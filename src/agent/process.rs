@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,10 +93,10 @@ fn elapsed_label(d: Duration) -> String {
 
 /// Spawn `command` in the background, confined to `root` (optionally a `cwd` subdir). Returns the
 /// new `proc_<n>` id.
-fn start(root: &PathBuf, command: &str, cwd: Option<&str>) -> Result<String> {
+fn start(root: &Path, command: &str, cwd: Option<&str>) -> Result<String> {
     let dir = match cwd {
         Some(c) => confine(root, c, true)?,
-        None => root.clone(),
+        None => root.to_path_buf(),
     };
 
     // Prune a finished slot if we're at the cap; refuse if everything is still running.

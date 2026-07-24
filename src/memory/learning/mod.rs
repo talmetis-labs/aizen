@@ -170,11 +170,46 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
         let is_inferred = provenance == ProvenanceKind::Inferred;
         let r = route::route(&c, &s);
 
-        // L2 session parking: inferred non-style facts stay in working memory this session
-        // (not durable long-tail). Explicit remember → durable. Style CorePromote still goes
-        // through confirm → STYLE (or session/no_core on deny).
+        // L2 session parking + the inferred→durable RATCHET. An inferred Store/Review fact still
+        // parks in this session's working memory (immediate inject), but it is ALSO journaled to the
+        // on-disk candidate ledger: re-observing it across enough DISTINCT sessions ripens it, and a
+        // ripe candidate is promoted into the durable store here (via the same `apply_store`
+        // consolidation path an explicit fact takes). This is what makes an inferred preference stick
+        // across restarts instead of evaporating with the process (fixes the dead park-in-RAM path).
+        // `AIZEN_NO_RATCHET` restores the old RAM-only behavior.
         if is_inferred && matches!(r, Route::Store | Route::Review) {
             park_session_note(&clean, scope.as_deref(), c.confidence, &c.name, opts, &mut report);
+            if !opts.dry_run && !config::ratchet_disabled() {
+                if let Ok(rec) = crate::memory::candidate::record(
+                    &c.name,
+                    &clean,
+                    c.mtype,
+                    scope.as_deref(),
+                    subpath.as_deref(),
+                    c.confidence,
+                    &opts.session_id,
+                ) {
+                    if rec.ripe {
+                        // Recurred across enough sessions → durably store it (Inferred provenance, so
+                        // decay/caps still govern it), then retire the ledger entry.
+                        apply_store(
+                            &clean,
+                            &c.mtype,
+                            provenance,
+                            c.confidence,
+                            false,
+                            scope.clone(),
+                            subpath.clone(),
+                            signal.kind,
+                            opts,
+                            &mut existing,
+                            &s,
+                            &mut report,
+                        )?;
+                        let _ = crate::memory::candidate::remove(&rec.id);
+                    }
+                }
+            }
             continue;
         }
 
@@ -421,7 +456,7 @@ fn apply_store(
 
         if let Some(old_id) = retire_id {
             if let Some(old_e) = existing.iter().find(|e| e.id == old_id) {
-                let _ = store::mark_superseded(old_e, &id)?;
+                store::mark_superseded(old_e, &id)?;
                 report.superseded.push((old_id.clone(), id.clone()));
                 audit::append(audit::AuditEvent {
                     ts: audit::ts_now(),

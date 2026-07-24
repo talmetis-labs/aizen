@@ -260,7 +260,7 @@ pub fn list() -> Vec<AgentDef> {
         by_slug.extend(dir_map(&dir, source)); // ascending → later overwrites
     }
     let mut out: Vec<AgentDef> = by_slug.into_values().collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 

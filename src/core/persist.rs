@@ -36,6 +36,7 @@ impl FileFingerprint {
         Self { exists: true, byte_len: bytes.len() as u64, sha256 }
     }
 
+    #[allow(dead_code)] // kept: tested/diagnostic API
     pub fn short_id(&self) -> String {
         self.sha256[..6].iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -49,6 +50,7 @@ pub struct WriteConflict {
 }
 
 impl WriteConflict {
+    #[allow(dead_code)] // kept: diagnostic accessor
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -126,6 +128,7 @@ pub fn create_if_absent(path: &Path, bytes: &[u8]) -> Result<FileFingerprint> {
     compare_and_atomic_write(path, &FileFingerprint::missing(), bytes)
 }
 
+#[allow(dead_code)] // kept: CAS remove API paired with compare_and_atomic_write
 pub fn remove_if_unchanged(path: &Path, expected: &FileFingerprint) -> Result<bool> {
     let actual = fingerprint(path)?;
     if &actual != expected {

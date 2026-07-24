@@ -385,7 +385,7 @@ impl RepoContext {
         // telling the user to run a command they already ran. Callers keying off the
         // "not a git repository" substring (save_protected_change/is_repo) still treat the benign
         // case as "checkpoints simply off", while real errors now propagate with their true cause.
-        let root = match raw_git(start, &["rev-parse", "--show-toplevel"]) {
+        let root = match raw_git(start, ["rev-parse", "--show-toplevel"]) {
             Ok(r) if !r.trim().is_empty() => r,
             // Bare repo or empty toplevel → no work tree to checkpoint; treat as no-TM.
             Ok(_) => bail!("not a git repository (run `git init` first to use the time machine)"),
@@ -398,8 +398,8 @@ impl RepoContext {
             }
         };
         let root = PathBuf::from(root).canonicalize().context("canonicalizing repository root")?;
-        let git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-dir"])?);
-        let common_git_dir = absolute_git_path(&root, &raw_git(&root, &["rev-parse", "--git-common-dir"])?);
+        let git_dir = absolute_git_path(&root, &raw_git(&root, ["rev-parse", "--git-dir"])?);
+        let common_git_dir = absolute_git_path(&root, &raw_git(&root, ["rev-parse", "--git-common-dir"])?);
         let common_canon = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
         let wt_canon = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
         let repo_id = format!("repo-{:016x}", fnv1a64(&common_canon.to_string_lossy()));
@@ -1441,6 +1441,7 @@ fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_checkpoint_locked(
     ctx: &RepoContext,
     ledger: &mut Ledger,

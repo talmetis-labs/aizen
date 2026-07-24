@@ -137,6 +137,55 @@ pub fn build_scoped(
     }
 }
 
+/// Top-`n` durable user-facts (salience-ordered) as short one-line strings, for the ONE-WAY
+/// memory→persona wire (Phase 2 quick-win): the persona reflection pass may lean on a few
+/// established user-facts as background. Read-only — this NEVER mutates the frozen core (the
+/// mid-session no-mutate invariant holds), and NEVER flows persona output back into memory (the
+/// leak-guard is upstream). Uses the same core-eligible filter + salience order as [`build_scoped`],
+/// so the anchors match what actually rides the always-on prefix. STYLE.md is intentionally excluded
+/// (it is the user's own voice, already the agent's baseline — not a discrete "fact" to re-derive).
+pub fn top_core_facts(n: usize) -> Vec<String> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let entries = match crate::memory::store::load_all() {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let active = crate::memory::bloat::supersede::active(&entries);
+    let today = decay::today();
+    let half_life = config::MemorySettings::default().recency_half_life_days;
+    let mut rest: Vec<&MemoryEntry> = active
+        .iter()
+        .filter(|e| {
+            e.mtype == MemoryType::User
+                && e.is_active()
+                && !e.core_denied
+                && e.scope.is_none()
+                && core_trusted(e)
+        })
+        .collect();
+    rest.sort_by(|a, b| {
+        decay::salience_of(b, &today, half_life)
+            .partial_cmp(&decay::salience_of(a, &today, half_life))
+            .unwrap_or(Ordering::Equal)
+            .then(b.mtime_ms.cmp(&a.mtime_ms))
+    });
+    rest.into_iter()
+        .take(n)
+        .map(|e| {
+            // Prefer the concise description; fall back to the (trimmed) body first line.
+            let d = e.description.trim();
+            if !d.is_empty() {
+                d.to_string()
+            } else {
+                e.body.trim().lines().next().unwrap_or("").trim().to_string()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Promote a pending rebuild (start-of-session) for the **current** project slug.
 /// Also consumes a legacy single-file `core.next.md` once (pre per-repo layout).
 pub fn promote_pending() -> Result<()> {

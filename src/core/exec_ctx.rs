@@ -66,6 +66,9 @@ thread_local! {
     /// Stack of contexts active on THIS thread. A stack (not a single slot) so a nested
     /// `with_current` — e.g. a tool that re-enters the agent loop — restores the outer context on
     /// exit, exactly like [`crate::core::cancel`]'s token stack.
+    // clippy 1.96 false-positive: the initializer is already a `const {}` block, but
+    // `missing_const_for_thread_local` still fires. Silence it on the static itself.
+    #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT: RefCell<Vec<ExecutionContext>> = const { RefCell::new(Vec::new()) };
 }
 

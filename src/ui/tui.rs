@@ -786,7 +786,7 @@ struct FooterLayout {
 }
 
 fn footer_layout(cols: usize) -> FooterLayout {
-    let w = cols.max(20) as usize;
+    let w = cols.max(20);
     let inset = if w >= 100 {
         2
     } else if w >= 64 {
@@ -1133,7 +1133,7 @@ fn paint_model_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
     buf.push_str(&theme::faint(hint_plain.as_str()).to_string());
     row_idx += 1;
 
-    LAST_MODEL_MENU.store(row_idx as u16, Ordering::Relaxed);
+    LAST_MODEL_MENU.store(row_idx, Ordering::Relaxed);
 }
 
 /// `/sessions` picker stacked above the top chat rule (mirrors [`paint_model_menu`], but each row is
@@ -1245,7 +1245,7 @@ fn paint_sessions_menu(buf: &mut String, r: &Render, top_row: u16, w: usize) {
     buf.push_str(&theme::faint(hint).to_string());
     row_idx += 1;
 
-    LAST_SESSIONS_MENU.store(row_idx as u16, Ordering::Relaxed);
+    LAST_SESSIONS_MENU.store(row_idx, Ordering::Relaxed);
 }
 
 /// Wrap one ANSI-free source line into terminal-width visual rows (Unicode display-width aware).
@@ -1340,7 +1340,7 @@ fn paint_text_overlay(buf: &mut String, r: &Render, top_row: u16, w: usize) {
     buf.push_str(&theme::faint("  ↑↓/PgUp/PgDn scroll · Esc/q close").to_string());
     row_idx += 1;
 
-    LAST_TEXT_OVERLAY.store(row_idx as u16, Ordering::Relaxed);
+    LAST_TEXT_OVERLAY.store(row_idx, Ordering::Relaxed);
 }
 
 /// Append the sandwich-style footer at the bottom `FOOTER` rows and leave the cursor at the input
@@ -2289,11 +2289,11 @@ fn handle_retained_mouse(
                 let bot = area.y.saturating_add(area.height.saturating_sub(1)) as i32;
                 let r = row as i32;
                 let (scroll_delta, start_delta): (i32, isize) = if r <= top {
-                    let dist = (top - r + 1) as i32;
+                    let dist = top - r + 1;
                     let n = if dist >= 4 { 4 } else if dist >= 2 { 2 } else { 1 };
                     (-n, -(n as isize))
                 } else if r >= bot {
-                    let dist = (r - bot + 1) as i32;
+                    let dist = r - bot + 1;
                     let n = if dist >= 4 { 4 } else if dist >= 2 { 2 } else { 1 };
                     (n, n as isize)
                 } else if r <= top + 1 {

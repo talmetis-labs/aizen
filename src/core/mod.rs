@@ -14,4 +14,5 @@ pub mod persist;
 pub mod recovery;
 pub mod repo_lock;
 pub mod types;
+pub mod workdir;
 pub mod workspace_txn;

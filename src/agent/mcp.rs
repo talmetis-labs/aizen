@@ -190,7 +190,7 @@ fn project_key() -> String {
 /// Whether the current repo is trusted to load its project-local MCP servers.
 pub fn project_trusted() -> bool {
     let key = project_key();
-    load_trust().trusted.iter().any(|t| *t == key)
+    load_trust().trusted.contains(&key)
 }
 
 /// Trust the current repo's project MCP servers (idempotent; clears any prior dismissal).
@@ -198,7 +198,7 @@ pub fn trust_project() -> Result<()> {
     let key = project_key();
     update_trust(|t| {
         t.dismissed.retain(|d| *d != key);
-        if !t.trusted.iter().any(|x| *x == key) {
+        if !t.trusted.contains(&key) {
             t.trusted.push(key.clone());
         }
     })
@@ -217,7 +217,7 @@ pub fn untrust_project() -> Result<()> {
 pub fn dismiss_project() -> Result<()> {
     let key = project_key();
     update_trust(|t| {
-        if !t.dismissed.iter().any(|x| *x == key) {
+        if !t.dismissed.contains(&key) {
             t.dismissed.push(key.clone());
         }
     })
@@ -232,7 +232,7 @@ pub fn project_trust_prompt() -> Option<usize> {
     }
     let key = project_key();
     let t = load_trust();
-    if t.trusted.iter().any(|x| *x == key) || t.dismissed.iter().any(|x| *x == key) {
+    if t.trusted.contains(&key) || t.dismissed.contains(&key) {
         return None;
     }
     Some(cfg.servers.len())
@@ -343,7 +343,7 @@ const REDACTED: &str = "«redacted»";
 ///   2. Generic patterns — `Bearer <...>` / `Basic <...>` authorization values, and `?token=`/
 ///      `?key=`/`?access_token=`/`?api_key=` query parameters — masked structurally so an unknown
 ///      credential (one we didn't pass in `known`) still doesn't leak.
-/// Short/empty `known` values are skipped so we never blanket-replace a 1-char string across output.
+///      Short/empty `known` values are skipped so we never blanket-replace a 1-char string across output.
 fn redact_secrets(input: &str, known: &[String]) -> String {
     let mut s = input.to_string();
     for secret in known {
@@ -357,6 +357,13 @@ fn redact_secrets(input: &str, known: &[String]) -> String {
     redact_generic(&s)
 }
 
+/// Case-insensitive ASCII prefix test that allocates nothing and reads at most `prefix.len()` bytes
+/// of `s` (perf 3.x). `prefix` is expected to be lowercase ASCII (all call sites pass literals).
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    let (sb, pb) = (s.as_bytes(), prefix.as_bytes());
+    sb.len() >= pb.len() && sb[..pb.len()].eq_ignore_ascii_case(pb)
+}
+
 /// The structural pass of [`redact_secrets`]: mask `Bearer`/`Basic` auth values and known secret
 /// query parameters even when the literal value wasn't supplied. Kept pure + separate so it's unit
 /// -testable and so [`McpTransportError::new`] can run just this layer with no `known` list.
@@ -366,10 +373,12 @@ fn redact_generic(input: &str) -> String {
     let mut i = 0;
     while i < input.len() {
         // Match `Bearer ` / `Basic ` (case-insensitive) then swallow the token that follows.
+        // Compare the prefix byte-wise (perf 3.x): the old `rest.to_ascii_lowercase()` allocated +
+        // lowercased the ENTIRE remaining string at every byte position → O(n²) over the input.
+        // `starts_with_ci` reads at most the keyword's bytes and allocates nothing.
         let rest = &input[i..];
-        let lower_rest = rest.to_ascii_lowercase();
-        if lower_rest.starts_with("bearer ") || lower_rest.starts_with("basic ") {
-            let kw_len = if lower_rest.starts_with("bearer ") { "bearer ".len() } else { "basic ".len() };
+        if starts_with_ci(rest, "bearer ") || starts_with_ci(rest, "basic ") {
+            let kw_len = if starts_with_ci(rest, "bearer ") { "bearer ".len() } else { "basic ".len() };
             out.push_str(&rest[..kw_len]);
             // The credential runs until whitespace, a quote, or end-of-string.
             let after = &rest[kw_len..];
@@ -386,9 +395,9 @@ fn redact_generic(input: &str) -> String {
         // preceded by `?` or `&`, then swallow the value up to the next `&`, `#`, whitespace, or quote.
         if bytes[i] == b'?' || bytes[i] == b'&' {
             let param_rest = &input[i + 1..];
-            let lower = param_rest.to_ascii_lowercase();
+            // Byte-wise prefix match (perf 3.x): no per-position `to_ascii_lowercase()` of the tail.
             let names = ["access_token=", "refresh_token=", "api_key=", "apikey=", "token=", "key=", "secret=", "password="];
-            if let Some(name) = names.iter().find(|n| lower.starts_with(**n)) {
+            if let Some(name) = names.iter().find(|n| starts_with_ci(param_rest, n)) {
                 out.push(bytes[i] as char);
                 out.push_str(&param_rest[..name.len()]);
                 let val = &param_rest[name.len()..];

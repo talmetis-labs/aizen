@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionNoteKind {
     /// Working scratch (tool/context notes).
+    #[allow(dead_code)] // kept: tested API variant / session-kind scaffold
     Working,
     /// Candidate fact inferred this session (may be promoted later by explicit path).
     Candidate,
@@ -57,10 +58,12 @@ impl SessionMem {
         Self { notes: Vec::new() }
     }
 
+    #[allow(dead_code)] // kept: tested API / inspection accessor
     pub fn list(&self) -> &[SessionNote] {
         &self.notes
     }
 
+    #[allow(dead_code)] // kept: tested API / inspection accessor
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty()
     }
@@ -122,15 +125,6 @@ impl SessionMem {
                 .then(b.created_ms.cmp(&a.created_ms))
         });
         self.notes.truncate(NOTE_CAP);
-    }
-
-    /// Notes that could be promoted to durable (high-importance candidates). Default policy
-    /// does **not** auto-promote — callers only use this for inspection / future CLI.
-    pub fn candidates_for_promote(&self) -> Vec<&SessionNote> {
-        self.notes
-            .iter()
-            .filter(|n| n.kind == SessionNoteKind::Candidate && n.importance >= 7)
-            .collect()
     }
 
     /// Render a short `<session_memory>` block, or `None` when empty / budget 0 / nothing qualifies.
@@ -291,14 +285,4 @@ mod tests {
         assert!(m.list().iter().any(|n| n.importance >= 8));
     }
 
-    #[test]
-    fn candidates_for_promote_filters() {
-        let mut m = SessionMem::new();
-        m.note("low", SessionNoteKind::Candidate, None, 5);
-        m.note("high", SessionNoteKind::Candidate, None, 8);
-        m.note("work", SessionNoteKind::Working, None, 9);
-        let c = m.candidates_for_promote();
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].body, "high");
-    }
 }

@@ -15,7 +15,7 @@
 //! (verified against Cargo.lock 2026-06-25). Tokens are compared by CHARACTER count, not byte
 //! length, so multibyte VN tokens aren't wrongly dropped.
 
-use icu_normalizer::ComposingNormalizer;
+use icu_normalizer::{ComposingNormalizer, ComposingNormalizerBorrowed};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
@@ -23,6 +23,9 @@ use std::collections::HashSet;
 // Letters (any script, incl. composed Vietnamese), numbers, underscore. `\p{L}`/`\p{N}` rely on
 // regex's unicode feature, which is enabled by default.
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+/// NFC normalizer is immutable after construction and uses compiled static ICU data. Build it once
+/// instead of recreating the wrapper for every query/document tokenization (perf T3).
+static NFC_NORMALIZER: ComposingNormalizerBorrowed<'static> = ComposingNormalizer::new_nfc();
 
 /// Bilingual stopword set: the original 48 English words (verbatim from the extension's proven
 /// tokenizer, globalMemoryStore.ts:233) + ~45 high-frequency Vietnamese function words so VN text
@@ -51,7 +54,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
         return Vec::new();
     }
     // NFC compose first (free; static compiled data). Cow → str via Deref for to_lowercase().
-    let normalized = ComposingNormalizer::new_nfc().normalize(s);
+    let normalized = NFC_NORMALIZER.normalize(s);
     let lowered = normalized.to_lowercase();
     let mut out = Vec::new();
     for m in TOKEN_RE.find_iter(&lowered) {

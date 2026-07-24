@@ -649,16 +649,46 @@ pub fn config_path() -> PathBuf {
     nextgen_home().join("cli-config.json")
 }
 
+/// In-process cache for `load()` (perf 1.3). The config file is read + serde-parsed on many hot
+/// paths — the bot boot reads it ~7× before the first prompt, and the HUD `status_text` reads it on
+/// every refresh. Keyed by `(path, mtime, len)` exactly like `codebase::INDEX_CACHE`, so an external
+/// edit (or a test that repoints `NEXTGEN_HOME` to a fresh dir) is still picked up on the next
+/// `stat`, while repeat reads within one process pay only a cheap `metadata()` syscall instead of a
+/// full read + `serde_json` parse of the ~40-field struct. `save_unlocked` refreshes the entry after
+/// every write so a save is immediately visible without touching disk again.
+/// Cached parse of the config file, keyed by `(path, mtime, len)`.
+type ConfigCacheEntry = (PathBuf, std::time::SystemTime, u64, CliConfig);
+static CONFIG_CACHE: Lazy<RwLock<Option<ConfigCacheEntry>>> = Lazy::new(|| RwLock::new(None));
+
+/// `(mtime, len)` fingerprint of the config file, or `None` when it's missing/unstatable.
+fn config_fingerprint(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 /// Load the config, or an empty one if the file is missing/unreadable/corrupt (never fails). A
 /// CORRUPT file is surfaced (once) instead of silently vanishing the user's endpoint+key — and
-/// `save` preserves it as `.bak` before overwriting, so the settings stay recoverable.
+/// `save` preserves it as `.bak` before overwriting, so the settings stay recoverable. Cached
+/// in-process keyed by `(path, mtime, len)` (see `CONFIG_CACHE`); a repeat read of an unchanged file
+/// returns a clone without re-parsing.
 pub fn load() -> CliConfig {
     let path = config_path();
+    let fp = config_fingerprint(&path);
+    // Cache hit: same path AND same (mtime, len) as when we last parsed.
+    if let Some((mtime, len)) = fp {
+        if let Ok(guard) = CONFIG_CACHE.read() {
+            if let Some((p, mt, l, cfg)) = guard.as_ref() {
+                if *p == path && *mt == mtime && *l == len {
+                    return cfg.clone();
+                }
+            }
+        }
+    }
     let s = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return CliConfig::default(), // missing/unreadable → empty (normal on first run)
     };
-    match serde_json::from_str(&s) {
+    let cfg = match serde_json::from_str::<CliConfig>(&s) {
         Ok(cfg) => cfg,
         Err(e) => {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -672,7 +702,18 @@ pub fn load() -> CliConfig {
             }
             CliConfig::default()
         }
+    };
+    // Cache only when the fingerprint stayed stable across the read. If another writer replaced the
+    // file between our first stat and this stat, `cfg` may describe the old bytes while the second
+    // fingerprint describes the new file; caching that pair would serve stale config indefinitely.
+    if let (Some(before), Some(after)) = (fp, config_fingerprint(&path)) {
+        if before == after {
+            if let Ok(mut guard) = CONFIG_CACHE.write() {
+                *guard = Some((path, after.0, after.1, cfg.clone()));
+            }
+        }
     }
+    cfg
 }
 
 /// Persist the config (creates `~/.aizen/` if needed). The file holds the gateway api_key, so it is
@@ -698,14 +739,29 @@ fn save_unlocked(cfg: &CliConfig, path: &std::path::Path) -> Result<()> {
     }
     // If the file on disk is currently corrupt, preserve it as `.bak` before we clobber it — so a
     // hand-edit typo or a partial write doesn't silently destroy the rest of the user's settings.
-    if let Ok(cur) = std::fs::read_to_string(&path) {
+    if let Ok(cur) = std::fs::read_to_string(path) {
         if serde_json::from_str::<CliConfig>(&cur).is_err() {
-            let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+            let _ = std::fs::copy(path, path.with_extension("json.bak"));
         }
     }
     let json = serde_json::to_string_pretty(&canonical)?;
-    std::fs::write(&path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
-    crate::core::config::harden_file(&path);
+    std::fs::write(path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
+    crate::core::config::harden_file(path);
+    // Refresh the load() cache so the just-saved value is visible on the next read without a disk
+    // round-trip. Fingerprint the file we actually wrote; if the stat fails, drop the cache so the
+    // next load() re-reads rather than serving a stale entry.
+    match config_fingerprint(path) {
+        Some((mtime, len)) => {
+            if let Ok(mut guard) = CONFIG_CACHE.write() {
+                *guard = Some((path.to_path_buf(), mtime, len, canonical));
+            }
+        }
+        None => {
+            if let Ok(mut guard) = CONFIG_CACHE.write() {
+                *guard = None;
+            }
+        }
+    }
     Ok(())
 }
 

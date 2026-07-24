@@ -159,6 +159,10 @@ struct PushDiags {
 struct OpenDoc {
     version: i32,
     fingerprint: u64,
+    /// `(mtime-nanos, len)` of the file when we last read + hashed it (perf 3.x). `ensure_open`
+    /// stats the file first and, if this matches, skips the full `read_to_string` + FNV hash — an
+    /// unchanged file is the common case across a burst of queries against the same buffer.
+    stat: (u64, u64),
 }
 
 /// Client-side state for the LSP router: indexing progress + the push-diagnostics store.
@@ -376,10 +380,35 @@ impl LspServer {
     /// publish should be expected.
     async fn ensure_open(&self, file: &Path) -> Result<(Url, bool)> {
         // Absolutize: callers may hand a cwd-relative path; `Url::from_file_path` needs absolute
-        // (canonicalize also verifies existence — it only succeeds for real files).
-        let file = &file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        // (canonicalize also verifies existence — it only succeeds for real files). Off the blocking
+        // pool via `tokio::fs` (perf 3.x) so a network/symlink-heavy FS doesn't stall an async worker.
+        let file = &tokio::fs::canonicalize(file).await.unwrap_or_else(|_| file.to_path_buf());
         let url = Url::from_file_path(file).map_err(|()| anyhow!("non-absolute path: {}", file.display()))?;
         let key = uri::normalize_uri(url.as_str());
+        // Cheap stat gate (perf 3.x): if this doc is already open and its `(mtime, len)` is unchanged
+        // since we last synced, skip the full `read_to_string` + FNV hash entirely — the common case
+        // across a burst of queries against the same buffer.
+        let stat = tokio::fs::metadata(file)
+            .await
+            .ok()
+            .map(|m| {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                (mtime, m.len())
+            })
+            .unwrap_or((0, 0));
+        {
+            let opened = self.opened.lock().await;
+            if let Some(doc) = opened.get(&key) {
+                if doc.stat == stat && stat != (0, 0) {
+                    return Ok((url, false));
+                }
+            }
+        }
         let text = tokio::fs::read_to_string(file)
             .await
             .with_context(|| format!("reading {}", file.display()))?;
@@ -397,12 +426,13 @@ impl LspServer {
                     },
                 })
                 .map_err(|e| anyhow!("didOpen failed: {e}"))?;
-                opened.insert(key, OpenDoc { version: 1, fingerprint });
+                opened.insert(key, OpenDoc { version: 1, fingerprint, stat });
                 Ok((url, true))
             }
             Some(doc) if doc.fingerprint != fingerprint => {
                 doc.version += 1;
                 doc.fingerprint = fingerprint;
+                doc.stat = stat;
                 sock.did_change(DidChangeTextDocumentParams {
                     text_document: VersionedTextDocumentIdentifier {
                         uri: url.clone(),
@@ -419,7 +449,12 @@ impl LspServer {
                 .map_err(|e| anyhow!("didChange failed: {e}"))?;
                 Ok((url, true))
             }
-            Some(_) => Ok((url, false)),
+            Some(doc) => {
+                // Content unchanged (hash match) but stat drifted (e.g. touched): refresh the stat so
+                // the next call hits the cheap gate again.
+                doc.stat = stat;
+                Ok((url, false))
+            }
         }
     }
 
@@ -465,12 +500,17 @@ impl LspServer {
         // reused across that file's hits: a 100-reference result costs one outline per distinct
         // file, not one per hit.
         let mut outline_cache: HashMap<Url, Option<DocumentSymbolResponse>> = HashMap::new();
+        // File CONTENT is likewise read ONCE per distinct file and shared across that file's hits
+        // (perf 1.4): rust-analyzer returns hundreds of refs, many in the same file, and the old
+        // per-hit `read_line_snippet` re-read + re-split the WHOLE file for every one — O(hits ×
+        // file_size). Now each file is read at most once; the snippet is sliced from the cached text.
+        let mut content_cache: HashMap<PathBuf, Option<Arc<String>>> = HashMap::new();
         let mut hits = Vec::with_capacity(locs.len());
         for loc in locs {
             let Ok(p) = uri::uri_to_path(loc.uri.as_str()) else { continue };
             let line = loc.range.start.line as usize;
             let col = loc.range.start.character as usize;
-            let snippet = read_line_snippet(&p, line).await;
+            let snippet = snippet_from_cache(&p, line, &mut content_cache).await;
             let enclosing = self
                 .enclosing_sym_cached(&loc.uri, loc.range.start, &mut outline_cache)
                 .await;
@@ -627,17 +667,48 @@ impl LspServer {
         Ok(out)
     }
 
+    /// The full item range AND kind label enclosing `chosen`, from a SINGLE `document_symbol`
+    /// request (perf 3.x). `symbol_body` needs both; the old path called `outline_range_at` and
+    /// `outline_kind_at` back to back, firing two identical `textDocument/documentSymbol` round-trips
+    /// for the same file + position. This fetches once and derives both from the one response.
+    async fn outline_range_and_kind_at(&self, chosen: &SymHit) -> (Option<Range>, Option<&'static str>) {
+        let mut sock = self.socket.clone();
+        let resp = sock
+            .document_symbol(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .ok()
+            .flatten();
+        let Some(resp) = resp else { return (None, None) };
+        match resp {
+            DocumentSymbolResponse::Nested(v) => {
+                (find_enclosing(&v, chosen.range.start), find_enclosing_kind(&v, chosen.range.start))
+            }
+            DocumentSymbolResponse::Flat(v) => {
+                let hit = v
+                    .into_iter()
+                    .find(|si| si.name == chosen.name && range_contains(&si.location.range, chosen.range.start));
+                match hit {
+                    Some(si) => (Some(si.location.range), Some(kind_label(si.kind))),
+                    None => (None, None),
+                }
+            }
+        }
+    }
+
     /// Resolve a named symbol to its full body text (definition file + inclusive line range).
     /// Prefer this over `file_read` when the agent only needs one item — much cheaper tokens.
     pub async fn symbol_body(&self, file_hint: Option<&Path>, symbol: &str) -> Result<SymBody> {
         let chosen = self.find_symbol(symbol, file_hint).await?;
         let target = uri::uri_to_path(chosen.uri.as_str())?;
         self.ensure_open(&target).await?;
-        let full_range = self.outline_range_at(&chosen).await.unwrap_or(chosen.range);
-        let kind = self
-            .outline_kind_at(&chosen)
-            .await
-            .unwrap_or("symbol");
+        // One document_symbol round-trip for BOTH the enclosing range and the kind label (perf 3.x).
+        let (range_opt, kind_opt) = self.outline_range_and_kind_at(&chosen).await;
+        let full_range = range_opt.unwrap_or(chosen.range);
+        let kind = kind_opt.unwrap_or("symbol");
         let text = tokio::fs::read_to_string(&target)
             .await
             .with_context(|| format!("reading {}", target.display()))?;
@@ -707,26 +778,6 @@ impl LspServer {
             InsertWhere::After => body.end_line.saturating_add(1),
         };
         Ok((body.path, at, new_text, base_fingerprint))
-    }
-
-    /// Kind label for the outline item enclosing `chosen` (best-effort).
-    async fn outline_kind_at(&self, chosen: &SymHit) -> Option<&'static str> {
-        let mut sock = self.socket.clone();
-        let resp = sock
-            .document_symbol(DocumentSymbolParams {
-                text_document: TextDocumentIdentifier { uri: chosen.uri.clone() },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .await
-            .ok()??;
-        match resp {
-            DocumentSymbolResponse::Nested(v) => find_enclosing_kind(&v, chosen.range.start),
-            DocumentSymbolResponse::Flat(v) => v
-                .into_iter()
-                .find(|si| si.name == chosen.name && range_contains(&si.location.range, chosen.range.start))
-                .map(|si| kind_label(si.kind)),
-        }
     }
 
     /// Project-wide fuzzy symbol search by name. Deduplicated — servers can return the same
@@ -838,7 +889,16 @@ impl LspServer {
             if self.is_indexed() || attempts >= max_attempts {
                 return Ok(Vec::new());
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Servers without an explicit indexing signal (JS/TS/Python) cannot distinguish "still
+            // warming" from "no symbol". Keep the warm-up responsive with a short exponential
+            // backoff instead of sleeping 500ms sixteen times (~8s) on every miss (perf T3). Rust
+            // servers retain their 500ms cadence because their signal tells us when to stop.
+            let delay_ms = if self.has_indexing_signal() {
+                500
+            } else {
+                100u64.saturating_mul(1u64 << (attempts.saturating_sub(1)).min(2))
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
 
@@ -1206,8 +1266,8 @@ fn flatten_symbols(resp: Option<WorkspaceSymbolResponse>) -> Vec<SymCand> {
 ///      (case-insensitive; the last path segment is enough, so `a/b/leaf` matches container `b`),
 ///   3. among the survivors, prefer one whose file matches `file_hint`,
 ///   4. else the first exact match, then the first fuzzy one.
-/// A bare `symbol` (no `/`) behaves exactly as before. When a server omits `container_name` the
-/// container filter simply finds nothing and falls through to the file-hint / first-match path.
+///      A bare `symbol` (no `/`) behaves exactly as before. When a server omits `container_name` the
+///      container filter simply finds nothing and falls through to the file-hint / first-match path.
 fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>) -> Option<SymHit> {
     let usable: Vec<SymCand> = candidates.into_iter().filter(|c| c.range.is_some()).collect();
     if usable.is_empty() {
@@ -1250,11 +1310,27 @@ fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>)
     pool.first().map(|c| to_hit(c))
 }
 
-/// Best-effort: read line `line0` (0-based) of `path`, trimmed and length-capped. Empty on error.
-async fn read_line_snippet(path: &Path, line0: usize) -> String {
-    match tokio::fs::read_to_string(path).await {
-        Ok(text) => text.lines().nth(line0).map(|l| l.trim().chars().take(200).collect()).unwrap_or_default(),
-        Err(_) => String::new(),
+/// Best-effort: line `line0` (0-based) of `path`, trimmed and length-capped, reading each file at
+/// most ONCE per reference batch (perf 1.4). The file's text is memoized in `cache` (`Arc<String>`
+/// so a re-hit is a pointer bump, `None` marks a read failure so we don't retry it); the snippet is
+/// then sliced from the cached text. Replaces the old per-hit `read_line_snippet`, which re-read the
+/// whole file for every reference hit.
+async fn snippet_from_cache(
+    path: &Path,
+    line0: usize,
+    cache: &mut HashMap<PathBuf, Option<Arc<String>>>,
+) -> String {
+    if !cache.contains_key(path) {
+        let text = tokio::fs::read_to_string(path).await.ok().map(Arc::new);
+        cache.insert(path.to_path_buf(), text);
+    }
+    match cache.get(path).and_then(|o| o.as_ref()) {
+        Some(text) => text
+            .lines()
+            .nth(line0)
+            .map(|l| l.trim().chars().take(200).collect())
+            .unwrap_or_default(),
+        None => String::new(),
     }
 }
 

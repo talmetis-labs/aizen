@@ -164,6 +164,7 @@ pub fn apply_toolset_filter(registry: &mut ToolRegistry) {
 }
 
 /// Human summary for `/tools` and `config show`.
+#[allow(dead_code)] // kept: tested API (distinct from orchestration::format_status)
 pub fn format_status(registry: &ToolRegistry) -> String {
     let cfg = cli_config::load();
     let names = registry.names();

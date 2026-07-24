@@ -5,8 +5,8 @@
 //! - `Review`      — mid-confidence; lands in the review queue for a human (`ng memory review`).
 //! - `Store`       — high-confidence; written to the live long-tail store automatically.
 //! - `CorePromote` — a high-confidence STYLE fact; eligible for the always-on core,
-//!                   but ONLY after confirmation (auto-learned facts never silently
-//!                   enter the always-injected prompt).
+//!   but ONLY after confirmation (auto-learned facts never silently
+//!   enter the always-injected prompt).
 
 use crate::core::config::MemorySettings;
 use crate::memory::learning::extract_free::Candidate;

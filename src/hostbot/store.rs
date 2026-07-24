@@ -86,6 +86,7 @@ pub fn update_bots<T>(mutate: impl FnOnce(&mut Vec<HostedBot>) -> Result<T>) -> 
 }
 
 /// Persist the hosted-bot list to `hostbot/bots.json`, hardened to owner-only.
+#[allow(dead_code)] // kept: tested API
 pub fn save_bots(bots: &[HostedBot]) -> Result<()> {
     let path = bots_path();
     let lock_path = crate::core::workspace_txn::store_lock("hostbot", "bots");

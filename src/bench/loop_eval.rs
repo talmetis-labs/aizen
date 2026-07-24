@@ -536,6 +536,9 @@ fn eval_cfg() -> AgentConfig {
 }
 
 /// Run one scenario against the REAL loop, return `(passed, iters, stop)`.
+// The guard must span the whole scenario (incl. the loop `.await`): it serializes access to the
+// process-global todo state, so an early drop would let concurrent scenarios clobber each other.
+#[allow(clippy::await_holding_lock)]
 async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason) {
     // Serialize process-global todo mutations across scenarios.
     let _g = crate::agent::todo::TEST_LOCK

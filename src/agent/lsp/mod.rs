@@ -56,6 +56,7 @@ pub struct SymbolEditPlan {
     pub old_body: String,
     pub new_content: String,
     pub base_fingerprint: crate::core::persist::FileFingerprint,
+    #[allow(dead_code)] // kept: config-struct field
     pub kind: SymbolEditKind,
     pub symbol: String,
 }

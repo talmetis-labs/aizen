@@ -256,7 +256,7 @@ impl MarkdownStream {
     /// row, and the bottom border so the frame is a true rectangle instead of a narrow top over wide
     /// content. Capped so wide terminals don't stretch code across the whole screen.
     fn fence_width(&self) -> usize {
-        self.cols.saturating_sub(measure_text_width(&gutter())).min(80).max(16)
+        self.cols.saturating_sub(measure_text_width(&gutter())).clamp(16, 80)
     }
 
     /// The writable span between the `│ ` left rule and the ` │` right rule.
@@ -507,13 +507,13 @@ pub fn render_retained(input: &str, cols: usize) -> String {
                     // the inner span then closed with a right rule) and the bottom border, so wide
                     // content can't sprawl past a narrow frame. `visual`/mermaid rows truncate; code
                     // char-wraps. All measured by display width, never byte length.
-                    let w = cols.saturating_sub(measure_text_width(&gutter())).min(80).max(16);
+                    let w = cols.saturating_sub(measure_text_width(&gutter())).clamp(16, 80);
                     let inner = w.saturating_sub(4).max(8);
                     let label_shown = truncate_display(label, inner.saturating_sub(2));
                     let head_dashes = inner.saturating_sub(measure_text_width(&label_shown) + 1);
                     out.push_str(&format!("{}╭─ {label_shown} {}╮\n", gutter(), "─".repeat(head_dashes)));
                     let visual = is_visual_fence(label) || rendered.is_some();
-                    let mut emit_row = |out: &mut String, chunk: &str, styled: String| {
+                    let emit_row = |out: &mut String, chunk: &str, styled: String| {
                         out.push_str(&gutter());
                         out.push_str("│ ");
                         out.push_str(&styled);
@@ -622,7 +622,7 @@ pub fn render_retained(input: &str, cols: usize) -> String {
     if in_code {
         // A dangling fence (never closed) → same true-rectangle box as the terminated path.
         let label = if code_lang.is_empty() { "code" } else { &code_lang };
-        let w = cols.saturating_sub(measure_text_width(&gutter())).min(80).max(16);
+        let w = cols.saturating_sub(measure_text_width(&gutter())).clamp(16, 80);
         let inner = w.saturating_sub(4).max(8);
         let label_shown = truncate_display(label, inner.saturating_sub(2));
         let head_dashes = inner.saturating_sub(measure_text_width(&label_shown) + 1);

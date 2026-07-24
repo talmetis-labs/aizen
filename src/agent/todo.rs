@@ -107,6 +107,7 @@ pub fn status_summary() -> Option<String> {
 }
 
 /// A glyph for a status: done ✓, in-progress ▸, pending ○.
+#[allow(dead_code)] // kept: used by render_block (tested API)
 fn glyph(s: Status) -> &'static str {
     match s {
         Status::Done => "✓",
@@ -116,6 +117,7 @@ fn glyph(s: Status) -> &'static str {
 }
 
 /// Render the list as a colored checklist block (one line per item). Empty list → empty string.
+#[allow(dead_code)] // kept: tested API
 pub fn render_block(items: &[Todo]) -> String {
     if items.is_empty() {
         return String::new();

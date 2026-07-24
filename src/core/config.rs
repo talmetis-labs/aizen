@@ -56,11 +56,39 @@ fn resolve_default_home(base: &Path) -> PathBuf {
 /// repo's `.nextgen/` (R4 — fixes the cwd-relative footgun). `NG_PROJECT_ROOT` overrides (tests + an
 /// escape hatch). Shell-out to git keeps the pure-static posture (no git2/gix).
 pub fn project_root() -> PathBuf {
-    if let Ok(v) = std::env::var("NG_PROJECT_ROOT") {
-        let v = v.trim();
-        if !v.is_empty() {
-            return PathBuf::from(v);
+    // Cached per (`NG_PROJECT_ROOT` env, cwd) — same key shape as `project_slug()` below — so the
+    // `git rev-parse` shell-out (the heaviest step on the boot path, especially on Windows where
+    // process creation is expensive) happens ONCE per process. Repeated callers on startup
+    // (`recovery::current_repo_scope`, `mcp::project_key`, `project_slug`'s own first call) now
+    // share one spawn; tests that repoint `NG_PROJECT_ROOT` are never served a stale root because
+    // the env value is part of the cache key.
+    static CACHE: std::sync::Mutex<Option<(String, PathBuf)>> = std::sync::Mutex::new(None);
+    let env_root = std::env::var("NG_PROJECT_ROOT").unwrap_or_default();
+    let cache_key = format!(
+        "{}|{}",
+        env_root,
+        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+    );
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((k, root)) = guard.as_ref() {
+            if *k == cache_key {
+                return root.clone();
+            }
         }
+    }
+    let root = compute_project_root(&env_root);
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((cache_key, root.clone()));
+    }
+    root
+}
+
+/// Uncached resolution behind `project_root()`'s per-(env,cwd) cache. `env_root` is the already-read
+/// `NG_PROJECT_ROOT` value (empty when unset) so we don't read the env var twice.
+fn compute_project_root(env_root: &str) -> PathBuf {
+    let v = env_root.trim();
+    if !v.is_empty() {
+        return PathBuf::from(v);
     }
     if let Ok(out) = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).output() {
         if out.status.success() {
@@ -105,6 +133,15 @@ pub fn graph_disabled() -> bool {
 /// the corpus), but *reading* it into results waits until the bench proves net recall value.
 pub fn graph_expand_enabled() -> bool {
     !graph_disabled() && env_flag("NG_GRAPH_EXPAND")
+}
+
+/// Cross-pillar co-fire kill-switch (Phase 4). Default-ON: the same Hebbian graph that already wires
+/// `fact↔fact` also wires `mem:<id>`, `skill:<name>`, and `self:<id>` nodes when they are USED
+/// together in a turn (a fact recalled + a skill loaded → an association). `NG_NO_GRAPH_XPILLAR=1`
+/// turns just the cross-pillar recording off, leaving the intra-memory `fact↔fact` spine untouched.
+/// Also honors the master `NG_NO_GRAPH` off (no graph at all → no cross-pillar edges either).
+pub fn graph_xpillar_disabled() -> bool {
+    graph_disabled() || env_flag("NG_NO_GRAPH_XPILLAR")
 }
 
 /// FNV-1a 64-bit — tiny local hash for the project-slug stable key (core must not depend on
@@ -306,6 +343,55 @@ pub fn legacy_core_next_path() -> PathBuf {
 /// Mid-confidence learned candidates land here for `ng memory review` (P3).
 pub fn review_dir() -> PathBuf {
     cli_memory_dir().join("review")
+}
+
+/// DURABLE inferred-candidate ledger (the inferred→durable ratchet). An inferred fact the pipeline
+/// used to park in RAM (lost on exit) is instead journaled here, one file per candidate, with a
+/// distinct-session recurrence count. When a candidate recurs across enough separate sessions it is
+/// promoted into the live entry store and its ledger file removed. This is what makes an inferred
+/// preference actually STICK across restarts instead of evaporating (fixes the dead park-in-RAM path).
+pub fn candidates_dir() -> PathBuf {
+    cli_memory_dir().join("candidates")
+}
+
+/// The inferred→durable ratchet kill-switch. `AIZEN_NO_RATCHET=1` restores the pre-ratchet
+/// behavior (inferred Store/Review facts park in RAM only, lost on exit). Escape hatch — the
+/// ratchet is the intended default (a resident assistant should remember what recurs).
+pub fn ratchet_disabled() -> bool {
+    env_flag("AIZEN_NO_RATCHET")
+}
+
+/// The default self-store kill-switch. When NO persona is active, the agent still accumulates a
+/// working relationship with the user (records formative episodes + reflects into insights under
+/// the reserved `_self` slug, injected as a neutral `<working_relationship>` block — never a
+/// persona costume). `AIZEN_NO_SELF_STORE=1` turns this OFF, restoring the pre-Phase-2 behavior
+/// where a personaless session grows nothing. Default ON: a resident assistant should learn how the
+/// user likes to work with it even without an explicit character.
+pub fn self_store_disabled() -> bool {
+    env_flag("AIZEN_NO_SELF_STORE")
+}
+
+/// The skill self-evolution kill-switch. When ON (default), the auto-learn loop is CLOSED: a
+/// distilled procedure that collides with an existing skill is offered to the distiller to REFINE
+/// (improve-or-keep) instead of being silently dropped; a skill whose steps repeatedly lead the turn
+/// into an unrecovered dead-end accrues a `fails` count and is eventually retired from the always-on
+/// index; and the distiller is fed the top durable user-facts so it distills project-aware steps.
+/// `AIZEN_NO_SKILL_REFINE=1` restores the pre-Phase-3 behavior (learn-once-then-bail, no fails, no
+/// retire). Default ON: a resident assistant should improve its playbooks, not freeze them at v1.
+pub fn skill_refine_disabled() -> bool {
+    env_flag("AIZEN_NO_SKILL_REFINE")
+}
+
+/// Distinct sessions an inferred candidate must recur across before it is promoted to the durable
+/// store. `2` = seen in the session it was first noted plus at least one LATER session — enough to
+/// separate a genuine recurring preference from a one-off phrasing. Overridable via
+/// `AIZEN_RATCHET_SESSIONS` for tuning/tests (clamped to ≥2 so a single mention never auto-promotes).
+pub fn ratchet_promote_sessions() -> u32 {
+    std::env::var("AIZEN_RATCHET_SESSIONS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .max(2)
 }
 
 /// Recoverable archive of evicted / superseded rows (P4).

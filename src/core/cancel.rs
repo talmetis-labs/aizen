@@ -75,6 +75,9 @@ impl TurnCancel {
 }
 
 thread_local! {
+    // clippy 1.96 false-positive: the initializer is already a `const {}` block, but
+    // `missing_const_for_thread_local` still fires. Silence it on the static itself.
+    #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT: RefCell<Vec<TurnCancel>> = const { RefCell::new(Vec::new()) };
 }
 

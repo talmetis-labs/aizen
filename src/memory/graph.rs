@@ -33,8 +33,11 @@ use crate::core::config;
 use crate::memory::bloat::decay::age_days;
 use crate::memory::score::recency_factor;
 use crate::memory::store::write_atomic;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Hard cap on stored edges. Over this, the weakest *effective*-weight edges are evicted on write
 /// — the long tail of associations stays bounded for years without ever touching the fact store.
@@ -73,9 +76,40 @@ fn key(x: &str, y: &str) -> (String, String) {
     }
 }
 
+/// Last parsed graph, keyed by `(path, mtime-nanos, len)`. Search reinforcement and optional
+/// neighbor expansion can touch the same ≤4000-edge TSV repeatedly in one process; a stat+Vec clone
+/// is substantially cheaper than read+split+parse+canonicalize every time (perf T3). The write path
+/// refreshes the cache immediately, while external/process writes are observed through the key.
+type GraphCache = Mutex<Option<(PathBuf, u64, u64, Vec<Edge>)>>;
+static GRAPH_CACHE: Lazy<GraphCache> = Lazy::new(|| Mutex::new(None));
+
+fn graph_stamp(path: &std::path::Path) -> (u64, u64) {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            (mt, m.len())
+        })
+        .unwrap_or((0, 0))
+}
+
 /// Parse the TSV edge file. Missing / unreadable → empty (never errors — the graph is best-effort).
 fn load() -> Vec<Edge> {
-    let raw = match std::fs::read_to_string(config::graph_path()) {
+    let path = config::graph_path();
+    let (mtime, len) = graph_stamp(&path);
+    if let Ok(guard) = GRAPH_CACHE.lock() {
+        if let Some((p, mt, l, edges)) = guard.as_ref() {
+            if *p == path && *mt == mtime && *l == len {
+                return edges.clone();
+            }
+        }
+    }
+    let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -100,6 +134,14 @@ fn load() -> Vec<Edge> {
         }
         let (a, b) = key(a, b);
         out.push(Edge { a, b, weight, last });
+    }
+    if let Ok(mut guard) = GRAPH_CACHE.lock() {
+        let (after_mtime, after_len) = graph_stamp(&path);
+        // Do not cache a parse if the file changed while it was being read. The caller still gets
+        // this best-effort snapshot, but the next call must re-read instead of pinning stale edges.
+        if (mtime, len) == (after_mtime, after_len) {
+            *guard = Some((path, after_mtime, after_len, out.clone()));
+        }
     }
     out
 }
@@ -126,7 +168,12 @@ fn save(mut edges: Vec<Edge>, today: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_atomic(&path, &s)
+    write_atomic(&path, &s)?;
+    let (mtime, len) = graph_stamp(&path);
+    if let Ok(mut guard) = GRAPH_CACHE.lock() {
+        *guard = Some((path, mtime, len, edges));
+    }
+    Ok(())
 }
 
 /// Record one co-retrieval event: the facts in `ids` were recalled together today, so strengthen
@@ -248,6 +295,113 @@ pub fn recording_enabled() -> bool {
 /// flag logic (incl. the `NG_NO_GRAPH` master off) lives in exactly one place.
 pub fn expansion_enabled() -> bool {
     config::graph_expand_enabled()
+}
+
+// ── Cross-pillar co-fire (Phase 4) ───────────────────────────────────────────────
+//
+// The intra-memory spine above wires `fact↔fact` from a single `memory_search` that surfaced ≥2
+// facts. Cross-pillar co-fire extends the SAME graph to the other two brains — memory, skill, and
+// self — by NAMESPACING the node ids: `mem:<fact-id>`, `skill:<name>`, `self:<insight-id>`. When a
+// turn USES nodes from ≥2 different pillars (recalls a fact AND loads a skill, say), it fires one
+// co-retrieval event over the union, so `neighbors("skill:deploy", …)` can surface the facts that
+// deploy is habitually recalled alongside — spreading activation across the three stores.
+//
+// Two deliberate design choices keep the signal clean and regression-free:
+//   * **Usage-driven, not inject-driven.** A node enters the turn set only when it is actually used
+//     (a fact returned by `memory_search`, a skill pulled by `skill_load`), not merely present in
+//     the always-on prompt. Firing every injected fact against every injected skill each turn would
+//     wire everything to everything — meaningless. Only genuine co-USE is Hebbian.
+//   * **Namespaced ids never collide with bare ids.** `slugify` output is lowercase-alnum-plus-dash
+//     and contains no `:`, so a `mem:`/`skill:`/`self:` node is disjoint from the bare fact ids the
+//     intra-memory spine (and `expand_with_graph`) use. The cross-pillar layer shares `graph.tsv`,
+//     `Edge`, decay, and the cap, but its edges live in a separate id-space — the pre-Phase-4
+//     retrieval path is byte-for-byte unaffected.
+
+/// Namespace a fact id for the cross-pillar graph: `mem:<id>`.
+pub fn mem_node(id: &str) -> String {
+    format!("mem:{}", id.trim())
+}
+
+/// Namespace a skill name for the cross-pillar graph: `skill:<name>` (name lowercased/slug-safe via
+/// the skills' own `sanitize_name` so the node matches regardless of how the user typed it).
+pub fn skill_node(name: &str) -> String {
+    format!("skill:{}", crate::skills::sanitize_name(name))
+}
+
+/// Namespace a self-memory (persona/working-relationship insight) id: `self:<id>`.
+#[allow(dead_code)] // wired once self-insight reuse is tracked; namespace reserved now for stability
+pub fn self_node(id: &str) -> String {
+    format!("self:{}", id.trim())
+}
+
+/// Process-global set of namespaced nodes USED in the current turn, accumulated across the
+/// `spawn_blocking` worker threads the tool bodies run on and drained by the post-turn hook on the
+/// driver thread. A thread-local can't bridge that hop (the buffer is written on a worker, read on
+/// the driver), and turns are strictly serial per process — the same invariant
+/// [`crate::core::convo::active`] already relies on — so one shared set is correct and race-free in
+/// practice. Best-effort throughout: a poisoned lock is recovered, never propagated.
+static TURN_NODES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Note that `node` (already namespaced — use [`mem_node`]/[`skill_node`]/[`self_node`]) was used
+/// this turn. Deduped on flush, so calling repeatedly for the same node is fine. No-op under the
+/// cross-pillar kill-switch, so a disabled build spends nothing.
+pub fn note_used(node: &str) {
+    if config::graph_xpillar_disabled() {
+        return;
+    }
+    let node = node.trim();
+    if node.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = TURN_NODES.lock() {
+        g.push(node.to_string());
+    }
+}
+
+/// Drain the turn's used-node set (clears it for the next turn). Returns the distinct nodes.
+fn take_turn_nodes() -> Vec<String> {
+    let mut out = match TURN_NODES.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => return Vec::new(),
+    };
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// How many DISTINCT pillars a namespaced node belongs to is what makes a turn cross-pillar. The
+/// prefix before the first `:` is the pillar tag (`mem`/`skill`/`self`); a bare id (no `:`) counts
+/// as its own "" pillar but never triggers cross-pillar recording on its own.
+fn pillar_of(node: &str) -> &str {
+    node.split_once(':').map(|(p, _)| p).unwrap_or("")
+}
+
+/// Flush the current turn's used nodes into one cross-pillar co-fire event, then clear the buffer.
+/// Fires **only when the turn touched ≥2 distinct pillars** — a memory-only or skill-only turn adds
+/// nothing here (the intra-memory `fact↔fact` spine already covers within-memory co-fire, and a
+/// lone skill has nothing to associate). Best-effort: any graph write error is swallowed. Returns
+/// whether an edge was recorded. No-op (and buffer left for the next flush attempt only if it was
+/// never populated) under the kill-switch.
+pub fn flush_turn_cofire(today: &str) -> bool {
+    if config::graph_xpillar_disabled() {
+        // Keep the buffer clear so a later-enabled turn doesn't inherit stale nodes.
+        let _ = take_turn_nodes();
+        return false;
+    }
+    let nodes = take_turn_nodes();
+    if nodes.len() < 2 {
+        return false;
+    }
+    // Need genuine CROSS-pillar activity: at least two different pillar tags among the used nodes.
+    let mut pillars: HashSet<&str> = HashSet::new();
+    for n in &nodes {
+        pillars.insert(pillar_of(n));
+    }
+    if pillars.len() < 2 {
+        return false; // all from one brain → intra-pillar, not this layer's job
+    }
+    let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
+    record_coretrieval(&refs, today).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -416,5 +570,96 @@ mod tests {
         // A clean env must NOT enable expansion (default-OFF, bench-gated like dense/fuzzy).
         std::env::remove_var("NG_GRAPH_EXPAND");
         assert!(!expansion_enabled());
+    }
+
+    // ── Cross-pillar co-fire (Phase 4) ──────────────────────────────────────
+    // These touch the process-global TURN_NODES buffer, so they run under the same TEST_HOME_LOCK
+    // `with_temp_home` holds (serialized). Each drains the buffer first so a prior test's leftover
+    // nodes can't bleed in, and clears both kill-switches (default-ON is the tested behavior).
+
+    fn xpillar_reset() {
+        std::env::remove_var("NG_NO_GRAPH");
+        std::env::remove_var("NG_NO_GRAPH_XPILLAR");
+        let _ = take_turn_nodes(); // start from an empty buffer
+    }
+
+    #[test]
+    fn namespaced_nodes_carry_their_pillar_tag() {
+        assert_eq!(mem_node("fact-1"), "mem:fact-1");
+        assert_eq!(skill_node("Deploy Web"), "skill:deploy-web"); // sanitize_name lowercases/slugs
+        assert_eq!(self_node("in-x"), "self:in-x");
+        assert_eq!(pillar_of("mem:fact-1"), "mem");
+        assert_eq!(pillar_of("skill:deploy"), "skill");
+        assert_eq!(pillar_of("bare-id"), "", "a bare id has the empty pillar");
+    }
+
+    #[test]
+    fn cross_pillar_use_wires_mem_to_skill() {
+        with_temp_home("xpillar", || {
+            xpillar_reset();
+            // A turn that recalled a fact AND loaded a skill.
+            note_used(&mem_node("prefers-pnpm"));
+            note_used(&skill_node("deploy"));
+            assert!(flush_turn_cofire("2026-07-01"), "≥2 pillars → one cross-pillar edge");
+            // The association is queryable in both directions across the namespace boundary.
+            let from_skill = neighbors(&skill_node("deploy"), "2026-07-01", 5, 0.0);
+            assert_eq!(from_skill.len(), 1);
+            assert_eq!(from_skill[0].0, mem_node("prefers-pnpm"));
+            let from_mem = neighbors(&mem_node("prefers-pnpm"), "2026-07-01", 5, 0.0);
+            assert_eq!(from_mem[0].0, skill_node("deploy"));
+        });
+    }
+
+    #[test]
+    fn single_pillar_turn_records_no_cross_edge() {
+        with_temp_home("xsingle", || {
+            xpillar_reset();
+            // Two facts, no skill/self → all one pillar. The intra-memory spine already covers this;
+            // the cross-pillar layer must add nothing.
+            note_used(&mem_node("a"));
+            note_used(&mem_node("b"));
+            assert!(!flush_turn_cofire("2026-07-01"), "one pillar → no cross-pillar edge");
+            assert!(neighbors(&mem_node("a"), "2026-07-01", 5, 0.0).is_empty());
+        });
+    }
+
+    #[test]
+    fn flush_clears_the_buffer_between_turns() {
+        with_temp_home("xclear", || {
+            xpillar_reset();
+            note_used(&mem_node("x"));
+            note_used(&skill_node("s"));
+            assert!(flush_turn_cofire("2026-07-01"));
+            // A fresh turn with a lone node must not re-fire the previous turn's pair.
+            note_used(&mem_node("y"));
+            assert!(!flush_turn_cofire("2026-07-02"), "buffer drained → nothing carries over");
+            // The old edge is unchanged (still exactly one co-fire), and `y` has no associations.
+            assert!(neighbors(&mem_node("y"), "2026-07-02", 5, 0.0).is_empty());
+        });
+    }
+
+    #[test]
+    fn kill_switch_disables_cross_pillar_recording() {
+        with_temp_home("xkill", || {
+            xpillar_reset();
+            std::env::set_var("NG_NO_GRAPH_XPILLAR", "1");
+            note_used(&mem_node("a")); // no-op under the kill-switch
+            note_used(&skill_node("s"));
+            assert!(!flush_turn_cofire("2026-07-01"), "kill-switch → no recording");
+            assert!(neighbors(&skill_node("s"), "2026-07-01", 5, 0.0).is_empty());
+            std::env::remove_var("NG_NO_GRAPH_XPILLAR");
+        });
+    }
+
+    #[test]
+    fn master_graph_off_also_disables_cross_pillar() {
+        with_temp_home("xmaster", || {
+            xpillar_reset();
+            std::env::set_var("NG_NO_GRAPH", "1");
+            note_used(&mem_node("a"));
+            note_used(&skill_node("s"));
+            assert!(!flush_turn_cofire("2026-07-01"), "master NG_NO_GRAPH off → no cross-pillar");
+            std::env::remove_var("NG_NO_GRAPH");
+        });
     }
 }

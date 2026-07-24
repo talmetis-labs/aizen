@@ -21,7 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,8 +30,18 @@ use super::HealthKind;
 mod metrics;
 
 const FOOTER_ROWS: u16 = 4;
-const CACHE_LIMIT: usize = 512;
+// Render-cache capacity. MUST stay ≥ `BLOCK_LIMIT` so a full transcript's completed blocks all fit
+// without eviction (perf 1.5): the old `CACHE_LIMIT=512 < BLOCK_LIMIT=2048` meant a long session
+// blew the cap and the cache `clear()`d itself every frame — every block re-rendered from scratch
+// exactly when caching mattered most. Sized to 2× `BLOCK_LIMIT` to also absorb transient keys (a
+// block re-rendered at a new width, or an assistant block whose streaming hash changed) before LRU
+// eviction ever kicks in.
+const CACHE_LIMIT: usize = 4096;
 const BLOCK_LIMIT: usize = 2048;
+// When the cache is full, evict this many least-recently-used entries at once. Batch eviction keeps
+// the O(n) min-tick scan rare (once per `EVICT_BATCH` misses over the cap) instead of on every
+// insert — and it never touches hot entries, unlike the old whole-map `clear()`.
+const EVICT_BATCH: usize = 512;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static COLS: AtomicU16 = AtomicU16::new(80);
@@ -186,28 +196,80 @@ struct CacheKey {
     complete: bool,
 }
 
+/// One cached render plus the access tick that orders LRU eviction. Alongside the raw SGR `rows`
+/// we memoize the two per-frame derivations `draw_transcript` used to recompute every frame (perf
+/// 2.1): `styled` (SGR parsed into ratatui spans by `ansi_spans`) and `plain` (ANSI stripped for the
+/// mouse-selection geometry). Both are `Arc` so a frame clones a pointer for the shared cache slot
+/// and only pays a per-line clone when it materializes the owned viewport — the expensive char-by-char
+/// SGR parse and the strip now happen ONCE per (block, width, content), not ~9×/s over the whole
+/// transcript. The single streaming assistant block still misses (its hash changes each delta) and is
+/// re-derived, which is correct — only completed history is reused.
+struct CacheEntry {
+    rows: Vec<String>,
+    styled: Arc<Vec<Line<'static>>>,
+    plain: Arc<Vec<String>>,
+    /// Privacy-preserving metric hash of the CacheKey (id + width + content hash + completion),
+    /// computed once on insert and reused each frame.
+    metric_hash: u64,
+    /// `tick` at the most recent get-or-insert. Smallest = least recently used.
+    used: u64,
+}
+
 #[derive(Default)]
 struct RenderCache {
-    rows: HashMap<CacheKey, Vec<String>>,
+    rows: HashMap<CacheKey, CacheEntry>,
     hits: u64,
     misses: u64,
+    /// Metric row hashes accumulated while `draw_transcript` walks blocks this frame. Each is derived
+    /// from the already-computed `CacheKey` — no second payload hash and no `format!` allocation.
+    frame_hashes: Vec<u64>,
+    /// Monotonic access counter — stamped onto an entry's `used` on every hit and insert so the
+    /// smallest-`used` entries are the coldest. Wrapping is a non-issue: at u64 it never realistically
+    /// overflows in a session.
+    tick: u64,
 }
 
 impl RenderCache {
+    /// Raw SGR rows for `block` at `width`, rendering + caching on a miss. Kept as the unit-tested
+    /// surface (hit/miss accounting, width/content keying); `draw_transcript` uses `render_display`
+    /// which also returns the memoized styled/plain derivations.
     fn get_or_render(&mut self, block: &UiBlock, width: u16) -> Vec<String> {
+        self.entry(block, width).rows.clone()
+    }
+
+    /// The memoized styled spans + plain (ANSI-stripped) rows and the privacy-preserving cache-key
+    /// hash for `block` at `width` (perf 2.1/T3).
+    fn render_display(
+        &mut self,
+        block: &UiBlock,
+        width: u16,
+    ) -> (Arc<Vec<Line<'static>>>, Arc<Vec<String>>, u64) {
+        let e = self.entry(block, width);
+        (e.styled.clone(), e.plain.clone(), e.metric_hash)
+    }
+
+    /// Shared miss path: render the raw rows, derive styled+plain once, insert, and return a `&`
+    /// to the freshly-cached (or already-cached) entry. Bumps the LRU tick + hit/miss counters.
+    fn entry(&mut self, block: &UiBlock, width: u16) -> &CacheEntry {
         let key = CacheKey {
             id: block.id,
             width,
             hash: block.payload.content_hash(),
             complete: block.complete,
         };
-        if let Some(rows) = self.rows.get(&key) {
+        self.tick = self.tick.wrapping_add(1);
+        // Two-phase to satisfy the borrow checker: bump `used` on a hit, else render+insert. We
+        // re-`get` at the end so both arms return a shared borrow with the same lifetime.
+        if self.rows.contains_key(&key) {
             self.hits += 1;
-            return rows.clone();
+            let tick = self.tick;
+            let e = self.rows.get_mut(&key).expect("just checked");
+            e.used = tick;
+            return e;
         }
         self.misses += 1;
         let w = width as usize;
-        let rows = match &block.payload {
+        let rows: Vec<String> = match &block.payload {
             Payload::Text(s) => match block.kind {
                 BlockKind::Assistant => render_assistant_rows(s, w),
                 _ => sanitize_keep_sgr(s).split('\n').map(str::to_string).collect(),
@@ -217,11 +279,50 @@ impl RenderCache {
             Payload::Diff(d) => render_diff_box(d, w),
             Payload::Verify(v) => vec![render_verify_line(v, w)],
         };
+        // Derive the two per-frame products ONCE here instead of every frame in draw_transcript.
+        let styled: Vec<Line<'static>> =
+            rows.iter().map(|r| styled_row(block.kind, r.clone())).collect();
+        let plain: Vec<String> =
+            rows.iter().map(|r| console::strip_ansi_codes(r).into_owned()).collect();
+        let mut metric_hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut metric_hasher);
+        let metric_hash = metric_hasher.finish();
+        // LRU eviction (perf 1.5): when full, drop the coldest `EVICT_BATCH` entries in one pass
+        // rather than `clear()`ing the whole map (which nuked hot entries and guaranteed a full
+        // re-render storm the next frame). Batching keeps the O(n) threshold scan rare.
         if self.rows.len() >= CACHE_LIMIT {
-            self.rows.clear();
+            self.evict_lru(EVICT_BATCH);
         }
-        self.rows.insert(key, rows.clone());
-        rows
+        self.rows.insert(
+            key,
+            CacheEntry {
+                rows,
+                styled: Arc::new(styled),
+                plain: Arc::new(plain),
+                metric_hash,
+                used: self.tick,
+            },
+        );
+        self.rows.get(&key).expect("just inserted")
+    }
+
+    /// Drop the `count` least-recently-used entries. Finds the `used` tick threshold via a single
+    /// pass over the values, then retains everything newer. Ties at the threshold may keep a few
+    /// extra entries — harmless, and cheaper than a full sort.
+    fn evict_lru(&mut self, count: usize) {
+        if count == 0 || self.rows.len() <= count {
+            // Nothing to keep distinct, or asked to drop everything — clear is correct and cheapest.
+            if self.rows.len() <= count {
+                self.rows.clear();
+            }
+            return;
+        }
+        let mut ticks: Vec<u64> = self.rows.values().map(|e| e.used).collect();
+        // The `count`-th smallest tick is the eviction threshold: entries with `used <= threshold`
+        // are the coldest `count` (modulo ties) and get dropped.
+        ticks.select_nth_unstable(count - 1);
+        let threshold = ticks[count - 1];
+        self.rows.retain(|_, e| e.used > threshold);
     }
 }
 
@@ -335,6 +436,15 @@ fn extract_from_plain_rows(rows: &[String], sel: SelectionRange) -> String {
     out
 }
 
+/// Display width of one char without allocating a temporary `String` (perf T3). `encode_utf8`
+/// writes into a four-byte stack buffer and lets console's Unicode-width implementation do the
+/// same measurement as before. Zero-width combining marks still consume one cursor cell in our
+/// selection/input coordinate model, preserving the prior `.max(1)` behavior.
+fn char_display_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    console::measure_text_width(ch.encode_utf8(&mut buf)).max(1)
+}
+
 /// Take the substring of `s` whose display-cell range is `[start_col, end_col)`.
 fn slice_by_display_cols(s: &str, start_col: usize, end_col: usize) -> String {
     if end_col <= start_col {
@@ -343,7 +453,7 @@ fn slice_by_display_cols(s: &str, start_col: usize, end_col: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
     for ch in s.chars() {
-        let w = console::measure_text_width(&ch.to_string()).max(1);
+        let w = char_display_width(ch);
         let next = col.saturating_add(w);
         if next > start_col && col < end_col {
             out.push(ch);
@@ -865,13 +975,13 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     ROWS.store(area.height.max(8), Ordering::Relaxed);
                 }
                 let started = Instant::now();
+                // `draw_transcript` fills this from each block's already-computed `CacheKey`; consume
+                // the hashes after the draw instead of rebuilding `format!(id:hash:complete)` strings
+                // and hashing them a second time for metrics (perf T3).
+                state.cache.frame_hashes.clear();
                 let _ = s.terminal.draw(|frame| draw(frame, &mut state));
-                let rows = state
-                    .blocks
-                    .iter()
-                    .map(|b| format!("{}:{:x}:{}", b.id, b.payload.content_hash(), b.complete))
-                    .collect::<Vec<_>>();
-                state.metrics.record(started.elapsed(), metrics::hash_rows(&rows), before != after);
+                let row_hashes = std::mem::take(&mut state.cache.frame_hashes);
+                state.metrics.record(started.elapsed(), row_hashes, before != after);
             }
             dirty = false;
         }
@@ -1038,11 +1148,15 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain_rows: Vec<String> = Vec::new();
     for block in &state.blocks {
-        let rows = state.cache.get_or_render(block, content_width);
-        for row in rows {
-            plain_rows.push(console::strip_ansi_codes(&row).into_owned());
-            lines.push(styled_row(block.kind, row));
-        }
+        // Pull the memoized styled spans + plain rows (perf 2.1): the SGR parse and ANSI strip ran
+        // once when the block was first rendered at this width, not char-by-char every frame. We
+        // still clone the per-line contents into the owned viewport Vecs — `apply_selection_highlight`
+        // mutates `lines` in place, and the geometry slot owns `plain_rows` — but that is a cheap
+        // Vec/String clone, not a reparse of the whole transcript.
+        let (styled, plain, metric_hash) = state.cache.render_display(block, content_width);
+        state.cache.frame_hashes.push(metric_hash);
+        lines.extend(styled.iter().cloned());
+        plain_rows.extend(plain.iter().cloned());
     }
     // Apply selection reverse highlight before scrolling into the viewport.
     if let Some(sel) = state.selection {
@@ -1099,14 +1213,14 @@ fn apply_selection_highlight(lines: &mut [Line<'static>], sel: SelectionRange) {
     }
     let a_line = a_line.min(lines.len().saturating_sub(1));
     let b_line = b_line.min(lines.len().saturating_sub(1));
-    for i in a_line..=b_line {
+    for (i, line) in lines.iter_mut().enumerate().take(b_line + 1).skip(a_line) {
         let start_col = if i == a_line { a_col } else { 0 };
         // end_col exclusive; for mid-range lines reverse the whole row (large end_col).
         let end_col = if i == b_line { b_col } else { usize::MAX };
         if end_col <= start_col {
             continue;
         }
-        reverse_line_cols(&mut lines[i], start_col, end_col);
+        reverse_line_cols(line, start_col, end_col);
     }
 }
 
@@ -1126,7 +1240,7 @@ fn reverse_line_cols(line: &mut Line<'static>, start_col: usize, end_col: usize)
         let mut mid = String::new();
         let mut after = String::new();
         for ch in text.chars() {
-            let w = console::measure_text_width(&ch.to_string()).max(1);
+            let w = char_display_width(ch);
             let next = col.saturating_add(w);
             if next <= start_col {
                 before.push(ch);
@@ -1316,7 +1430,7 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
     // The input box is a single physical row, so render an embedded newline as a visible `↵`
     // glyph (width 1) rather than a raw `\n` that ratatui can't lay out on one line.
     let disp = |c: char| -> char { if c == '\n' { '↵' } else { c } };
-    let cellw = |c: char| console::measure_text_width(&disp(c).to_string()).max(1);
+    let cellw = |c: char| char_display_width(disp(c));
     let mut start = cursor;
     let mut caret = 0usize;
     while start > 0 {
@@ -1344,7 +1458,7 @@ fn input_line(state: &AppState, budget: usize) -> (String, usize) {
 /// page is the furthest you can go. Returns the CLAMPED scroll so the caller can write it back — a
 /// PageDown past the end then reads as "at the bottom" rather than drifting into empty space.
 fn draw_overlay(frame: &mut Frame<'_>, area: Rect, overlay: &OverlaySnapshot, scroll: usize) -> usize {
-    let width = area.width.saturating_sub(4).min(84).max(20);
+    let width = area.width.saturating_sub(4).clamp(20, 84);
     let height = (overlay.lines.len() as u16 + 4).min(area.height.saturating_sub(2)).max(5);
     let rect = centered(area, width, height);
     frame.render_widget(Clear, rect);
@@ -1453,7 +1567,7 @@ pub(super) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
     let done = rows.iter().filter(|r| r.status == 2).count();
     let header = format!("☑ {done}/{} · plan", rows.len());
     // Inner width: cap so the box doesn't sprawl on a very wide pane; leave room for `│ ` + ` │`.
-    let inner = width.saturating_sub(2).min(72).max(12);
+    let inner = width.saturating_sub(2).clamp(12, 72);
     let bar = "─".repeat(inner);
     let mut out = Vec::new();
     out.push(theme::accent_dim(format!("╭─ {} ─╮", pad_to(&header, inner.saturating_sub(4)))).to_string());
@@ -1496,7 +1610,7 @@ pub(super) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
 /// salmon) inside the same rounded frame. Lines are clipped to the inner width.
 pub(super) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     use crate::ui::theme;
-    let inner = width.saturating_sub(2).min(84).max(12);
+    let inner = width.saturating_sub(2).clamp(12, 84);
     let bar = "─".repeat(inner);
     let header = format!("diff · {}   +{} −{}", d.path, d.adds, d.dels);
     let mut out = Vec::new();
@@ -1537,7 +1651,7 @@ fn clip_to(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut w = 0usize;
     for ch in s.chars() {
-        let cw = console::measure_text_width(&ch.to_string()).max(1);
+        let cw = char_display_width(ch);
         if w + cw > budget {
             break;
         }

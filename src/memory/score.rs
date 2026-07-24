@@ -93,15 +93,90 @@ impl Bm25Index {
 
     /// BM25 relevance of one doc to the query. ≥ 0; 0 means no overlapping term.
     pub fn score(&self, q_tokens: &[String], doc_tokens: &[String]) -> f64 {
-        self.score_inner(q_tokens, doc_tokens, false)
+        let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
+        self.score_with_qset(q_tokens, &q_set, doc_tokens, false, None)
     }
 
-    /// BM25 + fuzzy fallback (the production retrieval path).
+    /// Exact BM25 using a query-token set prepared once by the caller. Ranking a corpus of many
+    /// documents used to rebuild the same `HashSet` inside every document score (perf T3); this
+    /// method keeps that allocation outside the per-document loop.
+    pub fn score_with_qset(
+        &self,
+        q_tokens: &[String],
+        q_set: &HashSet<&str>,
+        doc_tokens: &[String],
+        fuzzy: bool,
+        fuzzy_only: Option<&HashSet<&str>>,
+    ) -> f64 {
+        self.score_inner(q_tokens, q_set, doc_tokens, fuzzy, fuzzy_only)
+    }
+
+    /// BM25 + fuzzy fallback (the production retrieval path). Fuzzy is armed for EVERY query term
+    /// missing from the doc (legacy behaviour); the memory path gates the whole call by `enable_fuzzy`.
+    #[allow(dead_code)] // kept: tested API (score_fuzzy tests); live path is score_fuzzy_gated_with_qset
     pub fn score_fuzzy(&self, q_tokens: &[String], doc_tokens: &[String]) -> f64 {
-        self.score_inner(q_tokens, doc_tokens, true)
+        let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
+        self.score_inner(q_tokens, &q_set, doc_tokens, true, None)
     }
 
-    fn score_inner(&self, q_tokens: &[String], doc_tokens: &[String], fuzzy: bool) -> f64 {
+    /// Query terms that are candidates for a fuzzy bridge: those absent from the corpus entirely
+    /// (present in NO document, so not a real indexed token) and long enough to fuzzy-match. A term
+    /// that DOES appear in the corpus is a real token — fuzzing it against every chunk is wasted work
+    /// (perf 2.5), so the per-chunk `best_fuzzy` scan should be armed only for these. Returns the
+    /// owned terms so the caller can build a borrowed set with the lifetime it needs.
+    pub fn fuzzy_candidate_terms(&self, q_tokens: &[String]) -> Vec<String> {
+        if self.params.fuzzy_min_sim <= 0.0 {
+            return Vec::new();
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out = Vec::new();
+        for t in q_tokens {
+            if seen.insert(t.as_str())
+                && t.chars().count() >= self.params.fuzzy_min_len
+                && !self.df.contains_key(t.as_str())
+            {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
+
+    /// BM25 with the fuzzy bridge armed ONLY for `fuzzy_terms` (perf 2.5). Callers pass the set from
+    /// [`fuzzy_candidate_terms`] — query terms absent from the whole corpus. When that set is empty
+    /// (the common case: every query term is a real indexed identifier) NO chunk pays the O(distinct
+    /// doc terms) `best_fuzzy` scan, yet true typos still bridge exactly as before.
+    #[allow(dead_code)] // kept: tested API; live path is score_fuzzy_gated_with_qset
+    pub fn score_fuzzy_gated(
+        &self,
+        q_tokens: &[String],
+        doc_tokens: &[String],
+        fuzzy_terms: &HashSet<&str>,
+    ) -> f64 {
+        let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
+        self.score_inner(q_tokens, &q_set, doc_tokens, true, Some(fuzzy_terms))
+    }
+
+    /// Gated fuzzy BM25 using a query set prepared once by the corpus-ranking caller.
+    pub fn score_fuzzy_gated_with_qset(
+        &self,
+        q_tokens: &[String],
+        q_set: &HashSet<&str>,
+        doc_tokens: &[String],
+        fuzzy_terms: &HashSet<&str>,
+    ) -> f64 {
+        self.score_inner(q_tokens, q_set, doc_tokens, true, Some(fuzzy_terms))
+    }
+
+    /// `fuzzy` arms the typo bridge; `fuzzy_only` (when `Some`) restricts it to those query terms,
+    /// so a caller that pre-computed which terms are true corpus-misses skips the scan for the rest.
+    fn score_inner(
+        &self,
+        q_tokens: &[String],
+        q_set: &HashSet<&str>,
+        doc_tokens: &[String],
+        fuzzy: bool,
+        fuzzy_only: Option<&HashSet<&str>>,
+    ) -> f64 {
         if q_tokens.is_empty() || doc_tokens.is_empty() {
             return 0.0;
         }
@@ -111,16 +186,16 @@ impl Bm25Index {
         }
         let norm = self.norm(doc_tokens.len() as f64);
         let k1 = self.params.k1;
-        let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
 
         let mut score = 0.0;
-        for t in &q_set {
+        for t in q_set {
             if let Some(&f) = tf.get(*t) {
                 let f = f as f64;
                 score += self.idf(t) * (f * (k1 + 1.0)) / (f + norm);
             } else if fuzzy
                 && self.params.fuzzy_min_sim > 0.0
                 && t.chars().count() >= self.params.fuzzy_min_len
+                && fuzzy_only.is_none_or(|set| set.contains(*t))
             {
                 // No exact hit — bridge to the closest doc term (typo / morphology).
                 if let Some((best_term, sim)) = best_fuzzy(t, &tf, self.params.fuzzy_min_sim) {

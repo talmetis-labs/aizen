@@ -81,8 +81,9 @@ pub fn detect_verify_command(cwd: &Path) -> Option<VerifyCommand> {
 /// project mcp.json, so it sits behind the same `mcp::project_trusted()` gate, plus the cmd_guard
 /// hard floor per command. Otherwise the built-in single detection. Run in order; first failure is
 /// the gate result.
+#[allow(dead_code)] // kept: tested API
 pub fn detect_verify_commands(cwd: &Path) -> Vec<VerifyCommand> {
-    if let Some(customs) = load_custom_verify(cwd) {
+    if let Some((customs, _)) = load_custom_verify_config(cwd) {
         if !customs.is_empty() {
             return customs;
         }
@@ -90,36 +91,33 @@ pub fn detect_verify_commands(cwd: &Path) -> Vec<VerifyCommand> {
     detect_verify_command(cwd).into_iter().collect()
 }
 
-/// Parse the trusted `./.aizen/verify.json` commands (≤3 honored; Blocked commands dropped).
-/// `None` ⇒ no usable custom file (missing / untrusted / unparseable).
-fn load_custom_verify(cwd: &Path) -> Option<Vec<VerifyCommand>> {
+/// The trusted `./.aizen/verify.json`, read + parsed ONCE (perf 2.6): both the command list and the
+/// timeout come from the same file, so the old pair of readers (`load_custom_verify` +
+/// `custom_verify_timeout`) each `read_to_string` + `serde_json::from_str`'d it independently. This
+/// reads and parses it a single time; callers pick the field they need. `None` ⇒ no usable custom
+/// file (missing / untrusted / unparseable).
+fn load_custom_verify_config(cwd: &Path) -> Option<(Vec<VerifyCommand>, Option<u64>)> {
     let text = std::fs::read_to_string(cwd.join(".aizen").join("verify.json")).ok()?;
     if !crate::agent::mcp::project_trusted() {
         return None; // untrusted repo → the file is inert
     }
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some(
-        v.get("commands")?
-            .as_array()?
-            .iter()
-            .filter_map(|c| c.as_str())
-            .take(3)
-            .filter(|c| {
-                !matches!(crate::agent::cmd_guard::classify(c), crate::agent::cmd_guard::Verdict::Blocked(_))
-            })
-            .map(|c| VerifyCommand::Custom(c.to_string()))
-            .collect(),
-    )
-}
-
-/// The custom file's per-command timeout (clamped [10, 600]); `None` when absent/untrusted.
-fn custom_verify_timeout(cwd: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(cwd.join(".aizen").join("verify.json")).ok()?;
-    if !crate::agent::mcp::project_trusted() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("timeout_secs")?.as_u64().map(|t| t.clamp(10, 600))
+    let commands = v
+        .get("commands")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.as_str())
+                .take(3)
+                .filter(|c| {
+                    !matches!(crate::agent::cmd_guard::classify(c), crate::agent::cmd_guard::Verdict::Blocked(_))
+                })
+                .map(|c| VerifyCommand::Custom(c.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let timeout = v.get("timeout_secs").and_then(|t| t.as_u64()).map(|t| t.clamp(10, 600));
+    Some((commands, timeout))
 }
 
 /// Parse `package.json` and return the first typecheck-flavored script that exists.
@@ -151,12 +149,18 @@ fn shell_command(command_line: &str) -> Command {
 /// the gate result); all-pass returns the last pass. Returns `None` when there is nothing to run
 /// (unknown project) or nothing could even be spawned (best-effort no-op).
 pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGateResult> {
-    let cmds = detect_verify_commands(cwd);
+    // Read `.aizen/verify.json` ONCE for both the command list and the per-command timeout (perf
+    // 2.6) — the old path parsed it twice (`detect_verify_commands` + `custom_verify_timeout`).
+    let (custom_cmds, custom_timeout) = load_custom_verify_config(cwd).unwrap_or_default();
+    let cmds = if custom_cmds.is_empty() {
+        detect_verify_command(cwd).into_iter().collect::<Vec<_>>()
+    } else {
+        custom_cmds
+    };
     if cmds.is_empty() {
         return None;
     }
-    let baseline = source_fingerprint(cwd);
-    let custom_timeout = custom_verify_timeout(cwd);
+    let baseline = source_fingerprint(cwd).await;
     let mut last_pass: Option<VerifyGateResult> = None;
     for cmd in cmds {
         let secs = match cmd {
@@ -166,7 +170,7 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
         match run_one_verify(cwd, &cmd, secs).await {
             None => continue,
             Some(mut r) => {
-                r.stable = baseline.is_some() && baseline == source_fingerprint(cwd);
+                r.stable = baseline.is_some() && baseline == source_fingerprint(cwd).await;
                 if !r.stable {
                     r.passed = false;
                     r.output = "verification result ignored: the source workspace changed while the command was running. No success was reported; retry after the other writer finishes".to_string();
@@ -225,21 +229,34 @@ async fn run_one_verify(cwd: &Path, cmd: &VerifyCommand, timeout_secs: u64) -> O
     }
 }
 
-fn source_fingerprint(cwd: &Path) -> Option<u64> {
+/// A content fingerprint of the source tree used to detect "did the workspace change WHILE the
+/// verify command ran?" (a mid-run edit makes the result untrustworthy → `stable=false`). Metadata
+/// alone is insufficient here: a same-length rewrite can retain or restore the original mtime on
+/// coarse/network filesystems and through checkout/copy tools. Hash the file contents so a changed
+/// workspace cannot be reported stable merely because its `(len, mtime)` tuple collided.
+async fn source_fingerprint(cwd: &Path) -> Option<u64> {
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || source_fingerprint_blocking(&cwd))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn source_fingerprint_blocking(cwd: &Path) -> Option<u64> {
     let mut files = Vec::new();
     collect_source_files(cwd, &mut files, 0);
     files.sort();
     if files.is_empty() {
         return None;
     }
-    let mut data = Vec::new();
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     for path in files {
-        data.extend_from_slice(path.to_string_lossy().as_bytes());
-        data.push(0);
-        data.extend_from_slice(&std::fs::read(&path).ok()?);
-        data.push(0xff);
+        ctx.update(path.to_string_lossy().as_bytes());
+        ctx.update(&[0]);
+        ctx.update(&std::fs::read(&path).ok()?);
+        ctx.update(&[0xff]);
     }
-    let digest = ring::digest::digest(&ring::digest::SHA256, &data);
+    let digest = ctx.finish();
     Some(u64::from_le_bytes(digest.as_ref()[..8].try_into().ok()?))
 }
 
@@ -537,6 +554,18 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         let cmds = detect_verify_commands(&d);
         std::env::remove_var("NEXTGEN_HOME");
         assert_eq!(cmds, vec![VerifyCommand::Cargo], "untrusted verify.json ignored: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn source_fingerprint_detects_same_length_rewrite() {
+        let d = temp_dir("fingerprint-same-length");
+        let source = d.join("lib.rs");
+        std::fs::write(&source, "fn alpha() {}\n").unwrap();
+        let before = source_fingerprint(&d).await.expect("initial fingerprint");
+        std::fs::write(&source, "fn bravo() {}\n").unwrap();
+        let after = source_fingerprint(&d).await.expect("rewritten fingerprint");
+        assert_ne!(before, after, "same-length source rewrite must invalidate verify stability");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

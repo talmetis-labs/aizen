@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryType {
@@ -240,9 +241,77 @@ impl MemoryEntry {
     }
 }
 
-/// Load every entry from the long-tail store. Missing dir → empty (never errors).
+/// In-process cache for `load_all` (perf 2.2). `search_filtered_scoped_cat` — plus every recall
+/// inject, `frozen_core` rebuild, cap enforcement, and the graph reinforcement pass — opens with a
+/// `load_all()` that reads and parses every `*.md`. The cache key records every entry's path,
+/// modified time, and length, so changing any ordinary file invalidates the parsed corpus without
+/// re-reading contents on a hit. Internal write paths also invalidate the cache immediately.
+type EntriesFingerprint = Vec<(PathBuf, SystemTime, u64)>;
+type LoadAllCache =
+    std::sync::Mutex<Option<(PathBuf, EntriesFingerprint, Vec<MemoryEntry>)>>;
+static LOAD_ALL_CACHE: once_cell::sync::Lazy<LoadAllCache> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+
+/// Sorted `(path, modified time, length)` records for all `*.md` files under `dir`. Missing dir is an
+/// empty store; any other directory-entry or metadata failure disables caching for that load.
+fn entries_fingerprint(dir: &Path) -> Option<EntriesFingerprint> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+    };
+    let mut stamp = Vec::new();
+    for ent in rd {
+        let ent = ent.ok()?;
+        let path = ent.path();
+        let is_md = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_md {
+            continue;
+        }
+        let metadata = ent.metadata().ok()?;
+        stamp.push((path, metadata.modified().ok()?, metadata.len()));
+    }
+    stamp.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(stamp)
+}
+
+/// Load every entry from the long-tail store. Missing dir → empty (never errors). Cached in-process
+/// under a stat-only per-file fingerprint; a repeat call over an unchanged store clones the cached
+/// parse instead of re-reading + re-parsing every `*.md`.
 pub fn load_all() -> Result<Vec<MemoryEntry>> {
-    load_from(&config::entries_dir())
+    let dir = config::entries_dir();
+    let stamp = entries_fingerprint(&dir);
+    if let (Some(stamp), Ok(guard)) = (stamp.as_ref(), LOAD_ALL_CACHE.lock()) {
+        if let Some((d, cached_stamp, entries)) = guard.as_ref() {
+            if *d == dir && cached_stamp == stamp {
+                return Ok(entries.clone());
+            }
+        }
+    }
+    let entries = load_from(&dir)?;
+    // Cache only when the per-file stamp stayed stable across parsing. If an external writer changes
+    // the store between the two scans, `entries` can reflect a mixed/older snapshot; return it for
+    // this best-effort call but force the next call to parse again instead of pinning it under B.
+    if let (Some(before), Some(after)) = (stamp, entries_fingerprint(&dir)) {
+        if before == after {
+            if let Ok(mut guard) = LOAD_ALL_CACHE.lock() {
+                *guard = Some((dir, after, entries.clone()));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Drop the `load_all` cache. Called by the write paths (`add`/`edit`/`supersede`/cap eviction) so a
+/// mutation is visible immediately, and by tests that swap the store dir within one process.
+pub fn invalidate_load_all_cache() {
+    if let Ok(mut guard) = LOAD_ALL_CACHE.lock() {
+        *guard = None;
+    }
 }
 
 /// Load every `*.md` entry under `dir` (entries dir, review queue, archive). Missing → empty.
@@ -638,7 +707,14 @@ pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
         &lock_path,
         std::time::Duration::from_secs(5),
     )?;
-    crate::core::persist::atomic_write(path, content.as_bytes())
+    let r = crate::core::persist::atomic_write(path, content.as_bytes());
+    // Drop the load_all cache after an ENTRIES write so an in-place edit is visible on the next
+    // read even when the OS mtime granularity is coarser than the write cadence. This helper is also
+    // reused by graph/review/style files; those must not evict the parsed entry corpus.
+    if path.starts_with(config::entries_dir()) {
+        invalidate_load_all_cache();
+    }
+    r
 }
 
 #[cfg(test)]

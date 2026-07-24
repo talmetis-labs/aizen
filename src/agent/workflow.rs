@@ -385,7 +385,7 @@ async fn fan_out_tracked(
 
 /// [`run_workflow`]'s COLLECTING sibling for the in-conversation `workflow` tool: same validation
 /// + fan-out, but a NON-streaming synthesis, everything returned as one result string (per-task
-/// status lines + the merged answer) instead of printed.
+///   status lines + the merged answer) instead of printed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_workflow_collect(
     http: &reqwest::Client,

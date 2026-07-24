@@ -55,6 +55,20 @@ const DEDUP_WINDOW: usize = 12;
 const SELF_HALF_LIFE_DAYS: f64 = 45.0;
 /// Insights heavily outrank episodes of equal importance/age (distilled > raw).
 const INSIGHT_RANK_BONUS: f64 = 2.0;
+/// Weight of the (log-scaled) reinforcement bonus in [`rank`]: a re-confirmed insight beats a
+/// one-shot one of equal importance/age. Small so reinforcement TILTS ordering without letting an
+/// old-but-oft-lived insight dominate a fresh high-importance one outright.
+const REINFORCE_RANK_WEIGHT: f64 = 0.5;
+/// How many recent formative episodes the reflection pass reads (and thus how many un-distilled
+/// episodes `prune` protects from eviction). Bounded so a genuine flood of formative work still
+/// prunes to the cap — only the substrate reflection will actually consume is shielded.
+const REFLECT_READ_WINDOW: usize = 20;
+
+/// Reserved self-store slug used when NO persona is active — the agent still accumulates a
+/// working relationship with the user (default self-store, Phase 2). It bypasses `sanitize_name`
+/// (which strips leading `_`), so no user-authored persona can ever collide with it: persona slugs
+/// always go through `sanitize_name`, and `_self` is not a reachable output of that function.
+pub const DEFAULT_SELF_SLUG: &str = "_self";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -80,15 +94,21 @@ impl Kind {
 
 #[derive(Debug, Clone)]
 pub struct SelfMemory {
-    // `id`/`updated` are parsed-record fields kept for completeness/forward-compat; not read today.
+    // `id` is a parsed-record field kept for completeness/forward-compat; not read today.
     #[allow(dead_code)]
     pub id: String,
     pub path: PathBuf,
     pub kind: Kind,
     pub importance: u8, // 0..=10
     pub created: Option<String>,
-    #[allow(dead_code)]
+    /// Last-touch date; now read by [`rank`] (the effective recency is the NEWER of created/updated,
+    /// so a re-confirmed insight rides its reconfirmation date, not its birth date).
     pub updated: Option<String>,
+    /// How many times fresh formative experience has RE-CONFIRMED this memory (an insight the user
+    /// keeps demonstrating) — the persona-side analogue of a memory fact's `reinforced` count. Feeds
+    /// [`rank`] so a repeatedly-lived insight outranks a one-shot one of equal age. `0` for a raw
+    /// episode or a never-reconfirmed insight. Serialized only when `>0` (keeps legacy files stable).
+    pub reinforced: u32,
     pub body: String,
     pub mtime_ms: u128,
 }
@@ -98,7 +118,7 @@ pub fn self_dir(persona_slug: &str) -> PathBuf {
     personas_dir().join(format!("{persona_slug}.self"))
 }
 
-const KEY_ORDER: &[&str] = &["kind", "importance", "created", "updated"];
+const KEY_ORDER: &[&str] = &["kind", "importance", "created", "updated", "reinforced"];
 
 fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
@@ -116,13 +136,24 @@ fn from_file(path: &Path) -> Option<SelfMemory> {
         .min(10);
     let created = fm.get("created").map(str::to_string).filter(|s| !s.trim().is_empty());
     let updated = fm.get("updated").map(str::to_string).filter(|s| !s.trim().is_empty());
+    let reinforced = fm.get("reinforced").and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
     let mtime_ms = fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    Some(SelfMemory { id, path: path.to_path_buf(), kind, importance, created, updated, body: fm.body, mtime_ms })
+    Some(SelfMemory {
+        id,
+        path: path.to_path_buf(),
+        kind,
+        importance,
+        created,
+        updated,
+        reinforced,
+        body: fm.body,
+        mtime_ms,
+    })
 }
 
 /// All self-memories for a character (missing dir → empty; never errors).
@@ -144,12 +175,17 @@ pub fn list(persona_slug: &str) -> Vec<SelfMemory> {
     out
 }
 
-fn render(kind: Kind, importance: u8, created: &str, updated: &str, body: &str) -> String {
+fn render(kind: Kind, importance: u8, created: &str, updated: &str, reinforced: u32, body: &str) -> String {
     let mut fields = BTreeMap::new();
     fields.insert("kind".to_string(), kind.as_str().to_string());
     fields.insert("importance".to_string(), importance.min(10).to_string());
     fields.insert("created".to_string(), created.to_string());
     fields.insert("updated".to_string(), updated.to_string());
+    // Serialize `reinforced` only when it has actually accrued — a fresh write (or any legacy
+    // file) stays byte-identical to the pre-Phase-4 format, so existing self-stores don't churn.
+    if reinforced > 0 {
+        fields.insert("reinforced".to_string(), reinforced.to_string());
+    }
     frontmatter::serialize(&fields, body, KEY_ORDER)
 }
 
@@ -192,7 +228,7 @@ fn write(persona_slug: &str, kind: Kind, importance: u8, body: &str) -> Result<S
     let now = today();
     crate::core::persist::atomic_write_owner_only(
         &path,
-        render(kind, importance, &now, &now, body).as_bytes(),
+        render(kind, importance, &now, &now, 0, body).as_bytes(),
     )?;
     Ok(path.file_stem().and_then(|s| s.to_str()).unwrap_or("mem").to_string())
 }
@@ -217,11 +253,86 @@ pub fn record_episode(persona_slug: &str, body: &str, importance: u8) -> Result<
     Ok(Some(id))
 }
 
-/// Persist a reflected insight (the durable character layer). Prunes insights to their cap.
+/// Jaccard threshold at which a freshly-distilled insight is treated as RE-CONFIRMING an existing
+/// one (reinforce in place) rather than a new observation (append). Matches the insight arm of
+/// [`is_near_duplicate`] so reflection is internally consistent: what that guard would call a dup is
+/// exactly what `save_insight` reinforces.
+const INSIGHT_RECONFIRM_JACCARD: f64 = 0.75;
+
+/// Persist a reflected insight (the durable character layer).
+///
+/// **Reinforce-on-reconfirm (Phase 4, #8):** if the reflection re-derives an insight the character
+/// already holds (near-dup by content), this does NOT append a second copy — it bumps that insight's
+/// `reinforced` count and stamps `updated` to today, so a repeatedly-lived observation earns rank
+/// (via [`rank`]) and rides its freshest reconfirmation date instead of decaying from its birth date.
+/// Only a genuinely NEW observation writes a new file. Prunes insights to their cap either way.
+/// Returns the id of the reinforced-or-created insight.
 pub fn save_insight(persona_slug: &str, body: &str, importance: u8) -> Result<String> {
+    if let Some(id) = reconfirm_matching_insight(persona_slug, body)? {
+        prune(persona_slug);
+        return Ok(id);
+    }
     let id = write(persona_slug, Kind::Insight, importance.max(5), body)?;
     prune(persona_slug);
     Ok(id)
+}
+
+/// Find an existing insight that `body` re-confirms (content near-dup) and reinforce it in place:
+/// `reinforced += 1`, `updated = today`, `importance` raised to the max of old/new. Returns its id
+/// when one matched, `Ok(None)` when `body` is a fresh observation. Best-effort file rewrite under
+/// the same store lock as [`write`].
+fn reconfirm_matching_insight(persona_slug: &str, body: &str) -> Result<Option<String>> {
+    let cand = content_tokens(body);
+    let mut insights: Vec<SelfMemory> =
+        list(persona_slug).into_iter().filter(|m| m.kind == Kind::Insight).collect();
+    // Reconfirm the STRONGEST current match (highest Jaccard), so a body doesn't split reinforcement
+    // across two similar insights — the most-related one absorbs the signal.
+    insights.sort_by(|a, b| {
+        jaccard(&cand, &content_tokens(&b.body))
+            .partial_cmp(&jaccard(&cand, &content_tokens(&a.body)))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some(m) = insights.into_iter().next() else {
+        return Ok(None);
+    };
+    if jaccard(&cand, &content_tokens(&m.body)) < INSIGHT_RECONFIRM_JACCARD {
+        return Ok(None);
+    }
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &crate::core::workspace_txn::store_lock("persona_self", persona_slug),
+        std::time::Duration::from_secs(5),
+    )?;
+    let created = m.created.clone().unwrap_or_else(today);
+    let rewritten = render(
+        Kind::Insight,
+        m.importance,
+        &created,
+        &today(),
+        m.reinforced.saturating_add(1),
+        &m.body,
+    );
+    crate::core::persist::atomic_write_owner_only(&m.path, rewritten.as_bytes())?;
+    Ok(Some(m.id))
+}
+
+/// Retract an insight the user has REVERSED direction on (Phase 4, #8): delete the near-dup insight
+/// so a stale "you prefer X" can't keep riding `<self>` after the user switched to Y. Content-matched
+/// like [`reconfirm_matching_insight`]. Returns the number of insights removed (0 when none matched).
+/// Best-effort; a delete failure is swallowed. Episodes are left alone (transient substrate).
+pub fn retract_insight(persona_slug: &str, body: &str) -> usize {
+    let cand = content_tokens(body);
+    let victims: Vec<SelfMemory> = list(persona_slug)
+        .into_iter()
+        .filter(|m| m.kind == Kind::Insight)
+        .filter(|m| jaccard(&cand, &content_tokens(&m.body)) >= INSIGHT_RECONFIRM_JACCARD)
+        .collect();
+    let mut removed = 0usize;
+    for m in victims {
+        if fs::remove_file(&m.path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn normalize(s: &str) -> String {
@@ -262,7 +373,7 @@ fn is_near_duplicate(persona_slug: &str, body: &str) -> bool {
     let norm = normalize(body);
     let mut eps: Vec<SelfMemory> =
         list(persona_slug).into_iter().filter(|m| m.kind == Kind::Episode).collect();
-    eps.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    eps.sort_by_key(|m| std::cmp::Reverse(m.mtime_ms));
     for m in eps.into_iter().take(DEDUP_WINDOW) {
         if normalize(&m.body) == norm {
             return true;
@@ -404,6 +515,7 @@ pub fn classify_turn(user_text: &str, tool_calls: usize) -> Option<TurnSalience>
 }
 
 /// Backward-compatible importance helper (CLI `persona remember` + tests). Prefer [`classify_turn`].
+#[allow(dead_code)] // kept: tested API / CLI `persona remember` helper
 pub fn episode_importance(user_text: &str, tool_calls: usize, corrected: bool) -> u8 {
     if corrected {
         return if user_text.chars().count() > 160 { 8 } else { 7 };
@@ -454,18 +566,59 @@ fn age_days(created: &Option<String>, today: chrono::NaiveDate) -> f64 {
     }
 }
 
-fn rank(m: &SelfMemory, today: chrono::NaiveDate) -> f64 {
-    let base = (m.importance as f64 / 10.0) * recency_factor(age_days(&m.created, today), SELF_HALF_LIFE_DAYS);
-    if m.kind == Kind::Insight {
-        base * INSIGHT_RANK_BONUS
-    } else {
-        base
+/// Effective recency age: the SMALLER of the created- and updated-derived ages, so a re-confirmed
+/// insight (whose `updated` moved forward on reinforcement) rides its freshest touch, not its
+/// birth date. A never-touched memory (`updated == created`) is unchanged.
+fn effective_age_days(m: &SelfMemory, today: chrono::NaiveDate) -> f64 {
+    let by_created = age_days(&m.created, today);
+    match &m.updated {
+        Some(_) => age_days(&m.updated, today).min(by_created),
+        None => by_created,
     }
 }
+
+fn rank(m: &SelfMemory, today: chrono::NaiveDate) -> f64 {
+    let base =
+        (m.importance as f64 / 10.0) * recency_factor(effective_age_days(m, today), SELF_HALF_LIFE_DAYS);
+    // Reinforcement bonus: an insight the user keeps re-demonstrating outranks a one-shot one of
+    // equal importance/age. Diminishing (log) so a single reconfirmation matters most and the term
+    // can't run away — the persona-side mirror of how a memory fact earns salience from `reinforced`.
+    let reinforce = 1.0 + (m.reinforced as f64 + 1.0).ln() * REINFORCE_RANK_WEIGHT;
+    if m.kind == Kind::Insight {
+        base * INSIGHT_RANK_BONUS * reinforce
+    } else {
+        base * reinforce
+    }
+}
+
+/// Header for the persona-scoped `<self>` block (in-character framing).
+const SELF_HEADER: &str = "You have lived as this character across past sessions. These are your \
+    distilled insights (and a few recent formative moments) — let them shape how you think and \
+    respond, in character. Prefer insights over raw episodes:";
+
+/// Header for the personaless `<working_relationship>` block — same substrate, but neutral voice
+/// (no "in character" framing) since the DEFAULT self-store grows the agent's own working
+/// relationship with the user, not a costume's.
+const WORKING_REL_HEADER: &str = "You have worked with this user across past sessions. These are \
+    your distilled observations about how they like to work with you (and a few recent formative \
+    moments) — let them shape how you show up. Prefer insights over raw episodes:";
 
 /// The inner `<self>` block: **insight-first** (CoALA semantic / MemoryBank profile), then at most
 /// a couple of hot formative episodes. Capped at `max_tokens`. `None` when empty.
 pub fn self_block(persona_slug: &str, max_tokens: usize) -> Option<String> {
+    render_block(persona_slug, max_tokens, SELF_HEADER)
+}
+
+/// The `<working_relationship>` block: the personaless DEFAULT self-store ([`DEFAULT_SELF_SLUG`])
+/// rendered with a neutral (non-costume) header. `None` when the agent has no accumulated
+/// relationship yet. This is the counterpart to [`self_block`] for the no-persona common case.
+pub fn working_relationship_block(max_tokens: usize) -> Option<String> {
+    render_block(DEFAULT_SELF_SLUG, max_tokens, WORKING_REL_HEADER)
+}
+
+/// Shared renderer for both the in-character `<self>` and the neutral `<working_relationship>`
+/// blocks — identical ranking/budget discipline, only the header differs.
+fn render_block(persona_slug: &str, max_tokens: usize, header: &str) -> Option<String> {
     let mems = list(persona_slug);
     if mems.is_empty() {
         return None;
@@ -489,9 +642,6 @@ pub fn self_block(persona_slug: &str, max_tokens: usize) -> Option<String> {
             .then(b.mtime_ms.cmp(&a.mtime_ms))
     });
 
-    let header = "You have lived as this character across past sessions. These are your distilled \
-                  insights (and a few recent formative moments) — let them shape how you think and \
-                  respond, in character. Prefer insights over raw episodes:";
     let mut budget = max_tokens.saturating_sub(est_tokens(header) + 1);
     let mut lines: Vec<String> = Vec::new();
 
@@ -542,17 +692,45 @@ fn prune(persona_slug: &str) {
 }
 
 fn prune_kind(persona_slug: &str, kind: Kind, cap: usize) {
-    let mut of_kind: Vec<SelfMemory> = list(persona_slug).into_iter().filter(|m| m.kind == kind).collect();
+    let all = list(persona_slug);
+    let mut of_kind: Vec<SelfMemory> = all.iter().filter(|m| m.kind == kind).cloned().collect();
     if of_kind.len() <= cap {
         return;
     }
-    // keep the best `cap` by (importance desc, mtime desc); delete the rest.
+    // Protect the not-yet-distilled formative episodes: a burst of episodes must never evict the
+    // reflection substrate BEFORE the reflection pass has had a chance to lift it into an insight.
+    // These are the fresh formative episodes since the last insight — exactly what `should_reflect`
+    // and `recent_episode_bodies` will read. They are exempt from eviction even over the cap (the
+    // cap is a soft ceiling for transient experience, not a hard limit that can lose pending learning).
+    let protected: std::collections::HashSet<String> = if kind == Kind::Episode {
+        let last_insight =
+            all.iter().filter(|m| m.kind == Kind::Insight).map(|m| m.mtime_ms).max().unwrap_or(0);
+        // Only the NEWEST `REFLECT_READ_WINDOW` fresh-formative episodes are shielded — exactly the
+        // substrate `recent_episode_bodies` feeds the reflection pass. An older overflow beyond that
+        // window is not pending learning, so the cap still evicts it (a flood never grows unbounded).
+        let mut fresh: Vec<&SelfMemory> = of_kind
+            .iter()
+            .filter(|m| m.importance >= FORMATIVE_MIN && m.mtime_ms > last_insight)
+            .collect();
+        fresh.sort_by_key(|m| std::cmp::Reverse(m.mtime_ms));
+        fresh
+            .into_iter()
+            .take(REFLECT_READ_WINDOW)
+            .map(|m| m.path.to_string_lossy().to_string())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    // keep the best `cap` by (importance desc, mtime desc); delete the rest, except the protected set.
     of_kind.sort_by(|a, b| {
         b.importance
             .cmp(&a.importance)
             .then(b.mtime_ms.cmp(&a.mtime_ms))
     });
     for victim in of_kind.into_iter().skip(cap) {
+        if protected.contains(&victim.path.to_string_lossy().to_string()) {
+            continue;
+        }
         let _ = fs::remove_file(&victim.path);
     }
 }
@@ -564,9 +742,26 @@ pub fn recent_episode_bodies(persona_slug: &str, n: usize) -> Vec<String> {
         .into_iter()
         .filter(|m| m.kind == Kind::Episode && m.importance >= FORMATIVE_MIN)
         .collect();
-    eps.sort_by(|a, b| a.mtime_ms.cmp(&b.mtime_ms)); // chronological
+    eps.sort_by_key(|a| a.mtime_ms); // chronological
     let start = eps.len().saturating_sub(n);
     eps[start..].iter().map(|m| m.body.clone()).collect()
+}
+
+/// Bodies of the character's current insights (strongest-ranked first) for the reflection pass to
+/// reconfirm/revise/retract against (Phase 4, #8). Capped at `n` so a large `<self>` doesn't bloat
+/// the chore prompt — the top-ranked beliefs are the ones most worth re-examining. Empty when the
+/// character holds no insights yet (first-ever reflection sees no beliefs).
+pub fn current_insight_bodies(persona_slug: &str, n: usize) -> Vec<String> {
+    let today = chrono::Local::now().date_naive();
+    let mut ins: Vec<SelfMemory> =
+        list(persona_slug).into_iter().filter(|m| m.kind == Kind::Insight).collect();
+    ins.sort_by(|a, b| {
+        rank(b, today)
+            .partial_cmp(&rank(a, today))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.mtime_ms.cmp(&a.mtime_ms))
+    });
+    ins.into_iter().take(n).map(|m| m.body.clone()).collect()
 }
 
 /// Accumulated *formative* episode importance since the most-recent insight (reflection trigger).
@@ -585,11 +780,126 @@ fn importance_since_last_insight(mems: &[SelfMemory]) -> (u32, usize) {
 }
 
 /// Should the character reflect now? True once enough formative experience has piled up since the
-/// last reflection (Generative-Agents-style importance threshold, free-scale).
+/// last reflection (Generative-Agents-style importance threshold, free-scale). This is the pure
+/// *backlog* signal — it does NOT consider whether a reflection is already in-flight or backing off
+/// after a failure. Use [`reflect_ready`] to decide whether to actually SPAWN a reflection.
 pub fn should_reflect(persona_slug: &str) -> bool {
     let mems = list(persona_slug);
     let (total, count) = importance_since_last_insight(&mems);
     total >= REFLECT_IMPORTANCE_THRESHOLD && count >= REFLECT_MIN_EPISODES
+}
+
+// ── reflection scheduling (pending marker + failure backoff) ────────────────────
+// Reflection runs as a background chore (spawned off the turn's critical path). Two hazards it must
+// avoid: (a) spawning a SECOND reflection while one is still in-flight (double-billing the same
+// backlog), and (b) re-billing on EVERY subsequent turn when the LM call keeps failing. A tiny
+// persisted state file per self-store guards both: a `pending` stamp (with staleness so a crash
+// can't wedge it) and an exponential failure `backoff`.
+
+/// Path of the per-store reflection scheduling state.
+fn reflect_state_path(persona_slug: &str) -> PathBuf {
+    self_dir(persona_slug).join(".reflect.state")
+}
+
+/// A pending reflection older than this is assumed dead (process exited mid-call) and ignored, so a
+/// crash can never permanently wedge reflection off.
+const REFLECT_PENDING_STALE_MS: u128 = 15 * 60 * 1000;
+/// Failure backoff base (doubles per consecutive failure) and its ceiling.
+const REFLECT_BACKOFF_BASE_MS: u128 = 10 * 60 * 1000;
+const REFLECT_BACKOFF_CAP_MS: u128 = 6 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReflectState {
+    /// Unix-ms when the in-flight reflection was spawned; `0` ⇒ none pending.
+    pending_since_ms: u128,
+    /// Consecutive failure count (drives the backoff window).
+    fails: u32,
+    /// Unix-ms before which reflection must NOT be re-attempted; `0` ⇒ no backoff.
+    next_attempt_ms: u128,
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn read_reflect_state(persona_slug: &str) -> ReflectState {
+    let raw = match fs::read_to_string(reflect_state_path(persona_slug)) {
+        Ok(s) => s,
+        Err(_) => return ReflectState::default(),
+    };
+    let mut st = ReflectState::default();
+    for line in raw.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim();
+        match k.trim() {
+            "pending_since_ms" => st.pending_since_ms = v.parse().unwrap_or(0),
+            "fails" => st.fails = v.parse().unwrap_or(0),
+            "next_attempt_ms" => st.next_attempt_ms = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    st
+}
+
+fn write_reflect_state(persona_slug: &str, st: ReflectState) {
+    let dir = self_dir(persona_slug);
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let body = format!(
+        "pending_since_ms={}\nfails={}\nnext_attempt_ms={}\n",
+        st.pending_since_ms, st.fails, st.next_attempt_ms
+    );
+    let _ = crate::core::persist::atomic_write_owner_only(&reflect_state_path(persona_slug), body.as_bytes());
+}
+
+/// Whether reflection should be SPAWNED now: there's a fresh backlog ([`should_reflect`]), no live
+/// reflection is already in-flight, and we're not inside a post-failure backoff window. A stale
+/// pending stamp (older than [`REFLECT_PENDING_STALE_MS`]) is treated as dead so a crashed run can't
+/// wedge reflection off forever.
+pub fn reflect_ready(persona_slug: &str) -> bool {
+    if !should_reflect(persona_slug) {
+        return false;
+    }
+    let st = read_reflect_state(persona_slug);
+    let now = now_ms();
+    if st.pending_since_ms != 0 && now.saturating_sub(st.pending_since_ms) < REFLECT_PENDING_STALE_MS {
+        return false; // a reflection is already running
+    }
+    if st.next_attempt_ms != 0 && now < st.next_attempt_ms {
+        return false; // backing off after a recent failure
+    }
+    true
+}
+
+/// Mark a reflection as in-flight (called just before spawning the background call). Preserves the
+/// failure/backoff fields so a spawn doesn't clear an existing backoff.
+pub fn mark_reflect_pending(persona_slug: &str) {
+    let mut st = read_reflect_state(persona_slug);
+    st.pending_since_ms = now_ms();
+    write_reflect_state(persona_slug, st);
+}
+
+/// Reflection finished successfully → clear pending + reset the failure backoff.
+pub fn mark_reflect_done(persona_slug: &str) {
+    write_reflect_state(persona_slug, ReflectState::default());
+}
+
+/// Reflection failed (LM error / empty result) → clear pending and grow the backoff window so the
+/// next attempt is deferred (exponential, capped). Prevents re-billing a failing call every turn.
+pub fn mark_reflect_failed(persona_slug: &str) {
+    let mut st = read_reflect_state(persona_slug);
+    st.pending_since_ms = 0;
+    st.fails = st.fails.saturating_add(1);
+    let shift = st.fails.saturating_sub(1).min(16);
+    let backoff = REFLECT_BACKOFF_BASE_MS
+        .saturating_mul(1u128 << shift)
+        .min(REFLECT_BACKOFF_CAP_MS);
+    st.next_attempt_ms = now_ms().saturating_add(backoff);
+    write_reflect_state(persona_slug, st);
 }
 
 /// Count `(episodes, insights)` for a character (status display).
@@ -756,6 +1066,175 @@ mod tests {
             assert!(eps <= EPISODE_CAP, "episodes pruned to cap, got {eps}");
             let bodies: Vec<String> = list("aria").into_iter().map(|m| m.body).collect();
             assert!(bodies.iter().any(|b| b.contains("KEEP THIS")), "the formative episode survives");
+        });
+    }
+
+    #[test]
+    fn working_relationship_block_uses_neutral_header() {
+        with_home("wrblock", || {
+            assert!(working_relationship_block(700).is_none(), "no default self yet → no block");
+            save_insight(DEFAULT_SELF_SLUG, "the user prefers terse vietnamese replies", 8).unwrap();
+            let block = working_relationship_block(700).expect("renders once there is experience");
+            assert!(block.contains("worked with this user"), "neutral (non-costume) framing: {block}");
+            assert!(!block.contains("in character"), "no persona-costume framing in the default store");
+            assert!(block.contains("terse vietnamese"));
+            // The default self-store must not leak into the persona-scoped <self> block and vice-versa.
+            assert!(self_block(DEFAULT_SELF_SLUG, 700).is_some(), "self_block reads the same store");
+        });
+    }
+
+    #[test]
+    fn prune_shields_pending_reflection_substrate() {
+        with_home("shield", || {
+            // A burst of fresh formative episodes (no insight yet) far over the cap. The newest
+            // REFLECT_READ_WINDOW must survive so the reflection pass still has its substrate.
+            for i in 0..(EPISODE_CAP + REFLECT_READ_WINDOW + 5) {
+                record_episode(
+                    "aria",
+                    &format!("correction: user redirected me — \"rule number {i}\""),
+                    7,
+                )
+                .unwrap();
+            }
+            let bodies: Vec<String> = list("aria").into_iter().map(|m| m.body).collect();
+            // The newest window is shielded from eviction, so the freshest formative rules remain.
+            let newest = EPISODE_CAP + REFLECT_READ_WINDOW + 4; // last i recorded
+            assert!(
+                bodies.iter().any(|b| b.contains(&format!("rule number {newest}"))),
+                "newest pending-reflection episode must survive prune: {bodies:?}"
+            );
+            // …but the store never grows unbounded past cap + the shielded window.
+            assert!(bodies.len() <= EPISODE_CAP + REFLECT_READ_WINDOW, "bounded: {}", bodies.len());
+        });
+    }
+
+    #[test]
+    fn reflect_ready_gates_on_pending_then_backoff() {
+        with_home("sched", || {
+            assert!(!reflect_ready("aria"), "no backlog → not ready");
+            // Build a fresh backlog (2 corrections, 7+7 ≥ 12).
+            record_episode("aria", "correction: user redirected me — \"tabs\"", 7).unwrap();
+            record_episode("aria", "correction: user redirected me — \"no spaces\"", 7).unwrap();
+            assert!(should_reflect("aria"));
+            assert!(reflect_ready("aria"), "backlog + no pending/backoff → ready");
+
+            // Marking pending blocks a second concurrent spawn.
+            mark_reflect_pending("aria");
+            assert!(!reflect_ready("aria"), "an in-flight reflection blocks a second spawn");
+
+            // A failure clears pending but opens a backoff window (no re-bill next turn).
+            mark_reflect_failed("aria");
+            assert!(!reflect_ready("aria"), "post-failure backoff defers the next attempt");
+
+            // A success clears everything → ready again once a NEW backlog exists.
+            mark_reflect_done("aria");
+            // The old backlog is still present (no insight saved by the test), so ready returns.
+            assert!(reflect_ready("aria"), "cleared state → ready again on the standing backlog");
+        });
+    }
+
+    #[test]
+    fn default_self_slug_is_not_a_sanitize_name_output() {
+        // `_self` must be unreachable from persona names so no character can collide with it.
+        assert_ne!(crate::skills::sanitize_name(DEFAULT_SELF_SLUG), DEFAULT_SELF_SLUG);
+        assert_ne!(crate::skills::sanitize_name("self"), DEFAULT_SELF_SLUG);
+    }
+
+    #[test]
+    fn save_insight_reconfirms_near_dup_instead_of_appending() {
+        with_home("reconfirm", || {
+            let first = save_insight("aria", "the user prefers terse vietnamese replies", 7).unwrap();
+            // A near-dup (same content, reworded) must NOT append a second file — it reconfirms.
+            let again =
+                save_insight("aria", "the user prefers terse replies in vietnamese", 6).unwrap();
+            assert_eq!(again, first, "a re-derived insight reinforces the existing one in place");
+            let (_, insights) = counts("aria");
+            assert_eq!(insights, 1, "reconfirm did not append a duplicate insight");
+            // The surviving file carries reinforced >= 1.
+            let m = list("aria").into_iter().find(|m| m.kind == Kind::Insight).unwrap();
+            assert!(m.reinforced >= 1, "reconfirmation bumped the reinforced count: {}", m.reinforced);
+            // A genuinely different insight DOES append.
+            save_insight("aria", "the user works late at night and values autonomy", 7).unwrap();
+            let (_, insights2) = counts("aria");
+            assert_eq!(insights2, 2, "a distinct observation is a new insight");
+        });
+    }
+
+    #[test]
+    fn reinforced_insight_outranks_an_equal_one_shot() {
+        // Two insights of equal importance/age; the reinforced one must rank strictly higher so it
+        // wins the always-on budget under pressure.
+        let today = chrono::Local::now().date_naive();
+        let mut one_shot = SelfMemory {
+            id: "a".into(),
+            path: PathBuf::from("a.md"),
+            kind: Kind::Insight,
+            importance: 7,
+            created: Some(today.format("%Y-%m-%d").to_string()),
+            updated: Some(today.format("%Y-%m-%d").to_string()),
+            reinforced: 0,
+            body: "x".into(),
+            mtime_ms: 1,
+        };
+        let reinforced = SelfMemory { reinforced: 4, ..one_shot.clone() };
+        assert!(
+            rank(&reinforced, today) > rank(&one_shot, today),
+            "a repeatedly-lived insight must outrank a one-shot one of equal importance/age"
+        );
+        // Sanity: with zero reinforcement the two are identical.
+        one_shot.reinforced = 0;
+        let twin = one_shot.clone();
+        assert_eq!(rank(&one_shot, today), rank(&twin, today));
+    }
+
+    #[test]
+    fn reconfirm_stamps_updated_so_recency_rides_the_reconfirmation() {
+        // An insight created "old" then reconfirmed today should rank by TODAY, not its birth date.
+        let today = chrono::Local::now().date_naive();
+        let old = SelfMemory {
+            id: "a".into(),
+            path: PathBuf::from("a.md"),
+            kind: Kind::Insight,
+            importance: 7,
+            created: Some("2026-01-01".into()),
+            updated: Some("2026-01-01".into()),
+            reinforced: 0,
+            body: "x".into(),
+            mtime_ms: 1,
+        };
+        // Same insight, reconfirmed today (updated moved forward): effective age is ~0, so it ranks
+        // higher than the stale version even before the reinforcement bonus.
+        let reconfirmed_today =
+            SelfMemory { updated: Some(today.format("%Y-%m-%d").to_string()), ..old.clone() };
+        assert!(effective_age_days(&reconfirmed_today, today) < effective_age_days(&old, today));
+        assert!(rank(&reconfirmed_today, today) > rank(&old, today));
+    }
+
+    #[test]
+    fn retract_insight_removes_the_matching_belief() {
+        with_home("retract", || {
+            save_insight("aria", "the user prefers tabs over spaces", 7).unwrap();
+            save_insight("aria", "the user works best late at night", 7).unwrap();
+            let (_, before) = counts("aria");
+            assert_eq!(before, 2);
+            // Retract the tabs belief by a near-dup phrasing → the matching insight is deleted.
+            let removed = retract_insight("aria", "the user prefers tabs to spaces");
+            assert_eq!(removed, 1, "the near-dup belief is retracted");
+            let bodies: Vec<String> = list("aria").into_iter().map(|m| m.body).collect();
+            assert!(!bodies.iter().any(|b| b.contains("tabs")), "tabs belief gone: {bodies:?}");
+            assert!(bodies.iter().any(|b| b.contains("late at night")), "unrelated belief survives");
+        });
+    }
+
+    #[test]
+    fn legacy_insight_without_reinforced_stays_byte_stable() {
+        with_home("legacy", || {
+            // A fresh insight (reinforced 0) must NOT write a `reinforced:` line — a legacy self-store
+            // stays byte-identical to the pre-Phase-4 format (no churn on read/prune).
+            save_insight("aria", "the user prefers terse replies", 7).unwrap();
+            let m = list("aria").into_iter().find(|m| m.kind == Kind::Insight).unwrap();
+            let raw = std::fs::read_to_string(&m.path).unwrap();
+            assert!(!raw.contains("reinforced"), "no reinforced field on a never-reconfirmed insight: {raw}");
         });
     }
 }

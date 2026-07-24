@@ -84,6 +84,7 @@ impl WorkspaceIdentity {
             .join("workspace.lock")
     }
 
+    #[allow(dead_code)] // kept: used by WorkspaceWriterLease::time_machine_lock (migration scaffold)
     pub fn timemachine_lock(&self) -> PathBuf {
         self.lock_root()
             .join("worktrees")
@@ -93,6 +94,7 @@ impl WorkspaceIdentity {
 }
 
 pub struct WorkspaceWriterLease {
+    #[allow(dead_code)] // kept: exposed via identity()/time_machine_lock() accessors (migration scaffold)
     identity: WorkspaceIdentity,
     _locks: LockSet,
 }
@@ -140,16 +142,19 @@ impl WorkspaceWriterLease {
         Ok(Self { identity, _locks: locks })
     }
 
+    #[allow(dead_code)] // kept: tested/migration-scaffold accessor
     pub fn time_machine_lock(&self) -> Result<RepoTxnLock> {
         RepoTxnLock::acquire_exclusive(&self.identity.timemachine_lock(), Duration::from_secs(5))
     }
 
+    #[allow(dead_code)] // kept: tested/migration-scaffold accessor
     pub fn identity(&self) -> &WorkspaceIdentity {
         &self.identity
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)] // kept: full lock-ordering class ladder; some ranks reserved for future lease kinds
 pub enum LockClass {
     Capacity = 1,
     RepositoryStore = 2,
@@ -208,10 +213,12 @@ impl LockSet {
         Ok(Self { held })
     }
 
+    #[allow(dead_code)] // kept: tested accessor
     pub fn len(&self) -> usize {
         self.held.len()
     }
 
+    #[allow(dead_code)] // kept: tested API (len() companion)
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }

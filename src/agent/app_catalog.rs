@@ -10,7 +10,7 @@
 //! - Else a **static-token remote** (declares a header we fill, e.g. GitHub's `Authorization`).
 //! - Else an **OAuth remote** (Linear/Notion/Slack/Gmail/Atlassian — no header, needs interactive
 //!   sign-in): we write `{url, auth:"oauth"}` and drive the browser PKCE flow (see `mcp_oauth`).
-//! `None` only for a legacy two-endpoint `sse`-only server (our client doesn't implement that).
+//!   `None` only for a legacy two-endpoint `sse`-only server (our client doesn't implement that).
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -205,10 +205,10 @@ fn remote_is_oauth(r: &Remote) -> bool {
 
 /// Pick the transport our client can use, **LOCAL-FIRST**: a self-hostable package (npm > pypi > oci
 /// > nuget) is preferred so the server runs on YOUR machine with YOUR credentials — never a
-/// third-party HOSTED gateway (those re-host the service behind their own domain and often their own
-/// account/billing — the surprise-paid trap). Then a fillable static-token remote; then an OAuth
-/// remote (the marquee SaaS apps — sign-in with the real vendor). `None` only when nothing matches
-/// (e.g. a legacy `sse`-only server).
+/// > third-party HOSTED gateway (those re-host the service behind their own domain and often their own
+/// > account/billing — the surprise-paid trap). Then a fillable static-token remote; then an OAuth
+/// > remote (the marquee SaaS apps — sign-in with the real vendor). `None` only when nothing matches
+/// > (e.g. a legacy `sse`-only server).
 pub fn pick_transport(s: &RegistryServer) -> Option<TransportChoice> {
     for ty in ["npm", "pypi", "oci", "nuget"] {
         if let Some(i) = s.packages.iter().position(|p| p.registry_type == ty) {

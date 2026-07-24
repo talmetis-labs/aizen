@@ -1284,16 +1284,19 @@ impl Tool for FileGlob {
             // Rank best-first so line 1 is the most likely answer (P1.3). The needle for scoring is
             // the last literal segment of the pattern (the intended name).
             let needle = last_literal_segment(pattern);
-            let mut ranked = outcome.paths;
-            ranked.sort_by(|a, b| {
-                score_path(b, &needle, &self.root, now)
-                    .partial_cmp(&score_path(a, &needle, &self.root, now))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Decorate-sort: score each path ONCE, then sort on the precomputed key. Calling
+            // `score_path` inside the comparator would rerun it 2×/comparison → O(n log n) `metadata`
+            // syscalls + jaro passes over the whole result set. Mirrors the fuzzy branch below.
+            let mut ranked: Vec<(f64, PathBuf)> = outcome
+                .paths
+                .into_iter()
+                .map(|p| (score_path(&p, &needle, &self.root, now), p))
+                .collect();
+            ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             let shown = 50.min(ranked.len());
             let mut lines: Vec<String> = ranked[..shown]
                 .iter()
-                .map(|p| {
+                .map(|(_, p)| {
                     let s = display_path(&self.root, p);
                     if p.is_dir() { format!("{s}/") } else { s }
                 })
@@ -1664,6 +1667,7 @@ impl Tool for FileMove {
 /// rewrite would otherwise silently reset mode). The temp file is cleaned up on any failure before
 /// the rename lands. The temp lives in the target's own directory, so the rename never crosses a
 /// filesystem boundary (which would make it non-atomic).
+#[allow(dead_code)] // kept: tested API
 pub(crate) fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -2518,6 +2522,9 @@ impl Tool for SkillLoad {
                 // useful skill floats to the top of the always-on index and survives its line cap.
                 // Best-effort: a bump failure (repo-shipped skill, or I/O) must never break the load.
                 let _ = crate::skills::record_use(name);
+                // Cross-pillar co-fire (Phase 4): note this skill as USED this turn, so it can wire
+                // to any facts also recalled in the turn. Namespaced + deduped; kill-switch-gated.
+                crate::memory::graph::note_used(&crate::memory::graph::skill_node(name));
                 Ok(crate::skills::render_loaded(&sk))
             }
             None => {

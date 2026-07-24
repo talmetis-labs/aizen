@@ -54,6 +54,9 @@ struct Cli {
     command: Option<Commands>,
 }
 
+// Variants differ in size (arg structs vary widely); boxing a clap `Args` struct breaks the
+// derive, so we accept the size skew for the top-level CLI enum instead.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Stream a chat completion from an OpenAI-compatible endpoint.
@@ -519,6 +522,8 @@ struct CrawlArgs {
     show_source: bool,
 }
 
+// Same size skew as `Commands`: clap `Args` structs can't be boxed without breaking the derive.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
     /// Set one or more config fields (only the flags you pass are changed).
@@ -819,6 +824,18 @@ enum MemoryCmd {
     },
     /// Run anti-bloat maintenance (enforce the inferred-fact LRU cap → archive victims).
     Compact,
+    /// Consolidate redundant aging facts: cluster same-zone/type/category inferred facts, distill
+    /// each cluster into ONE insight, and supersede the members (history kept). DRY-RUN by default —
+    /// prints the plan and writes nothing; pass `--apply` to actually write (asks to confirm on a TTY).
+    /// Only ever touches old, low-session, inferred facts — never manual/user-explicit/core/fresh ones.
+    Consolidate {
+        /// Actually write (distill + supersede). Without this flag it is a dry-run preview only.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the interactive confirm on `--apply` (for scripts). No effect on a dry-run.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Show a fact's strongest co-retrieval associations (the Hebbian graph, P5).
     Neighbors {
         /// The memory (id or name) whose neighbors to list.
@@ -1024,7 +1041,7 @@ async fn apps_add(name: &str) -> Result<()> {
         None => (None, name.to_string(), name.to_string(), name.to_string()),
     };
     let hits = app_catalog::dedupe_latest(app_catalog::search(&query, 50).await?);
-    let viable: Vec<app_catalog::RegistryServer> = hits.into_iter().filter(|s| app_catalog::is_viable(s)).collect();
+    let viable: Vec<app_catalog::RegistryServer> = hits.into_iter().filter(app_catalog::is_viable).collect();
     if viable.is_empty() {
         return Err(anyhow!(
             "no connectable '{label}' server found on the registry (only legacy sse-only entries, which aizen's client doesn't speak). Run `aizen apps search {query}` to explore."
@@ -1343,64 +1360,6 @@ async fn run_reach(cmd: ReachCmd) -> Result<()> {
 
 // ───────────────────────────── telegram daemon + setup ─────────────────────────────
 
-const SERVE_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
-(read-only tools; destructive ops will ask you to approve here). Follow-ups keep context, so \
-\"now fix it\" works. Prefix with `/agent ` to run fully autonomously (file edits / shell without \
-asking). /new (or /reset) starts a fresh conversation · /resume shows how much context is kept · \
-/help shows this.";
-
-/// Discord has no inline approval routing yet (unlike Telegram's ✓/✗ buttons), so destructive ops
-/// are auto-DENIED on a plain message — the agent simply skips them. This help text says so honestly
-/// instead of promising an approval prompt that never arrives. Use `/agent ` to run autonomously.
-const DISCORD_HELP: &str = "Aizen is listening. Send a message to chat with the agent \
-(read-only tools work as-is). Discord can't show approval prompts yet, so file edits / shell are \
-SKIPPED unless you prefix with `/agent ` to run fully autonomously (no approval needed). \
-Follow-ups keep context, so \"now fix it\" works. /new (or /reset) starts a fresh conversation · \
-/help shows this.";
-
-/// Split text under a platform's UTF-16 limit, preferring newline boundaries so table records and
-/// text-diagram rows stay intact. A single over-limit line falls back to scalar-safe hard splitting.
-fn chunk_text(s: &str, max: usize) -> Vec<String> {
-    if s.encode_utf16().count() <= max {
-        return vec![s.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut cur_units = 0usize;
-    for segment in s.split_inclusive('\n') {
-        let units = segment.encode_utf16().count();
-        if units <= max {
-            if cur_units + units > max && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_units = 0;
-            }
-            cur.push_str(segment);
-            cur_units += units;
-            continue;
-        }
-        if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-        }
-        let mut piece = String::new();
-        let mut piece_units = 0usize;
-        for ch in segment.chars() {
-            let u = ch.len_utf16();
-            if piece_units + u > max && !piece.is_empty() {
-                out.push(std::mem::take(&mut piece));
-                piece_units = 0;
-            }
-            piece.push(ch);
-            piece_units += u;
-        }
-        cur = piece;
-        cur_units = piece_units;
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 /// Run the agent loop once (non-streaming, quiet) and return its final text — used by `ng serve`
 /// to answer a Telegram message.
 async fn run_agent_capture(
@@ -1443,209 +1402,6 @@ async fn run_agent_capture(
         .final_text
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
-}
-
-/// Hard cap on messages retained in one serve (Telegram) session, so a long conversation can't grow
-/// without bound. Generous — the mid-loop context guard handles within-turn pressure.
-const SERVE_SESSION_MAX_MSGS: usize = 40;
-
-/// Bound a serve session's history: drop the OLDEST whole turns (keeping the system prompt at [0])
-/// until under `max`, always cutting at a `user` boundary so an assistant tool-call turn is never
-/// split from its tool results (a dangling tool_call ⇒ a 400 on strict gateways).
-fn cap_session(history: &mut Vec<Message>, max: usize) {
-    let lead = agent::compact::leading_system_count(history).max(1);
-    while history.len() > max {
-        // index of the SECOND user message (the start of the 2nd turn); drop after the system prefix.
-        let second_user =
-            history.iter().enumerate().filter(|(i, m)| *i >= lead && m.role == "user").nth(1).map(|(i, _)| i);
-        match second_user {
-            Some(i) if i > lead => {
-                history.drain(lead..i);
-            }
-            _ => break, // only one turn present → nothing safe to drop; the loop guard handles it
-        }
-    }
-}
-
-/// Run one `ng serve` turn over a PERSISTENT per-chat history, so follow-ups like "now fix it" keep
-/// context. Seeds the system prompt (with memory + SOUL + persona) once per session, appends the
-/// user task, drives the loop, learns passively, and bounds the history. A `clarify` yield leaves a
-/// resumable history (the owner's next message is the answer).
-async fn run_serve_turn(
-    http: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    history: &mut Vec<Message>,
-    task: &str,
-    approval_mode: ApprovalMode,
-) -> Result<String> {
-    if history.is_empty() {
-        // Built once per session → the stable lane stays byte-stable across the conversation.
-        let bundle = current_system_prompt_bundle(model);
-        history.push(Message::system(bundle.stable));
-        if !bundle.dynamic.trim().is_empty() {
-            history.push(Message::system(bundle.dynamic));
-        }
-    }
-    history.push(Message::user(task.to_string()));
-
-    arm_lsp_session();
-    let registry = agent::builtin::default_registry_with_task(
-        http.clone(),
-        base_url.to_string(),
-        api_key.to_string(),
-        model.to_string(),
-        approval_mode,
-        resolve_ctx_window(model).0,
-    )?;
-    let cfg = AgentConfig {
-        approval_mode,
-        quiet: true,
-        enable_verify_gate: false,
-        context_window: resolve_ctx_window(model).0,
-        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
-        ..Default::default()
-    };
-    let http_ref = http;
-    let base = base_url;
-    let key = api_key;
-    let model_ref = model;
-    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
-    };
-    // Mid-loop auto-compaction for long serve sessions: a NON-streaming summarize closure over the
-    // same endpoint. `cap_session` below stays only as a hard backstop (compaction usually keeps the
-    // history well under its cap).
-    let sum_ep = summarizer_endpoint(base, key, model_ref);
-    let summarize = move |msgs: Vec<Message>| {
-        let ep = sum_ep.clone();
-        async move {
-            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
-        }
-    };
-    let outcome =
-        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
-
-    // Memory is the moat — passively learn durable facts from this turn (free; core stays gated).
-    maybe_learn_memory(history);
-    cap_session(history, SERVE_SESSION_MAX_MSGS);
-
-    if let StopReason::AwaitingInput(q) = &outcome.stop {
-        return Ok(format!("❓ {q}"));
-    }
-    Ok(outcome
-        .final_text
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
-}
-
-/// `ng serve` — the long-lived daemon: one poll loop owns getUpdates, an agent runner handles one
-/// message at a time, and destructive-op approvals route to the phone (via the approval gate).
-async fn run_serve() -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    let (client, cfg) = telegram::configured().context("telegram not configured — run `aizen telegram setup` first")?;
-    let (base_url, api_key, model) =
-        resolve_endpoint(None, None, None).context("configure the model endpoint first (run `aizen config`)")?;
-    let http = http_client()?;
-
-    telegram::set_daemon_active(true);
-    let client = Arc::new(client);
-    eprintln!("{}", style(format!("aizen serve — listening on Telegram (Ctrl-C to stop). chats: {:?}", cfg.allowed_chat_ids)).dim());
-
-    let (tx, mut rx) = mpsc::channel::<(i64, String)>(64);
-
-    let poll_client = client.clone();
-    let poll_cfg = cfg.clone();
-    let poll = tokio::spawn(async move {
-        let mut offset = 0i64;
-        loop {
-            let updates = match poll_client.get_updates(offset, telegram::POLL_TIMEOUT_SECS).await {
-                Ok(u) => u,
-                Err(e) => {
-                    eprintln!("[poll] {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
-            for u in updates {
-                offset = offset.max(u.update_id + 1);
-                if let Some(cb) = u.callback_query {
-                    let chat = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
-                    if telegram::is_allowed(&poll_cfg, chat) {
-                        if let Some((id, ok)) = cb.data.as_deref().and_then(telegram::parse_callback) {
-                            telegram::resolve_approval(&id, ok);
-                        }
-                    }
-                    let _ = poll_client.answer_callback(&cb.id, "").await;
-                    continue;
-                }
-                if let Some(msg) = u.message {
-                    if telegram::is_allowed(&poll_cfg, msg.chat.id) {
-                        if let Some(text) = msg.text {
-                            let _ = tx.send((msg.chat.id, text)).await;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Per-chat conversation history → follow-ups ("now fix it") keep context. In-memory only
-    // (a daemon restart starts fresh); `/new`/`/reset` clear a chat, `/resume` reports its size.
-    let mut sessions: std::collections::HashMap<i64, Vec<Message>> = std::collections::HashMap::new();
-
-    loop {
-        let (chat, text) = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
-            m = rx.recv() => match m { Some(m) => m, None => break },
-        };
-        let trimmed = text.trim();
-        if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(chat, SERVE_HELP).await;
-            continue;
-        }
-        if trimmed == "/new" || trimmed == "/reset" {
-            sessions.remove(&chat);
-            let _ = client.send_message(chat, "🆕 started a fresh conversation — earlier context dropped.").await;
-            continue;
-        }
-        if trimmed == "/resume" {
-            let turns = sessions.get(&chat).map(|h| h.iter().filter(|m| m.role == "user").count()).unwrap_or(0);
-            let msg = if turns == 0 {
-                "🧵 no active conversation — just send a message to start one.".to_string()
-            } else {
-                format!("🧵 continuing — {turns} message(s) of context kept. /new to start over.")
-            };
-            let _ = client.send_message(chat, &msg).await;
-            continue;
-        }
-        let (task, approval) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
-            None => (trimmed.to_string(), approval_mode()),
-        };
-        if task.is_empty() {
-            continue;
-        }
-        let _ = client.send_message(chat, "⏳ working…").await;
-        let history = sessions.entry(chat).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-        let shown = crate::ui::markdown::render_plain_blocks(&reply);
-        for piece in chunk_text(&shown, 3500) {
-            let _ = client.send_message(chat, &piece).await;
-        }
-    }
-
-    telegram::set_daemon_active(false);
-    poll.abort();
-    Ok(())
 }
 
 // ───────────────────────────── time machine (git snapshots) ─────────────────────────────
@@ -1840,7 +1596,7 @@ fn print_timeline() -> Result<()> {
 /// A checkpoint saved through `/timeline` / `/checkpoint` carries a chat sidecar (all three tiers);
 /// an auto/agent checkpoint is Files-only. Every restore is reversible — the pre-restore tree is
 /// auto-snapshotted, and the current chat is saved to the `last` session before a task rewind.
-async fn timeline_menu(history: &mut Vec<Message>, model_label: &mut String) -> Result<()> {
+async fn timeline_menu(history: &mut Vec<Message>, model_label: &mut str) -> Result<()> {
     let theme = ui_theme();
     loop {
         let (snaps, cursor) = match timemachine::timeline() {
@@ -1896,7 +1652,7 @@ async fn timeline_menu(history: &mut Vec<Message>, model_label: &mut String) -> 
 fn restore_menu(
     snap: &timemachine::Snapshot,
     history: &mut Vec<Message>,
-    model_label: &mut String,
+    model_label: &mut str,
     theme: &dialoguer::theme::ColorfulTheme,
 ) -> Result<()> {
     // Files-only checkpoints (auto/agent) can't restore the chat — do the files rewind directly.
@@ -1961,7 +1717,7 @@ fn files_restore(id: u32) -> Result<()> {
 
 /// Rewind only the conversation to the sidecar captured with checkpoint `id`; files stay as they are.
 /// Before overwriting, the CURRENT chat is saved to the `last` session so it's never lost.
-fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut String) -> Result<()> {
+fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut str) -> Result<()> {
     let chat = timemachine::load_chat_checked(id)?;
     if chat.is_empty() {
         bail!("checkpoint #{id} has an empty saved conversation");
@@ -2079,68 +1835,6 @@ async fn discord_setup() -> Result<()> {
     cfg.discord = Some(d);
     cli_config::save(&cfg)?;
     println!("\n{}", style("Saved. Start the bot with:  aizen discord serve").color256(splash::ACCENT));
-    Ok(())
-}
-
-/// `ng discord serve` — the Discord bot daemon. A gateway task receives messages (heartbeating
-/// independently); this loop runs the agent one message at a time (per-channel history) and replies
-/// over REST. Mirrors `run_serve` (Telegram). NOTE: destructive-op approvals are not yet routed to
-/// Discord, so edits need `/yolo`/smart approval; read/research work as-is.
-async fn run_discord_serve() -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    let (client, cfg) = discord::configured().context("Discord bot not configured — run `aizen discord setup`")?;
-    let (base_url, api_key, model) =
-        resolve_endpoint(None, None, None).context("configure the model endpoint first (run `aizen config`)")?;
-    let http = http_client()?;
-    let token = cfg.resolved_token().context("no bot token")?;
-    let client = Arc::new(client);
-    eprintln!(
-        "{}",
-        style(format!("aizen serve — listening on Discord (Ctrl-C to stop). channels: {:?}", cfg.allowed_channel_ids)).dim()
-    );
-
-    let (tx, mut rx) = mpsc::channel::<discord::Incoming>(64);
-    let gw_cfg = cfg.clone();
-    let gw = tokio::spawn(async move { discord::run_gateway(token, gw_cfg, tx).await });
-
-    // Per-channel conversation history → follow-ups keep context (in-memory; /new resets).
-    let mut sessions: std::collections::HashMap<u64, Vec<Message>> = std::collections::HashMap::new();
-    loop {
-        let inc = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => { eprintln!("\nshutting down…"); crate::agent::process::kill_all(); break; }
-            m = rx.recv() => match m { Some(m) => m, None => break },
-        };
-        let trimmed = inc.content.trim();
-        if trimmed == "/help" || trimmed == "/start" {
-            let _ = client.send_message(inc.channel_id, DISCORD_HELP).await;
-            continue;
-        }
-        if trimmed == "/new" || trimmed == "/reset" {
-            sessions.remove(&inc.channel_id);
-            let _ = client.send_message(inc.channel_id, "🆕 started a fresh conversation — earlier context dropped.").await;
-            continue;
-        }
-        let (task, approval) = match trimmed.strip_prefix("/agent ") {
-            Some(rest) => (rest.trim().to_string(), ApprovalMode::Yolo),
-            None => (trimmed.to_string(), approval_mode()),
-        };
-        if task.is_empty() {
-            continue;
-        }
-        let _ = client.send_message(inc.channel_id, "⏳ working…").await;
-        let history = sessions.entry(inc.channel_id).or_default();
-        let reply = run_serve_turn(&http, &base_url, &api_key, &model, history, &task, approval)
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-        let shown = crate::ui::markdown::render_plain_blocks(&reply);
-        for piece in chunk_text(&shown, discord::MESSAGE_MAX) {
-            let _ = client.send_message(inc.channel_id, &piece).await;
-        }
-    }
-    gw.abort();
     Ok(())
 }
 
@@ -2686,7 +2380,7 @@ async fn skill_search_interactive() -> Result<()> {
         return Ok(());
     }
     let mut items: Vec<String> =
-        hits.iter().map(|s| format!("{}  {}", s.id(), style(s.summary_line().splitn(2, " — ").nth(1).unwrap_or("")).dim())).collect();
+        hits.iter().map(|s| format!("{}  {}", s.id(), style(s.summary_line().split_once(" — ").map(|x| x.1).unwrap_or("")).dim())).collect();
     items.push("Cancel".to_string());
     let pick = match Select::with_theme(&theme)
         .with_prompt("Install which skill?")
@@ -2801,7 +2495,7 @@ fn persona_self_view(slug: &str, name: &str) {
         );
     }
     // insights first (the durable layer), newest first
-    mems.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    mems.sort_by_key(|m| std::cmp::Reverse(m.mtime_ms));
     let insights: Vec<&persona::self_mem::SelfMemory> =
         mems.iter().filter(|m| m.kind == persona::self_mem::Kind::Insight).collect();
     if !insights.is_empty() {
@@ -3338,7 +3032,7 @@ async fn run_menu() -> Result<()> {
 }
 
 /// One-time prompt when a cloned repo ships project-local MCP servers (`./.aizen/mcp.json`): trust
-/// + load them, or dismiss (won't nag again — `ng mcp trust` re-enables). MCP servers can run
+/// and load them, or dismiss (won't nag again — `ng mcp trust` re-enables). MCP servers can run
 /// commands, hence the explicit gate before auto-arming a stranger's repo.
 fn prompt_mcp_trust(server_count: usize) {
     let theme = ui_theme();
@@ -3872,8 +3566,13 @@ async fn run_menu_sticky() -> Result<()> {
                             }
                         }
                         maybe_learn_skill(&history, &http, &base_url, &api_key, &model).await;
+                        maybe_record_skill_fail(&history);
                         maybe_evolve_persona(&history, &http, &base_url, &api_key, &model).await;
                         maybe_learn_memory(&history);
+                        // Cross-pillar co-fire (Phase 4): wire the memory/skill/self nodes actually
+                        // USED together this turn into one Hebbian association. Best-effort, no-op
+                        // unless ≥2 distinct pillars fired; kill-switch-gated inside the flush.
+                        let _ = memory::graph::flush_turn_cofire(&memory::bloat::decay::today());
                         maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
                         autosave_session(&history, &http, &base_url, &api_key, &model).await;
                     }
@@ -4110,10 +3809,14 @@ async fn run_menu_plain() -> Result<()> {
                 }
                 // Learn a skill from the full task detail BEFORE any compaction may summarize it.
                 maybe_learn_skill(&history, &http, &base_url, &api_key, &model).await;
+                // Outcome-aware demotion: if a loaded skill's steps led this turn into a dead-end, bump its fails.
+                maybe_record_skill_fail(&history);
                 // Let the active persona grow from this turn (free episode + periodic reflection).
                 maybe_evolve_persona(&history, &http, &base_url, &api_key, &model).await;
                 // Passively learn durable user/project facts (free regex; core stays human-gated).
                 maybe_learn_memory(&history);
+                // Cross-pillar co-fire (Phase 4): associate the memory/skill/self nodes used together.
+                let _ = memory::graph::flush_turn_cofire(&memory::bloat::decay::today());
                 maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
                 // Auto-checkpoint so /sessions can always restore where you left off (no manual save).
                 autosave_session(&history, &http, &base_url, &api_key, &model).await;
@@ -4165,11 +3868,17 @@ async fn maybe_auto_compact(
     }
 }
 
+/// How many top durable user/project facts to feed the skill distiller so the steps it writes are
+/// project-aware (the memory→skill wire). Small, like the persona known-facts cap — a handful of
+/// anchors, not the whole store.
+const SKILL_DISTILL_FACTS: usize = 6;
+
 /// After a completed turn: if the just-finished task was a real multi-step PROCEDURE, distill it
 /// into a reusable skill (the "self-evolving" path — like memory's free learning, but for how-to).
-/// Conservative + best-effort: one cheap extraction call, only on substantial turns, skips when the
-/// model says it isn't worth saving or a same-named skill already exists. Visible (prints a notice),
-/// toggle in `/config`. Reads only the LAST task (from the last user message to the end).
+/// Conservative + best-effort: one cheap extraction call, only on substantial turns. On a same-slug
+/// collision the loop CLOSES: instead of bailing, the old body + this run are handed to the distiller
+/// to refine (improve-or-keep). Visible (prints a notice), toggle in `/config`. Reads only the LAST
+/// task (from the last user message to the end).
 async fn maybe_learn_skill(
     history: &[Message],
     http: &reqwest::Client,
@@ -4200,12 +3909,23 @@ async fn maybe_learn_skill(
     let sys = Message::system(
         "You distill a COMPLETED task into a reusable skill, but ONLY if it is a generalizable, \
          repeatable procedure worth doing the same way next time. Be conservative — most one-off \
-         tasks are NOT skills, and do not duplicate an existing skill. Reply with ONLY a JSON \
+         tasks are NOT skills, and do not duplicate an existing skill. Steps should bake in what's \
+         already established about this project (the PROJECT FACTS block) rather than re-deriving it. \
+         Reply with ONLY a JSON \
          object: {\"worth_saving\": true|false, \"name\": \"kebab-case-name\", \"when\": \"short \
          trigger\", \"steps\": \"1. ...\\n2. ...\"}. If not worth saving, reply {\"worth_saving\": false}.",
     );
+    // Feed the distiller the top durable user/project facts so the steps it writes are project-aware
+    // (e.g. "run the tests" becomes the project's actual test command). Read-only — one-way
+    // memory→skill, mirroring the memory→persona wire; never flows back into user memory.
+    let facts = memory::frozen_core::top_core_facts(SKILL_DISTILL_FACTS);
+    let facts_block = if facts.is_empty() {
+        String::new()
+    } else {
+        format!("PROJECT FACTS (established — bake these into the steps):\n- {}\n\n", facts.join("\n- "))
+    };
     let usr = Message::user(format!(
-        "Existing skills (do not duplicate): {}\n\nCompleted task transcript:\n{}",
+        "{facts_block}Existing skills (do not duplicate): {}\n\nCompleted task transcript:\n{}",
         if existing.is_empty() { "(none)".to_string() } else { existing.join(", ") },
         transcript
     ));
@@ -4234,21 +3954,159 @@ async fn maybe_learn_skill(
     if name.is_empty() || steps.is_empty() {
         return;
     }
-    // Don't overwrite/duplicate an existing skill (case-insensitive on the slug).
+    // On a same-slug collision the pre-P3 behavior was to BAIL (learn-once, never improve). Now the
+    // loop is closed: hand the old body + this fresh experience back to the distiller to REFINE
+    // (improve-or-keep) instead of silently dropping the lesson. Gated by the kill-switch — with
+    // `AIZEN_NO_SKILL_REFINE` set we fall back to the old bail.
     let slug = skill::sanitize_name(name);
     if existing.iter().any(|e| skill::sanitize_name(e) == slug) {
+        if !crate::core::config::skill_refine_disabled() {
+            maybe_refine_existing_skill(name, steps, when, &transcript, &facts, http, base, key, model).await;
+        }
         return;
     }
     // Auto-learned procedures are almost always about THIS project → they land in the current
     // workspace's zone, so another repo's `<skills>` index never pays for them.
-    match skill::save_scoped(name, "", when, steps, true) {
-        Ok(_) => tui::emit_line(
+    // best-effort: a failed save just means no skill learned this turn.
+    if skill::save_scoped(name, "", when, steps, true).is_ok() {
+        tui::emit_line(
             &style(format!("{}learned skill '{name}' — /skills to view/edit/remove", icons::g(icons::learned())))
                 .color256(splash::ACCENT)
                 .to_string(),
-        ),
-        Err(_) => {} // best-effort
+        );
     }
+}
+
+/// Refine-on-collision (the closed skill loop): a completed turn re-distilled a procedure whose slug
+/// already exists. Load the CURRENT body, then ask the distiller to compare it against this turn's
+/// fresh steps and either return an IMPROVED full body or decline. On "improve" we `skill::refine`
+/// (which archives the old copy, bumps `version`, preserves `uses`, resets `fails`); on "keep" we
+/// no-op. Best-effort throughout: a repo-shipped skill (not refinable here), an absent writable copy,
+/// or any LM/parse error just means no refinement this turn. Chore-class call → summarizer endpoint.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_refine_existing_skill(
+    name: &str,
+    new_steps: &str,
+    new_when: &str,
+    transcript: &str,
+    known: &[String],
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+) {
+    // Only refine a copy we actually own (zone/global). A repo-shipped skill is the checkout's file;
+    // improving it is a git operation, not ours — bail before spending an LM call.
+    let Some(existing) = skill::load(name) else { return };
+    if matches!(existing.origin, skill::SkillOrigin::Repo) {
+        return;
+    }
+    let known_block = if known.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nDurable facts about the user/project (keep the steps consistent with these):\n- {}", known.join("\n- "))
+    };
+    let sys = Message::system(
+        "You MAINTAIN a saved skill (a reusable procedure). Given the CURRENT steps and a fresh \
+         transcript of doing the same task again, decide whether the current steps should be \
+         IMPROVED. Only improve if the new run reveals a genuinely better/safer/more-complete way — \
+         a clarification, a missing step, a corrected order, a dead-end to avoid. Do NOT rewrite for \
+         style, and do NOT lose hard-won detail. Reply with ONLY a JSON object: {\"improve\": \
+         true|false, \"steps\": \"1. ...\\n2. ...\", \"when\": \"short trigger\"}. If the current \
+         steps are already as good, reply {\"improve\": false}.",
+    );
+    let usr = Message::user(format!(
+        "Skill name: {name}\n\nCurrent steps:\n{}\n\nFresh transcript of doing it again:\n{}{}\n\nProposed steps from this run (for reference): {}",
+        existing.body.trim(),
+        transcript,
+        known_block,
+        new_steps,
+    ));
+    let ep = summarizer_endpoint(base, key, model);
+    let resp = match client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &[sys, usr], &[]).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let content = resp.content.unwrap_or_default();
+    let Some(json) = extract_json_object(&content) else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return };
+    if !v.get("improve").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return; // distiller judged the current steps already good — keep, no churn
+    }
+    // Prefer the distiller's reconciled steps; fall back to this turn's raw steps if it improved but
+    // returned none. An empty body would make `refine` error, so guard it.
+    let refined_steps = v.get("steps").and_then(|s| s.as_str()).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(new_steps);
+    if refined_steps.trim().is_empty() {
+        return;
+    }
+    let refined_when = v.get("when").and_then(|s| s.as_str()).map(str::trim).filter(|w| !w.is_empty()).or({
+        if new_when.is_empty() { None } else { Some(new_when) }
+    });
+    // best-effort: on a refine error (no writable copy / I/O) we simply don't refine this turn.
+    if let Ok((version, _archived)) = skill::refine(name, refined_steps, None, refined_when) {
+        tui::emit_line(
+            &style(format!(
+                "{}refined skill '{name}' → v{version} — /skills to view/edit/remove",
+                icons::g(icons::learned())
+            ))
+            .color256(splash::ACCENT)
+            .to_string(),
+        );
+    }
+}
+
+/// Outcome-aware demotion (the other half of the closed skill loop): if this turn LOADED a skill and
+/// then ended in an UNRECOVERED dead-end (the final tool result is still an error the turn never
+/// worked past), that skill's steps led into a wall — bump its `fails`. Enough of those and
+/// `skill::retired` drops it from the always-on index. Best-effort + gated: no-op under the
+/// kill-switch, and a bump that can't write (repo-shipped / absent copy) is silently skipped.
+fn maybe_record_skill_fail(history: &[Message]) {
+    if crate::core::config::skill_refine_disabled() {
+        return;
+    }
+    // Scope to the LAST turn (from the last user message to the end), like `maybe_learn_skill` — a
+    // skill loaded three turns ago isn't to blame for THIS turn's wall.
+    let turn = match history.iter().rposition(|m| m.role == "user") {
+        Some(i) => &history[i..],
+        None => return,
+    };
+    // Only penalize when the turn actually ended badly. A turn that recovered (error → later success)
+    // is a WIN for the loaded skill's recovery advice, not a failure; and a clean turn is obviously no
+    // failure. So the trigger is: at least one error, and the LAST tool result is an error.
+    if turn_recovered_from_dead_end(turn) || !turn_ended_in_dead_end(turn) {
+        return;
+    }
+    // Which skills did this turn pull? Only those get the blame — an unrelated skill sitting in the
+    // index isn't at fault for a turn that never loaded it.
+    let mut loaded: Vec<String> = Vec::new();
+    for m in turn.iter().filter(|m| m.role == "assistant") {
+        for call in &m.tool_calls {
+            if call.function.name == "skill_load" {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
+                    if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
+                        let n = n.trim().to_string();
+                        if !n.is_empty() && !loaded.iter().any(|e| e == &n) {
+                            loaded.push(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for name in loaded {
+        let _ = skill::record_fail(&name); // best-effort; a failed bump must never disrupt the REPL
+    }
+}
+
+/// Did this turn end in an UNRECOVERED dead-end — is the LAST tool result an error? (The counterpart
+/// to [`turn_recovered_from_dead_end`], which asks whether a success came AFTER an error.) Used to
+/// decide whether a loaded skill's steps led the turn into a wall it never climbed out of.
+fn turn_ended_in_dead_end(turn: &[Message]) -> bool {
+    turn.iter()
+        .rfind(|m| m.role == "tool")
+        .and_then(|m| m.content.as_deref())
+        .map(|c| c.trim_start().to_ascii_lowercase().starts_with("error:"))
+        .unwrap_or(false)
 }
 
 /// Did this turn RECOVER from a dead end — a tool result errored, then a LATER tool result in the
@@ -4472,11 +4330,29 @@ async fn maybe_evolve_persona(
     if !persona_evolve_enabled() {
         return;
     }
-    let persona = match persona::active() {
-        Some(p) => p,
-        None => return, // no character active → nothing to evolve
+    // Two evolution targets, mutually exclusive:
+    //   • a persona is active → grow THAT character (`<self>`), keeping its name/role for framing;
+    //   • no persona, but the default self-store is on → grow the agent's own working relationship
+    //     with the user under the reserved `_self` slug (neutral `<working_relationship>`, no costume).
+    // `label`/`role` only drive the reflection prompt's voice; the personaless case uses a neutral
+    // assistant framing and NEVER fabricates a character identity.
+    let (slug, label, role, is_persona) = match persona::active() {
+        Some(p) => {
+            let slug = skill::sanitize_name(&p.name);
+            (slug, p.name, p.role, true)
+        }
+        None => {
+            if crate::core::config::self_store_disabled() {
+                return; // no character + default self-store off → nothing to evolve
+            }
+            (
+                persona::self_mem::DEFAULT_SELF_SLUG.to_string(),
+                "the assistant".to_string(),
+                String::new(),
+                false,
+            )
+        }
     };
-    let slug = skill::sanitize_name(&persona.name);
 
     // Scope to the LAST turn (from the last user message to the end), like maybe_learn_skill.
     let start = match history.iter().rposition(|m| m.role == "user") {
@@ -4509,66 +4385,107 @@ async fn maybe_evolve_persona(
         let _ = persona::self_mem::record_episode(&slug, &body, sal.importance);
     }
 
-    if persona::self_mem::should_reflect(&slug) {
-        run_persona_reflection(&persona, &slug, http, base, key, model).await;
+    // Reflection is a background chore: spawn it OFF the turn's critical path (no added latency) and
+    // guard against double-billing (a live pending run) or re-billing a failing call every turn
+    // (exponential backoff). `reflect_ready` folds `should_reflect` + those guards together.
+    if persona::self_mem::reflect_ready(&slug) {
+        spawn_persona_reflection(slug, label, role, is_persona, http, base, key, model);
     }
 }
 
-/// The reflection call: synthesize recent episodes into 1-3 durable insights for this character.
-async fn run_persona_reflection(
-    persona: &persona::Persona,
-    slug: &str,
+/// Spawn the reflection call in the background: synthesize recent episodes into 1-3 durable insights.
+/// Marks the store pending BEFORE spawning (so a second turn won't re-spawn), and on completion marks
+/// done (success) or failed (grows the backoff). Best-effort + visible — never blocks the REPL.
+#[allow(clippy::too_many_arguments)]
+fn spawn_persona_reflection(
+    slug: String,
+    label: String,
+    role: String,
+    is_persona: bool,
     http: &reqwest::Client,
     base: &str,
     key: &str,
     model: &str,
 ) {
-    let episodes = persona::self_mem::recent_episode_bodies(slug, 20);
+    persona::self_mem::mark_reflect_pending(&slug);
+    let episodes = persona::self_mem::recent_episode_bodies(&slug, 20);
     if episodes.len() < persona::self_mem::REFLECT_MIN_EPISODES {
+        persona::self_mem::mark_reflect_done(&slug); // nothing to distill; clear the pending stamp
         return;
     }
-    let (sys, usr) = persona::reflect::build_reflection_prompt(&persona.name, &persona.role, &episodes);
+    // ONE-WAY memory→persona wire: hand a few established user-facts to the reflection as background
+    // (read-only; never flows the reflection output back into user memory — the leak-guard is upstream).
+    let known_facts = memory::frozen_core::top_core_facts(6);
+    // Insight revision (Phase 4, #8): hand the character its CURRENT beliefs so the reflection can
+    // name any the recent episodes have REVERSED (the retract half). Empty store → plain prompt.
+    let beliefs = persona::self_mem::current_insight_bodies(&slug, 12);
+    let (sys, usr) = persona::reflect::build_reflection_prompt_with_beliefs(
+        &label,
+        &role,
+        &episodes,
+        &known_facts,
+        &beliefs,
+    );
     // Chore-class synthesis call → billed to the summarizer role, like every other harness chore.
     let ep = summarizer_endpoint(base, key, model);
-    let resp = match client::chat_with_tools(
-        http,
-        &ep.base_url,
-        &ep.api_key,
-        &ep.model,
-        &[Message::system(sys), Message::user(usr)],
-        &[],
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(_) => return, // best-effort; never disrupt the REPL
-    };
-    let content = resp.content.unwrap_or_default();
-    let json = match extract_json_object(&content) {
-        Some(j) => j,
-        None => return,
-    };
-    let insights = persona::reflect::parse_insights(json);
-    if insights.is_empty() {
-        return;
-    }
-    let mut saved = 0usize;
-    for ins in &insights {
-        if persona::self_mem::save_insight(slug, &ins.text, ins.importance).is_ok() {
-            saved += 1;
+    let http = http.clone();
+    tokio::spawn(async move {
+        let resp = client::chat_with_tools(
+            &http,
+            &ep.base_url,
+            &ep.api_key,
+            &ep.model,
+            &[Message::system(sys), Message::user(usr)],
+            &[],
+        )
+        .await;
+        let content = match resp {
+            Ok(t) => t.content.unwrap_or_default(),
+            Err(_) => {
+                persona::self_mem::mark_reflect_failed(&slug); // grow backoff; don't re-bill next turn
+                return;
+            }
+        };
+        let reflection = extract_json_object(&content)
+            .map(persona::reflect::parse_reflection)
+            .unwrap_or_default();
+        if reflection.insights.is_empty() && reflection.retract.is_empty() {
+            // A clean empty result is NOT a failure (the model may just have nothing to distill), but
+            // the backlog is now consumed — clear pending so we don't re-spawn the same episodes.
+            persona::self_mem::mark_reflect_done(&slug);
+            return;
         }
-    }
-    if saved > 0 {
-        tui::emit_line(
-            &style(format!(
-                "{}{} reflected — +{saved} insight(s) from recent sessions (/persona to view)",
-                icons::g(icons::learned()),
-                persona.name
-            ))
-            .color256(splash::ACCENT)
-            .to_string(),
-        );
-    }
+        // Retract first: an insight the user reversed shouldn't linger, and dropping it before the save
+        // pass means a fresh insight on the same topic writes clean (no stale near-dup to reconfirm).
+        // Model-judged against the beliefs we handed in, so it only fires on a genuine reversal.
+        for stale in &reflection.retract {
+            let _ = persona::self_mem::retract_insight(&slug, stale);
+        }
+        let mut saved = 0usize;
+        for ins in &reflection.insights {
+            // save_insight reinforces in place when this re-confirms an existing belief (bumps its
+            // `reinforced`/`updated`), else appends — so a repeatedly-lived insight earns rank.
+            if persona::self_mem::save_insight(&slug, &ins.text, ins.importance).is_ok() {
+                saved += 1;
+            }
+        }
+        persona::self_mem::mark_reflect_done(&slug);
+        if saved > 0 {
+            let what = if is_persona {
+                format!("{label} reflected")
+            } else {
+                "learned from how we work together".to_string()
+            };
+            tui::emit_line(
+                &style(format!(
+                    "{}{what} — +{saved} insight(s) from recent sessions (/persona to view)",
+                    icons::g(icons::learned()),
+                ))
+                .color256(splash::ACCENT)
+                .to_string(),
+            );
+        }
+    });
 }
 
 /// Build the current system prompt lanes (stable cache prefix + dynamic identity/memory).
@@ -4586,11 +4503,6 @@ fn current_system_prompt_bundle(model: &str) -> agent::PromptBundle {
         bundle.dynamic.push('\n');
     }
     bundle
-}
-
-/// Flattened system prompt for callers that still expect a single string.
-fn current_system_prompt(model: &str) -> String {
-    current_system_prompt_bundle(model).flatten()
 }
 
 /// Seed both system lanes for a brand-new conversation.
@@ -4680,9 +4592,8 @@ fn update_system_prompt(history: &mut Vec<Message>, model: &str) {
 /// `% context` HUD only — not a hard cap (the upstream enforces the real limit). Defaults to 128K.
 fn ctx_window_for(model: &str) -> usize {
     let m = model.to_ascii_lowercase();
-    if m.contains("1m") {
-        1_000_000 // explicit 1M-context variants (e.g. opus-4-8-1m-thinking) — checked before the family heuristics
-    } else if m.contains("gemini") {
+    // explicit 1M-context variants (e.g. opus-4-8-1m-thinking) + gemini — checked before family heuristics
+    if m.contains("1m") || m.contains("gemini") {
         1_000_000
     } else if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
         200_000
@@ -5119,6 +5030,7 @@ fn approval_mode() -> ApprovalMode {
 /// Arm the LSP manager once per process (default ON, lazy spawn). Safe to call every turn:
 /// - first call enables the runtime (no language server process until a query needs one);
 /// - later calls are no-ops, so a mid-session `/lsp off` stays off until the user runs `/lsp on`.
+///
 /// Always refreshes request timeout + edit-feedback from config.
 fn arm_lsp_session() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5571,7 +5483,7 @@ fn slash_agents(arg: &str) {
                 out.push_str(&format!("  {mark} {:<24} model: {model}\n", slug));
             }
             out.push_str("\nset a model:  /agents set-model <name> <model>   ·   clear:  /agents set-model <name> clear");
-            tui::emit_line(&out.trim_end().to_string());
+            tui::emit_line(out.trim_end());
         }
         other => {
             tui::emit_line(&style(format!("unknown /agents subcommand '{other}' — try /agents or /agents set-model <name> <model>")).dim().to_string());
@@ -7672,11 +7584,246 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Archive => memory::cmd_archive_list(),
         MemoryCmd::Restore { id } => memory::cmd_restore(&id),
         MemoryCmd::Compact => memory::cmd_compact(),
+        MemoryCmd::Consolidate { apply, yes } => run_memory_consolidate(apply, yes).await,
         MemoryCmd::Neighbors { id, k } => memory::cmd_neighbors(&id, k),
         MemoryCmd::ModelDownload { name } => {
             memory::model_dl::download(name.as_deref()).await.map(|_| ())
         }
     }
+}
+
+/// Phase 4B — the manual consolidation pass. Cluster redundant AGING inferred facts, distill each
+/// cluster into ONE insight via the chore-class summarizer, LM-VERIFY the insight covers every member,
+/// and supersede the members (history kept, never deleted). DRY-RUN by default: prints the plan and
+/// writes nothing. `--apply` writes — insight FIRST, supersede AFTER, so a crash mid-cluster leaves the
+/// members valid (we keep too much, never lose). On a TTY, `--apply` asks to confirm once after showing
+/// the plan (unless `--yes`). This is the only path in the batch that bulk-rewrites the durable store,
+/// so every gate errs toward NOT folding: eligibility excludes manual/user-explicit/core/fresh facts,
+/// clustering never crosses zone/type/category, and a failed coverage check leaves the cluster intact.
+async fn run_memory_consolidate(apply: bool, yes: bool) -> Result<()> {
+    use crate::memory::learning::consolidate;
+    use crate::memory::provenance::ProvenanceKind;
+    use crate::memory::store::{self, LearnedWrite};
+
+    let today = memory::bloat::decay::today();
+    let all = store::load_all()?;
+    let active = memory::bloat::supersede::active(&all);
+    let eligible: Vec<&store::MemoryEntry> = active
+        .iter()
+        .filter(|e| {
+            consolidate::eligible_for_consolidation(e, &today, consolidate::CONSOLIDATE_FRESH_DAYS)
+        })
+        .collect();
+    if eligible.is_empty() {
+        println!("nothing to consolidate — no aging, low-session, inferred facts to fold.");
+        return Ok(());
+    }
+
+    let mut clusters = consolidate::cluster(
+        &eligible,
+        consolidate::CONSOLIDATE_CLUSTER_MIN,
+        consolidate::CONSOLIDATE_MAX_MEMBERS,
+    );
+    if clusters.is_empty() {
+        println!(
+            "nothing to consolidate — {} aging fact(s), but none cluster together.",
+            eligible.len()
+        );
+        return Ok(());
+    }
+    let capped = clusters.len() > consolidate::CONSOLIDATE_MAX_CLUSTERS;
+    clusters.truncate(consolidate::CONSOLIDATE_MAX_CLUSTERS); // one run can never rewrite the whole store
+
+    let (base_url, api_key, model) =
+        resolve_endpoint(None, None, None).context("need an endpoint to distill — run /config first")?;
+    let ep = summarizer_endpoint(&base_url, &api_key, &model);
+    let http = http_client()?;
+
+    // id → entry (into `all`, which outlives the write phase) for member bodies + supersede targets.
+    let by_id: std::collections::HashMap<&str, &store::MemoryEntry> =
+        all.iter().map(|e| (e.id.as_str(), e)).collect();
+
+    let dry = !apply;
+    println!(
+        "{} {} candidate cluster(s) from {} aging fact(s){}",
+        if dry { "consolidation plan (dry-run):" } else { "consolidating —" },
+        clusters.len(),
+        eligible.len(),
+        if capped {
+            format!(" (capped at {}; run again for more)", consolidate::CONSOLIDATE_MAX_CLUSTERS)
+        } else {
+            String::new()
+        },
+    );
+
+    // Build the plan up front (LM distill + independent LM verify per cluster) — NO writes yet, so the
+    // preview shown on both dry-run and pre-apply-confirm reflects exactly what would be written.
+    struct PlannedFold {
+        insight: String,
+        members: Vec<String>,
+        scope: Option<String>,
+        mtype: store::MemoryType,
+        confidence: f64,
+    }
+    let mut plans: Vec<PlannedFold> = Vec::new();
+    for members in &clusters {
+        let entries: Vec<&store::MemoryEntry> =
+            members.iter().filter_map(|id| by_id.get(id.as_str()).copied()).collect();
+        if entries.len() < 2 {
+            continue; // an id vanished between load and here — skip, never fold a singleton
+        }
+        // The cluster bucket guarantees a shared (scope, mtype, category); take them off member 0.
+        let scope = entries[0].scope.clone();
+        let mtype = entries[0].mtype;
+        let bodies: Vec<String> = entries.iter().map(|e| e.body.trim().to_string()).collect();
+
+        let Some(insight) = distill_cluster(&http, &ep, &bodies).await else {
+            continue; // distiller declined (SKIP) or errored → leave the cluster intact
+        };
+        if !verify_cluster_coverage(&http, &ep, &insight, &bodies).await {
+            continue; // insight does not provably cover every member → do not fold
+        }
+        let confidence = entries.iter().map(|e| e.confidence).fold(0.0_f64, f64::max);
+        plans.push(PlannedFold { insight, members: members.clone(), scope, mtype, confidence });
+    }
+
+    if plans.is_empty() {
+        println!("  (no cluster passed the coverage check — nothing to write.)");
+        return Ok(());
+    }
+    for (i, p) in plans.iter().enumerate() {
+        println!("\n  [{}] fold {} fact(s) → insight:", i + 1, p.members.len());
+        println!("      {}", style(&p.insight).color256(splash::ACCENT));
+        for id in &p.members {
+            println!("      {} supersede {id}", style("↳").dim());
+        }
+    }
+
+    if dry {
+        println!("\ndry-run: nothing written. Re-run with --apply to consolidate.");
+        return Ok(());
+    }
+
+    // --apply: on a TTY, confirm once now that the full plan is visible; scripts must pass --yes.
+    if !yes {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("--apply needs a TTY to confirm (or pass --yes for non-interactive use)");
+        }
+        let members_total: usize = plans.iter().map(|p| p.members.len()).sum();
+        let ok = dialoguer::Confirm::with_theme(&ui_theme())
+            .with_prompt(format!(
+                "Fold {} cluster(s), superseding {members_total} fact(s)? (history kept)",
+                plans.len()
+            ))
+            .default(false)
+            .interact()?;
+        if !ok {
+            println!("aborted — nothing written.");
+            return Ok(());
+        }
+    }
+
+    let session_id = crate::memory::learning::default_session_id();
+    let mut folded = 0usize;
+    let mut superseded = 0usize;
+    for p in &plans {
+        // Insight FIRST. A crash between here and the supersedes below leaves the members valid AND the
+        // insight present — redundant, but nothing lost. That asymmetry is deliberate.
+        let name: String = p.insight.chars().take(56).collect();
+        let w = LearnedWrite {
+            name: &name,
+            description: "",
+            mtype: p.mtype,
+            body: &p.insight,
+            source: ProvenanceKind::Inferred, // a distilled insight is inferred — it re-earns core the normal way
+            confidence: p.confidence,
+            session_id: &session_id,
+            no_core: false,
+            scope: p.scope.clone(),
+            subpath: None,
+        };
+        let new_id = match store::add_learned(&w) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("{} {e}", style("skip cluster:").red());
+                continue;
+            }
+        };
+        for mid in &p.members {
+            if let Some(old) = by_id.get(mid.as_str()) {
+                if store::mark_superseded(old, &new_id).is_ok() {
+                    superseded += 1;
+                    crate::memory::learning::audit::append(crate::memory::learning::audit::AuditEvent {
+                        ts: crate::memory::learning::audit::ts_now(),
+                        session_id: &session_id,
+                        op: "consolidate",
+                        id: None,
+                        old_id: Some(mid),
+                        new_id: Some(&new_id),
+                        body_preview: Some(&p.insight.chars().take(120).collect::<String>()),
+                        signal: Some("consolidate"),
+                    });
+                }
+            }
+        }
+        folded += 1;
+        println!("{} folded {} fact(s) → {new_id}", style("✓").color256(splash::ACCENT), p.members.len());
+    }
+    println!(
+        "\nconsolidated {folded} cluster(s); superseded {superseded} fact(s). History kept — inspect with `aizen memory as-of <date>` or revert with `aizen memory supersede`."
+    );
+    Ok(())
+}
+
+/// Distill one consolidation cluster into a single faithful sentence via the chore-class summarizer.
+/// Returns `None` when the distiller declines (`SKIP`), returns nothing, or the call errors — every
+/// such case leaves the cluster intact (best-effort, fold-nothing-on-doubt).
+async fn distill_cluster(
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+    bodies: &[String],
+) -> Option<String> {
+    let sys = Message::system(
+        "You consolidate several RELATED facts about a project into ONE faithful sentence that \
+         preserves every distinct claim. Do NOT add anything not present in the inputs, and do NOT \
+         drop any detail. If the facts cannot be merged without losing information, reply with ONLY \
+         the word SKIP. Otherwise reply with ONLY the consolidated fact as a single line.",
+    );
+    let usr = Message::user(format!("Facts to consolidate:\n- {}", bodies.join("\n- ")));
+    let resp =
+        client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &[sys, usr], &[]).await.ok()?;
+    let out = resp.content.unwrap_or_default().trim().to_string();
+    if out.is_empty() || out.eq_ignore_ascii_case("skip") {
+        return None;
+    }
+    Some(out)
+}
+
+/// Independent LM check that a distilled insight FULLY covers its source facts — a separate call (not a
+/// same-prompt self-check) so the verdict does not just echo the distiller. Any error / unparseable
+/// reply / "unsure" → `false`, so the strict default is to NOT fold.
+async fn verify_cluster_coverage(
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+    insight: &str,
+    bodies: &[String],
+) -> bool {
+    let sys = Message::system(
+        "You verify whether a CONSOLIDATED sentence fully covers a list of ORIGINAL facts — every \
+         distinct claim in each original must be present or clearly entailed by the consolidated \
+         sentence. Reply with ONLY a JSON object {\"covers_all\": true|false}. If you are unsure, or \
+         any detail is missing, answer false.",
+    );
+    let usr = Message::user(format!("Consolidated:\n{insight}\n\nOriginals:\n- {}", bodies.join("\n- ")));
+    let resp = match client::chat_with_tools(http, &ep.base_url, &ep.api_key, &ep.model, &[sys, usr], &[]).await {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let content = resp.content.unwrap_or_default();
+    let Some(json) = extract_json_object(&content) else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return false };
+    v.get("covers_all").and_then(|b| b.as_bool()).unwrap_or(false)
 }
 
 fn run_persona(cmd: PersonaCmd) -> Result<()> {
@@ -7756,8 +7903,7 @@ fn run_persona(cmd: PersonaCmd) -> Result<()> {
                         .map(|s| s.importance)
                         .unwrap_or(6)
                 })
-                .max(persona::self_mem::FORMATIVE_MIN)
-                .min(10);
+                .clamp(persona::self_mem::FORMATIVE_MIN, 10);
             let body = if text.trim().starts_with("correction:")
                 || text.trim().starts_with("preference:")
                 || text.trim().starts_with("work:")
@@ -8547,25 +8693,6 @@ mod tests {
         assert_eq!(tier(5), "max");
     }
 
-    #[test]
-    fn chunk_text_splits_on_utf16_units_not_scalars() {
-        // 2100 emoji = 2100 scalars but 4200 UTF-16 units. Under a 3500-unit cap it MUST split —
-        // Telegram/Discord count length in UTF-16; naive char-splitting would wrongly keep it whole
-        // and the platform would 400 → the reply is silently dropped.
-        let s = "🚀".repeat(2100);
-        let chunks = chunk_text(&s, 3500);
-        assert!(chunks.len() >= 2, "over-the-UTF16-cap reply must split, got {}", chunks.len());
-        for c in &chunks {
-            assert!(c.encode_utf16().count() <= 3500, "each chunk within the UTF-16 budget");
-        }
-        assert_eq!(chunks.concat(), s, "reassembles losslessly");
-        assert_eq!(chunk_text("hello", 3500), vec!["hello".to_string()], "ASCII under cap stays whole");
-
-        let rows = "alpha row\nbeta row\ngamma row\n";
-        let chunks = chunk_text(rows, 20);
-        assert_eq!(chunks.concat(), rows, "line-aware splitting stays lossless");
-        assert!(chunks[..chunks.len() - 1].iter().all(|c| c.ends_with('\n')), "{chunks:?}");
-    }
 
     #[test]
     fn default_index_points_at_the_saved_model() {
@@ -8653,35 +8780,6 @@ mod tests {
         assert_eq!(blocks(50.0), 5);
         assert_eq!(blocks(100.0), 10);
         assert_eq!(blocks(150.0), 10); // clamped, never overflows the 10-cell bar
-    }
-
-    #[test]
-    fn cap_session_drops_oldest_whole_turns_at_user_boundary() {
-        // sys + 3 turns (each user + assistant). Cap to 5 → must drop the oldest whole turn(s),
-        // keep system[0], and always START the tail at a `user` message.
-        let mut h = vec![
-            Message::system("sys"),
-            Message::user("u1"),
-            Message::assistant("a1"),
-            Message::user("u2"),
-            Message::assistant("a2"),
-            Message::user("u3"),
-            Message::assistant("a3"),
-        ];
-        cap_session(&mut h, 5);
-        assert!(h.len() <= 5, "trimmed under the cap");
-        assert_eq!(h[0].role, "system", "system prompt is preserved");
-        assert_eq!(h[1].role, "user", "tail begins at a user boundary (no orphaned turn)");
-        // the most recent turn must survive
-        assert!(h.iter().any(|m| m.content.as_deref() == Some("u3")));
-    }
-
-    #[test]
-    fn cap_session_keeps_single_turn_even_if_over_cap() {
-        // One huge turn can't be split at a 2nd user boundary → left intact (loop guard handles size).
-        let mut h = vec![Message::system("sys"), Message::user("u1"), Message::assistant("a1")];
-        cap_session(&mut h, 2);
-        assert_eq!(h.len(), 3, "no safe cut point → keep the turn whole");
     }
 
     #[test]

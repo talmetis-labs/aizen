@@ -197,9 +197,12 @@ pub fn classify(command: &str) -> Verdict {
     // floor must see what the program will actually receive. (Matching both keeps patterns that rely
     // on literal chars working; a rare false-positive on a quoted *mention* like `echo "rm -rf /"`
     // fails safe by blocking, which is acceptable for a catastrophic-only floor.)
-    let unquoted = strip_quotes(&norm);
+    // Only build + scan the quote-stripped copy when the command actually contains a quote (perf
+    // T3): the strip allocates a fresh String and doubles the blocklist regex passes, but for the
+    // common unquoted command it's identical to `norm` — so skip it unless a quote is present.
+    let unquoted = norm.contains(['"', '\'']).then(|| strip_quotes(&norm));
     for (re, reason) in BLOCKLIST.iter() {
-        if re.is_match(&norm) || re.is_match(&unquoted) {
+        if re.is_match(&norm) || unquoted.as_deref().is_some_and(|u| re.is_match(u)) {
             return Verdict::Blocked((*reason).to_string());
         }
     }

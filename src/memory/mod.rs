@@ -4,6 +4,7 @@
 //! learning (P3), anti-bloat (P4), dense semantic tier (P5).
 
 pub mod bloat;
+pub mod candidate;
 pub mod category;
 pub mod dialectic;
 pub mod dimension;
@@ -23,6 +24,8 @@ pub mod store;
 pub mod tokenize;
 
 use crate::core::config::{self, MemorySettings};
+use crate::core::workdir::WorkdirKind;
+use crate::memory::category::{Category, Kind};
 use crate::memory::dimension::Dimension;
 use crate::memory::learning::{LearnOptions, LearnReport};
 use crate::memory::provenance::ProvenanceKind;
@@ -103,6 +106,10 @@ fn record_reuse(hits: &[Hit]) {
     let today = bloat::decay::today();
     for h in hits {
         let _ = store::record_retrieval(&h.entry, &today);
+        // Cross-pillar co-fire (Phase 4): note each recalled fact as USED this turn, so it can wire
+        // to a skill/self node also touched in the turn. Namespaced (`mem:<id>`) + turn-deduped;
+        // kill-switch-gated inside `note_used`. Distinct from the bare-id intra-mem co-fire below.
+        graph::note_used(&graph::mem_node(&h.entry.id));
     }
     // "Neurons that fire together wire together": one search that surfaced ≥2 facts is one co-fire
     // event. Per-day-deduped per pair inside `record_coretrieval`, so a chatty session can't inflate
@@ -165,6 +172,56 @@ fn expand_with_graph(hits: &mut Vec<Hit>, _query: &str, k: usize, sel: &ScopeSel
 
 /// Minimum decayed edge weight for a neighbor to be considered live (below this a link has faded).
 const GRAPH_EDGE_FLOOR: f64 = 0.35;
+
+/// The soft recall bias a favored fact earns (Phase 5). Same order of magnitude as the subpath
+/// region boost — enough to break a tie between equal-scoring neighbors, never enough to let a
+/// weak match jump a strong one. Layered onto `bm25 · decay · salience`, not a filter.
+const WORKDIR_CATEGORY_BOOST: f64 = 1.12;
+
+/// The recall-policy [`WorkdirKind`] for this turn, honoring the `AIZEN_NO_WORKDIR` kill-switch by
+/// collapsing to the neutral [`WorkdirKind::Work`] verdict (same contract as the `<workspace>` hint
+/// in `agent/mod.rs`). `classify()` is cached per `(NG_PROJECT_ROOT, cwd)`, so this is a cheap read.
+fn recall_workdir_kind() -> WorkdirKind {
+    if crate::core::workdir::workdir_disabled() {
+        WorkdirKind::Work
+    } else {
+        crate::core::workdir::classify()
+    }
+}
+
+/// Per-directory-kind content bias (Phase 5): a small multiplier applied to a hit whose content
+/// category is what this KIND of workspace leans on. NEVER a hard filter — the long tail is intact,
+/// a favored fact just edges out an equal neighbor. [`WorkdirKind::Work`] (also the kill-switch
+/// forced verdict) returns 1.0 for everything, so the policy collapses to the pre-Phase-5 baseline
+/// byte-for-byte.
+fn workdir_category_boost(kind: WorkdirKind, cat: Category) -> f64 {
+    match kind {
+        // A code repo (and a large one) leans on operational + structural knowledge: how to run
+        // it, where things live, what was decided, and which dead ends to skip re-trying.
+        WorkdirKind::Code | WorkdirKind::Large => match cat {
+            Category::Command
+            | Category::Codebase
+            | Category::ArchDecision
+            | Category::FailedAttempt => WORKDIR_CATEGORY_BOOST,
+            _ => 1.0,
+        },
+        // A research / notes folder leans on durable knowledge over command history.
+        WorkdirKind::Research if matches!(cat.kind(), Kind::Semantic) => WORKDIR_CATEGORY_BOOST,
+        WorkdirKind::Research | WorkdirKind::Work => 1.0,
+    }
+}
+
+/// Per-kind subpath-region boost (Phase 5). The baseline 1.15 (`Work`/`Code`) rewards a current-zone
+/// fact tagged with the subpath the user is under right now; `Large` and `Research` tighten toward
+/// the working area (a monorepo package / a notes sub-folder), so a same-zone but off-area fact
+/// yields to the on-area one more decisively. `Work` keeps the exact pre-Phase-5 value.
+fn workdir_subpath_boost(kind: WorkdirKind) -> f64 {
+    match kind {
+        WorkdirKind::Large => 1.30,
+        WorkdirKind::Research => 1.25,
+        WorkdirKind::Code | WorkdirKind::Work => 1.15,
+    }
+}
 
 /// The full retrieval pipeline with dimension + workspace-zone selection. The zone filter runs
 /// BEFORE the BM25 index is built (the index is corpus-relative — IDF/avgdl over exactly the
@@ -231,15 +288,23 @@ pub fn search_filtered_scoped_cat(
     let today = bloat::decay::today();
     let half_life = cfg.recency_half_life_days;
     let cur_sub = config::current_subpath();
+    // Phase 5: the KIND of directory we're in biases recall (soft — see `workdir_category_boost`).
+    // Resolved once per query; `Work`/kill-switch collapses every multiplier below to 1.0.
+    let wk = recall_workdir_kind();
+    let subpath_boost = workdir_subpath_boost(wk);
     for h in &mut hits {
         // final = bm25 · decay · salience — facts rise/sink on reuse + reinforcement (P8).
         h.score = bloat::decay::evolved_score(h.score, &h.entry, &today, half_life);
+        // Dir-type content bias: in a code repo a `command`/`codebase` fact edges out a neutral
+        // one; in a research folder durable/semantic knowledge does. Multiplicative + tiny.
+        h.score *= workdir_category_boost(wk, h.entry.category);
         // Soft region boost: a current-project fact tagged with the subpath the user is working
-        // under right now edges out its zone-mates (never a hard partition — see the plan).
+        // under right now edges out its zone-mates (never a hard partition — see the plan). The
+        // strength tightens in a monorepo / notes tree (`workdir_subpath_boost`).
         if h.entry.scope.as_deref() == Some(current.as_str()) {
             if let (Some(tag), Some(cur)) = (h.entry.subpath.as_deref(), cur_sub.as_deref()) {
                 if frozen_core::subpath_matches(tag, cur) {
-                    h.score *= 1.15;
+                    h.score *= subpath_boost;
                 }
             }
         }
@@ -327,10 +392,13 @@ fn rank_lexical(
         entries.into_iter().filter(|e| !exclude.contains(&e.id)).collect();
     // IDF + avgdl are corpus-relative, so build the index over exactly the candidate set we rank.
     let idx = Bm25Index::build(candidates.iter().map(|e| e.tokens.as_slice()));
+    // Prepare the distinct query-token set once for the whole corpus (perf T3). The scorer used to
+    // allocate the identical HashSet again for every candidate document.
+    let q_set: HashSet<&str> = q.iter().map(String::as_str).collect();
     let mut hits: Vec<Hit> = candidates
         .into_iter()
         .filter_map(|e| {
-            let s = if fuzzy { idx.score_fuzzy(&q, &e.tokens) } else { idx.score(&q, &e.tokens) };
+            let s = idx.score_with_qset(&q, &q_set, &e.tokens, fuzzy, None);
             if s > 0.0 {
                 Some(Hit { entry: e, score: s })
             } else {
@@ -1141,6 +1209,63 @@ mod tests {
             tokens: tokenize(text),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn workdir_boost_is_neutral_in_a_generic_workspace() {
+        // `Work` (also the `AIZEN_NO_WORKDIR` forced verdict) must collapse every Phase-5 multiplier
+        // to the pre-Phase-5 baseline: 1.0 category bias for every category, 1.15 subpath boost.
+        for cat in [
+            Category::Command,
+            Category::Codebase,
+            Category::ArchDecision,
+            Category::FailedAttempt,
+            Category::SecurityRule,
+            Category::None,
+        ] {
+            assert_eq!(
+                workdir_category_boost(WorkdirKind::Work, cat),
+                1.0,
+                "Work must not bias {:?}",
+                cat
+            );
+        }
+        assert_eq!(workdir_subpath_boost(WorkdirKind::Work), 1.15, "Work keeps the legacy subpath boost");
+    }
+
+    #[test]
+    fn code_repo_favors_operational_and_structural_facts() {
+        // In a code repo, the categories a developer reaches for get the soft edge; neutral content
+        // stays at 1.0 so it's a tie-breaker, not a filter.
+        for cat in [Category::Command, Category::Codebase, Category::ArchDecision, Category::FailedAttempt] {
+            assert!(
+                workdir_category_boost(WorkdirKind::Code, cat) > 1.0,
+                "Code should favor {:?}",
+                cat
+            );
+        }
+        assert_eq!(workdir_category_boost(WorkdirKind::Code, Category::None), 1.0);
+        // Large inherits the same content bias as Code.
+        assert_eq!(
+            workdir_category_boost(WorkdirKind::Large, Category::Command),
+            workdir_category_boost(WorkdirKind::Code, Category::Command),
+        );
+    }
+
+    #[test]
+    fn research_folder_favors_durable_semantic_knowledge() {
+        // Semantic categories (arch decisions, codebase facts) get the edge in a notes/research tree;
+        // an episodic command does not.
+        assert!(workdir_category_boost(WorkdirKind::Research, Category::ArchDecision) > 1.0);
+        assert!(workdir_category_boost(WorkdirKind::Research, Category::Codebase) > 1.0);
+        assert_eq!(workdir_category_boost(WorkdirKind::Research, Category::Command), 1.0);
+    }
+
+    #[test]
+    fn subpath_boost_tightens_in_a_monorepo_and_notes_tree() {
+        // A large/monorepo and a research tree pull harder toward the working area than a flat repo.
+        assert!(workdir_subpath_boost(WorkdirKind::Large) > workdir_subpath_boost(WorkdirKind::Code));
+        assert!(workdir_subpath_boost(WorkdirKind::Research) > workdir_subpath_boost(WorkdirKind::Work));
     }
 
     #[test]

@@ -108,7 +108,7 @@ pub fn list() -> Vec<Persona> {
         by_name.insert(sanitize_name(&p.name), p); // HOME wins on a name collision
     }
     let mut out: Vec<Persona> = by_name.into_values().collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -268,6 +268,21 @@ pub fn prompt_block() -> Option<String> {
 pub fn self_block() -> Option<String> {
     let slug = active_slug()?;
     self_mem::self_block(&slug, SELF_BLOCK_MAX_TOKENS)
+}
+
+/// The `<working_relationship>` block for the system prompt: the personaless DEFAULT self-store's
+/// accumulated observations about how the user likes to work with the agent. This is the no-persona
+/// counterpart to [`self_block`] — the agent grows a relationship with the user even without a
+/// character costume (Phase 2 default self-store).
+///
+/// `None` when the default self-store is disabled ([`crate::core::config::self_store_disabled`]) or
+/// empty. The caller only reaches this when NO persona is active (a persona's `<self>` wins), so the
+/// two blocks are mutually exclusive by construction.
+pub fn working_relationship_block() -> Option<String> {
+    if crate::core::config::self_store_disabled() {
+        return None;
+    }
+    self_mem::working_relationship_block(SELF_BLOCK_MAX_TOKENS)
 }
 
 #[cfg(test)]

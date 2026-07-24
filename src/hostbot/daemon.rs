@@ -141,6 +141,7 @@ fn cap_session(history: &mut Vec<Message>, max: usize) {
 /// context. Seeds the system prompt (with memory + SOUL + persona) once per session, appends the
 /// user task, drives the loop, learns passively, and bounds the history. A `clarify` yield leaves a
 /// resumable history (the owner's next message is the answer).
+#[allow(clippy::too_many_arguments)]
 async fn run_serve_turn(
     http: &reqwest::Client,
     base_url: &str,
@@ -273,8 +274,8 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
         let trimmed = text.trim().to_string();
 
         // A `/command` → the dispatcher. `Some(reply)` = handled; `None` = fall through to the agent.
-        if trimmed.starts_with('/') {
-            let mut parts = trimmed[1..].splitn(2, char::is_whitespace);
+        if let Some(cmd_body) = trimmed.strip_prefix('/') {
+            let mut parts = cmd_body.splitn(2, char::is_whitespace);
             let name = parts.next().unwrap_or("").trim().to_string();
             let arg = parts.next().unwrap_or("").trim().to_string();
             if let Some(reply) =
@@ -559,9 +560,21 @@ async fn handle_command<P: Platform>(
             } else if arg.trim().is_empty() {
                 Some("usage: /memory <query>  ·  /memory remember <fact>".to_string())
             } else {
-                Some(match crate::memory::search_scoped(arg.trim(), 5, &crate::memory::ScopeSel::default_view()) {
-                    Ok(hits) if hits.is_empty() => format!("(no memory matches '{}')", arg.trim()),
-                    Ok(hits) => {
+                let query = arg.trim().to_string();
+                let searched = tokio::task::spawn_blocking(move || {
+                    crate::memory::search_scoped(
+                        &query,
+                        5,
+                        &crate::memory::ScopeSel::default_view(),
+                    )
+                })
+                .await;
+                Some(
+                    match searched {
+                        Ok(Ok(hits)) if hits.is_empty() => {
+                            format!("(no memory matches '{}')", arg.trim())
+                        }
+                        Ok(Ok(hits)) => {
                         let mut s = String::new();
                         for h in &hits {
                             let body: String = h.entry.body.chars().take(160).collect();
@@ -569,7 +582,8 @@ async fn handle_command<P: Platform>(
                         }
                         s.trim_end().to_string()
                     }
-                    Err(e) => format!("memory: {e}"),
+                    Ok(Err(e)) => format!("memory: {e}"),
+                    Err(e) => format!("memory worker: {e}"),
                 })
             }
         }

@@ -276,9 +276,9 @@ fn push_title(out: &mut String, word: &str, allow_sixel: bool) {
     out.push('\n');
     push_sun(out, allow_sixel);
     out.push('\n');
-    for row in 0..5 {
+    for (row, color) in TITLE.iter().enumerate() {
         let line: String = word.chars().map(|c| glyph(c)[row]).collect::<Vec<_>>().join(" ");
-        let _ = writeln!(out, "  {}", style(line).color256(TITLE[row]).bold());
+        let _ = writeln!(out, "  {}", style(line).color256(*color).bold());
     }
     let _ = writeln!(out, "  {}", style("ARTIFICIAL INTELLIGENCE AGENT").color256(crate::ui::theme::MUTED));
     out.push('\n');

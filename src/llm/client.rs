@@ -473,6 +473,7 @@ pub type EagerStartFn<'a> = &'a (dyn Fn(usize, &ToolCall) -> Option<tokio::task:
 /// Stream a chat completion. Prints content deltas to stdout as they arrive and
 /// returns the full concatenated assistant text. Returns a typed error on a non-2xx
 /// response (so the caller can decide retry/stop) instead of panicking.
+#[allow(dead_code)] // kept: tested API / public wrapper
 pub async fn stream_chat(
     client: &reqwest::Client,
     base_url: &str,
@@ -1041,7 +1042,7 @@ impl ThinkFilter {
 fn partial_suffix(s: &str, tag: &str) -> usize {
     let max = tag.len().min(s.len());
     for k in (1..=max).rev() {
-        if &s.as_bytes()[s.len() - k..] == &tag.as_bytes()[..k] {
+        if s.as_bytes()[s.len() - k..] == tag.as_bytes()[..k] {
             return k;
         }
     }

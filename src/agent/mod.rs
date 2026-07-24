@@ -133,6 +133,7 @@ impl PromptBundle {
         }
     }
 
+    #[allow(dead_code)] // kept: public API mirror of flatten
     pub fn is_empty(&self) -> bool {
         self.stable.trim().is_empty() && self.dynamic.trim().is_empty()
     }
@@ -171,6 +172,18 @@ pub fn build_system_prompt_bundle(
     stable.push_str("</environment>\n");
 
     let mut dynamic = String::new();
+    // Directory-kind hint (code / research / work / large) so recall behaves like a resident
+    // assistant that knows what sort of place it's in. Derived from the LIVE filesystem (not the
+    // passed args), so it belongs in the dynamic lane alongside the other environment-derived blocks
+    // — NOT the pure-args stable prefix, which must stay byte-identical as a function of its inputs.
+    // It's cached per cwd, so it stays byte-stable across turns within a session (zero prefix churn),
+    // and collapses to nothing when the classifier is disabled.
+    if !crate::core::workdir::workdir_disabled() {
+        dynamic.push_str(&format!(
+            "\n<workspace>\nkind: {}\n</workspace>\n",
+            crate::core::workdir::classify().environment_hint()
+        ));
+    }
     // Durable AGENT operating-identity (who the agent IS across every persona/project) — ABOVE the
     // persona costume and the user model. HOME-only + sanitized + fail-closed (see `crate::persona::soul`).
     if let Some(soul) = crate::persona::soul::prompt_block() {
@@ -190,6 +203,14 @@ pub fn build_system_prompt_bundle(
             dynamic.push_str(sb.trim());
             dynamic.push_str("\n</self>\n");
         }
+    } else if let Some(wr) = crate::persona::working_relationship_block() {
+        // NO persona costume active, but the agent has still accumulated a working relationship with
+        // the user across sessions (default self-store, Phase 2). Inject that as a NEUTRAL block —
+        // deliberately NOT a `<persona>`/`<self>` pair, so the agent keeps its own default voice and
+        // no character identity is fabricated. Absent when the store is empty (zero cost).
+        dynamic.push_str("\n<working_relationship>\n");
+        dynamic.push_str(wr.trim());
+        dynamic.push_str("\n</working_relationship>\n");
     }
     if let Some(fc) = frozen_core {
         let fc = fc.trim();
@@ -437,6 +458,7 @@ pub struct AgentConfig {
     /// server). Default ON: tools register and servers spawn lazily on first symbol query (no
     /// process until needed). Set false / `/lsp off` to reclaim RAM and hide the tools. Sub-agents
     /// and workflows keep a separate slim registry (no LSP tools).
+    #[allow(dead_code)] // kept: config-struct field (set by callers; read via LSP.is_enabled elsewhere)
     pub enable_lsp: bool,
     /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
     /// agent turn. Mirrors Helix's 20s default.
@@ -1362,7 +1384,12 @@ where
         // the REPL's `select!` dropping this future mid-batch (Esc) can never leave a dangling
         // `assistant.tool_calls` (strict gateways 400 on that). Real results overwrite the
         // placeholders as they land inside `execute_calls`.
-        let calls = turn.tool_calls.clone();
+        // Move the calls out of the turn now that divergence analysis above no longer needs them
+        // (perf T3). The old `turn.tool_calls.clone()` kept the original Vec alive and then cloned
+        // `calls` AGAIN into the assistant history message — two deep clones of every JSON argument.
+        // `take` removes the first clone; one clone remains because the executor and history both need
+        // independent ownership while tools run.
+        let calls = std::mem::take(&mut turn.tool_calls);
         messages.push(Message {
             role: "assistant".to_string(),
             content: turn.content.clone(),
@@ -1408,7 +1435,15 @@ where
             // a turn that only ran (say) a shell build with no file change costs nothing. Runs AFTER
             // the pre-fill/execute so the snapshot captures the POST-edit tree.
             if cfg.checkpoint_each_edit {
-                match crate::features::timemachine::save("after agent edit", true) {
+                // Run the git checkpoint on the blocking pool (perf 2.3): `save` shells out to git
+                // synchronously (pack objects, write refs) — hundreds of ms to seconds on a big repo —
+                // and running it inline on this async future stalled a tokio worker every editing turn.
+                // `spawn_blocking` moves that off the async workers. Matches the tool-body pattern below.
+                let save_result =
+                    tokio::task::spawn_blocking(|| crate::features::timemachine::save("after agent edit", true))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("checkpoint thread panicked")));
+                match save_result {
                     Ok(snap) => {
                         crate::features::timemachine::note_last_good(snap.id);
                         if !cfg.quiet {
@@ -1502,14 +1537,13 @@ where
                 cfg.conf_high,
                 cfg.conf_spike_delta,
             );
-            if cfg.enable_hill_climb {
-                if todo::snapshot().iter().any(|t| {
+            if cfg.enable_hill_climb
+                && todo::snapshot().iter().any(|t| {
                     t.status != todo::Status::Done
                         && t.hill_climbable.is_some_and(|h| h < cfg.hill_climb_gate)
                 }) {
                     hill_climb_on = true;
                 }
-            }
         }
 
         // P0.3 hill-climb: one-shot reframe + optional cadence remeasure (system nudges).
@@ -1820,7 +1854,16 @@ async fn execute_calls(
                                 && !*auto_checkpointed
                                 && effect.needs_checkpoint()
                             {
-                                match crate::features::timemachine::save_protected_change("before agent edits") {
+                                // Pre-edit checkpoint on the blocking pool (perf 2.3): `save_protected_change`
+                                // shells out to git synchronously; running it inline on this async future
+                                // stalled a tokio worker and couldn't be raced by Esc. `spawn_blocking`
+                                // moves the git work off the async workers, matching the tool-body path.
+                                let pre = tokio::task::spawn_blocking(|| {
+                                    crate::features::timemachine::save_protected_change("before agent edits")
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err(anyhow::anyhow!("checkpoint thread panicked")));
+                                match pre {
                                     Ok(None) => {
                                         if !cfg.quiet {
                                             emit_trace("→ checkpoint unavailable: not a git repository");
@@ -2920,7 +2963,7 @@ fn budget_band(est: usize, window: usize) -> Option<u8> {
 /// out.` Kept terse; the leading `NUDGE_BUDGET` prefix lets `push_nudge` collapse the prior one.
 fn budget_nudge_text(est: usize, window: usize) -> String {
     let remaining = window.saturating_sub(est);
-    let pct_left = if window > 0 { remaining * 100 / window } else { 0 };
+    let pct_left = (remaining * 100).checked_div(window).unwrap_or(0);
     format!(
         "{NUDGE_BUDGET} ~{}/{} tokens used (~{} remaining, {}% left). Spend it deliberately — do \
          not re-read files you already have, and wrap up before it runs out.",
@@ -3140,6 +3183,7 @@ fn compact_args(v: &serde_json::Value) -> String {
 /// target — so the event line reads like a narration of intent (`Write foo.rs`, `Run build.ps1`,
 /// `Search the web`) instead of a bare tool id. Returns `None` for tools with no natural verb, so
 /// [`tool_call_line`] falls back to the raw `name(arg)` shape. Global product → English, always.
+#[allow(dead_code)] // kept: tested API
 fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
     let field = |k: &str| args.get(k).and_then(|v| v.as_str());
     let base = |p: &str| basename(p).to_string();
@@ -3186,7 +3230,7 @@ fn tool_action(name: &str, args: &serde_json::Value) -> Option<String> {
 /// The last path segment of `p` (handles both `/` and `\`), so a long absolute path renders as just
 /// the file name in the action line. Empty stays empty.
 fn basename(p: &str) -> &str {
-    p.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(p)
+    p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
 
 /// The host of a URL for a compact fetch/crawl label — `https://docs.rs/x` → `docs.rs`. Falls back

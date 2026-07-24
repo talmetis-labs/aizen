@@ -176,10 +176,14 @@ impl Tool for SearchFiles {
                     None => return WalkState::Continue, // binary
                 };
                 let rel = dent.path().strip_prefix(&self.root).unwrap_or(dent.path()).to_path_buf();
-                let mut this_file = false;
+                // Collect this file's matches locally, then push them under the shared lock ONCE
+                // (perf T3): the old code took `results.lock()` and cloned `rel` for EVERY matching
+                // line, so a file with many hits hammered the mutex and reallocated the path per
+                // match. Now the lock is taken at most once per file and `rel` is moved in, not cloned.
+                let mut local: Vec<(PathBuf, usize, String)> = Vec::new();
+                let mut capped = false;
                 for (i, line) in text.lines().enumerate() {
                     if re.is_match(line) {
-                        this_file = true;
                         let trimmed = line.trim_end();
                         let shown: String = if trimmed.chars().count() > MAX_LINE_CHARS {
                             trimmed.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
@@ -189,13 +193,18 @@ impl Tool for SearchFiles {
                         let n = match_count.fetch_add(1, Ordering::Relaxed);
                         if n >= max_results {
                             truncated.store(true, Ordering::Relaxed);
+                            capped = true;
                             break;
                         }
-                        results.lock().unwrap().push((rel.clone(), i + 1, shown));
+                        local.push((rel.clone(), i + 1, shown));
                     }
                 }
-                if this_file {
+                if !local.is_empty() {
                     files_hit.fetch_add(1, Ordering::Relaxed);
+                    results.lock().unwrap().extend(local);
+                }
+                if capped {
+                    return WalkState::Quit;
                 }
                 WalkState::Continue
             })

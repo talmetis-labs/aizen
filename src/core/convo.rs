@@ -18,6 +18,7 @@ impl ConversationId {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
+    #[allow(dead_code)] // kept: tested API
     pub fn as_str(&self) -> &str {
         &self.0
     }

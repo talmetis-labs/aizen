@@ -542,6 +542,7 @@ fn persist_owner(chat: i64) {
 /// `name`. Never fails (a bad token just yields username "?" + a poll loop that logs + backs off);
 /// callers that must reject a bad token (`do_add_bot`) validate with `get_me` first. `pairing` is
 /// `Some(code)` only for the primary bot when there's no owner yet.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_bot(
     bots: &Arc<Mutex<HashMap<String, BotHandle>>>,
     menu: &[(String, String)],

@@ -44,6 +44,7 @@ impl std::error::Error for LockBusy {}
 #[derive(Debug)]
 pub struct RepoTxnLock {
     file: File,
+    #[allow(dead_code)] // kept: exposed via mode() accessor / diagnostic state
     mode: LockMode,
 }
 
@@ -77,6 +78,8 @@ impl RepoTxnLock {
             .read(true)
             .write(true)
             .create(true)
+            // Lock file is a coordination handle, not a data file: never clobber existing content.
+            .truncate(false)
             .open(path)
             .with_context(|| format!("opening transaction lock {}", path.display()))?;
 
@@ -98,6 +101,7 @@ impl RepoTxnLock {
         }
     }
 
+    #[allow(dead_code)] // kept: tested accessor
     pub fn mode(&self) -> LockMode {
         self.mode
     }
