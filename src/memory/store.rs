@@ -40,6 +40,19 @@ impl MemoryType {
             _ => MemoryType::Reference,
         }
     }
+
+    /// Like [`MemoryType::parse`] but `None` on an unrecognized value, so a HUMAN's (or model's)
+    /// typo is reported instead of silently filed as `reference`. The lenient `parse` stays the
+    /// right choice for reading files off disk, where a legacy/unknown `type:` must not fail a load.
+    pub fn parse_strict(s: &str) -> Option<MemoryType> {
+        match s.trim().to_lowercase().as_str() {
+            "user" => Some(MemoryType::User),
+            "feedback" => Some(MemoryType::Feedback),
+            "project" => Some(MemoryType::Project),
+            "reference" => Some(MemoryType::Reference),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +250,26 @@ impl MemoryEntry {
     /// A currently-valid (non-superseded) fact.
     pub fn is_active(&self) -> bool {
         self.valid_to.is_none() && self.superseded_by.is_none()
+    }
+
+    /// A short one-line gist for confirmations/listings: the description when there is one, else the
+    /// head of the body flattened to a single line. Never empty-looking, so a "deleted X" message
+    /// always says WHAT was deleted.
+    pub fn description_or_body_head(&self) -> String {
+        let src = if self.description.trim().is_empty() {
+            self.body.trim()
+        } else {
+            self.description.trim()
+        };
+        let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+        let head: String = flat.chars().take(80).collect();
+        if head.is_empty() {
+            "(empty)".to_string()
+        } else if flat.chars().count() > head.chars().count() {
+            format!("{head}…")
+        } else {
+            head
+        }
     }
 }
 
@@ -628,6 +661,103 @@ pub fn record_retrieval(entry: &MemoryEntry, today: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// A partial update to an existing entry: `None` = leave that field exactly as it is on disk.
+/// Every field the patch does not name — including frontmatter keys this build doesn't know about —
+/// survives verbatim, because [`update`] edits the parsed field map instead of re-rendering a
+/// fixed record shape (the mistake `reinforce`/`mark_superseded` make, where each new metadata
+/// field has to be threaded through by hand or it is silently dropped).
+#[derive(Debug, Default, Clone)]
+pub struct EntryPatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub mtype: Option<MemoryType>,
+    pub body: Option<String>,
+    /// `Some(None)` = make it global; `Some(Some(slug))` = move to that zone; `None` = leave alone.
+    pub scope: Option<Option<String>>,
+    /// Keep `updated:` exactly as it is on disk instead of stamping today. For BOOKKEEPING-only
+    /// patches (zone migration retag): `updated` is the store's aging clock (decay, the inferred
+    /// LRU cap, recency ranking), and a mass retag that stamped it would make every migrated
+    /// fact look freshly touched — evicting the user's genuinely-active facts first.
+    pub preserve_updated: bool,
+}
+
+impl EntryPatch {
+    /// Does this patch actually change anything?
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.description.is_none()
+            && self.mtype.is_none()
+            && self.body.is_none()
+            && self.scope.is_none()
+    }
+}
+
+/// Apply a partial update to an existing entry in place, preserving every field the patch does not
+/// name, and stamping `updated` = today. Re-reads the file first so a concurrent reinforce isn't
+/// clobbered. The file NAME (and therefore the id) never changes — renaming would break
+/// `supersededBy` pointers and the co-retrieval graph, so `name:` is display-only here.
+pub fn update(entry: &MemoryEntry, patch: &EntryPatch) -> Result<()> {
+    if patch.is_empty() {
+        anyhow::bail!("nothing to update (pass at least one field)");
+    }
+    let raw = fs::read_to_string(&entry.path)
+        .with_context(|| format!("reading {} to update", entry.path.display()))?;
+    let fm = frontmatter::parse(&raw);
+    let mut fields = fm.fields.clone();
+    if let Some(n) = patch.name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        fields.insert("name".to_string(), n.to_string());
+    }
+    if let Some(d) = patch.description.as_ref() {
+        let d = d.trim();
+        if d.is_empty() {
+            fields.remove("description");
+        } else {
+            fields.insert("description".to_string(), d.to_string());
+        }
+    }
+    if let Some(t) = patch.mtype {
+        fields.insert("type".to_string(), t.as_str().to_string());
+    }
+    if let Some(s) = patch.scope.as_ref() {
+        match s.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(slug) => {
+                fields.insert("scope".to_string(), slug.to_string());
+            }
+            None => {
+                fields.remove("scope");
+            }
+        }
+    }
+    // A well-formed entry always carries a type; a fence-less hand-authored file may not.
+    fields.entry("type".to_string()).or_insert_with(|| entry.mtype.as_str().to_string());
+    fields.entry("created".to_string()).or_insert_with(today);
+    if !patch.preserve_updated {
+        fields.insert("updated".to_string(), today());
+    }
+    let body = patch.body.as_deref().unwrap_or(&fm.body);
+    let content = frontmatter::serialize(&fields, body, LEARNED_KEY_ORDER);
+    write_atomic(&entry.path, &content)?;
+    Ok(())
+}
+
+/// Soft-delete: move the entry into the recoverable archive (`aizen memory restore <id>` brings it
+/// back). This is the ONLY delete exposed to the agent — the store's whole design is
+/// "never lose a fact", so a model deciding something is obsolete must not be able to destroy it.
+/// Returns the archived id.
+pub fn retire(entry: &MemoryEntry) -> Result<String> {
+    crate::memory::bloat::caps::archive_entry(entry)
+}
+
+/// Hard-delete an ARCHIVED entry's file. Human-only (the CLI's `memory purge`); irreversible.
+pub fn purge_archived(id: &str) -> Result<()> {
+    let path = config::archive_dir().join(format!("{}.md", id.to_lowercase()));
+    if !path.exists() {
+        anyhow::bail!("no archived memory '{id}' ({})", path.display());
+    }
+    fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
+    Ok(())
+}
+
 /// Write atomically: temp file + rename. The temp name is unique per (process, write) so two `ng`
 /// processes (or threads) writing the same entry never collide on a shared `.entry.md.tmp` and
 /// clobber each other's rename. (P4 adds advisory locking + drift check.)
@@ -702,6 +832,96 @@ mod tests {
         assert!(reload(&legacy).scope.is_none(), "no scope key → global");
         let g = add_scoped("explicit global", "", MemoryType::User, "b", Some("global")).unwrap();
         assert!(reload(&g).scope.is_none(), "literal 'global' → None");
+
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_patches_named_fields_and_preserves_the_rest() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+
+        let w = LearnedWrite {
+            name: "deploy note",
+            description: "old summary",
+            mtype: MemoryType::Project,
+            body: "deploys from ci",
+            source: crate::memory::provenance::ProvenanceKind::Inferred,
+            confidence: 0.7,
+            session_id: "s1",
+            no_core: true,
+            scope: Some("proj-0a1b2c3d".into()),
+            subpath: Some("src/agent".into()),
+        };
+        let id = add_learned(&w).unwrap();
+        let reload = |id: &str| {
+            let id = id.to_string();
+            load_all().unwrap().into_iter().find(|e| e.id == id).unwrap()
+        };
+        let before = reload(&id);
+
+        // patch the body only — every other field must survive untouched
+        update(&before, &EntryPatch { body: Some("deploys from the tag workflow".into()), ..Default::default() }).unwrap();
+        let after = reload(&id);
+        assert_eq!(after.body, "deploys from the tag workflow");
+        assert_eq!(after.description, "old summary", "unnamed field kept");
+        assert_eq!(after.mtype, MemoryType::Project);
+        assert_eq!(after.scope.as_deref(), Some("proj-0a1b2c3d"), "zone not silently promoted to global");
+        assert_eq!(after.subpath.as_deref(), Some("src/agent"), "unknown-to-the-patch field kept");
+        assert!(after.core_denied, "an explicit core deny survives an edit");
+        assert_eq!(after.confidence, 0.7);
+        assert_eq!(after.created, before.created, "created is immutable");
+        assert_eq!(after.updated.as_deref(), Some(today().as_str()), "updated is stamped");
+
+        // the id (filename) never moves, even when the display name changes
+        update(&after, &EntryPatch { name: Some("deploy note v2".into()), mtype: Some(MemoryType::Reference), ..Default::default() }).unwrap();
+        let renamed = reload(&id);
+        assert_eq!(renamed.id, id, "id is stable so supersededBy / graph edges stay valid");
+        assert_eq!(renamed.name, "deploy note v2");
+        assert_eq!(renamed.mtype, MemoryType::Reference);
+        assert_eq!(renamed.body, "deploys from the tag workflow", "body kept across a name-only patch");
+
+        // description → empty clears the key; scope → Some(None) re-globalizes deliberately
+        update(&renamed, &EntryPatch { description: Some(String::new()), scope: Some(None), ..Default::default() }).unwrap();
+        let cleared = reload(&id);
+        assert!(cleared.description.is_empty());
+        assert!(cleared.scope.is_none(), "explicit Some(None) moves the fact global");
+
+        assert!(update(&cleared, &EntryPatch::default()).is_err(), "an empty patch is a caller bug");
+
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retire_is_recoverable_and_purge_is_not() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-retire-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("NEXTGEN_HOME", &dir);
+
+        let id = add("obsolete fact", "", MemoryType::User, "no longer true").unwrap();
+        let e = load_all().unwrap().into_iter().find(|x| x.id == id).unwrap();
+
+        let archived = retire(&e).unwrap();
+        assert!(!load_all().unwrap().iter().any(|x| x.id == id), "retired fact leaves the live store");
+        assert!(
+            crate::memory::bloat::caps::list_archive().unwrap().iter().any(|x| x.id == archived),
+            "…but is recoverable from the archive"
+        );
+        crate::memory::bloat::caps::restore(&archived).unwrap();
+        assert!(load_all().unwrap().iter().any(|x| x.id == id), "restore brings it back");
+
+        // purge is the human-only irreversible path, and only reaches ARCHIVED files
+        let e = load_all().unwrap().into_iter().find(|x| x.id == id).unwrap();
+        assert!(purge_archived(&id).is_err(), "a LIVE fact is never purgeable");
+        let archived = retire(&e).unwrap();
+        purge_archived(&archived).unwrap();
+        assert!(crate::memory::bloat::caps::list_archive().unwrap().is_empty(), "purge really deletes");
+        assert!(purge_archived(&archived).is_err(), "purging twice is an error, not a silent no-op");
 
         std::env::remove_var("NEXTGEN_HOME");
         let _ = fs::remove_dir_all(&dir);

@@ -141,6 +141,35 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// footer's own working pill is driven by the render thread's `AppState`, fed via [`set_working`].
 static WORKING: AtomicBool = AtomicBool::new(false);
 
+/// Whether the REPL currently owns stdin for a `dialoguer` menu — set by [`suspend`], cleared by
+/// [`resume`]. The input thread nurses this on every iteration and releases the keyboard (dropping
+/// raw mode) for as long as it is set.
+///
+/// This flag replaced a park decision the input thread used to make on its own, by matching the
+/// slash name against a table and then blocking on the resume channel. Two things went wrong with
+/// that. The table was a *second* copy of `main.rs`'s interactive-command list and had drifted from
+/// it, so a command the REPL never suspended for could still park the keyboard until some unrelated
+/// resume signal arrived. And the decision read `WORKING` at the moment the key was pressed while
+/// the REPL suspends at the moment it dequeues — type `/config` mid-turn and the two disagreed, so
+/// the input thread kept reading keys (re-asserting raw mode every iteration) underneath the menu
+/// that was trying to read them. Observing the real suspend/resume edges cannot drift and cannot
+/// deadlock: nothing blocks forever waiting for a signal that no longer matches.
+static KEYBOARD_PARKED: AtomicBool = AtomicBool::new(false);
+
+/// Acknowledgement for the flag above: set by the input thread once it has actually left the read
+/// path and dropped raw mode, cleared when it takes the keyboard back. [`suspend`] waits on this
+/// (bounded) so a `dialoguer` menu never opens while the reader is still inside its 1s `event::poll`
+/// and would consume one more key — or re-assert raw mode — underneath the menu.
+static KEYBOARD_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// Serializes tests that arm/cancel the process-global turn slot below.
+///
+/// `ACTIVE_TURN_CANCEL` is one slot for the whole process, and `request_cancel` cancels whatever
+/// happens to be in it. Two tests exercising cancellation at once would therefore cancel each
+/// other's token — a real race, not a theoretical one, since cargo runs tests in parallel threads.
+#[cfg(test)]
+pub(crate) static TEST_CANCEL_LOCK: Mutex<()> = Mutex::new(());
+
 /// Turn-scoped cancellation handle currently armed by the interactive REPL.
 ///
 /// Unlike the old process-global latch, this slot only points at the active logical turn. Children
@@ -176,6 +205,20 @@ pub fn request_cancel() {
 /// Current interactive token, exposed to synchronous pollers outside a tool scope.
 pub fn active_cancel_token() -> Option<crate::core::cancel::TurnCancel> {
     active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Is there cancellable work in flight? `true` when the working pill is up OR a cancel token is
+/// armed — and Esc keys off THIS, never off `WORKING` alone.
+///
+/// The two are not the same window. Between dequeuing a submission and flipping `WORKING`, the REPL
+/// does real, slow work: prompt-lane rebuild, codebase retrieval, a recovery checkpoint, LSP arming,
+/// registry construction. `WORKING` is still false for all of it, so an Esc pressed there used to
+/// fall through to the idle branch and merely clear the draft — the turn then started anyway. That
+/// window is per-queued-message, which is why it bit hardest while a queue was draining. Arming the
+/// token first and testing it here makes Esc live for the whole turn, prep included.
+pub fn turn_in_flight() -> bool {
+    WORKING.load(Ordering::Relaxed)
+        || active_turn_cancel().lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 /// Whimsical present-tense verbs cycled (slowly, every ~3s) in the working pill — the "still
@@ -630,10 +673,36 @@ pub fn install_panic_hook() {
 /// The render thread drops the alternate screen and stops painting, but keeps folding `Command::Emit`
 /// into its block buffer — so output produced *during* the menu survives and [`resume`] redraws it.
 pub fn suspend() {
+    // Park the keyboard FIRST: the input thread must stop re-asserting raw mode before
+    // `prepare_dialoguer_session` puts stdin back into cooked mode, or the two race and the menu
+    // reads nothing. Set unconditionally (even when retained isn't running) so the plain REPL's
+    // dialoguer menus get the same protection.
+    KEYBOARD_PARKED.store(true, Ordering::SeqCst);
+    // Then WAIT for the acknowledgement. Setting the flag isn't enough on its own: the input thread
+    // can be sitting inside a 1s `event::poll`, so it would still consume one more key — and worse,
+    // re-assert raw mode — after the menu had already taken the terminal. `KEYBOARD_RELEASED` is set
+    // by the input thread only once it has actually dropped out of the read path. The deadline is the
+    // safety valve: a missing ack (no input thread at all — the plain REPL, a pipe, tests) must never
+    // hang the menu, so we cap the wait and proceed.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while !KEYBOARD_RELEASED.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     if retained::is_running() {
         retained::suspend();
         prepare_dialoguer_session();
     }
+}
+
+/// Whether the input thread should stand down because a `dialoguer` menu owns stdin.
+pub fn keyboard_parked() -> bool {
+    KEYBOARD_PARKED.load(Ordering::SeqCst)
+}
+
+/// Called by the input thread to report whether it currently holds the keyboard. [`suspend`] waits on
+/// this so a menu never opens while the reader is still mid-`poll`.
+pub(crate) fn note_keyboard_released(released: bool) {
+    KEYBOARD_RELEASED.store(released, Ordering::SeqCst);
 }
 
 /// Re-enter the retained frame after a slash menu. The render thread re-enters the alternate screen
@@ -647,6 +716,11 @@ pub fn resume(status: &str) {
     if retained::is_running() {
         let _ = retained::resume(status);
     }
+    // Hand the keyboard back LAST — after the retained frame is painted again, so the first keystroke
+    // can't be read against a screen that isn't up yet. This is the release half of the pairing with
+    // `suspend`: while the flag is set the input thread holds no stdin at all, so forgetting to clear
+    // it here would wedge input permanently (every key ignored, no way to type or quit).
+    KEYBOARD_PARKED.store(false, Ordering::SeqCst);
 }
 
 /// Whether an `emit` capture session is in progress. When set, `emit`/`emit_line` accumulate into
@@ -1268,6 +1342,26 @@ fn input_loop(
     }
 
     loop {
+        // STAND DOWN while a `dialoguer` menu owns stdin. This is the whole fix for the input freeze:
+        // the flag is set by `suspend()` itself, so it can't disagree with who actually holds the
+        // terminal, and we spin on a short sleep instead of blocking on a resume signal — a menu that
+        // exits by an unexpected path can never leave the keyboard wedged forever. Raw mode is dropped
+        // once on the parking edge so the menu's cooked mode survives (the re-assert below is what used
+        // to clobber it every iteration).
+        if KEYBOARD_PARKED.load(Ordering::SeqCst) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            // Tell `suspend()` the keyboard is genuinely out of the way. It blocks on this (with a
+            // deadline) before handing stdin to the menu, so the menu can't open while we're still
+            // finishing a `poll`.
+            KEYBOARD_RELEASED.store(true, Ordering::SeqCst);
+            while KEYBOARD_PARKED.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            KEYBOARD_RELEASED.store(false, Ordering::SeqCst);
+            // Drain resume pings buffered by the old park protocol so they can't unpark a later menu.
+            while resume_rx.try_recv().is_ok() {}
+            last_activity = Instant::now();
+        }
         // Raw mode is required for crossterm's event reader (no line buffering / echo). Re-assert it
         // every iteration: it's idempotent, and a slash command that parked us for a `dialoguer` menu
         // flips stdin back to cooked mode (see `prepare_dialoguer_session`) — re-enabling here restores
@@ -1293,6 +1387,10 @@ fn input_loop(
             if !have_event {
                 if !screensaver_up
                     && retained::is_active()
+                    // Same sixel gate as the startup card above. Without it this path fires every
+                    // 15 idle seconds on a terminal that cannot decode sixel — the startup blit was
+                    // gated but this one was not, so the freeze came back on a timer.
+                    && crate::ui::splash::logo_is_sixel()
                     && !WORKING.load(Ordering::Relaxed)
                     && !APPROVAL_PENDING.load(Ordering::Relaxed)
                     && !model_menu_active()
@@ -1364,11 +1462,23 @@ fn input_loop(
                             continue;
                         }
                     }
-                    // Esc while a selection is active just clears it (does not quit / cancel turn).
+                    // Esc with a live mouse selection clears the selection — but ONLY when there is no
+                    // turn to stop. Stopping the agent always outranks dropping a highlight.
+                    //
+                    // This branch used to consume Esc unconditionally, and `selecting` is only cleared
+                    // on a left-button RELEASE. Press inside the transcript and release anywhere the
+                    // terminal doesn't report (drag out of a small panel, focus lost mid-drag) and the
+                    // state stays `Some` for the rest of the session — from then on EVERY Esc was eaten
+                    // here and cancel never ran. Falling through while a turn is in flight (and clearing
+                    // the stale selection on the way) means a missed mouse-up can no longer disarm Esc.
                     if ke.code == KeyCode::Esc && selecting.is_some() {
                         selecting = None;
                         retained::clear_selection();
-                        continue;
+                        if !turn_in_flight() {
+                            continue; // idle: dropping the highlight is the whole action
+                        }
+                        // A turn IS running: the highlight is gone, but this Esc still has to reach
+                        // the cancel arm below, so don't consume it.
                     }
                     match crossterm_to_console_key(ke) {
                         Some(k) => break k,
@@ -1404,10 +1514,24 @@ fn input_loop(
         // y/n/a decision to the blocked gate and never treat it as draft input. Other keys are
         // ignored so a stray press can't accidentally approve.
         if APPROVAL_PENDING.load(Ordering::Relaxed) {
+            // Esc at an approval prompt means "stop", not merely "deny this one". Denying alone hands
+            // the model an `error: denied` string and it keeps going — the user presses Esc, watches the
+            // turn continue, and concludes cancel is broken. So answer the blocked gate with `n` (it is
+            // waiting on that channel and would otherwise hang forever) AND request cancellation, so the
+            // loop unwinds instead of proceeding to the next tool call.
+            if matches!(key, Key::Escape) {
+                if let Some(tx) = approval_slot().lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = tx.send('n');
+                }
+                request_cancel();
+                let _ = cancel_tx.send(());
+                crate::core::steer::clear();
+                continue;
+            }
             let decided = match key {
                 Key::Char('y') | Key::Char('Y') => Some('y'),
                 Key::Char('a') | Key::Char('A') => Some('a'),
-                Key::Char('n') | Key::Char('N') | Key::Escape => Some('n'),
+                Key::Char('n') | Key::Char('N') => Some('n'),
                 _ => None,
             };
             if let Some(c) = decided {
@@ -1474,20 +1598,14 @@ fn input_loop(
                 repaint();
                 if let Some(name) = pick {
                     history.push(format!("/{name}"));
-                    let park = slash_parks_input_thread(&name);
                     if sub_tx.send(Submission::Slash(name)).is_err() {
                         return;
                     }
                     note_submission_enqueued();
-                    // Park to hand stdin to the REPL's dialoguer menu — but ONLY when idle. While the
-                    // agent is working the REPL is blocked in its turn `select!` and won't consume this
-                    // Slash until the turn ends; parking now would freeze ALL input (typing, queueing,
-                    // even Esc) for the whole turn — the confirmed "can't chat while working" freeze.
-                    // When working: leave it queued, keep reading keys; the REPL runs it after the turn.
-                    if !WORKING.load(Ordering::Relaxed) && park {
-                        while resume_rx.try_recv().is_ok() {} // discard resume buffered by a deferred slash
-                        let _ = resume_rx.recv();
-                    }
+                    // No park decision here: the command is only queued, and whether it opens a menu
+                    // is the REPL's business (it calls `suspend`, which raises `KEYBOARD_PARKED` and
+                    // the loop head stands down). Deciding here meant guessing from the name, at the
+                    // wrong moment — see `KEYBOARD_PARKED`.
                     continue;
                 }
                 let trimmed = line.trim().to_string();
@@ -1513,17 +1631,13 @@ fn input_loop(
                     line = rest.trim().to_string();
                 }
                 if let Some(cmd) = trimmed.strip_prefix('/').filter(|_| images == 0) {
-                    let park = slash_parks_input_thread(cmd);
+                    // No park decision here either (see the pick branch): if this command opens a
+                    // menu, the REPL's `suspend()` raises KEYBOARD_PARKED and the loop head stands
+                    // down — whenever that actually happens, including after a turn finishes.
                     if sub_tx.send(Submission::Slash(cmd.to_string())).is_err() {
                         return;
                     }
                     note_submission_enqueued();
-                    // Park to hand stdin to the dialoguer menu only when idle (see the pick branch):
-                    // parking mid-turn would freeze all input until the turn ends.
-                    if !WORKING.load(Ordering::Relaxed) && park {
-                        while resume_rx.try_recv().is_ok() {} // discard resume buffered by a deferred slash
-                        let _ = resume_rx.recv();
-                    }
                 } else {
                     // Image data URLs aren't carried here (the box only tracks a count); the REPL
                     // resolves attachments — for now we forward the text and image count is folded in
@@ -1537,7 +1651,10 @@ fn input_loop(
                 }
             }
             Key::Escape | Key::Char('\u{3}') | Key::Char('\u{4}') | Key::CtrlC => {
-                if WORKING.load(Ordering::Relaxed) {
+                // Key off `turn_in_flight`, not `WORKING`: the latter is false during turn PREP
+                // (retrieval, checkpoint, registry build), and an Esc there used to be swallowed as
+                // "clear the draft" while the turn went on to start anyway.
+                if turn_in_flight() {
                     request_cancel(); // cooperative: lets a running tool (e.g. a long shell) abort now
                     let _ = cancel_tx.send(()); // and wake the REPL's select! at the next yield point
                     // Esc means "stop everything" — a steer aimed at the turn being killed is moot, and
@@ -2078,10 +2195,6 @@ fn text_overlay_finish() {
 }
 
 /// Whether the input thread should park on `resume` after dispatching this slash (false for native overlays).
-pub fn slash_parks_keyboard_thread(name: &str) -> bool {
-    slash_parks_input_thread(name)
-}
-
 /// Drop sticky overlays and reset Windows stdin to cooked line mode (echo + line input).
 pub fn prepare_dialoguer_session() {
     if model_menu_active() {
@@ -2310,13 +2423,24 @@ fn text_overlay_handle_key(key: &Key) -> bool {
     }
 }
 
-fn slash_parks_input_thread(input: &str) -> bool {
+/// Whether this slash command line opens a `dialoguer` menu (or a daemon) that takes over stdin, so
+/// the REPL must [`suspend`] the retained frame before running it.
+///
+/// ONE table, consumed by the REPL only. The input thread no longer makes this decision — it observes
+/// [`suspend`]/[`resume`] via `KEYBOARD_PARKED` instead. Previously `main.rs::slash_is_interactive`
+/// held a second, drifted copy which matched the whole input line, so `/timeline pick` and
+/// `/tools menu` ran their menus without suspending at all.
+///
+/// Takes the FULL command line, because whether stdin is claimed depends on the argument: bare
+/// `/timeline` prints, `/timeline pick` opens a picker; bare `/effort` drags a slider, `/effort high`
+/// just sets it.
+pub fn slash_takes_stdin(input: &str) -> bool {
     let mut parts = input.trim().splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
     let arg = parts.next().unwrap_or("").trim();
-    // Only commands which directly own stdin (dialoguer / slider / daemon) park the keyboard thread.
-    // Native overlays and every other command keep it alive; unknown/custom commands may expand to a
-    // chat prompt and must not deadlock waiting for a resume signal.
+    // Only commands which directly own stdin (dialoguer / slider / daemon) qualify. Native overlays
+    // and pure-print commands run with the sticky box still up, so their output flows into the scroll
+    // region instead of being painted over on resume.
     matches!(
         name,
         "config"
@@ -2593,6 +2717,46 @@ mod tests {
         assert!(!session_allow_all(), "reset clears it");
     }
 
+    /// The Esc-responsiveness invariant, pinned end to end.
+    ///
+    /// `turn_in_flight` — not `WORKING` — is what the input thread keys Esc off. `WORKING` is only
+    /// flipped immediately before the model call, so it is FALSE for the whole prep stretch
+    /// (retrieval, checkpoint, LSP spawn, registry build). An armed token has to cover that window,
+    /// or Esc lands in the idle branch and just clears the draft while the turn starts anyway. All
+    /// three phases are asserted in one test because the state is process-global — splitting them
+    /// would let the phases race each other across parallel test threads.
+    #[test]
+    fn esc_is_live_across_prep_working_and_teardown() {
+        let _g = TEST_CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let token = crate::core::cancel::TurnCancel::new();
+        // Sanity: a clean slot with no turn reports idle, so Esc clears the draft (and Ctrl-C quits).
+        disarm_cancel(&token);
+        WORKING.store(false, Ordering::Relaxed);
+
+        // PREP — armed, but `WORKING` is still false. This is the window the bug lived in.
+        arm_cancel(token.clone());
+        assert!(!WORKING.load(Ordering::Relaxed), "prep runs before the working pill goes up");
+        assert!(turn_in_flight(), "an armed token alone must make Esc mean cancel");
+        request_cancel();
+        assert!(token.is_cancelled(), "Esc during prep must reach the turn's token");
+
+        // WORKING — the classic window; still in flight.
+        let token2 = crate::core::cancel::TurnCancel::new();
+        arm_cancel(token2.clone());
+        WORKING.store(true, Ordering::Relaxed);
+        assert!(turn_in_flight());
+
+        // TEARDOWN — the REPL clears both; Esc goes back to being a draft-clear.
+        WORKING.store(false, Ordering::Relaxed);
+        disarm_cancel(&token2);
+        assert!(!turn_in_flight(), "no turn ⇒ Esc must not be treated as cancel");
+        // Identity-checked disarm: a finished OLD turn cannot disarm the one running now.
+        arm_cancel(token2.clone());
+        disarm_cancel(&token);
+        assert!(turn_in_flight(), "a stale token's disarm must not clear a newer turn");
+        disarm_cancel(&token2);
+    }
+
     #[test]
     fn tips_are_nonempty_one_line_and_rotate() {
         // Every tip must be a single non-empty line (they render on one dim row under the message).
@@ -2706,18 +2870,48 @@ mod tests {
 
     #[test]
     fn slash_parking_only_claims_direct_stdin_owners() {
-        assert!(slash_parks_input_thread("config"));
-        assert!(slash_parks_input_thread("sessions"));
-        assert!(slash_parks_input_thread("effort"));
-        assert!(!slash_parks_input_thread("effort status"));
-        assert!(slash_parks_input_thread("timeline pick"));
-        assert!(!slash_parks_input_thread("timeline"));
-        assert!(!slash_parks_input_thread("memory"));
-        assert!(!slash_parks_input_thread("memory rust"));
-        assert!(slash_parks_input_thread("tools menu"));
-        assert!(!slash_parks_input_thread("tools list"));
-        assert!(!slash_parks_input_thread("help"));
-        assert!(!slash_parks_input_thread("custom-command arg"));
+        assert!(slash_takes_stdin("config"));
+        assert!(slash_takes_stdin("sessions"));
+        assert!(slash_takes_stdin("effort"));
+        assert!(!slash_takes_stdin("effort status"));
+        assert!(slash_takes_stdin("timeline pick"));
+        assert!(!slash_takes_stdin("timeline"));
+        assert!(!slash_takes_stdin("memory"));
+        assert!(!slash_takes_stdin("memory rust"));
+        assert!(slash_takes_stdin("tools menu"));
+        assert!(!slash_takes_stdin("tools list"));
+        assert!(!slash_takes_stdin("help"));
+        assert!(!slash_takes_stdin("custom-command arg"));
+    }
+
+    #[test]
+    fn stdin_ownership_is_decided_per_argument_not_per_name() {
+        // The freeze came from TWO tables disagreeing: `main.rs` matched only the bare NAME, so
+        // `/timeline pick` and `/tools menu` opened a dialoguer picker without suspending the retained
+        // frame, while this table (the keyboard's copy) parked for them. `/memory` was the mirror
+        // image — main suspended, the keyboard didn't. One argument-aware table now answers both.
+        for line in ["timeline pick", "timeline restore", "tm open", "tools menu", "toolsets toggle", "effort"] {
+            assert!(slash_takes_stdin(line), "/{line} opens a picker → must suspend");
+        }
+        // Same command names WITHOUT the menu argument only print, so the box stays up.
+        for line in ["timeline", "tm", "tools", "tools list", "effort high", "memory", "mem rust"] {
+            assert!(!slash_takes_stdin(line), "/{line} is pure-print → keep the sticky box");
+        }
+    }
+
+    #[test]
+    fn keyboard_park_flag_tracks_suspend_and_resume() {
+        // Drive the REAL entry points, not the flag. An earlier version of this test stored the
+        // atomic by hand and passed while `resume()` did not clear it at all — which is the worst
+        // possible bug here: the input thread stands down on the flag, so one stuck `true` wedges
+        // the keyboard for the rest of the session. Off-TTY `suspend`/`resume` skip their retained
+        // halves but still own this flag, so the edges are assertable in a unit test.
+        let _g = TEST_CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!keyboard_parked(), "idle: the keyboard owns stdin");
+        suspend();
+        assert!(keyboard_parked(), "suspend() must park the keyboard before a menu takes stdin");
+        resume("status");
+        assert!(!keyboard_parked(), "resume() must hand the keyboard back, or input is dead");
     }
 
 }

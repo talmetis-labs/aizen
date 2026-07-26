@@ -516,6 +516,13 @@ mod tests {
         let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ng-skill-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        // MUST exist before the first `project_slug()` call: that slug hashes `canonicalize(root)`,
+        // which FAILS on a missing dir and falls back to the plain path — a different string, so a
+        // different slug (on Windows canonicalize also adds the `\\?\` verbatim prefix). Creating the
+        // zone dir mid-test would then move `project_zone_dir()` out from under `load`/`list` as soon
+        // as the single-entry slug cache is evicted by another test, which is how the zone test
+        // failed only in a full run.
+        let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("NEXTGEN_HOME", &dir);
         // Pin the project root into the same isolated temp dir so project-local skill discovery
         // doesn't pick up the real repo's `.nextgen/skills/` and skew these HOME-only assertions.

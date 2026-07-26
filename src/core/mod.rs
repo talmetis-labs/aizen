@@ -9,6 +9,7 @@ pub mod convo;
 pub mod config;
 pub mod effort;
 pub mod exec_ctx;
+pub mod gitx;
 pub mod net_guard;
 pub mod proctree;
 pub mod steer;

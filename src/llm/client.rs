@@ -275,6 +275,46 @@ fn rand_u64() -> u64 {
     u64::from_le_bytes(b)
 }
 
+/// Longest SILENCE tolerated inside a live SSE stream before we declare it dead.
+///
+/// This is the fix for a confirmed hang: `send_with_retry` protects the request, but once the
+/// provider answers 200 the `while let Some(event) = stream.next().await` loop had NO deadline at
+/// all. A gateway that accepts the request and then stops writing (dropped upstream socket, a
+/// load-balancer holding the connection open, a rate-limit stall) parks that loop forever — the
+/// turn never fails, never returns, and the only way out is Esc + asking the model to continue.
+/// reqwest's `read_timeout` is the backstop at 300s, which is far past the point where a person
+/// concludes the tool is broken.
+const STREAM_STALL_SECS: u64 = 90;
+
+/// Env override for the stall deadline, clamped to a sane band. A reasoning model can legitimately
+/// think for a long time before its first token, so the floor stays generous.
+const STREAM_STALL_ENV: &str = "AIZEN_STREAM_STALL_SECS";
+
+/// Resolve the inter-event stall deadline: env override (clamped 15s..=1800s) or the default.
+fn stream_stall_timeout() -> std::time::Duration {
+    let secs = std::env::var(STREAM_STALL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(15, 1800))
+        .unwrap_or(STREAM_STALL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// How many times a stream that died BEFORE producing anything is replayed. Bounded and only ever
+/// on the blank case — see `stream_chat_with_tools_eager`.
+const STREAM_BLANK_RETRIES: u32 = 2;
+
+/// Tell the user the stream stalled and is being replayed. Routed through the TUI funnel: a raw
+/// `eprintln!` here would be painted over by the retained render thread.
+fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
+    let line = format!("⟳ stream died before any output ({reason}) — retrying {attempt}/{max} in {delay_ms}ms");
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
+    } else {
+        eprintln!("{line}");
+    }
+}
+
 /// Full-jitter backoff: a uniform delay in `[ceil/2, ceil]`. Jitter spreads retries so a fleet of
 /// callers doesn't thunder back in lock-step after a shared 503.
 fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
@@ -532,11 +572,22 @@ pub async fn stream_chat_with_visual_contract(
     // newline below still runs (a clean line break before the error surfaces) — same invariant
     // as `stream_chat_with_tools`.
     let mut stream_err: Option<anyhow::Error> = None;
-    while let Some(event) = stream.next().await {
-        let event = match event {
-            Ok(e) => e,
-            Err(e) => {
+    // Same stall watchdog as the tool-calling path: a provider that answers 200 and then goes quiet
+    // would otherwise park this loop until reqwest's 300s read timeout — and only if it withholds
+    // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
+    // eager handles to detach and its caller already prints the error.
+    let stall = stream_stall_timeout();
+    loop {
+        let event = match tokio::time::timeout(stall, stream.next()).await {
+            Ok(Some(Ok(e))) => e,
+            Ok(Some(Err(e))) => {
                 stream_err = Some(anyhow!("SSE stream error: {e}"));
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                stream_err =
+                    Some(anyhow!("SSE stream error: timeout — no data for {}s", stall.as_secs()));
                 break;
             }
         };
@@ -817,13 +868,21 @@ pub async fn stream_chat_with_tools_eager(
         reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone()),
     };
 
+    // BLANK-STREAM REPLAY. The request layer (`send_with_retry`) only covers failures that happen
+    // before the 200; a stream that is accepted and then dies or goes silent used to leave the turn
+    // parked forever with nothing to show. Retry the whole call, but ONLY while the stream has
+    // produced literally nothing (no text, no tool-call fragment, no usage): re-sending after
+    // partial output would duplicate text in the transcript or resurrect a half-streamed tool call.
+    // Once anything has arrived we fall through to the existing error path and let the caller decide.
+    let mut blank_attempt: u32 = 0;
+    loop {
     // Spinner during the "thinking" gap: from request send until the first token / tool delta
     // streams back. TTY-only (silent no-op on pipes/CI). Cleared before any output is printed.
     // Suppressed under the sticky TUI — its box shows the "⚡ working…" indicator instead, and a
     // carriage-return spinner would fight the pinned footer.
     let mut spin = if crate::ui::tui::active() { None } else { Some(crate::ui::spinner::Spinner::start("thinking")) };
 
-    let resp = match send_chat(client, &url, api_key, body).await {
+    let resp = match send_chat(client, &url, api_key, body.clone()).await {
         Ok(r) => r,
         Err(e) => {
             spin.take(); // clear the spinner before surfacing the error
@@ -853,11 +912,30 @@ pub async fn stream_chat_with_tools_eager(
     // the terminal with a half-rendered line or an UNCLOSED code-fence box that corrupts every
     // subsequent turn. Capture the error, break, flush the display to a clean state, THEN propagate.
     let mut stream_err: Option<anyhow::Error> = None;
-    while let Some(event) = stream.next().await {
-        let event = match event {
-            Ok(e) => e,
-            Err(e) => {
+    // IDLE WATCHDOG. `reqwest`'s `read_timeout` fires only on a socket that delivers no BYTES; a
+    // gateway that keeps the connection warm with comment/keepalive frames, or an upstream that
+    // stalls after `role`, satisfies it forever — so the turn hung with no cap at all. Bound the gap
+    // between USEFUL events instead, and re-arm the timer on every one.
+    let idle_cap = stream_stall_timeout();
+    // Has this stream produced anything a retry would duplicate? Text, a tool-call fragment, or a
+    // usage report all count. Governs both the watchdog's error wording and blank-stream replay.
+    let mut produced = false;
+    loop {
+        let event = match tokio::time::timeout(idle_cap, stream.next()).await {
+            Ok(Some(Ok(e))) => e,
+            Ok(Some(Err(e))) => {
                 stream_err = Some(anyhow!("SSE stream error: {e}"));
+                break;
+            }
+            Ok(None) => break, // stream ended without [DONE]
+            Err(_) => {
+                // No useful frame for `idle_cap`. Name it as a stall so the transcript says why the
+                // turn ended, and mark it Transient-shaped ("timeout") for goal-mode classification.
+                stream_err = Some(anyhow!(
+                    "SSE stream error: timeout — no data for {}s{}",
+                    idle_cap.as_secs(),
+                    if produced { " (stream stalled mid-response)" } else { " (stream never started)" }
+                ));
                 break;
             }
         };
@@ -877,6 +955,7 @@ pub async fn stream_chat_with_tools_eager(
                     if chunk.choices.is_empty() {
                         cost_meter().record(u);
                         final_usage = Some(u.clone());
+                        produced = true; // a usage report means the call really was billed
                     }
                 }
                 if let Some(choice) = chunk.choices.first() {
@@ -888,6 +967,7 @@ pub async fn stream_chat_with_tools_eager(
                     }
                     if let Some(content) = &choice.delta.content {
                         spin.take(); // stop+clear the spinner before the first token prints
+                        produced = true; // even a content delta filtered to nothing was real output
                         let shown = think.push(content);
                         if !shown.is_empty() {
                             full.push_str(&shown); // history keeps the RAW markdown
@@ -904,6 +984,7 @@ pub async fn stream_chat_with_tools_eager(
                     }
                     if !choice.delta.tool_calls.is_empty() {
                         spin.take(); // a tool-only turn: clear before the loop prints tool traces
+                        produced = true; // a tool-call fragment must never be re-requested
                         let completed = acc.ingest(&choice.delta.tool_calls);
                         if let Some(hook) = eager_hook {
                             for (slot, tc) in completed {
@@ -958,6 +1039,28 @@ pub async fn stream_chat_with_tools_eager(
         }
     }
 
+    // BLANK STREAM ⇒ REPLAY, not a dead turn. A stall or drop that produced NOTHING is exactly the
+    // case the user hits as "it froze; I killed the turn and told it to continue, then it was fine" —
+    // the manual retry worked because there was nothing wrong with the request. Do that retry here.
+    // Guarded on `!produced`, so a stream that emitted any text/tool-fragment/usage never replays
+    // (that would duplicate output). Also skipped once the model claimed `finish_reason`: an
+    // intentionally empty completion is a real answer, not a failure.
+    let blank_failure = !produced && finish_reason.is_none();
+    if blank_failure && blank_attempt < STREAM_BLANK_RETRIES {
+        blank_attempt += 1;
+        let delay = backoff_ms(blank_attempt - 1, 400, 4_000);
+        let why = stream_err
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "stream closed with no output".to_string());
+        stream_retry_note(&why, blank_attempt, STREAM_BLANK_RETRIES, delay);
+        // Detach any eager handles from the abandoned attempt. They are read-only by policy (the
+        // eager starter refuses destructive/unsafe calls), so dropping them is safe.
+        drop(eager_by_slot);
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        continue;
+    }
+
     // The display is now clean (fence closed, partial line flushed) — surface any transport error
     // that interrupted the stream. The partial `full` / tool-calls are intentionally discarded: a
     // truncated tool-call's arguments JSON is unparseable, so feeding it back would be worse than a
@@ -973,13 +1076,14 @@ pub async fn stream_chat_with_tools_eager(
         .enumerate()
         .filter_map(|(pos, (slot, _))| eager_by_slot.remove(slot).map(|h| (pos, h)))
         .collect();
-    Ok(ChatTurn {
+    return Ok(ChatTurn {
         content: if full.is_empty() { None } else { Some(full) },
         tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
         finish_reason,
         usage: final_usage,
         eager,
-    })
+    });
+    } // end blank-stream replay loop
 }
 
 /// A streaming filter that suppresses `<think>…</think>` reasoning blocks from the printed output.
@@ -1052,6 +1156,34 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
 mod tests {
     use super::*;
     use crate::core::types::FunctionDelta;
+
+    #[test]
+    fn stall_timeout_defaults_and_clamps_the_env_override() {
+        // Serialize with every other env-touching test (the shared process environment is global).
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(STREAM_STALL_ENV);
+        assert_eq!(stream_stall_timeout().as_secs(), STREAM_STALL_SECS, "no override → the default");
+        std::env::set_var(STREAM_STALL_ENV, "240");
+        assert_eq!(stream_stall_timeout().as_secs(), 240, "a sane override is honoured");
+        // A typo must not disable the deadline that keeps a stalled turn from hanging forever.
+        std::env::set_var(STREAM_STALL_ENV, "0");
+        assert_eq!(stream_stall_timeout().as_secs(), 15, "clamped up to the floor");
+        std::env::set_var(STREAM_STALL_ENV, "999999");
+        assert_eq!(stream_stall_timeout().as_secs(), 1800, "clamped down to the ceiling");
+        std::env::set_var(STREAM_STALL_ENV, "not-a-number");
+        assert_eq!(stream_stall_timeout().as_secs(), STREAM_STALL_SECS, "garbage → the default");
+        std::env::remove_var(STREAM_STALL_ENV);
+    }
+
+    #[test]
+    fn a_stalled_stream_classifies_as_transient_so_goal_mode_retries() {
+        // The watchdog's wording must land on the retryable side of `classify_api_error` — a stall is
+        // exactly the flakiness goal mode exists to survive.
+        let e = anyhow!("SSE stream error: timeout — no data for 90s (stream never started)");
+        assert_eq!(classify_api_error(&e), ApiErrorKind::Transient);
+        let mid = anyhow!("SSE stream error: timeout — no data for 90s (stream stalled mid-response)");
+        assert_eq!(classify_api_error(&mid), ApiErrorKind::Transient);
+    }
 
     #[test]
     fn cost_meter_last_call_tracks_most_recent() {

@@ -32,6 +32,10 @@ const MAX_PARALLEL: usize = 5;
 const CHILD_MAX_ITERS: usize = 15;
 /// Hard ceiling on auto-extend for a workflow child (`2 × CHILD_MAX_ITERS`, same shape as task).
 const CHILD_AUTO_EXTEND: usize = 30;
+/// Transient model-call failures a workflow child absorbs per turn before giving up (see
+/// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy.
+const CHILD_TRANSIENT_RETRIES: usize = 4;
+
 /// Cap each child's summary before stuffing it into the synthesis prompt (chars). Prevents 5 verbose
 /// children from blowing the synth context / $$.
 const SUMMARY_CHAR_CAP: usize = 4_000;
@@ -600,6 +604,9 @@ async fn run_one_task(
         enable_todo_poke: false,
         enable_confidence_gate: false,
         enable_hill_climb: false,
+        // Same reason as the `task` tool: a workflow child runs unwatched, and a transient gateway
+        // error used to reduce a whole child's work to `status: "error"` in the synthesis input.
+        max_transient_retries: CHILD_TRANSIENT_RETRIES,
         // Sub-agents leave context_window 0 (no tool-result clearing) — workflow children are short.
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         ..AgentConfig::default()

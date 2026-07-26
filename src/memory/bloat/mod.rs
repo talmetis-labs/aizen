@@ -42,7 +42,7 @@ pub fn compact() -> Result<CompactReport> {
 
 /// Prune dangling graph edges against the union of the live store + the archive (a superseded fact
 /// is still a legitimate association endpoint). Best-effort: any error → 0 pruned, never propagated.
-fn prune_graph_best_effort() -> usize {
+pub fn prune_graph_best_effort() -> usize {
     use std::collections::HashSet;
     let mut live: HashSet<String> = HashSet::new();
     if let Ok(entries) = crate::memory::store::load_all() {

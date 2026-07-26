@@ -22,7 +22,7 @@ pub const CATALOG: &[ToolsetInfo] = &[
     ToolsetInfo {
         id: "memory",
         label: "memory",
-        blurb: "recall facts, profile, dialectic Q&A",
+        blurb: "list/recall facts, profile, Q&A, save/edit/forget",
     },
     ToolsetInfo {
         id: "file",
@@ -97,7 +97,8 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
         return Some("mcp");
     }
     match name {
-        "memory_search" | "memory_profile" | "memory_ask" => Some("memory"),
+        "memory_search" | "memory_list" | "memory_profile" | "memory_ask" | "memory_save"
+        | "memory_update" | "memory_forget" => Some("memory"),
         "file_read"
         | "file_glob"
         | "search_files"

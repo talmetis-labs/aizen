@@ -401,6 +401,11 @@ impl RepoContext {
                 if msg.contains("not a git repository") || msg.contains("not a work tree") {
                     bail!("not a git repository (run `git init` first to use the time machine)");
                 }
+                // git absent ≠ git failed: keep the typed GitMissing chain untouched so the
+                // benign-path callers can recognize it without substring guessing.
+                if crate::core::gitx::is_git_missing(&e) {
+                    return Err(e);
+                }
                 return Err(e).context("time machine could not use git in this directory");
             }
         };
@@ -524,7 +529,7 @@ impl RepoContext {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut cmd = Command::new("git");
+        let mut cmd = git_cmd();
         let hooks = strip_windows_verbatim(&self.hooks_dir).to_string_lossy().replace('\\', "/");
         let store = strip_windows_verbatim(&self.store_git_dir);
         let work_tree = strip_windows_verbatim(&self.root);
@@ -565,7 +570,7 @@ impl RepoContext {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut cmd = Command::new("git");
+        let mut cmd = git_cmd();
         let git_dir = strip_windows_verbatim(&self.git_dir);
         let work_tree = strip_windows_verbatim(&self.root);
         cmd.current_dir(&self.root)
@@ -807,7 +812,7 @@ impl RepoContext {
     fn materialize_commit(&self, commit: &str) -> Result<()> {
         // `cat-file --batch-check` validates reachability; `repack -a -d --window=0` is too heavy.
         // Use `pack-objects` of a single commit via stdin — pure plumbing, no hooks.
-        let mut child = Command::new("git");
+        let mut child = git_cmd();
         let store = strip_windows_verbatim(&self.store_git_dir);
         let hooks = strip_windows_verbatim(&self.hooks_dir).to_string_lossy().replace('\\', "/");
         child
@@ -846,7 +851,7 @@ impl RepoContext {
             let _ = self.git(None, ["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
             return Ok(());
         }
-        let mut unpack = Command::new("git");
+        let mut unpack = git_cmd();
         unpack
             .current_dir(&self.root)
             .env("GIT_DIR", &store)
@@ -983,7 +988,7 @@ fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<(
     if !store_git_dir.join("HEAD").exists() {
         fs::create_dir_all(store_git_dir)
             .with_context(|| format!("creating private time-machine store {}", store_git_dir.display()))?;
-        let out = Command::new("git")
+        let out = git_cmd()
             .args(["init", "--bare", "-q"])
             .arg(store_git_dir)
             .output()
@@ -1021,7 +1026,7 @@ fn ensure_private_store(store_git_dir: &Path, common_git_dir: &Path) -> Result<(
     }
 
     // Neutralize config inside the private store itself (no shared hooks/fsmonitor).
-    let _ = Command::new("git")
+    let _ = git_cmd()
         .env("GIT_DIR", strip_windows_verbatim(store_git_dir))
         .args(["config", "core.hooksPath", "hooks-disabled"])
         .output();
@@ -1048,6 +1053,17 @@ fn null_device() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
+/// Builder for every git spawn in this module: the executable resolved by `core::gitx` (PATH or a
+/// well-known install location), so the time machine keeps working in shells where git isn't on
+/// PATH. Falls back to the literal name only when resolution says Missing — the spawn then fails
+/// with the same ENOENT it always had, and `raw_git`/`discover` classify it as GitMissing.
+fn git_cmd() -> Command {
+    match crate::core::gitx::git_exe() {
+        Some(p) => Command::new(p),
+        None => Command::new("git"),
+    }
+}
+
 fn fnv1a64(s: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in s.as_bytes() {
@@ -1062,7 +1078,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let out = Command::new("git")
+    // Absence of a git executable is a TYPED error (GitMissing), not a spawn ENOENT dressed as a
+    // repo problem — `save_protected_change`/`preflight` treat it as "checkpoints simply off"
+    // instead of refusing every file edit on a machine without git.
+    let out = crate::core::gitx::command()?
         .current_dir(root)
         .args(args)
         .output()
@@ -1208,7 +1227,7 @@ fn index_blob_bytes(ctx: &RepoContext, index: &Path) -> Result<u64> {
     }
 
     // One `cat-file --batch-check` process instead of N `cat-file -s` spawns.
-    let mut child = Command::new("git");
+    let mut child = git_cmd();
     let store = strip_windows_verbatim(&ctx.store_git_dir);
     let hooks = strip_windows_verbatim(&ctx.hooks_dir).to_string_lossy().replace('\\', "/");
     child
@@ -1325,6 +1344,15 @@ pub fn is_repo() -> bool {
     RepoContext::current().is_ok()
 }
 
+/// "Checkpoints are simply off here" — either the directory isn't a repo, or there is no git
+/// executable at all. Both must degrade to no-checkpoint instead of failing the caller: the
+/// git-missing case used to propagate as a hard error, and because the protected-edit gate runs
+/// before every mutation, that refused EVERY `file_write`/`multi_edit` on a gitless machine
+/// while blaming "the pre-edit checkpoint".
+fn benign_no_checkpoint(e: &anyhow::Error) -> bool {
+    e.to_string().contains("not a git repository") || crate::core::gitx::is_git_missing(e)
+}
+
 /// Validate Time Machine metadata without capturing a tree. Kept for CLI diagnostics; protected
 /// mutations should call [`save_protected_change`] while their workspace writer lease is held.
 #[allow(dead_code)]
@@ -1336,7 +1364,7 @@ pub fn preflight_protected_change() -> Result<bool> {
             ctx.recover_pending(&mut ledger)?;
             Ok(true)
         }
-        Err(e) if e.to_string().contains("not a git repository") => Ok(false),
+        Err(e) if benign_no_checkpoint(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1347,7 +1375,7 @@ pub fn preflight_protected_change() -> Result<bool> {
 pub fn save_protected_change(label: &str) -> Result<Option<Snapshot>> {
     match RepoContext::current() {
         Ok(ctx) => save_in(&ctx, label, true, None).map(Some),
-        Err(e) if e.to_string().contains("not a git repository") => Ok(None),
+        Err(e) if benign_no_checkpoint(&e) => Ok(None),
         Err(e) => Err(e),
     }
 }

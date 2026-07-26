@@ -545,8 +545,47 @@ fn remember_slug(text: &str) -> String {
 pub fn cmd_add(name: &str, description: &str, mtype: &str, body: &str) -> Result<()> {
     let t = MemoryType::parse(mtype);
     let id = store::add(name, description, t, body)?;
-    println!("saved memory '{id}' (type={})", t.as_str());
+    tui::emit_line(&format!("saved memory '{id}' (type={})", t.as_str()));
     Ok(())
+}
+
+/// Resolve one entry by id or (case-insensitive) name, over the live store.
+///
+/// The store's ids are slugs, so `id == name.to_lowercase()` for most entries and an exact match on
+/// either is the common path. When neither matches exactly we fall back to a UNIQUE prefix/substring
+/// match, and report the candidates rather than picking one when it's ambiguous — a silent
+/// wrong-entry edit or delete is the failure mode worth spending an error message on.
+pub fn resolve_entry(id_or_name: &str) -> Result<MemoryEntry> {
+    let all = store::load_all()?;
+    resolve_in(all, id_or_name)
+}
+
+/// `resolve_entry` over an already-loaded set (so a caller with the entries in hand doesn't re-read
+/// the whole store, and tests can drive it without a temp home).
+pub fn resolve_in(entries: Vec<MemoryEntry>, id_or_name: &str) -> Result<MemoryEntry> {
+    let key = id_or_name.trim().to_lowercase();
+    if key.is_empty() {
+        anyhow::bail!("no memory id given");
+    }
+    if let Some(e) = entries.iter().find(|e| e.id == key || e.name.to_lowercase() == key) {
+        return Ok(e.clone());
+    }
+    let mut near: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|e| e.id.contains(&key) || e.name.to_lowercase().contains(&key))
+        .collect();
+    match near.len() {
+        0 => anyhow::bail!("no memory matching '{id_or_name}' (see `aizen memory list`)"),
+        1 => Ok(near.remove(0).clone()),
+        _ => {
+            let names: Vec<&str> = near.iter().take(6).map(|e| e.id.as_str()).collect();
+            anyhow::bail!(
+                "'{id_or_name}' matches {} memories ({}) — use the full id",
+                near.len(),
+                names.join(", ")
+            )
+        }
+    }
 }
 
 /// Parse a CLI `--scope` value into a workspace view. `None` → All (human inspection sees
@@ -570,52 +609,125 @@ fn zone_tag(e: &MemoryEntry) -> String {
     }
 }
 
-pub fn cmd_list(scope: Option<&str>) -> Result<()> {
-    let sel = parse_scope_sel(scope);
+/// Enumerate what is stored, WITHOUT a search query — the answer to "what do you actually know
+/// about me?". Rendered as text (shared by the CLI's `memory list` and the agent's `memory_list`
+/// tool) so the human and the model always see the same inventory, addressed by the same ids.
+///
+/// `mtype` filters to one kind; `archived` lists the recoverable archive instead of the live store.
+/// Entries are grouped by type and each line leads with the ID, because every write path
+/// (`edit`/`forget`/`supersede`) addresses the id, not the display name.
+pub fn inventory(
+    sel: &ScopeSel,
+    mtype: Option<MemoryType>,
+    limit: usize,
+    archived: bool,
+) -> Result<String> {
     let current = config::project_slug();
-    let mut entries = store::load_all()?;
-    let superseded = entries.iter().filter(|e| !e.is_active()).count();
-    entries.retain(|e| e.is_active() && sel.admits(e.scope.as_deref(), &current));
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
-    if entries.is_empty() {
-        println!("(no active memories in this view — `aizen memory add ...`, or `--scope all`)");
-        return Ok(());
+    let all =
+        if archived { bloat::caps::list_archive()? } else { store::load_all()? };
+    let superseded = all.iter().filter(|e| !e.is_active()).count();
+    let mut entries: Vec<MemoryEntry> = all
+        .into_iter()
+        // The archive is a graveyard: filtering it by `is_active` would hide superseded rows, which
+        // are exactly what someone inspecting the archive is looking for.
+        .filter(|e| archived || e.is_active())
+        .filter(|e| sel.admits(e.scope.as_deref(), &current))
+        .filter(|e| mtype.is_none_or(|t| e.mtype == t))
+        .collect();
+    let total = entries.len();
+    if total == 0 {
+        let where_ = if archived { "the archive" } else { "this view" };
+        return Ok(format!("(nothing stored in {where_})"));
     }
-    for e in &entries {
-        let desc = if e.description.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", e.description)
+    // Most-recently-touched first: what the store learned lately is what a "what do you know" question
+    // is usually about, and it keeps the truncated tail the least interesting part.
+    entries.sort_by(|a, b| {
+        let key = |e: &MemoryEntry| e.updated.clone().or_else(|| e.created.clone()).unwrap_or_default();
+        key(b).cmp(&key(a)).then_with(|| a.id.cmp(&b.id))
+    });
+    let shown = limit.min(total);
+    let mut out = String::new();
+    let mut last_type: Option<MemoryType> = None;
+    for e in entries.iter().take(shown) {
+        if last_type != Some(e.mtype) {
+            out.push_str(&format!("\n[{}]\n", e.mtype.as_str()));
+            last_type = Some(e.mtype);
+        }
+        let desc = e.description_or_body_head();
+        let sup = match &e.superseded_by {
+            Some(by) => format!(" (superseded by {by})"),
+            None => String::new(),
         };
-        println!("[{}]{} {}{}", e.mtype.as_str(), zone_tag(e), e.name, desc);
+        out.push_str(&format!("  {}{}{} — {desc}{sup}\n", e.id, zone_tag(e), cat_tag(e)));
     }
-    println!("\n{} memories", entries.len());
-    if superseded > 0 {
-        println!("({superseded} superseded — hidden; `aizen memory as-of <date>` to view history)");
+    if shown < total {
+        out.push_str(&format!("\n(+{} more — raise `limit` or filter by type/scope)\n", total - shown));
     }
+    out.push_str(&format!("\n{total} stored"));
+    if !archived && superseded > 0 {
+        out.push_str(&format!("; {superseded} superseded (hidden — `memory as-of <date>`)"));
+    }
+    Ok(out.trim_start().to_string())
+}
+
+pub fn cmd_list(scope: Option<&str>) -> Result<()> {
+    // Human listing: no cap (an explicit `memory list` should show everything it has).
+    tui::emit_line(&inventory(&parse_scope_sel(scope), None, usize::MAX, false)?);
     Ok(())
 }
 
+/// Show one entry in full, INCLUDING its metadata. The id is printed separately from the display
+/// name because every write command (`edit`/`forget`/`supersede`) addresses the id, and the two
+/// differ whenever a slug collided (`fact`, `fact-2`) — printing only the name left no way to tell
+/// two same-named entries apart.
 pub fn cmd_show(id_or_name: &str) -> Result<()> {
-    let entries = store::load_all()?;
-    let key = id_or_name.to_lowercase();
-    let found = entries
-        .iter()
-        .find(|e| e.id == key || e.name.to_lowercase() == key);
-    match found {
-        Some(e) => {
-            println!("# {} ({})", e.name, e.mtype.as_str());
-            if !e.description.is_empty() {
-                println!("{}", e.description);
-            }
-            if let Some(c) = &e.created {
-                println!("created: {c}");
-            }
-            println!("\n{}", e.body);
-            Ok(())
-        }
-        None => anyhow::bail!("no memory matching '{id_or_name}'"),
+    let e = resolve_entry(id_or_name)?;
+    tui::emit_line(&format!("# {} ({})", e.name, e.mtype.as_str()));
+    tui::emit_line(&format!("id: {}", e.id));
+    if !e.description.is_empty() {
+        tui::emit_line(&e.description);
     }
+    tui::emit_line(&meta_line(&e));
+    if let Some(by) = &e.superseded_by {
+        let to = e.valid_to.as_deref().unwrap_or("?");
+        tui::emit_line(&format!("superseded: {to} → '{by}' (kept for history)"));
+    }
+    tui::emit_line(&format!("file: {}", e.path.display()));
+    tui::emit_line(&format!("\n{}", e.body));
+    Ok(())
+}
+
+/// One-line provenance/lifecycle summary shared by `show` and the write commands' confirmations:
+/// where the fact came from, how sure, how often reused, and when.
+fn meta_line(e: &MemoryEntry) -> String {
+    let mut parts = vec![format!("source: {}", e.source.as_str())];
+    if e.source != ProvenanceKind::Manual {
+        parts.push(format!("confidence {:.2}", e.confidence));
+    }
+    parts.push(format!("reinforced {}× over {} session(s)", e.reinforced, e.sessions));
+    match e.scope.as_deref() {
+        Some(z) => parts.push(format!("zone {z}")),
+        None => parts.push("global".to_string()),
+    }
+    if let Some(s) = &e.subpath {
+        parts.push(format!("under {s}"));
+    }
+    if e.category != crate::memory::category::Category::None {
+        parts.push(format!("{}/{}", e.category.kind().as_str(), e.category.as_str()));
+    }
+    if let Some(c) = &e.created {
+        parts.push(format!("created {c}"));
+    }
+    if let Some(u) = &e.updated {
+        parts.push(format!("updated {u}"));
+    }
+    if let Some(r) = &e.last_retrieved {
+        parts.push(format!("last recalled {r}"));
+    }
+    if e.core_denied {
+        parts.push("core: denied by user".to_string());
+    }
+    parts.join(" · ")
 }
 
 pub fn cmd_search(
@@ -732,13 +844,13 @@ fn render_profile(p: &profile::UserProfile) {
 pub fn cmd_ask(query: &str, json: bool) -> Result<()> {
     let answer = answer_about_user(query)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&answer)?);
+        tui::emit_line(&serde_json::to_string_pretty(&answer)?);
         return Ok(());
     }
-    println!("{}", answer.text);
+    tui::emit_line(&answer.text);
     if !answer.basis.is_empty() {
         let cited: Vec<String> = answer.basis.iter().take(3).map(|b| b.name.clone()).collect();
-        println!("  ↳ from: {}", cited.join("; "));
+        tui::emit_line(&format!("  ↳ from: {}", cited.join("; ")));
     }
     Ok(())
 }
@@ -756,19 +868,19 @@ pub fn answer_about_user(query: &str) -> Result<dialectic::Answer> {
 pub fn cmd_frozen(_rebuild: bool) -> Result<()> {
     let served = refresh_frozen_core();
     if served.trim().is_empty() {
-        println!("(frozen core empty — add `type=user` memories or a STYLE.md, e.g. `aizen memory add me -t user -b \"...\"`)");
+        tui::emit_line("(frozen core empty — add `type=user` memories or a STYLE.md, e.g. `aizen memory add me -t user -b \"...\"`)");
         return Ok(());
     }
     let entries = store::load_all()?;
     let active = bloat::supersede::active(&entries);
     let fresh = frozen_core::build(&active, load_style().as_deref(), settings().frozen_core_max_tokens);
-    println!(
+    tui::emit_line(&format!(
         "frozen core: ~{} tok · {} entries · {} spilled to retrieval (refreshed from the current store)\n",
         crate::memory::render::est_tokens(&served),
         fresh.source_ids.len(),
         fresh.spilled_ids.len()
-    );
-    println!("{served}");
+    ));
+    tui::emit_line(&served);
     Ok(())
 }
 
@@ -824,10 +936,10 @@ fn print_learn_report(r: &LearnReport, dry_run: bool) {
 pub fn cmd_style() -> Result<()> {
     match load_style() {
         Some(body) => {
-            println!("# user style ({})", config::style_path().display());
-            println!("\n{body}");
+            tui::emit_line(&format!("# user style ({})", config::style_path().display()));
+            tui::emit_line(&format!("\n{body}"));
         }
-        None => println!("(no STYLE.md yet — learned via `aizen memory learn` core-promotion, or edit {} directly)", config::style_path().display()),
+        None => tui::emit_line(&format!("(no STYLE.md yet — learned via `aizen memory learn` core-promotion, or edit {} directly)", config::style_path().display())),
     }
     Ok(())
 }
@@ -903,12 +1015,8 @@ pub fn cmd_as_of(date: &str) -> Result<()> {
 /// history. Both are matched by id or name.
 pub fn cmd_supersede(old: &str, new: &str) -> Result<()> {
     let all = store::load_all()?;
-    let find = |key: &str| {
-        let k = key.to_lowercase();
-        all.iter().find(|e| e.id == k || e.name.to_lowercase() == k).cloned()
-    };
-    let old_e = find(old).ok_or_else(|| anyhow::anyhow!("no memory matching '{old}'"))?;
-    let new_e = find(new).ok_or_else(|| anyhow::anyhow!("no memory matching '{new}'"))?;
+    let old_e = resolve_in(all.clone(), old)?;
+    let new_e = resolve_in(all, new)?;
     if old_e.id == new_e.id {
         anyhow::bail!("'{old}' and '{new}' are the same memory");
     }
@@ -917,16 +1025,75 @@ pub fn cmd_supersede(old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
+/// Edit one stored fact in place. Only the fields passed are touched; the id never changes.
+pub fn cmd_edit(
+    id_or_name: &str,
+    name: Option<String>,
+    description: Option<String>,
+    mtype: Option<String>,
+    body: Option<String>,
+    scope: Option<String>,
+) -> Result<()> {
+    let e = resolve_entry(id_or_name)?;
+    let mtype = match mtype.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(MemoryType::parse_strict(s).ok_or_else(|| {
+            anyhow::anyhow!("unknown type '{s}' (user|feedback|project|reference)")
+        })?),
+        None => None,
+    };
+    // `--scope global` clears the zone; any other value moves the fact to that zone.
+    let scope = scope.map(|s| {
+        let s = s.trim().to_string();
+        if s.is_empty() || s.eq_ignore_ascii_case("global") {
+            None
+        } else if s.eq_ignore_ascii_case("current") || s.eq_ignore_ascii_case("project") {
+            Some(config::project_slug())
+        } else {
+            Some(s)
+        }
+    });
+    let patch = store::EntryPatch { name, description, mtype, body, scope, preserve_updated: false };
+    store::update(&e, &patch)?;
+    // Re-read so the confirmation shows what is actually on disk now, not what we asked for.
+    let after = resolve_entry(&e.id)?;
+    tui::emit_line(&format!("updated '{}'", after.id));
+    tui::emit_line(&meta_line(&after));
+    tui::emit_line(&format!("file: {}", after.path.display()));
+    Ok(())
+}
+
+/// Retire a fact into the recoverable archive (`aizen memory restore <id>` brings it back).
+/// Named `forget` because that is what the user means; it is deliberately NOT a hard delete.
+pub fn cmd_forget(id_or_name: &str) -> Result<()> {
+    let e = resolve_entry(id_or_name)?;
+    // Echo WHAT is being forgotten before doing it: `forget` takes a fuzzy key, so the one
+    // failure worth guarding against is retiring a different fact than the user meant.
+    tui::emit_line(&format!("forgetting '{}' — {}", e.id, e.description_or_body_head()));
+    let archived = store::retire(&e)?;
+    tui::emit_line(&format!("archived as '{archived}' (restore: `aizen memory restore {archived}`)"));
+    Ok(())
+}
+
+/// Hard-delete an ARCHIVED fact's file. Irreversible, so it only ever touches the archive:
+/// a live fact must be `forget`-ed first, which makes "destroy this" a deliberate two-step.
+pub fn cmd_purge(id: &str) -> Result<()> {
+    store::purge_archived(id)?;
+    // The co-retrieval graph may now hold edges to an id that exists in neither the live store nor
+    // the archive — the one case where a purge must also touch the graph.
+    let pruned = bloat::prune_graph_best_effort();
+    println!("purged archived '{id}' (irreversible)");
+    if pruned > 0 {
+        println!("pruned {pruned} dangling graph edge(s).");
+    }
+    Ok(())
+}
+
 /// Show the Hebbian co-retrieval neighbors of a fact (P5): the other facts most often recalled
 /// together with it, ranked by decayed edge weight. Matches `id` by id or name. Inspection-only —
 /// reads the graph, never records a co-fire (so `ng memory neighbors` can't pollute its own signal).
 pub fn cmd_neighbors(id_or_name: &str, k: usize) -> Result<()> {
     let all = store::load_all()?;
-    let key = id_or_name.to_lowercase();
-    let seed = all
-        .iter()
-        .find(|e| e.id == key || e.name.to_lowercase() == key)
-        .ok_or_else(|| anyhow::anyhow!("no memory matching '{id_or_name}'"))?;
+    let seed = &resolve_in(all.clone(), id_or_name)?;
     let today = bloat::decay::today();
     let neigh = graph::neighbors(&seed.id, &today, k, 0.0);
     if neigh.is_empty() {
@@ -950,7 +1117,7 @@ pub fn cmd_neighbors(id_or_name: &str, k: usize) -> Result<()> {
 /// Restore an archived memory back into the live store.
 pub fn cmd_restore(id: &str) -> Result<()> {
     let restored = bloat::caps::restore(id)?;
-    println!("restored '{restored}' from the archive");
+    tui::emit_line(&format!("restored '{restored}' from the archive"));
     Ok(())
 }
 
@@ -958,15 +1125,15 @@ pub fn cmd_restore(id: &str) -> Result<()> {
 pub fn cmd_archive_list() -> Result<()> {
     let arch = bloat::caps::list_archive()?;
     if arch.is_empty() {
-        println!("(archive empty)");
+        tui::emit_line("(archive empty)");
         return Ok(());
     }
     let mut arch = arch;
     arch.sort_by(|a, b| a.id.cmp(&b.id));
     for e in &arch {
-        println!("[{}] {} — {}", e.mtype.as_str(), e.id, e.body);
+        tui::emit_line(&format!("[{}] {} — {}", e.mtype.as_str(), e.id, e.body));
     }
-    println!("\n{} archived. Restore: `aizen memory restore <id>`", arch.len());
+    tui::emit_line(&format!("\n{} archived. Restore: `aizen memory restore <id>`", arch.len()));
     Ok(())
 }
 
@@ -1075,6 +1242,98 @@ mod tests {
         std::env::remove_var("NG_PROJECT_ROOT");
         std::env::remove_var("NEXTGEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inventory_lists_without_a_query_and_edit_forget_restore_round_trip() {
+        let _g = config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ng-inventory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // create_dir_all BEFORE project_slug() is ever computed: canonicalize() of a missing dir
+        // fails and yields a DIFFERENT slug than once it exists, which silently splits the zone.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXTGEN_HOME", &dir);
+        std::env::set_var("NG_PROJECT_ROOT", &dir);
+
+        store::add("pnpm over npm", "package manager", MemoryType::User, "the user prefers pnpm").unwrap();
+        store::add("deploys from ci", "", MemoryType::Project, "release runs in github actions").unwrap();
+
+        // The whole point: enumerate what is stored with NO search query.
+        let inv = inventory(&ScopeSel::All, None, 50, false).unwrap();
+        assert!(inv.contains("pnpm-over-npm"), "inventory addresses entries by id: {inv}");
+        assert!(inv.contains("deploys-from-ci"));
+        assert!(inv.contains("[user]") && inv.contains("[project]"), "grouped by type: {inv}");
+        assert!(inv.contains("2 stored"));
+        // an id-less entry still shows a body head rather than an empty line
+        assert!(inv.contains("release runs in github actions"), "empty description falls back to body");
+
+        // type filter narrows it
+        let only_user = inventory(&ScopeSel::All, Some(MemoryType::User), 50, false).unwrap();
+        assert!(only_user.contains("pnpm-over-npm") && !only_user.contains("deploys-from-ci"));
+
+        // edit: named fields change, unnamed survive, id is stable
+        cmd_edit(
+            "pnpm-over-npm",
+            None,
+            Some("the package manager to use".into()),
+            Some("feedback".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let e = resolve_entry("pnpm-over-npm").unwrap();
+        assert_eq!(e.id, "pnpm-over-npm", "the id never changes on edit");
+        assert_eq!(e.description, "the package manager to use");
+        assert_eq!(e.mtype, MemoryType::Feedback, "type was retyped");
+        assert_eq!(e.body, "the user prefers pnpm", "body untouched by a description-only edit");
+        assert!(e.updated.is_some(), "edit stamps updated");
+
+        // an unknown type is REJECTED rather than silently coerced to `reference`
+        assert!(
+            cmd_edit("pnpm-over-npm", None, None, Some("nonsense".into()), None, None).is_err(),
+            "a typo'd type must not silently retype the fact"
+        );
+
+        // forget = recoverable archive, not destruction
+        cmd_forget("pnpm-over-npm").unwrap();
+        assert!(resolve_entry("pnpm-over-npm").is_err(), "gone from the live store");
+        let arch = inventory(&ScopeSel::All, None, 50, true).unwrap();
+        assert!(arch.contains("pnpm-over-npm"), "…but present in the archive: {arch}");
+
+        cmd_restore("pnpm-over-npm").unwrap();
+        assert!(resolve_entry("pnpm-over-npm").is_ok(), "restore brings it back");
+
+        // purge only ever touches the archive
+        assert!(cmd_purge("pnpm-over-npm").is_err(), "a LIVE fact cannot be purged directly");
+        cmd_forget("pnpm-over-npm").unwrap();
+        cmd_purge("pnpm-over-npm").unwrap();
+        assert!(
+            bloat::caps::list_archive().unwrap().iter().all(|e| e.id != "pnpm-over-npm"),
+            "purge is the one irreversible step"
+        );
+
+        std::env::remove_var("NG_PROJECT_ROOT");
+        std::env::remove_var("NEXTGEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_reports_ambiguity_instead_of_picking_one() {
+        let mk = |id: &str| MemoryEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            ..Default::default()
+        };
+        let all = vec![mk("deploy-staging"), mk("deploy-prod"), mk("pnpm")];
+
+        // exact id wins over any substring candidates
+        assert_eq!(resolve_in(all.clone(), "deploy-prod").unwrap().id, "deploy-prod");
+        // a unique substring resolves
+        assert_eq!(resolve_in(all.clone(), "pnp").unwrap().id, "pnpm");
+        // an ambiguous one must NOT silently edit/delete the wrong fact
+        let err = resolve_in(all.clone(), "deploy").unwrap_err().to_string();
+        assert!(err.contains("matches 2 memories"), "ambiguity is reported: {err}");
+        assert!(resolve_in(all, "nothing-like-this").is_err());
     }
 
     #[test]

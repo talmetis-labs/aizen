@@ -7,3 +7,4 @@ pub mod crawl;
 pub mod cron;
 pub mod slash;
 pub mod timemachine;
+pub mod zones;

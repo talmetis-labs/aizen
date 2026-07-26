@@ -24,6 +24,13 @@ pub const KEEP_TURNS: usize = 3;
 /// though the old boundary note itself is summarized away into the new one.
 pub const COMPACT_MARKER_PREFIX: &str = "[Earlier conversation auto-compacted";
 
+/// Stable prefix of the `/handoff` seed note — the distilled context carried into a fresh thread.
+/// Byte-identical to the text every historical handoff already wrote, so saved sessions get the
+/// same treatment retroactively. Like the compaction marker it is conversation CONTENT, not prompt
+/// prefix: [`leading_system_count`] stops at it, so lane rewrites (`/config`, `/model`, resume)
+/// splice around it instead of overwriting it, and a later compaction may fold it into its summary.
+pub const HANDOFF_MARKER_PREFIX: &str = "[handoff context from the previous session]";
+
 /// The summarization instruction. Centralized here so the REPL and the loop produce identical
 /// summaries. Mirrors the original `compact_history` prompt.
 const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to conserve context. \
@@ -83,7 +90,13 @@ pub fn render_transcript(msgs: &[Message]) -> String {
             }
             "assistant" => out.push_str(&format!("Assistant: {body}\n")),
             "tool" => out.push_str(&format!("Tool result: {}\n", truncate_chars(body, 600))),
-            "system" => out.push_str(&format!("Note: {}\n", truncate_chars(body, 600))),
+            // A `system` message inside the conversation body is never chatter: it's a prior
+            // compaction boundary or a `/handoff` seed — i.e. context that ALREADY survived one
+            // distillation. Both are foldable into the next summary, so truncating them at the
+            // tool-result budget silently dropped the densest text in the transcript. Give them
+            // room (~600 tokens) so a chain of compactions/handoffs doesn't erode the original
+            // decisions one 600-char cut at a time.
+            "system" => out.push_str(&format!("Note: {}\n", truncate_chars(body, 2400))),
             other => out.push_str(&format!("{other}: {body}\n")),
         }
     }
@@ -137,15 +150,18 @@ pub fn context_touchpoints(history: &[Message]) -> Touchpoints {
 }
 
 /// Number of leading `system` messages that form the prompt prefix (stable lane + optional dynamic
-/// lane). Compaction/session caps must preserve all of them. The compaction boundary marker is ALSO
-/// a leading `system` message but is conversation content (a lossy summary), NOT prompt prefix — it
-/// must be foldable into the next compaction, so the count stops at it.
+/// lane). Compaction/session caps must preserve all of them. The compaction boundary marker and the
+/// handoff seed are ALSO leading `system` messages but are conversation content (a lossy summary /
+/// carried-over context), NOT prompt prefix — they must survive lane rewrites and stay foldable
+/// into the next compaction, so the count stops at either.
 pub fn leading_system_count(history: &[Message]) -> usize {
     history
         .iter()
         .take_while(|m| {
             m.role == "system"
-                && !m.content.as_deref().is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX))
+                && !m.content.as_deref().is_some_and(|c| {
+                    c.starts_with(COMPACT_MARKER_PREFIX) || c.starts_with(HANDOFF_MARKER_PREFIX)
+                })
         })
         .count()
 }

@@ -140,6 +140,13 @@ enum Commands {
         #[command(subcommand)]
         cmd: TimeCmd,
     },
+    /// Show where aizen keeps THIS project's state: root, zone slug, git executable, home dirs.
+    Where,
+    /// Project zones (the slug keying memory/skills/index): report + merge legacy twins.
+    Zone {
+        #[command(subcommand)]
+        cmd: ZoneCmd,
+    },
     /// Schedule agent tasks via the OS scheduler (no daemon): add / list / remove.
     Cron {
         #[command(subcommand)]
@@ -829,11 +836,44 @@ enum MemoryCmd {
         /// The memory (id or name) that replaces it.
         new: String,
     },
+    /// Edit a stored memory in place (only the flags you pass are changed; the id never changes).
+    Edit {
+        /// The memory to edit (id or name; a unique prefix works).
+        id: String,
+        /// New display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New one-line summary (pass "" to clear it).
+        #[arg(short, long)]
+        description: Option<String>,
+        /// New type: user | feedback | project | reference.
+        #[arg(short = 't', long = "type")]
+        mtype: Option<String>,
+        /// Replace the fact body. If the flag is given with no value, read from stdin.
+        #[arg(short, long)]
+        body: Option<String>,
+        /// Move zones: global | current | project | a zone slug.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Forget a memory: move it to the recoverable archive (undo with `memory restore <id>`).
+    Forget {
+        /// The memory to forget (id or name; a unique prefix works).
+        id: String,
+    },
     /// List archived (LRU-evicted) memories.
     Archive,
     /// Restore an archived memory back into the live store.
     Restore {
         id: String,
+    },
+    /// Permanently delete an ARCHIVED memory (irreversible; `forget` it first).
+    Purge {
+        /// The archived memory id.
+        id: String,
+        /// Required — confirms the deletion cannot be undone.
+        #[arg(long)]
+        yes: bool,
     },
     /// Run anti-bloat maintenance (enforce the inferred-fact LRU cap → archive victims).
     Compact,
@@ -916,6 +956,11 @@ async fn main() -> Result<()> {
         Commands::Telegram { cmd } => run_telegram(cmd).await,
         Commands::Discord { cmd } => run_discord(cmd).await,
         Commands::Time { cmd } => run_time(cmd),
+        Commands::Where => {
+            println!("{}", where_report());
+            Ok(())
+        }
+        Commands::Zone { cmd } => run_zone(cmd),
         Commands::Cron { cmd } => cron::handle(cmd).await,
         Commands::Mcp { cmd } => match cmd {
             McpCmd::List => {
@@ -1670,6 +1715,135 @@ async fn run_serve() -> Result<()> {
     Ok(())
 }
 
+// ───────────────────────── project identity (where + zones) ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+enum ZoneCmd {
+    /// Find artifacts stored under LEGACY slugs of this project (the pre-2026-07 remote-URL /
+    /// verbatim-path keying) and merge them into the current zone. Dry-run by default: it only
+    /// REPORTS. `--apply` executes; every action is printed; clashes are moved aside, never
+    /// overwritten — with ONE exception: the codebase-index cache keeps the newer of two copies
+    /// and drops the other (`/init` rebuilds it). If you keep several checkouts of this repo, a
+    /// URL-keyed legacy zone is shared between them — migrating claims it for THIS checkout.
+    Migrate {
+        /// Execute the merge (without this flag: report only).
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+/// Strip URL userinfo before display when it carries a password/token
+/// (`https://user:TOKEN@host/…`) — remote URLs may embed credentials and the identity surfaces
+/// must never print one. A plain username (`git@host:…`) is kept: it isn't a secret and losing
+/// it would make the URL unrecognizable.
+fn redact_remote_url(url: &str) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    match rest.find('@') {
+        Some(at) if rest[..at].contains(':') => format!("{scheme}***@{}", &rest[at + 1..]),
+        _ => url.to_string(),
+    }
+}
+
+/// The identity card — one honest surface for the questions that previously had none: which
+/// root am I in, which zone does my memory go to, which git binary runs, where do sessions live.
+/// Shared verbatim by `aizen where` (println) and `/where` (tui::emit_line).
+fn where_report() -> String {
+    use std::fmt::Write as _;
+    let root = crate::core::config::project_root();
+    let slug = crate::core::config::project_slug();
+    let home = crate::core::config::nextgen_home();
+    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into());
+    let mut s = String::new();
+    let _ = writeln!(s, "project root : {}", root.display());
+    if let Ok(over) = std::env::var("NG_PROJECT_ROOT") {
+        if !over.trim().is_empty() {
+            let _ = writeln!(s, "               (root forced by NG_PROJECT_ROOT={})", over.trim());
+        }
+    }
+    let _ = writeln!(s, "cwd          : {cwd}   (identity follows the root, fixed at launch)");
+    let _ = writeln!(s, "zone slug    : {slug}   (keys memory scope · skills · codebase index · frozen core)");
+    if let Some(url) = crate::core::config::git_remote_origin(&root) {
+        let _ = writeln!(
+            s,
+            "git remote   : {}   (informational — no longer part of the identity key)",
+            redact_remote_url(&url)
+        );
+    }
+    match crate::core::gitx::git_exe() {
+        Some(p) => {
+            let _ = writeln!(s, "git          : {}", p.display());
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "git          : NOT FOUND — identity uses the nearest .git marker (or this folder); time-machine checkpoints are off"
+            );
+        }
+    }
+    if let Some(note) = crate::core::gitx::resolution_note() {
+        if crate::core::gitx::git_exe().is_some() {
+            let _ = writeln!(s, "               ({note})");
+        }
+    }
+    let zone_dir = crate::skills::project_zone_dir();
+    let idx = crate::core::config::codebase_index_path(&slug);
+    let exists = |p: &std::path::Path| if p.exists() { "" } else { "   (not created yet)" };
+    let _ = writeln!(s, "home         : {}", home.display());
+    let _ = writeln!(s, "memory store : {}", crate::core::config::cli_memory_dir().display());
+    let _ = writeln!(s, "skills zone  : {}{}", zone_dir.display(), exists(&zone_dir));
+    let _ = writeln!(s, "codebase idx : {}{}", idx.display(), exists(&idx));
+    let _ = writeln!(s, "sessions     : {}", sessions_dir().display());
+    if let Some(l) = crate::features::zones::quick_legacy_probe() {
+        let _ = writeln!(
+            s,
+            "⚠ legacy zone : {l} — data from the old slug keying; `aizen zone migrate` shows what would merge (--apply to do it)"
+        );
+    }
+    s.trim_end().to_string()
+}
+
+fn run_zone(cmd: ZoneCmd) -> Result<()> {
+    match cmd {
+        ZoneCmd::Migrate { apply } => {
+            let plan = crate::features::zones::plan()?;
+            println!("current zone: {}", plan.current_slug);
+            if plan.legacy.is_empty() {
+                println!("no legacy zones found for this project — nothing to merge.");
+                return Ok(());
+            }
+            println!("legacy zones of this project:");
+            for z in &plan.legacy {
+                println!("  {}", z.summary());
+            }
+            if !apply {
+                println!("\ndry-run — nothing was changed. Re-run with `aizen zone migrate --apply` to merge into {}.", plan.current_slug);
+                return Ok(());
+            }
+            let rep = crate::features::zones::apply(&plan);
+            for a in &rep.actions {
+                println!("  ✓ {a}");
+            }
+            for w in &rep.warnings {
+                eprintln!("  ⚠ {w}");
+            }
+            println!(
+                "merged {} legacy zone(s) into {}: {} action(s), {} warning(s).",
+                plan.legacy.len(),
+                plan.current_slug,
+                rep.actions.len(),
+                rep.warnings.len()
+            );
+            if !rep.warnings.is_empty() {
+                anyhow::bail!("zone migrate finished with warnings — each one above states exactly what moved and what didn't");
+            }
+            Ok(())
+        }
+    }
+}
+
 // ───────────────────────────── time machine (git snapshots) ─────────────────────────────
 
 fn run_time(cmd: TimeCmd) -> Result<()> {
@@ -2057,15 +2231,25 @@ fn restore_menu(
             if chat.is_empty() {
                 bail!("checkpoint #{} has an empty saved conversation", snap.id);
             }
-            save_session(history, "last").context("backing up the current conversation before combined restore")?;
+            let backup = current_session_slug().unwrap_or_else(|| allocate_session_slug(history));
+            save_session(history, &backup, Some(model_label))
+                .context("backing up the current conversation before combined restore")?;
             files_restore(snap.id)?;
             *history = chat;
             migrate_legacy_prompt_lanes(history, model_label);
             refresh_dynamic_prompt_lane(history, model_label);
+            // The rewound thread continues under a NEW file — keeping the old slug would make the
+            // next autosave overwrite the backup that was just written.
+            set_session_slug(None);
+            update_live_history(history);
             println!(
                 "{} #{} — files and conversation rewound",
                 style("⏪ restored both").color256(splash::ACCENT),
                 snap.id
+            );
+            println!(
+                "{}",
+                style(format!("  (your previous chat was saved as “{backup}” — /sessions to get it back)")).dim()
             );
         }
         _ => {}
@@ -2089,17 +2273,22 @@ fn files_restore(id: u32) -> Result<()> {
 }
 
 /// Rewind only the conversation to the sidecar captured with checkpoint `id`; files stay as they are.
-/// Before overwriting, the CURRENT chat is saved to the `last` session so it's never lost.
+/// Before overwriting, the CURRENT chat is saved under its own session name so it's never lost.
 fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut String) -> Result<()> {
     let chat = timemachine::load_chat_checked(id)?;
     if chat.is_empty() {
         bail!("checkpoint #{id} has an empty saved conversation");
     }
     // Fail closed: do not replace the live transcript unless its recovery copy is durable.
-    save_session(history, "last").context("backing up the current conversation before task restore")?;
+    let backup = current_session_slug().unwrap_or_else(|| allocate_session_slug(history));
+    save_session(history, &backup, Some(model_label))
+        .context("backing up the current conversation before task restore")?;
     *history = chat;
     migrate_legacy_prompt_lanes(history, model_label);
     refresh_dynamic_prompt_lane(history, model_label);
+    // Same rotation as the combined arm: the rewound thread must not autosave over its backup.
+    set_session_slug(None);
+    update_live_history(history);
     println!(
         "{} #{} — conversation rewound; files untouched",
         style("⏪ restored task").color256(splash::ACCENT),
@@ -2107,7 +2296,7 @@ fn task_restore(id: u32, history: &mut Vec<Message>, model_label: &mut String) -
     );
     println!(
         "{}",
-        style("  (your previous chat was saved as `last` — /sessions to get it back)").dim()
+        style(format!("  (your previous chat was saved as “{backup}” — /sessions to get it back)")).dim()
     );
     Ok(())
 }
@@ -3645,6 +3834,60 @@ fn cache_hit_label() -> Option<String> {
     Some(format!("⛁ {}% cached", cached * 100 / prompt))
 }
 
+/// Disarms the interactive cancel token however a turn ends — normal completion, an early `continue`
+/// from a prep failure, or a panic unwinding out of the arm. `disarm_cancel` is identity-checked, so
+/// this can never clear a NEWER turn's token and double-disarming is harmless.
+///
+/// This exists because the token is now armed BEFORE the turn's prep work (see the Chat arm), and an
+/// armed token is what `tui::turn_in_flight` reports. Leaking one past a `continue` would leave the
+/// REPL idle while Esc still behaved like "cancel", so every exit path must disarm.
+struct TurnCancelGuard(crate::core::cancel::TurnCancel);
+
+impl Drop for TurnCancelGuard {
+    fn drop(&mut self) {
+        tui::disarm_cancel(&self.0);
+    }
+}
+
+/// Run a slash command's network call as INTERRUPTIBLE work. `None` means the user pressed Esc.
+///
+/// Slash handlers that call the model (`/compact`, `/handoff`) used to `await` straight inside the
+/// REPL loop with no token armed and `WORKING` still false. Two consequences, both bad: the HTTP
+/// client's 300s read timeout became the real ceiling, and `tui::turn_in_flight()` reported false —
+/// so Esc took the idle branch and merely cleared the draft while the REPL sat blocked in the await,
+/// consuming no submissions. A slow or hung endpoint therefore froze the whole app for up to five
+/// minutes with no spinner and no way out. This is the confirmed "/compact makes it hang".
+///
+/// Arming the token is what makes Esc live (the input thread's `request_cancel` cancels exactly this
+/// token); `set_working` puts the pill up so the wait is visibly work. The guard disarms on every
+/// exit path including a panic, and dropping the future at its await point aborts the request.
+async fn cancellable_slash<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
+    let token = crate::core::cancel::TurnCancel::new();
+    tui::arm_cancel(token.clone());
+    let _guard = TurnCancelGuard(token.clone());
+    tui::set_working(true);
+    let out = crate::core::cancel::race(&token, fut).await;
+    tui::set_working(false);
+    out
+}
+
+/// The startup identity banner: one line saying which project root + zone slug THIS launch is
+/// bound to (the audit's top visibility gap: no surface printed either), plus loud notes when git
+/// resolved unusually or a legacy zone from the old slug keying still holds data.
+fn identity_banner() -> (String, Vec<String>) {
+    let root = crate::core::config::project_root();
+    let slug = crate::core::config::project_slug();
+    let main = format!("project: {} · zone {slug} · /where for details", root.display());
+    let mut notes = Vec::new();
+    if let Some(note) = crate::core::gitx::resolution_note() {
+        notes.push(note);
+    }
+    if let Some(l) = crate::features::zones::quick_legacy_probe() {
+        notes.push(format!("⚠ legacy zone {l} has data — `aizen zone migrate` merges it into {slug}"));
+    }
+    (main, notes)
+}
+
 /// The sticky-TUI REPL: a background keyboard thread feeds a submission queue while the agent runs,
 /// the input box stays pinned at the bottom, and Esc/Ctrl-C cancels an in-flight turn.
 async fn run_menu_sticky() -> Result<()> {
@@ -3669,10 +3912,34 @@ async fn run_menu_sticky() -> Result<()> {
         return run_menu_plain().await;
     }
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
+    {
+        let (main, notes) = identity_banner();
+        tui::emit_line(&style(main).dim().to_string());
+        for n in notes {
+            tui::emit_line(&style(n).color256(theme::WARN).to_string());
+        }
+    }
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
     if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope).into_iter().next() {
         tui::emit_line(&style(format!("⟳ {}", crate::core::recovery::format_offer(&offer))).dim().to_string());
         tui::emit_line(&style("  /recover restore · /recover discard").dim().to_string());
+    } else if let Some((name, n, origin)) = most_recent_session() {
+        // OFFER the previous conversation instead of waiting to be asked. Every turn was already
+        // autosaved, but nothing on this screen said so — a reopened terminal looked like a blank
+        // slate, so the transcript sat on disk unmentioned and the user retyped their context.
+        // Suppressed when a crash-recovery offer is showing: two competing restore prompts in a row
+        // is worse than one, and `/recover` (which carries an unsent draft + checkpoint id) wins.
+        // A session from ANOTHER project is only offered when this one has none — labeled, so
+        // resuming it is a visible choice.
+        let origin_note = origin.map(|o| format!(", {o}")).unwrap_or_default();
+        tui::emit_line(
+            &style(format!(
+                "⟲ last conversation “{}” ({n} messages{origin_note}) — /resume to continue it",
+                pretty_session_name(&name)
+            ))
+            .dim()
+            .to_string(),
+        );
     }
     // Background model health poller: colours the idle `● ready` chip green/yellow/red from a real
     // GET /models probe every 60s (plus once immediately). Independent of the chat HTTP client so a
@@ -3740,6 +4007,16 @@ async fn run_menu_sticky() -> Result<()> {
                 if line.is_empty() && images.is_empty() {
                     continue;
                 }
+                // ARM CANCEL FIRST — before any prep. Everything between here and `set_working(true)`
+                // is real latency the user can see and will try to interrupt: `@file` expansion, the
+                // dynamic prompt-lane rebuild, codebase retrieval, the recovery checkpoint, LSP
+                // spawn, registry construction. The token being armed is what makes `turn_in_flight`
+                // true, so Esc cancels throughout that window instead of silently clearing the draft
+                // while the turn starts anyway. The guard disarms on EVERY exit path (including the
+                // `continue`s below), so an aborted prep never leaves Esc mis-wired.
+                let turn_cancel = crate::core::cancel::TurnCancel::new();
+                tui::arm_cancel(turn_cancel.clone());
+                let _cancel_guard = TurnCancelGuard(turn_cancel.clone());
                 // Input-box affordances on a typed message (skipped for a vision message): `#remember`
                 // / `!shell-escape` run no turn; a normal message has its `@file`·`` !`cmd` `` expanded.
                 let echo_src = line.clone();
@@ -3827,7 +4104,6 @@ async fn run_menu_sticky() -> Result<()> {
                         continue;
                     }
                 };
-                let turn_cancel = crate::core::cancel::TurnCancel::new();
                 let cfg = AgentConfig {
                     approval_mode: approval_mode(),
                     cancel: turn_cancel.clone(),
@@ -3842,10 +4118,21 @@ async fn run_menu_sticky() -> Result<()> {
                     // correction the user typed is aimed at THIS task, not at whatever a delegated
                     // sub-agent happens to be doing (children keep the `false` default).
                     enable_steering: true,
+                    // Keep the exit-flush snapshot current DURING the turn, not just at its edges.
+                    on_progress: Some(publish_live_history),
                     ..AgentConfig::default()
                 };
 
-                tui::arm_cancel(turn_cancel.clone());
+                // Esc pressed DURING prep already cancelled this token — honour it instead of firing
+                // the request anyway. Without this, cancelling in the prep window (the very thing the
+                // early arm above made possible) would still send the turn to the model.
+                if turn_cancel.is_cancelled() {
+                    tui::emit_line(&theme::muted("⏹ stopped.").to_string());
+                    history.pop(); // drop the user message this turn never ran
+                    while input.cancel.try_recv().is_ok() {}
+                    cli_config::clear_effort_override();
+                    continue;
+                }
                 // Open the steering mailbox for this turn: Alt+Enter now hands a message to the RUNNING
                 // loop (folded in at its next step) instead of the post-turn queue.
                 crate::core::steer::arm();
@@ -3967,12 +4254,22 @@ async fn run_menu_sticky() -> Result<()> {
                                 &theme::muted(format!("  cleared {flushed} queued message(s).")).to_string(),
                             );
                         }
+                        // Persist the cancelled turn. Only the success arm reaches
+                        // `autosave_session`, so a turn stopped with Esc used to leave the session
+                        // file at whatever the LAST successful turn wrote — every question and tool
+                        // result from the cancelled run was lost on quit. Cancelling is not a reason
+                        // to forget: the partial transcript is exactly what the user comes back to.
+                        autosave_last(&history, Some(&model));
                     }
                     // `clarify` paused the turn awaiting the user's answer — show the question and
                     // loop back to the input box (the next message continues this conversation).
                     // Skip the post-turn learning/compaction passes: the turn isn't finished yet.
                     Some(Ok(AgentOutcome { stop: StopReason::AwaitingInput(q), .. })) => {
                         show_clarify(&q);
+                        // Same reason as the Esc arm: this branch deliberately skips the post-turn
+                        // passes because the turn isn't finished, but the question the agent asked is
+                        // real conversation. Persist it so quitting at the prompt doesn't drop it.
+                        autosave_last(&history, Some(&model));
                     }
                     Some(Ok(outcome)) => {
                         // Goal mode finishes only on a verify-passing `Done` (the goal gate lets the
@@ -4019,11 +4316,30 @@ async fn run_menu_sticky() -> Result<()> {
                                 );
                             }
                         }
-                        maybe_learn_skill(&history, &http, &base_url, &api_key, &model).await;
-                        maybe_evolve_persona(&history, &http, &base_url, &api_key, &model).await;
-                        maybe_learn_memory(&history);
-                        maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
-                        autosave_session(&history, &http, &base_url, &api_key, &model).await;
+                        maybe_learn_memory(&history); // local only — no network, nothing to interrupt
+                        // The post-turn passes are THREE more model calls (skill distillation, persona
+                        // evolution, auto-compaction) and they run here, after `set_working(false)` and
+                        // after the turn's token was disarmed. So the pill was down, `turn_in_flight()`
+                        // was false, and Esc took the idle branch — while the REPL sat awaiting them and
+                        // consumed no input. To the user the turn had visibly ENDED and the app was
+                        // wedged anyway. Re-arm for the duration; cancelling skips the remaining
+                        // learning, which is always optional work.
+                        let learned = cancellable_slash(async {
+                            maybe_learn_skill(&history, &http, &base_url, &api_key, &model).await;
+                            maybe_evolve_persona(&history, &http, &base_url, &api_key, &model).await;
+                            maybe_auto_compact(&mut history, &http, &base_url, &api_key, &model).await;
+                        })
+                        .await;
+                        if learned.is_none() {
+                            tui::emit_line(&theme::muted("⏹ skipped the post-turn learning passes.").to_string());
+                        }
+                        // Persistence is NOT optional, so it sits outside that block: a cancelled
+                        // learning pass must still leave the conversation on disk. `autosave_session`
+                        // names the session with a model call, so it's cancellable too — falling back
+                        // to the local-only writer keeps the transcript either way.
+                        if cancellable_slash(autosave_session(&history, &http, &base_url, &api_key, &model)).await.is_none() {
+                            autosave_last(&history, Some(&model));
+                        }
                     }
                     Some(Err(e)) => {
                         tui::emit_line(&format!("{} {e}", theme::err("error:")));
@@ -4061,6 +4377,13 @@ async fn run_menu_plain() -> Result<()> {
         "{}",
         style("Type to talk to the agent — it chats AND uses tools in one loop. /help for commands · Esc, Ctrl-C or /quit to exit.").dim()
     );
+    {
+        let (main, notes) = identity_banner();
+        println!("{}", style(main).dim());
+        for n in notes {
+            println!("{}", style(n).color256(theme::WARN));
+        }
+    }
 
     let http = http_client()?;
     let mut model_label = cli_config::load().model.unwrap_or_else(|| "(no model)".to_string());
@@ -4068,6 +4391,17 @@ async fn run_menu_plain() -> Result<()> {
     let mut input_history: Vec<String> = Vec::new(); // recallable past prompts (↑/↓ in the box)
     rebuild_system(&mut history, &model_label);
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
+    if let Some((name, n, origin)) = most_recent_session() {
+        let origin_note = origin.map(|o| format!(", {o}")).unwrap_or_default();
+        println!(
+            "{}",
+            style(format!(
+                "⟲ last conversation “{}” ({n} messages{origin_note}) — /resume to continue it",
+                pretty_session_name(&name)
+            ))
+            .dim()
+        );
+    }
 
     loop {
         icons::set_tier(cli_config::load().icons.as_deref()); // refresh after a possible /config change
@@ -4179,6 +4513,9 @@ async fn run_menu_plain() -> Result<()> {
             // Goal mode (set by `/goal <text>`): threads the live goal so the loop runs cap-free
             // with smart retry until the goal is declared + verified.
             goal: crate::agent::goal::current_goal(),
+            // Same mid-turn snapshot as the sticky REPL: an abrupt close mid-turn keeps the work
+            // done so far instead of only the question.
+            on_progress: Some(publish_live_history),
             ..AgentConfig::default()
         };
         let http_ref = &http;
@@ -4231,6 +4568,7 @@ async fn run_menu_plain() -> Result<()> {
             // typed message continues this conversation). No post-turn learning: not done yet.
             Ok(AgentOutcome { stop: StopReason::AwaitingInput(q), .. }) => {
                 show_clarify(&q);
+                autosave_last(&history, Some(&model)); // mirror of the sticky path: a paused turn is still a transcript
             }
             Ok(outcome) => {
                 // Surface an empty single-call turn (empty 200 / content filter / gateway that
@@ -4784,6 +5122,28 @@ fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &str) {
     }
 }
 
+/// Rewrite BOTH system lanes in place, preserving every non-system message.
+///
+/// For settings changes that alter the STABLE lane — `/model` and `/config` both do, since the model
+/// name, prompt tier and `<project_context>` live at index 0 — but must NOT end the conversation.
+/// `rebuild_system` cannot serve here: it calls `seed_prompt_lanes`, which starts with
+/// `history.clear()`, so using it for a settings change silently threw away the whole chat (the user
+/// went to `/config` to retune the context and came back to an empty thread).
+///
+/// Session working memory is deliberately KEPT: this is the same conversation, so its scratch notes
+/// are still valid. That is the other half of why `/config` must not route through `rebuild_system`,
+/// which drops them as part of starting a new thread.
+fn refresh_prompt_lanes_in_place(history: &mut Vec<Message>, model: &str) {
+    let lead = agent::compact::leading_system_count(history);
+    let bundle = current_system_prompt_bundle(model);
+    let mut lanes = vec![Message::system(bundle.stable)];
+    if !bundle.dynamic.trim().is_empty() {
+        lanes.push(Message::system(bundle.dynamic));
+    }
+    // Splice the new lanes over the old leading system block, keeping the conversation tail intact.
+    history.splice(0..lead, lanes);
+}
+
 /// Automatic codebase RAG, folded into the CURRENT user turn (NOT the dynamic system lane).
 ///
 /// When `/init` has built an index, the top-ranked chunks (path + line range + real content,
@@ -4808,6 +5168,20 @@ fn fold_retrieval_into_query(query: &str) -> String {
         Some(block) => format!("{block}\n\n{query}"),
         None => query.to_string(),
     }
+}
+
+/// Everything a THREAD SWITCH must reset besides history itself: session scratch memory, todos,
+/// the cost tally, destructive-op session grants, and browser page @refs. `/clear`, `/handoff`,
+/// `/resume`, `/sessions` restore and `/recover` all route here so a fresh or restored thread
+/// never inherits the previous one's state (the classic leak: a restored conversation still
+/// "allowed" the old thread's destructive ops and showed its cost).
+fn reset_per_session_state() {
+    memory::session_mem::clear_process_session_mem();
+    crate::agent::todo::clear();
+    client::cost_meter().reset();
+    tui::reset_session_allow();
+    #[cfg(feature = "browser")]
+    crate::agent::browser::release_active();
 }
 
 /// Reset the conversation to just the system prompt (fresh session / model change). Rebuilds the
@@ -5439,6 +5813,69 @@ async fn handoff_now(history: &[Message], goal: &str) -> Result<String> {
     Ok(summary.trim().to_string())
 }
 
+/// `/memory <sub>` — the in-REPL view of the same store the agent writes through, so the user can
+/// audit and correct it without dropping to the CLI. Sub-commands mirror `aizen memory <sub>` 1:1
+/// (same functions, same ids) rather than reimplementing a second, drifting surface.
+///
+/// `forget` here is the SOFT delete (archive → restorable); hard `purge` is CLI-only on purpose, so
+/// nothing typed mid-chat can destroy a fact irreversibly.
+fn slash_memory(arg: &str) -> Result<()> {
+    let (sub, rest) = match arg.split_once(char::is_whitespace) {
+        Some((s, r)) => (s.trim(), r.trim()),
+        None => (arg.trim(), ""),
+    };
+    match sub {
+        // Bare `/memory` keeps its old meaning (the rolled-up profile).
+        "" => memory::cmd_profile(false),
+        "list" | "ls" => memory::cmd_list(if rest.is_empty() { None } else { Some(rest) }),
+        "show" | "cat" => {
+            if rest.is_empty() {
+                anyhow::bail!("usage: /memory show <id>  (ids from `/memory list`)");
+            }
+            memory::cmd_show(rest)
+        }
+        "remember" | "add" => {
+            if rest.is_empty() {
+                anyhow::bail!("usage: /memory remember <fact>");
+            }
+            let id = memory::remember(rest)?;
+            tui::emit_line(
+                &style(format!("{}remembered ({id})", icons::g(icons::learned())))
+                    .color256(splash::ACCENT)
+                    .to_string(),
+            );
+            Ok(())
+        }
+        "edit" | "update" => {
+            // `/memory edit <id> <new body>` — the common correction. Field-by-field editing
+            // (description/type/scope) stays on the CLI, which has real flags for it.
+            let (id, body) = rest.split_once(char::is_whitespace).map(|(i, b)| (i.trim(), b.trim())).unwrap_or((rest, ""));
+            if id.is_empty() || body.is_empty() {
+                anyhow::bail!("usage: /memory edit <id> <corrected fact>  (field flags: `aizen memory edit --help`)");
+            }
+            memory::cmd_edit(id, None, None, None, Some(body.to_string()), None)
+        }
+        "forget" | "rm" => {
+            if rest.is_empty() {
+                anyhow::bail!("usage: /memory forget <id>  (archived, not erased — restorable)");
+            }
+            memory::cmd_forget(rest)
+        }
+        "archive" => memory::cmd_archive_list(),
+        "restore" => {
+            if rest.is_empty() {
+                anyhow::bail!("usage: /memory restore <id>  (ids from `/memory archive`)");
+            }
+            memory::cmd_restore(rest)
+        }
+        "profile" => memory::cmd_profile(false),
+        "style" => memory::cmd_style(),
+        "frozen" | "core" => memory::cmd_frozen(false),
+        // Anything else is treated as a search query, which is what `/memory <words>` always did.
+        _ => memory::cmd_search(arg, 5, None, None, None),
+    }
+}
+
 enum SlashOutcome {
     Continue,
     Quit,
@@ -5471,6 +5908,7 @@ const SLASH_HELP: &str = "\
 Commands:
   /help              this list
   /init [--force|--status]  index the codebase into a semantic chunk index (SHA-256 incremental, secrets redacted); powers codebase_search + auto per-turn retrieval. --force rebuilds, --status shows state, Esc cancels
+  /where             show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)
   /model             list the provider's models (with context windows) + pick one
   /config            set endpoint + key + model (wizard)
   /memory [query]    show your profile, or search memory; /memory remember <fact> to save
@@ -5481,10 +5919,14 @@ Commands:
   /mcp               MCP servers from ~/.aizen/mcp.json — lifecycle generation, health, pinned schema + tools
   /browser           browser profile/routes status (when built with --features browser)
   /telegram          Telegram integration menu (setup · test · status · start daemon · disable)
-  /sessions          saved conversations — restore · save · delete (auto-saves as you go)
+  /sessions          saved conversations — restore · save · delete (autosaves into its own file each turn; newest first, labeled by project)
+  /resume [name]     reopen the last conversation FROM THIS PROJECT (or a named one); /handoff <goal> starts a fresh thread carrying only what that goal needs
+  /where             which project/zone you're in, and which file this conversation is saved to
   /workflows         multi-agent status — live task/workflow children, sub-agent slots (also /wf)
   /agents            specialist sub-agents you can delegate to — list · set-model <name> <model> (routes model→endpoint)
+  /recover           a session interrupted by a crash/kill — restore its transcript + unsent draft, or /recover discard
   /timeline          show the checkpoint timeline (▸ = current); /timeline pick to restore · also /undo · /redo
+  /diff              what changed in the working tree since a checkpoint (read before you /undo)
   /checkpoint [note] save a restore point of the working tree now
   /compact           summarize older turns to free context now
   /goal <text>       run until the goal is done — model self-declares (goal_complete) + verify passes; no iteration cap, auto-retries API errors (incl. empty 200); /goal off to stop, Esc to cancel
@@ -5509,29 +5951,13 @@ Anything else you type goes to the agent (it chats and uses tools in one loop)."
 /// Slash commands that drive the terminal directly (dialoguer menus, the Telegram daemon) and so
 /// need the sticky box SUSPENDED. Everything else is pure-print: it runs with the box still up and
 /// its `tui::emit_line` output flows into the scroll region (so short output isn't painted over).
-fn slash_is_interactive(name: &str) -> bool {
-    matches!(
-        name,
-        "config"
-            | "setup"
-            | "persona"
-            | "personas"
-            | "character"
-            | "skills"
-            | "skill"
-            | "apps"
-            | "integrations"
-            | "telegram"
-            | "tg"
-            | "serve"
-            | "sessions"
-            | "model" // dialoguer Select owns stdin → must suspend retained first (mirrors /sessions)
-            | "memory"
-            | "mem"
-            | "timeline"
-            | "tm"
-            | "effort" // no-arg → the interactive drag slider owns stdin
-    )
+///
+/// Delegates to the ONE shared table in `tui`. This used to be a second, independently maintained
+/// list, and the two had drifted: this copy matched whole command names, so `/timeline pick` and
+/// `/tools menu` opened a dialoguer menu without suspending the box, while `/memory` (pure-print)
+/// was suspended for nothing. Anything that owns stdin must appear in exactly one place.
+fn slash_is_interactive(cmd: &str) -> bool {
+    tui::slash_takes_stdin(cmd)
 }
 
 async fn slash_tools(_arg: &str) {
@@ -5753,26 +6179,71 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
         "quit" | "exit" | "q" => return SlashOutcome::Quit,
         "clear" | "new" | "reset" => {
             rebuild_system(history, model_label);
-            crate::agent::todo::clear(); // a fresh conversation starts with an empty task list
-            client::cost_meter().reset(); // and a fresh cost tally
-            tui::reset_session_allow(); // re-confirm destructive ops in the new conversation
+            reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
             set_session_slug(None); // the next turn names + autosaves a brand-new session file
             update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
                                           // immediate window-close after /clear doesn't re-save it
-            #[cfg(feature = "browser")]
-            crate::agent::browser::release_active(); // drop this conversation's browser page/@refs
             tui::emit_line(&style("(new conversation)").dim().to_string());
+        }
+        "where" => {
+            tui::emit_line(&where_report());
+            // In the REPL, "where" includes WHICH FILE this conversation is being written to.
+            let sess = match current_session_slug() {
+                Some(s) => format!("session:  {}", sessions_dir().join(format!("{s}.json")).display()),
+                None => "session:  (not saved yet — named on the first autosave)".to_string(),
+            };
+            tui::emit_line(&style(sess).dim().to_string());
         }
         "tokens" => print_status_line(history, model_label),
         "context" | "ctx" => print_context(history, model_label),
         "cost" | "usage" => print_cost(history, model_label),
-        // /save + /load folded into /sessions (the current chat also auto-saves as "last").
+        // /save + /load folded into /sessions (the current chat autosaves under its own name).
         "save" | "load" => {
             tui::emit_line(&style("→ use /sessions — restore / save / delete are all there now").dim().to_string());
         }
         "sessions" => {
             if let Err(e) = sessions_menu(history, model_label).await {
                 eprintln!("{} {e}", style("sessions:").red());
+            }
+        }
+        // One keystroke back into the last conversation. `/sessions` could already restore, but it
+        // costs a menu and knowing which of a dozen files is the newest — so in practice a reopened
+        // terminal started from scratch even though the transcript was on disk the whole time.
+        "resume" | "continue" => {
+            // Bare `/resume` carries the offer's origin label through, so opening another project's
+            // conversation (only offered when this project has none) says so on the confirmation
+            // line — including for pre-provenance files, where `load_session` has nothing to warn with.
+            let (target, origin) = if arg.is_empty() {
+                match most_recent_session() {
+                    Some((slug, _, origin)) => (Some(slug), origin),
+                    None => (None, None),
+                }
+            } else {
+                (Some(sanitize_name(arg)), None)
+            };
+            match target {
+                None => tui::emit_line(&style("no saved conversation to resume yet").dim().to_string()),
+                Some(name) => match load_session(history, &name, model_label) {
+                    Ok(n) => {
+                        // A restore is a thread switch — the restored thread must not inherit the
+                        // previous one's todos/cost/grants. Only on success: a failed load leaves
+                        // the live thread (and its state) untouched.
+                        reset_per_session_state();
+                        // Replay so the restored thread is VISIBLE, not just present in the request:
+                        // resuming into an empty-looking screen reads as "it didn't work".
+                        agent::replay_transcript(history);
+                        let origin_note = origin.map(|o| format!(" ({o})")).unwrap_or_default();
+                        tui::emit_line(
+                            &style(format!(
+                                "⟲ resumed “{}”{origin_note} — {n} messages, context restored",
+                                pretty_session_name(&name)
+                            ))
+                            .color256(splash::ACCENT)
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("resume:").red())),
+                },
             }
         }
         "workflows" | "workflow" | "wf" | "agents-status" => slash_workflows(arg).await,
@@ -5795,6 +6266,9 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                         *history = restored;
                         migrate_legacy_prompt_lanes(history, model_label);
                         refresh_dynamic_prompt_lane(history, model_label);
+                        // Same thread-switch contract as /resume: the crashed thread's todos/cost/
+                        // grants belong to it, not to whatever was live before accepting.
+                        reset_per_session_state();
                         agent::replay_transcript(history);
                         if let Some(d) = draft {
                             tui::set_draft(&d);
@@ -5823,10 +6297,15 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
             // Harvest what the older turns touched BEFORE they collapse — once summarized their tool
             // calls are gone, so the tree must read the history while it's still whole.
             let tp = agent::compact::context_touchpoints(history);
-            tui::emit_line(&style("compacting…").dim().to_string());
-            match compact_now(history).await {
-                Ok((b, a)) => print_compact_summary(b, a, &tp),
-                Err(e) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
+            tui::emit_line(&style("compacting… (Esc to stop)").dim().to_string());
+            // Interruptible: the summarizer call is a network round-trip on the REPL's own thread.
+            // Without this the whole app is frozen until it returns (or the 300s read timeout).
+            match cancellable_slash(compact_now(history)).await {
+                Some(Ok((b, a))) => print_compact_summary(b, a, &tp),
+                Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
+                // Cancelled before the summary landed. `compact_history` only splices AFTER a
+                // non-empty summary returns, so dropping the future leaves history untouched.
+                None => tui::emit_line(&theme::muted("⏹ compact stopped — context unchanged.").to_string()),
             }
         }
         "handoff" => {
@@ -5834,20 +6313,42 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 tui::emit_line(&style("usage: /handoff <new goal> — start a fresh thread carrying only what matters for it").dim().to_string());
             } else {
                 tui::emit_line(&style("handing off…").dim().to_string());
-                match handoff_now(history, arg.trim()).await {
-                    Ok(summary) => {
+                // Same cancellable wrapper as /compact: this is a blocking model call inside the
+                // REPL loop, so without an armed token Esc can't reach it.
+                match cancellable_slash(handoff_now(history, arg.trim())).await {
+                    Some(Ok(summary)) => {
                         // Fresh thread: new system prompt, the goal-relevant extraction seeded as
                         // context, todos cleared, destructive-op session grants re-armed (like /clear).
                         rebuild_system(history, model_label);
+                        // The marker prefix keeps the seed alive through lane rewrites (/config,
+                        // /model, resume) — `leading_system_count` stops at it, so lane splices go
+                        // around the seed instead of overwriting it.
                         history.push(Message::system(format!(
-                            "[handoff context from the previous session]\n{summary}"
+                            "{}\n{summary}",
+                            agent::compact::HANDOFF_MARKER_PREFIX
                         )));
-                        crate::agent::todo::clear();
-                        tui::reset_session_allow();
+                        reset_per_session_state();
+                        // The finished conversation keeps its file; the handoff starts a NEW one.
+                        // Without re-slugging, the very next autosave overwrote the previous
+                        // thread's saved transcript with this freshly seeded stub.
+                        let previous = current_session_slug();
+                        set_session_slug(None);
+                        update_live_history(history);
                         tui::emit_line(&style("handoff — fresh thread seeded with the relevant context").color256(splash::ACCENT).to_string());
+                        // Name the thread being left behind, so the full transcript is findable.
+                        if let Some(prev) = previous {
+                            tui::emit_line(
+                                &style(format!("  (the previous thread stays saved as “{prev}” — /sessions to reopen it)"))
+                                    .dim()
+                                    .to_string(),
+                            );
+                        }
                         return SlashOutcome::Submit(arg.trim().to_string());
                     }
-                    Err(e) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
+                    Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
+                    // Cancelled before the extraction landed. Nothing was rebuilt, so the current
+                    // thread continues untouched.
+                    None => tui::emit_line(&theme::muted("⏹ handoff stopped — thread unchanged.").to_string()),
                 }
             }
         }
@@ -6059,7 +6560,10 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                     eprintln!("{} {e}", style("model:").red());
                 }
             } else {
-                rebuild_system(history, model_label);
+                // Also in place: the help text promises `/model` "switches models mid-session", and a
+                // switch that silently discarded the session would make that promise a lie. The stable
+                // lane carries `model:`, so it must be rewritten — see `refresh_prompt_lanes_in_place`.
+                refresh_prompt_lanes_in_place(history, model_label);
             }
         }
         "config" | "setup" => {
@@ -6067,27 +6571,12 @@ async fn handle_slash(input: &str, history: &mut Vec<Message>, model_label: &mut
                 eprintln!("{} {e}", style("config:").red());
             }
             *model_label = cli_config::load().model.unwrap_or_else(|| model_label.clone());
-            rebuild_system(history, model_label);
+            // Refresh IN PLACE — retuning settings mid-chat must not end the conversation.
+            refresh_prompt_lanes_in_place(history, model_label);
         }
         "memory" | "mem" => {
-            if let Some(rest) = arg.strip_prefix("remember").map(str::trim).filter(|s| !s.is_empty()) {
-                match memory::remember(rest) {
-                    Ok(id) => tui::emit_line(
-                        &style(format!("{}remembered ({id})", icons::g(icons::learned())))
-                            .color256(splash::ACCENT)
-                            .to_string(),
-                    ),
-                    Err(e) => tui::emit_line(&format!("{} {e}", style("memory:").red())),
-                }
-            } else {
-                let r = if arg.is_empty() {
-                    memory::cmd_profile(false)
-                } else {
-                    memory::cmd_search(arg, 5, None, None, None)
-                };
-                if let Err(e) = r {
-                    eprintln!("{} {e}", style("memory:").red());
-                }
+            if let Err(e) = slash_memory(arg) {
+                eprintln!("{} {e}", style("memory:").red());
             }
         }
         "persona" | "personas" | "character" => {
@@ -6245,6 +6734,20 @@ fn sanitize_name(s: &str) -> String {
         n.to_string()
     }
 }
+/// Why a save-as name can't be used, or `None` if it can. Split out of the picker's arm so the rule
+/// is testable without driving the interactive prompt.
+///
+/// Only `last` is refused, and only here: it is the retired legacy-pointer name, which
+/// [`scan_sessions`] deliberately skips. Accepting it would print "saved" for a file the picker can
+/// neither restore nor delete, and pin every later autosave to it. Not folded into
+/// [`sanitize_name`], which must keep mapping `last` verbatim so the legacy pointer stays loadable
+/// and re-homable.
+fn session_save_name_error(raw: &str) -> Option<&'static str> {
+    (sanitize_name(raw.trim()) == "last").then_some(
+        "“last” is the retired pointer name — pick another (it would not show up in /sessions)",
+    )
+}
+
 /// Suggest a human-readable session name from the conversation's first user turn, so the "Save as"
 /// prompt comes PRE-FILLED with the topic (Enter to accept, or edit) instead of a blank box. A short
 /// hyphenated slug of the first few meaningful words + a date suffix to keep same-topic saves distinct.
@@ -6278,12 +6781,171 @@ fn suggest_session_name(history: &[Message]) -> String {
         format!("{slug}-{date}")
     }
 }
-fn save_session(history: &[Message], name: &str) -> Result<String> {
+/// Provenance stamped into every saved session so a file can answer "which project, which model,
+/// when?" without the user cross-referencing anything. Every field is optional: a hand-edited or
+/// pre-provenance file still parses, absent just means "unknown".
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SessionMeta {
+    /// Normalized canonical path key of the project root — the exact string `project_slug()`
+    /// hashes, so "same project?" agrees byte-for-byte with zone identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated: Option<String>,
+}
+
+/// On-disk shape of a saved session: `{"version":2,"meta":{…},"messages":[…]}`. The
+/// pre-provenance format was a bare `Vec<Message>` array — [`parse_session_bytes`] accepts both.
+/// `version` and `meta` both default: a future writer may bump the version, and a hand-written or
+/// partially-written file that still has `messages` is worth loading. Only a missing/unparsable
+/// `messages` makes a file unreadable.
+#[derive(serde::Deserialize)]
+struct SessionFile {
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    meta: SessionMeta,
+    messages: Vec<Message>,
+}
+
+/// Borrowed twin of [`SessionFile`] for writing, so every autosave doesn't clone the transcript.
+#[derive(serde::Serialize)]
+struct SessionFileRef<'a> {
+    version: u32,
+    meta: &'a SessionMeta,
+    messages: &'a [Message],
+}
+
+/// Parse either session format. `None` = unreadable/corrupt (callers surface that explicitly —
+/// a corrupt file must never masquerade as an empty conversation).
+fn parse_session_bytes(bytes: &[u8]) -> Option<(Vec<Message>, Option<SessionMeta>)> {
+    if let Ok(f) = serde_json::from_slice::<SessionFile>(bytes) {
+        return Some((f.messages, Some(f.meta)));
+    }
+    serde_json::from_slice::<Vec<Message>>(bytes).ok().map(|m| (m, None))
+}
+
+fn save_session(history: &[Message], name: &str, model: Option<&str>) -> Result<String> {
+    // All three come from one cached identity lookup, so a file's key and slug can never disagree.
+    write_session(
+        history,
+        name,
+        SessionMeta {
+            project_key: Some(config::project_key()),
+            project_root: Some(config::project_root().display().to_string()),
+            project_slug: Some(config::project_slug()),
+            model: model.map(str::to_string).or_else(|| cli_config::load().model),
+            created: None,
+            updated: None,
+        },
+    )
+}
+
+/// Re-home an UNATTRIBUTED transcript — the legacy `last.json` pointer copy — under a real slug
+/// without inventing provenance for it. The pointer never recorded which project it came from, so
+/// stamping the current one would assert on disk that another repo's conversation belongs here:
+/// that lie then silences [`load_session`]'s cross-project warning, makes the file read as `here`
+/// forever, and can never be undone (there is no original path left to restore). Absent fields are
+/// the truth. Whatever the source DID record is carried through verbatim.
+fn rehome_session(
+    history: &[Message],
+    name: &str,
+    carried: Option<SessionMeta>,
+    model: Option<&str>,
+) -> Result<String> {
+    let mut meta = carried.unwrap_or_default();
+    meta.model = model.map(str::to_string).or(meta.model);
+    write_session(history, name, meta)
+}
+
+/// How many saved sessions still carry a LEGACY zone slug — for `aizen zone migrate`'s plan.
+/// Sessions are a flat pool keyed by the provenance INSIDE each file, so they are invisible to the
+/// slug-directory sweep the rest of the migration does.
+pub(crate) fn count_sessions_of_slug(legacy_slug: &str) -> usize {
+    stat_sessions()
+        .iter()
+        .filter(|s| {
+            read_session_row(&s.path)
+                .1
+                .and_then(|m| m.project_slug)
+                .is_some_and(|sl| sl == legacy_slug)
+        })
+        .count()
+}
+
+/// Re-stamp every session recorded under `legacy_slug` with the CURRENT project identity — the
+/// session leg of `aizen zone migrate`. Without it, a moved/re-cloned checkout (or a pre-fix
+/// twin-zone population) left every one of the user's OWN transcripts reading as another project:
+/// labeled `from <old dir>` in the picker and warned about on restore, permanently, because nothing
+/// else in the migration touches provenance stored inside files.
+///
+/// `updated` is preserved: a bookkeeping rewrite must not make a stale conversation look freshly
+/// used, exactly as memory retagging preserves its aging clock. (The file's mtime does move — std
+/// has no portable way to set it, and adding a C dependency for cosmetics isn't worth it — so
+/// `updated` stays the honest record of when the conversation itself last changed.)
+pub(crate) fn retag_sessions_of_slug(legacy_slug: &str, on_error: &mut dyn FnMut(String)) -> usize {
+    let key = config::project_key();
+    let root = config::project_root().display().to_string();
+    let slug = config::project_slug();
+    let mut n = 0usize;
+    for s in stat_sessions() {
+        let Some((msgs, Some(mut meta))) =
+            std::fs::read(&s.path).ok().and_then(|b| parse_session_bytes(&b))
+        else {
+            continue;
+        };
+        if meta.project_slug.as_deref() != Some(legacy_slug) {
+            continue;
+        }
+        meta.project_key = Some(key.clone());
+        meta.project_root = Some(root.clone());
+        meta.project_slug = Some(slug.clone());
+        let file = SessionFileRef { version: 2, meta: &meta, messages: &msgs };
+        let bytes = match serde_json::to_vec_pretty(&file) {
+            Ok(mut b) => {
+                b.push(b'\n');
+                b
+            }
+            Err(e) => {
+                on_error(format!("session {}: {e:#}", s.name));
+                continue;
+            }
+        };
+        match crate::core::persist::atomic_write(&s.path, &bytes)
+            .and_then(|_| crate::core::persist::harden_owner_only_checked(&s.path))
+        {
+            Ok(_) => n += 1,
+            Err(e) => on_error(format!("session {}: {e:#}", s.name)),
+        }
+    }
+    n
+}
+
+/// Write a session file. `created` is preserved across the per-turn re-saves of one conversation
+/// (existing file's stamp wins, then the caller's carried one, then now); `updated` is always now.
+fn write_session(history: &[Message], name: &str, mut meta: SessionMeta) -> Result<String> {
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     config::harden_dir(&dir);
     let path = dir.join(format!("{}.json", sanitize_name(name)));
-    let mut bytes = serde_json::to_vec_pretty(history)?;
+    let existing_created = std::fs::read(&path)
+        .ok()
+        .and_then(|b| parse_session_bytes(&b))
+        .and_then(|(_, m)| m.and_then(|m| m.created));
+    let now = chrono::Local::now().to_rfc3339();
+    meta.created = existing_created.or(meta.created).or_else(|| Some(now.clone()));
+    meta.updated = Some(now);
+    let file = SessionFileRef { version: 2, meta: &meta, messages: history };
+    let mut bytes = serde_json::to_vec_pretty(&file)?;
     bytes.push(b'\n');
     crate::core::persist::atomic_write(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -6293,14 +6955,75 @@ fn save_session(history: &[Message], name: &str) -> Result<String> {
 }
 fn load_session(history: &mut Vec<Message>, name: &str, model: &str) -> Result<usize> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
-    let s = std::fs::read_to_string(&path).with_context(|| format!("no saved session '{name}'"))?;
-    let loaded: Vec<Message> = serde_json::from_str(&s).context("parsing session file")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("no saved session '{name}'"))?;
+    let (loaded, meta) = parse_session_bytes(&bytes).context("parsing session file")?;
     *history = loaded;
-    migrate_legacy_prompt_lanes(history, model);
-    refresh_dynamic_prompt_lane(history, model);
-    // Continue autosaving into the SAME file we just restored (don't spawn a fresh slug next turn).
-    set_session_slug(Some(sanitize_name(name)));
-    Ok(history.len())
+    // Rebuild BOTH prompt lanes for the CURRENT project + model. The stable lane saved in the file
+    // reflects wherever the session was recorded — replaying it verbatim in another checkout
+    // grafted the OTHER project's <project_context>/frozen core onto this cwd: every tool ran here
+    // while the model was told it was there. The splice keeps the conversation tail (and any
+    // handoff seed) intact. Thread-switch resets (todos/cost/grants) are the CALLER's job — this
+    // function only loads, so tests and backup paths can use it without mutating global state.
+    refresh_prompt_lanes_in_place(history, model);
+    // Cross-project restore is allowed but must be LOUD: name the source so "why does the model
+    // think it's in the other repo?" never needs source-diving. Files without provenance stay
+    // silent — there is nothing truthful to warn with.
+    if let Some(theirs) = meta.as_ref().and_then(|m| m.project_key.as_ref()) {
+        if *theirs != config::project_key() {
+            let from = meta
+                .as_ref()
+                .and_then(|m| m.project_root.clone().or_else(|| m.project_slug.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
+            // If the recorded directory is GONE, "another project" is the wrong accusation: the
+            // overwhelmingly likely story is that this very checkout was moved or renamed, so the
+            // conversation is the user's own history. Same facts, honest reading — and the phrasing
+            // still says what was rebuilt, because the lane rewrite happened either way.
+            let vanished = meta
+                .as_ref()
+                .and_then(|m| m.project_root.as_deref())
+                .is_some_and(|r| !std::path::Path::new(r).exists());
+            let headline = if vanished {
+                format!("⚠ this session was saved at {from}, which no longer exists — moved or renamed project?")
+            } else {
+                format!("⚠ this session was saved in another project: {from}")
+            };
+            tui::emit_line(&style(headline).color256(theme::WARN).to_string());
+            tui::emit_line(
+                &style(format!(
+                    "  system context rebuilt for the current project: {}",
+                    config::project_root().display()
+                ))
+                .color256(theme::WARN)
+                .to_string(),
+            );
+        }
+    }
+    // Continue autosaving into the SAME file we just restored (don't spawn a fresh slug next turn)
+    // — EXCEPT the legacy `last` pointer copy: pinning the live slug to `last` would make every
+    // later turn overwrite the pointer instead of a real conversation, so re-home it first.
+    let slug = sanitize_name(name);
+    if slug == "last" {
+        let fresh = allocate_session_slug(history);
+        // The transcript is already restored into `history` at this point, so a failed re-home must
+        // not fail the restore — report it and leave the slug unpinned, which makes the next autosave
+        // allocate a fresh name (and say so) instead of overwriting the pointer.
+        match save_session(history, &fresh, Some(model)) {
+            Ok(_) => set_session_slug(Some(fresh)),
+            Err(e) => {
+                set_session_slug(None);
+                tui::emit_line(&format!(
+                    "{} could not re-home the legacy `last` pointer: {e:#} — this chat will be saved under a new name on the next turn",
+                    theme::warn("⚠")
+                ));
+            }
+        }
+    } else {
+        set_session_slug(Some(slug));
+    }
+    // Keep the exit-flush snapshot in step with what was just restored, so an abrupt window close
+    // right after re-saves this conversation, not a stale one.
+    update_live_history(history);
+    Ok(conversation_len(history))
 }
 static SESSION_SLUG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -6319,40 +7042,224 @@ fn current_session_slug() -> Option<String> {
 }
 fn pretty_session_name(name: &str) -> String { name.replace('-', " ") }
 
+/// One row of the session pool, as scanned from disk.
+struct SessionInfo {
+    name: String,
+    /// Real conversation turns (leading system lanes excluded); `None` = unreadable/corrupt file —
+    /// distinct from a readable empty one, so the picker can say "(unreadable)" instead of "0 msgs".
+    msgs: Option<usize>,
+    meta: Option<SessionMeta>,
+    /// Modification time in Unix MILLIseconds. `None` = the filesystem wouldn't say (network share,
+    /// FUSE mount, transient ACL error) — rendered as "age unknown" rather than posing as fresh.
+    /// Milliseconds, not seconds, because two saves inside one second are routine (a `/handoff` and
+    /// the seeded turn's autosave) and a second-granularity tie fell through to ALPHABETICAL order,
+    /// which points the wrong way as often as not while the picker still claims "newest first".
+    mtime_ms: Option<u64>,
+    /// Saved from THIS project? `None` = no provenance (pre-provenance file, project unknown).
+    here: Option<bool>,
+}
+
+/// One session file as seen WITHOUT reading it. Statting a directory is cheap; deserializing every
+/// multi-MB transcript in it is not — and the startup hint runs before the first prompt is even
+/// accepted, so it must not pay for the whole pool just to name one conversation.
+struct SessionStat {
+    name: String,
+    path: std::path::PathBuf,
+    mtime_ms: Option<u64>,
+    /// Sort key: mtime clamped to now. A stamp in the FUTURE (clock skew from a VM resume, a
+    /// pre-NTP boot, a dual-boot clock) would otherwise pin one file to the top of every launch's
+    /// offer forever. `None` (filesystem wouldn't say) sorts last.
+    recency: Option<u64>,
+}
+
+/// The pool, newest first, without reading any transcript. One ordering, shared by the hint and the
+/// picker, so the two surfaces can never disagree about which conversation is the newest. The legacy
+/// `last.json` pointer is a duplicate COPY of some conversation, not a session of its own — it never
+/// appears as a row.
+fn stat_sessions() -> Vec<SessionStat> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|x| x.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if name == "last" {
+                continue;
+            }
+            let mtime_ms = e
+                .metadata()
+                .ok()
+                .and_then(|md| md.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            out.push(SessionStat { name, path, mtime_ms, recency: None });
+        }
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    for s in &mut out {
+        s.recency = s.mtime_ms.map(|ms| ms.min(now_ms));
+    }
+    // Milliseconds, not seconds: two saves inside one second are routine (a `/handoff` and the
+    // seeded turn's autosave), and a second-granularity tie fell through to ALPHABETICAL order,
+    // which points the wrong way as often as not while the prompt still says "newest first". Name
+    // order remains the last resort so the sort is total and stable.
+    out.sort_by(|a, b| b.recency.cmp(&a.recency).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+/// Read one row's transcript-derived fields. `(None, None)` = unreadable/corrupt.
+fn read_session_row(path: &std::path::Path) -> (Option<usize>, Option<SessionMeta>) {
+    match std::fs::read(path).ok().and_then(|b| parse_session_bytes(&b)) {
+        Some((m, meta)) => (Some(conversation_len(&m)), meta),
+        None => (None, None),
+    }
+}
+
+/// Read the whole pool, newest first — for the `/sessions` picker, which shows every row and so
+/// genuinely needs every file parsed. The startup hint uses [`most_recent_session`] instead, which
+/// parses lazily in the same order.
+fn scan_sessions() -> Vec<SessionInfo> {
+    let here_key = config::project_key();
+    stat_sessions()
+        .into_iter()
+        .map(|s| {
+            let (msgs, meta) = read_session_row(&s.path);
+            let here = meta.as_ref().and_then(|m| m.project_key.as_ref()).map(|k| *k == here_key);
+            SessionInfo { name: s.name, msgs, meta, mtime_ms: s.mtime_ms, here }
+        })
+        .collect()
+}
+
+/// Age of a session file for the picker. Distinct from [`fmt_time_ago`], which was written for
+/// `/init --status` and maps both 0 and future stamps to "just now" — for a session row that would
+/// print "just now" on an unreadable mtime and on a clock-skewed file, i.e. exactly the two cases
+/// the user needs told apart from a genuinely fresh save.
+fn fmt_session_age(mtime_ms: Option<u64>) -> String {
+    let Some(ms) = mtime_ms else {
+        return "age unknown".to_string();
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    if ms > now_ms.saturating_add(60_000) {
+        return "future timestamp (clock skew)".to_string();
+    }
+    fmt_time_ago((ms / 1000).max(1)) // .max(1): second 0 is fmt_time_ago's "unknown" sentinel
+}
+
+/// Short human label for where a foreign or unlabeled session came from — the picker/hint suffix.
+/// Takes the meta rather than the row so the `last.json` re-home path (which has no row) can use it.
+///
+/// A recorded root that no longer EXISTS is flagged as such rather than presented as a live sibling
+/// project: the usual cause is this checkout being moved or renamed, in which case a bare
+/// "from <old dir>" is the picker calling the user's own history someone else's.
+fn session_origin_label(meta: Option<&SessionMeta>) -> String {
+    let root = meta.and_then(|m| m.project_root.as_deref());
+    let named = root
+        .and_then(|r| std::path::Path::new(r).file_name().and_then(|n| n.to_str()))
+        .map(str::to_string)
+        .or_else(|| meta.and_then(|m| m.project_slug.clone()));
+    match named {
+        Some(n) if root.is_some_and(|r| !std::path::Path::new(r).exists()) => {
+            format!("from {n} (path gone)")
+        }
+        Some(n) => format!("from {n}"),
+        None => "project unknown".to_string(),
+    }
+}
+
+/// The session to offer for bare `/resume` and the startup hint: the newest one saved FROM THIS
+/// project. Only when this project has none does it fall back to the pool's newest, labeled with
+/// its origin — a cross-project resume must be a visible choice, never a trap.
+///
+/// Returns `(slug, conversation_turns, origin_label)`; the label is `None` for a same-project
+/// offer. `None` overall when nothing restorable has been saved yet.
+fn most_recent_session() -> Option<(String, usize, Option<String>)> {
+    let here_key = config::project_key();
+    // Parse in newest-first order and STOP at the first same-project hit, rather than deserializing
+    // the whole pool to name one conversation. This runs before the first prompt is accepted, and a
+    // long-lived pool is dozens of multi-MB transcripts (autosave per turn + a slug per handoff) —
+    // on an AV-scanned or cloud-synced profile dir the eager scan was seconds of silent dead time.
+    let stats = stat_sessions();
+    let mut rows: Vec<(usize, usize, Option<SessionMeta>)> = Vec::new(); // (index, turns, meta)
+    let mut best: Option<usize> = None; // index into `rows` of the best tier seen so far
+    let tier = |meta: &Option<SessionMeta>| match meta.as_ref().and_then(|m| m.project_key.as_ref())
+    {
+        // Three tiers, not two. A file with NO provenance is not evidence of a foreign project — on
+        // the first launch after upgrading EVERY file is keyless, so folding `None` in with
+        // `Some(false)` made the whole pool "project unknown" and left the prefer-this-project rule
+        // dead until each file had been resumed once. Unlabeled ranks between mine and theirs.
+        Some(k) if *k == here_key => 0u8,
+        None => 1,
+        Some(_) => 2,
+    };
+    for (i, s) in stats.iter().enumerate() {
+        let (msgs, meta) = read_session_row(&s.path);
+        let Some(turns) = msgs else { continue }; // unreadable/corrupt — never offered
+        let t = tier(&meta);
+        rows.push((i, turns, meta));
+        if best.is_none_or(|b| t < tier(&rows[b].2)) {
+            best = Some(rows.len() - 1);
+        }
+        if t == 0 {
+            break; // newest same-project file — nothing later in the order can beat it
+        }
+    }
+    if let Some(b) = best {
+        let (i, turns, meta) = &rows[b];
+        // Only a file that PROVES it came from elsewhere gets the origin suffix. `None` provenance
+        // has nothing truthful to say — the same rule `load_session` applies to its warning.
+        let label = (tier(meta) == 2).then(|| session_origin_label(meta.as_ref()));
+        return Some((stats[*i].name.clone(), *turns, label));
+    }
+    // Nothing restorable in the pool — which is NOT the same as an empty pool: one stray unparsable
+    // `.json` in the dir used to make this fallback unreachable, hiding a perfectly readable
+    // pointer-era transcript from the hint AND (since `last` is never a row) from the picker too.
+    // Pre-provenance pool where only the shared `last.json` copy ever existed: re-home that
+    // transcript into a real named file once, so it shows up in /sessions from now on.
+    let bytes = std::fs::read(sessions_dir().join("last.json")).ok()?;
+    let (msgs, carried) = parse_session_bytes(&bytes)?;
+    if !msgs.iter().any(|m| m.role == "user") {
+        return None;
+    }
+    let fresh = allocate_session_slug(&msgs);
+    // Carry the pointer's own meta through rather than stamping THIS project onto it: the pointer
+    // was project-blind, so claiming it as ours would be a lie that also silences load_session's
+    // cross-project warning forever. Unattributed → offered as "project unknown", honestly.
+    let label = carried
+        .as_ref()
+        .and_then(|m| m.project_key.as_ref())
+        .map_or_else(
+            || Some("project unknown".to_string()),
+            |k| (*k != config::project_key()).then(|| session_origin_label(carried.as_ref())),
+        );
+    // Re-homing is a convenience, not a precondition: if the dir is unwritable the transcript
+    // is still READABLE, so keep offering it under the legacy `last` name rather than pretending
+    // there is nothing to resume. `load_session` re-homes on restore (and reports if that fails).
+    match rehome_session(&msgs, &fresh, carried, None) {
+        Ok(_) => Some((fresh, conversation_len(&msgs), label)),
+        Err(_) => Some(("last".to_string(), conversation_len(&msgs), label)),
+    }
+}
+
+/// Count of real conversation turns (excluding the leading system lanes) — for the resume hint, so
+/// it reports what the user recognizes as "messages" rather than raw vector length.
+fn conversation_len(history: &[Message]) -> usize {
+    history.len().saturating_sub(agent::compact::leading_system_count(history))
+}
+
 async fn autosave_session(
     history: &[Message],
     _http: &reqwest::Client,
     _base_url: &str,
     _api_key: &str,
-    _model: &str,
+    model: &str,
 ) {
-    autosave_last(history);
+    autosave_last(history, Some(model));
 }
 
-fn list_sessions() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
-                    out.push(stem.to_string());
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-/// Message count of a saved session (0 if missing/unparsable) — for the picker's display.
-fn session_len(name: &str) -> usize {
-    let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<Message>>(&s).ok())
-        .map(|v| v.len())
-        .unwrap_or(0)
-}
 fn delete_session(name: &str) -> Result<()> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
     std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -6394,13 +7301,41 @@ fn update_live_history(history: &[Message]) {
 /// Persist the live conversation on any exit — graceful (/quit, Ctrl-D) or abrupt (window ✕ via the
 /// Windows console handler). Safe to call from a foreign thread: it only does synchronous file I/O.
 fn flush_live_session_on_exit() {
+    // Route the notices for teardown: the "· saving as" line is pointless when the render thread may
+    // already be gone, and a failure must go to stderr instead of the TUI. Cleared on the way out so
+    // this can't permanently mute a process that keeps running (the unix SIGHUP handler and the
+    // test suite both call this without exiting).
+    EXIT_FLUSHING.store(true, std::sync::atomic::Ordering::Relaxed);
     let snapshot = live_history_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    autosave_last(&snapshot);
+    // No REPL model label on this thread — `save_session` falls back to the configured model.
+    autosave_last(&snapshot, None);
+    EXIT_FLUSHING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set while the exit-flush path is writing, so autosave stays silent during teardown.
+static EXIT_FLUSHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mid-turn progress hook hnaded to the agent loop as a plain `fn` pointer (so `AgentConfig` keeps
+/// its `Clone + Debug` derives and stays `dyn`-free).
+///
+/// Without this the exit-flush snapshot only advanced when a turn STARTED or FINISHED: the loop owns
+/// `history` mutably for the whole turn, so a terminal closed mid-turn saved the user's question and
+/// threw away every assistant reply and tool result the turn had already produced. The loop calls
+/// this at each iteration boundary — the same point steering drains, where history is guaranteed
+/// coherent (no `tool_calls` awaiting results) — so what lands on disk is always a valid transcript.
+/// Memory-only by design; the actual file write happens once, on exit.
+fn publish_live_history(history: &[Message]) {
+    update_live_history(history);
 }
 
 /// Catch the terminal window being closed (✕), user logoff and system shutdown so the live chat is
-/// flushed to `/sessions` before Windows terminates us. Ctrl-C / Ctrl-Break are deliberately left to
-/// the existing in-app cancel handling (we return FALSE for them, changing nothing). No-op elsewhere.
+/// flushed to `/sessions` before the OS terminates us. Ctrl-C / Ctrl-Break are deliberately left to
+/// the existing in-app cancel handling (we return FALSE for them, changing nothing).
+///
+/// Both halves are needed because "the user closed the terminal" is a different OS event per
+/// platform: a console control event on Windows, `SIGHUP` (pty hangup) or `SIGTERM` on unix. Without
+/// the unix half, closing a terminal there killed the process with no flush at all and the whole
+/// conversation was lost — the exact failure this handler exists to prevent.
 fn install_exit_flush_handler() {
     #[cfg(windows)]
     {
@@ -6419,24 +7354,77 @@ fn install_exit_flush_handler() {
             let _ = SetConsoleCtrlHandler(Some(handler), 1);
         }
     }
+    // Unix: closing the terminal emulator hangs up the pty (`SIGHUP`); a session manager or
+    // `kill` sends `SIGTERM`. Default disposition for both is immediate termination, so the
+    // transcript needs saving from the handler task. Watched on the tokio runtime (async signal
+    // handling, no `unsafe`), then we exit ourselves — the default action is what the sender asked
+    // for, so restoring the terminal and leaving is the honest response to it.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        for kind in [SignalKind::hangup(), SignalKind::terminate()] {
+            if let Ok(mut sig) = signal(kind) {
+                tokio::spawn(async move {
+                    if sig.recv().await.is_some() {
+                        flush_live_session_on_exit();
+                        // Give the alt-screen back before dying, else the user's shell is left in
+                        // raw mode with no cursor.
+                        tui::deactivate();
+                        std::process::exit(0);
+                    }
+                });
+            }
+        }
+    }
 }
 
 /// Best-effort auto-save of the live conversation (called after each turn and on exit) so you can
 /// always come back to it via `/sessions` without ever running an explicit save. A brand-new chat is
 /// given its own distinct file on first save so it never overwrites another unnamed conversation.
-fn autosave_last(history: &[Message]) {
+fn autosave_last(history: &[Message], model: Option<&str>) {
     if history.iter().any(|m| m.role == "user") {
         let name = match current_session_slug() {
             Some(n) => n,
             None => {
                 let slug = allocate_session_slug(history);
                 set_session_slug(Some(slug.clone()));
+                // Name the file OUT LOUD the moment it exists: "which file is THIS conversation
+                // being written to?" must be answerable from the screen, not from source.
+                if !EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed) {
+                    tui::emit_line(&style(format!("· saving as “{slug}”")).dim().to_string());
+                }
                 slug
             }
         };
-        let _ = save_session(history, &name);
-        if name != "last" {
-            let _ = save_session(history, "last"); // keep `last` as the "most recent" pointer
+        // "auto-saves as you go" is a PROMISE (/help says so). When the write fails — full disk,
+        // ACL damage, OneDrive/AV lock on ~/.aizen — swallowing it meant the user worked for hours
+        // believing the transcript was on disk and found nothing to resume. Say it once per failure
+        // streak (not every turn), and say it again after a recovery so the state is never stale.
+        match save_session(history, &name, model) {
+            Ok(_) => {
+                if AUTOSAVE_BROKEN.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    && !EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    tui::emit_line(
+                        &style("· autosave recovered — this conversation is being saved again")
+                            .dim()
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                if !AUTOSAVE_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let msg = format!(
+                        "⚠ autosave failed: {e:#} — this conversation is NOT being saved. Fix the path or use /sessions to save elsewhere."
+                    );
+                    // The TUI may already be torn down on the exit-flush path; stderr still lands.
+                    if EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("{msg}");
+                    } else {
+                        tui::emit_line(&style(msg).color256(theme::WARN).to_string());
+                    }
+                }
+            }
         }
         update_live_history(history);
         let _ = crate::core::recovery::checkpoint_history(
@@ -6447,23 +7435,43 @@ fn autosave_last(history: &[Message]) {
     }
 }
 
+/// Latch so a persistent autosave failure warns ONCE per streak instead of every turn (and reports
+/// once when writes start working again).
+static AUTOSAVE_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `/sessions` — the conversation manager (replaces the old `/save` + `/load`): pick a saved
-/// conversation to RESTORE, save the current one under a name, or delete one. The live chat is also
-/// auto-saved as `last` after every turn, so there's always something to come back to.
+/// conversation to RESTORE, save the current one under a name, or delete one. The live chat
+/// autosaves into its OWN named file after every turn, so there's always something to come back to.
 async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<()> {
     loop {
         let theme = ui_theme();
-        let names = list_sessions();
-        let n_sessions = names.len();
-        let mut items: Vec<String> = names
+        // Newest first, with provenance: age, origin project for foreign/unlabeled files, a
+        // "● current" marker on the live conversation's file, and corrupt files called out as
+        // unreadable instead of posing as plausible "0 msgs" sessions.
+        let pool = scan_sessions();
+        let names: Vec<String> = pool.iter().map(|s| s.name.clone()).collect();
+        let n_sessions = pool.len();
+        let current = current_session_slug();
+        let mut items: Vec<String> = pool
             .iter()
-            .map(|name| {
-                let n = session_len(name);
-                format!(
-                    "{} {name}  —  {n} msg{}",
+            .map(|s| {
+                let count = match s.msgs {
+                    Some(n) => format!("{n} msg{}", if n == 1 { "" } else { "s" }),
+                    None => "(unreadable)".to_string(),
+                };
+                let mut row = format!(
+                    "{} {}  —  {count} · {}",
                     icons::g(icons::slash("sessions")),
-                    if n == 1 { "" } else { "s" }
-                )
+                    s.name,
+                    fmt_session_age(s.mtime_ms)
+                );
+                if s.here == Some(false) {
+                    row.push_str(&format!(" · {}", session_origin_label(s.meta.as_ref())));
+                }
+                if current.as_deref() == Some(s.name.as_str()) {
+                    row.push_str(" · ● current");
+                }
+                row
             })
             .collect();
         items.push("+ Save current conversation…".to_string());
@@ -6475,7 +7483,7 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
         let prompt = if n_sessions == 0 {
             "Sessions — none saved yet (Esc to go back)".to_string()
         } else {
-            format!("Sessions — {n_sessions} saved · pick one to restore (Esc to go back)")
+            format!("Sessions — {n_sessions} saved, newest first · pick one to restore (Esc to go back)")
         };
         let pick = match Select::with_theme(&theme).with_prompt(prompt).items(&items).default(0).interact_opt()? {
             Some(i) => i,
@@ -6486,10 +7494,8 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
             let name = &names[pick];
             match load_session(history, name, model_label) {
                 Ok(n) => {
+                    reset_per_session_state(); // thread switch — same contract as /resume
                     println!("{}", style(format!("restored '{}' ({n} messages)", pretty_session_name(name))).color256(splash::ACCENT));
-                    // Keep the exit-flush snapshot in step with what we just restored so an abrupt
-                    // window close right after restore re-saves this conversation, not a stale one.
-                    update_live_history(history);
                     agent::replay_transcript(history);
                     return Ok(());
                 }
@@ -6503,7 +7509,25 @@ async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<
                 .interact_text()
                 .unwrap_or_default();
             if !name.trim().is_empty() {
-                match save_session(history, name.trim()) {
+                // Saving over a DIFFERENT conversation's file is destructive — confirm it. Re-saving
+                // the live conversation's own file is the normal case and stays silent.
+                let target = sanitize_name(name.trim());
+                if let Some(why) = session_save_name_error(&name) {
+                    eprintln!("{} {why}", style("save:").red());
+                    continue;
+                }
+                let exists = sessions_dir().join(format!("{target}.json")).exists();
+                if exists && current.as_deref() != Some(target.as_str()) {
+                    let overwrite = Confirm::with_theme(&theme)
+                        .with_prompt(format!("'{}' already exists — overwrite it?", pretty_session_name(&target)))
+                        .default(false)
+                        .interact_opt()?
+                        .unwrap_or(false);
+                    if !overwrite {
+                        continue;
+                    }
+                }
+                match save_session(history, name.trim(), Some(model_label)) {
                     Ok(_) => {
                         // Pin the session to this name so later autosaves keep rewriting the SAME file
                         // (both paths route through `sanitize_name`, so the raw name maps to one file).
@@ -7856,6 +8880,24 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Review { promote, clear } => memory::cmd_review(promote, clear),
         MemoryCmd::AsOf { date } => memory::cmd_as_of(date.trim()),
         MemoryCmd::Supersede { old, new } => memory::cmd_supersede(&old, &new),
+        MemoryCmd::Edit { id, name, description, mtype, body, scope } => {
+            // `--body -` reads the replacement body from stdin (so a multi-line rewrite can be piped
+            // in); omitting `--body` entirely leaves the body untouched.
+            let body = match body.as_deref() {
+                Some("-") => Some(read_stdin("reading replacement body from stdin")?),
+                _ => body,
+            };
+            memory::cmd_edit(&id, name, description, mtype, body, scope)
+        }
+        MemoryCmd::Forget { id } => memory::cmd_forget(&id),
+        MemoryCmd::Purge { id, yes } => {
+            if !yes {
+                anyhow::bail!(
+                    "`memory purge` permanently deletes an archived fact — pass --yes to confirm"
+                );
+            }
+            memory::cmd_purge(&id)
+        }
         MemoryCmd::Archive => memory::cmd_archive_list(),
         MemoryCmd::Restore { id } => memory::cmd_restore(&id),
         MemoryCmd::Compact => memory::cmd_compact(),
@@ -8445,7 +9487,7 @@ fn unique_n() -> u64 {
 /// code — it only reads files. `--no-recurse-submodules` stops a hostile `.gitmodules` from making git
 /// fetch arbitrary (possibly internal) submodule URLs we never vetted.
 fn git_clone_shallow(url: &str, dest: &std::path::Path) -> Result<()> {
-    let out = std::process::Command::new("git")
+    let out = crate::core::gitx::command()?
         .args(["clone", "--depth", "1", "--no-recurse-submodules", "--quiet", url])
         .arg(dest)
         .output()
@@ -8663,6 +9705,474 @@ mod tests {
 
     fn models() -> Vec<String> {
         vec!["opus-4-8".to_string(), "sonnet-4-6".to_string(), "minimax-m3".to_string()]
+    }
+
+    /// `/compact` used to `await` its summarizer call bare inside the REPL loop: no token armed, so
+    /// `turn_in_flight()` was false and Esc merely cleared the draft, while the REPL sat blocked in
+    /// the await consuming nothing. A hung endpoint froze the app until the 300s read timeout. The
+    /// wrapper must (a) report in-flight so Esc routes to cancel, (b) actually return on cancel
+    /// rather than waiting out the call, and (c) leave the slot clean for the next turn.
+    #[tokio::test]
+    async fn cancellable_slash_lets_esc_abort_a_hung_model_call() {
+        let _g = tui::TEST_CANCEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A call that never returns — stands in for a dead endpoint inside the read timeout.
+        let hung = async {
+            std::future::pending::<()>().await;
+            unreachable!("the wrapper must not wait for this to finish");
+        };
+        // Press Esc once the wrapper has armed its token: this is exactly what the input thread does.
+        let presser = tokio::spawn(async {
+            for _ in 0..200 {
+                if tui::turn_in_flight() {
+                    tui::request_cancel();
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            false
+        });
+        let out = cancellable_slash(hung).await;
+        assert!(presser.await.unwrap(), "the wrapper must report in-flight so Esc means cancel");
+        assert!(out.is_none(), "cancel must win the race instead of blocking on the call");
+        assert!(!tui::turn_in_flight(), "the token is disarmed on the way out, so Esc goes idle again");
+    }
+
+    /// A settings change mid-chat must not end the conversation. `/config` and `/model` used to route
+    /// through `rebuild_system`, whose `seed_prompt_lanes` starts with `history.clear()` — so going to
+    /// config to retune the context and coming back left an empty thread.
+    #[test]
+    fn refreshing_prompt_lanes_keeps_the_conversation() {
+        let mut history = vec![
+            Message::system("STABLE LANE v1".to_string()),
+            Message::system("dynamic lane v1".to_string()),
+            Message::user("câu hỏi đầu tiên".to_string()),
+            Message::assistant("trả lời đầu tiên".to_string()),
+            Message::user("câu hỏi thứ hai".to_string()),
+        ];
+        let before: Vec<_> = history.iter().filter(|m| m.role != "system").cloned().collect();
+
+        refresh_prompt_lanes_in_place(&mut history, "opus-4-8");
+
+        // Every non-system message survives, in order.
+        let after: Vec<_> = history.iter().filter(|m| m.role != "system").cloned().collect();
+        assert_eq!(after.len(), before.len(), "conversation dropped: {history:#?}");
+        for (a, b) in after.iter().zip(before.iter()) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.content, b.content);
+        }
+        // The stale lanes are gone (rewritten, not appended) and the leading block is still systems.
+        let lead = agent::compact::leading_system_count(&history);
+        assert!((1..=2).contains(&lead), "expected 1-2 system lanes, got {lead}");
+        assert!(
+            !history[..lead].iter().any(|m| m.content.as_deref() == Some("STABLE LANE v1")),
+            "old stable lane not replaced"
+        );
+        assert_eq!(history[lead].role, "user", "conversation must start right after the lanes");
+
+        // And the contrast: the /clear path is still allowed to wipe.
+        let mut fresh = history.clone();
+        rebuild_system(&mut fresh, "opus-4-8");
+        assert!(
+            !fresh.iter().any(|m| m.role != "system"),
+            "rebuild_system is the /clear path and must still reset"
+        );
+    }
+
+    /// `/resume` and the startup hint must offer THIS project's newest session, not whichever
+    /// project's conversation happened to write last — the shared flat pool is exactly how a
+    /// foreign transcript used to be offered unlabeled and restored into the wrong repo.
+    #[test]
+    fn most_recent_session_prefers_this_project_over_a_newer_foreign_one() {
+        // Serialize with every home-MUTATING test (zones/skills/memory sandboxes repoint
+        // AIZEN_HOME then delete their tree) — this test's saves resolve through the home.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-recent-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        let dir = sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A HERE session, saved through the real writer (stamps the current project key)…
+        let history =
+            vec![Message::system("lane".to_string()), Message::user("here-work".to_string())];
+        save_session(&history, "zzz-here", Some("m1")).unwrap();
+        // …and a FOREIGN session. Named to sort as "newer" under the scan's equal-mtime
+        // name tie-break, so this test can't pass by timing luck. Its root EXISTS on disk, which
+        // is the ordinary case (two live checkouts): the label names the dir with no caveat.
+        let foreign_root = home.join("else");
+        std::fs::create_dir_all(&foreign_root).unwrap();
+        let foreign = serde_json::json!({
+            "version": 2,
+            "meta": {
+                "project_key": "c:/somewhere/else",
+                "project_root": foreign_root.display().to_string(),
+            },
+            "messages": [
+                { "role": "system", "content": "lane" },
+                { "role": "user", "content": "foreign-work" },
+            ]
+        });
+        std::fs::write(dir.join("aaa-foreign.json"), serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+        let (slug, n, origin) = most_recent_session().expect("a saved session must be found");
+        assert_eq!(slug, "zzz-here", "must prefer this project's session over a foreign one");
+        assert_eq!(n, 1, "hint counts conversation turns, not raw vector length");
+        assert!(origin.is_none(), "a same-project offer carries no origin label");
+
+        // With the here-session gone, the foreign one IS offered — but labeled with its origin.
+        std::fs::remove_file(dir.join("zzz-here.json")).unwrap();
+        let (slug, _, origin) = most_recent_session().expect("foreign fallback must be offered");
+        assert_eq!(slug, "aaa-foreign");
+        assert_eq!(origin.as_deref(), Some("from else"), "a foreign offer must name its project");
+
+        // And when that project's dir is GONE (deleted or renamed checkout), the label says so
+        // instead of naming a path the user can no longer go look at.
+        std::fs::remove_dir_all(&foreign_root).unwrap();
+        let (_, _, origin) = most_recent_session().expect("foreign fallback must be offered");
+        assert_eq!(
+            origin.as_deref(),
+            Some("from else (path gone)"),
+            "a vanished origin must be flagged, not presented as a live project"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every saved file must carry provenance (project key/root/slug + timestamps), `created` must
+    /// survive re-saves, and a pre-provenance bare-array file must still load.
+    #[test]
+    fn session_files_carry_provenance_and_legacy_arrays_still_load() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-sess-prov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        let dir = sessions_dir();
+
+        let history =
+            vec![Message::system("lane".to_string()), Message::user("stamp me".to_string())];
+        save_session(&history, "stamped", Some("model-x")).unwrap();
+        let bytes = std::fs::read(dir.join("stamped.json")).unwrap();
+        let (_, meta) = parse_session_bytes(&bytes).expect("v2 file parses");
+        let meta = meta.expect("v2 file carries meta");
+        assert_eq!(meta.project_key.as_deref(), Some(config::project_key().as_str()));
+        assert_eq!(meta.model.as_deref(), Some("model-x"));
+        let created = meta.created.clone().expect("created stamped");
+        // Re-save: `created` is the file's birth stamp and must not advance.
+        save_session(&history, "stamped", Some("model-x")).unwrap();
+        let bytes = std::fs::read(dir.join("stamped.json")).unwrap();
+        let (_, meta2) = parse_session_bytes(&bytes).unwrap();
+        assert_eq!(meta2.unwrap().created.as_deref(), Some(created.as_str()));
+
+        // Legacy: a bare `Vec<Message>` array (what every pre-provenance save wrote).
+        let legacy = serde_json::json!([
+            { "role": "system", "content": "old lane" },
+            { "role": "user", "content": "legacy question" },
+        ]);
+        std::fs::write(dir.join("old-chat.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut restored = Vec::new();
+        let n = load_session(&mut restored, "old-chat", "model-x").unwrap();
+        assert_eq!(n, 1, "legacy conversation still loads");
+        assert!(restored.iter().any(|m| m.content.as_deref() == Some("legacy question")));
+
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Restoring a session saved elsewhere must REBUILD the system lanes for the current project:
+    /// keeping the file's own stable lane grafted the other project's context onto this cwd, and
+    /// the model confidently edited the wrong tree.
+    #[test]
+    fn load_session_rebuilds_stale_lanes_for_the_current_project() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-sess-lanes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        let dir = sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stale = "STALE STABLE LANE recorded in another checkout";
+        let foreign = serde_json::json!({
+            "version": 2,
+            "meta": { "project_key": "c:/somewhere/else", "project_root": "C:/somewhere/else" },
+            "messages": [
+                { "role": "system", "content": stale },
+                { "role": "user", "content": "carried question" },
+            ]
+        });
+        std::fs::write(dir.join("from-b.json"), serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+        let mut history = Vec::new();
+        let n = load_session(&mut history, "from-b", "model-x").unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            !history.iter().any(|m| m.content.as_deref() == Some(stale)),
+            "the foreign stable lane must be replaced, not replayed"
+        );
+        assert_eq!(history[0].role, "system", "current-project lanes lead the restored thread");
+        assert!(
+            history.iter().any(|m| m.content.as_deref() == Some("carried question")),
+            "the conversation itself is preserved"
+        );
+
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The pool scan must classify every file shape it can meet: this project's v2 file, another
+    /// project's v2 file, a pre-provenance bare array (project unknown), and a corrupt file — which
+    /// must read as UNREADABLE, never as a plausible empty conversation the user might restore.
+    #[test]
+    fn scan_sessions_classifies_mine_foreign_unlabeled_and_corrupt() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-scan-classes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        let dir = sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        save_session(&[Message::system("lane"), Message::user("mine")], "mine", Some("m")).unwrap();
+        // A live foreign checkout: its root exists, so the label names it without a caveat. (The
+        // vanished-root variant is covered by the most_recent_session test.)
+        let foreign_root = home.join("repo");
+        std::fs::create_dir_all(&foreign_root).unwrap();
+        let foreign = serde_json::json!({
+            "version": 2,
+            "meta": {
+                "project_key": "c:/other/repo",
+                "project_root": foreign_root.display().to_string(),
+            },
+            "messages": [{ "role": "user", "content": "theirs" }]
+        });
+        std::fs::write(dir.join("theirs.json"), serde_json::to_vec(&foreign).unwrap()).unwrap();
+        std::fs::write(dir.join("unlabeled.json"), br#"[{"role":"user","content":"old"}]"#).unwrap();
+        std::fs::write(dir.join("broken.json"), b"{not json").unwrap();
+        // The retired pointer must never appear as a restorable row.
+        std::fs::write(dir.join("last.json"), br#"[{"role":"user","content":"ptr"}]"#).unwrap();
+
+        let pool = scan_sessions();
+        let by = |n: &str| pool.iter().find(|s| s.name == n).expect("row present");
+        assert!(!pool.iter().any(|s| s.name == "last"), "the pointer is not a session row");
+        assert_eq!(by("mine").here, Some(true));
+        assert_eq!(by("theirs").here, Some(false));
+        assert_eq!(by("unlabeled").here, None, "no provenance → project unknown, not 'foreign'");
+        assert_eq!(by("broken").msgs, None, "a corrupt file is unreadable, not empty");
+        assert_eq!(session_origin_label(by("theirs").meta.as_ref()), "from repo");
+        assert_eq!(session_origin_label(by("unlabeled").meta.as_ref()), "project unknown");
+
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The picker's age column must tell "I couldn't read the clock" and "this file claims the
+    /// future" APART from "saved just now" — the three used to render identically, so an unreadable
+    /// or clock-skewed row looked like the freshest conversation in the pool.
+    #[test]
+    fn session_age_distinguishes_unknown_skewed_and_real_stamps() {
+        assert_eq!(fmt_session_age(None), "age unknown", "no mtime is not 'just now'");
+
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        assert_eq!(
+            fmt_session_age(Some(now_ms + 3_600_000)),
+            "future timestamp (clock skew)",
+            "a stamp beyond the skew grace must be called out, not sorted to the top silently"
+        );
+        // Just inside the grace window: ordinary filesystem/clock jitter still reads as fresh.
+        assert!(!fmt_session_age(Some(now_ms + 5_000)).contains("clock skew"));
+
+        // Epoch 0 must not collapse into fmt_time_ago's "unknown" sentinel.
+        assert_ne!(fmt_session_age(Some(0)), "age unknown");
+        let hour_ago = fmt_session_age(Some(now_ms.saturating_sub(3_600_000)));
+        assert!(hour_ago.contains('h') || hour_ago.contains("hour"), "real age renders: {hour_ago}");
+    }
+
+    /// Save-as must refuse `last`: the picker skips that stem, so accepting it printed "saved" for a
+    /// file the user could then neither restore nor delete, and pinned every later autosave to it.
+    #[test]
+    fn save_as_refuses_the_retired_pointer_name() {
+        assert!(session_save_name_error("last").is_some());
+        assert!(session_save_name_error("  last  ").is_some(), "trimmed before the check");
+        assert!(session_save_name_error("LAST").is_none(), "case-distinct stems are distinct files");
+        assert!(session_save_name_error("lastly").is_none(), "only the exact name is reserved");
+        // Punctuation sanitizes to a DIFFERENT stem (`last_`), which is its own listable file.
+        assert!(session_save_name_error("last!").is_none());
+        assert!(session_save_name_error("fix-the-parser").is_none());
+    }
+
+    /// `aizen zone migrate` must re-home SESSIONS too. They are the one artifact keyed by provenance
+    /// inside the file rather than by directory, so the slug-directory sweep was blind to them: after
+    /// a rename/move every one of the user's own transcripts stayed labeled "from <old dir>" forever.
+    #[test]
+    fn zone_migrate_rehomes_sessions_carrying_a_legacy_slug() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-zone-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        let dir = sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let legacy_slug = "zzz-legacy-slug";
+        let file = serde_json::json!({
+            "version": 2,
+            "meta": {
+                "project_key": "c:/old/checkout",
+                "project_root": "C:/old/checkout",
+                "project_slug": legacy_slug,
+                "created": "2026-01-01T00:00:00+00:00",
+                "updated": "2026-01-02T00:00:00+00:00",
+            },
+            "messages": [
+                { "role": "system", "content": "lane" },
+                { "role": "user", "content": "pre-move work" },
+            ]
+        });
+        std::fs::write(dir.join("moved.json"), serde_json::to_vec(&file).unwrap()).unwrap();
+        // An unrelated row must be left strictly alone.
+        save_session(&[Message::system("lane"), Message::user("mine")], "mine", Some("m")).unwrap();
+
+        assert_eq!(count_sessions_of_slug(legacy_slug), 1, "the plan must see the session");
+        assert_eq!(count_sessions_of_slug("no-such-slug"), 0);
+
+        let mut errs: Vec<String> = Vec::new();
+        let n = retag_sessions_of_slug(legacy_slug, &mut |e| errs.push(e));
+        assert_eq!((n, errs.len()), (1, 0), "exactly the legacy row is re-homed, cleanly");
+
+        let pool = scan_sessions();
+        let moved = pool.iter().find(|s| s.name == "moved").expect("row survives");
+        assert_eq!(moved.here, Some(true), "the transcript now reads as this project's own");
+        assert_eq!(moved.msgs, Some(1), "the conversation itself is untouched");
+        let meta = moved.meta.as_ref().expect("provenance rewritten");
+        assert_eq!(meta.project_slug.as_deref(), Some(config::project_slug().as_str()));
+        // The aging clock must NOT be reset by a bookkeeping rewrite.
+        assert_eq!(meta.updated.as_deref(), Some("2026-01-02T00:00:00+00:00"));
+        assert_eq!(meta.created.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+
+        assert_eq!(count_sessions_of_slug(legacy_slug), 0, "migration is idempotent-complete");
+
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A restored legacy `last` pointer must be RE-HOMED into a real named file: pinning the live
+    /// slug to `last` made every later turn overwrite the pointer instead of a conversation.
+    #[test]
+    fn restoring_the_legacy_last_pointer_rehomes_it_to_a_named_file() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-last-rehome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        let dir = sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A pre-provenance pool whose ONLY file is the shared pointer.
+        let legacy = serde_json::json!([
+            { "role": "system", "content": "old lane" },
+            { "role": "user", "content": "pointer-era chat" },
+        ]);
+        std::fs::write(dir.join("last.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        // The hint must offer it (not "nothing to resume") under a NEW name…
+        let (slug, n, _) = most_recent_session().expect("the legacy pointer must still be offered");
+        assert_ne!(slug, "last", "the offer must be re-homed, not the pointer itself");
+        assert_eq!(n, 1);
+        assert!(dir.join(format!("{slug}.json")).exists(), "re-homed file was written");
+
+        // …and restoring the pointer directly must never pin the live slug to `last`.
+        let mut history = Vec::new();
+        load_session(&mut history, "last", "model-x").unwrap();
+        assert_ne!(
+            current_session_slug().as_deref(),
+            Some("last"),
+            "the live slug must never be the pointer"
+        );
+
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The `/handoff` seed is conversation content, not prompt prefix: a lane rewrite (what
+    /// `/config` and `/model` do via `refresh_prompt_lanes_in_place`) must splice AROUND it.
+    /// Before the marker, the splice consumed it and the fresh thread silently lost its context.
+    #[test]
+    fn handoff_seed_survives_a_lane_rewrite() {
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-handoff-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+
+        let seed = format!("{}\ndecisions: use the v2 format", agent::compact::HANDOFF_MARKER_PREFIX);
+        let mut history = vec![
+            Message::system("stable lane".to_string()),
+            Message::system("dynamic lane".to_string()),
+            Message::system(seed.clone()),
+            Message::user("continue the migration".to_string()),
+        ];
+        assert_eq!(
+            agent::compact::leading_system_count(&history),
+            2,
+            "the seed must not count as prompt prefix"
+        );
+        refresh_prompt_lanes_in_place(&mut history, "model-x");
+        assert!(
+            history.iter().any(|m| m.content.as_deref() == Some(seed.as_str())),
+            "a /config-style lane rewrite must keep the handoff seed"
+        );
+        assert!(
+            history.iter().any(|m| m.content.as_deref() == Some("continue the migration")),
+            "the conversation tail survives too"
+        );
+
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The mid-turn publish hook is what makes a terminal closed DURING a turn keep the work: the
+    /// agent loop owns `history` for the whole turn, so without it the exit snapshot stayed frozen at
+    /// the user's question and every reply/tool result produced so far was lost.
+    #[test]
+    fn publishing_mid_turn_advances_the_exit_snapshot() {
+        let early = vec![Message::system("lane".to_string()), Message::user("làm việc đi".to_string())];
+        publish_live_history(&early);
+        let snap_before = live_history_slot().lock().unwrap_or_else(|e| e.into_inner()).len();
+
+        // The turn progresses: assistant reply + a tool result land while the loop still owns history.
+        let mut mid = early.clone();
+        mid.push(Message::assistant("đang chạy".to_string()));
+        mid.push(Message::tool_result("call-1", "kết quả"));
+        publish_live_history(&mid);
+
+        let snap_after = live_history_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(snap_before, early.len());
+        assert_eq!(snap_after.len(), mid.len(), "mid-turn progress never reached the exit snapshot");
+        assert_eq!(snap_after.last().unwrap().content.as_deref(), Some("kết quả"));
+    }
+
+    /// A legacy single-lane history (persisted before the split) must gain both lanes without
+    /// losing the chat — `splice(0..1, …)` grows the leading block in place.
+    #[test]
+    fn refreshing_prompt_lanes_migrates_a_legacy_single_lane() {
+        let mut history = vec![
+            Message::system("legacy combined prompt".to_string()),
+            Message::user("giữ tôi lại".to_string()),
+        ];
+        refresh_prompt_lanes_in_place(&mut history, "opus-4-8");
+        let lead = agent::compact::leading_system_count(&history);
+        assert_eq!(history[lead].content.as_deref(), Some("giữ tôi lại"));
+        assert!(
+            !history.iter().any(|m| m.content.as_deref() == Some("legacy combined prompt")),
+            "legacy lane should be replaced, not kept"
+        );
     }
 
     #[test]
@@ -8977,7 +10487,7 @@ mod tests {
         let h = vec![Message::system("s"), Message::user("fix the parser bug")];
         let first = allocate_session_slug(&h);
         // Simulate the first chat having been saved under that slug.
-        save_session(&h, &first).unwrap();
+        save_session(&h, &first, None).unwrap();
         let second = allocate_session_slug(&h);
         assert_ne!(first, second, "second chat on the same topic must not reuse the first's file");
         assert!(!first.is_empty() && !second.is_empty());
@@ -9002,12 +10512,11 @@ mod tests {
         flush_live_session_on_exit();
 
         // It must be discoverable and restorable via the same path /sessions uses.
-        let names = list_sessions();
-        assert!(!names.is_empty(), "exit flush left nothing in /sessions");
+        assert!(!scan_sessions().is_empty(), "exit flush left nothing in /sessions");
         let slug = current_session_slug().expect("exit flush should have pinned a slug");
         let mut restored = Vec::new();
         let n = load_session(&mut restored, &slug, "opus-4-8").unwrap();
-        assert!(n >= 2, "restored conversation kept its messages");
+        assert!(n >= 1, "restored conversation kept its user turn (n counts conversation, not lanes)");
         assert!(
             restored.iter().any(|m| m.content.as_deref() == Some("remember this across a window close")),
             "the live user turn survived the exit flush"

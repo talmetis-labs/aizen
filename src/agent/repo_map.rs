@@ -167,7 +167,8 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 /// never match the real UTF-8 path the walker produced — so those files silently rank churn:0. With
 /// quotePath off, git prints the raw UTF-8 path and the map keys line up.
 fn git_churn(root: &Path) -> Option<HashMap<String, u32>> {
-    let out = std::process::Command::new("git")
+    let out = crate::core::gitx::command()
+        .ok()?
         .args(["-c", "core.quotePath=false", "log", "--name-only", "--pretty=format:", "-n", CHURN_COMMITS])
         .current_dir(root)
         .output()

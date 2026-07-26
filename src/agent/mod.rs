@@ -460,6 +460,14 @@ pub struct AgentConfig {
     pub hill_climb_gate: u8,
     /// Re-nudge to re-measure every N iters while hill-climb mode is on. `0` = reframe only.
     pub hill_climb_reminder_every: usize,
+    /// How many times an ORDINARY (non-goal-mode) turn retries a TRANSIENT model-call failure
+    /// (429/5xx/transport/timeout) with backoff before giving up. Permanent 4xx is never retried here.
+    ///
+    /// `0` at the top level, deliberately: the REPL surfaces the error to a user who is right there
+    /// and can re-ask, and a silent retry would just look like a hang. DELEGATED loops set it > 0 —
+    /// nobody is watching a sub-agent, and one transient blip used to discard every step it had
+    /// completed and come back as a bare "sub-agent (coder) failed".
+    pub max_transient_retries: usize,
     /// GOAL MODE (`/goal <text>`). `Some(goal)` makes the loop run until the goal is genuinely
     /// finished — the iteration cap is bypassed (stop only on Esc or a verified completion), and
     /// transient API failures (429/5xx/timeouts/empty-200) auto-retry with backoff instead of
@@ -475,6 +483,18 @@ pub struct AgentConfig {
     /// workflow children leave it `false` so a steer aimed at the main task can't be swallowed by a
     /// delegated child. Default `false` (the mailbox is process-global; opting in is explicit).
     pub enable_steering: bool,
+    /// MID-TURN PERSISTENCE hook, called at each iteration boundary with the conversation so far.
+    ///
+    /// The loop borrows `messages` mutably for the whole turn, so nothing outside it can observe
+    /// progress — which meant a terminal closed mid-turn persisted the user's question and lost every
+    /// assistant reply and tool result the turn had already produced. Called at the same boundary
+    /// steering drains, the only point where history is guaranteed coherent (no assistant `tool_calls`
+    /// awaiting their results), so the observer never sees a shape a strict gateway would reject.
+    ///
+    /// A plain `fn` pointer, not a closure: `AgentConfig` derives `Clone + Debug` and is threaded
+    /// through every sub-agent spawn, so a boxed `dyn Fn` would cost both derives. `None` ⇒ no
+    /// observer (sub-agents and workflow children: their transcripts aren't the user's session).
+    pub on_progress: Option<fn(&[Message])>,
 }
 
 impl Default for AgentConfig {
@@ -514,8 +534,10 @@ impl Default for AgentConfig {
             enable_hill_climb: true,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
+            max_transient_retries: 0, // top level: the user sees the error and can re-ask
             goal: None,
             enable_steering: false,
+            on_progress: None,
         }
     }
 }
@@ -764,6 +786,16 @@ where
                 }
                 messages.push(Message::user(crate::core::steer::format_injection(&steers)));
             }
+        }
+
+        // PUBLISH the in-flight transcript for crash/close safety. Same boundary as the steering
+        // drain, for the same reason: this is the only point where history is guaranteed coherent
+        // (every assistant `tool_calls` already paired with its results), so a snapshot taken here is
+        // always a transcript that can be reloaded. The REPL owns `messages` mutably for the whole
+        // turn, so without this hook a terminal closed mid-turn persisted the user's question and
+        // discarded every reply and tool result the turn had already produced.
+        if let Some(publish) = cfg.on_progress {
+            publish(messages);
         }
 
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
@@ -1029,19 +1061,48 @@ where
                 }
             }
         } else {
-            match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
-                None => {
-                    if nudge_pushed {
-                        messages.pop();
+            // ORDINARY TURNS: a bounded TRANSIENT retry, then fatal. `max_transient_retries` is 0 at
+            // the top level (unchanged behavior: the REPL shows the error and the user is right there
+            // to re-ask), but non-zero for a delegated sub-agent — nobody is watching that loop, and
+            // one 429/5xx mid-run used to throw away every step of work it had already done and
+            // surface as a bare "sub-agent failed". Permanent 4xx never retries here: it can't fix
+            // itself and burning backoff on it only delays the report.
+            let mut attempt: u32 = 0;
+            loop {
+                match crate::core::cancel::race(&cfg.cancel, chat(messages.clone(), defs.clone())).await {
+                    None => {
+                        if nudge_pushed {
+                            messages.pop();
+                        }
+                        return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
                     }
-                    return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
-                }
-                Some(Ok(t)) => t,
-                Some(Err(e)) => {
-                    if nudge_pushed {
-                        messages.pop();
+                    Some(Ok(t)) => break t,
+                    Some(Err(e)) => {
+                        let transient = matches!(
+                            crate::llm::client::classify_api_error(&e),
+                            crate::llm::client::ApiErrorKind::Transient
+                        );
+                        if !transient || attempt as usize >= cfg.max_transient_retries {
+                            if nudge_pushed {
+                                messages.pop();
+                            }
+                            return Err(e);
+                        }
+                        let delay = crate::llm::client::goal_backoff_ms(attempt);
+                        attempt += 1;
+                        if !cfg.quiet {
+                            goal_retry_line(
+                                &format!("API error; retry {attempt}/{}", cfg.max_transient_retries),
+                                delay,
+                            );
+                        }
+                        if goal_sleep_or_cancel(&cfg.cancel, delay).await {
+                            if nudge_pushed {
+                                messages.pop();
+                            }
+                            return Ok(AgentOutcome { final_text: None, iters: iter, stop: StopReason::Cancelled });
+                        }
                     }
-                    return Err(e);
                 }
             }
         };
@@ -1492,6 +1553,11 @@ where
                             emit_trace("  └ checkpoint unavailable: not a git repository");
                         }
                     }
+                    Err(e) if crate::core::gitx::is_git_missing(&e) => {
+                        if !cfg.quiet {
+                            emit_trace("  └ checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
+                        }
+                    }
                     Err(e) => {
                         emit_trace(&format!(
                             "  └ warning: post-edit checkpoint failed; the latest change may not be independently rewindable: {e:#}"
@@ -1851,9 +1917,13 @@ async fn execute_calls(
                                 let cwd = std::env::current_dir()
                                     .and_then(|p| p.canonicalize())
                                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                // 15s, not 5: transient contention (another aizen instance, an
+                                // autosave, the parallel test suite) must WAIT, not fail the edit
+                                // with a lease error the user can't act on. Esc still interrupts —
+                                // the cancel token is threaded into the wait loop.
                                 match crate::core::workspace_txn::WorkspaceWriterLease::acquire(
                                     &cwd,
-                                    std::time::Duration::from_secs(5),
+                                    std::time::Duration::from_secs(15),
                                     Some(&cfg.cancel),
                                     tool.name(),
                                 ) {
@@ -1886,8 +1956,16 @@ async fn execute_calls(
                             {
                                 match crate::features::timemachine::save_protected_change("before agent edits") {
                                     Ok(None) => {
+                                        // Two benign shapes, two honest messages: "not a repo" and
+                                        // "no git executable" behave the same (checkpoints off, the
+                                        // edit proceeds) but must never be conflated in what the
+                                        // user reads — the latter is fixable by installing git.
                                         if !cfg.quiet {
-                                            emit_trace("→ checkpoint unavailable: not a git repository");
+                                            if crate::core::gitx::git_exe().is_none() {
+                                                emit_trace("→ checkpoint off: git executable not found — edits proceed without checkpoints");
+                                            } else {
+                                                emit_trace("→ checkpoint unavailable: not a git repository");
+                                            }
                                         }
                                         None
                                     }
@@ -2912,7 +2990,7 @@ where
 
 /// The working-tree `git diff`, capped at 12k chars. `None` when not a repo / git missing / clean.
 fn git_diff_capped() -> Option<String> {
-    let out = std::process::Command::new("git").args(["diff"]).output().ok()?;
+    let out = crate::core::gitx::command().ok()?.args(["diff"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -3666,10 +3744,14 @@ mod tests {
             enable_hill_climb: false,
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
+            // Mirrors the production top-level default: a chat error is fatal unless a test opts in
+            // (the delegated-loop tests set it explicitly).
+            max_transient_retries: 0,
             goal: None, // goal mode OFF in unit tests unless a test arms it
             // Steering OFF by default in unit tests: the mailbox is process-global, so an unrelated
             // script must not pick up a steer a steering test left behind.
             enable_steering: false,
+            on_progress: None, // no live-history publishing in unit tests
         }
     }
 
@@ -4104,6 +4186,10 @@ mod tests {
             tool_turn("delete", r#"{"x":"1"}"#),             // successful edit → resets everything
             final_turn("recovered"),
         ]);
+        // Same home-stability need as the divergence test above: the delete call's writer lease
+        // resolves its lock path through `nextgen_home()`, and a concurrent sandbox flip can fail
+        // it — turning the "successful edit resets everything" step into a failure.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.stop, StopReason::Done, "legit re-read→retry recovery must not be punished");
         assert_eq!(out.final_text.as_deref(), Some("recovered"));
@@ -4135,6 +4221,12 @@ mod tests {
             tool_turn("delete", r#"{}"#),
             final_turn("unreached"),
         ];
+        // Serialize with home-MUTATING sandbox tests: the destructive call's writer lease resolves
+        // its lock path through `nextgen_home()` AT ACQUIRE TIME, so a concurrent sandbox flip
+        // (AIZEN_HOME repointed / tree deleted) can fail call #1 — then the first SUCCESS lands on
+        // the nudge iteration, its novel content clears the divergence latch once, and the
+        // hard-stop drifts 3 → 4. The exact-iteration assertion below needs a stable home.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let out = run_agent(scripted(turns), &c, &r, "sys", "task").await.unwrap();
         assert_eq!(out.stop, StopReason::Divergence, "a repeated identical destructive call must stop");
         assert_eq!(out.iters, 3, "must hard-stop by the 3rd identical call, not run to the extended cap");
@@ -4615,6 +4707,9 @@ mod tests {
             final_turn("first done"),  // intercepted by the self-review nudge
             final_turn("second done"), // accepted
         ]);
+        // Home-stability: a lease failure on the delete call would leave made_any_edits false and
+        // the property under test (exactly one review turn) silently unexercised.
+        let _g = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.final_text.as_deref(), Some("second done"));
@@ -4998,6 +5093,69 @@ mod tests {
         let chat = scripted_results(vec![Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded"))]);
         let res = run_agent_loop(chat, &c, &r, &mut messages).await;
         assert!(res.is_err(), "ordinary turns keep the fatal-on-error path");
+        assert_eq!(c.max_transient_retries, 0, "the top-level default is what keeps it fatal");
+        assert_eq!(
+            AgentConfig::default().max_transient_retries, 0,
+            "production top-level config agrees with the test cfg"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_loop_absorbs_bounded_transient_errors_but_not_permanent_ones() {
+        // A DELEGATED loop (task/workflow child) sets max_transient_retries > 0: nobody is watching
+        // it, so one 429/5xx must not discard the steps it already completed. Goal mode is OFF here —
+        // this is the ordinary path, proving the retry is driven by the budget, not by `cfg.goal`.
+        let r = registry();
+        let c = AgentConfig { max_transient_retries: 4, quiet: true, ..cfg() };
+
+        // Two transient blips then real work → survives, and the work still lands.
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!("upstream returned HTTP 503 Service Unavailable: overloaded")),
+            Err(anyhow::anyhow!("request failed after retries")),
+            Ok(final_turn("survived the blips")),
+        ]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("survived the blips"));
+
+        // A PERMANENT 4xx is NOT retried even with budget left — retrying can't fix a bad key, and
+        // burning backoff on it only delays the report. One call, then the error.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let counting = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(anyhow::anyhow!("upstream returned HTTP 401 Unauthorized: bad key")))
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        assert!(run_agent_loop(counting, &c, &r, &mut messages).await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "permanent → no retry");
+
+        // The budget is a CEILING: transient errors past it are still fatal (no infinite retry — that
+        // is goal mode's contract, not a sub-agent's).
+        let c2 = AgentConfig { max_transient_retries: 1, quiet: true, ..cfg() };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![
+            Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")),
+            Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded")),
+            Ok(final_turn("never reached")),
+        ]);
+        assert!(
+            run_agent_loop(chat, &c2, &r, &mut messages).await.is_err(),
+            "one retry allowed, the second failure is fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_during_a_delegated_transient_retry_returns_cancelled() {
+        // Esc must escape the new retry backoff cleanly (Cancelled, not a swallowed error).
+        let r = registry();
+        let c = AgentConfig { max_transient_retries: 4, quiet: true, ..cfg() };
+        c.cancel.cancel();
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let chat = scripted_results(vec![Err(anyhow::anyhow!("upstream returned HTTP 503: overloaded"))]);
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Cancelled);
     }
 
     #[tokio::test]

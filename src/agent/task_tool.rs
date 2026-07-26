@@ -36,10 +36,40 @@ const SUBAGENT_PREAMBLE: &str = "\
 <subagent>
 You are a focused sub-agent dispatched to do ONE task and report back.
 - output_discipline: your FINAL message is the RETURN VALUE to the orchestrating agent — it is not shown to a human. Return the result/finding directly: no greeting, no \"I'll help\", no sign-off.
-- scope: do only the dispatched task; do not widen it. If blocked, stop and state precisely what blocks you.
+- completeness: finish the WHOLE dispatched task, not the easy part of it. Multi-step work is still ONE task — keep going until every part is done. Never hand back a plan, an outline, or a partial result as if it were the answer, and never stop merely because the task is large.
+- plan: for anything past a few steps, write the steps with todo_write first, then work them off one at a time and flip each to done as you finish it. Consult it as you go so you don't stop halfway.
+- verify: before returning, check your own work with the tools you have — read the edited region back, run the build/tests when shell is in scope. Say what you verified and what you could not.
+- scope: do only the dispatched task; do not widen it. If you are genuinely blocked, state exactly what is done, what remains, and what blocks you.
 - workspace: file/shell ops resolve relative paths against the working directory but may reach elsewhere on disk; you cannot dispatch further sub-agents.
 - contract: if a <contract> block follows, its boundaries, expected output, and step budget are BINDING.
 </subagent>";
+
+/// Bounded CONTINUATION: how many extra step budgets a sub-agent may earn after exhausting one
+/// without finishing. The step budget exists to bound a *runaway* loop, but it also silently
+/// truncated genuinely large tasks — the sub-agent returned a partial result and the parent reported
+/// it as an answer. A continuation re-enters the SAME conversation (full context, its own todo list
+/// and tool results intact), so the work resumes instead of restarting.
+const MAX_CONTINUATIONS: u32 = 2;
+
+/// The continuation nudge, injected as a `user` turn (the role a model can't talk past) when a
+/// sub-agent burns its budget with work still open.
+const CONTINUE_NUDGE: &str = "[continue] You reached your step budget and the dispatched task is \
+    NOT finished. Do not restart, re-plan from scratch, or re-summarize what you already did: pick up \
+    exactly where you left off and work through what remains. You have a fresh budget of steps. Return \
+    your final result only once the whole task is genuinely done and verified.";
+
+/// Transient model-call failures a sub-agent absorbs per turn before giving up (see
+/// `AgentConfig::max_transient_retries`). Unlike the top level, there is no user watching to re-ask.
+const SUBAGENT_TRANSIENT_RETRIES: usize = 4;
+
+/// Default step budget for a dispatch when the parent doesn't set `max_steps`. Matches the top-level
+/// default (25) rather than undercutting it: a sub-task is narrower in SCOPE, but the old 15 meant a
+/// multi-file investigation ran out of steps mid-way and reported a partial answer as done.
+const DEFAULT_STEP_BUDGET: usize = 25;
+
+/// Ceiling on an explicit `max_steps`, so a parent can size a genuinely large dispatch without the
+/// harness capping it back down. The continuation mechanism above stacks on top of this.
+const MAX_STEP_BUDGET: usize = 80;
 
 /// The dispatch CONTRACT the parent attaches to a spawn (the Anthropic multi-agent lesson:
 /// under-specified delegation is where sub-agents duplicate and drift — objective, boundaries,
@@ -65,8 +95,8 @@ impl TaskContract {
             max_steps: args
                 .get("max_steps")
                 .and_then(|v| v.as_u64())
-                .map(|n| (n as usize).clamp(1, 50))
-                .unwrap_or(15),
+                .map(|n| (n as usize).clamp(1, MAX_STEP_BUDGET))
+                .unwrap_or(DEFAULT_STEP_BUDGET),
         }
     }
 
@@ -243,7 +273,9 @@ pub(crate) struct Dispatch {
     /// Defaults to the parent endpoint when the model has no registry entry (same-gateway case).
     pub base_url: String,
     pub api_key: String,
-    /// The dispatch step budget (`max_steps` arg, clamped 1..=50; default 15).
+    /// The dispatch step budget (`max_steps` arg, clamped `1..=MAX_STEP_BUDGET`; default
+    /// [`DEFAULT_STEP_BUDGET`]). Exhausting it without finishing earns a bounded CONTINUATION rather
+    /// than truncating the task — see [`MAX_CONTINUATIONS`].
     pub max_steps: usize,
     /// Optional JSON Schema the sub-agent's FINAL answer must satisfy (`expects` arg).
     pub expects: Option<Value>,
@@ -345,10 +377,12 @@ impl Tool for TaskTool {
     fn description(&self) -> &str {
         "Dispatch a focused sub-agent (fresh context) to do ONE self-contained sub-task and return \
          its result. Use for isolatable work that would clutter your own context (a deep \
-         investigation, a contained implementation). The sub-agent CANNOT dispatch further \
-         sub-agents. Prefer a named specialist via `agent` (a slug from <agents>, e.g. \
-         \"code-reviewer\") when one fits; otherwise pick a generic `role`: coder (read/edit/shell), \
-         tester (shell, no edit), planner/reviewer (read-only)."
+         investigation, a contained implementation). The sub-task may be LARGE — the sub-agent plans, \
+         works through every part, verifies, and earns extra step budget automatically if it needs it; \
+         do not pre-split a coherent task into fragments to keep it small. The sub-agent CANNOT \
+         dispatch further sub-agents. Prefer a named specialist via `agent` (a slug from <agents>, \
+         e.g. \"code-reviewer\") when one fits; otherwise pick a generic `role`: coder \
+         (read/edit/shell), tester (shell, no edit), planner/reviewer (read-only)."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -361,7 +395,7 @@ impl Tool for TaskTool {
                 "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
                 "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
-                "max_steps": {"type": "integer", "description": "step budget (default 15, cap 50)"},
+                "max_steps": {"type": "integer", "description": "step budget per continuation (default 25, cap 80). Raise it for a large task; the sub-agent also earns up to 2 fresh budgets automatically if unfinished, so a big dispatch is never truncated"},
                 "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the sub-agent replies with ONLY a JSON object and the harness validates it (result header shows json:ok|invalid)"}
             },
             "required": ["prompt"],
@@ -457,10 +491,12 @@ impl Tool for TaskTool {
             exec_ctx: parent_ctx,
             quiet: true,                     // suppress nested progress trace
             enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
-            // The dispatch step budget (default 15 ≪ the top level's 25/50 — a sub-task is
-            // narrower by definition) with a bounded auto-extend.
+            // The dispatch step budget, with a bounded auto-extend. Exhausting BOTH is not the end of
+            // the road any more: the continuation loop below re-enters the same conversation with a
+            // fresh budget (up to MAX_CONTINUATIONS) so a genuinely large task finishes instead of
+            // returning the partial work it happened to reach.
             max_iters: max_steps,
-            auto_extend_to: (max_steps * 2).min(50),
+            auto_extend_to: max_steps * 2,
             // Inherit the parent's window so TOOL-RESULT CLEARING is ON for deep investigations
             // (mid-loop compaction stays off by construction: one user turn can't be cut).
             context_window: self.context_window,
@@ -474,6 +510,10 @@ impl Tool for TaskTool {
             enable_todo_poke: false,
             enable_confidence_gate: false,
             enable_hill_climb: false,
+            // Survive a flaky gateway. Nobody watches a sub-agent loop, so a single transient error
+            // used to discard every step it had already completed and surface to the parent as a bare
+            // "sub-agent (coder) failed" — the work was gone, and the parent could only guess why.
+            max_transient_retries: SUBAGENT_TRANSIENT_RETRIES,
             ..AgentConfig::default()
         };
 
@@ -500,6 +540,11 @@ impl Tool for TaskTool {
         // (see the note at the top of this impl) — `block_in_place`+`block_on` is a verified
         // pass-through there. Never call `execute` from a plain `#[test]` past the early-return
         // guards (no runtime).
+        //
+        // CONTINUATION: the loop is driven over ONE persistent conversation so a budget exhaustion
+        // can be resumed rather than restarted. `run_agent_loop` appends every turn (and, on
+        // MaxIters, its own synthesized summary) to `msgs`, so re-entering with a `[continue]` user
+        // turn keeps the sub-agent's whole context: its plan, its tool results, its edits.
         let outcome = tokio::task::block_in_place(|| {
             // EFFORT ISOLATION: the parent turn may have armed a process-global effort override
             // (e.g. ultimate mode pins `max`). A sub-agent is a NARROWER task and must pick its own
@@ -508,8 +553,26 @@ impl Tool for TaskTool {
             // guard disarms the override for exactly this synchronous dispatch and restores it on
             // drop, before control returns to the parent turn.
             let _effort = crate::core::cli_config::suppress_effort_override();
-            tokio::runtime::Handle::current()
-                .block_on(crate::agent::run_agent(chat, &cfg, &registry, &system, prompt))
+            tokio::runtime::Handle::current().block_on(async {
+                let mut msgs = vec![Message::system(system.as_str()), Message::user(prompt)];
+                let mut total_iters = 0usize;
+                let mut continuations = 0u32;
+                loop {
+                    let o = crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs).await?;
+                    total_iters += o.iters;
+                    let resumable = is_resumable(&o.stop, continuations)
+                        && !cfg.cancel.is_cancelled();
+                    if !resumable {
+                        return Ok::<_, anyhow::Error>(crate::agent::AgentOutcome {
+                            iters: total_iters,
+                            ..o
+                        });
+                    }
+                    continuations += 1;
+                    continue_note(&header_label, continuations, MAX_CONTINUATIONS);
+                    msgs.push(Message::user(CONTINUE_NUDGE));
+                }
+            })
         });
         let outcome = match outcome {
             Ok(o) => o,
@@ -571,6 +634,31 @@ impl Tool for TaskTool {
             track.finish_err(detail);
         }
         Ok(format!("[task: {header_label}, {} step(s), {stop}{json_tag}]\n{body}", outcome.iters))
+    }
+}
+
+/// Should a finished sub-agent run be RESUMED with a fresh step budget? Only a budget exhaustion
+/// qualifies, and only while continuations remain:
+/// - `MaxIters` — ran out of steps with work still open. This is the resumable one.
+/// - `Done` — it finished; nothing to resume.
+/// - `Divergence` — it is repeating itself; more steps buy more of the same, not progress.
+/// - `VerificationFailed` — its own verify/repair loop already spent its attempts.
+/// - `Cancelled` — the user said stop. Never override that.
+/// - `AwaitingInput` — unreachable for a sub-agent (no `clarify` in any sub-registry: nobody to
+///   answer), and resuming would loop on a question that can never be answered.
+fn is_resumable(stop: &crate::agent::StopReason, continuations_used: u32) -> bool {
+    matches!(stop, crate::agent::StopReason::MaxIters) && continuations_used < MAX_CONTINUATIONS
+}
+
+/// Surface a continuation to the user: a sub-agent silently earning more budget would otherwise look
+/// like a hang (it runs `quiet`, so nothing else it does reaches the screen). Routed through the TUI
+/// funnel when it owns the screen — a raw `eprintln!` mid-turn corrupts the retained frame.
+fn continue_note(label: &str, n: u32, max: u32) {
+    let note = format!("→ task({label}): step budget spent, work still open — continuing ({n}/{max})");
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+    } else {
+        eprintln!("{note}");
     }
 }
 
@@ -913,6 +1001,13 @@ mod tests {
         // (Default cargo --test-threads>1 races two gate tests on the same atomic.)
         static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // ALSO the home lock: the gate's slots are OS file locks under `nextgen_home()`, and the
+        // sandbox tests in this module repoint `NEXTGEN_HOME`/`AIZEN_HOME` at a temp dir and then
+        // `remove_dir_all` it. Interleaved, this test's lock files land in a directory being deleted,
+        // every `acquire_exclusive` fails, and `try_acquire` returns None for a slot that is free —
+        // a flaky "slot 3" panic. Lock order is GATE→HOME here and nothing takes GATE but this test,
+        // so there is no inversion with the sandbox tests (which take HOME alone).
+        let _home = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // Drain any leftover slots from a panicked sibling test so this assertion is hermetic.
         while ACTIVE_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
@@ -954,17 +1049,59 @@ mod tests {
             "max_steps": 999
         });
         let c = TaskContract::from_args(&args);
-        assert_eq!(c.max_steps, 50, "budget clamps to 50");
+        assert_eq!(c.max_steps, MAX_STEP_BUDGET, "an over-large budget clamps to the ceiling");
         let p = build_subagent_prompt("reviewer", &root, "m", "2026-06-20", Some(&c));
         assert!(p.contains("<contract>"), "{p}");
         assert!(p.contains("boundaries: do not touch src/main.rs"));
         assert!(p.contains("expected_output: a findings list"));
-        assert!(p.contains("step_budget: 50 steps"));
-        // Defaults: absent fields don't render; default budget is 15.
+        assert!(p.contains(&format!("step_budget: {MAX_STEP_BUDGET} steps")));
+        // Defaults: absent fields don't render; the default budget is the top-level default, not a
+        // narrower one (undercutting it is what truncated large dispatches mid-way).
         let d = TaskContract::from_args(&serde_json::json!({}));
-        assert_eq!(d.max_steps, 15);
+        assert_eq!(d.max_steps, DEFAULT_STEP_BUDGET);
+        assert_eq!(d.max_steps, AgentConfig::default().max_iters, "matches the top-level default");
         let r = d.render();
         assert!(!r.contains("boundaries:") && !r.contains("expected_output:"), "{r}");
+    }
+
+    #[test]
+    fn only_budget_exhaustion_earns_a_continuation() {
+        use crate::agent::StopReason::*;
+        // A large task that ran out of steps resumes — the whole point: the old behavior returned
+        // whatever partial work it had reached and the parent reported it as the answer.
+        assert!(is_resumable(&MaxIters, 0));
+        assert!(is_resumable(&MaxIters, MAX_CONTINUATIONS - 1), "budget still available");
+        // Bounded: never an unlimited loop.
+        assert!(!is_resumable(&MaxIters, MAX_CONTINUATIONS));
+        assert!(!is_resumable(&MaxIters, MAX_CONTINUATIONS + 1));
+        // Every other stop reason returns as-is (see the doc comment for why each one).
+        for stop in [
+            Done,
+            Divergence,
+            VerificationFailed,
+            Cancelled,
+            AwaitingInput("q?".into()),
+        ] {
+            assert!(!is_resumable(&stop, 0), "{stop:?} must not be resumed");
+        }
+    }
+
+    #[test]
+    fn subagent_preamble_demands_completion_not_a_partial_answer() {
+        // The behavioral half of the same fix: a sub-agent that stops early because the task felt
+        // large is the failure the continuation loop can't detect (it looks like a clean `Done`), so
+        // the preamble has to forbid it explicitly.
+        let root = std::env::temp_dir();
+        let p = build_subagent_prompt("coder", &root, "m", "2026-06-20", None);
+        assert!(p.contains("completeness:"), "completeness clause present");
+        assert!(p.contains("finish the WHOLE dispatched task"));
+        assert!(p.contains("never stop merely because the task is large"));
+        assert!(p.contains("plan:"), "told to plan multi-step work with todo_write");
+        assert!(p.contains("verify:"), "told to check its own work before returning");
+        // A coder sub-agent actually HAS the tools those clauses assume.
+        let r = crate::agent::builtin::role_registry("coder", &root);
+        assert!(r.get("todo_write").is_some(), "the plan clause needs todo_write in scope");
+        assert!(r.get("shell_run").is_some(), "the verify clause needs shell for build/tests");
     }
 
     #[test]
