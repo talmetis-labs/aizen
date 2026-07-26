@@ -7,7 +7,10 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
-## [0.4.8] — 2026-07-26
+## [0.4.9] — 2026-07-26
+
+Released from `release/v0.4.9` for stability testing before merging to `main`. (The 0.4.8 tag was
+already published from the pre-identity-work tree, so this work ships as 0.4.9.)
 
 ### Fixed
 - **A project's memory, skills and index no longer fork in two depending on whether `git` was on
