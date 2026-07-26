@@ -7,6 +7,39 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-07-26
+
+### Fixed
+- **A project's memory, skills and index no longer fork in two depending on whether `git` was on
+  PATH** — the zone key was hashed from the git remote URL when git could be found and from the raw
+  path when it couldn't, so the same checkout answered to two different zones from one launch to the
+  next and half the user's memory went missing without a word. The key is now the normalized
+  canonical project path only; the remote URL is informational. `aizen zone migrate` shows what a
+  legacy zone holds (dry-run by default) and merges it on `--apply`, including saved conversations,
+  which are keyed by provenance inside each file and so were invisible to a per-directory sweep.
+- **A missing `git` no longer blocks editing** — `git` not being on PATH was treated as a hard
+  checkpoint failure, which refused every edit rather than degrading. It is now benign: checkpoints
+  switch off with one warning and work continues. `git` is resolved once through a central resolver
+  (`AIZEN_GIT`, then PATH, then the usual install locations) so a GUI-installed git is found even
+  when the shell can't see it.
+- **`/resume` no longer grafts one project's context onto another** — sessions live in one flat pool,
+  so restoring offered whichever conversation was written last, from any project, and replayed its
+  stale system lane into the current one. Session files now record their origin (project key/root/
+  slug, model, created/updated); the startup hint and bare `/resume` prefer this project's newest
+  conversation and label a cross-project offer with `from <dir>`; restoring rebuilds both prompt
+  lanes for the current project. `/handoff` rotates to a fresh file instead of overwriting the
+  conversation it summarized.
+- **The `/sessions` picker says what each row is** — turn count, age, origin project and a `● current`
+  marker, newest first, with a confirmation before overwriting another conversation's file and
+  `(unreadable)` for a corrupt one instead of a plausible-looking empty row.
+- **A failing autosave is no longer silent** — it warns once per failure streak and reports recovery,
+  so a conversation that is not reaching disk says so.
+
+### Added
+- `aizen where` and `/where` — print the project root, zone slug, resolved `git`, and the paths
+  backing memory, skills, the codebase index and sessions, so which zone is in effect is checkable
+  rather than inferred.
+
 ### Changed
 - **Telegram replies are now native, compact HTML instead of raw Markdown** — headings, emphasis,
   inline/fenced code, safe links, lists and quotes use Telegram's supported formatting; Markdown
