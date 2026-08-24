@@ -317,39 +317,80 @@ async fn run_menu() -> Result<()> {
 /// mockup shows them); the graphical context meter is still fed via `tui::set_ctx_permille` and the
 /// retained backend's footer tints the mode/persona chips as it draws the row.
 fn status_text(history: &[Message], model: &str) -> String {
-    let toks = session_tokens(history);
+    // The meter + token chip prefer the provider-reported size of this conversation's most recent
+    // request (recorded by the turn's chat closure) over the chars/4 estimate — the estimate only
+    // carries a fresh thread, or one whose provider never reports usage. The real number is
+    // cleared on thread switches and compaction, so it can never describe a history it no longer
+    // matches.
+    let toks = tui::ctx_real_tokens()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| session_tokens(history));
     let (window, _) = resolve_ctx_window(model);
     // Feed the graphical context meter (per-mille for sub-1% resolution); the footer draws the bar.
-    let permille = (toks as f64 / window as f64 * 1000.0)
-        .round()
-        .clamp(0.0, 1000.0) as u16;
-    tui::set_ctx_permille(permille);
+    tui::set_ctx_permille(ctx_permille(toks, window));
     // One "turn" = one user message that opened an exchange (system prompt at [0] is not a turn).
     let turns = history.iter().filter(|m| m.role == "user").count();
     let turns_chip = format!("  ·  {turns} turn{}", if turns == 1 { "" } else { "s" });
-    let tok_chip = format!("  ·  ~{}/{} tok", fmt_k(toks), fmt_k(window));
+    let tok_plain = format!("~{}/{} tok", fmt_k(toks), fmt_k(window));
+    let tok_chip = format!("  ·  {tok_plain}");
     let approval = approval_mode();
-    let mode = if cli_config::ultimate_enabled() {
-        "  ·  ✦ ultimate"
+    let mode_label = if cli_config::ultimate_enabled() {
+        "ultimate"
     } else if approval == ApprovalMode::Yolo {
-        "  ·  ⚡ yolo"
+        "yolo"
     } else if approval == ApprovalMode::Smart {
-        "  ·  ◆ smart"
+        "smart"
     } else {
         ""
     };
+    let mode = match mode_label {
+        "ultimate" => "  ·  ✦ ultimate",
+        "yolo" => "  ·  ⚡ yolo",
+        "smart" => "  ·  ◆ smart",
+        _ => "",
+    };
     // Active persona chip — so it's always visible WHICH character aizen is role-playing (not just a
     // one-off "now playing" line that scrolls away). `🎭 Name`, styled by the footer's chip pass.
-    let persona = cli_config::load()
-        .persona
-        .map(|p| format!("  ·  🎭 {p}"))
-        .unwrap_or_default();
+    let cfg = cli_config::load();
+    let persona_name = cfg.persona.clone().unwrap_or_default();
+    let persona = if persona_name.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  🎭 {persona_name}")
+    };
     let todos = crate::agent::todo::status_summary()
         .map(|s| format!("  ·  {s}"))
         .unwrap_or_default();
     let agents = crate::agent::orchestration::hud_chip()
         .map(|s| format!("  ·  {s}"))
         .unwrap_or_default();
+    // Same numbers, typed, for the retained sidebar — published from the exact spot that formats
+    // the HUD string, so the two surfaces can never drift apart. No-op on the classic path.
+    // Model/effort/mode/persona stay OFF the sidebar: the HUD row above already shows them.
+    tui::set_facts(tui::SessionFacts {
+        tokens: tok_plain,
+        turns,
+        session: crate::core::session_store::current_session_slug().unwrap_or_default(),
+        // Named profile when one is active; otherwise the bare endpoint host so the row still
+        // says WHERE requests go for a hand-edited base_url.
+        provider: cfg.active_provider.clone().unwrap_or_else(|| {
+            cfg.base_url
+                .as_deref()
+                .map(|u| {
+                    let no_scheme = u.split("://").nth(1).unwrap_or(u);
+                    no_scheme.split('/').next().unwrap_or(no_scheme).to_string()
+                })
+                .unwrap_or_default()
+        }),
+        mcp_servers: crate::agent::mcp::load_config()
+            .ok()
+            .flatten()
+            .map(|c| c.servers.len())
+            .unwrap_or(0),
+        lsp: crate::agent::lsp::LSP.status().chip(),
+        memory_facts: crate::memory::live_fact_count(),
+        memory_recalled: crate::memory::stats::session_counters().0 as usize,
+    });
     format!("{model}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
 }
 
@@ -542,6 +583,11 @@ async fn run_menu_sticky() -> Result<()> {
     // and neither had any collector before.
     crate::core::recovery::sweep_expired();
     sweep_orphan_temps();
+    // Same policy for the two other self-inflicted accumulators: abandoned per-run scratch dirs
+    // (the place the prompt tells the model to put throwaway files) and sandbox private-tmp dirs
+    // whose Drop never ran. Both were previously swept only by `aizen sandbox doctor` or not at all.
+    crate::core::scratch::sweep_stale();
+    let _ = crate::sandbox::backend::guarded::sweep_stale_tmp();
     // Publish this window to the repository's session registry so the OTHER aizen windows (and the
     // one that eventually reviews and commits) can see it exists, what it is doing, and which files
     // it has changed. Best-effort: a registry failure never blocks the REPL.

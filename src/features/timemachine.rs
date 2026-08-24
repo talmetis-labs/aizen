@@ -3500,6 +3500,26 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
     }
 
     let mut trash_dir = None;
+    if apply {
+        // The trash is a reversible holding pen, not an archive: stamps a month old have had every
+        // realistic "oops" window pass, and nothing else ever empties this dir. Purged only on
+        // apply so a dry-run stays a pure report.
+        const TRASH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+        if let Ok(rd) = fs::read_dir(root.join(".trash")) {
+            let now = std::time::SystemTime::now();
+            for entry in rd.flatten() {
+                let expired = entry
+                    .metadata()
+                    .and_then(|md| md.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|age| age.as_secs() > TRASH_TTL_SECS);
+                if expired {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
     if apply && !orphans.is_empty() {
         let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
         let trash = root.join(".trash").join(&stamp);

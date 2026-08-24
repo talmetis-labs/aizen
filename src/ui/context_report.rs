@@ -7,7 +7,7 @@
 
 use crate::agent;
 use crate::core::cli_config;
-use crate::core::types::Message;
+use crate::core::types::{Message, Usage};
 use crate::ui::{theme, tui};
 use crate::*;
 
@@ -82,6 +82,41 @@ pub(crate) fn session_tokens(history: &[Message]) -> usize {
         .map(agent::estimate_message_tokens)
         .sum::<usize>()
         + agent::schema_overhead_tokens()
+}
+
+/// Per-mille fill of `window` for `tokens`, clamped to the gauge range — the one conversion the
+/// HUD meter, the sidebar and the per-send updates must all agree on.
+pub(crate) fn ctx_permille(tokens: usize, window: usize) -> u16 {
+    (tokens as f64 / window.max(1) as f64 * 1000.0)
+        .round()
+        .clamp(0.0, 1000.0) as u16
+}
+
+/// The REAL size of the context after a model call, from provider-reported usage: input + output
+/// tokens. Wire shapes disagree on cache accounting — Anthropic-style gateways report
+/// `prompt_tokens` EXCLUSIVE of `cache_read_input_tokens` (and of cache writes), OpenAI-style
+/// report it INCLUSIVE (`prompt_tokens_details.cached_tokens` is a subset). A cache read larger
+/// than the reported prompt cannot be a subset of it, so that is the exclusive-shape signal — and
+/// then the cache-write tokens (also exclusive) are part of the context too.
+pub(crate) fn usage_ctx_tokens(u: &Usage) -> usize {
+    match usage_input_tokens(u) + u.completion_tokens.unwrap_or(0) as usize {
+        // Some gateways send ONLY `total_tokens` — better than falling back to the estimate.
+        0 => u.total_tokens.unwrap_or(0) as usize,
+        n => n,
+    }
+}
+
+/// Just the INPUT side of a call's reported usage — what actually went out WITH the request (live
+/// prompt + cache reads/writes, whichever wire shape — see [`usage_ctx_tokens`]). Feeds the working
+/// line's `↑N tok` chip, which describes the request, not the whole exchange.
+pub(crate) fn usage_input_tokens(u: &Usage) -> usize {
+    let p = u.prompt_tokens.unwrap_or(0);
+    let cached = u.cache_read();
+    (if cached > p {
+        p + cached + u.cache_creation_input_tokens.unwrap_or(0)
+    } else {
+        p
+    }) as usize
 }
 
 /// Compact a token count for display: `12.4K` / `300`.

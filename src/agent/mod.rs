@@ -212,6 +212,12 @@ pub fn build_system_prompt_bundle(
         "cwd: {cwd}\nos: {os}\nshell: {}\ndate: {date}\nmodel: {model}\n",
         shell_line(os)
     ));
+    // Fixed for the process lifetime (OnceLock), so the stable lane stays byte-stable within a
+    // session — same contract as cwd/model above.
+    stable.push_str(&format!(
+        "scratch: {}\n",
+        crate::core::scratch::dir().display()
+    ));
     stable.push_str("</environment>\n");
 
     let mut dynamic = String::new();
@@ -322,6 +328,11 @@ pub(crate) fn build_role_scoped_subagent_base_prompt(
     s.push_str(&format!(
         "cwd: {cwd}\nos: {os}\nshell: {}\ndate: {date}\nmodel: {model}\n",
         shell_line(os)
+    ));
+    // Sub-agents share the parent's per-run scratch dir: their leavings are swept with the run's.
+    s.push_str(&format!(
+        "scratch: {}\n",
+        crate::core::scratch::dir().display()
     ));
     s.push_str("</environment>\n");
     if let Some(idx) = crate::skills::gated_index(task) {
@@ -979,11 +990,12 @@ where
     let mut last_hill_climb_reminder = 0usize;
     let mut iter = 0usize;
     // Identical-re-read short-circuit: sig(file_read args) → what that call answered last time.
-    // Cleared whenever history is rebuilt (compaction / emergency shrink) — the msg_index leg of
-    // the proof dies with the rebuild. Eviction blanks bodies IN PLACE, which the byte-level
-    // intact-check catches per entry, so no clear is needed there.
-    let mut read_cache: std::collections::HashMap<String, ReadCacheEntry> =
-        std::collections::HashMap::new();
+    // Lives in the process-global store under this scope so it survives into the NEXT user turn
+    // (same history, new loop invocation). Cleared per-scope whenever history is rebuilt
+    // (compaction / emergency shrink) — the msg_index leg of the proof dies with the rebuild.
+    // Eviction blanks bodies IN PLACE, which the byte-level intact-check catches per entry, so no
+    // clear is needed there.
+    let read_cache_scope = cfg.exec_ctx.resource_scope();
     // Batch-coach streak (see NUDGE_BATCH): consecutive turns whose ONLY call was one read-only
     // retrieval. One-shot latch per run.
     let mut single_read_streak = 0usize;
@@ -1233,7 +1245,7 @@ where
                             budget_band_shown = None; // …and the running budget signal (P-ctx1)
                             real_anchor = None; // spliced history invalidates the anchor
                             stall.forget_successes(); // summarized-away results must not mark a re-read as stale
-                            read_cache.clear(); // rebuilt indices — the short-circuit proof is void
+                            read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
                             est_now = estimate_tokens(messages) + schema_overhead;
                             if !cfg.quiet {
                                 let line =
@@ -2166,17 +2178,22 @@ where
         // simply drops its eager handles: detached, read-only, harmless.)
         let mut eager = std::mem::take(&mut turn.eager);
         // IDENTICAL-RE-READ SHORT-CIRCUIT: a `file_read` whose canonical args exactly match an
-        // earlier call this run, whose file bytes are unchanged, and whose earlier result is still
-        // verbatim in history would return byte-identical content the model already has. Answer it
-        // with a one-line pointer instead — injected through the eager-adoption path so traces,
-        // ordering and cancellation stay uniform. (Measured sessions: 30% of tool calls re-hit a
-        // target already hit; the byte-identical subset is pure history bloat.) A real eager start
-        // for the same slot wins — its body already ran and its result is at least as good.
+        // earlier call this conversation, whose file bytes are unchanged, and whose earlier result
+        // is still verbatim in history would return byte-identical content the model already has.
+        // Answer it with a one-line pointer instead — injected through the eager-adoption path so
+        // traces, ordering and cancellation stay uniform. (Measured sessions: 30% of tool calls
+        // re-hit a target already hit; the byte-identical subset is pure history bloat.) A proven
+        // hit REPLACES a real eager start for the same slot: the eager body's I/O is already spent
+        // either way, but its full result would re-enter history — resending bytes the model
+        // provably holds, which is the exact cost this exists to remove. (It used to be the other
+        // way round, which disabled the short-circuit for every call but the last of a batched
+        // turn: eager starts fire for all completed-but-not-final slots.)
         for (k, tc) in calls.iter().enumerate() {
-            if tc.function.name != "file_read" || eager.iter().any(|(i, _)| *i == k) {
+            if tc.function.name != "file_read" {
                 continue;
             }
-            let Some(entry) = read_cache.get(&canonical_args(&tc.function.arguments)) else {
+            let key = read_cache_key(&read_cache_scope, &canonical_args(&tc.function.arguments));
+            let Some(entry) = read_cache_get(&key) else {
                 continue;
             };
             let intact = messages.get(entry.msg_index).is_some_and(|m| {
@@ -2190,18 +2207,32 @@ where
             if !intact {
                 continue;
             }
-            let unchanged = std::fs::read(&entry.path)
-                .map(|b| crate::core::persist::FileFingerprint::for_bytes(&b) == entry.fingerprint)
-                .unwrap_or(false);
+            let unchanged = entry.files.iter().all(|(path, fp)| {
+                std::fs::read(path)
+                    .map(|b| crate::core::persist::FileFingerprint::for_bytes(&b) == *fp)
+                    .unwrap_or(false)
+            });
             if !unchanged {
                 continue;
             }
+            let what = entry
+                .files
+                .iter()
+                .map(|(p, _)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The pointer names the earlier tool result's id so a model that cannot "see" where
+            // the content sits can find it instead of re-asking with slightly different args.
             let canned = format!(
-                "[unchanged] {} — identical to your earlier file_read this run; that result is \
-                 still in context above and the file has not changed since. Use what you already \
-                 have, or pass a different start/end for another slice.",
-                entry.path.display()
+                "[unchanged] {what} — identical to your earlier file_read (tool result {} above); \
+                 still in context and the file has not changed since. Use what you already have, \
+                 or pass a different start/end for another slice.",
+                entry.call_id
             );
+            if let Some(pos) = eager.iter().position(|(i, _)| *i == k) {
+                let (_, stale) = eager.swap_remove(pos);
+                stale.abort(); // read-only body; its result is superseded by the pointer
+            }
             eager.push((k, tokio::task::spawn(async move { canned })));
         }
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::ExecutingTools);
@@ -2299,30 +2330,53 @@ where
                 let Ok(args) = parse_call_args(&tc.function.arguments) else {
                     continue;
                 };
-                // The batch (`files:[…]`) form mixes several files in one result — one fingerprint
-                // cannot attest to it. Only the single-path form is cached.
-                if args.get("files").is_some() {
+                // Both forms record: the single-path form as one (path, fingerprint) pair, the
+                // batch (`files:[…]`) form as one pair PER file — a later byte-identical repeat of
+                // the whole call is unchanged iff every file still matches. (The batch form used
+                // to be skipped outright, which made batched reads — the shape the coach pushes
+                // models toward — the one shape the short-circuit never helped.)
+                let mut raw_paths: Vec<&str> = Vec::new();
+                if let Some(files) = args.get("files").and_then(|v| v.as_array()) {
+                    for f in files {
+                        match f.get("path").and_then(|v| v.as_str()) {
+                            Some(p) => raw_paths.push(p),
+                            None => {
+                                raw_paths.clear();
+                                break;
+                            }
+                        }
+                    }
+                } else if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                    raw_paths.push(p);
+                }
+                if raw_paths.is_empty() {
                     continue;
                 }
-                let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Ok(resolved) =
-                    crate::agent::builtin::confine(&cfg.effective_root(), path, true)
-                else {
-                    continue;
-                };
-                let Ok(bytes) = std::fs::read(&resolved) else {
-                    continue;
-                };
-                if read_cache.len() >= 512 {
-                    read_cache.clear(); // bounded; a dropped entry only costs a re-read
+                let mut files: Vec<(std::path::PathBuf, crate::core::persist::FileFingerprint)> =
+                    Vec::with_capacity(raw_paths.len());
+                for p in raw_paths {
+                    let Ok(resolved) =
+                        crate::agent::builtin::confine(&cfg.effective_root(), p, true)
+                    else {
+                        files.clear();
+                        break;
+                    };
+                    let Ok(bytes) = std::fs::read(&resolved) else {
+                        files.clear();
+                        break;
+                    };
+                    files.push((
+                        resolved,
+                        crate::core::persist::FileFingerprint::for_bytes(&bytes),
+                    ));
                 }
-                read_cache.insert(
-                    canonical_args(&tc.function.arguments),
+                if files.is_empty() {
+                    continue;
+                }
+                read_cache_insert(
+                    read_cache_key(&read_cache_scope, &canonical_args(&tc.function.arguments)),
                     ReadCacheEntry {
-                        path: resolved,
-                        fingerprint: crate::core::persist::FileFingerprint::for_bytes(&bytes),
+                        files,
                         msg_index: base + k,
                         call_id: call_id.clone(),
                         result_chars: result.chars().count(),
@@ -2345,6 +2399,7 @@ where
                     | "codebase_search"
                     | "read_symbol"
                     | "memory_search"
+                    | "session_recall"
                     | "web_fetch"
                     | "web_search"
             ) || name.starts_with("lsp_")
@@ -3677,30 +3732,84 @@ fn edit_target(head: &str) -> String {
     }
 }
 
-/// Emit a boxed diff preview for an edit result: header `diff · <path>  +A −D`, then up to a few of
-/// the `^[-+]`-prefixed lines the unified `diff_preview` emitted (added = green `+`, removed = salmon
-/// `−`); context / cap-note lines (space- / `…`-prefixed) are skipped. `path` is the edited target
-/// (already a basename-ish target string). The full diff still reaches the model; only this preview
-/// hits the screen. Under retained this is a framed box; classic re-renders the same box inline.
+/// Parse a `@@ -N[,c] +M[,c] @@` unified hunk header into `(N, M)`.
+fn parse_hunk_header(l: &str) -> Option<(usize, usize)> {
+    let rest = l.strip_prefix("@@ -")?;
+    let (old_part, rest) = rest.split_once(" +")?;
+    let (new_part, _) = rest.split_once(" @@")?;
+    let num = |s: &str| s.split(',').next()?.parse::<usize>().ok();
+    Some((num(old_part)?, num(new_part)?))
+}
+
+/// Emit a boxed diff preview for an edit result: the `^[-+]`-prefixed lines the unified
+/// `diff_preview` emitted, grouped into hunks by their `@@ -N +M @@` headers with the surrounding
+/// context lines kept — everything the side-by-side panes need (real gutter numbers, aligned
+/// context). A headerless output (an older tool shape) still shows, as bare `+`/`−` rows without
+/// numbers; context is only trusted INSIDE a numbered hunk (space-prefixed prose elsewhere in a
+/// result must not leak into the box). `path` is the edited target. The full diff still reaches
+/// the model; only this preview hits the screen. Under retained this is a framed box; classic
+/// re-renders the same box inline.
 fn emit_edit_diff(path: &str, out: &str) {
-    const MAX_SHOWN: usize = 8;
+    const MAX_CHANGED: usize = 12; // changed (±) rows shown across all hunks; context rides free
     let (adds, dels) = count_diff(out);
-    let mut lines: Vec<(bool, String)> = Vec::new();
+    let mut hunks: Vec<crate::ui::tui::DiffHunk> = Vec::new();
+    let mut cur: Option<crate::ui::tui::DiffHunk> = None;
+    let mut changed = 0usize;
     for l in out.lines() {
-        let (is_add, content) = match l.as_bytes().first() {
-            Some(b'+') => (true, &l[1..]),
-            Some(b'-') => (false, &l[1..]),
-            _ => continue,
-        };
-        if lines.len() == MAX_SHOWN {
-            break;
+        if let Some((so, sn)) = parse_hunk_header(l) {
+            if let Some(h) = cur.take().filter(|h| !h.rows.is_empty()) {
+                hunks.push(h);
+            }
+            cur = Some(crate::ui::tui::DiffHunk {
+                start_old: so,
+                start_new: sn,
+                rows: Vec::new(),
+            });
+            continue;
         }
-        lines.push((is_add, content.trim_end().to_string()));
+        if l.starts_with('…') {
+            continue; // `…(N more lines …)` cap note — elision, not the end of the diff section
+        }
+        let (kind, text) = match l.as_bytes().first() {
+            Some(b'+') => (1u8, &l[1..]),
+            Some(b'-') => (2u8, &l[1..]),
+            // Context is only meaningful inside a numbered hunk — a space-prefixed line anywhere
+            // else (edit summaries, LSP diagnostics) is prose, not diff.
+            Some(b' ') if cur.as_ref().is_some_and(|h| h.start_old > 0) => (0u8, &l[1..]),
+            _ => {
+                // A non-diff line after rows have been collected ends the diff section — anything
+                // later (the LSP feedback fold) must not be mistaken for more hunk rows.
+                if cur.as_ref().is_some_and(|h| !h.rows.is_empty()) || !hunks.is_empty() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if kind != 0 {
+            if changed == MAX_CHANGED {
+                break;
+            }
+            changed += 1;
+            if cur.is_none() {
+                // Headerless output: one synthetic hunk, unknown position.
+                cur = Some(crate::ui::tui::DiffHunk {
+                    start_old: 0,
+                    start_new: 0,
+                    rows: Vec::new(),
+                });
+            }
+        }
+        if let Some(h) = cur.as_mut() {
+            h.rows.push((kind, text.trim_end().to_string()));
+        }
     }
-    if lines.is_empty() {
+    if let Some(h) = cur.take().filter(|h| !h.rows.is_empty()) {
+        hunks.push(h);
+    }
+    if hunks.iter().all(|h| h.rows.iter().all(|(k, _)| *k == 0)) {
         return;
     }
-    crate::ui::tui::diff_box(path, adds, dels, lines);
+    crate::ui::tui::diff_box(path, adds, dels, hunks);
 }
 
 /// Build the `⎿` summary for a tool result, returning `(ok, text)` (`ok=false` → coloured as a
@@ -3823,19 +3932,65 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
 /// verbatim in history". All legs must hold; any miss falls back to a normal read. A false
 /// negative costs nothing, a false positive would starve the model of content it needs — so every
 /// check is byte-level.
+#[derive(Clone)]
 struct ReadCacheEntry {
-    /// Resolved on-disk path, for the fingerprint re-check.
-    path: std::path::PathBuf,
-    /// Fingerprint of the file bytes the cached result described. Recorded only from turns with
-    /// NO destructive call, so it provably equals the content at read time (nothing in the same
-    /// turn could have rewritten the file between the read and the record).
-    fingerprint: crate::core::persist::FileFingerprint,
+    /// Resolved on-disk path(s) with the fingerprint of the bytes the cached result described —
+    /// one pair for the single-path form, one per entry for the `files:[…]` batch form (every
+    /// file must still match for the whole call to count as unchanged). Recorded only from turns
+    /// with NO destructive call, so each fingerprint provably equals the content at read time
+    /// (nothing in the same turn could have rewritten the file between the read and the record).
+    files: Vec<(std::path::PathBuf, crate::core::persist::FileFingerprint)>,
     /// Where the result message sat when recorded — revalidated against id+len+prefix below, so a
     /// shifted (compacted) or blanked (evicted) history can never false-match.
     msg_index: usize,
     call_id: String,
     result_chars: usize,
     result_prefix: String,
+}
+
+/// The short-circuit store, process-global and keyed by `{scope}\u{1f}{canonical args}` so it
+/// SURVIVES the loop that recorded it: history persists across user turns, but the cache used to be
+/// a loop local — turn 2 re-reading a file from turn 1 always paid full price, which is exactly the
+/// pattern the feature exists for. Safe globally because every hit re-proves itself at use time
+/// against the CURRENT history and the CURRENT file bytes; a stale entry from any other loop or
+/// scope simply misses. Scoped by `exec_ctx.resource_scope()` (conversation id for top-level turns,
+/// a derived id per delegated child) so a sub-agent's recordings never collide with its parent's.
+fn read_cache_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, ReadCacheEntry>>
+{
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ReadCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn read_cache_key(scope: &str, canonical: &str) -> String {
+    format!("{scope}\u{1f}{canonical}")
+}
+
+fn read_cache_get(key: &str) -> Option<ReadCacheEntry> {
+    read_cache_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()
+}
+
+fn read_cache_insert(key: String, entry: ReadCacheEntry) {
+    let mut map = read_cache_store().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 512 {
+        map.clear(); // bounded; a dropped entry only costs a re-read
+    }
+    map.insert(key, entry);
+}
+
+/// Drop every entry recorded under `scope` — the compaction path calls this when it rebuilds
+/// history, because the msg_index leg of those entries' proof dies with the rebuild.
+fn read_cache_clear_scope(scope: &str) {
+    let prefix = format!("{scope}\u{1f}");
+    read_cache_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|k, _| !k.starts_with(&prefix));
 }
 
 fn turn_signature(calls: &[ToolCall]) -> String {
@@ -5427,6 +5582,17 @@ mod tests {
         // an error is coloured as a failure
         let (ok, s) = summarize_result("file_edit", "error: old_string not found");
         assert!(!ok && s.starts_with("error:"), "{s:?}");
+    }
+
+    #[test]
+    fn hunk_header_parses_starts_and_rejects_prose() {
+        assert_eq!(parse_hunk_header("@@ -95,7 +95,8 @@"), Some((95, 95)));
+        assert_eq!(parse_hunk_header("@@ -4 +6 @@"), Some((4, 6)));
+        assert_eq!(parse_hunk_header("@@ nonsense @@"), None);
+        assert_eq!(
+            parse_hunk_header("edited src/x.rs (1 replacement(s))"),
+            None
+        );
     }
 
     #[test]

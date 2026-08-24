@@ -521,6 +521,47 @@ fn working_caption_types_out_then_holds() {
 }
 
 #[test]
+fn working_line_carries_the_sent_token_chip_and_resets_per_turn() {
+    let mut state = AppState::new("intro", "status");
+    apply_command(&mut state, Command::Working(true));
+    // No call has gone out yet — the chip stays off the line.
+    let (before, _) = working_line(&state).remove(0);
+    assert!(!before.contains('↑'), "no chip before a send: {before:?}");
+
+    apply_command(&mut state, Command::SentTokens(6_200));
+    let (with, _) = working_line(&state).remove(0);
+    assert!(
+        with.contains("↑6.2K tok"),
+        "the request size rides the working line: {with:?}"
+    );
+
+    // A NEW turn starts blank — the previous request size says nothing about it.
+    apply_command(&mut state, Command::Working(false));
+    apply_command(&mut state, Command::Working(true));
+    let (fresh, _) = working_line(&state).remove(0);
+    assert!(
+        !fresh.contains('↑'),
+        "a fresh turn resets the chip: {fresh:?}"
+    );
+}
+
+#[test]
+fn working_clock_rolls_into_minutes_past_sixty_seconds() {
+    // A long turn used to read `754s` — the clock must roll into `12m34s` units instead.
+    let mut state = AppState::new("intro", "status");
+    apply_command(&mut state, Command::Working(true));
+    let Some(t) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(90)) else {
+        return; // very early process uptime can't back-date an Instant — nothing to assert
+    };
+    state.working_since = Some(t);
+    let (plain, _) = working_line(&state).remove(0);
+    assert!(
+        plain.contains("1m3"),
+        "90s must read as minutes (1m30s): {plain:?}"
+    );
+}
+
+#[test]
 fn tool_caption_replaces_verb_then_falls_back() {
     // The hybrid caption: a tool call re-points it at a concrete action (restarting the reveal so
     // the new text types out), and an empty `WorkCaption` — what `emit_tool_result` sends when the
@@ -979,32 +1020,149 @@ fn tool_event_updates_the_same_line_by_seq() {
 }
 
 #[test]
-fn diff_box_frames_add_and_del() {
-    let d = DiffPayload {
-        path: "src/auth.rs".into(),
-        adds: 2,
-        dels: 1,
-        lines: vec![(true, "let x = 1;".into()), (false, "let y = 2;".into())],
+fn a_long_boot_note_wraps_to_the_pane_instead_of_clipping() {
+    // The reported bug: `sandbox:` / `[dense]` boot notes are one long line; the Generic render
+    // used to keep them as ONE row, and the paint clipped it at the pane's right edge.
+    let note = "sandbox: no kernel sandbox backend on this platform — commands run with software guards only (guarded)";
+    let rows = wrap_keep_sgr(note, 40);
+    assert!(rows.len() > 1, "a long note must fold: {rows:?}");
+    assert!(
+        rows.iter().all(|r| console::measure_text_width(r) <= 40),
+        "every folded row fits the pane: {rows:?}"
+    );
+    assert_eq!(
+        rows.concat().split_whitespace().collect::<Vec<_>>(),
+        note.split_whitespace().collect::<Vec<_>>(),
+        "no words are lost or reordered by the fold"
+    );
+    // Word-boundary preference: no row starts mid-word with a space left dangling on it.
+    assert!(
+        rows.iter().skip(1).all(|r| !r.starts_with(' ')),
+        "soft breaks land AFTER the space: {rows:?}"
+    );
+}
+
+#[test]
+fn a_styled_note_keeps_its_colour_past_the_fold() {
+    let sgr = "\x1b[38;5;179m";
+    let note =
+        format!("{sgr}mcp: server 'design' skipped because its launcher exited early\x1b[0m");
+    let rows = wrap_keep_sgr(&note, 30);
+    assert!(rows.len() > 1, "must fold: {rows:?}");
+    for r in &rows[1..] {
+        assert!(
+            r.starts_with(sgr),
+            "continuation rows re-open the active colour: {r:?}"
+        );
+    }
+}
+
+#[test]
+fn generic_blocks_render_folded_rows_through_the_cache() {
+    let mut cache = RenderCache::default();
+    let block = UiBlock {
+        id: 9,
+        kind: BlockKind::Generic,
+        payload: Payload::Text(
+            "[dense] loaded model2vec-potion-multilingual-128M (dim 256) — auto-detected".into(),
+        ),
+        complete: true,
     };
-    let out: Vec<String> = render_diff_box(&d, 48).iter().map(|s| plain(s)).collect();
+    let rows = cache.get_or_render(&block, 32);
+    assert!(rows.len() > 1, "the Generic path folds long rows: {rows:?}");
+    assert!(rows.iter().all(|r| console::measure_text_width(r) <= 32));
+}
+
+fn sample_diff() -> DiffPayload {
+    DiffPayload {
+        path: "src/auth.rs".into(),
+        adds: 1,
+        dels: 1,
+        hunks: vec![crate::ui::tui::DiffHunk {
+            start_old: 96,
+            start_new: 96,
+            rows: vec![
+                (0, "required".into()),
+                (2, "tabIndex={4}".into()),
+                (1, "tabIndex={5}".into()),
+                (0, "autoComplete".into()),
+            ],
+        }],
+    }
+}
+
+#[test]
+fn diff_box_narrow_stacks_unified_with_line_numbers() {
+    let out: Vec<String> = render_diff_box(&sample_diff(), 48)
+        .iter()
+        .map(|s| plain(s))
+        .collect();
     assert!(
         out[0].contains("diff · src/auth.rs"),
         "header names the path: {:?}",
         out[0]
     );
     assert!(
-        out[0].contains("+2 −1"),
+        out[0].contains("+1 −1"),
         "header carries the counts: {:?}",
         out[0]
     );
+    // Unified: one column, gutter numbered from the hunk header — the removed line keeps the OLD
+    // file's number, the added line the NEW file's.
     assert!(
-        out.iter().any(|l| l.contains("+ let x = 1;")),
-        "added line: {out:?}"
+        out.iter().any(|l| l.contains(" 96   required")),
+        "leading context with its number: {out:?}"
     );
     assert!(
-        out.iter().any(|l| l.contains("− let y = 2;")),
+        out.iter().any(|l| l.contains(" 97 − tabIndex={4}")),
         "removed line: {out:?}"
     );
+    assert!(
+        out.iter().any(|l| l.contains(" 97 + tabIndex={5}")),
+        "added line: {out:?}"
+    );
+}
+
+#[test]
+fn diff_box_wide_pairs_old_and_new_panes() {
+    let out: Vec<String> = render_diff_box(&sample_diff(), 100)
+        .iter()
+        .map(|s| plain(s))
+        .collect();
+    // Side-by-side: the removed/added pair share ONE row — old pane left, new pane right.
+    let paired = out
+        .iter()
+        .find(|l| l.contains("− tabIndex={4}") && l.contains("+ tabIndex={5}"))
+        .expect("one row carries both sides of the change");
+    assert!(
+        paired.find("− tabIndex={4}").unwrap() < paired.find("+ tabIndex={5}").unwrap(),
+        "old pane sits left of the new pane: {paired:?}"
+    );
+    // Context appears on BOTH panes of its row, numbered on each side.
+    assert!(
+        out.iter()
+            .any(|l| l.match_indices("96   required").count() == 2),
+        "context is mirrored across the panes: {out:?}"
+    );
+}
+
+#[test]
+fn diff_box_spans_the_full_width_it_is_given() {
+    // The box used to clamp itself to 100 columns, so on a wide terminal both panes clipped code
+    // at "…" while the right half of the pane sat empty. Every row — header, pane rows, footer —
+    // must measure exactly the width handed in, in both the side-by-side (160) and unified (48)
+    // layouts. The header once ran one column past the box (its fill under-counted the fixed
+    // columns), which the clamp kept hidden inside the pane.
+    for width in [48usize, 160] {
+        for row in &render_diff_box(&sample_diff(), width) {
+            assert_eq!(
+                console::measure_text_width(&plain(row)),
+                width,
+                "row painted off-width at {width}: {:?}",
+                plain(row)
+            );
+        }
+    }
 }
 
 #[test]
@@ -1072,4 +1230,117 @@ fn a_draft_taller_than_the_box_stops_growing_and_says_what_is_hidden() {
         rows[15]
     );
     assert_eq!(rows[0], "intro", "the transcript keeps its floor");
+}
+
+#[test]
+fn a_wide_terminal_docks_the_sidebar_and_a_narrow_one_does_not() {
+    let mut state = AppState::new("intro", "status");
+    state.ctx_permille = 420;
+    state.facts = SessionFacts {
+        tokens: "~6.6K/128.0K tok".to_string(),
+        turns: 3,
+        session: "phien-thu-nghiem-0822".to_string(),
+        provider: "openrouter".to_string(),
+        mcp_servers: 1,
+        lsp: "rust ready".to_string(),
+        memory_facts: 12,
+        memory_recalled: 4,
+    };
+    state.apply_plan(vec![
+        PlanRow {
+            status: 2,
+            text: "read the code".to_string(),
+        },
+        PlanRow {
+            status: 1,
+            text: "write the fix".to_string(),
+        },
+        PlanRow {
+            status: 0,
+            text: "run the tests".to_string(),
+        },
+    ]);
+
+    // Wide: the right column carries the header and the live plan. The context gauge stays OUT —
+    // the HUD row already draws that same permille, so the sidebar must not repeat it.
+    let rows = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("Aizen v"),
+        "sidebar header missing:\n{joined}"
+    );
+    assert!(joined.contains("Todo 1/3"), "plan tally missing:\n{joined}");
+    assert!(joined.contains("write the fix"), "plan rows missing");
+    assert!(
+        !joined.contains("Context"),
+        "context gauge must not be painted in the sidebar:\n{joined}"
+    );
+    assert!(
+        joined.contains("~6.6K/128.0K tok"),
+        "token line missing under Session"
+    );
+    assert!(
+        joined.contains("phien-thu-nghiem-0822"),
+        "session name missing"
+    );
+    assert!(
+        joined.contains("Provider openrouter"),
+        "provider row missing:\n{joined}"
+    );
+    assert!(joined.contains("MCP 1 server"), "mcp row missing");
+    assert!(joined.contains("LSP rust ready"), "lsp row missing");
+    assert!(joined.contains("Memory 12 facts"), "memory row missing");
+    assert!(
+        joined.contains("4 recalled this session"),
+        "recall tally missing"
+    );
+    // The divider sits at one constant column on every row.
+    let side_x = (SIDEBAR_MIN_TERM_W - SIDEBAR_W) as usize;
+    assert!(
+        rows.iter()
+            .all(|r| r.chars().nth(side_x).is_some_and(|c| c == '│')),
+        "divider column broken"
+    );
+    // The transcript still paints, narrowed, on the left.
+    assert!(rows[0].starts_with("intro"));
+
+    // One column short of the threshold: the conversation keeps the full width.
+    let rows = painted_rows(&mut state, SIDEBAR_MIN_TERM_W - 1, 24);
+    let joined = rows.join("\n");
+    assert!(
+        !joined.contains("Todo 1/3"),
+        "sidebar must not appear below the width threshold"
+    );
+}
+
+#[test]
+fn sidebar_wrap_breaks_words_and_marks_overflow() {
+    assert_eq!(
+        wrap_plain("hello world again", 11, 3),
+        vec!["hello world", "again"]
+    );
+    assert_eq!(
+        wrap_plain("aaaaaaaaaaaa", 5, 3),
+        vec!["aaaaa", "aaaaa", "aa"]
+    );
+    let clipped = wrap_plain("one two three four five six seven", 8, 2);
+    assert_eq!(clipped.len(), 2);
+    assert!(
+        clipped[1].ends_with('…'),
+        "overflow must be marked: {clipped:?}"
+    );
+}
+
+#[test]
+fn content_width_subtracts_the_docked_sidebar() {
+    // Pre-wrap consumers (markdown, stream boxes) must measure the PANE, not the grid — text
+    // wrapped to the full grid paints its line tails under the sidebar, where they are clipped.
+    COLS.store(140, Ordering::Relaxed);
+    assert_eq!(content_width(), 140 - SIDEBAR_W);
+    COLS.store(100, Ordering::Relaxed);
+    assert_eq!(
+        content_width(),
+        100,
+        "no sidebar → the full grid is the pane"
+    );
 }

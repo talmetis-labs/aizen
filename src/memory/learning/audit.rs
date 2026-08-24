@@ -94,6 +94,11 @@ pub fn audit_path() -> std::path::PathBuf {
     config::cli_memory_dir().join("learning-audit.jsonl")
 }
 
+/// Append-only logs need a ceiling or they never stop growing (a real profile hit 180 KB in weeks
+/// with nothing ever reading past the recent tail). Same single-generation rotation as the sandbox
+/// audit log: at the cap the live file becomes `.1` and a fresh one starts — bounded at two files.
+const MAX_BYTES: u64 = 2 * 1024 * 1024;
+
 /// One NDJSON line per event; never fails the learn pipeline.
 pub fn append(ev: AuditEvent<'_>) {
     let line = match serde_json::to_string(&ev) {
@@ -103,6 +108,11 @@ pub fn append(ev: AuditEvent<'_>) {
     let path = audit_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= MAX_BYTES) {
+        let rolled = path.with_file_name("learning-audit.1.jsonl");
+        let _ = std::fs::remove_file(&rolled);
+        let _ = std::fs::rename(&path, &rolled);
     }
     let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) else {
         return;

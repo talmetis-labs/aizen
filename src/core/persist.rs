@@ -101,6 +101,57 @@ fn temp_path(path: &Path) -> PathBuf {
     ))
 }
 
+/// Remove `.{name}.aizen-tmp-{pid}-{seq}` staging orphans in `dir` — leftovers of a writer killed
+/// between the staged write and the rename (the in-process error path never ran, and nothing else
+/// knows the name). Age-gated: another process may be mid-write RIGHT NOW and its staging file is
+/// indistinguishable by name; a minute is far longer than any staged write. Best-effort.
+pub fn sweep_orphan_temps_in(dir: &Path) {
+    sweep_orphan_temps_older_than(dir, 60);
+}
+
+/// The age knob exists for tests (mtime cannot be set portably without a dependency); production
+/// callers go through [`sweep_orphan_temps_in`] and its one-minute gate.
+pub(crate) fn sweep_orphan_temps_older_than(dir: &Path, min_age_secs: u64) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with('.') || !name.contains(".aizen-tmp-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|md| md.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() >= min_age_secs);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Sweep `parent` for staging orphans at most once per process. Every `atomic_write` destination
+/// dir self-heals this way — including dirs inside the user's repo, which the startup sweep (scoped
+/// to the state dir) can never see. The once-gate keeps the added cost to one `read_dir` per
+/// distinct directory per run instead of one per write.
+fn sweep_parent_once(parent: &Path) {
+    use std::sync::{Mutex, OnceLock};
+    static SWEPT: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let swept = SWEPT.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut set = swept.lock().unwrap_or_else(|e| e.into_inner());
+        if set.len() >= 512 {
+            set.clear(); // bounded; a re-sweep only costs a read_dir
+        }
+        if !set.insert(parent.to_path_buf()) {
+            return;
+        }
+    }
+    sweep_orphan_temps_in(parent);
+}
+
 /// Read bytes and return the exact content fingerprint used for a later compare-and-swap.
 pub fn read_with_fingerprint(path: &Path) -> Result<(Option<Vec<u8>>, FileFingerprint)> {
     match fs::read(path) {
@@ -182,6 +233,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    sweep_parent_once(parent);
 
     let tmp = temp_path(path);
     let result = (|| -> Result<()> {
@@ -449,5 +501,30 @@ mod tests {
         assert_eq!(next, FileFingerprint::for_bytes(b"new"));
         assert_eq!(fs::read(&path).unwrap(), b"new");
         let _ = fs::remove_file(path);
+    }
+
+    /// The orphan sweep must take exactly the killed-writer leftovers and nothing else: staging
+    /// names are removed, real files (including dotfiles that merely LOOK similar) survive.
+    #[test]
+    fn orphan_sweep_removes_staging_names_and_spares_everything_else() {
+        let dir = std::env::temp_dir().join(format!("aizen-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let orphan_a = dir.join(".state.json.aizen-tmp-999-0");
+        let orphan_b = dir.join(".cfg.toml.aizen-tmp-1-7");
+        let real = dir.join("state.json");
+        let dotfile = dir.join(".gitignore");
+        for p in [&orphan_a, &orphan_b, &real, &dotfile] {
+            fs::write(p, b"x").unwrap();
+        }
+        sweep_orphan_temps_older_than(&dir, 0);
+        assert!(!orphan_a.exists() && !orphan_b.exists(), "orphans removed");
+        assert!(real.exists() && dotfile.exists(), "real files untouched");
+        // The production gate: nothing younger than the threshold is touched, because a sibling
+        // process may be mid-write with an identical-looking staging file RIGHT NOW.
+        fs::write(&orphan_a, b"x").unwrap();
+        sweep_orphan_temps_in(&dir);
+        assert!(orphan_a.exists(), "a fresh staging file must survive");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

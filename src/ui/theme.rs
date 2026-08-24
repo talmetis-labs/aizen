@@ -40,6 +40,18 @@ pub const WARN: u8 = 179;
 /// Links + inline code (a calm blue, distinct from the gold accent).
 pub const LINK: u8 = 110;
 
+// ── diff panes (the boxed edit preview) ──────────────────────────────────────────
+// Changed rows carry a tinted BACKGROUND (the OpenCode/GitHub side-by-side look) with a light
+// same-family foreground on top — subtle enough not to shout, distinct enough to scan.
+/// Removed-row background — a deep muted red.
+pub const DIFF_DEL_BG: u8 = 52;
+/// Removed-row text — light salmon that reads on [`DIFF_DEL_BG`].
+pub const DIFF_DEL_FG: u8 = 217;
+/// Added-row background — a deep muted green.
+pub const DIFF_ADD_BG: u8 = 22;
+/// Added-row text — light green that reads on [`DIFF_ADD_BG`].
+pub const DIFF_ADD_FG: u8 = 157;
+
 // ── code-syntax sub-palette (light, best-effort highlighter) ─────────────────────
 pub const CODE_KEYWORD: u8 = 176; // soft mauve
 pub const CODE_STRING: u8 = 108; // sage green
@@ -71,6 +83,15 @@ pub fn warn<D: Display>(d: D) -> StyledObject<D> {
 }
 pub fn link<D: Display>(d: D) -> StyledObject<D> {
     style(d).color256(LINK)
+}
+/// An added diff row: light green ON the deep-green tint (the whole padded cell, so the
+/// background reaches the pane edge).
+pub fn diff_add<D: Display>(d: D) -> StyledObject<D> {
+    style(d).color256(DIFF_ADD_FG).on_color256(DIFF_ADD_BG)
+}
+/// A removed diff row: light salmon ON the deep-red tint.
+pub fn diff_del<D: Display>(d: D) -> StyledObject<D> {
+    style(d).color256(DIFF_DEL_FG).on_color256(DIFF_DEL_BG)
 }
 
 #[cfg(test)]

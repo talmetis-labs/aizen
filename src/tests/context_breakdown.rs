@@ -30,6 +30,42 @@ fn base_only_prompt_reports_just_base() {
 }
 
 #[test]
+fn ctx_permille_clamps_and_survives_a_zero_window() {
+    assert_eq!(ctx_permille(0, 128_000), 0);
+    assert_eq!(ctx_permille(64_000, 128_000), 500);
+    assert_eq!(ctx_permille(300_000, 128_000), 1000); // over-full clamps at the gauge top
+    assert_eq!(ctx_permille(50, 0), 1000); // degenerate window must not divide by zero
+}
+
+#[test]
+fn usage_ctx_tokens_reads_both_cache_shapes() {
+    // OpenAI-style: `prompt_tokens` already INCLUDES the cached subset — nothing to add.
+    let openai: Usage = serde_json::from_str(
+        r#"{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":900}}"#,
+    )
+    .unwrap();
+    assert_eq!(usage_ctx_tokens(&openai), 1050);
+
+    // Anthropic-style: cache reads/writes ride BESIDE a small live prompt — all three are context.
+    let anthropic: Usage = serde_json::from_str(
+        r#"{"prompt_tokens":40,"completion_tokens":10,"cache_read_input_tokens":9000,"cache_creation_input_tokens":200}"#,
+    )
+    .unwrap();
+    assert_eq!(usage_ctx_tokens(&anthropic), 40 + 9000 + 200 + 10);
+
+    // A gateway that sends ONLY `total_tokens` still yields the real number.
+    let total_only: Usage = serde_json::from_str(r#"{"total_tokens":777}"#).unwrap();
+    assert_eq!(usage_ctx_tokens(&total_only), 777);
+
+    // An empty usage frame reports 0 — the caller keeps the chars/4 estimate.
+    assert_eq!(usage_ctx_tokens(&Usage::default()), 0);
+
+    // The input split (the `↑N tok` chip) excludes the reply in both shapes.
+    assert_eq!(usage_input_tokens(&openai), 1000);
+    assert_eq!(usage_input_tokens(&anthropic), 40 + 9000 + 200);
+}
+
+#[test]
 fn fold_retrieval_passthrough_when_empty_or_no_index() {
     // Empty / whitespace query → returned verbatim (nothing to retrieve against).
     assert_eq!(fold_retrieval_into_query(""), "");

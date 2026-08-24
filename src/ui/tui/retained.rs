@@ -31,7 +31,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::HealthKind;
+use super::{HealthKind, SessionFacts};
 
 mod metrics;
 
@@ -64,6 +64,10 @@ const FOOTER_CHROME_ROWS: u16 = 3;
 const MAX_INPUT_TEXT_ROWS: u16 = 10;
 const CACHE_LIMIT: usize = 512;
 const BLOCK_LIMIT: usize = 2048;
+/// How long the terminal size must hold still after a change before the one reconciling full
+/// repaint fires (see `resize_settle` in the render loop). Long enough to sit out a ConPTY resize
+/// storm, short enough that the user never catches the screen dirty.
+const RESIZE_SETTLE: Duration = Duration::from_millis(400);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static COLS: AtomicU16 = AtomicU16::new(80);
@@ -103,7 +107,8 @@ enum BlockKind {
     /// The in-place task checklist box (`☑ done/total · plan` + ✓/▸/○ rows). One stable block per
     /// session, replaced (not appended) on each `todo_write`.
     Plan,
-    /// A boxed unified-diff preview (`diff · <path>` + `+`/`−` rows).
+    /// A boxed diff preview (`diff · <path>` header + side-by-side old/new panes, unified when
+    /// narrow).
     Diff,
     /// A green verify-gate success line (`✓ <cmd> — <detail>`).
     Verify,
@@ -141,14 +146,14 @@ pub(super) struct PlanRow {
     pub text: String,
 }
 
-/// A boxed diff preview: the edited path plus the `+`/`−` lines (`is_add`, content, already clipped
-/// upstream). `adds`/`dels` are the full counts for the header even when `lines` is truncated.
+/// A boxed diff preview: the edited path plus the parsed hunks (see [`super::DiffHunk`]).
+/// `adds`/`dels` are the full counts for the header even when the hunks are truncated.
 #[derive(Clone)]
 pub(super) struct DiffPayload {
     pub path: String,
     pub adds: usize,
     pub dels: usize,
-    pub lines: Vec<(bool, String)>,
+    pub hunks: Vec<super::DiffHunk>,
 }
 
 /// A verify-gate success line: `✓ <cmd> — <detail>` (e.g. `cargo check`, `0 errors · verify gate passed`).
@@ -192,9 +197,13 @@ impl Payload {
                 d.path.hash(&mut h);
                 d.adds.hash(&mut h);
                 d.dels.hash(&mut h);
-                for (add, line) in &d.lines {
-                    add.hash(&mut h);
-                    line.hash(&mut h);
+                for hunk in &d.hunks {
+                    hunk.start_old.hash(&mut h);
+                    hunk.start_new.hash(&mut h);
+                    for (kind, line) in &hunk.rows {
+                        kind.hash(&mut h);
+                        line.hash(&mut h);
+                    }
                 }
             }
             Payload::Verify(v) => {
@@ -246,9 +255,11 @@ impl RenderCache {
         let rows = match &block.payload {
             Payload::Text(s) => match block.kind {
                 BlockKind::Assistant => render_assistant_rows(s, w),
+                // Intro/Generic (boot notes, warnings, the `❯` echo): wrap to the pane instead of
+                // letting the paint clip a long single-line note at the right edge.
                 _ => sanitize_keep_sgr(s)
                     .split('\n')
-                    .map(str::to_string)
+                    .flat_map(|l| wrap_keep_sgr(l, w))
                     .collect(),
             },
             Payload::Tool(t) => render_tool_row(t, w)
@@ -276,8 +287,14 @@ struct AppState {
     working_since: Option<Instant>,
     frame: usize,
     ctx_permille: u16,
+    /// Tokens that went out with the turn's most recent model call (`↑6.2K tok` on the working
+    /// line). Estimated at send, corrected by provider usage on the reply; `0` = none yet this
+    /// turn, and the chip stays off the line. Reset when a turn starts (fed by `Command::SentTokens`).
+    sent_tok: u64,
     /// Live model health for the idle `● ready` chip (fed by `Command::Health`).
     health: HealthKind,
+    /// Typed session facts for the sidebar (fed by `Command::Facts`).
+    facts: SessionFacts,
     /// Transcript scroll offset measured in wrapped lines UP from the bottom. `0` means "follow the
     /// tail" — the newest output stays pinned to the bottom as it streams. Any positive value means
     /// the user scrolled up to read; while scrolled up, new content arriving at the bottom must NOT
@@ -364,7 +381,9 @@ impl AppState {
             working_since: None,
             frame: 0,
             ctx_permille: 0,
+            sent_tok: 0,
             health: HealthKind::Unknown,
+            facts: SessionFacts::default(),
             scroll_from_tail: 0,
             last_total: 0,
             overlay_scroll: 0,
@@ -518,8 +537,13 @@ enum Command {
     /// `/ultimate` handler and once at activation, never read from disk in the draw path.
     Ultimate(bool),
     Context(u16),
+    /// Tokens sent with the latest model call of the turn — the `↑N tok` chip on the working line.
+    SentTokens(u64),
     /// Idle `● ready` chip colour/label — green/yellow/red based on the last `/models` probe.
     Health(HealthKind),
+    /// Typed session facts for the sidebar (model, effort, persona, tokens, …) — published from
+    /// the same call sites that set the HUD status string, so the two can never disagree.
+    Facts(SessionFacts),
     Tick,
     OpenOverlay(OverlaySnapshot),
     /// Replace the OPEN overlay's body while preserving the reader's scroll position. Distinct from
@@ -667,6 +691,13 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     // Set by `Command::Redraw`: clear the terminal before the next draw so ratatui's cell diff starts
     // from a blank slate instead of its stale belief about the screen.
     let mut force_clear = false;
+    // Armed whenever the painted size changes; fires ONE forced clear+repaint once the storm goes
+    // quiet. ratatui clears on every resize it sees, but Windows ConPTY (and xterm.js) re-encode the
+    // screen themselves during a drag and can leave mangled cells behind at a final size ratatui
+    // already believes in — so no further resize arrives, no clear comes "for free", and the cell
+    // diff would keep painting small deltas on top of garbage forever (the "resize + scroll
+    // shredded the frame" report). One late full repaint reconciles screen and model.
+    let mut resize_settle: Option<Instant> = None;
     loop {
         let wait = if state.working && state.focused {
             Duration::from_millis(110)
@@ -729,6 +760,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 // no second stdin reader, just a cheap ioctl on this render thread.
                 if session.is_some() && terminal_size_changed() {
                     dirty = true;
+                    resize_settle = Some(Instant::now());
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -788,14 +820,30 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
             let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
         }
         was_working = state.working;
+        // The quiet gap passed with no further size change ⇒ the drag is over. Repaint from scratch
+        // exactly once (see `resize_settle` above). Checked outside the `dirty` gate so an idle
+        // terminal still fires it on the next tick.
+        if resize_settle.is_some_and(|t| t.elapsed() >= RESIZE_SETTLE) {
+            resize_settle = None;
+            force_clear = true;
+            dirty = true;
+        }
         if dirty {
             if let Some(s) = session.as_mut() {
-                let before = s.terminal.size().ok();
                 let _ = s.terminal.autoresize();
                 let after = s.terminal.size().ok();
+                let mut resized = false;
                 if let Some(area) = after {
-                    COLS.store(area.width.max(20), Ordering::Relaxed);
-                    ROWS.store(area.height.max(8), Ordering::Relaxed);
+                    let (w, h) = (area.width.max(20), area.height.max(8));
+                    // `swap` (not `store`) so a size change seen HERE — mid-scroll, when the idle
+                    // probe never runs because commands keep the channel busy — also arms the
+                    // settle repaint. Both swaps must run: no short-circuit between them.
+                    let pw = COLS.swap(w, Ordering::Relaxed);
+                    let ph = ROWS.swap(h, Ordering::Relaxed);
+                    resized = pw != w || ph != h;
+                    if resized {
+                        resize_settle = Some(Instant::now());
+                    }
                 }
                 if let Some(idx) = state.screensaver {
                     // Screensaver up: cover-encode the card to the terminal's pixel size and blit it
@@ -850,11 +898,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                         .iter()
                         .map(|b| format!("{}:{:x}:{}", b.id, b.payload.content_hash(), b.complete))
                         .collect::<Vec<_>>();
-                    state.metrics.record(
-                        started.elapsed(),
-                        metrics::hash_rows(&rows),
-                        before != after,
-                    );
+                    state
+                        .metrics
+                        .record(started.elapsed(), metrics::hash_rows(&rows), resized);
                 }
             }
             dirty = false;
@@ -905,7 +951,9 @@ fn apply_command(state: &mut AppState, cmd: Command) {
             state.working_since = working.then(Instant::now);
             if working {
                 // A fresh turn opens on a new whimsical verb, and the caption starts on it (typed from
-                // scratch) until the first tool call renames it to a concrete action.
+                // scratch) until the first tool call renames it to a concrete action. The sent-tokens
+                // chip resets too — the previous turn's request size says nothing about this one.
+                state.sent_tok = 0;
                 state.work_verb = crate::ui::tui::next_work_verb().to_string();
                 state.set_work_caption(state.work_verb.clone());
             } else {
@@ -926,7 +974,9 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         }
         Command::Ultimate(on) => state.ultimate = on,
         Command::Context(v) => state.ctx_permille = v,
+        Command::SentTokens(n) => state.sent_tok = n,
         Command::Health(h) => state.health = h,
+        Command::Facts(f) => state.facts = f,
         Command::Tick => {
             state.frame = state.frame.wrapping_add(1);
             // Type one more character of the working caption per tick (the typewriter). Clamped to the

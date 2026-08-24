@@ -68,7 +68,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/browser` | browser profile / host-route / pinned-session status (`--features browser`) |
 | `/apps` | connected apps & MCP catalog — Telegram/Discord/Slack/webhook notify + browser-sign-in MCP apps |
 | `/telegram` | Telegram integration menu: setup · test · status · start daemon · disable |
-| `/sessions` | saved conversations — restore · save · delete (the chat also auto-saves as `last`) |
+| `/sessions` | saved conversations — restore · save · delete (every turn auto-saves under a topic-date name) |
 | `/compact` | summarize older turns now to free context |
 | `/approval [ask|smart|yolo]` | one approval setting: ask every time, auto-run read-only shell, or pre-authorize tools after the hard safety floor |
 | `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` compacts this repo's store (packs loose objects — a save does it automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
@@ -387,6 +387,14 @@ Behavior worth knowing:
   request together, and the model is never told about a tool it cannot call.
 - **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
   concurrently; any turn that edits or runs shell stays serial (and approval-gated).
+- **Continuing earlier work** — a fresh conversation's prompt lists this project's recent saved
+  conversations in a `<sessions>` block, and the read-only `session_recall` tool returns a clipped
+  digest (opening request + latest exchanges) so "continue the most recent session" resumes the
+  work instead of sending the model hunting for transcripts. Restoring a full transcript stays
+  yours: `/resume`.
+- **Scratch directory** — `<environment>` names a per-run `scratch:` path (under the OS temp dir)
+  where the agent is told to put throwaway helper files instead of your repo or cwd; abandoned
+  scratch dirs are swept automatically a week after their run ends.
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
   choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval` is the persisted

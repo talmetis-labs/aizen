@@ -509,6 +509,34 @@ pub fn next_work_verb() -> &'static str {
 ///
 /// The live value lives in the render thread's `AppState` (fed by [`set_health`]) — there is no
 /// second copy here, so the chip can never disagree with what was drawn.
+/// Typed session facts for the retained sidebar — the same numbers the HUD chips carry, but
+/// structured, so the sidebar renders state instead of parsing its own status line back apart.
+/// Display-only strings stay preformatted (the sidebar has no business re-deriving `~6.6K/128K`).
+///
+/// Deliberately NO model / effort / mode / persona here: the composer's HUD row already carries
+/// all four, and the sidebar repeating them was pure duplication — don't add them back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionFacts {
+    /// Preformatted token chip, e.g. "~6.6K/128.0K tok".
+    pub tokens: String,
+    pub turns: usize,
+    /// Pretty name of the conversation's autosave slug, "" before the first save.
+    pub session: String,
+    /// Where requests go: the active provider profile's name, or the endpoint host when the
+    /// user configured `base_url` directly without a named profile. "" hides the row.
+    pub provider: String,
+    /// Configured MCP servers (0 = none / no mcp.json).
+    pub mcp_servers: usize,
+    /// One-line LSP chip: "off", the detected language while lazy ("rust idle" / "no project"),
+    /// or `lang state` pairs
+    /// ("rust ready · python indexing…"). "" hides the row.
+    pub lsp: String,
+    /// Live facts in the CLI memory store (superseded ones excluded).
+    pub memory_facts: usize,
+    /// Facts recall injected into prompts this session.
+    pub memory_recalled: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HealthKind {
@@ -548,12 +576,46 @@ impl HealthKind {
     }
 }
 
-/// Update the context-meter fill (per-mille, clamped 0..=1000). Called from `status_text` alongside
-/// each status refresh; harmless when the TUI is inactive.
+/// Update the context-meter fill (per-mille, clamped 0..=1000). Fed per model call by the REPL's
+/// chat closure and per status refresh by `status_text`; harmless when the TUI is inactive.
 pub fn set_ctx_permille(v: u16) {
     if retained::is_running() {
         retained::set_context(v.min(1000));
     }
+}
+
+/// REAL context size (tokens) of the MAIN conversation as of its most recent model call, from
+/// provider-reported usage — `0` = none yet. Written ONLY by the interactive turn's chat closure:
+/// sub-agent, workflow and post-turn chore calls answer for other contexts, and one of them writing
+/// here would snap the meter to a context the user is not looking at. Cleared on thread switches
+/// (`reset_per_session_state`) and after compaction, where the number no longer describes the
+/// history; `status_text` prefers it over the chars/4 estimate while it stands.
+static CTX_REAL_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// Record the provider-reported context size of the latest main-conversation call.
+pub fn set_ctx_real_tokens(n: u64) {
+    CTX_REAL_TOKENS.store(n, Ordering::Relaxed);
+}
+
+/// Show how many tokens the turn's latest model call sent (`↑6.2K tok` on the working line).
+/// Fed per send by the REPL's chat closure; harmless when the TUI is inactive.
+pub fn set_sent_tokens(n: u64) {
+    if retained::is_running() {
+        retained::set_sent_tokens(n);
+    }
+}
+
+/// The provider-reported context size, when one has been recorded since the last reset.
+pub fn ctx_real_tokens() -> Option<u64> {
+    match CTX_REAL_TOKENS.load(Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Forget the recorded real context size (thread switch / compaction — the estimate takes over).
+pub fn clear_ctx_real_tokens() {
+    CTX_REAL_TOKENS.store(0, Ordering::Relaxed);
 }
 
 /// Push a new health reading into the idle footer chip. Harmless when the TUI is inactive.
@@ -1242,7 +1304,9 @@ fn overlay_menu_click(
 /// been "actually painted" to disagree with, so a live probe is strictly better.
 pub fn width() -> usize {
     if retained::is_running() && retained::is_active() {
-        retained::size().1 as usize
+        // The transcript pane's width, not the raw grid: when the sidebar is docked the pane is
+        // narrower, and content pre-wrapped to the full grid would be clipped under the sidebar.
+        retained::content_width() as usize
     } else {
         term_size().1 as usize
     }
@@ -1252,6 +1316,15 @@ fn term_size() -> (u16, u16) {
     // console returns (rows, cols); fall back to a sane default if it can't probe.
     let (r, c) = Term::stdout().size();
     (r.max(8), c.max(20))
+}
+
+/// Columns the intro splash may lay itself out to: the transcript pane's width as it WILL be once
+/// the retained backend takes the grid — the sidebar's columns already subtracted on a terminal
+/// wide enough to dock it. Probed live because the splash is built BEFORE the render thread owns
+/// a size ([`width`] would report the raw grid at that point, which is exactly the overhang that
+/// used to push the splash's right edge under the sidebar and clip it).
+pub fn splash_width() -> usize {
+    retained::pane_width_for(term_size().1) as usize
 }
 
 /// Start the interactive TUI: hand the terminal to the retained full-frame backend.
@@ -1567,13 +1640,25 @@ pub fn plan_update(items: &[(u8, String)]) {
     }
 }
 
-/// Push a boxed diff preview. `lines` = `(is_add, content)` already clipped of the leading `+`/`-`.
-pub fn diff_box(path: &str, adds: usize, dels: usize, lines: Vec<(bool, String)>) {
+/// One hunk of a boxed diff preview: where the window sits in the file plus its rows in unified
+/// order. `rows` = `(kind, text)` with the leading marker already stripped — kind 0 = context,
+/// 1 = added, 2 = removed. `start_old`/`start_new` are the 1-based file lines of `rows[0]`
+/// (0 = unknown → the renderer hides the gutter numbers for this hunk).
+#[derive(Clone)]
+pub struct DiffHunk {
+    pub start_old: usize,
+    pub start_new: usize,
+    pub rows: Vec<(u8, String)>,
+}
+
+/// Push a boxed diff preview — rendered side-by-side (old pane │ new pane) when the transcript is
+/// wide enough, unified otherwise.
+pub fn diff_box(path: &str, adds: usize, dels: usize, hunks: Vec<DiffHunk>) {
     let d = retained::DiffPayload {
         path: path.to_string(),
         adds,
         dels,
-        lines,
+        hunks,
     };
     if retained::is_running() {
         retained::diff_box(d);
@@ -1651,6 +1736,14 @@ pub fn set_status(status: &str) {
     }
     if retained::is_running() {
         retained::set_status(status);
+    }
+}
+
+/// Publish the typed sidebar facts. Retained-only: the classic surface has no sidebar, and the HUD
+/// string set alongside already carries the human-readable form.
+pub fn set_facts(facts: SessionFacts) {
+    if retained::is_running() {
+        retained::set_facts(facts);
     }
 }
 

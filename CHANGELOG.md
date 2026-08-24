@@ -7,6 +7,118 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Added
+- **"Continue the most recent session" works again — and this time the model can see it.** Until
+  0.5.0 the request worked by accident: every autosave duplicated the transcript into a fixed
+  `last.json` the model could read blind, and retiring that pointer (right for provenance) silently
+  removed the model's only route to prior work — the startup resume hint prints to the terminal,
+  which the model never sees, so it went spelunking the filesystem instead. Now a fresh
+  conversation's prompt carries a `<sessions>` block naming up to three recent same-project
+  conversations (topic snippet, size, age; a foreign one is offered only when this project has
+  none, labeled with its origin), and a new read-only `session_recall` tool returns a clipped
+  digest — opening request + latest exchanges — to continue from. Restoring a full transcript
+  stays the user's move (`/resume`); no tool loads history.
+- **A per-run scratch directory the prompt actually names.** "Use a temp dir" with no path meant
+  helper scripts, probes and notes landed in the repo or the cwd and stayed there. `<environment>`
+  now carries `scratch: <path>` (per run, under the OS temp dir; sub-agents share the parent's),
+  both prompt tiers direct throwaway files there — the strict tier previously had NO cleanup
+  guidance at all — and abandoned scratch dirs are swept a week after their run dies.
+
+### Changed
+- **The edit diff box grew into side-by-side review panes.** Wide enough, an edit's boxed preview
+  now reads like a review tool instead of a raw patch: the old version on the left pane, the new
+  on the right, real file line numbers in both gutters, removed rows on a deep-red background
+  tint and added rows on a deep-green one, with the surrounding context lines quiet between them
+  — a removed/added pair shares one row, so what replaced what is a single glance. A narrow
+  transcript stacks the same numbered rows in one unified column, and multiple hunks are split by
+  a broken rule. Feeding it, `diff_preview` now opens each window with a standard
+  `@@ -N,c +N,c @@` hunk header (the model gets a line anchor for follow-up edits; the TUI gets
+  its gutter numbers), and the retained renderer's SGR parser learned background colours — which
+  it previously measured and threw away. From 125 columns up, the right edge carries a live
+  dashboard the way the maximized window's spare width deserves: brand + endpoint health; what
+  the agent is doing right now and for how long; the live todo checklist (wrapped to two rows per
+  item, `… +N more` past the fold); the conversation's autosave name over the token tally; the
+  provider the requests go to (the active profile's name, or the endpoint host for a hand-edited
+  `base_url`); connected MCP servers; the LSP chip (off / idle / per-server `lang state`); the
+  memory store (live facts + how many recall injected this session); and the working directory
+  pinned to the bottom row. Model, effort, approval mode, persona and the context gauge
+  deliberately stay OFF the sidebar — the composer's HUD row already shows all five, and
+  repeating them was dead weight. The facts arrive typed (`SessionFacts`), published from the
+  same call site that formats the HUD string, so the two surfaces can never drift apart — and
+  below the threshold every column stays with the conversation.
+- **The splash: wordmark centred above the panel, the sun docked inside on its right flank.** The
+  AIZEN wordmark + tagline sit OUTSIDE the frame, centred over its full width; the braille sun
+  lives INSIDE the frame to the right of the text column, so the panel reads content wall-to-wall
+  instead of a narrow card floating in a wide window. The layout is chosen against the width the
+  transcript pane will ACTUALLY have (`tui::splash_width()` — the retained sidebar's columns
+  already subtracted); the old docked layout measured the raw terminal, and the difference pushed
+  the panel's right edge under the sidebar and clipped it (the "hidden text" report). A pane too
+  narrow for the flank stacks the sun above the wordmark; the sixel (raster) logo always renders
+  above — an image is pixels, not columns, and cannot sit inside a character border.
+
+- **The working clock counts in minutes once it earns them.** The spinner's elapsed readout used to
+  tick raw seconds forever — a long run read `754s` and made the user do the division. Past 60s it
+  now rolls into the same `12m34s` / `2h05m` units the tool-result lines already use, on both the
+  footer working line and the sidebar's "Now" block. Riding beside the clock, a new `↑N tok` chip
+  shows what the turn's latest request carried — estimated the moment each call leaves, corrected
+  to the provider's real input count (cache reads/writes included) when the reply lands, and reset
+  at every turn start.
+- **The diff panes take the whole pane now.** The boxed diff clamped itself to 100 columns, so on
+  a maximized window both panes clipped code at `…` while the right half of the transcript sat
+  empty. The clamp is gone: the box spans the width the transcript pane actually has, and every
+  extra column goes to code.
+- **The sidebar's LSP chip names the language before a server ever starts.** Servers spawn lazily
+  on the first symbol query, and until then the chip said only `idle` — true, but useless. It now
+  reads the project the way the lazy start will (`rust idle`), says `no project` when no supported
+  manifest resolves (so nothing is implied to be pending), and `/lsp status` carries the same
+  detection in prose.
+
+### Fixed
+- **A window resize can no longer shred the frame.** Dragging the terminal edge — especially with
+  the transcript scrolling at the same time — could leave the screen a collage of torn glyphs and
+  stale rows that no amount of further scrolling repaired. ratatui does clear on every resize it
+  observes, but Windows ConPTY (and VS Code's xterm.js) re-encode the screen themselves during the
+  drag and can mangle cells at a final size the renderer already believes in — after which the
+  cell-diff painter keeps patching tiny deltas on top of garbage forever; only Ctrl-L healed it.
+  The renderer now arms a settle timer on every observed size change (including those seen
+  mid-scroll, when the idle probe never runs) and, 400ms after the storm goes quiet, forces one
+  full clear + repaint to reconcile the screen with the model.
+- **The context gauge is live and honest now.** It used to be computed only at idle from the
+  chars/4 estimate, so it sat frozen through an entire agent run — tool results piling into the
+  context moved it not at all until the turn ended, and the estimate could drift far from what the
+  provider actually counts. The gauge now updates on EVERY model call of the interactive
+  conversation: the outgoing request's estimated size moves it the moment the request leaves, and
+  the provider-reported usage on the reply corrects it to the real number (cache reads/writes
+  included, whichever wire shape the gateway uses), which the idle HUD refresh then prefers over
+  re-estimating. Sub-agent and background chore calls never touch it — they answer for other
+  contexts. The real number is forgotten on `/clear`, `/resume` and compaction, where it no longer
+  describes the history.
+- **Long boot notes fold instead of running off the right edge.** The `sandbox:` degradation
+  warning, the `[dense] loaded …` model line and friends are one long line each; the retained
+  transcript kept non-assistant text rows verbatim and the paint clipped them at the pane edge,
+  so the tail of the message was simply gone. Intro/Generic rows now word-wrap to the pane, and
+  the fold is SGR-aware — a coloured note re-opens its colour on the continuation row, escapes
+  never count toward the width, and pre-aligned whitespace is preserved byte-for-byte.
+- **The binary now cleans up after itself.** A pile of leaks, each individually small and none
+  ever collected: `.aizen-update-*.part` from a download killed mid-stream (now swept at startup
+  once an hour old); `.{name}.aizen-tmp-*` staging orphans from a writer killed mid-rename, in
+  ANY directory `atomic_write` touches — the old sweep only covered the sessions dir (now every
+  destination dir self-heals, once per dir per run); an embedding-model `.part` left by a network
+  error mid-download (every error path now removes it); sandbox private-tmp dirs, previously swept
+  only by `aizen sandbox doctor` (now also at startup); `aizen time gc --all --apply`'s `.trash`,
+  which nothing ever emptied (now purged past 30 days on the next apply); and the two append-only
+  logs with no ceiling, `learning-audit.jsonl` (2 MiB) and per-job cron logs (1 MiB), which now
+  rotate to a single `.1` generation like the sandbox audit log always did.
+- **The identical-re-read short-circuit now fires where the reads actually happen.** Three
+  structural bypasses, found by audit: the cache was a loop local, so it died at the end of every
+  user turn while history (where the proof lives) persisted — it now survives per conversation and
+  every hit still re-proves itself byte-level against the current history and the current file
+  bytes; an eager-started call was exempt, which in a batched turn exempted every call but the
+  last — a proven hit now replaces the eager result instead of yielding to it; and the
+  `files:[…]` batch form was never recorded at all — it now fingerprints every file in the call.
+  The `[unchanged]` pointer also names the earlier tool-result id, so a model that cannot find the
+  content re-uses it instead of re-asking with slightly different args and missing the cache.
+
 ## [0.6.6] — 2026-08-21
 
 ### Added

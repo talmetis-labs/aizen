@@ -85,21 +85,30 @@ async fn fetch_to_file(client: &reqwest::Client, url: &str, dest: &std::path::Pa
         .await
         .with_context(|| format!("creating {}", part.display()))?;
     let mut written: u64 = 0;
-    let mut stream = resp.bytes_stream();
     let name = dest.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading response chunk")?;
-        written += chunk.len() as u64;
-        if written > MAX_FILE_BYTES {
-            let _ = tokio::fs::remove_file(&part).await;
-            bail!("file exceeded {MAX_FILE_BYTES} bytes mid-stream");
+    // Any failure mid-stream must take the `.part` with it — a bare `?` here used to leave the
+    // partial file behind forever (only the size-overflow branch cleaned up), and nothing else
+    // ever sweeps the model dir.
+    let outcome: anyhow::Result<()> = async {
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading response chunk")?;
+            written += chunk.len() as u64;
+            if written > MAX_FILE_BYTES {
+                bail!("file exceeded {MAX_FILE_BYTES} bytes mid-stream");
+            }
+            file.write_all(&chunk)
+                .await
+                .context("writing chunk to disk")?;
         }
-        file.write_all(&chunk)
-            .await
-            .context("writing chunk to disk")?;
+        file.flush().await.context("flushing file")
     }
-    file.flush().await.context("flushing file")?;
+    .await;
     drop(file);
+    if let Err(e) = outcome {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(e);
+    }
     tokio::fs::rename(&part, dest)
         .await
         .with_context(|| format!("finalizing {}", dest.display()))?;

@@ -431,26 +431,7 @@ pub(crate) fn pretty_session_name(name: &str) -> String {
 /// staging file is invisible to us. A minute is far longer than any staged write and far shorter than
 /// the interval at which anyone would notice clutter. Best-effort — never blocks startup.
 pub(crate) fn sweep_orphan_temps() {
-    let Ok(rd) = std::fs::read_dir(sessions_dir()) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in rd.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with('.') || !name.contains(".aizen-tmp-") {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .and_then(|md| md.modified())
-            .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|age| age.as_secs() > 60);
-        if stale {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    crate::core::persist::sweep_orphan_temps_in(&sessions_dir());
 }
 
 /// One row of the session pool, as scanned from disk.
@@ -696,6 +677,198 @@ pub(crate) fn most_recent_session() -> Option<(String, usize, Option<String>)> {
         Ok(_) => Some((fresh, conversation_len(&msgs), label)),
         Err(_) => Some(("last".to_string(), conversation_len(&msgs), label)),
     }
+}
+
+/// Char-safe clip with an ellipsis, collapsed to one line — session text goes into prompt blocks
+/// where a stray newline would break the row shape.
+fn clip_line(s: &str, max_chars: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// "2h ago"-style age from a millisecond mtime, for the `<sessions>` rows.
+fn age_label(mtime_ms: Option<u64>) -> String {
+    let Some(ms) = mtime_ms else {
+        return "age unknown".to_string();
+    };
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let secs = now.saturating_sub(ms) / 1000;
+    match secs {
+        0..=3599 => format!("{}m ago", (secs / 60).max(1)),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Parse one pool file just far enough for a `<sessions>` row: turn count, provenance, and the
+/// first user message as the topic snippet.
+fn read_session_brief(path: &std::path::Path) -> Option<(usize, Option<SessionMeta>, String)> {
+    let (msgs, meta) = std::fs::read(path)
+        .ok()
+        .and_then(|b| parse_session_bytes(&b))?;
+    let snippet = msgs
+        .iter()
+        .find(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| !c.trim().is_empty()))
+        .and_then(|m| m.content.as_deref())
+        .map(|c| clip_line(c, 100))
+        .unwrap_or_default();
+    Some((conversation_len(&msgs), meta, snippet))
+}
+
+/// The `<sessions>` block a fresh conversation's dynamic lane carries: up to three recent
+/// same-project conversations, so "continue the most recent session" is something the model can SEE
+/// and act on instead of groveling the filesystem for transcripts.
+///
+/// Until 0.5.0 the retired `last.json` pointer made that request work by accident — one fixed path
+/// holding the newest transcript, readable blind. Its retirement (right for provenance) silently
+/// removed the model's only route to prior work: the startup resume hint prints to the terminal,
+/// which the model never sees. This block is the deliberate replacement; `session_recall` is the
+/// matching fetch.
+///
+/// Same honesty rules as [`most_recent_session`]: prefer files that prove they are this project's,
+/// and when only foreign/unlabeled ones exist, offer the single best with its origin stated. Cost
+/// is bounded the same way too — newest-first, at most a handful of files parsed.
+pub(crate) fn recent_sessions_block() -> Option<String> {
+    const EXAMINE_CAP: usize = 8;
+    const ROWS_CAP: usize = 3;
+    let here_key = config::project_key();
+    let stats = stat_sessions();
+    let mut mine: Vec<String> = Vec::new();
+    let mut fallback: Option<String> = None;
+    for s in stats.iter().take(EXAMINE_CAP) {
+        let Some((turns, meta, snippet)) = read_session_brief(&s.path) else {
+            continue;
+        };
+        let same = meta
+            .as_ref()
+            .and_then(|m| m.project_key.as_ref())
+            .is_some_and(|k| *k == here_key);
+        let row = |origin: &str| {
+            let snip = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!(": \"{snippet}\"")
+            };
+            format!(
+                "- {} ({turns} msgs, {}{origin}){snip}",
+                s.name,
+                age_label(s.mtime_ms)
+            )
+        };
+        if same {
+            mine.push(row(""));
+            if mine.len() >= ROWS_CAP {
+                break;
+            }
+        } else if fallback.is_none() {
+            let foreign = meta
+                .as_ref()
+                .and_then(|m| m.project_key.as_ref())
+                .is_some_and(|k| *k != here_key);
+            let origin = if foreign {
+                format!(", {}", session_origin_label(meta.as_ref()))
+            } else {
+                ", project unknown".to_string()
+            };
+            fallback = Some(row(&origin));
+        }
+    }
+    let rows = if mine.is_empty() {
+        vec![fallback?]
+    } else {
+        mine
+    };
+    let mut out = String::from(
+        "<sessions>\nSaved conversations from earlier runs, newest first. When the user asks to \
+         continue a previous or most-recent session, call `session_recall` (add name:\"…\" for any \
+         but the newest) and continue the work from its digest — never go hunting through the \
+         filesystem for transcripts. Restoring a full transcript is the user's move: /resume.\n",
+    );
+    for r in rows {
+        out.push_str(&r);
+        out.push('\n');
+    }
+    out.push_str("</sessions>\n");
+    Some(out)
+}
+
+/// Model-facing digest of one saved conversation — the fetch half of "continue the most recent
+/// session". Returns the opening request plus the latest exchanges, clipped hard: enough to resume
+/// the WORK, deliberately not the transcript (that is `/resume`, and it is the user's call).
+pub(crate) fn session_digest(name: Option<&str>) -> anyhow::Result<String> {
+    let resolved = match name {
+        Some(n) if !n.trim().is_empty() => sanitize_name(n.trim()),
+        _ => {
+            most_recent_session()
+                .ok_or_else(|| anyhow::anyhow!("no saved conversations to recall"))?
+                .0
+        }
+    };
+    let path = sessions_dir().join(format!("{resolved}.json"));
+    let bytes = std::fs::read(&path)
+        .map_err(|_| anyhow::anyhow!("no saved conversation named \"{resolved}\""))?;
+    let (msgs, meta) = parse_session_bytes(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("\"{resolved}\" is unreadable (corrupt session file)"))?;
+
+    let mut out = format!(
+        "Digest of saved conversation \"{resolved}\" — {} conversation messages",
+        conversation_len(&msgs)
+    );
+    if let Some(m) = meta.as_ref() {
+        if let Some(u) = m.updated.as_deref() {
+            out.push_str(&format!(", last saved {}", clip_line(u, 25)));
+        }
+        if let Some(md) = m.model.as_deref() {
+            out.push_str(&format!(", model {md}"));
+        }
+    }
+    out.push_str(".\n");
+    let foreign = meta
+        .as_ref()
+        .and_then(|m| m.project_key.as_ref())
+        .is_some_and(|k| *k != config::project_key());
+    if foreign {
+        out.push_str(&format!(
+            "NOTE: this conversation is {} — not this project.\n",
+            session_origin_label(meta.as_ref())
+        ));
+    }
+
+    let convo: Vec<&Message> = msgs
+        .iter()
+        .filter(|m| {
+            (m.role == "user" || m.role == "assistant")
+                && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+        })
+        .collect();
+    if let Some(first_user) = convo.iter().find(|m| m.role == "user") {
+        out.push_str("\nOpening request:\n");
+        out.push_str(&format!(
+            "  user: {}\n",
+            clip_line(first_user.content.as_deref().unwrap_or_default(), 500)
+        ));
+    }
+    if convo.len() > 1 {
+        out.push_str("\nLatest exchanges:\n");
+        let tail_start = convo.len().saturating_sub(6);
+        for m in &convo[tail_start..] {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                m.role,
+                clip_line(m.content.as_deref().unwrap_or_default(), 700)
+            ));
+        }
+    }
+    out.push_str(
+        "\nContinue the work from this digest plus the current repo state. The full transcript \
+         loads only when the USER types /resume — no tool restores it.\n",
+    );
+    Ok(out)
 }
 
 /// Count of real conversation turns (excluding the leading system lanes) — for the resume hint, so

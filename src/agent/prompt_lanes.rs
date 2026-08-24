@@ -55,6 +55,15 @@ pub(crate) fn system_prompt_bundle_in(
         bundle.dynamic.push_str(&block);
         bundle.dynamic.push('\n');
     }
+    // Recent saved conversations, so "continue the most recent session" is visible to the MODEL —
+    // the startup resume hint only ever reached the terminal. REPL surfaces only (`root` is None):
+    // a hostbot lane carries its own per-chat history and terminal sessions would be noise there.
+    if root.is_none() {
+        if let Some(block) = crate::core::session_store::recent_sessions_block() {
+            bundle.dynamic.push('\n');
+            bundle.dynamic.push_str(&block);
+        }
+    }
     bundle
 }
 
@@ -295,6 +304,9 @@ pub(crate) fn reset_per_session_state() {
     memory::pending::clear();
     crate::agent::todo::clear();
     client::cost_meter().reset();
+    // The provider-reported context size describes the OLD thread's last request — the new one
+    // starts from the chars/4 estimate until its own first call reports usage.
+    tui::clear_ctx_real_tokens();
     tui::reset_session_allow();
     #[cfg(feature = "browser")]
     crate::agent::browser::release_active();

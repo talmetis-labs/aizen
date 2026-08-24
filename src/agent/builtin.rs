@@ -182,6 +182,9 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(MemoryList));
     r.register(Box::new(MemoryProfile));
     r.register(Box::new(MemoryAsk));
+    // Top-level only, like the `<sessions>` block that advertises it: a sub-agent serves one
+    // stated task and has no business rummaging through the user's other conversations.
+    r.register(Box::new(SessionRecall));
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::search::SearchFiles::new(
@@ -1369,6 +1372,34 @@ impl Tool for MemoryAsk {
 /// existed the agent had no way to answer "what do you remember about me?" — it could only guess
 /// query terms and report whatever happened to match, which reads as confidently not knowing its
 /// own state. This is the tool that makes the store legible.
+/// The fetch half of "continue the most recent session": a clipped digest of one saved
+/// conversation from the pool the `<sessions>` block lists. Read-only by design — restoring a full
+/// transcript rewrites live history, which stays a USER move (`/resume`), never a tool's.
+struct SessionRecall;
+impl Tool for SessionRecall {
+    fn name(&self) -> &str {
+        "session_recall"
+    }
+    fn description(&self) -> &str {
+        "Digest of a previously saved conversation: opening request + latest exchanges. Use when \
+         the user asks to continue earlier/previous/most-recent work. Default is the newest \
+         conversation for this project; pass name from the <sessions> block for another. \
+         Read-only; the full transcript is only restored by the user typing /resume."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "saved conversation name (optional; default = most recent for this project)"}
+            },
+            "additionalProperties": false
+        })
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        crate::core::session_store::session_digest(args.get("name").and_then(|v| v.as_str()))
+    }
+}
+
 struct MemoryList;
 impl Tool for MemoryList {
     fn name(&self) -> &str {
@@ -2188,7 +2219,7 @@ impl FileEdit {
         let mut out = format!(
             "edited {path} ({})\n{}",
             applied.summary(),
-            diff_preview(&applied.before, &applied.after)
+            diff_preview(&applied.before, &applied.after, applied.start_line)
         );
         // Post-edit LSP fold: NEW diagnostics land in THIS result (zero extra round-trips to
         // discover breakage). Fail-soft + hard-capped inside; a no-op when LSP is off.
@@ -2244,7 +2275,11 @@ impl FileEdit {
                 other => format!("1 replacement, {other} match"),
             };
             summaries.push(format!("  #{n}: {detail}"));
-            diffs.push(diff_preview(&applied.before, &applied.after));
+            diffs.push(diff_preview(
+                &applied.before,
+                &applied.after,
+                applied.start_line,
+            ));
             buf = applied.content;
         }
 
@@ -2445,7 +2480,7 @@ impl Tool for FileWrite {
         // a brand-new file or a no-op rewrite.
         if existed && before != content {
             out.push('\n');
-            out.push_str(&diff_preview(&before, content));
+            out.push_str(&diff_preview(&before, content, 1));
         }
         // Same post-write LSP fold as file_edit — surface new diagnostics in this result.
         if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
@@ -2699,6 +2734,15 @@ struct EditApplied {
     /// Which ladder rung applied: "exact" | "indent" | "ws-norm" | "anchor-trim" | "unescape" |
     /// "blank-norm".
     rung: &'static str,
+    /// 1-based line (in the PRE-edit content) where the replaced region starts — feeds the diff
+    /// preview's `@@` hunk header so the TUI can gutter real line numbers. First match for
+    /// `replace_all`.
+    start_line: usize,
+}
+
+/// 1-based line number of byte offset `at` in `content` (`at` must sit on a char boundary).
+fn line_at(content: &str, at: usize) -> usize {
+    content[..at].matches('\n').count() + 1
 }
 impl EditApplied {
     /// Human summary. The "exact" and "indent" wordings are byte-identical to the original
@@ -2762,12 +2806,14 @@ fn apply_one_edit(
         } else {
             content.replacen(old, new, 1)
         };
+        let start_line = content.find(old).map(|p| line_at(content, p)).unwrap_or(0);
         return Ok(EditApplied {
             content: updated,
             before: old.to_string(),
             after: new.to_string(),
             count,
             rung: "exact",
+            start_line,
         });
     }
     // R2 indent-tolerant (kept uncapped + byte-stable messages — the original fallback).
@@ -2812,6 +2858,7 @@ fn apply_one_edit(
                         after: new.to_string(),
                         count: 1,
                         rung: "blank-norm",
+                        start_line: line_at(content, bs),
                     });
                 }
                 n => bail!(
@@ -2849,12 +2896,14 @@ fn try_pair(
     let count = content.matches(old).count();
     if count == 1 {
         let updated = content.replacen(old, new, 1);
+        let start_line = content.find(old).map(|p| line_at(content, p)).unwrap_or(0);
         return Ok(Some(EditApplied {
             content: updated,
             before: old.to_string(),
             after: new.to_string(),
             count: 1,
             rung,
+            start_line,
         }));
     }
     if count > 1 {
@@ -2890,6 +2939,7 @@ fn block_rung(
                 after: new.to_string(),
                 count: 1,
                 rung,
+                start_line: line_at(content, bs),
             }))
         }
         n => {
@@ -3137,14 +3187,15 @@ fn blank_insensitive_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
 
 /// A compact **unified diff** of an edit: common leading/trailing lines are trimmed away (so a big
 /// block collapses to just its changed window), the removed lines are prefixed `-`, the added lines
-/// `+`, and a couple of context lines (prefixed with a space) bracket the change. Gives the model
-/// cheap verifiability AND is what the TUI colourises (removed = salmon, added = green) — the lines
+/// `+`, and a couple of context lines (prefixed with a space) bracket the change, under a
+/// `@@ -N,c +N,c @@` hunk header carrying the window's 1-based file line. Gives the model
+/// cheap verifiability AND is what the TUI renders as the side-by-side diff panes — the lines
 /// are `^[-+]`-prefixed at column 0 so the display can pick them out unambiguously. Both sides are
 /// capped so a giant replacement can't flood the result.
 ///
 /// Callers pass the SMALL changed region (single form: `applied.before`/`after`; batch form: each
 /// per-edit before/after), so the prefix/suffix trim is enough — no full LCS needed.
-fn diff_preview(before: &str, after: &str) -> String {
+fn diff_preview(before: &str, after: &str, base_line: usize) -> String {
     const CTX: usize = 2; // context lines kept on each side of the change
     const MAX_SIDE: usize = 40; // cap removed / added lines shown per side
 
@@ -3167,6 +3218,20 @@ fn diff_preview(before: &str, after: &str) -> String {
     let added = &a[p..a.len() - s];
 
     let mut out = String::new();
+    // `@@ -N,c +N,c @@` hunk header anchoring the window in the FILE (`base_line` = 1-based file
+    // line of `before`'s first line; 0 = unknown → header omitted). Counts are the true window
+    // sizes even when the visual cap below elides lines — the `…` note says what was cut. Gives
+    // the model a line anchor for follow-up edits and gives the TUI its gutter numbers.
+    let lead = p.min(CTX);
+    if base_line > 0 {
+        let start = base_line + p - lead;
+        let trail = s.min(CTX);
+        out.push_str(&format!(
+            "@@ -{start},{} +{start},{} @@\n",
+            lead + removed.len() + trail,
+            lead + added.len() + trail
+        ));
+    }
     // leading context (from the shared prefix)
     for line in &b[p.saturating_sub(CTX)..p] {
         out.push_str(&format!(" {line}\n"));
@@ -4061,33 +4126,20 @@ mod tests {
     #[test]
     fn diff_preview_is_a_trimmed_unified_diff() {
         // A localized change in a longer block: the shared prefix/suffix collapse to ±2 context
-        // lines, and the change renders as column-0 `-`/`+` lines (what the TUI colourises).
+        // lines under a `@@` header anchored at the file line, and the change renders as column-0
+        // `-`/`+` lines (what the TUI's diff panes parse).
         let before = "1\n2\n3\n4\n5\nOLD\n7\n8\n9\n10";
         let after = "1\n2\n3\n4\n5\nNEW\n7\n8\n9\n10";
-        let d = diff_preview(before, after);
-        assert!(
-            d.lines().any(|l| l == "-OLD"),
-            "removed line, column-0 '-': {d:?}"
+        let d = diff_preview(before, after, 1);
+        assert_eq!(
+            d, "@@ -4,5 +4,5 @@\n 4\n 5\n-OLD\n+NEW\n 7\n 8",
+            "window = header + ±2 context around the one changed line"
         );
+        // Unknown base (0) omits the header — the TUI then shows the rows without gutter numbers.
+        let d0 = diff_preview(before, after, 0);
         assert!(
-            d.lines().any(|l| l == "+NEW"),
-            "added line, column-0 '+': {d:?}"
-        );
-        assert!(
-            d.lines().any(|l| l == " 5"),
-            "keeps a leading context line: {d:?}"
-        );
-        assert!(
-            d.lines().any(|l| l == " 7"),
-            "keeps a trailing context line: {d:?}"
-        );
-        assert!(
-            !d.contains("--- before") && !d.contains("+++ after"),
-            "no old block headers: {d:?}"
-        );
-        assert!(
-            !d.contains('1'),
-            "far prefix/suffix bulk is trimmed away: {d:?}"
+            !d0.contains("@@"),
+            "no header when the base line is unknown: {d0:?}"
         );
     }
 
