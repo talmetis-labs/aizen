@@ -3360,15 +3360,26 @@ pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>)> {
     Ok((doctor()?, compacted))
 }
 
-/// One private store found while sweeping `~/.aizen/timemachine/`. `source_exists == false` marks an
-/// ORPHAN: the source repo it alternates onto is gone (deleted, or moved before the identity fix
-/// landed), so the store can never be reached by discovery again — pure dead weight.
+/// One private store found while sweeping `~/.aizen/timemachine/`. Two ways a store is an ORPHAN:
+/// `source_exists == false` (the repo it alternates onto is gone), or `superseded_by` is set (the
+/// repo is alive, but the identity registry serves it through a DIFFERENT store, so no resolve can
+/// ever key back to this one). Either way, dead weight no discovery will reach again.
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreEntry {
     pub repo_id: String,
     /// Absolute source `.git/objects` path recorded in the store's sealed alternates pointer.
     pub source: Option<String>,
     pub source_exists: bool,
+    /// Named by the home identity registry. An unregistered store is reachable only through
+    /// legacy-id grandfathering — which stops working the moment its repo registers under another
+    /// id. `true` also when the registry itself was unreadable: unknown is not reportable garbage.
+    pub registered: bool,
+    /// The registered store now serving this store's source repo. Set only for an unregistered
+    /// store whose source still exists: `resolve` answers that path with the registered id (exact
+    /// hit wins) and grandfathering hashes only the current path, so this store has been
+    /// permanently out-keyed — the id-migration leftovers `gc --all` exists to find.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     pub bytes: u64,
     pub checkpoints: usize,
 }
@@ -3388,7 +3399,8 @@ pub struct CompactReport {
 pub struct GcAllReport {
     /// Every store under the home root, newest-scan order.
     pub stores: Vec<StoreEntry>,
-    /// Orphan stores (subset of `stores` with `source_exists == false`).
+    /// Orphan stores: subset of `stores` whose source repo is gone, or whose source is alive but
+    /// served by a different registered store (`superseded_by`).
     pub orphans: Vec<StoreEntry>,
     /// True when `--apply` actually moved orphans to `.trash/`; false for a dry run.
     pub applied: bool,
@@ -3437,15 +3449,82 @@ fn store_checkpoint_count(store_root: &Path) -> usize {
     n
 }
 
+/// One directory, as every writer spells it: the registry stores `//?/C:/…` (canonicalized, then
+/// backslashes forwarded), an alternates file stores plain `C:/…`, and older writers used `\\?\C:\…`.
+/// Verbatim prefix dropped, slashes forwarded, trailing slashes trimmed, case folded on Windows —
+/// where paths compare case-insensitively; on Unix case stays significant, so it is kept.
+fn dir_key(raw: &str) -> String {
+    let mut s = raw.trim().replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//?/UNC/") {
+        s = format!("//{rest}");
+    } else if let Some(rest) = s.strip_prefix("//?/") {
+        s = rest.to_string();
+    }
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// Classify one swept store against the identity registry: is it registered, and if not, which
+/// registered store has taken over its source repo. A `None` registry (missing, unreadable,
+/// corrupt) disables the superseded class entirely and reports the store as registered — the same
+/// fail-open posture as [`resolve_identity`]: a broken registry must never be able to turn every
+/// legacy store on the machine into reportable garbage.
+fn classify_store(
+    repo_id: &str,
+    source: Option<&str>,
+    source_exists: bool,
+    registry: Option<&identity::Registry>,
+) -> (bool, Option<String>) {
+    let Some(reg) = registry else {
+        return (true, None);
+    };
+    if reg.repos.iter().any(|r| r.repo_id == repo_id) {
+        return (true, None);
+    }
+    // Superseded needs a LIVE source: a dead-source store is already the first orphan class, and
+    // matching a registered entry against a path that no longer exists would prove nothing.
+    let Some(src) = source.filter(|_| source_exists) else {
+        return (false, None);
+    };
+    // The alternates line is `<common_git_dir>/objects`; the registry keys repos by the common
+    // git dir itself.
+    let Some(common) = dir_key(src).strip_suffix("/objects").map(str::to_string) else {
+        return (false, None);
+    };
+    let by = reg
+        .repos
+        .iter()
+        .find(|r| dir_key(&r.common_git_dir) == common)
+        .map(|r| r.repo_id.clone());
+    (false, by)
+}
+
 /// Home-level store sweep. Unlike [`doctor_gc`] (which cleans refs/sidecars WITHIN the current repo's
-/// store), this walks EVERY `~/.aizen/timemachine/repo-*` and finds ORPHAN stores whose source repo
-/// no longer exists on disk. Dry-run by default (`apply == false`) — it only reports. With
-/// `apply == true` it moves each orphan into `~/.aizen/timemachine/.trash/<timestamp>/` (reversible,
-/// not an irrecoverable delete). A store whose source still exists is never touched.
+/// store), this walks EVERY `~/.aizen/timemachine/repo-*` and finds ORPHAN stores: those whose source
+/// repo no longer exists on disk, and those out-keyed by an identity migration — the repo is alive
+/// but registered under a different store id, so no resolve can reach the old store again (exact
+/// path hit wins, and grandfathering hashes only the current path). Dry-run by default
+/// (`apply == false`) — it only reports. With `apply == true` it moves each orphan into
+/// `~/.aizen/timemachine/.trash/<timestamp>/` (reversible, not an irrecoverable delete) and drops
+/// any registry entry that named a reaped store. A store that is still reachable is never touched.
 pub fn gc_all(apply: bool) -> Result<GcAllReport> {
     let root = crate::core::config::aizen_home().join("timemachine");
     let mut stores = Vec::new();
     let mut orphans = Vec::new();
+
+    // Read once for the whole sweep. Classification is a pure function over this parse; the apply
+    // half re-reads under the registry lease before writing anything back.
+    let registry: Option<identity::Registry> =
+        crate::core::persist::read_optional(&root.join("registry.json"))
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
     let rd = match fs::read_dir(&root) {
         Ok(rd) => rd,
@@ -3484,16 +3563,21 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
             }
             _ => (None, false, false),
         };
+        let (registered, superseded_by) =
+            classify_store(&name, source.as_deref(), source_exists, registry.as_ref());
         let se = StoreEntry {
             repo_id: name,
             source,
             source_exists,
+            registered,
+            superseded_by,
             bytes: dir_size_bytes(&store_root),
             checkpoints: store_checkpoint_count(&store_root),
         };
-        // Orphan = alternates was readable AND its source path is gone. `known == false` (no
-        // alternates) is left alone.
-        if known && !source_exists {
+        // Orphan = alternates was readable AND its source path is gone, OR the source is alive but
+        // another store now owns it in the registry. `known == false` (no alternates) is left
+        // alone: a store mid-creation must not be reaped.
+        if (known && !source_exists) || se.superseded_by.is_some() {
             orphans.push(se.clone());
         }
         stores.push(se);
@@ -3521,6 +3605,12 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
         }
     }
     if apply && !orphans.is_empty() {
+        // The same exclusive lease every identity resolve takes, held across the moves and the
+        // registry rewrite: a concurrent save must not be able to register or re-key a store while
+        // it is being carried out of the building.
+        let reg_lock_path = root.join("registry.lock");
+        let _reg_lock =
+            crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&reg_lock_path, LOCK_TIMEOUT)?;
         let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
         let trash = root.join(".trash").join(&stamp);
         fs::create_dir_all(&trash)
@@ -3531,6 +3621,23 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
             fs::rename(&from, &to).with_context(|| {
                 format!("moving orphan store {} to {}", from.display(), to.display())
             })?;
+        }
+        // A registered store reaped for a dead source leaves its registry entry behind; drop those
+        // so the registry only names stores that exist. Reloaded under the lease rather than
+        // reusing the sweep's parse — the sweep read without it. Best-effort: the bytes are
+        // already moved, and a registry bookkeeping failure must not report the gc as failed.
+        let reg_path = root.join("registry.json");
+        if let Ok(Some(bytes)) = crate::core::persist::read_optional(&reg_path) {
+            if let Ok(mut reg) = serde_json::from_slice::<identity::Registry>(&bytes) {
+                let before = reg.repos.len();
+                reg.repos
+                    .retain(|r| !orphans.iter().any(|o| o.repo_id == r.repo_id));
+                if reg.repos.len() != before {
+                    if let Ok(out) = serde_json::to_vec_pretty(&reg) {
+                        let _ = crate::core::persist::atomic_write(&reg_path, &out);
+                    }
+                }
+            }
         }
         trash_dir = Some(trash.to_string_lossy().replace('\\', "/"));
     }
@@ -4707,6 +4814,97 @@ mod tests {
     }
 
     // ── identity::resolve — pure, no git/disk. Each move/clone/legacy branch is exercised here. ──
+    /// The three spellings one directory gets — registry (`//?/C:/…`), alternates (`C:/…`), legacy
+    /// verbatim (`\\?\C:\…`) — must compare equal, or the superseded match never fires on Windows.
+    #[test]
+    fn dir_key_folds_every_writer_spelling_of_one_directory() {
+        assert_eq!(
+            dir_key("//?/C:/Users/a/p/.git"),
+            dir_key(r"C:\Users\a\p\.git")
+        );
+        assert_eq!(
+            dir_key(r"\\?\C:\Users\a\p\.git"),
+            dir_key("C:/Users/a/p/.git/")
+        );
+        #[cfg(windows)]
+        assert_eq!(dir_key("C:/USERS/a/p/.git"), dir_key("c:/users/a/p/.git"));
+        #[cfg(not(windows))]
+        assert_ne!(dir_key("/home/A/p/.git"), dir_key("/home/a/p/.git"));
+    }
+
+    fn reg_of(entries: &[(&str, &str)]) -> identity::Registry {
+        identity::Registry {
+            schema_version: 1,
+            repos: entries
+                .iter()
+                .map(|(id, common)| identity::RepoEntry {
+                    repo_id: id.to_string(),
+                    root_commit: None,
+                    common_git_dir: common.to_string(),
+                    worktrees: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The id-migration leftover: an unregistered store whose live source repo is registered under
+    /// a DIFFERENT id is superseded — and the registered store itself must never be flagged.
+    #[test]
+    fn a_superseded_store_is_flagged_and_the_registered_one_never_is() {
+        let reg = reg_of(&[("repo-new", "//?/c:/users/a/proj/.git")]);
+        let (registered, by) = classify_store(
+            "repo-old",
+            Some("c:/users/a/proj/.git/objects"),
+            true,
+            Some(&reg),
+        );
+        assert!(!registered);
+        assert_eq!(by.as_deref(), Some("repo-new"));
+        let (registered, by) = classify_store(
+            "repo-new",
+            Some("c:/users/a/proj/.git/objects"),
+            true,
+            Some(&reg),
+        );
+        assert!(registered);
+        assert_eq!(by, None);
+    }
+
+    /// A dormant legacy store — unregistered, but no registered sibling owns its repo — is NOT
+    /// superseded: the next `aizen` run in that repo grandfathers it back in, so reaping it would
+    /// destroy a timeline that is merely asleep.
+    #[test]
+    fn a_dormant_legacy_store_is_left_alone() {
+        let reg = reg_of(&[("repo-other", "//?/c:/users/a/elsewhere/.git")]);
+        let (registered, by) = classify_store(
+            "repo-old",
+            Some("c:/users/a/proj/.git/objects"),
+            true,
+            Some(&reg),
+        );
+        assert!(!registered);
+        assert_eq!(by, None);
+    }
+
+    /// A broken registry disables the superseded class outright — fail-open, like
+    /// `resolve_identity`. And a dead source never matches through the registry either: such a
+    /// store is the first orphan class already, and matching a vanished path proves nothing.
+    #[test]
+    fn a_missing_registry_never_manufactures_superseded_stores() {
+        let (registered, by) =
+            classify_store("repo-old", Some("c:/users/a/proj/.git/objects"), true, None);
+        assert!(registered);
+        assert_eq!(by, None);
+        let reg = reg_of(&[("repo-new", "//?/c:/users/a/proj/.git")]);
+        let (_, by) = classify_store(
+            "repo-old",
+            Some("c:/users/a/proj/.git/objects"),
+            false,
+            Some(&reg),
+        );
+        assert_eq!(by, None);
+    }
+
     mod identity_resolve {
         use super::super::identity::*;
 

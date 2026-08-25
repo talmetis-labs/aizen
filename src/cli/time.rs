@@ -128,7 +128,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                 let fmt_mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
                 if report.orphans.is_empty() {
                     println!(
-                        "{} {} store(s) scanned · no orphans (every source repo still exists)",
+                        "{} {} store(s) scanned · no orphans (every store is still reachable from its repo)",
                         style("🧹 time gc --all:").color256(splash::ACCENT),
                         report.stores.len()
                     );
@@ -141,12 +141,25 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                         fmt_mb(total)
                     );
                     for o in &report.orphans {
+                        // Two distinct fates, named apart: a repo that vanished, and a repo that is
+                        // alive but re-keyed under a different store id after an identity change.
+                        let why = if !o.source_exists {
+                            format!(
+                                "source gone: {}",
+                                o.source.as_deref().unwrap_or("(unknown)")
+                            )
+                        } else {
+                            format!(
+                                "superseded by {} — its repo now keys there",
+                                o.superseded_by.as_deref().unwrap_or("(unknown)")
+                            )
+                        };
                         println!(
-                            "  {} · {} · {} checkpoint(s) · source gone: {}",
+                            "  {} · {} · {} checkpoint(s) · {}",
                             o.repo_id,
                             fmt_mb(o.bytes),
                             o.checkpoints,
-                            o.source.as_deref().unwrap_or("(unknown)")
+                            why
                         );
                     }
                     if report.applied {
