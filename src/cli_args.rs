@@ -575,6 +575,13 @@ pub(crate) enum TimeCmd {
         #[arg(short, long)]
         keep: Option<usize>,
     },
+    /// Delete specific checkpoints by id (disk is reclaimed by the next `aizen time gc`).
+    Rm {
+        /// Checkpoint ids (from `aizen time list`). The active point is refused — restore
+        /// somewhere else first.
+        #[arg(required = true)]
+        ids: Vec<u32>,
+    },
     /// Inspect ledger/refs/sidecars/journal without mutating the working tree.
     Doctor {
         /// Emit a machine-readable JSON report.

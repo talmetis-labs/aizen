@@ -83,6 +83,14 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             );
             Ok(())
         }
+        TimeCmd::Rm { ids } => {
+            let removed = timemachine::remove(&ids)?;
+            println!(
+                "{} {removed} checkpoint(s); disk is reclaimed by the next `aizen time gc`.",
+                style("🧹 removed").color256(splash::ACCENT)
+            );
+            Ok(())
+        }
         TimeCmd::Doctor { json, repair } => {
             let report = if repair {
                 timemachine::doctor_repair()?

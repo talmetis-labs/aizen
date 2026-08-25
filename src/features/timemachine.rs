@@ -2486,6 +2486,54 @@ pub fn prune(keep: usize) -> Result<usize> {
     Ok(dropped.len())
 }
 
+/// The named checkpoints out of the ledger, validated before anything is touched: an unknown id
+/// fails the whole call (a typo must not half-delete), and the cursor is refused — the working
+/// tree is standing on that point, and deleting the ground under it would leave `undo`/`redo`
+/// with no anchor.
+fn remove_plan(ledger: &mut Ledger, ids: &[u32]) -> Result<Vec<Snapshot>> {
+    let want: HashSet<u32> = ids.iter().copied().collect();
+    for id in &want {
+        if !ledger.snapshots.iter().any(|s| s.id == *id) {
+            bail!("no checkpoint #{id} — see `aizen time list`");
+        }
+    }
+    if let Some(cur) = ledger.cursor_id.filter(|c| want.contains(c)) {
+        bail!("checkpoint #{cur} is the active point — restore another checkpoint first, then delete this one");
+    }
+    let mut dropped = Vec::new();
+    let mut i = 0;
+    while i < ledger.snapshots.len() {
+        if want.contains(&ledger.snapshots[i].id) {
+            dropped.push(ledger.snapshots.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ledger.set_cursor(ledger.cursor_id);
+    Ok(dropped)
+}
+
+/// Delete exactly the checkpoints named — `aizen time rm 3 7`. Same transaction shape as `prune`:
+/// the plan is validated in memory first, then journal, then ledger-first deletion, so an
+/// interrupted run leaves harmless orphan refs and never ledger rows pointing at reaped objects.
+pub fn remove(ids: &[u32]) -> Result<usize> {
+    let ctx = RepoContext::current()?;
+    let _store = ctx.store_shared()?;
+    let _lock = ctx.lock()?;
+    let mut ledger = ctx.load_ledger()?;
+    ctx.recover_pending(&mut ledger)?;
+    ctx.migrate_legacy_refs(&mut ledger)?;
+    let dropped = remove_plan(&mut ledger, ids)?;
+    let mut journal = Journal::new(JournalKind::Prune, ledger.generation);
+    ctx.save_journal(&journal)?;
+    ctx.save_ledger(&mut ledger)?;
+    delete_snapshots(&ctx, &dropped)?;
+    journal.phase = JournalPhase::LedgerCommitted;
+    ctx.save_journal(&journal)?;
+    ctx.clear_journal()?;
+    Ok(dropped.len())
+}
+
 pub fn clear() -> Result<usize> {
     let ctx = RepoContext::current()?;
     let _store = ctx.store_shared()?;
@@ -4487,6 +4535,48 @@ mod tests {
         );
         assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(l.cursor_id, Some(1));
+    }
+
+    #[test]
+    fn rm_takes_exactly_the_named_ids_and_nothing_else() {
+        let mut l = Ledger {
+            snapshots: vec![mk(1, None), mk(2, Some(1)), mk(3, Some(2)), mk(4, Some(3))],
+            next_id: 5,
+            ..Default::default()
+        };
+        l.set_cursor(Some(4));
+        let dropped = remove_plan(&mut l, &[2, 3]).unwrap();
+        assert_eq!(dropped.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            l.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(l.cursor_id, Some(4));
+    }
+
+    /// Both refusals must land BEFORE the ledger is touched: `rm 2 9` with 9 unknown deletes
+    /// nothing, and the cursor cannot be removed however it is spelled.
+    #[test]
+    fn rm_refuses_the_cursor_and_unknown_ids_before_touching_anything() {
+        let mut l = Ledger {
+            snapshots: vec![mk(1, None), mk(2, Some(1))],
+            next_id: 3,
+            ..Default::default()
+        };
+        l.set_cursor(Some(2));
+        assert!(
+            remove_plan(&mut l, &[2]).is_err(),
+            "the active point must survive"
+        );
+        assert!(
+            remove_plan(&mut l, &[1, 9]).is_err(),
+            "a typo must not half-delete"
+        );
+        assert_eq!(
+            l.snapshots.len(),
+            2,
+            "a refused plan leaves the ledger whole"
+        );
     }
 
     #[test]
