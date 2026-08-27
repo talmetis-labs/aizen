@@ -1946,7 +1946,9 @@ fn server_defs_estimate(srv: &ServerHandle) -> usize {
                 tool_description(&srv.name, t),
                 t.input_schema.clone(),
             );
-            serde_json::to_string(&def).map(|s| s.len() / 4).unwrap_or(0)
+            serde_json::to_string(&def)
+                .map(|s| s.len() / 4)
+                .unwrap_or(0)
         })
         .sum()
 }
@@ -2459,7 +2461,10 @@ mod tests {
             &rows(&[("huge", 30_000, Some(false)), ("mid", 6000, None)]),
             4000,
         );
-        assert!(!plan.contains("huge"), "pinned-visible wins over the budget");
+        assert!(
+            !plan.contains("huge"),
+            "pinned-visible wins over the budget"
+        );
         assert!(plan.contains("mid"));
 
         // A `defer: true` pin defers a tiny server even when the total fits.

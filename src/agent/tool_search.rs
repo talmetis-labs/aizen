@@ -278,7 +278,12 @@ mod tests {
         }
     }
 
-    fn entry(name: &'static str, server: &str, desc: &'static str, destructive: bool) -> DeferredEntry {
+    fn entry(
+        name: &'static str,
+        server: &str,
+        desc: &'static str,
+        destructive: bool,
+    ) -> DeferredEntry {
         DeferredEntry {
             tool: Arc::new(Fake {
                 name,
@@ -323,7 +328,10 @@ mod tests {
             .execute(&json!({"query": "create issue"}))
             .unwrap();
         assert!(out.contains("## mcp_github_create_issue"), "{out}");
-        assert!(out.contains("\"required\":[\"title\"]"), "schema rides in-band: {out}");
+        assert!(
+            out.contains("\"required\":[\"title\"]"),
+            "schema rides in-band: {out}"
+        );
         assert!(out.contains("state-changing"), "effect labeled: {out}");
         assert!(out.contains("call it directly"), "{out}");
         // The best match leads: name hits outrank the description-only sibling.
@@ -335,7 +343,10 @@ mod tests {
     #[test]
     fn server_and_property_words_also_match() {
         let by_server = searcher().execute(&json!({"query": "datadog"})).unwrap();
-        assert!(by_server.contains("mcp_datadog_query_metrics"), "{by_server}");
+        assert!(
+            by_server.contains("mcp_datadog_query_metrics"),
+            "{by_server}"
+        );
         // 'title' appears only as a schema property name, never in prose.
         let by_prop = searcher().execute(&json!({"query": "title"})).unwrap();
         assert!(by_prop.contains("## mcp_"), "{by_prop}");
@@ -354,7 +365,10 @@ mod tests {
             let out = searcher().execute(&args).unwrap();
             assert!(out.contains("3 deferred tool(s)"), "{out}");
             assert!(out.contains("- mcp_github_create_issue [github]"), "{out}");
-            assert!(!out.contains("\"properties\""), "browse carries no schema: {out}");
+            assert!(
+                !out.contains("\"properties\""),
+                "browse carries no schema: {out}"
+            );
         }
     }
 

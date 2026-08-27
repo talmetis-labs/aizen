@@ -416,7 +416,11 @@ fn deferred_tools_leave_the_request_but_stay_dispatchable_through_tool_search() 
     registry.register(Box::new(ToolSearch::new(entries)));
 
     // The request: no deferred schema, but the discovery door is advertised.
-    let def_names: Vec<String> = registry.defs().into_iter().map(|d| d.function.name).collect();
+    let def_names: Vec<String> = registry
+        .defs()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
     assert!(!def_names.iter().any(|n| n.starts_with("mcp_fake_")));
     assert!(def_names.iter().any(|n| n == "tool_search"));
 
@@ -432,7 +436,10 @@ fn deferred_tools_leave_the_request_but_stay_dispatchable_through_tool_search() 
     // Dispatch: a deferred tool called by exact name still runs (this is what makes a
     // tool_search result actionable without ever touching the request's tools array).
     let hidden = registry.get_arc("mcp_fake_query").expect("dispatchable");
-    assert_eq!(hidden.execute(&serde_json::json!({"sql": "x"})).unwrap(), "rows");
+    assert_eq!(
+        hidden.execute(&serde_json::json!({"sql": "x"})).unwrap(),
+        "rows"
+    );
 
     // Discovery: the search result carries the exact name + the full schema in-band.
     let search = registry.get("tool_search").unwrap();
