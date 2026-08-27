@@ -1765,6 +1765,14 @@ pub fn set_work_caption(text: &str) {
     }
 }
 
+/// [`set_work_caption`] tinted with the running tool's work-lane colour (`theme::tool_color`), so
+/// the "what am I doing" line carries the same hue as the tool row it narrates.
+pub fn set_work_caption_tinted(text: &str, color: u8) {
+    if retained::is_running() {
+        retained::set_work_caption_tinted(text, color);
+    }
+}
+
 /// Handles to drive the REPL from the background input thread.
 pub struct InputHandles {
     /// Submissions (chat / slash / quit), in the order the user pressed Enter.

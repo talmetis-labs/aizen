@@ -1560,6 +1560,70 @@ SlashId::Yolo => {
                 ),
             }
         }
+        SlashId::Theme => {
+            let sub = arg.trim().to_ascii_lowercase();
+            // Persist + apply one theme choice. `lanes` is stored explicitly; moonlight is the
+            // default, so choosing it CLEARS the field rather than pinning a redundant value.
+            let set = |lanes: bool, label: &str| {
+                let mut cfg = cli_config::load();
+                cfg.theme = lanes.then(|| "lanes".to_string());
+                match cli_config::save(&cfg) {
+                    Ok(_) => {
+                        crate::ui::theme::set_lanes_enabled(lanes);
+                        tui::emit_line(
+                            &style(format!("theme → {label}"))
+                                .color256(splash::ACCENT)
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("theme:").red())),
+                }
+            };
+            match sub.as_str() {
+                "" | "list" | "status" => {
+                    let on = crate::ui::theme::lanes_enabled();
+                    let dot = |sel: bool| if sel { "●" } else { "○" };
+                    tui::emit_line(&style("themes:").color256(splash::ACCENT).to_string());
+                    tui::emit_line(&format!(
+                        "  {} moonlight — the calm all-silver default",
+                        dot(!on)
+                    ));
+                    // The swatch shows each lane in its own hue, so the choice is visible before
+                    // it is made.
+                    let swatch = [
+                        ("read", theme::LANE_READ),
+                        ("edit", theme::LANE_EDIT),
+                        ("shell", theme::LANE_EXEC),
+                        ("web", theme::LANE_WEB),
+                        ("memory", theme::LANE_MIND),
+                        ("talk", theme::LANE_TALK),
+                        ("plan", theme::LANE_PLAN),
+                    ]
+                    .map(|(word, c)| style(word).color256(c).to_string())
+                    .join(" · ");
+                    tui::emit_line(&format!(
+                        "  {} lanes — each kind of work in its own colour: {swatch}",
+                        dot(on)
+                    ));
+                    tui::emit_line(
+                        &style("pick with /theme moonlight | lanes")
+                            .dim()
+                            .to_string(),
+                    );
+                }
+                "lanes" | "lane" | "colors" | "colours" => {
+                    set(true, "lanes — each kind of work in its own colour")
+                }
+                "moonlight" | "default" | "silver" | "mono" => {
+                    set(false, "moonlight — the calm all-silver default")
+                }
+                other => tui::emit_line(
+                    &style(format!("usage: /theme [moonlight|lanes]  (unknown '{other}')"))
+                        .dim()
+                        .to_string(),
+                ),
+            }
+        }
         SlashId::Provider => {
             let selected = if arg.eq_ignore_ascii_case("add") || arg.eq_ignore_ascii_case("manage") {
                 let mut cfg = cli_config::load();

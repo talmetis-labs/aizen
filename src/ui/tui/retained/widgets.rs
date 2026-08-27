@@ -123,10 +123,13 @@ pub(crate) fn fmt_elapsed(ms: Option<u64>) -> String {
 }
 
 /// Lay out one tool-call line under the transcript, mockup-style but result-below: the call
-/// `<icon> <name>   <target>` on its own line (icon + name in moonlight accent, target dim silver),
-/// then an indented `└ <digest> · <time>` line beneath it — the result digest tinted by state
-/// (running = faint, ok = green, err = salmon) and carrying the wall-clock run time. A still-running
-/// call (empty digest) is just the call line; the result line is added when the digest lands.
+/// `<icon> <name>   <target>` on its own line (icon + name in the tool's WORK-LANE colour under
+/// the `lanes` theme — blue read, gold edit, mauve shell, cyan web, violet memory, pink
+/// delegation/asking, teal plan — so a glance down the transcript shows what kind of work
+/// happened; the default `moonlight` theme paints them silver; target dim silver), then an
+/// indented `└ <digest> · <time>` line beneath it — the result digest tinted by state (running =
+/// faint, ok = green, err = salmon) and carrying the wall-clock run time. A still-running call
+/// (empty digest) is just the call line; the result line is added when the digest lands.
 pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
     use crate::ui::theme;
     let _ = width; // stacked layout no longer needs the frame width to right-align
@@ -135,13 +138,13 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
     } else {
         format!("{} ", t.icon)
     };
-    let name_styled = theme::accent(&t.name).to_string();
+    let name_styled = theme::lane(&t.name, &t.name).to_string();
     let call_line = if t.target.is_empty() {
-        format!("{}{}", theme::accent(&icon), name_styled)
+        format!("{}{}", theme::lane(&t.name, &icon), name_styled)
     } else {
         format!(
             "{}{}   {}",
-            theme::accent(&icon),
+            theme::lane(&t.name, &icon),
             name_styled,
             theme::accent_dim(&t.target)
         )
@@ -168,23 +171,30 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
 }
 
 /// Render the in-place plan panel as a boxed checklist: a `☑ done/total · plan` header row, then one
-/// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses. Done rows
-/// are green + dim-struck, the in-progress row is bright moonlight, pending rows are faint.
+/// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses — but in
+/// the PLAN lane's teal, so the panel reads as "progress" from across the room the same way a tool
+/// row's hue reads as its kind of work. Done rows are green + dim-struck, the in-progress row is
+/// bright moonlight, pending rows are faint.
 pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
     use crate::ui::theme;
+    // The frame tint: the plan/checkpoint lane's teal under the `lanes` theme, the quiet dim
+    // silver every box wears under `moonlight`.
+    let frame_color = if theme::lanes_enabled() {
+        theme::LANE_PLAN
+    } else {
+        theme::ACCENT_DIM
+    };
+    let frame = |s: String| console::style(s).color256(frame_color).to_string();
     let done = rows.iter().filter(|r| r.status == 2).count();
     let header = format!("☑ {done}/{} · plan", rows.len());
     // Inner width: cap so the box doesn't sprawl on a very wide pane; leave room for `│ ` + ` │`.
     let inner = width.saturating_sub(2).min(72).max(12);
     let bar = "─".repeat(inner);
     let mut out = Vec::new();
-    out.push(
-        theme::accent_dim(format!(
-            "╭─ {} ─╮",
-            pad_to(&header, inner.saturating_sub(4))
-        ))
-        .to_string(),
-    );
+    out.push(frame(format!(
+        "╭─ {} ─╮",
+        pad_to(&header, inner.saturating_sub(4))
+    )));
     for r in rows {
         let glyph = match r.status {
             2 => "✓",
@@ -209,14 +219,14 @@ pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
         let pad = inner.saturating_sub(4 + console::measure_text_width(&clipped));
         out.push(format!(
             "{} {} {}{} {}",
-            theme::accent_dim("│"),
+            frame("│".to_string()),
             g,
             styled,
             " ".repeat(pad),
-            theme::accent_dim("│")
+            frame("│".to_string())
         ));
     }
-    out.push(theme::accent_dim(format!("╰{bar}╯")).to_string());
+    out.push(frame(format!("╰{bar}╯")));
     out
 }
 
@@ -326,7 +336,15 @@ pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     out.push(format!(
         "{}{}  {} {}{}",
         theme::accent_dim("╭─ "),
-        theme::accent(&label),
+        // Under the `lanes` theme the label rides the EDIT lane's gold — the diff box is what an
+        // edit-lane tool just did, so its title matches the `file_edit` row that produced it. The
+        // frame stays quiet silver either way: a gold outline around a whole code box would shout;
+        // one gold word ties them together. Moonlight keeps the label bright silver as it was.
+        console::style(&label).color256(if theme::lanes_enabled() {
+            theme::LANE_EDIT
+        } else {
+            theme::ACCENT
+        }),
         format!(
             "{} {}",
             theme::ok(format!("+{}", d.adds)),

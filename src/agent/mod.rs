@@ -3348,23 +3348,24 @@ fn relevance_query_from_args(args: &serde_json::Value) -> String {
 /// as a quiet footnote. Tools with no mapping fall back to the older `◆ name(salient-arg)` shape.
 /// The `◆` anchor is moonlight-silver here (the call is starting); the result corner `└` on the
 /// A one-shot styled string form of the call line (mockup shape `⚙ <name>   <target>`) — the raw
-/// tool name in moonlight, its salient target in dim silver. Used for the APPROVAL PROMPT (a single
-/// inline line), where there's no in-place digest to fill later. The live transcript uses the
-/// structured [`emit_tool_call`]/[`emit_tool_result`] pair instead, which right-aligns the digest.
+/// tool name in its work-lane colour (matching the live transcript's `render_tool_row`), its
+/// salient target in dim silver. Used for the APPROVAL PROMPT (a single inline line), where
+/// there's no in-place digest to fill later. The live transcript uses the structured
+/// [`emit_tool_call`]/[`emit_tool_result`] pair instead, which right-aligns the digest.
 fn tool_call_line(name: &str, args: &serde_json::Value) -> String {
     let icon = tool_icon();
     let target = tool_target(name, args);
     if target.is_empty() {
         format!(
             "{} {}",
-            crate::ui::theme::accent(icon),
-            crate::ui::theme::accent(name)
+            crate::ui::theme::lane(name, icon),
+            crate::ui::theme::lane(name, name)
         )
     } else {
         format!(
             "{} {}   {}",
-            crate::ui::theme::accent(icon),
-            crate::ui::theme::accent(name),
+            crate::ui::theme::lane(name, icon),
+            crate::ui::theme::lane(name, name),
             crate::ui::theme::accent_dim(target)
         )
     }
@@ -3653,7 +3654,12 @@ fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
     // tool has no English mapping, leave the caption on whatever whimsical verb is showing rather than
     // typing out a raw tool slug. `emit_tool_result` clears it back to the verb when the call ends.
     if let Some(action) = tool_action(name, args) {
-        crate::ui::tui::set_work_caption(&action);
+        // Under the `lanes` theme the caption types out in the tool's work-lane hue, matching the
+        // row this call opens; under `moonlight` it stays untinted (the painter's link-blue).
+        match crate::ui::theme::lane_tint(name) {
+            Some(c) => crate::ui::tui::set_work_caption_tinted(&action, c),
+            None => crate::ui::tui::set_work_caption(&action),
+        }
     }
     crate::ui::tui::tool_call_begin(tool_icon(), name, &tool_target(name, args))
 }

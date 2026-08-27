@@ -75,6 +75,7 @@ pub enum SlashId {
     Team,
     Yolo,
     AutoCopy,
+    Theme,
 }
 
 /// When a command takes over stdin (a `dialoguer` menu, the effort slider, a daemon) and the
@@ -679,6 +680,17 @@ Builtin {
         description: "auto-copy on mouse select release",
         argument_hint: "[on|off|status]",
         help: "on (default): releasing a drag-select copies to the clipboard. off: keep the highlight and copy with Ctrl-C (Windows/Linux) or ⌘C (macOS). bare /auto-copy toggles",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Theme,
+        name: "theme",
+        aliases: &[],
+        hidden_aliases: &["themes"],
+        hidden: false,
+        description: "pick the colour theme (moonlight | lanes)",
+        argument_hint: "[moonlight|lanes]",
+        help: "bare: list themes. `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal; `moonlight` (default) keeps the calm all-silver look",
         stdin: Stdin::Never,
     },
 ];

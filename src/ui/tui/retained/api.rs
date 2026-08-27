@@ -273,7 +273,13 @@ pub(crate) fn set_ultimate(on: bool) {
 /// Set the working caption target — a running tool's action ("Reading retained.rs") or the whimsical
 /// verb between steps. The typewriter reveal replays only when the text actually changes.
 pub(crate) fn set_work_caption(text: &str) {
-    send(Command::WorkCaption(text.to_string()));
+    send(Command::WorkCaption(text.to_string(), None));
+}
+
+/// [`set_work_caption`] carrying the running tool's work-lane colour, so the caption types out in
+/// the same hue as the tool row it narrates.
+pub(crate) fn set_work_caption_tinted(text: &str, color: u8) {
+    send(Command::WorkCaption(text.to_string(), Some(color)));
 }
 
 pub(crate) fn set_context(permille: u16) {

@@ -178,7 +178,14 @@ fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
             })
             .unwrap_or_default();
         for l in wrap_plain(&format!("{}{elapsed}", state.work_caption), inner, 2) {
-            body.push(Line::styled(l, accent));
+            // Same lane tint as the footer caption, so the sidebar's "Now" agrees with it.
+            body.push(Line::styled(
+                l,
+                match state.work_tint {
+                    Some(c) => Style::default().fg(Color::Indexed(c)),
+                    None => accent,
+                },
+            ));
         }
         body.push(Line::default());
     }
@@ -635,7 +642,12 @@ pub(super) fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
             format!("{glyph} "),
             Style::default().fg(Color::Indexed(theme::ACCENT)),
         ),
-        Span::styled(revealed, Style::default().fg(Color::Indexed(theme::LINK))),
+        Span::styled(
+            revealed,
+            // A tool's action types out in that tool's lane hue; the whimsical verb (no tool
+            // running) keeps the link-blue "live status" tint.
+            Style::default().fg(Color::Indexed(state.work_tint.unwrap_or(theme::LINK))),
+        ),
         Span::styled(
             {
                 // `↑N tok` = what the turn's latest request carried (estimated at send, corrected

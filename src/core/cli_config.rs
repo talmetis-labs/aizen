@@ -162,6 +162,10 @@ pub struct CliConfig {
     /// TUI icon style: `"emoji"` (default), `"nerd"` (Nerd Font glyphs), or `"off"`. `None` ⇒ emoji.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<String>,
+    /// TUI colour theme (`/theme`): `"lanes"` colours each kind of work with its own hue; anything
+    /// else — including `None`, the default — is `moonlight`, the all-silver look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_visuals: Option<ResponseVisuals>,

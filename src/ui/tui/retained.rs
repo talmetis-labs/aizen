@@ -229,6 +229,10 @@ struct CacheKey {
     width: u16,
     hash: u64,
     complete: bool,
+    /// `theme::theme_generation()` at render time. A `/theme` switch changes how the same payload
+    /// paints without changing its content hash — folding the generation in makes every cached row
+    /// from the old theme a miss instead of a stale hit.
+    theme_gen: u32,
 }
 
 #[derive(Default)]
@@ -245,6 +249,7 @@ impl RenderCache {
             width,
             hash: block.payload.content_hash(),
             complete: block.complete,
+            theme_gen: crate::ui::theme::theme_generation(),
         };
         if let Some(rows) = self.rows.get(&key) {
             self.hits += 1;
@@ -339,6 +344,10 @@ struct AppState {
     /// ("Reading retained.rs") or `work_verb` when nothing is running. Reset (`work_reveal = 0`) whenever
     /// this target changes so the typewriter re-runs on the new text.
     work_caption: String,
+    /// The work-lane colour of the tool the caption describes (`theme::tool_color`), `None` for the
+    /// whimsical verb — the painter falls back to link-blue. Lets the "what am I doing" line carry
+    /// the same hue as the tool row it narrates.
+    work_tint: Option<u8>,
     /// How many chars of `work_caption` are revealed so far — advanced one per animation tick for the
     /// typewriter effect, clamped to the caption length.
     work_reveal: usize,
@@ -397,19 +406,23 @@ impl AppState {
             ultimate: false,
             work_verb: String::new(),
             work_caption: String::new(),
+            work_tint: None,
             work_reveal: 0,
             input_row_scroll: 0,
         }
     }
 
-    /// Point the working caption at `text` (a tool action or the whimsical verb). Resets the reveal
-    /// counter only when the text actually changes, so the typewriter replays on a new caption but a
-    /// re-assert of the same one doesn't stutter back to the first character.
-    fn set_work_caption(&mut self, text: String) {
+    /// Point the working caption at `text` (a tool action or the whimsical verb) in `tint` (the
+    /// tool's lane colour; `None` ⇒ link-blue). Resets the reveal counter only when the text
+    /// actually changes, so the typewriter replays on a new caption but a re-assert of the same one
+    /// doesn't stutter back to the first character. The tint always updates — it costs nothing and
+    /// a re-assert never changes it in practice.
+    fn set_work_caption(&mut self, text: String, tint: Option<u8>) {
         if self.work_caption != text {
             self.work_caption = text;
             self.work_reveal = 0;
         }
+        self.work_tint = tint;
     }
 
     fn push_block(&mut self, kind: BlockKind, payload: Payload, complete: bool) -> u64 {
@@ -531,8 +544,9 @@ enum Command {
     /// Set the working caption target (a running tool's action, or a whimsical verb between steps).
     /// The typewriter reveal restarts whenever the text changes; a re-assert of the same text is a
     /// no-op so it doesn't stutter back to the first character. Passing an empty string clears it back
-    /// to the whimsical `work_verb`.
-    WorkCaption(String),
+    /// to the whimsical `work_verb`. The `Option<u8>` is the running tool's work-lane colour
+    /// (`theme::tool_color`); `None` — the verb, or a caller with no tool — paints link-blue.
+    WorkCaption(String, Option<u8>),
     /// Ultimate mode toggled — recolour the input box (gold ON, moonlight OFF). Pushed from the
     /// `/ultimate` handler and once at activation, never read from disk in the draw path.
     Ultimate(bool),
@@ -955,22 +969,23 @@ fn apply_command(state: &mut AppState, cmd: Command) {
                 // chip resets too — the previous turn's request size says nothing about this one.
                 state.sent_tok = 0;
                 state.work_verb = crate::ui::tui::next_work_verb().to_string();
-                state.set_work_caption(state.work_verb.clone());
+                state.set_work_caption(state.work_verb.clone(), None);
             } else {
                 state.frame = 0;
                 state.work_caption.clear();
+                state.work_tint = None;
                 state.work_reveal = 0;
             }
         }
         Command::Status(status) => state.input.status = status,
-        Command::WorkCaption(text) => {
-            // Empty ⇒ fall back to the whimsical verb (a tool finished, nothing else running yet).
-            let target = if text.is_empty() {
-                state.work_verb.clone()
+        Command::WorkCaption(text, tint) => {
+            // Empty ⇒ fall back to the whimsical verb (a tool finished, nothing else running yet) —
+            // and the verb never carries a lane tint.
+            if text.is_empty() {
+                state.set_work_caption(state.work_verb.clone(), None);
             } else {
-                text
-            };
-            state.set_work_caption(target);
+                state.set_work_caption(text, tint);
+            }
         }
         Command::Ultimate(on) => state.ultimate = on,
         Command::Context(v) => state.ctx_permille = v,

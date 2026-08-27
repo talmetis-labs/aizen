@@ -413,7 +413,7 @@ fn working_line_advances_glyph_with_the_frame_counter() {
     // the glyph to frame 0 while the caption keeps typing.
     let mut state = AppState::new("intro", "status");
     apply_command(&mut state, Command::Working(true));
-    state.set_work_caption("Reading retained.rs".to_string());
+    state.set_work_caption("Reading retained.rs".to_string(), None);
 
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..BLOOM.len() {
@@ -445,7 +445,7 @@ fn working_line_draws_no_caret_of_its_own() {
     // just the settled state would have passed against the very bug this guards.
     let mut state = AppState::new("intro", "status");
     apply_command(&mut state, Command::Working(true));
-    state.set_work_caption("Reading retained.rs".to_string());
+    state.set_work_caption("Reading retained.rs".to_string(), None);
 
     // 1. mid-typewriter
     apply_command(&mut state, Command::Tick);
@@ -573,21 +573,33 @@ fn tool_caption_replaces_verb_then_falls_back() {
 
     apply_command(
         &mut state,
-        Command::WorkCaption("Reading retained.rs".into()),
+        Command::WorkCaption(
+            "Reading retained.rs".into(),
+            Some(crate::ui::theme::LANE_READ),
+        ),
     );
     assert_eq!(state.work_caption, "Reading retained.rs");
     assert_eq!(state.work_reveal, 0, "a new caption retypes from scratch");
+    assert_eq!(
+        state.work_tint,
+        Some(crate::ui::theme::LANE_READ),
+        "a tool caption carries its lane hue"
+    );
 
     // Re-asserting the SAME caption must not stutter the reveal back to zero.
     apply_command(&mut state, Command::Tick);
     apply_command(
         &mut state,
-        Command::WorkCaption("Reading retained.rs".into()),
+        Command::WorkCaption(
+            "Reading retained.rs".into(),
+            Some(crate::ui::theme::LANE_READ),
+        ),
     );
     assert_eq!(state.work_reveal, 1, "same text ⇒ reveal is preserved");
 
-    apply_command(&mut state, Command::WorkCaption(String::new()));
+    apply_command(&mut state, Command::WorkCaption(String::new(), None));
     assert_eq!(state.work_caption, verb, "empty falls back to the verb");
+    assert_eq!(state.work_tint, None, "the verb never keeps a tool's hue");
 }
 
 #[test]
@@ -597,7 +609,10 @@ fn working_line_only_rides_the_transcript_while_working() {
     // …" row lingers under the finished answer.
     let mut state = AppState::new("intro", "status");
     apply_command(&mut state, Command::Working(true));
-    apply_command(&mut state, Command::WorkCaption("Run cargo test".into()));
+    apply_command(
+        &mut state,
+        Command::WorkCaption("Run cargo test".into(), Some(crate::ui::theme::LANE_EXEC)),
+    );
     assert!(state.working, "turn in flight");
 
     apply_command(&mut state, Command::Working(false));
