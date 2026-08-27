@@ -59,12 +59,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: 'cla/signatures.json'
-          path-to-document: 'https://github.com/aizen-stack/aizen/blob/main/CLA.md'
+          path-to-document: 'https://github.com/talmetis-labs/aizen/blob/main/CLA.md'
           branch: 'cla-signatures'
           allowlist: 'dawnofcd,dependabot[bot],aizen-sync[bot]'
           custom-notsigned-prcomment: >
             Thanks for the pull request. Before we can merge it, please read our
-            [Contributor License Agreement](https://github.com/aizen-stack/aizen/blob/main/CLA.md)
+            [Contributor License Agreement](https://github.com/talmetis-labs/aizen/blob/main/CLA.md)
             — note especially **§3**, which asks for the right to license your contribution under
             commercial terms as well as Apache-2.0 — and, if you agree, post a comment below with
             **exactly** this sentence:

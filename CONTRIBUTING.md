@@ -6,7 +6,7 @@ commercially, and contributions are welcome under the terms below.
 
 ## Before you start
 
-- **Search existing [issues](https://github.com/aizen-stack/aizen/issues)** before opening a new one —
+- **Search existing [issues](https://github.com/talmetis-labs/aizen/issues)** before opening a new one —
   it may already be reported or in progress.
 - For anything bigger than a small fix, **open an issue first** and describe what you want to do.
   A quick "here's the plan" saves everyone a rejected PR.
@@ -71,7 +71,7 @@ Requirements:
 4. Run `cargo test --bin aizen` and make sure it's **green**.
 5. Run `cargo fmt` and `cargo clippy` and clear anything you introduced.
 6. Commit with a clear message (imperative mood: "fix scrollbar drift", not "fixed stuff").
-7. Push and open a PR against `aizen-stack/aizen:dev`. Fill in the PR template.
+7. Push and open a PR against `talmetis-labs/aizen:dev`. Fill in the PR template.
 
 ## What gets merged
 
