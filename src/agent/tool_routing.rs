@@ -298,7 +298,9 @@ pub fn lane_for(name: &str) -> Option<Lane> {
         "checkpoint" | "checkpoint_view" => Lane::Checkpoint,
         "telegram_send" | "telegram_ask" | "bot_admin" | "notify" => Lane::Messaging,
         "persona_create" => Lane::Persona,
-        "repo_map" | "codebase_search" => Lane::Structure,
+        // `git_inspect` is read-only repo intel (status/log/diff/blame), not command execution —
+        // it groups with structure, and disabling the shell bundle must not take it along.
+        "repo_map" | "codebase_search" | "git_inspect" => Lane::Structure,
         "lsp_references"
         | "lsp_definition"
         | "read_symbol"

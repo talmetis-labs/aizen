@@ -30,6 +30,7 @@ pub mod prompt_lanes;
 pub mod query_lang;
 pub mod reach;
 pub mod repo_map;
+pub mod roles;
 pub mod search;
 pub mod task_tool;
 pub mod todo;

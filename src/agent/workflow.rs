@@ -312,20 +312,23 @@ pub(crate) fn enforce_singular_writer(spec: &WorkflowSpec) -> Result<()> {
 }
 
 /// Does this task resolve to a WRITE-capable sub-agent? Mirrors the runner's resolution
-/// (`run_one_task`): a named `agent` supersedes `role`. Unresolvable slug → coder (write) fallback.
+/// (`run_one_task`): a named `agent` supersedes `role`.
 pub(crate) fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
     if let Some(slug) = agent.map(str::trim).filter(|s| !s.is_empty()) {
         return match crate::agents::load(slug) {
             Some(def) => !crate::agent::task_tool::dispatch_is_read_only(
                 &crate::agent::builtin::agent_registry(&def, std::path::Path::new(".")),
             ),
-            // Unresolvable slug → treat as a writer. Conservative on purpose: the RUNNER falls
-            // back to the task's ROLE scope (default `reviewer`, read-only), so over-counting
-            // here can only refuse/serialize a dispatch that was safe — never the reverse.
+            // Unresolvable slug → treat as a writer. Conservative on purpose: the RUNNER now
+            // REFUSES such a task outright (see `run_one_task`), so over-counting here can only
+            // refuse/serialize a dispatch that was doomed anyway — never the reverse.
             None => true,
         };
     }
-    matches!(role, "coder" | "tester")
+    // A role is a writer iff its table profile grants edit or shell — the same table
+    // `role_registry` scopes tools from, legacy aliases included. Unknown role → the
+    // conservative read-only base, so not a writer.
+    crate::agent::roles::canonical(role).is_some_and(|p| p.edit || p.shell)
 }
 
 /// Fan the tasks out, bounded to the process-global sub-agent cap via chunking — shared by the CLI
@@ -666,12 +669,26 @@ async fn run_one_task(
     }
     // A resolvable `agent` slug supersedes `role` (the specialist/fusion path), mirroring the `task`
     // tool. Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
-    let spec = task
+    let named_agent = task
         .agent
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(crate::agents::load);
+        .filter(|s| !s.is_empty());
+    let spec = named_agent.and_then(crate::agents::load);
+    // A slug that names NOTHING is refused, not silently swapped for the role scope: the parent
+    // asked for a specific specialist, and running the task under different powers/prompt would
+    // report a result the parent attributes to expertise that never ran. Same soft wording as the
+    // `task` tool; the workflow carries on with its other tasks.
+    if let (Some(slug), None) = (named_agent, &spec) {
+        return TaskOutcome {
+            id: task.id.clone(),
+            role: task.role.clone(),
+            model: model.to_string(),
+            status: "error".into(),
+            summary: crate::agent::task_tool::unknown_agent_error(slug),
+            iters: 0,
+        };
+    }
     // Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
     // The resolved model is then routed through the model-endpoint registry so a task pinned to
     // another provider's model carries ITS gateway (base_url/api_key) — the caller it inherits from
@@ -1234,11 +1251,49 @@ mod tests {
 
     #[test]
     fn task_is_writer_classifies_roles() {
-        assert!(task_is_writer("coder", None));
-        assert!(task_is_writer("tester", None));
-        assert!(!task_is_writer("reviewer", None));
-        assert!(!task_is_writer("planner", None));
+        // Legacy and pantheon names classify identically (one role table).
+        for role in ["coder", "tester", "daedalus", "themis"] {
+            assert!(task_is_writer(role, None), "{role} is a writer");
+        }
+        for role in ["reviewer", "planner", "argus", "metis", "nemesis", "clio"] {
+            assert!(!task_is_writer(role, None), "{role} is read-only");
+        }
         assert!(task_is_writer("reviewer", Some("__no_such_agent__")));
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_task_errors_instead_of_falling_back() {
+        // The runner refuses a task naming an unresolvable specialist BEFORE any network call —
+        // running it under the role scope would attribute the result to expertise that never ran.
+        let http = reqwest::Client::new();
+        let task = WorkflowTask {
+            id: "t1".into(),
+            role: "reviewer".into(),
+            agent: Some("__no_such_agent__".into()),
+            prompt: "review x".into(),
+            model: None,
+        };
+        let out = run_one_task(
+            &http,
+            "http://localhost:1", // unreachable on purpose: the refusal must come first
+            "k",
+            "m",
+            crate::core::approval::ApprovalMode::Ask,
+            Path::new("."),
+            "2026-08-27",
+            &task,
+            None,
+            crate::core::cancel::TurnCancel::default(),
+            0,
+        )
+        .await;
+        assert_eq!(out.status, "error");
+        assert!(
+            out.summary.starts_with("error: unknown agent"),
+            "got: {}",
+            out.summary
+        );
+        assert_eq!(out.iters, 0, "no model steps were spent");
     }
 
     #[tokio::test]
