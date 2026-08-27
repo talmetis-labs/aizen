@@ -125,12 +125,32 @@ fn whole_file_symbol_hint(is_code: bool, lsp_on: bool, line_count: usize) -> Opt
 /// `aizen skill` path are unaffected.
 /// Stored in ADVERTISED order, not as a set: the system prompt's tool-routing map is generated from
 /// this list and must name tools in the same order the request's `tools` array carries them.
+/// DEFERRED tools (schema reached via `tool_search`) are deliberately absent — the map may only
+/// name what the request advertises.
 static ACTIVE_TOOL_NAMES: Lazy<Mutex<Option<Vec<String>>>> = Lazy::new(|| Mutex::new(None));
+
+/// The DEFERRED half of the surface: tool names + per-server counts, published beside
+/// [`ACTIVE_TOOL_NAMES`]. Names feed the skills `requires:` gate (a deferred tool is callable, so
+/// a skill needing it still applies); counts feed the prompt's deferred-integrations note.
+static DEFERRED_TOOL_SURFACE: Lazy<Mutex<Option<crate::agent::tools::DeferredSurface>>> =
+    Lazy::new(|| Mutex::new(None));
 
 /// Publish the live tool surface (idempotent). ONLY the top-level registry calls this — never the
 /// smaller `role_registry`, so the set is never wrongly shrunk when a sub-agent assembles a prompt.
+///
+/// The deferred half is published only while `tool_search` survived the toolset filter: deferred
+/// tools without their discovery tool are unreachable, and advertising unreachable tools in the
+/// prompt is exactly the drift the routing map exists to prevent.
 fn publish_active_tools(r: &ToolRegistry) {
-    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.names());
+    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.advertised_names());
+    let deferred = if r.get("tool_search").is_some() {
+        r.deferred_summary()
+    } else {
+        None
+    };
+    *DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = deferred;
 }
 
 /// The published live tool surface in advertised order, or `None` if no session registry has been
@@ -144,8 +164,47 @@ pub fn active_tool_surface() -> Option<Vec<String>> {
 }
 
 /// The published live tool surface as a set, for membership tests (the `<skills>` index filter).
+/// Includes DEFERRED tool names: a deferred tool is callable once discovered through `tool_search`,
+/// so a skill that `requires:` one must not be hidden by the deferral.
 pub fn active_tool_names() -> Option<HashSet<String>> {
-    active_tool_surface().map(|v| v.into_iter().collect())
+    let mut set: HashSet<String> = match active_tool_surface() {
+        Some(v) => v.into_iter().collect(),
+        None => return None,
+    };
+    if let Some((names, _)) = DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        set.extend(names.iter().cloned());
+    }
+    Some(set)
+}
+
+/// The prompt block for the DEFERRED surface, or `None` when nothing is deferred (the common case
+/// — zero bytes added). Appended to the top-level prompt's dynamic lane right after the routing
+/// map, whose "these are the only tools" claim it narrows: deferred integrations exist, and
+/// `tool_search` is the door. Byte-stable across turns of one session (same surface ⇒ same string),
+/// so it costs no cache churn.
+pub fn deferred_tools_note() -> Option<String> {
+    let guard = DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (names, by_server) = guard.as_ref()?;
+    let servers = by_server
+        .iter()
+        .map(|(s, n)| format!("{s} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "# Deferred integrations (via tool_search)\n\
+         Beyond the surface above, {} more MCP tool(s) are connected but not pre-loaded: {}. \
+         When the task needs one of these integrations, find it with `tool_search` (query by \
+         capability) — a match returns the full argument schema, and that tool is then callable \
+         directly by its exact name.\n",
+        names.len(),
+        servers,
+    ))
 }
 
 /// Swap the published surface, returning the previous value — TESTS ONLY.
@@ -156,6 +215,18 @@ pub fn active_tool_names() -> Option<HashSet<String>> {
 #[cfg(test)]
 pub(crate) fn swap_active_tools_for_test(next: Option<Vec<String>>) -> Option<Vec<String>> {
     let mut g = ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, next)
+}
+
+/// Swap the published DEFERRED surface — TESTS ONLY (same save/act/restore discipline as
+/// [`swap_active_tools_for_test`], same reason: process-global state).
+#[cfg(test)]
+pub(crate) fn swap_deferred_tools_for_test(
+    next: Option<crate::agent::tools::DeferredSurface>,
+) -> Option<crate::agent::tools::DeferredSurface> {
+    let mut g = DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     std::mem::replace(&mut *g, next)
 }
 
@@ -285,8 +356,28 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // `mcp_<server>_<tool>`. Empty (zero cost) when MCP is unconfigured. Top-level only, like
     // todo/process: sub-agents share the same live connections via the global manager but don't
     // need the surface advertised to them.
-    for t in crate::agent::mcp::discovered_tools() {
-        r.register(t);
+    //
+    // A server the deferral plan marked (pinned `defer: true`, or auto — the combined schema
+    // estimate over `deferAutoTokens`) registers its tools DEFERRED: dispatchable by name, absent
+    // from `defs()`. `tool_search` is their discovery door and registers only when at least one
+    // tool is deferred — a session with a small surface pays neither the tool nor its schema.
+    let mut deferred_entries: Vec<crate::agent::tool_search::DeferredEntry> = Vec::new();
+    for d in crate::agent::mcp::discovered_tools() {
+        if d.deferred {
+            let arc: std::sync::Arc<dyn Tool> = std::sync::Arc::from(d.tool);
+            r.register_deferred(arc.clone(), d.server.clone());
+            deferred_entries.push(crate::agent::tool_search::DeferredEntry {
+                tool: arc,
+                server: d.server,
+            });
+        } else {
+            r.register(d.tool);
+        }
+    }
+    if !deferred_entries.is_empty() {
+        r.register(Box::new(crate::agent::tool_search::ToolSearch::new(
+            deferred_entries,
+        )));
     }
     // CDP browser tools (OPT-IN: `--features browser`, default OFF). Top-level only; they connect
     // lazily to a local Chrome/Edge/Brave and return an actionable error if none is running.

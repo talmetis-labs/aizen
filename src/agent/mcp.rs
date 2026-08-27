@@ -53,6 +53,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct McpConfig {
     #[serde(default, rename = "mcpServers", alias = "servers")]
     pub servers: BTreeMap<String, ServerConfig>,
+    /// Auto-deferral budget, in estimated schema tokens. When the COMBINED schema cost of every
+    /// connected server exceeds this, the largest servers are deferred (biggest first) until the
+    /// advertised remainder fits — deferred tools are reached through `tool_search` instead of
+    /// riding on every request. Absent or `0` leaves auto-deferral OFF — it is opt-in, because a
+    /// grammar-constrained gateway cannot call a deferred tool at all (see
+    /// [`DEFER_AUTO_TOKENS_DEFAULT`]). Per-server `defer` pins win over this budget in both
+    /// directions.
+    #[serde(default, rename = "deferAutoTokens", alias = "defer_auto_tokens")]
+    pub defer_auto_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -78,6 +87,12 @@ pub struct ServerConfig {
     /// Tool names to drop (after `include`).
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Deferral pin. `true` → this server's tools never ride on the request (always reached via
+    /// `tool_search`); `false` → always advertised, however large; absent → the auto budget
+    /// (`deferAutoTokens`) decides. Deferred tools stay fully callable — only their schemas move
+    /// from the request to `tool_search` results.
+    #[serde(default)]
+    pub defer: Option<bool>,
     /// `"oauth"` → this remote needs OAuth 2.1 sign-in; the token is cached under
     /// `~/.aizen/mcp-tokens/<key>.json` and attached as a `Bearer` header (refreshed transparently).
     #[serde(default)]
@@ -1899,17 +1914,123 @@ fn qualified_name(server: &str, tool: &str) -> String {
     format!("{head}{suffix}")
 }
 
+// ───────────────────────────── schema deferral ─────────────────────────────
+
+/// Default auto-deferral budget: **0 — auto-deferral is opt-in.**
+///
+/// Deferral only works where the provider lets the model emit a tool call whose name is not in
+/// the request's `tools` array. Measured 2026-08-26 (A/B, same model, same forced prompt): a
+/// hosted gateway's free-tier model called an ADVERTISED `mcp_design_docs` on its first action,
+/// but with the server deferred it could not produce that call at all — every attempt decoded
+/// into an advertised tool instead, i.e. the gateway grammar-locks call names to the advertised
+/// set. First-party endpoints (Anthropic, OpenAI) accept undeclared names, but a default that
+/// silently breaks connected tools on constrained gateways is worse than a default that spends
+/// tokens; users opt in with `"deferAutoTokens": 4000` (or pin `"defer": true` per server) once
+/// they know their provider.
+const DEFER_AUTO_TOKENS_DEFAULT: usize = 0;
+
+/// The model-facing description of one MCP tool — shared by the live registration and the size
+/// estimate so the two can never measure different strings.
+fn tool_description(server: &str, t: &ToolMeta) -> String {
+    format!("[MCP {}] {}", server, t.description)
+}
+
+/// Estimated schema-token cost of advertising ONE server: its tools serialized exactly as request
+/// `ToolDef`s, length/4 — the same estimate the loop publishes for the HUD.
+fn server_defs_estimate(srv: &ServerHandle) -> usize {
+    srv.tools
+        .iter()
+        .map(|t| {
+            let def = crate::core::types::ToolDef::function(
+                qualified_name(&srv.name, &t.name),
+                tool_description(&srv.name, t),
+                t.input_schema.clone(),
+            );
+            serde_json::to_string(&def).map(|s| s.len() / 4).unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Which servers to defer, given `(name, estimated tokens, pin)` per server and the auto budget.
+///
+/// Pins are absolute: `Some(true)` defers, `Some(false)` advertises, regardless of size. Unpinned
+/// servers defer LARGEST-FIRST, but only while the combined advertised estimate still exceeds
+/// `threshold` — so one fat server tips itself into `tool_search` while the small ones beside it
+/// stay visible. Ties break by name; the whole decision is deterministic, which the per-turn
+/// registry rebuild (and the prompt built from it) depends on.
+fn plan_deferral(
+    servers: &[(String, usize, Option<bool>)],
+    threshold: usize,
+) -> std::collections::BTreeSet<String> {
+    let mut deferred: std::collections::BTreeSet<String> = servers
+        .iter()
+        .filter(|(_, _, pin)| *pin == Some(true))
+        .map(|(n, _, _)| n.clone())
+        .collect();
+    if threshold == 0 {
+        return deferred; // auto off — pins only
+    }
+    let mut total: usize = servers
+        .iter()
+        .filter(|(n, _, _)| !deferred.contains(n))
+        .map(|(_, est, _)| *est)
+        .sum();
+    let mut auto: Vec<&(String, usize, Option<bool>)> =
+        servers.iter().filter(|(_, _, pin)| pin.is_none()).collect();
+    auto.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (name, est, _) in auto {
+        if total <= threshold {
+            break;
+        }
+        deferred.insert(name.clone());
+        total = total.saturating_sub(*est);
+    }
+    deferred
+}
+
+/// The deferral decision for the CONNECTED servers: per-server pins + the auto budget from the
+/// effective mcp.json. Config is re-read here (two small files) so a pin edit takes effect on the
+/// next turn's registry rebuild without a reconnect.
+fn deferred_servers(mgr: &Manager) -> std::collections::BTreeSet<String> {
+    let cfg = match load_config() {
+        Ok(Some(c)) => c,
+        _ => McpConfig::default(),
+    };
+    let threshold = cfg.defer_auto_tokens.unwrap_or(DEFER_AUTO_TOKENS_DEFAULT);
+    let rows: Vec<(String, usize, Option<bool>)> = mgr
+        .servers
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                server_defs_estimate(s),
+                cfg.servers.get(&s.name).and_then(|sc| sc.defer),
+            )
+        })
+        .collect();
+    plan_deferral(&rows, threshold)
+}
+
+/// One MCP tool as handed to the registry builder: the wrapper itself, the server key it belongs
+/// to, and whether its schema is deferred to `tool_search` instead of riding on every request.
+pub struct Discovered {
+    pub tool: Box<dyn Tool>,
+    pub server: String,
+    pub deferred: bool,
+}
+
 /// All MCP tools, ready to register into a `ToolRegistry`. Empty (no cost) when MCP is off.
 /// Called from `default_registry_in` so the top-level agent surface gains them automatically.
 /// Qualified names are de-duplicated (across servers exposing the same tool name) so one collision
 /// can't silently shadow a tool or make the provider reject the whole tool array.
-pub fn discovered_tools() -> Vec<Box<dyn Tool>> {
+pub fn discovered_tools() -> Vec<Discovered> {
     ensure_manager();
     let guard = MANAGER.read().unwrap();
     let Some(mgr) = guard.as_ref() else {
         return Vec::new();
     };
-    let mut out: Vec<Box<dyn Tool>> = Vec::new();
+    let deferred = deferred_servers(mgr);
+    let mut out: Vec<Discovered> = Vec::new();
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for srv in &mgr.servers {
         for t in &srv.tools {
@@ -1936,21 +2057,25 @@ pub fn discovered_tools() -> Vec<Box<dyn Tool>> {
                 }
             }
             used.insert(qn.clone());
-            out.push(Box::new(McpTool {
-                qualified: qn,
+            out.push(Discovered {
+                tool: Box::new(McpTool {
+                    qualified: qn,
+                    server: srv.name.clone(),
+                    remote_name: t.name.clone(),
+                    description: tool_description(&srv.name, t),
+                    schema: t.input_schema.clone(),
+                    destructive: !t.read_only,
+                    conn: srv.conn.clone(),
+                    // Pin the server's tool-schema hash + connect-time generation (0). A reconnect
+                    // mid-turn re-lists the tools and bumps the generation to 1; if the re-listed hash
+                    // differs the live surface no longer matches what the model was shown, so the call
+                    // isn't replayed and the registry rebuilds next turn.
+                    built_generation: 0,
+                    built_schema_hash: srv.schema_hash,
+                }),
                 server: srv.name.clone(),
-                remote_name: t.name.clone(),
-                description: format!("[MCP {}] {}", srv.name, t.description),
-                schema: t.input_schema.clone(),
-                destructive: !t.read_only,
-                conn: srv.conn.clone(),
-                // Pin the server's tool-schema hash + connect-time generation (0). A reconnect
-                // mid-turn re-lists the tools and bumps the generation to 1; if the re-listed hash
-                // differs the live surface no longer matches what the model was shown, so the call
-                // isn't replayed and the registry rebuilds next turn.
-                built_generation: 0,
-                built_schema_hash: srv.schema_hash,
-            }));
+                deferred: deferred.contains(&srv.name),
+            });
         }
     }
     out
@@ -1992,6 +2117,7 @@ pub fn summary() -> String {
         "MCP generation {} · schema pinned per turn\n",
         mgr.generation
     ));
+    let deferred = deferred_servers(mgr);
     for srv in &mgr.servers {
         let info = srv
             .server_info
@@ -2010,14 +2136,20 @@ pub fn summary() -> String {
             ),
             Err(_) => (0, "busy"),
         };
+        let defer_mark = if deferred.contains(&srv.name) {
+            " · deferred → tool_search"
+        } else {
+            ""
+        };
         s.push_str(&format!(
-            "● {}{} — {} tool(s) · conn gen {} · {} · schema {:016x}\n",
+            "● {}{} — {} tool(s) · conn gen {} · {} · schema {:016x}{}\n",
             srv.name,
             info,
             srv.tools.len(),
             conn_gen,
             health,
             srv.schema_hash,
+            defer_mark,
         ));
         for t in &srv.tools {
             let ro = if t.read_only { " [read-only]" } else { "" };
@@ -2282,6 +2414,70 @@ mod tests {
         assert!(rem.allows("anything"));
         assert!(!rem.allows("danger"), "exclude drops it");
         assert!(!cfg.servers["off"].enabled);
+    }
+
+    #[test]
+    fn config_parses_defer_pins_and_the_auto_budget() {
+        let raw = r#"{
+          "deferAutoTokens": 9000,
+          "mcpServers": {
+            "big":   {"command": "x", "defer": true},
+            "small": {"command": "y", "defer": false},
+            "auto":  {"command": "z"}
+          }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.defer_auto_tokens, Some(9000));
+        assert_eq!(cfg.servers["big"].defer, Some(true));
+        assert_eq!(cfg.servers["small"].defer, Some(false));
+        assert_eq!(cfg.servers["auto"].defer, None, "absent = auto");
+        // The snake_case alias parses too (hand-written configs).
+        let alias: McpConfig =
+            serde_json::from_str(r#"{"defer_auto_tokens": 0, "mcpServers": {}}"#).unwrap();
+        assert_eq!(alias.defer_auto_tokens, Some(0));
+    }
+
+    #[test]
+    fn plan_deferral_pins_win_and_auto_defers_largest_first() {
+        let rows = |v: &[(&str, usize, Option<bool>)]| -> Vec<(String, usize, Option<bool>)> {
+            v.iter().map(|(n, e, p)| (n.to_string(), *e, *p)).collect()
+        };
+
+        // Under budget: nothing auto-defers.
+        let plan = plan_deferral(&rows(&[("a", 1000, None), ("b", 2000, None)]), 4000);
+        assert!(plan.is_empty());
+
+        // Over budget: the LARGEST unpinned server goes first, and deferral stops as soon as the
+        // advertised remainder fits — the small server stays visible.
+        let plan = plan_deferral(&rows(&[("small", 500, None), ("big", 30_000, None)]), 4000);
+        assert!(plan.contains("big"));
+        assert!(!plan.contains("small"), "small stays advertised: {plan:?}");
+
+        // A `defer: false` pin keeps even a huge server on the request; the budget then can only
+        // shed the unpinned one.
+        let plan = plan_deferral(
+            &rows(&[("huge", 30_000, Some(false)), ("mid", 6000, None)]),
+            4000,
+        );
+        assert!(!plan.contains("huge"), "pinned-visible wins over the budget");
+        assert!(plan.contains("mid"));
+
+        // A `defer: true` pin defers a tiny server even when the total fits.
+        let plan = plan_deferral(&rows(&[("tiny", 100, Some(true)), ("b", 200, None)]), 4000);
+        assert!(plan.contains("tiny"));
+        assert!(!plan.contains("b"));
+
+        // Threshold 0 = auto OFF: pins only, however big the surface.
+        let plan = plan_deferral(
+            &rows(&[("big", 50_000, None), ("pinned", 10, Some(true))]),
+            0,
+        );
+        assert!(!plan.contains("big"));
+        assert!(plan.contains("pinned"));
+
+        // Equal sizes: ties break by name, deterministically.
+        let plan = plan_deferral(&rows(&[("bb", 3000, None), ("aa", 3000, None)]), 4000);
+        assert_eq!(plan.iter().collect::<Vec<_>>(), vec!["aa"]);
     }
 
     #[test]
@@ -2623,6 +2819,7 @@ mod tests {
             enabled: true,
             include: vec![],
             exclude: vec![],
+            defer: None,
             auth: None,
             oauth: None,
         };

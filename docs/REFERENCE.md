@@ -74,6 +74,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` compacts this repo's store (packs loose objects — a save does it automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
 | `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
+| `/theme [moonlight\|lanes]` | colour theme: `moonlight` (default) keeps the calm all-silver look; `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal. Bare `/theme` lists both with a live colour swatch; the choice persists |
 | `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
 
 **Input shortcuts** — on a normally typed message (not with an image):
@@ -591,6 +592,36 @@ At startup `aizen` connects each enabled server, lists its tools, and exposes ea
 **approval-gated by default** (unless the server marks a tool read-only). A pure-Rust client — no
 Node/Python MCP SDK, no extra runtime; the single static binary is preserved. `aizen mcp list` or
 **`/mcp`** shows the manager/connection generation, sanitized health, pinned schema hash, and tools.
+
+**Tool Search — big surfaces stop bloating the context.** Every advertised tool's JSON Schema rides
+on *every* request, so a few schema-heavy servers (GitHub-sized) can burn thousands of tokens per
+turn before a single call is made. Aizen defers them instead: a deferred server's tools are still
+fully callable, but their schemas leave the request — the agent discovers them through a small
+`tool_search` tool whose results carry each match's full schema in-band, then calls the found tool
+directly by name. The request's tool list stays byte-stable all session, so the provider's prefix
+cache is never invalidated by connecting more integrations, and this works on ANY endpoint (it is
+client-side — no provider feature required). Control it per server with `"defer": true` (always
+deferred) / `"defer": false` (always advertised), or opt into the automatic budget: set
+`"deferAutoTokens"` (top-level in mcp.json) and when the combined schema estimate of all connected
+servers exceeds it, the **largest servers defer first** until the advertised remainder fits.
+`/mcp` marks a deferred server with `deferred → tool_search`.
+
+**Deferral is opt-in — check your provider first.** It requires an endpoint that lets the model
+call a tool whose name is not in the request's `tools` array. First-party APIs (Anthropic, OpenAI)
+accept that; some hosted gateways grammar-lock generated call names to the advertised set, and
+there a deferred tool can never be called (measured A/B on one such gateway: the same model called
+the tool instantly when advertised and could not produce the call at all when deferred). That is
+why nothing defers until you set `deferAutoTokens` or pin a server `"defer": true`.
+
+```json
+{
+  "deferAutoTokens": 4000,
+  "mcpServers": {
+    "github": { "url": "https://api.githubcopilot.com/mcp/", "auth": "oauth", "defer": true },
+    "time":   { "command": "uvx", "args": ["mcp-server-time"], "defer": false }
+  }
+}
+```
 
 MCP schemas are **pinned for one agent run**. If a server emits `notifications/tools/list_changed`,
 Aizen defers the new schema until the next fresh user message instead of mutating the tool registry

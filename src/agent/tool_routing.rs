@@ -272,7 +272,9 @@ impl Group {
 /// routing map are both views over it, which is what stops the config bundles and the prompt from
 /// disagreeing about what a tool is.
 pub fn lane_for(name: &str) -> Option<Lane> {
-    if name.starts_with("mcp_") {
+    // `tool_search` discovers DEFERRED MCP tools, so it lives (and is config-filtered) with them:
+    // disabling the `mcp` bundle removes the door along with the rooms.
+    if name.starts_with("mcp_") || name == "tool_search" {
         return Some(Lane::Mcp);
     }
     Some(match name {

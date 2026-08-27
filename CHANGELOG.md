@@ -8,6 +8,26 @@ development log lives in that monorepo's history.
 ## [Unreleased]
 
 ### Added
+- **Tool Search — dozens of MCP connectors no longer bloat every request.** Connecting a
+  schema-heavy server (GitHub-sized: tens of tools, thousands of schema tokens) used to tax every
+  single turn, called or not, and enough of them crowded real context out of the window. Now the
+  deferral plan keeps the request small: a server pinned `"defer": true` in mcp.json — or picked by
+  the opt-in automatic budget (`"deferAutoTokens"` estimated tokens; largest servers defer first
+  until the advertised remainder fits) — registers its tools as *deferred*: fully callable, but
+  their schemas leave the request. The agent reaches them through a
+  new `tool_search` tool (searches name/server/description/argument names; no query = browse) whose
+  results carry each match's full schema in-band, then calls the found tool directly by its exact
+  name. Because schemas travel in results rather than the `tools` array, that array stays
+  byte-stable all session — connecting more integrations never invalidates the provider's prefix
+  cache — and the mechanism is client-side, so it works on every OpenAI-compatible endpoint. The
+  top-level prompt gains a two-line "Deferred integrations" note (per-server counts, nothing more),
+  `/mcp` marks deferred servers with `deferred → tool_search`, a skill that `requires:` a deferred
+  tool stays applicable, and disabling the `mcp` toolset removes the door along with the rooms.
+  Deferral is deliberately opt-in (nothing defers until `deferAutoTokens` is set or a server is
+  pinned): it needs a provider that accepts a call to an unadvertised tool name, and a measured
+  A/B on one hosted gateway showed its decoder grammar-locking call names to the advertised set —
+  the same model called the tool instantly when advertised and could not produce the call when
+  deferred.
 - **"Continue the most recent session" works again — and this time the model can see it.** Until
   0.5.0 the request worked by accident: every autosave duplicated the transcript into a fixed
   `last.json` the model could read blind, and retiring that pointer (right for provenance) silently
@@ -23,6 +43,18 @@ development log lives in that monorepo's history.
   now carries `scratch: <path>` (per run, under the OS temp dir; sub-agents share the parent's),
   both prompt tiers direct throwaway files there — the strict tier previously had NO cleanup
   guidance at all — and abandoned scratch dirs are swept a week after their run dies.
+- **`/theme` — an opt-in `lanes` colour theme.** The default look is unchanged: `moonlight`, the
+  calm all-silver transcript. `/theme lanes` switches to a theme where every kind of work has its
+  own colour, folded straight from the one name→capability routing table: blue = reading/searching
+  the repo, gold = mutating files (deliberately the same warm family as the yolo chip and warnings
+  — "this changes things"), mauve = shell and processes, cyan = the web/browser/MCP, violet =
+  memory/skills/persona, pink = sub-agents and questions to you, teal = plan and checkpoints. Under
+  `lanes`, tool rows and the approval prompt tint the icon + name by lane, the working caption
+  types out in the running tool's hue (the sidebar's "Now" agrees), the plan checklist box wears
+  the plan lane's teal frame, and a diff box's title goes edit-gold to match the row that produced
+  it. Unknown tools stay silver; results keep their meaning — green ok, salmon error — and no lane
+  colour collides with either. Bare `/theme` lists both themes with a live swatch; the choice
+  persists (`"theme": "lanes"`) and switching repaints the transcript in place.
 
 ### Changed
 - **The edit diff box grew into side-by-side review panes.** Wide enough, an edit's boxed preview

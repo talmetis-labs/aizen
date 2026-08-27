@@ -34,6 +34,7 @@ pub mod search;
 pub mod task_tool;
 pub mod todo;
 pub mod tool_routing;
+pub mod tool_search;
 pub mod tools;
 pub mod toolsets;
 pub mod verify_gate;
@@ -425,6 +426,14 @@ pub fn build_top_level_system_prompt_bundle(
     {
         bundle.dynamic.push('\n');
         bundle.dynamic.push_str(&block);
+        // The DEFERRED half of the surface, when one exists: connected MCP tools whose schemas
+        // ride `tool_search` results instead of the request. Appended directly under the map it
+        // narrows (the map says "these are the only tools"; this names the exception and the
+        // door). Same lane, same stability: byte-identical while the surface is unchanged.
+        if let Some(note) = builtin::deferred_tools_note() {
+            bundle.dynamic.push('\n');
+            bundle.dynamic.push_str(&note);
+        }
     }
     // Project conventions (AGENTS.md / CLAUDE.md), top-level only: coder turns inherit the repo's
     // build/test commands and house rules. Kept in the stable lane so they don't thrash the cache
