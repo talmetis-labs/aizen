@@ -1,17 +1,30 @@
 //! The Pantheon — aizen's built-in sub-agent roles as ONE declarative table.
 //!
-//! Six roles: `argus` (searcher) · `metis` (planner) · `daedalus` (coder) · `nemesis` (reviewer) ·
-//! `themis` (tester) · `clio` (librarian). Each entry carries the role's name, the legacy names
-//! still accepted on the wire, the one-line brief for the sub-agent prompt, and the capability
-//! grants beyond the shared read-only base. `builtin::role_registry`, the prompt's role brief, and
-//! the `<project_context>` switch all derive from this table, so a new role is one entry here —
-//! not four hand-synced `match` arms drifting apart.
+//! Seven roles: `argus` (searcher) · `metis` (planner) · `daedalus` (coder) · `nemesis`
+//! (reviewer) · `themis` (tester) · `clio` (librarian) · `mnemosyne` (historian — session and
+//! memory recall). Each entry carries the role's name, the legacy names still accepted on the
+//! wire, the one-line brief for the sub-agent prompt, and the capability grants beyond the shared
+//! read-only base. `builtin::role_registry`, the prompt's role brief, the `<project_context>`
+//! switch, and the writer/parallelism classification all derive from this table, so a new role is
+//! one entry here — not four hand-synced `match` arms drifting apart.
 //!
 //! Naming: the mythological name is the product identity; the FUNCTION is what a routing model
 //! needs. Every brief therefore leads with `name (function) —` so the semantics travel with the
 //! name into every prompt and result header. Legacy aliases (`coder`, `planner`, `reviewer`,
 //! `tester`) are kept **forever**: an alias is one table row, and dropping it would break saved
 //! workflow specs, user scripts, and `mcp serve`'s defaults for zero benefit.
+
+/// The three access classes a dispatch can hold. Derived from the grant flags
+/// ([`RoleProfile::access`]) so classification can never disagree with the actual registry:
+/// - `ReadOnly` → safe to fan out in parallel;
+/// - `Execute` → may run processes but cannot edit source; NOT parallel-safe on a shared tree;
+/// - `Write` → edits files and runs commands; at most one per workflow (the singular writer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessClass {
+    ReadOnly,
+    Execute,
+    Write,
+}
 
 /// One built-in sub-agent role. Capability flags are grants ON TOP of the shared read-only base
 /// (`builtin::subagent_read_only_base`): memory + read/glob/search + code intel + `git_inspect` +
@@ -32,9 +45,32 @@ pub struct RoleProfile {
     pub shell: bool,
     /// File mutation: `file_edit`/`file_write`/`file_move` + `skill_save`/refine + symbolic edit.
     pub edit: bool,
+    /// `session_recall` — read-only access to recent same-project conversations (the historian's
+    /// instrument; other roles get memory search but not transcript recall).
+    pub history: bool,
     /// Include `<project_context>` (build/test conventions) — the roles whose job is building
     /// and testing pay for it; investigation roles don't.
     pub project_context: bool,
+    /// Default total step budget for a dispatch that doesn't pass `max_steps`. One value today,
+    /// but it lives here so the profile — not a scattered constant — answers the question.
+    pub default_max_steps: usize,
+    /// The role's working-method prompt (embedded at compile time from `roles/<name>.md`),
+    /// rendered inside `<role>` after the brief. A sub-agent prompt is paid uncached per
+    /// dispatch, so each file stays tight: method, then the report contract — no lore.
+    pub prompt: &'static str,
+}
+
+impl RoleProfile {
+    /// The typed access class, derived from the grant flags (see [`AccessClass`]).
+    pub fn access(&self) -> AccessClass {
+        if self.edit {
+            AccessClass::Write
+        } else if self.shell {
+            AccessClass::Execute
+        } else {
+            AccessClass::ReadOnly
+        }
+    }
 }
 
 /// The Pantheon, in dispatch-frequency order (the order routing surfaces list them in).
@@ -47,7 +83,10 @@ pub const ROLES: &[RoleProfile] = &[
         web: true,
         shell: true,
         edit: true,
+        history: false,
         project_context: true,
+        default_max_steps: 25,
+        prompt: include_str!("roles/daedalus.md"),
     },
     RoleProfile {
         name: "argus",
@@ -59,7 +98,10 @@ pub const ROLES: &[RoleProfile] = &[
         web: false,
         shell: false,
         edit: false,
+        history: false,
         project_context: false,
+        default_max_steps: 25,
+        prompt: include_str!("roles/argus.md"),
     },
     RoleProfile {
         name: "metis",
@@ -70,7 +112,10 @@ pub const ROLES: &[RoleProfile] = &[
         web: true,
         shell: false,
         edit: false,
+        history: false,
         project_context: false,
+        default_max_steps: 25,
+        prompt: include_str!("roles/metis.md"),
     },
     RoleProfile {
         name: "nemesis",
@@ -82,7 +127,10 @@ pub const ROLES: &[RoleProfile] = &[
         web: true,
         shell: false,
         edit: false,
+        history: false,
         project_context: false,
+        default_max_steps: 25,
+        prompt: include_str!("roles/nemesis.md"),
     },
     RoleProfile {
         name: "themis",
@@ -93,7 +141,10 @@ pub const ROLES: &[RoleProfile] = &[
         web: true,
         shell: true,
         edit: false,
+        history: false,
         project_context: true,
+        default_max_steps: 25,
+        prompt: include_str!("roles/themis.md"),
     },
     RoleProfile {
         name: "clio",
@@ -104,7 +155,22 @@ pub const ROLES: &[RoleProfile] = &[
         web: true,
         shell: false,
         edit: false,
+        history: false,
         project_context: false,
+        default_max_steps: 25,
+        prompt: include_str!("roles/clio.md"),
+    },
+    RoleProfile {
+        name: "mnemosyne",
+        aliases: &["historian"],
+        brief: "mnemosyne (historian) — recover prior decisions and project/session history: what                 was decided, when, and whether it was later revised. Tools: memory search/list +                 session_recall (recent same-project conversations) + read/glob files; READ-ONLY:                 no web, no edits, no shell, no memory writes.",
+        web: false,
+        shell: false,
+        edit: false,
+        history: true,
+        project_context: false,
+        default_max_steps: 25,
+        prompt: include_str!("roles/mnemosyne.md"),
     },
 ];
 
@@ -130,6 +196,7 @@ mod tests {
             ("reviewer", "nemesis"),
             ("tester", "themis"),
             ("librarian", "clio"),
+            ("historian", "mnemosyne"),
         ] {
             assert_eq!(canonical(legacy).map(|p| p.name), Some(canon), "{legacy}");
             assert_eq!(canonical(canon).map(|p| p.name), Some(canon), "{canon}");
@@ -141,6 +208,21 @@ mod tests {
         }
         assert!(canonical("weird").is_none(), "unknown stays unknown");
         assert!(canonical("").is_none());
+    }
+
+    #[test]
+    fn every_role_ships_a_tight_working_method_prompt() {
+        for p in ROLES {
+            assert!(p.prompt.contains("## Working method"), "{}", p.name);
+            assert!(p.prompt.contains("## Report"), "{}", p.name);
+            // Paid uncached on every dispatch — a role prompt that balloons is a cost regression.
+            assert!(
+                p.prompt.len() < 2_000,
+                "{}: {} bytes — keep it tight",
+                p.name,
+                p.prompt.len()
+            );
+        }
     }
 
     #[test]
@@ -182,6 +264,28 @@ mod tests {
                 "{}: project context rides with build/test capability",
                 p.name
             );
+        }
+    }
+
+    #[test]
+    fn access_classes_derive_from_the_grants() {
+        for p in ROLES {
+            let want = match p.name {
+                "daedalus" => AccessClass::Write,
+                "themis" => AccessClass::Execute,
+                _ => AccessClass::ReadOnly,
+            };
+            assert_eq!(p.access(), want, "{}", p.name);
+        }
+        // Exactly one Write in the whole table — the singular-writer invariant at the source.
+        let writers = ROLES
+            .iter()
+            .filter(|p| p.access() == AccessClass::Write)
+            .count();
+        assert_eq!(writers, 1);
+        // History (session_recall) is the historian's instrument alone.
+        for p in ROLES {
+            assert_eq!(p.history, p.name == "mnemosyne", "{}", p.name);
         }
     }
 }

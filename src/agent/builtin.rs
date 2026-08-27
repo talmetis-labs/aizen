@@ -638,6 +638,12 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
     if p.web {
         register_subagent_web(&mut r);
     }
+    if p.history {
+        // The historian's instrument: read-only recall of recent same-project conversations.
+        // Deliberately NOT in the shared base — transcript access is mnemosyne's job, and every
+        // other role paying its schema (and temptation) bought nothing.
+        r.register(Box::new(SessionRecall));
+    }
     if p.shell {
         r.register(Box::new(ShellRun::new(root.to_path_buf())));
         r.register(Box::new(crate::agent::process::Process::new(
@@ -656,12 +662,14 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
 }
 
 /// Build a tool registry for a dispatched SPECIALIST agent (see [`crate::agents`]). Same read-only
-/// base as [`role_registry`], plus a destructive scope derived from the persona's `tools:` frontmatter:
-/// - EMPTY `tools:` → **coder scope** (file_edit + file_write + file_move + shell_run +
-///   skill_save) — the locked default; no wider than the trusted `coder` sub-agent (the `cmd_guard`
-///   floor + per-op approval still apply underneath).
+/// base as [`role_registry`] plus web research, plus a destructive scope derived from the persona's
+/// `tools:` frontmatter:
+/// - EMPTY `tools:` → **read-only** (the safe default; write/process capability must be asked for
+///   explicitly — a card that relied on the old implicit coder scope adds `tools: Edit, Bash`).
 /// - non-empty `tools:` → exactly those, mapped by name (Claude-Code casing accepted via the alias
-///   map in [`canonical_subagent_tool`]; duplicates collapsed).
+///   map in [`canonical_subagent_tool`]; duplicates collapsed; a shell grant carries the scoped
+///   `process` pool with it, the same pairing the built-in roles get). The `cmd_guard` floor +
+///   per-op approval still apply underneath every grant.
 ///
 /// Capability invariants (a third-party persona body is UNTRUSTED): this NEVER grants `task`
 /// (recursion guard) or the top-level-only tools `todo`/`process`/`clarify`/`persona_create`/`mcp_*`
@@ -673,15 +681,12 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
     // `tools:` names only DESTRUCTIVE grants, so there is no way for a card to ask for web back
     // if the base dropped it. Role-level web trimming is a built-in-role concern (`argus`).
     register_subagent_web(&mut r);
+    // A card with NO `tools:` used to receive the full coder scope implicitly — a third-party
+    // persona whose author never asked for edit/shell got both anyway. The safe default is now
+    // READ-ONLY: write and process capability must be requested explicitly in frontmatter
+    // (`tools: Edit, Bash, …`). Older cards that relied on the implicit scope add one line —
+    // see the migration note in docs/REFERENCE.md.
     if def.tools.is_empty() {
-        // Locked default: coder scope.
-        r.register(Box::new(FileEdit::new(root.to_path_buf())));
-        r.register(Box::new(FileWrite::new(root.to_path_buf())));
-        r.register(Box::new(FileMove::new(root.to_path_buf())));
-        r.register(Box::new(ShellRun::new(root.to_path_buf())));
-        r.register(Box::new(SkillSave));
-        register_skill_refine(&mut r);
-        register_subagent_lsp_write(&mut r, root);
         return r;
     }
     let mut granted: HashSet<&'static str> = HashSet::new();
@@ -700,7 +705,15 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
             }
             "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
             "file_move" => r.register(Box::new(FileMove::new(root.to_path_buf()))),
-            "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
+            "shell_run" => {
+                r.register(Box::new(ShellRun::new(root.to_path_buf())));
+                // The scoped process pool rides with shell (same pairing as the built-in roles):
+                // shell_run's timeout message says "re-run it through process", and advice a
+                // child cannot act on is worse than none.
+                r.register(Box::new(crate::agent::process::Process::new(
+                    root.to_path_buf(),
+                )));
+            }
             "skill_save" => {
                 // A persona granted skill authoring gets the refine companion too (gated on any
                 // skill existing — see register_skill_refine), so it can evolve, not just mint.
@@ -5899,6 +5912,7 @@ mod tests {
             "nemesis",
             "themis",
             "clio",
+            "mnemosyne",
             "coder",
             "tester",
             "planner",
@@ -5960,6 +5974,7 @@ mod tests {
             "metis",
             "nemesis",
             "clio",
+            "mnemosyne",
             "planner",
             "reviewer",
             "unknown-role",
@@ -5983,16 +5998,19 @@ mod tests {
             "nemesis",
             "themis",
             "clio",
+            "mnemosyne",
             "unknown-role",
         ] {
             let r = role_registry(role, &root);
             assert!(r.get("git_inspect").is_some(), "{role} has git_inspect");
         }
-        // Web research is a per-role grant now: argus works entirely inside the repository.
-        assert!(
-            role_registry("argus", &root).get("web_search").is_none(),
-            "argus has no web — its job is repo-local"
-        );
+        // Web research is a per-role grant now: argus and mnemosyne work entirely locally.
+        for role in ["argus", "mnemosyne"] {
+            assert!(
+                role_registry(role, &root).get("web_search").is_none(),
+                "{role} has no web — its job is local"
+            );
+        }
         for role in ["metis", "nemesis", "themis", "clio", "daedalus"] {
             assert!(
                 role_registry(role, &root).get("web_search").is_some(),
@@ -6003,7 +6021,44 @@ mod tests {
         assert!(role_registry("unknown-role", &root)
             .get("web_search")
             .is_none());
-        // Legacy aliases land on the same scopes as their canonical names.
+        // session_recall is the historian's instrument alone — and mnemosyne stays read-only
+        // (the memory WRITE trio is top-level only; nothing here may mutate memory).
+        assert!(role_registry("mnemosyne", &root)
+            .get("session_recall")
+            .is_some());
+        for role in ["argus", "metis", "nemesis", "themis", "clio", "daedalus"] {
+            assert!(
+                role_registry(role, &root).get("session_recall").is_none(),
+                "{role} has no transcript recall"
+            );
+        }
+        for tool in ["memory_save", "memory_update", "memory_forget"] {
+            assert!(
+                role_registry("mnemosyne", &root).get(tool).is_none(),
+                "mnemosyne cannot mutate memory ({tool})"
+            );
+        }
+        assert!(
+            crate::agent::task_tool::dispatch_is_read_only(&role_registry("mnemosyne", &root)),
+            "mnemosyne is read-only → fans out"
+        );
+        // Legacy aliases land on the same scopes as their canonical names. Compared on the
+        // STABLE surface only: skill_*/lsp_*/symbol_*/repo_map registration is gated on global
+        // state (skills existing, LSP enabled) that parallel tests legitimately flip between the
+        // two builds — equality over those names is a race, not a property of the role table.
+        let stable_names = |role: &str| -> Vec<String> {
+            role_registry(role, &root)
+                .names()
+                .into_iter()
+                .filter(|n| {
+                    !n.starts_with("skill_")
+                        && !n.starts_with("lsp_")
+                        && !n.starts_with("symbol_")
+                        && n != "repo_map"
+                        && n != "read_symbol"
+                })
+                .collect()
+        };
         for (legacy, canon) in [
             ("coder", "daedalus"),
             ("planner", "metis"),
@@ -6011,8 +6066,8 @@ mod tests {
             ("tester", "themis"),
         ] {
             assert_eq!(
-                role_registry(legacy, &root).names(),
-                role_registry(canon, &root).names(),
+                stable_names(legacy),
+                stable_names(canon),
                 "{legacy} == {canon}"
             );
         }

@@ -8,6 +8,36 @@ development log lives in that monorepo's history.
 ## [Unreleased]
 
 ### Added
+- **The Pantheon — seven sub-agent roles, declared in one table.** The four generic sub-agent
+  roles grow into seven named ones: `argus` finds code (read-only, repo-local — no web), `metis`
+  plans, `daedalus` implements (the only role that edits), `nemesis` reviews, `themis` runs
+  tests/builds (shell, no edit), `clio` researches dependencies and docs on the web, and
+  `mnemosyne` recovers prior decisions from memory and session history (read-only recall — the
+  only role holding `session_recall`, and it cannot write memory). Each role carries a short
+  embedded working-method prompt with a fixed report shape (findings with severity for nemesis, a
+  PASS/FAIL verdict with commands for themis, a chronology with superseded decisions for
+  mnemosyne, …), not just a one-line brief — and everything about a role — name, legacy alias,
+  brief, prompt, tool grants, access class (read-only / execute / write), step budget,
+  project-context switch — lives in a single declarative table (`src/agent/roles.rs`), so the
+  tool scoping and the prompt can no longer drift apart. The legacy names
+  `coder`/`planner`/`reviewer`/`tester` remain accepted everywhere, forever (result headers
+  answer with the canonical name); saved workflow specs keep working unchanged.
+  The safety edges that went with the rename:
+  - every sub-agent scope gains `git_inspect`, a closed read-only git window
+    (status/log/diff/show/blame, exec-form argv through the sandbox runner — no shell), so a
+    reviewer can finally read the diff it was dispatched to review;
+  - an `agent` slug or `role` that doesn't resolve is refused with recovery guidance instead of
+    silently running under a substituted scope — and a dispatch with NO role now defaults to
+    read-only `argus`, never a writer;
+  - a specialist card with no `tools:` line runs READ-ONLY (it used to inherit the full coder
+    scope implicitly); cards that edit or run commands now say so in frontmatter
+    (`tools: Edit, Bash` — a shell grant carries the scoped `process` pool);
+  - telegram/notify left the sub-agent toolset — reaching the user is the parent's channel.
+- **Workflow tasks carry the same contract a `task` dispatch does.** Per-task `boundaries`,
+  `expected_output`, `max_steps`, and `expects` now travel from a workflow spec into each child —
+  the same `<contract>` block, the same step-budget clamps, and the same `expects` validation
+  (one repair attempt; the task's status reports `json:ok`/`json:invalid` honestly) as the
+  single-dispatch path, built by the same code rather than a parallel implementation.
 - **Tool Search — dozens of MCP connectors no longer bloat every request.** Connecting a
   schema-heavy server (GitHub-sized: tens of tools, thousands of schema tokens) used to tax every
   single turn, called or not, and enough of them crowded real context out of the window. Now the

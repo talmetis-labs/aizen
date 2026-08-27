@@ -406,20 +406,41 @@ Behavior worth knowing:
 - **Verify gate** — after an editing run, a fast typecheck (`cargo check` / a `typecheck`
   npm script / `npx tsc --noEmit`) runs once before the agent reports done; on failure the
   errors are fed back for one fix turn. Skips silently for unrecognized projects.
-- **Sub-agents** — the agent can call the `task` tool to delegate a self-contained sub-task to
-  a fresh role-scoped sub-agent (`coder`/`tester`/`planner`/`reviewer`). Single depth: a
-  sub-agent cannot spawn further sub-agents.
+- **Sub-agents (the Pantheon)** — the agent can call the `task` tool to delegate a self-contained
+  sub-task to a fresh role-scoped sub-agent. Seven built-in roles, each with its own tool scope
+  and embedded working method: `argus` (searcher — read-only, repo-local), `metis` (planner —
+  read-only), `daedalus` (coder — the only role that edits; read/edit/shell), `nemesis` (reviewer
+  — read-only), `themis` (tester — shell, no edit), `clio` (librarian — read-only web research),
+  `mnemosyne` (historian — read-only memory + session recall, no web). Every role gets
+  `git_inspect`, a read-only git window (status/log/diff/show/blame), so a reviewer can see the
+  diff it reviews without holding a shell. The legacy names `coder`/`planner`/`reviewer`/`tester`
+  are still accepted everywhere a role is named (deprecated: result headers answer with the
+  canonical name). An unknown `agent` or `role` is refused with the real list — never silently
+  substituted. With neither given, the dispatch runs as `argus` (the safe read-only default;
+  editing must be asked for by name: `role=daedalus`). Read-only dispatches fan out in parallel;
+  write-capable ones stay serial. Single depth: a sub-agent cannot spawn further sub-agents.
+  Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
+  change flow is one `daedalus` implementation followed by separate `themis` (verify) and
+  `nemesis` (review) dispatches.
+- **Specialist cards** — markdown personas under `.aizen/agents/` / `.claude/agents/` still
+  dispatch via `task(agent="<slug>")`. **Migration note:** a card with no `tools:` line now runs
+  READ-ONLY (it used to receive the full coder scope implicitly). A card that needs to edit or
+  run commands must say so in frontmatter — add e.g. `tools: Edit, Bash` (a shell grant carries
+  the background `process` pool with it). Runtime capability always comes from the resolved tool
+  registry, never from the card's prose.
 - **Clarify, don't guess** — when a choice is genuinely ambiguous and a wrong guess would waste
   real work, the agent calls `clarify` to ask ONE question; the turn pauses and your next message
   is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention with the
   input box). For low-stakes choices it assumes and states rather than stalling.
 - **Web research** — `web_search` (needs a free Tavily key — set `TAVILY_API_KEY`) finds pages; `web_fetch` GETs a URL and
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
-  seed URL (see `aizen crawl` below). Read-only; available to every role.
+  seed URL (see `aizen crawl` below). Read-only; available to every role except `argus`, whose
+  whole job is inside the repository.
 
 ### `aizen workflow <spec.json>` — fan-out + synthesis
-Run several role-scoped sub-agents concurrently (bounded to 5), then merge their results into
-one answer (mixture-of-agents). See [examples/review.workflow.json](../examples/review.workflow.json):
+Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
+in-REPL dispatches), then merge their results into one answer (mixture-of-agents). See
+[examples/review.workflow.json](../examples/review.workflow.json):
 ```bash
 aizen workflow examples/review.workflow.json
 ```
@@ -427,13 +448,23 @@ Spec shape:
 ```jsonc
 {
   "name": "review-changes",
-  "tasks": [ { "id": "bugs", "role": "reviewer", "prompt": "...", "model": "optional-per-task" }, ... ],
+  "tasks": [ {
+    "id": "bugs", "role": "nemesis", "prompt": "...",
+    "model": "optional-per-task",
+    // optional dispatch contract — same semantics as the task tool:
+    "boundaries": "Do not edit files",
+    "expected_output": "Findings with severity and file:line evidence",
+    "max_steps": 25,                      // total step budget for this child (cap 80)
+    "expects": { "type": "object" }       // JSON Schema the child's answer must satisfy
+  }, ... ],
   "synthesis": { "model": "optional-override", "prompt": "optional merge instruction" }
 }
 ```
-Roles set each sub-agent's tools (coder = read/edit/shell, tester = shell no edit,
-planner/reviewer = read-only). A failed task never aborts the workflow — its result is captured
-and the synthesis still runs. The synthesis uses `AIZEN_MODEL` unless `synthesis.model` overrides it.
+Roles set each sub-agent's tools (see the Pantheon above; omitted role = `nemesis`, read-only —
+legacy role names in existing specs keep working, unknown ones are refused). The contract fields
+travel INTO the child's prompt exactly as they do on a `task` dispatch; an `expects` schema is
+validated (one repair attempt) and the task's status carries `json:ok`/`json:invalid`. A failed
+task never aborts the workflow — its result is captured and the synthesis still runs. The synthesis uses `AIZEN_MODEL` unless `synthesis.model` overrides it.
 **Model diversity (mixture-of-agents):** each task may set its own `model` (e.g. a cheap model
 scouts, a strong one reviews) — else the workflow default. `--trace <path>` writes a JSON audit of
 the fan-out (per-task model + outcome + the synthesis model).

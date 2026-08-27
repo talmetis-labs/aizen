@@ -336,7 +336,8 @@ pub(crate) enum McpCmd {
     /// aizen's specialists. Serves the repo it is started in.
     Serve {
         /// Allow dispatches that can edit files or run shell. Without it the server refuses any
-        /// coder/tester role and any specialist whose card grants a destructive tool.
+        /// write-capable role (daedalus/themis — legacy coder/tester) and any specialist whose
+        /// card grants a destructive tool.
         #[arg(long)]
         yes: bool,
     },

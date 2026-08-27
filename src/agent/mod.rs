@@ -3600,10 +3600,10 @@ fn subagent_target(args: &serde_json::Value) -> String {
     let who = field("agent")
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        // Mirrors `resolve_dispatch`: absent/blank `role` runs as `coder`, so the line must say
-        // `coder` rather than go silent about a dispatch that CAN write.
+        // Mirrors `resolve_dispatch`: absent/blank `role` runs as `argus`, the safe read-only
+        // default — a dispatch that needs to write must say `daedalus` out loud.
         .or_else(|| field("role").map(str::trim).filter(|s| !s.is_empty()))
-        .unwrap_or("coder");
+        .unwrap_or("argus");
     let subject = subagent_subject(args, 48);
     if subject.is_empty() {
         who.to_string()
@@ -5450,8 +5450,8 @@ mod tests {
             "{t:?}"
         );
         assert!(
-            t.starts_with("coder"),
-            "absent role defaults to coder: {t:?}"
+            t.starts_with("argus"),
+            "absent role defaults to argus (the safe read-only scope): {t:?}"
         );
         assert!(!t.contains("prompt"), "no arg-name leakage: {t:?}");
         assert!(!t.contains('{'), "no JSON dump: {t:?}");
@@ -5464,7 +5464,7 @@ mod tests {
             "task",
             &serde_json::json!({"prompt": "Read every call site and report", "label": "cwd-audit"}),
         );
-        assert_eq!(t, "coder · cwd-audit");
+        assert_eq!(t, "argus · cwd-audit");
         // A resolvable `agent` slug supersedes `role` in `resolve_dispatch`; the line must agree.
         let t = tool_target(
             "task",

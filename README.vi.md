@@ -83,7 +83,7 @@ Cài đặt chỉ có vậy. Không cần biến môi trường, không phải t
 
 | **REPL hợp nhất** | Một vòng chat + agent duy nhất, không cần chuyển chế độ. HUD trực tiếp: model · token · lượt · `% context`. Markdown, bảng, sơ đồ, nhập ảnh. |
 | **Vòng lặp agent** | Đọc song song, ghi phải qua phê duyệt, sửa mức ký hiệu bằng LSP, điều phối sub-agent, và một verify gate phải vượt qua trước khi được coi là "xong". |
-| **Đa agent** | `aizen workflow` phóng ra các sub-agent theo vai trò rồi tổng hợp thành một câu trả lời duy nhất. |
+| **Đa agent** | Pantheon: bảy sub-agent chia quyền theo vai (`argus` tìm · `metis` hoạch định · `daedalus` xây · `nemesis` soi · `themis` kiểm · `clio` tra cứu · `mnemosyne` nhớ); `aizen workflow` phóng chúng ra rồi tổng hợp thành một câu trả lời duy nhất. |
 | **Web + trình duyệt** | Tìm kiếm, fetch, và crawler kiểu katana — tất cả đều được bảo vệ SSRF. Công cụ CDP (opt-in) điều khiển Chrome thật. |
 | **Mở rộng được** | MCP server (stdio/HTTP, OAuth 2.1), macro slash-command viết bằng markdown, kênh notify đi ra. |
 | **Khôi phục được** | Checkpoint dựa trên git — `/timemachine` quay lại đúng lượt đi sai. |

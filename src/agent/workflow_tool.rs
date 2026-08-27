@@ -96,8 +96,20 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 let role = t
                     .get("role")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("reviewer")
+                    .unwrap_or("nemesis")
                     .to_string();
+                // An unknown role is refused at spec build, not silently run read-only — same
+                // discipline as the `task` tool's role guard.
+                if crate::agent::roles::canonical(&role).is_none() {
+                    bail!(crate::agent::task_tool::unknown_role_error(&role));
+                }
+                let opt_str = |k: &str| {
+                    t.get(k)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                };
                 tasks.push(WorkflowTask {
                     id: t
                         .get("id")
@@ -113,6 +125,13 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         .ok_or_else(|| anyhow::anyhow!("task #{} is missing 'prompt'", i + 1))?
                         .to_string(),
                     model: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
+                    boundaries: opt_str("boundaries"),
+                    expected_output: opt_str("expected_output"),
+                    max_steps: t
+                        .get("max_steps")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize),
+                    expects: t.get("expects").filter(|v| v.is_object()).cloned(),
                 });
             }
             // Singular-writer invariant — shared with CLI `run_workflow` via
@@ -153,10 +172,11 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .filter_map(|(i, f)| f.as_str().map(|s| (i, s)))
                 .map(|(i, f)| WorkflowTask {
                     id: format!("refute-{}", i + 1),
-                    role: "reviewer".to_string(), // read-only → these fan out safely
+                    role: "nemesis".to_string(), // read-only → these fan out safely
                     agent: None,
                     prompt: refuter_prompt(f),
                     model: None,
+                    ..Default::default()
                 })
                 .collect::<Vec<_>>();
             if tasks.is_empty() {
@@ -196,9 +216,13 @@ impl Tool for WorkflowTool {
                 "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (request what the work needs; the harness bounds concurrent width by machine)", "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string", "description": "complete, self-contained task"},
-                    "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"], "description": "default reviewer (read-only); set coder/tester explicitly, at most one writer per workflow"},
+                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "default nemesis (read-only review); daedalus/themis are the writers — at most one writer per workflow. argus=find · metis=plan · clio=web research · mnemosyne=history. Legacy coder/planner/reviewer/tester names are also accepted"},
                     "agent": {"type": "string", "description": "optional specialist slug from <agents>"},
-                    "model": {"type": "string"}
+                    "model": {"type": "string"},
+                    "boundaries": {"type": "string", "description": "what this child must NOT do or touch"},
+                    "expected_output": {"type": "string", "description": "the shape/content of the answer wanted back"},
+                    "max_steps": {"type": "integer", "description": "TOTAL step budget for this child (cap 80)"},
+                    "expects": {"type": "object", "description": "JSON Schema the child's final answer must satisfy (validated; status carries json:ok|json:invalid)"}
                 }, "required": ["prompt"], "additionalProperties": false}},
                 "synthesis": {"type": "string", "description": "fanout mode: optional merge instruction"},
                 "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description": "verify mode: claims to refute, each self-contained with file:line evidence"}
@@ -279,7 +303,7 @@ mod tests {
         assert_eq!(spec.tasks.len(), 2);
         assert_eq!(spec.tasks[0].id, "refute-1");
         assert_eq!(
-            spec.tasks[0].role, "reviewer",
+            spec.tasks[0].role, "nemesis",
             "refuters are read-only → they fan out"
         );
         assert!(spec.tasks[0].prompt.contains("REFUTE"));
@@ -288,6 +312,42 @@ mod tests {
             spec.tasks[1].prompt.contains("verdict: confirmed"),
             "fixed verdict contract"
         );
+    }
+
+    #[test]
+    fn fanout_parses_contract_fields_and_refuses_unknown_roles() {
+        // The per-task contract fields ride into the spec verbatim — full propagation is proven
+        // downstream (run_one_task builds the same TaskContract the `task` tool does).
+        let (spec, _) = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{
+                "id": "review-auth",
+                "role": "nemesis",
+                "prompt": "review the auth changes",
+                "boundaries": "Do not edit files",
+                "expected_output": "Findings with severity and file:line",
+                "max_steps": 12,
+                "expects": {"type": "object", "required": ["verdict"]}
+            }]
+        }))
+        .unwrap();
+        let t = &spec.tasks[0];
+        assert_eq!(t.boundaries.as_deref(), Some("Do not edit files"));
+        assert_eq!(
+            t.expected_output.as_deref(),
+            Some("Findings with severity and file:line")
+        );
+        assert_eq!(t.max_steps, Some(12));
+        assert!(t.expects.as_ref().unwrap().is_object());
+        // An unknown role is refused at spec build with the real list — never run read-only.
+        let err = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{"prompt": "x", "role": "wizard"}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown role"), "{err}");
+        assert!(err.contains("argus"), "the real list is named: {err}");
     }
 
     #[test]

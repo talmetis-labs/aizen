@@ -60,12 +60,12 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 **Sub-agent delegation — the `task` tool**
 - The agent can dispatch a **focused sub-agent** with a fresh context and a role-scoped toolset for one self-contained sub-task; only the sub-agent's final text returns to the parent.
-- **Roles:** `coder` (read/edit/shell), `tester` (shell, no edits), `planner`/`reviewer` (read-only). Sub-agents can't recurse (no `task` tool inside a task) and inherit the parent's `--yes`.
+- **Roles — the Pantheon:** `daedalus` (coder — the only editor; read/edit/shell), `themis` (tester — shell, no edits), `argus` (searcher), `metis` (planner), `nemesis` (reviewer), `clio` (librarian — web research), `mnemosyne` (historian — memory/session recall). All but daedalus/themis are read-only and fan out in parallel; every role carries `git_inspect` (read-only git). Legacy `coder`/`planner`/`reviewer`/`tester` names remain accepted; an unknown name is refused, and a dispatch with no role runs read-only as `argus`. Sub-agents can't recurse (no `task` tool inside a task) and inherit the parent's `--yes`.
 
 **Multi-agent workflow — `aizen workflow <spec.json>`**
 - **Mixture-of-agents fan-out:** runs a set of role-scoped sub-agents concurrently (each with its own `role`, `prompt`, and optional per-task `model`), then a **synthesis pass** merges their outputs into one deliverable.
 - Per-task model diversity (cheap models scout, a strong model judges/synthesizes). Errors in one task don't abort siblings.
-- **Spec shape:** `{name, tasks:[{id,role,prompt,model?}], synthesis?:{model?,prompt?}}`. Flags: `--trace <file>` writes a JSON audit (per-task model + status + iters + summary), `--yes`, `--model`.
+- **Spec shape:** `{name, tasks:[{id,role,prompt,model?,boundaries?,expected_output?,max_steps?,expects?}], synthesis?:{model?,prompt?}}` — the contract fields travel into each child exactly as on a `task` dispatch (`expects` is validated; status carries `json:ok|json:invalid`). Flags: `--trace <file>` writes a JSON audit (per-task model + status + iters + summary), `--yes`, `--model`.
 
 ---
 

@@ -3,17 +3,17 @@
   "tasks": [
     {
       "id": "correctness",
-      "role": "reviewer",
+      "role": "nemesis",
       "prompt": "Review the Rust code under src/ for correctness bugs (logic errors, panics, unwrap on None, off-by-one, race conditions). Report each as file:line + one sentence. If none, say so."
     },
     {
       "id": "security",
-      "role": "reviewer",
+      "role": "nemesis",
       "prompt": "Review the code under src/ for security issues (path traversal, command injection, unvalidated input, secret leakage). Report each as file:line + one sentence. If none, say so."
     },
     {
       "id": "tests",
-      "role": "tester",
+      "role": "themis",
       "prompt": "Run `cargo test` and report the pass/fail counts and any failing test names. Do not edit anything."
     }
   ],

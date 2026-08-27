@@ -102,7 +102,7 @@ That's the whole setup. No env vars, no config file to hand-edit.
 
 | **Unified REPL** | One chat + agent loop, no mode switch. Live HUD: model · tokens · turn · `% context`. Markdown, tables, diagrams, image input. |
 | **Agent loop** | Parallel reads, approval-gated writes, LSP-powered symbolic edits, sub-agent dispatch, and a verify gate that must pass before "done". |
-| **Multi-agent** | `aizen workflow` fans out role-scoped sub-agents and synthesises one answer. |
+| **Multi-agent** | The Pantheon: seven capability-scoped sub-agents (`argus` finds · `metis` plans · `daedalus` builds · `nemesis` reviews · `themis` tests · `clio` researches · `mnemosyne` recalls); `aizen workflow` fans them out and synthesises one answer. |
 | **Web + browser** | Search, fetch, and a katana-style crawler — all SSRF-guarded. Opt-in CDP tools drive a real Chrome. |
 | **Extensible** | MCP servers (stdio/HTTP, OAuth 2.1), markdown slash-command macros, outbound notify channels. |
 | **Recoverable** | Git-backed checkpoints — `/timemachine` rewinds a bad turn. |
