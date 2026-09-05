@@ -70,6 +70,29 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
+    /// Pin this machine to the Aizen gateway: one domain, a short code you approve in a browser,
+    /// and the key + endpoints come back. Same as `aizen gateway login`.
+    Login(GatewayLoginArgs),
+    /// Remove this machine's local gateway key. Same as `aizen gateway logout`.
+    Logout(GatewayLogoutArgs),
+    /// The Aizen gateway: pin this machine (`login`), see what the key is allowed to do
+    /// (`status`), hand the two base URLs to another tool (`env`), or drop the key (`logout`).
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
+    /// Your Aizen account session (email + password → `/auth/*`), which is NOT the gateway key:
+    /// `login` · `whoami` · `logout`. Required before `aizen sub`.
+    Account {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+    /// Buy and manage subscriptions: `plan`, marketplace `model`, and paid `plugin`.
+    /// Needs an account session — run `aizen account login` first.
+    Sub {
+        #[command(subcommand)]
+        cmd: SubCmd,
+    },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
@@ -701,6 +724,203 @@ pub(crate) struct CrawlArgs {
     /// Annotate each URL with its source (seed/html/js) in plain output.
     #[arg(long)]
     pub(crate) show_source: bool,
+}
+
+/// `aizen gateway …` — device pairing against the Aizen gateway, and what the key can do.
+#[derive(Subcommand, Debug)]
+pub(crate) enum GatewayCmd {
+    /// Pin this machine: print a short code, wait for it to be approved in a browser, save the key.
+    Login(GatewayLoginArgs),
+    /// What the gateway says this key is: endpoints, default model, limits, karma left.
+    Status(GatewayStatusArgs),
+    /// The two base URLs as environment variables, for a tool that is not this CLI.
+    Env(GatewayEnvArgs),
+    /// Remove the local key. Does NOT revoke it — unpin the device in the dashboard for that.
+    Logout(GatewayLogoutArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayLoginArgs {
+    /// What this machine is called in the dashboard. Defaults to the hostname.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    /// The config profile the key is written into.
+    #[arg(long, default_value = "aizen")]
+    pub(crate) profile: String,
+    /// Save the endpoint without making it the one this CLI uses.
+    #[arg(long)]
+    pub(crate) no_activate: bool,
+    /// Do not try to open a browser — a server, an SSH session, a headless box.
+    #[arg(long)]
+    pub(crate) no_browser: bool,
+    /// Print the result as JSON. The key is never included.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Gateway root (overrides AIZEN_GATEWAY_URL). Only for staging.
+    #[arg(long, value_name = "URL")]
+    pub(crate) gateway: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayStatusArgs {
+    /// Which config profile's key to ask with. Defaults to the pinned one.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+    /// Print the gateway's own answer as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Gateway root (overrides AIZEN_GATEWAY_URL). Only for staging.
+    #[arg(long, value_name = "URL")]
+    pub(crate) gateway: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayEnvArgs {
+    /// Prefix each line so it can be sourced (`export …`, or `$env:…` on Windows).
+    #[arg(long)]
+    pub(crate) export: bool,
+    /// Also print the API key. Off by default: this puts a live secret in your scrollback.
+    #[arg(long)]
+    pub(crate) with_key: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayLogoutArgs {
+    /// Which config profile to clear. Defaults to the pinned one.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+}
+
+/// `aizen account …` — the session that opens `/auth/*` (plans, subscriptions, plugins).
+#[derive(Subcommand, Debug)]
+pub(crate) enum AccountCmd {
+    /// Sign in with email + password and store the session token (never the gateway key).
+    Login(AccountLoginArgs),
+    /// Show the signed-in account. Never prints the token.
+    Whoami {
+        /// Print as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the stored session. Leaves the gateway key alone (that is `aizen logout`).
+    Logout,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct AccountLoginArgs {
+    /// Account email. Prompted if omitted (and required in non-interactive use).
+    #[arg(long)]
+    pub(crate) email: Option<String>,
+    /// Web host for the session API. Defaults to the saved one, else the built-in
+    /// (overridable with AIZEN_WEB_URL). Not derived from the gateway URL.
+    #[arg(long, value_name = "URL")]
+    pub(crate) web_url: Option<String>,
+}
+
+/// `aizen sub …` — the three kinds of subscription.
+#[derive(Subcommand, Debug)]
+pub(crate) enum SubCmd {
+    /// The account plan.
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCmd,
+    },
+    /// Marketplace model subscriptions.
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
+    },
+    /// Paid plugins.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PlanCmd {
+    /// List available plans.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Buy or switch to a plan (spends karma — confirms first unless --yes).
+    Buy {
+        plan_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelCmd {
+    /// List your model subscriptions (cancelled ones hidden unless --all).
+    Ls {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Subscribe to a model listing (seller/model, e.g. nbz/glm-5-air).
+    Add {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm a price change so a blocked subscription works again.
+    Confirm {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a model subscription.
+    Rm {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginCmd {
+    /// List plugins and what you own.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the final price (after a coupon). Does not buy.
+    Quote {
+        slug: String,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Buy a plugin (spends karma — confirms first unless --yes).
+    Buy {
+        slug: String,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a plugin you own.
+    Download {
+        slug: String,
+        /// Where to save the file (default: the server's filename, else <slug>.zip).
+        #[arg(short = 'o', long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 /// `aizen auth …` — experimental provider OAuth (ChatGPT Codex).

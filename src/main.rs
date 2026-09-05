@@ -54,7 +54,7 @@ pub(crate) use crate::ui::effort_ui::*;
 use crate::ui::menus::{apps_menu, run_discord, run_telegram};
 pub(crate) use crate::ui::plain_input::read_input_box;
 pub(crate) use crate::ui::provider_ui::*;
-use crate::ui::{config_ui, icons, splash, theme, tui};
+use crate::ui::{config_ui, gateway_ui, icons, splash, theme, tui};
 
 // The `clap` type tree (every subcommand enum) lives in its own file — see `cli_args`.
 use cli_args::*;
@@ -149,6 +149,11 @@ async fn main() -> Result<()> {
         },
         Commands::Config { cmd } => config_ui::run_config(cmd).await,
         Commands::Auth { cmd } => config_ui::run_auth(cmd).await,
+        Commands::Login(args) => gateway_ui::login(args).await,
+        Commands::Logout(args) => gateway_ui::logout(args),
+        Commands::Gateway { cmd } => gateway_ui::run_gateway(cmd).await,
+        Commands::Account { cmd } => cli::account_cmd::run(cmd).await,
+        Commands::Sub { cmd } => cli::sub_cmd::run(cmd).await,
         Commands::Models(args) => run_models(args).await,
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Reach { cmd } => run_reach(cmd).await,

@@ -1,9 +1,11 @@
 //! One module per top-level `aizen <subcommand>`: the argument shapes live in `cli_args`, the
 //! behaviour lives here. Split out of `main.rs`, which now only dispatches.
 
+pub mod account_cmd;
 pub mod agents_cmd;
 pub mod apps;
 pub mod coop_cmd;
+pub mod sub_cmd;
 pub mod memory_cmd;
 pub mod persona_cmd;
 pub mod run_cmds;
