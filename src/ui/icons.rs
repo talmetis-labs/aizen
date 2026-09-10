@@ -131,6 +131,10 @@ pub fn slash(name: &str) -> &'static str {
         "approval" => pick("🛡", "\u{f132}"),  // shield
         "yolo" => pick("⚡", "\u{f0e7}"),     // legacy alias / HUD
         "smart" => pick("◆", "\u{f132}"),     // legacy alias / HUD
+        "login" => pick("🔑", "\u{f090}"),    // sign-in
+        "signin" => pick("🔑", "\u{f090}"),
+        "logout" => pick("👋", "\u{f08b}"),   // sign-out
+        "signout" => pick("👋", "\u{f08b}"),
         "quit" => pick("🚪", "\u{f08b}"),     // sign-out
         _ => "•",
     }

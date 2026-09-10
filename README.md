@@ -46,11 +46,16 @@ curl -fsSL https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.sh
 Then open a new terminal:
 
 ```bash
-aizen config     # base URL → API key → pick a model
-aizen            # land in the REPL and start typing
+aizen account login   # on an Aizen plan? sign in — no key to fetch, nothing to paste
+aizen config          # or bring your own: base URL → API key → pick a model
+aizen                 # land in the REPL and start typing
 ```
 
 That's the whole setup. No env vars, no config file to hand-edit.
+
+An Aizen plan is bought by signing in: the session opens the gateway on its own, and nothing but the
+token is written to disk. On a machine that cannot open a browser — SSH, a container, CI — pair it
+instead with `aizen login`, which approves a short code and comes back with a key.
 
 <sub>Prefer to do it by hand? Grab a binary from the
 [latest release](https://github.com/talmetis-labs/aizen/releases/latest) — or build it yourself with

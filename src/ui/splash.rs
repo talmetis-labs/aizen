@@ -520,10 +520,31 @@ fn render_inner(allow_sixel: bool, avail: usize) -> String {
 /// The panel body — endpoint info, tools, commands — as plain rows ([`frame`] adds the borders).
 fn body_rows() -> Vec<String> {
     let cfg = cli_config::load();
-    let model = cfg.model.as_deref().unwrap_or("(not set)");
-    let endpoint = cfg.base_url.as_deref().unwrap_or("(not set)");
-    let key = if cfg.api_key.is_some() {
+    // What the first turn will use, not what the config file happens to hold. A machine that
+    // signed in from the desktop app has no config row at all — the session in
+    // `~/.aizen/session.json` is its endpoint and its credential — and a panel reading the file
+    // alone opened with "key: not set" in red on a machine that could call a model right then.
+    let resolved = crate::core::endpoint::resolve_endpoint(None, None, None).ok();
+    let model = resolved
+        .as_ref()
+        .map(|(_, _, m)| m.as_str())
+        .or(cfg.model.as_deref())
+        .unwrap_or("(not set)");
+    let endpoint = resolved
+        .as_ref()
+        .map(|(b, _, _)| b.as_str())
+        .or(cfg.base_url.as_deref())
+        .unwrap_or("(not set)");
+    let key = if cfg.api_key.is_some() || cli_config::branded_env("API_KEY").is_some() {
         style("configured").color256(ACCENT).to_string()
+    } else if let Some(sess) = crate::llm::account::load() {
+        // The session is the credential. Named, so the panel says whose plan this window spends.
+        let who = sess.email.trim();
+        if who.is_empty() {
+            style("signed in").color256(ACCENT).to_string()
+        } else {
+            style(format!("signed in as {who}")).color256(ACCENT).to_string()
+        }
     } else {
         style("not set").red().to_string()
     };

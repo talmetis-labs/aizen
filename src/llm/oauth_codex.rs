@@ -164,7 +164,7 @@ fn pkce() -> Result<(String, String)> {
     Ok((verifier, challenge))
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     // Do not route the URL through `cmd /C start`: OAuth query strings contain `&`,
     // which cmd treats as command separators. Use Windows URL protocol handling directly,
     // so the complete authorize URL is handed to the default browser as one argument.

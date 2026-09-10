@@ -318,3 +318,72 @@ fn default_index_falls_back_to_zero() {
     assert_eq!(model_default_index(&models(), None), 0);
     assert_eq!(model_default_index(&models(), Some("retired-model")), 0);
 }
+
+/// First in the list, because it is the only provider that needs nothing from anywhere else: the
+/// key, the endpoint and the model all arrive from one browser approval. Position is the point of
+/// this test — a preset added below the other seven is a preset most people never scroll to, which
+/// is exactly what happened to the OpenCode and Codex rows.
+#[test]
+fn the_gateway_preset_is_the_first_row() {
+    let p = &PROVIDER_PRESETS[0];
+    assert_eq!(p.slug, "aizen");
+    assert_eq!(p.base, crate::llm::gateway::DEFAULT_OPENAI_BASE);
+    // It promises no key page, because there is no key to go and get.
+    assert!(!p.keys_url.contains("http"), "{}", p.keys_url);
+}
+
+/// Green marks the row you can use right now, and this pins the row to that mark without depending
+/// on whether the test harness has a terminal: with colour off both sides are plain, with colour on
+/// both carry the same escape. Either way, a row built any other way fails.
+///
+/// Equality rather than `starts_with`, and that is the assertion doing the work: the whole row has
+/// to be ONE span. `dialoguer` wraps the selected item in its own style, so a colour ending mid-row
+/// would drop that highlight from everything after it and leave the active row half-painted.
+#[test]
+fn the_gateway_row_is_one_green_span_and_the_rest_are_plain() {
+    let p = &PROVIDER_PRESETS[0];
+    let want = theme::ok(format!(
+        "{:<20} {}",
+        p.label,
+        crate::llm::gateway::openai_base(None)
+    ))
+    .to_string();
+    assert_eq!(preset_row(p), want);
+    for other in PROVIDER_PRESETS.iter().skip(1) {
+        assert_eq!(
+            preset_row(other),
+            format!("{:<20} {}", other.label, other.base),
+            "{} should be plain",
+            other.label
+        );
+    }
+}
+
+/// The row prints the root this build actually talks to, not the constant in the table: a staging
+/// `AIZEN_GATEWAY_URL` moves where the pairing lands, and a row still showing the shipped default
+/// would be lying about where the key is about to come from.
+#[test]
+fn the_gateway_row_shows_the_root_this_build_talks_to() {
+    let p = &PROVIDER_PRESETS[0];
+    let plain = console::strip_ansi_codes(&preset_row(p)).to_string();
+    assert_eq!(
+        plain,
+        format!("{:<20} {}", p.label, crate::llm::gateway::openai_base(None))
+    );
+}
+
+/// Picking the gateway does not ask for a provider name, because the pairing already chose one and
+/// already wrote the key there. This pins the choice it makes instead: whatever the pin file
+/// recorded, and the shipped default only when there is nothing to read.
+///
+/// That last case is the one worth a test. Writing the pin file is best-effort — it holds no secret
+/// and a failed write must not look like a failed pairing — while writing the key is not, so a
+/// machine with a key and no pin file still has to land on the profile `adopt` filed it under.
+#[test]
+fn a_pin_takes_the_name_it_recorded_not_one_the_user_invents() {
+    assert_eq!(pin_profile_name(Some("mygw")), "mygw");
+    assert_eq!(pin_profile_name(Some("  spaced  ")), "spaced");
+    let default = crate::llm::gateway::DEFAULT_PROFILE;
+    assert_eq!(pin_profile_name(Some("   ")), default);
+    assert_eq!(pin_profile_name(None), default);
+}

@@ -7,7 +7,55 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-09-11
+
+Subscriptions arrive. An Aizen plan is now sold by **signing in**, not by pasting a key: sign in
+through the browser and the plan calls models straight away, with a family of commands to buy and
+manage the three subscription kinds — a plan, a marketplace model/combo, and a paid plugin. Every
+line of it is client-side; there are **no server changes** in this release. Ships alongside the
+Pantheon sub-agent roster and the Tool Search slimming carried over from the prior cycle.
+
 ### Added
+- **Sign in to Aizen — the subscription is the credential, no key on disk.** `aizen account login`
+  opens the browser (a loopback redirect on `127.0.0.1`, guarded by a random `state`), trades the
+  returned code for a session JWT, and stores it in `~/.aizen/session.json` (owner-only `0600`,
+  kept in a *separate* file from the gateway key so neither is ever handed to the wrong door). Since
+  2026-09-06 that session token opens `/v1` on its own — so after signing in there is nothing to
+  paste and nothing to fetch. `aizen account login --password` remains for the minority of accounts
+  that actually have a password (most are Google/GitHub, whose hash is null); `aizen account whoami`
+  reports who is signed in and **never prints the token**; `aizen account logout` drops the session
+  alone. The token lives ~30 days with no refresh — a 401 mid-run means sign in again, not a retry.
+- **`aizen sub` — buy and manage the three subscription kinds.** `plan`, marketplace `model`/`combo`,
+  and paid `plugin`, each with `ls` / `buy` / `add` / `confirm` / `rm`, plus `quote` and `download`
+  where they apply. Built around the traps that make spending unsafe: **no retry on any call that
+  spends** (a lost answer resent is karma charged twice), the coupon price is the server's quote and
+  never recomputed locally, a `needs_review` hold is surfaced rather than swallowed, `gone`/
+  `cancelled` are shown plainly, and a spend confirms first — with a hard stop (exit `2`) in a
+  non-TTY unless `--yes` is passed. Exit codes are stable: `401/403 → 4`, `429 → 5`,
+  `400/404/409/410/422 → 2`.
+- **`aizen custom` — bring your own provider endpoints (BYOK).** `ls` · `add` · `set` · `rm` for
+  your own OpenAI-compatible roots, managed against the account rather than hand-edited into the
+  config. Needs a session (`aizen account login` first).
+- **`aizen key` — see what the plan key can call, and manage your own keys.** `ls` · `show` ·
+  `rotate` · `reveal` · `loadout` · `models`. The plan's key is shown for reference but has no string
+  to copy — the plan is bought by signing in, and no route mints a string for it. Needs a session.
+- **`aizen login` / `aizen logout` — device pairing, and one word to leave.** `aizen login` pairs
+  this machine by approving a short code (for a box with no browser — SSH, a container, CI) and comes
+  back with a **per-device** credential; `aizen gateway login|logout|status|env` are the narrow verbs
+  for the key alone. `aizen logout` leaves Aizen entirely — the account session **and** the local
+  gateway key — and says plainly that it revokes neither (the token stays valid elsewhere until it
+  expires; the device row stays live until unpinned in the dashboard).
+- **`/login` and `/logout` inside the REPL.** Renew a session that just 401'd, or leave, without
+  dropping the running conversation. `/logout` runs the same teardown and prints the same words as
+  `aizen logout`.
+- **The CLI and the desktop app now recognise each other's sign-in.** Both read the one
+  `~/.aizen/session.json`, so signing in on either side signs in on both. A CLI whose first launch
+  finds a desktop sign-in skips the setup wizard, the splash and status bar name the session
+  endpoint and "signed in as …" instead of "not set", and the turn after the desktop signs out
+  points at `/login` rather than the setup screen. In the reverse direction the desktop window
+  watches the shared files and updates the account card live when `aizen account login` / `aizen
+  logout` runs in a terminal beside it.
+
 - **The Pantheon — seven sub-agent roles, declared in one table.** The four generic sub-agent
   roles grow into seven named ones: `argus` finds code (read-only, repo-local — no web), `metis`
   plans, `daedalus` implements (the only role that edits), `nemesis` reviews, `themis` runs

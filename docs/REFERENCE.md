@@ -59,6 +59,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/help` | list commands |
 | `/model` | list the provider's models (with context windows) + arrow-key pick one |
 | `/provider [name|add|manage]` | one-pick switch among saved providers; add/edit/rename/delete in the same manager |
+| `/login` | sign in to Aizen in a browser — the session opens the gateway, so nothing is stored but the token |
+| `/logout` | leave Aizen here: the session **and** the pinned key. Revokes neither |
 | `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
 | `/memory [query]` | show your profile, or search memory |
 | `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory |
@@ -239,6 +241,239 @@ export AIZEN_BASE_URL=https://api.openai.com/v1
 export AIZEN_API_KEY=sk-...
 export AIZEN_MODEL=gpt-4o-mini
 ```
+
+### `aizen login` — pin this machine to the Aizen gateway
+
+The short way to a working endpoint when your key comes from the Aizen gateway: no key to find, no
+URL to type. `aizen` prints a short code, you approve it in a browser you are already signed into,
+and the gateway sends back the key, both base URLs and a default model — written straight into
+`~/.aizen/cli-config.json` and switched on.
+
+It is also the **first row of the provider picker, drawn in green**: `aizen config` → Providers &
+connection → **Aizen (subscription)** runs the same pairing in place of the API-key prompt, the way
+the Codex row runs a browser sign-in. Green marks the one provider you can start using without
+going anywhere else first; picking it there carries on into the model list the fresh key can already
+reach. It does not stop to ask what to call the profile: the pairing has already written the key
+into one, and `~/.aizen/gateway.json` points at that row, so the only name that keeps the key and
+the pin together is the one it chose.
+
+```bash
+aizen login                     # print a code, wait, save the key
+aizen login --no-browser        # a server or an SSH session: print, don't try to open anything
+aizen login --no-activate       # save the profile without making it the endpoint in use
+aizen gateway status            # what the key is allowed to do, asked live
+aizen gateway env               # the two base URLs, for a tool that is not this CLI
+aizen gateway logout            # drop the local key
+```
+
+One domain is all the CLI knows: `https://aizen.talmetis.com`, overridable with `AIZEN_GATEWAY_URL`
+(falling back to `OMNIROUTE_PUBLIC_API_BASE_URL`). The page you open comes back from the gateway —
+nothing here builds a URL.
+
+It is the same domain `aizen account` and `aizen sub` use, deliberately: it serves `/v1/*` against
+the pairing key and `/auth/*` against the session JWT. One name, two prefixes, two credentials — a
+pairing key sent to `/auth/*` answers `401 "Not signed in"`, which is about the paper, not the
+login. `api.talmetis.com` was the gateway before the names merged; it still answers `/v1/` and is
+still recognised as a gateway root, so machines pinned against it keep working.
+
+Three things worth knowing, because each is wrong in a way that still looks like it works:
+
+* **The short code only ever goes one way — from this machine to you.** It names a pending pairing
+  for the account owner to look at; the 256-bit device code, which is what actually collects the
+  key, is printed nowhere and written to no file. So if a code reaches you from anywhere else — a
+  message, an email, someone reading it out — that is somebody else's pairing, and approving it
+  hands them a key on your account. There is deliberately nowhere in this CLI to paste one.
+* **The key crosses the wire exactly once.** It is minted at hand-over, not at approval, so
+  approving and then closing the laptop leaves no live key behind. `aizen login` writes it to disk
+  before it prints anything. If you lose that one answer, pair again — it cannot be re-sent.
+* **The gateway states two base URLs, and they are not the same string.** OpenAI-shaped clients
+  append `/chat/completions` to `…/v1`; Anthropic-shaped clients append `/v1/messages` to the root
+  *without* `/v1`. `aizen gateway env` prints both as the gateway gave them. Deriving one from the
+  other is how a request ends up at `/v1/v1/messages` and a 404 gets read as "the gateway is down".
+
+`aizen gateway logout` removes the local copy and nothing else. The key stays live until you unpin
+the device in the dashboard (**API keys → devices**), which revokes it in the same transaction.
+
+**Each machine carries its own credential.** Pairing used to hand back the account's `ak_…` plan
+key — the same string on every machine — so "unpin this device" in the dashboard could not cut
+anything: revoking that string would cut every other machine and the account's key with it. Since
+2026-09-06 pairing answers with a **JWT bound to this machine's device row**, the gateway reads that
+row on every `/v1` call, and unpinning cuts exactly one machine on its next request. The plan key
+stops leaving the server. Nothing about billing moved: the loadout, the per-minute ceiling and the
+spend ledger still hang off the plan key's row, and calls still count against it.
+
+Three consequences worth knowing, because two of them fail silently:
+
+* **Never test the credential's prefix.** What is stored is `eyJ…`, and a client still checking for
+  `ak_` rejects the one string that works while reporting it as a malformed key — which reads like a
+  server fault. The CLI checks no shape anywhere; the one place it looks at the first three
+  characters is to notice a pre-2026-09-06 pairing and say so.
+* **`key_prefix` is the PLAN key's head, not a piece of what this machine holds.** It is shown so a
+  row can be matched against the keys screen. `aizen gateway status` calls it `plan key`, beside the
+  `device` row that the dashboard's unpin button acts on.
+* **A `401` can now arrive at any moment**, and usually means somebody cut this machine on purpose:
+  unpinned in the dashboard, logged out from another machine, or the account password changed (a
+  password change ends every pairing, deliberately). All three end the same way — the credential is
+  removed from this machine and one sentence names `aizen login`. It is never retried: `401` is
+  absent from the retry table, and it is its own error kind so that goal mode stops at once instead
+  of spending a backoff budget on calls that cannot be built.
+
+**A machine pinned before this still works**, and it is not urgent — but it cannot be cut remotely,
+and the dashboard labels it as such. `aizen gateway status` says so and points at `aizen login`;
+nothing re-pairs on its own. `aizen logout` on one of those tells the gateway nothing, deliberately:
+that string is the account's, has no device row behind it, and posting it to a route that cuts
+device rows is a way to cut the wrong one.
+
+The full wire contract — every field, the error table, the browser-side routes — is
+`docs/reference/DEVICE_PAIRING.md` in `admin_aizen`.
+
+### `aizen account` — signing in, which is how the plan is bought
+```bash
+aizen account login             # opens the browser
+aizen account login --password  # email + password, for an account that has one
+aizen account whoami
+aizen account logout            # drops the token here; revokes nothing
+aizen logout                    # leaves Aizen entirely: session AND pinned key
+```
+
+In the REPL the same two doors are `/login` and `/logout`.
+
+**Deleting the Aizen provider row is a logout, not a row deletion.** Both delete paths —
+`aizen config provider remove <name>` and the manager inside `aizen config` — check whether the row
+is Aizen's, by the pin *or* by its endpoint, and tear down the whole credential when it is: the
+profile, the pin, the local key, and the session. Deleting a keyless row while leaving the session
+behind would be the worse half of the job, since the session still spends and `resolve_endpoint`
+picks it up again on the next turn. Every other provider row deletes as a row.
+
+**Signing in is the whole of it.** The session token opens both prefixes: `/auth/*` for plans and
+purchases, and `/v1/*` for model calls. There is no key to fetch, nothing to paste, and nothing
+written to disk but the token — the Aizen subscription is sold by sign-in, not by a string.
+`aizen login` (device pairing) is the older door and still hands out a key; it is for machines that
+cannot open a browser at all. With a browser, use this one.
+
+**The browser is the default and `--password` is the exception**, because most accounts have no
+password: created through Google or GitHub, their `password_hash` is NULL, and a password prompt
+tells the majority they typed their own password wrong.
+
+**Leaving is one word.** `/logout` in the REPL and `aizen logout` in a shell drop both credentials
+— the session and this machine's pinned one — because from outside they are one thing, and while
+the plan rides the session a logout that dropped only the pin would leave somebody who typed the
+word still able to spend. `aizen account logout` and `aizen gateway logout` are the narrow ones.
+
+The pinned half now really is cut: `aizen logout` calls `POST /v1/device/logout` with this
+machine's own credential, which cuts this machine's device row and nothing else, effective on its
+very next call. **The local teardown happens whatever the server answers** — 200, 401 and a dead
+network all mean one thing here, and the `forget_token` in the reply is an instruction rather than
+a suggestion, since the server cannot reach this disk. Calling twice is another 200: the route
+reports a state, not an event. The account session half still revokes nothing — that token stays
+valid on other machines until it expires.
+
+**The token is a bearer credential.** It is stored owner-only, never printed, never logged, and
+never a field of `--json` output. It lives 30 days with no refresh route, and a password change
+anywhere kills every token minted before it — so a `401` in the middle of a run means *sign in
+again*, not a network hiccup to retry. The CLI says exactly that when it sees one, and `401` is
+absent from the retry table on purpose.
+
+At `/v1` only the `Authorization` header opens the door; a cookie does not. The CLI sends none, and
+should not gain one: a cookie that spent money would make every open browser tab a wallet.
+
+The browser flow binds `127.0.0.1:0` *first* (the port is part of the URL), opens
+`/auth/cli/authorize?port=…&state=…`, catches the redirect, and trades the code at
+`/auth/cli/exchange` for the same JWT a password login returns. It waits **ten minutes**, not the
+code's two: that clock starts only once you have a session, and step one is often a whole round trip
+through Google.
+
+Two things are worth knowing here as well:
+
+* **`state` is the only defence.** A page in the same browser can point at `/auth/cli/authorize`
+  while the listener is up, and the redirect that follows is indistinguishable at the socket. A
+  mismatched `state` means the code is discarded and never exchanged — exchanging it would burn a
+  stranger's code and adopt whatever account it belonged to. The page returned to the browser also
+  says only fixed sentences: `?error=` is chosen by whoever provoked the redirect.
+* **The code burns once, and its three refusals are three different problems.** `404` no such code,
+  `409` already used, `410` expired. Each is printed in the server's own words rather than flattened
+  into "invalid code", and all three exit `2` — a retry is the one thing that cannot help.
+
+### `aizen key` — your keys, and what your plan may call
+```bash
+aizen key ls                       # your keys; the plan's row is marked
+aizen key reveal --id k_123        # the string of a key you made yourself (--id required)
+aizen key loadout ls               # the plans it may call, in `auto` preference order
+aizen key models                   # what those plans resolve to today
+```
+
+**Your plan is not a key you can copy.** Signing in is what buys it, and no route emits a string for
+it. A row of `api_keys` does stand behind each account server-side — it carries the loadout, the
+per-minute ceiling, the budget and every `usage_history.api_key_id` — but it is an internal detail
+this CLI never holds.
+
+So there is no `key show` and no `key rotate`. They existed briefly against a contract that had
+`/auth/plan-key` and `/auth/plan-key/rotate`; those routes were withdrawn before they shipped and
+answer `404` permanently. `reveal` takes no default for the same reason: guessing the plan's row
+there could only produce a refusal that reads like a bug in the command, so it names the row and
+says why instead.
+
+Keys still exist in two places, and neither changed: a key **you made yourself**, for models bought
+from a seller, and your own key at the far end of a BYOK endpoint (`mine/gpt-4o`), which bills there
+and never touches a plan.
+
+There is no revoke subcommand and none should be added — `/auth/keys/{id}` is DELETE, and the
+server refuses it at the plan's row anyway.
+
+Your plan's row also breaks three expectations an ordinary key sets:
+
+* it calls **Aizen's own plans only** — a seller's model through it is a `403`, and belongs on a key
+  you made yourself;
+* an **empty loadout means it can call nothing**, the opposite of an empty allow-list on any other
+  key, so a freshly issued one refuses everything until something is loaded;
+* its loadout holds **plans, not models**, at most 10, and the order is meaning: `auto` resolves to
+  the first entry callable at that moment. `auto` points *into* the list and can never be in it.
+
+Two route shapes are worth knowing because getting them wrong is expensive. The id goes **last** —
+`/auth/keys/reveal/{id}`, `/auth/keys/loadout/{id}` — because `/auth/keys/{id}` is the revoke route.
+And the plan key is found by the `plan_key` flag on each row, never by its label: one issued through
+the admin door is labelled with the owner's email, not `main`.
+
+### `aizen sub` — plans, combos, model subscriptions, plugins
+```bash
+aizen sub plan ls                     # what a plan grants, costs and caps
+aizen sub plan buy pro                # spends karma — confirms first unless --yes
+aizen sub combo ls                    # the marketplace shelf
+aizen sub model add nbz/glm-5-air     # subscribe (free; usage is charged at call time)
+aizen sub model ls --all              # what you hold, cancelled ones included
+aizen sub model confirm nbz/glm-5-air # accept a price change and unblock it
+aizen sub plugin buy <slug> --code X  # the coupon price is the server's quote, never recomputed
+```
+
+Everything here runs on the account session, never on a gateway key, and nothing here mints,
+reveals or loads one.
+
+**Buying a thing and being able to call it are two different questions**, and the gap between them
+is the source of this API's most confusing `403`:
+
+* the **plan key carries Aizen's own plans only**, so a seller's model bought through `model add` is
+  subscribed and still refused through that key — it needs a key of your own (`aizen key ls`);
+* an **empty loadout on the plan key means it can call nothing**, inverting what an empty allow-list
+  means on every other key, so a freshly bought plan refuses everything until `aizen key loadout`
+  holds it.
+
+Both sentences are printed at the moment of the purchase rather than left for the first failed call.
+
+Three details that decide whether a client is correct:
+
+* **Spends never retry.** A purchase whose answer was lost must not be sent again — the second send
+  charges twice, and the server's `409` is a last fence rather than a contract (a plugin *renewal*
+  is legitimately repeatable, so it cannot catch a double send at all).
+* **`null` is not `0`.** A null `quota_units` is "no cap" while `0` is a real cap of zero; a null
+  `karma_price` means "not sold for karma", which is the opposite of free. `owned` on a plugin is
+  the string `none`/`active`/`expired` — read as a boolean it is truthy in three cases out of three.
+* **A listing id is cut from the END.** The model is the last segment and the namespace before it
+  may hold further `/`, so `two/slashes/here` is a legal id, not a typo. The `/` also stays a real
+  separator in the URL path: `%2F` makes the route stop matching.
+
+Own endpoints (`mine/…`, BYOK) do not pass through this door at any point — they are billed by your
+provider at the far end, spend no karma, and hold no subscription. `aizen sub model add mine/gpt-4o`
+is refused here rather than at the server, because the answer is `aizen custom`, not a retry.
 
 ### `aizen config` — provider-first setup (recommended)
 Run it with no subcommand for the config dashboard. **Providers & connection** is the first row: add a

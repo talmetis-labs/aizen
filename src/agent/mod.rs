@@ -1458,6 +1458,15 @@ where
                             est_now = estimate_tokens(messages) + schema_overhead;
                             goal_retry_line("context overflow — cleared old tool results", 0);
                         }
+                        // No budget, no backoff: the credential this call used is already gone
+                        // from disk, so every retry is a request that cannot be built, and the
+                        // sentence waiting behind them names the command that fixes it.
+                        crate::llm::client::ApiErrorKind::SignedOut => {
+                            if nudge_pushed {
+                                messages.pop();
+                            }
+                            return Err(e);
+                        }
                         crate::llm::client::ApiErrorKind::Permanent => {
                             permanent_tries += 1;
                             if permanent_tries > GOAL_PERMANENT_RETRIES {

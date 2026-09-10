@@ -73,7 +73,9 @@ pub(crate) enum Commands {
     /// Pin this machine to the Aizen gateway: one domain, a short code you approve in a browser,
     /// and the key + endpoints come back. Same as `aizen gateway login`.
     Login(GatewayLoginArgs),
-    /// Remove this machine's local gateway key. Same as `aizen gateway logout`.
+    /// Leave Aizen on this machine: sign out AND drop the local gateway key. Revokes nothing.
+    ///
+    /// Use `aizen account logout` for the session alone, or `aizen gateway logout` for the key.
     Logout(GatewayLogoutArgs),
     /// The Aizen gateway: pin this machine (`login`), see what the key is allowed to do
     /// (`status`), hand the two base URLs to another tool (`env`), or drop the key (`logout`).
@@ -87,11 +89,24 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         cmd: AccountCmd,
     },
-    /// Buy and manage subscriptions: `plan`, marketplace `model`, and paid `plugin`.
+    /// Buy and manage subscriptions: `plan`, `combo`, marketplace `model`, and paid `plugin`.
     /// Needs an account session — run `aizen account login` first.
     Sub {
         #[command(subcommand)]
         cmd: SubCmd,
+    },
+    /// Your own provider endpoints (BYOK): `ls` · `add` · `set` · `rm`.
+    /// Needs an account session — run `aizen account login` first.
+    Custom {
+        #[command(subcommand)]
+        cmd: CustomCmd,
+    },
+    /// Your API keys and what the plan key can call: `ls` · `show` · `rotate` · `reveal` ·
+    /// `loadout` · `models`.
+    /// Needs an account session — run `aizen account login` first.
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
     },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
@@ -794,7 +809,7 @@ pub(crate) struct GatewayLogoutArgs {
 /// `aizen account …` — the session that opens `/auth/*` (plans, subscriptions, plugins).
 #[derive(Subcommand, Debug)]
 pub(crate) enum AccountCmd {
-    /// Sign in with email + password and store the session token (never the gateway key).
+    /// Sign in through the browser and store the session token (never the gateway key).
     Login(AccountLoginArgs),
     /// Show the signed-in account. Never prints the token.
     Whoami {
@@ -802,13 +817,20 @@ pub(crate) enum AccountCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Remove the stored session. Leaves the gateway key alone (that is `aizen logout`).
+    /// Remove the stored session, and nothing else. `aizen logout` drops the pinned key too.
     Logout,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct AccountLoginArgs {
-    /// Account email. Prompted if omitted (and required in non-interactive use).
+    /// Sign in with an email and password instead of through the browser.
+    ///
+    /// Only works for an account that HAS a password. Most do not: an account created through
+    /// Google or GitHub has a null hash, and no string typed at a prompt can match it.
+    #[arg(long)]
+    pub(crate) password: bool,
+    /// Account email. Prompted if omitted. Used only with `--password` — the browser flow takes the
+    /// address from the session it opens.
     #[arg(long)]
     pub(crate) email: Option<String>,
     /// Web host for the session API. Defaults to the saved one, else the built-in
@@ -817,7 +839,12 @@ pub(crate) struct AccountLoginArgs {
     pub(crate) web_url: Option<String>,
 }
 
-/// `aizen sub …` — the three kinds of subscription.
+/// `aizen sub …` — what an account can buy.
+///
+/// `combo` and `model` are two names for one door: both are marketplace *listings*, both are
+/// subscribed to and cancelled through `/auth/subscriptions`, and the server decides which kind a
+/// listing id names. They are separated here only because they are browsed differently — a combo is
+/// a shelf you look at before buying, a subscription is a thing you already hold.
 #[derive(Subcommand, Debug)]
 pub(crate) enum SubCmd {
     /// The account plan.
@@ -825,7 +852,12 @@ pub(crate) enum SubCmd {
         #[command(subcommand)]
         cmd: PlanCmd,
     },
-    /// Marketplace model subscriptions.
+    /// Marketplace combos on offer (subscribe with `aizen sub model add <listing-id>`).
+    Combo {
+        #[command(subcommand)]
+        cmd: ComboCmd,
+    },
+    /// Listing subscriptions you hold — combos and seller models alike.
     Model {
         #[command(subcommand)]
         cmd: ModelCmd,
@@ -834,6 +866,15 @@ pub(crate) enum SubCmd {
     Plugin {
         #[command(subcommand)]
         cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ComboCmd {
+    /// List the combos on offer, with what each costs and whether you can call it.
+    Ls {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -863,7 +904,7 @@ pub(crate) enum ModelCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Subscribe to a model listing (seller/model, e.g. nbz/glm-5-air).
+    /// Subscribe to a listing — a seller model or a combo (e.g. aizen/deepseek).
     Add {
         listing_id: String,
         #[arg(short = 'y', long)]
@@ -920,6 +961,151 @@ pub(crate) enum PluginCmd {
         /// Where to save the file (default: the server's filename, else <slug>.zip).
         #[arg(short = 'o', long)]
         out: Option<std::path::PathBuf>,
+    },
+}
+
+/// `aizen custom …` — your own provider endpoints, called with your own key (BYOK).
+///
+/// Calls through one of these are billed by the provider directly, so they spend no karma and eat
+/// no plan quota. They are still logged: a "what did my agent do" table missing half the calls is a
+/// table that lies.
+#[derive(Subcommand, Debug)]
+pub(crate) enum CustomCmd {
+    /// List your endpoints (never shows a key — only whether one is stored).
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an endpoint. The prefix becomes the model namespace: `mine` → call `mine/gpt-4o`.
+    Add {
+        /// A name for you. Must be unique across your endpoints.
+        name: String,
+        /// Model prefix: lowercase letters, digits and dashes only.
+        prefix: String,
+        /// Upstream base URL. Must be http(s); private/internal addresses are refused (SSRF guard).
+        base_url: String,
+        /// The provider key to call it with. Prompted (no echo) if omitted.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+        /// Request timeout in seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change an endpoint. Only the flags you pass are touched.
+    Set {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
+        /// Replace the stored key. Prompted (no echo) if given with no value.
+        #[arg(long, value_name = "KEY", num_args = 0..=1, default_missing_value = "")]
+        key: Option<String>,
+        /// Forget the stored key, leaving the endpoint otherwise intact.
+        #[arg(long, conflicts_with = "key")]
+        clear_key: bool,
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        /// Stop routing to it without deleting it.
+        #[arg(long)]
+        disable: bool,
+        /// Route to it again.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete an endpoint.
+    Rm {
+        id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `aizen key …` — your API keys, and what your plan is allowed to call.
+///
+/// Your plan is not a key you can copy: the subscription is sold by signing in, and
+/// `aizen account login` is the whole of it. A row still stands behind the account server-side —
+/// marked by the `plan_key` flag, never by its label — because that row carries the loadout, the
+/// ceiling and the budget. Nothing emits its string, so nothing here prints one.
+///
+/// It behaves unlike every other key: it calls Aizen's own plan items only, and an EMPTY loadout
+/// means it can call nothing at all — the opposite of what an empty allow-list means elsewhere.
+///
+/// There is deliberately no `revoke`, and no `show`/`rotate`: the plan's row cannot be re-made, and
+/// the two routes that once printed and replaced its string were withdrawn before they shipped.
+#[derive(Subcommand, Debug)]
+pub(crate) enum KeyCmd {
+    /// List your API keys. Shows the visible head only, never the key itself.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the full string of a key you made yourself. Requires --id.
+    ///
+    /// There is no default: your plan has no string to reveal, so guessing one here could only
+    /// produce a refusal that reads like a bug.
+    Reveal {
+        /// Which key — `aizen key ls` lists them.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The plan key's loadout — the plans it may call, in `auto` preference order.
+    Loadout {
+        #[command(subcommand)]
+        cmd: LoadoutCmd,
+    },
+    /// What each loadout entry can actually call, resolved through the marketplace.
+    Models {
+        /// Only this loadout entry.
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum LoadoutCmd {
+    /// Show the loadout in order. `auto` picks the first entry that is callable right now.
+    Ls {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the whole loadout. Order matters — it is `auto`'s preference order.
+    Set {
+        /// Plan names, best first. Max 10.
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append to the loadout (read, modify, write — the route only takes a whole list).
+    Add {
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove entries from the loadout.
+    Rm {
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 

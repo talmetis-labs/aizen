@@ -36,3 +36,11 @@ main_diff*.txt
 # coding-agent scratch: per-agent git worktrees (hundreds of MB) and this checkout's local tool
 # settings. Machine-specific and regenerated on demand — an accidental `git add -A` must not sweep it.
 .claude/
+
+# analysis/fix scratch and stray per-version release-note drafts left in the tree — real release
+# notes live in CHANGELOG.md and release-notes-v<version>.md (tracked), not these.
+/fix-analysis.md
+/fix-summary.md
+/mutable-cuddling-narwhal.md
+/release-notes-v0.5.9.md
+/release-notes-v0.6.0.md
