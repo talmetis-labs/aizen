@@ -70,6 +70,44 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
+    /// Pin this machine to the Aizen gateway: one domain, a short code you approve in a browser,
+    /// and the key + endpoints come back. Same as `aizen gateway login`.
+    Login(GatewayLoginArgs),
+    /// Leave Aizen on this machine: sign out AND drop the local gateway key. Revokes nothing.
+    ///
+    /// Use `aizen account logout` for the session alone, or `aizen gateway logout` for the key.
+    Logout(GatewayLogoutArgs),
+    /// The Aizen gateway: pin this machine (`login`), see what the key is allowed to do
+    /// (`status`), hand the two base URLs to another tool (`env`), or drop the key (`logout`).
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
+    /// Your Aizen account session (email + password → `/auth/*`), which is NOT the gateway key:
+    /// `login` · `whoami` · `logout`. Required before `aizen sub`.
+    Account {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+    /// Buy and manage subscriptions: `plan`, `combo`, marketplace `model`, and paid `plugin`.
+    /// Needs an account session — run `aizen account login` first.
+    Sub {
+        #[command(subcommand)]
+        cmd: SubCmd,
+    },
+    /// Your own provider endpoints (BYOK): `ls` · `add` · `set` · `rm`.
+    /// Needs an account session — run `aizen account login` first.
+    Custom {
+        #[command(subcommand)]
+        cmd: CustomCmd,
+    },
+    /// Your API keys and what the plan key can call: `ls` · `show` · `rotate` · `reveal` ·
+    /// `loadout` · `models`.
+    /// Needs an account session — run `aizen account login` first.
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
@@ -336,7 +374,8 @@ pub(crate) enum McpCmd {
     /// aizen's specialists. Serves the repo it is started in.
     Serve {
         /// Allow dispatches that can edit files or run shell. Without it the server refuses any
-        /// coder/tester role and any specialist whose card grants a destructive tool.
+        /// write-capable role (daedalus/themis — legacy coder/tester) and any specialist whose
+        /// card grants a destructive tool.
         #[arg(long)]
         yes: bool,
     },
@@ -575,6 +614,13 @@ pub(crate) enum TimeCmd {
         #[arg(short, long)]
         keep: Option<usize>,
     },
+    /// Delete specific checkpoints by id (disk is reclaimed by the next `aizen time gc`).
+    Rm {
+        /// Checkpoint ids (from `aizen time list`). The active point is refused — restore
+        /// somewhere else first.
+        #[arg(required = true)]
+        ids: Vec<u32>,
+    },
     /// Inspect ledger/refs/sidecars/journal without mutating the working tree.
     Doctor {
         /// Emit a machine-readable JSON report.
@@ -693,6 +739,374 @@ pub(crate) struct CrawlArgs {
     /// Annotate each URL with its source (seed/html/js) in plain output.
     #[arg(long)]
     pub(crate) show_source: bool,
+}
+
+/// `aizen gateway …` — device pairing against the Aizen gateway, and what the key can do.
+#[derive(Subcommand, Debug)]
+pub(crate) enum GatewayCmd {
+    /// Pin this machine: print a short code, wait for it to be approved in a browser, save the key.
+    Login(GatewayLoginArgs),
+    /// What the gateway says this key is: endpoints, default model, limits, karma left.
+    Status(GatewayStatusArgs),
+    /// The two base URLs as environment variables, for a tool that is not this CLI.
+    Env(GatewayEnvArgs),
+    /// Remove the local key. Does NOT revoke it — unpin the device in the dashboard for that.
+    Logout(GatewayLogoutArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayLoginArgs {
+    /// What this machine is called in the dashboard. Defaults to the hostname.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    /// The config profile the key is written into.
+    #[arg(long, default_value = "aizen")]
+    pub(crate) profile: String,
+    /// Save the endpoint without making it the one this CLI uses.
+    #[arg(long)]
+    pub(crate) no_activate: bool,
+    /// Do not try to open a browser — a server, an SSH session, a headless box.
+    #[arg(long)]
+    pub(crate) no_browser: bool,
+    /// Print the result as JSON. The key is never included.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Gateway root (overrides AIZEN_GATEWAY_URL). Only for staging.
+    #[arg(long, value_name = "URL")]
+    pub(crate) gateway: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayStatusArgs {
+    /// Which config profile's key to ask with. Defaults to the pinned one.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+    /// Print the gateway's own answer as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Gateway root (overrides AIZEN_GATEWAY_URL). Only for staging.
+    #[arg(long, value_name = "URL")]
+    pub(crate) gateway: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayEnvArgs {
+    /// Prefix each line so it can be sourced (`export …`, or `$env:…` on Windows).
+    #[arg(long)]
+    pub(crate) export: bool,
+    /// Also print the API key. Off by default: this puts a live secret in your scrollback.
+    #[arg(long)]
+    pub(crate) with_key: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct GatewayLogoutArgs {
+    /// Which config profile to clear. Defaults to the pinned one.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+}
+
+/// `aizen account …` — the session that opens `/auth/*` (plans, subscriptions, plugins).
+#[derive(Subcommand, Debug)]
+pub(crate) enum AccountCmd {
+    /// Sign in through the browser and store the session token (never the gateway key).
+    Login(AccountLoginArgs),
+    /// Show the signed-in account. Never prints the token.
+    Whoami {
+        /// Print as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the stored session, and nothing else. `aizen logout` drops the pinned key too.
+    Logout,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct AccountLoginArgs {
+    /// Sign in with an email and password instead of through the browser.
+    ///
+    /// Only works for an account that HAS a password. Most do not: an account created through
+    /// Google or GitHub has a null hash, and no string typed at a prompt can match it.
+    #[arg(long)]
+    pub(crate) password: bool,
+    /// Account email. Prompted if omitted. Used only with `--password` — the browser flow takes the
+    /// address from the session it opens.
+    #[arg(long)]
+    pub(crate) email: Option<String>,
+    /// Web host for the session API. Defaults to the saved one, else the built-in
+    /// (overridable with AIZEN_WEB_URL). Not derived from the gateway URL.
+    #[arg(long, value_name = "URL")]
+    pub(crate) web_url: Option<String>,
+}
+
+/// `aizen sub …` — what an account can buy.
+///
+/// `combo` and `model` are two names for one door: both are marketplace *listings*, both are
+/// subscribed to and cancelled through `/auth/subscriptions`, and the server decides which kind a
+/// listing id names. They are separated here only because they are browsed differently — a combo is
+/// a shelf you look at before buying, a subscription is a thing you already hold.
+#[derive(Subcommand, Debug)]
+pub(crate) enum SubCmd {
+    /// The account plan.
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCmd,
+    },
+    /// Marketplace combos on offer (subscribe with `aizen sub model add <listing-id>`).
+    Combo {
+        #[command(subcommand)]
+        cmd: ComboCmd,
+    },
+    /// Listing subscriptions you hold — combos and seller models alike.
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
+    },
+    /// Paid plugins.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ComboCmd {
+    /// List the combos on offer, with what each costs and whether you can call it.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PlanCmd {
+    /// List available plans.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Buy or switch to a plan (spends karma — confirms first unless --yes).
+    Buy {
+        plan_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelCmd {
+    /// List your model subscriptions (cancelled ones hidden unless --all).
+    Ls {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Subscribe to a listing — a seller model or a combo (e.g. aizen/deepseek).
+    Add {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm a price change so a blocked subscription works again.
+    Confirm {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a model subscription.
+    Rm {
+        listing_id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PluginCmd {
+    /// List plugins and what you own.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the final price (after a coupon). Does not buy.
+    Quote {
+        slug: String,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Buy a plugin (spends karma — confirms first unless --yes).
+    Buy {
+        slug: String,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a plugin you own.
+    Download {
+        slug: String,
+        /// Where to save the file (default: the server's filename, else <slug>.zip).
+        #[arg(short = 'o', long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+/// `aizen custom …` — your own provider endpoints, called with your own key (BYOK).
+///
+/// Calls through one of these are billed by the provider directly, so they spend no karma and eat
+/// no plan quota. They are still logged: a "what did my agent do" table missing half the calls is a
+/// table that lies.
+#[derive(Subcommand, Debug)]
+pub(crate) enum CustomCmd {
+    /// List your endpoints (never shows a key — only whether one is stored).
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an endpoint. The prefix becomes the model namespace: `mine` → call `mine/gpt-4o`.
+    Add {
+        /// A name for you. Must be unique across your endpoints.
+        name: String,
+        /// Model prefix: lowercase letters, digits and dashes only.
+        prefix: String,
+        /// Upstream base URL. Must be http(s); private/internal addresses are refused (SSRF guard).
+        base_url: String,
+        /// The provider key to call it with. Prompted (no echo) if omitted.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+        /// Request timeout in seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change an endpoint. Only the flags you pass are touched.
+    Set {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
+        /// Replace the stored key. Prompted (no echo) if given with no value.
+        #[arg(long, value_name = "KEY", num_args = 0..=1, default_missing_value = "")]
+        key: Option<String>,
+        /// Forget the stored key, leaving the endpoint otherwise intact.
+        #[arg(long, conflicts_with = "key")]
+        clear_key: bool,
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        /// Stop routing to it without deleting it.
+        #[arg(long)]
+        disable: bool,
+        /// Route to it again.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete an endpoint.
+    Rm {
+        id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `aizen key …` — your API keys, and what your plan is allowed to call.
+///
+/// Your plan is not a key you can copy: the subscription is sold by signing in, and
+/// `aizen account login` is the whole of it. A row still stands behind the account server-side —
+/// marked by the `plan_key` flag, never by its label — because that row carries the loadout, the
+/// ceiling and the budget. Nothing emits its string, so nothing here prints one.
+///
+/// It behaves unlike every other key: it calls Aizen's own plan items only, and an EMPTY loadout
+/// means it can call nothing at all — the opposite of what an empty allow-list means elsewhere.
+///
+/// There is deliberately no `revoke`, and no `show`/`rotate`: the plan's row cannot be re-made, and
+/// the two routes that once printed and replaced its string were withdrawn before they shipped.
+#[derive(Subcommand, Debug)]
+pub(crate) enum KeyCmd {
+    /// List your API keys. Shows the visible head only, never the key itself.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the full string of a key you made yourself. Requires --id.
+    ///
+    /// There is no default: your plan has no string to reveal, so guessing one here could only
+    /// produce a refusal that reads like a bug.
+    Reveal {
+        /// Which key — `aizen key ls` lists them.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The plan key's loadout — the plans it may call, in `auto` preference order.
+    Loadout {
+        #[command(subcommand)]
+        cmd: LoadoutCmd,
+    },
+    /// What each loadout entry can actually call, resolved through the marketplace.
+    Models {
+        /// Only this loadout entry.
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum LoadoutCmd {
+    /// Show the loadout in order. `auto` picks the first entry that is callable right now.
+    Ls {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the whole loadout. Order matters — it is `auto`'s preference order.
+    Set {
+        /// Plan names, best first. Max 10.
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append to the loadout (read, modify, write — the route only takes a whole list).
+    Add {
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove entries from the loadout.
+    Rm {
+        models: Vec<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `aizen auth …` — experimental provider OAuth (ChatGPT Codex).

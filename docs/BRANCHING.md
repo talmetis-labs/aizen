@@ -7,7 +7,7 @@ branch protection and CI, not by memory — if something here is only a conventi
 
 | Remote | URL | Role |
 |---|---|---|
-| `public` | `github.com/aizen-stack/aizen` | **the live line.** `main`, `dev`, every PR, every release |
+| `public` | `github.com/talmetis-labs/aizen` | **the live line.** `main`, `dev`, every PR, every release |
 | `origin` | `github.com/dawnofcd/Aizen_agent` (private) | historical private mirror — **divergent history** |
 
 `origin/main` and `public/main` do not share an ancestor any more. Never merge one into the other:

@@ -272,11 +272,15 @@ impl Group {
 /// routing map are both views over it, which is what stops the config bundles and the prompt from
 /// disagreeing about what a tool is.
 pub fn lane_for(name: &str) -> Option<Lane> {
-    if name.starts_with("mcp_") {
+    // `tool_search` discovers DEFERRED MCP tools, so it lives (and is config-filtered) with them:
+    // disabling the `mcp` bundle removes the door along with the rooms.
+    if name.starts_with("mcp_") || name == "tool_search" {
         return Some(Lane::Mcp);
     }
     Some(match name {
-        "memory_search" | "memory_list" | "memory_profile" | "memory_ask" => Lane::MemoryRead,
+        "memory_search" | "memory_list" | "memory_profile" | "memory_ask" | "session_recall" => {
+            Lane::MemoryRead
+        }
         "memory_save" | "memory_update" | "memory_forget" => Lane::MemoryWrite,
         "file_read" | "file_glob" | "search_files" => Lane::FileRead,
         "file_edit" | "file_write" | "file_move" => Lane::FileWrite,
@@ -294,7 +298,9 @@ pub fn lane_for(name: &str) -> Option<Lane> {
         "checkpoint" | "checkpoint_view" => Lane::Checkpoint,
         "telegram_send" | "telegram_ask" | "bot_admin" | "notify" => Lane::Messaging,
         "persona_create" => Lane::Persona,
-        "repo_map" | "codebase_search" => Lane::Structure,
+        // `git_inspect` is read-only repo intel (status/log/diff/blame), not command execution —
+        // it groups with structure, and disabling the shell bundle must not take it along.
+        "repo_map" | "codebase_search" | "git_inspect" => Lane::Structure,
         "lsp_references"
         | "lsp_definition"
         | "read_symbol"

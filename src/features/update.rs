@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
-const DEFAULT_REPO: &str = "aizen-stack/aizen";
+const DEFAULT_REPO: &str = "talmetis-labs/aizen";
 const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_BINARY_BYTES: u64 = 300 * 1024 * 1024;
 const HTTP_TIMEOUT_SECS: u64 = 120;
@@ -322,6 +322,7 @@ pub fn cleanup_stale_backups(dir: &Path, live_exe: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
@@ -329,6 +330,22 @@ pub fn cleanup_stale_backups(dir: &Path, live_exe: &Path) {
         };
         if name != live_name && name.starts_with("aizen") && name.contains(".old-") {
             let _ = fs::remove_file(path);
+            continue;
+        }
+        // A download killed mid-stream leaves `.aizen-update-{pid}.part` with nothing to collect
+        // it (the in-process removals only run when the SAME process lives to see the error).
+        // Age-gated: another window may be mid-download right now, and an hour is far past any
+        // real download while costing nothing on the sweep.
+        if name.starts_with(".aizen-update-") && name.ends_with(".part") {
+            let stale = entry
+                .metadata()
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age.as_secs() > 60 * 60);
+            if stale {
+                let _ = fs::remove_file(path);
+            }
         }
     }
 }
@@ -626,11 +643,21 @@ mod tests {
         fs::write(&stale, b"stale").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
 
+        // A download `.part` too fresh to be an orphan: it may be another window's LIVE download,
+        // so the sweep must leave it (the stale case needs an hour-old mtime, which a unit test
+        // cannot fabricate portably — the age gate is the assertion here).
+        let part = root.join(".aizen-update-999.part");
+        fs::write(&part, b"partial").unwrap();
+
         cleanup_stale_backups(&root, &live);
 
         assert!(live.exists(), "the running binary must survive the sweep");
         assert!(!stale.exists(), "a previous update's backup must be swept");
         assert!(unrelated.exists(), "unrelated files must be left alone");
+        assert!(
+            part.exists(),
+            "a fresh .part may be a live download elsewhere"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

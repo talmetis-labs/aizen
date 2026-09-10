@@ -1560,6 +1560,137 @@ SlashId::Yolo => {
                 ),
             }
         }
+        SlashId::Theme => {
+            let sub = arg.trim().to_ascii_lowercase();
+            // Persist + apply one theme choice. `lanes` is stored explicitly; moonlight is the
+            // default, so choosing it CLEARS the field rather than pinning a redundant value.
+            let set = |lanes: bool, label: &str| {
+                let mut cfg = cli_config::load();
+                cfg.theme = lanes.then(|| "lanes".to_string());
+                match cli_config::save(&cfg) {
+                    Ok(_) => {
+                        crate::ui::theme::set_lanes_enabled(lanes);
+                        tui::emit_line(
+                            &style(format!("theme → {label}"))
+                                .color256(splash::ACCENT)
+                                .to_string(),
+                        );
+                    }
+                    Err(e) => tui::emit_line(&format!("{} {e}", style("theme:").red())),
+                }
+            };
+            match sub.as_str() {
+                "" | "list" | "status" => {
+                    let on = crate::ui::theme::lanes_enabled();
+                    let dot = |sel: bool| if sel { "●" } else { "○" };
+                    tui::emit_line(&style("themes:").color256(splash::ACCENT).to_string());
+                    tui::emit_line(&format!(
+                        "  {} moonlight — the calm all-silver default",
+                        dot(!on)
+                    ));
+                    // The swatch shows each lane in its own hue, so the choice is visible before
+                    // it is made.
+                    let swatch = [
+                        ("read", theme::LANE_READ),
+                        ("edit", theme::LANE_EDIT),
+                        ("shell", theme::LANE_EXEC),
+                        ("web", theme::LANE_WEB),
+                        ("memory", theme::LANE_MIND),
+                        ("talk", theme::LANE_TALK),
+                        ("plan", theme::LANE_PLAN),
+                    ]
+                    .map(|(word, c)| style(word).color256(c).to_string())
+                    .join(" · ");
+                    tui::emit_line(&format!(
+                        "  {} lanes — each kind of work in its own colour: {swatch}",
+                        dot(on)
+                    ));
+                    tui::emit_line(
+                        &style("pick with /theme moonlight | lanes")
+                            .dim()
+                            .to_string(),
+                    );
+                }
+                "lanes" | "lane" | "colors" | "colours" => {
+                    set(true, "lanes — each kind of work in its own colour")
+                }
+                "moonlight" | "default" | "silver" | "mono" => {
+                    set(false, "moonlight — the calm all-silver default")
+                }
+                other => tui::emit_line(
+                    &style(format!("usage: /theme [moonlight|lanes]  (unknown '{other}')"))
+                        .dim()
+                        .to_string(),
+                ),
+            }
+        }
+        SlashId::Login => {
+            // `Stdin::Always`, so the frame is down and plain `println!` from the shared sign-in
+            // screen lands on the terminal — one copy of that screen, warnings included.
+            let web = crate::llm::account::web_url();
+            if let Some(who) = crate::llm::account::load().map(|s| s.email) {
+                let who = if who.trim().is_empty() {
+                    "this machine".to_string()
+                } else {
+                    who
+                };
+                println!("Already signed in as {who}. Signing in again replaces that session.");
+            }
+            match crate::cli::account_cmd::browser_login(&web).await {
+                Ok(session) => {
+                    // A session that cannot be written is a sign-in that did not happen: the next
+                    // turn would resolve nothing and blame the endpoint. Said, not swallowed.
+                    if let Err(e) = crate::llm::account::save(&session) {
+                        tui::emit_line(
+                            &style(format!("signed in, but the session could not be saved: {e}"))
+                                .color256(theme::WARN)
+                                .to_string(),
+                        );
+                        return SlashOutcome::Continue;
+                    }
+                    tui::emit_line(
+                        &style(if session.email.is_empty() {
+                            "signed in".to_string()
+                        } else {
+                            format!("signed in as {}", session.email)
+                        })
+                        .color256(splash::ACCENT)
+                        .to_string(),
+                    );
+                    // Worth saying here and not only in the CLI: somebody who reached for `/login`
+                    // inside a running window is usually renewing a session that just 401'd.
+                    tui::emit_line(
+                        &theme::muted(
+                            "the plan is ready to call — no key needed; `/provider` to switch endpoints",
+                        )
+                        .to_string(),
+                    );
+                }
+                // Never fatal in the REPL: the window is holding a conversation, and the three
+                // refusals here (no such code, already used, expired) all mean "run it again".
+                Err(e) => tui::emit_line(
+                    &style(format!("sign-in did not finish: {e}"))
+                        .color256(theme::WARN)
+                        .to_string(),
+                ),
+            }
+        }
+        SlashId::Logout => {
+            // The same teardown and the same words as `aizen logout`; only the way a line reaches
+            // the screen differs, which is why `left_lines` is shared rather than re-worded.
+            let left = crate::llm::gateway::leave(None).await;
+            for line in crate::ui::gateway_ui::left_lines(&left) {
+                tui::emit_line(&line);
+            }
+            if left.signed_out || left.key_profile.is_some() {
+                // This window resolved its endpoint before the teardown, so it may still be
+                // holding a credential that is now gone from disk. Say so rather than let the next
+                // turn be the thing that explains it.
+                tui::emit_line(
+                    &theme::muted("`/login` to sign in again before the next turn").to_string(),
+                );
+            }
+        }
         SlashId::Provider => {
             let selected = if arg.eq_ignore_ascii_case("add") || arg.eq_ignore_ascii_case("manage") {
                 let mut cfg = cli_config::load();

@@ -108,6 +108,10 @@ pub enum CommandOrigin {
     VerifyGate,
     /// A language server child (binary from PATH discovery; input is repository content).
     Lsp,
+    /// The `git_inspect` tool — a read-only git query whose subcommand and flags are Aizen-fixed
+    /// (closed action enum, exec form — no shell), with the model-supplied path/rev arguments
+    /// validated by the tool before they reach argv.
+    GitInspect,
     /// A `` !`cmd` `` expansion inside a user-defined custom command (repository-influenced).
     CustomCommand,
     /// The user's own `!cmd` escape typed at the REPL prompt.
@@ -143,6 +147,7 @@ impl CommandOrigin {
             Self::ProcessStart => "process_start",
             Self::VerifyGate => "verify_gate",
             Self::Lsp => "lsp",
+            Self::GitInspect => "git_inspect",
             Self::CustomCommand => "custom_command",
             Self::UserEscape => "user_escape",
             Self::TelegramShell => "telegram_shell",
@@ -248,6 +253,7 @@ mod tests {
             CommandOrigin::ProcessStart,
             CommandOrigin::VerifyGate,
             CommandOrigin::Lsp,
+            CommandOrigin::GitInspect,
             CommandOrigin::CustomCommand,
             CommandOrigin::UserEscape,
             CommandOrigin::SubAgent,

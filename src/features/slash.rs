@@ -34,6 +34,8 @@ pub enum SlashId {
     Goal,
     Model,
     Provider,
+    Login,
+    Logout,
     Config,
     Memory,
     Persona,
@@ -75,6 +77,7 @@ pub enum SlashId {
     Team,
     Yolo,
     AutoCopy,
+    Theme,
 }
 
 /// When a command takes over stdin (a `dialoguer` menu, the effort slider, a daemon) and the
@@ -213,6 +216,31 @@ pub const BUILTINS: &[Builtin] = &[
         argument_hint: "[name|add|manage]",
         help: "[name]   one-pick switch; `add` creates and `manage` edits/renames/deletes providers",
         stdin: Stdin::BareOr(&["add", "manage"]),
+    },
+    Builtin {
+        id: SlashId::Login,
+        name: "login",
+        aliases: &[("signin", "alias for /login")],
+        hidden_aliases: &["sign-in", "account"],
+        hidden: false,
+        description: "sign in to Aizen with your browser",
+        argument_hint: "",
+        help: "sign in to your Aizen account in a browser; the session opens the gateway on its own, so nothing is stored but the token (`aizen account login`)",
+        // Prints a link and then waits — up to ten minutes, since the code's own two-minute clock
+        // only starts once the person has a session and step one is often a round trip through
+        // Google. The frame has to come down for any of that to be readable.
+        stdin: Stdin::Always,
+    },
+    Builtin {
+        id: SlashId::Logout,
+        name: "logout",
+        aliases: &[("signout", "alias for /logout")],
+        hidden_aliases: &["sign-out"],
+        hidden: false,
+        description: "leave Aizen here: the session and the local key",
+        argument_hint: "",
+        help: "drop this machine's Aizen session AND its pinned gateway key. Revokes neither — the token stays valid elsewhere until it expires, and the key until you unpin the device in the dashboard (`aizen logout`)",
+        stdin: Stdin::Never,
     },
     Builtin {
         id: SlashId::Config,
@@ -681,6 +709,17 @@ Builtin {
         help: "on (default): releasing a drag-select copies to the clipboard. off: keep the highlight and copy with Ctrl-C (Windows/Linux) or ⌘C (macOS). bare /auto-copy toggles",
         stdin: Stdin::Never,
     },
+    Builtin {
+        id: SlashId::Theme,
+        name: "theme",
+        aliases: &[],
+        hidden_aliases: &["themes"],
+        hidden: false,
+        description: "pick the colour theme (moonlight | lanes)",
+        argument_hint: "[moonlight|lanes]",
+        help: "bare: list themes. `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal; `moonlight` (default) keeps the calm all-silver look",
+        stdin: Stdin::Never,
+    },
 ];
 /// What a line beginning with `/` actually IS.
 ///
@@ -1008,9 +1047,19 @@ mod tests {
             "serve",
             "auto-copy",
             "autocopy",
+            "login",
+            "logout",
         ] {
             assert!(names.contains(name), "slash catalog must include /{name}");
         }
+        // Both spellings of each credential command reach it: somebody who types `/signin` is
+        // asking for the same door, and a slash surface that answers "unknown command" there is
+        // telling them the door does not exist.
+        assert_eq!(resolve("login").map(|b| b.id), Some(SlashId::Login));
+        assert_eq!(resolve("signin").map(|b| b.id), Some(SlashId::Login));
+        assert_eq!(resolve("account").map(|b| b.id), Some(SlashId::Login));
+        assert_eq!(resolve("logout").map(|b| b.id), Some(SlashId::Logout));
+        assert_eq!(resolve("signout").map(|b| b.id), Some(SlashId::Logout));
         assert_eq!(resolve("auto-copy").map(|b| b.id), Some(SlashId::AutoCopy));
         assert_eq!(resolve("autocopy").map(|b| b.id), Some(SlashId::AutoCopy));
         assert_eq!(cmd("/auto-copy off"), ("auto-copy".into(), "off".into()));

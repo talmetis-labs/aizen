@@ -68,6 +68,20 @@ pub struct SymbolEditPlan {
 /// The process-global LSP manager. One per CLI process; servers are spawned lazily and reused.
 pub static LSP: Lazy<LspManager> = Lazy::new(LspManager::new);
 
+/// The language [`discovery::detect`] would serve for the process cwd — i.e. what the lazy server
+/// WILL be once the first symbol query lands. Cached for the process lifetime: the sidebar asks on
+/// every status refresh, and the cwd does not move under a running session (the same assumption the
+/// renderer's `sidebar_cwd` makes).
+fn detected_workspace_lang() -> Option<&'static str> {
+    static DETECTED: Lazy<Option<&'static str>> = Lazy::new(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| discovery::detect(&d))
+            .map(|(spec, _)| spec.lang)
+    });
+    *DETECTED
+}
+
 /// A crashed server is respawned at most this many times per session before being marked disabled
 /// (never a tight restart loop — plan §2 decision 5). `/lsp restart` resets the counters.
 const MAX_RESPAWNS: u32 = 2;
@@ -76,6 +90,10 @@ const MAX_RESPAWNS: u32 = 2;
 pub struct LspStatus {
     pub enabled: bool,
     pub servers: Vec<ServerStatus>,
+    /// The language [`discovery::detect`] resolves for the process cwd — what the lazily-started
+    /// server WILL be, so status can name it before the first symbol query starts anything.
+    /// `None` = no supported project here, so no server will ever start.
+    pub detected: Option<&'static str>,
 }
 
 pub struct ServerStatus {
@@ -83,6 +101,19 @@ pub struct ServerStatus {
     pub root: PathBuf,
     pub indexed: bool,
     pub alive: bool,
+}
+
+impl ServerStatus {
+    /// One word for where the server is in its life: dead / ready / indexing….
+    fn state(&self) -> &'static str {
+        if !self.alive {
+            "dead"
+        } else if self.indexed {
+            "ready"
+        } else {
+            "indexing…"
+        }
+    }
 }
 
 impl LspStatus {
@@ -93,26 +124,46 @@ impl LspStatus {
                 .to_string();
         }
         if self.servers.is_empty() {
-            return "LSP: on — no server running yet (starts lazily on the first symbol query)."
-                .to_string();
+            return match self.detected {
+                Some(lang) => format!(
+                    "LSP: on — this repo looks like {lang}; the server starts lazily on the first \
+                     symbol query."
+                ),
+                None => "LSP: on — no rust/python/typescript project detected here, so no server \
+                         will start."
+                    .to_string(),
+            };
         }
         let mut s = String::from("LSP: on\n");
         for sv in &self.servers {
-            let state = if !sv.alive {
-                "dead"
-            } else if sv.indexed {
-                "ready"
-            } else {
-                "indexing…"
-            };
             s.push_str(&format!(
                 "  {} [{}]  {}\n",
                 sv.lang,
-                state,
+                sv.state(),
                 sv.root.display()
             ));
         }
         s.trim_end().to_string()
+    }
+
+    /// One-line chip for the retained sidebar: "off", the detected language while lazy ("rust
+    /// idle" — which server WOULD serve this repo, before any symbol query has started it), or the
+    /// live servers as `lang state` pairs.
+    pub fn chip(&self) -> String {
+        if !self.enabled {
+            return "off".to_string();
+        }
+        if self.servers.is_empty() {
+            return match self.detected {
+                Some(lang) => format!("{lang} idle"),
+                None => "no project".to_string(),
+            };
+        }
+        self.servers
+            .iter()
+            .map(|sv| format!("{} {}", sv.lang, sv.state()))
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
@@ -247,6 +298,7 @@ impl LspManager {
         LspStatus {
             enabled: self.is_enabled(),
             servers,
+            detected: detected_workspace_lang(),
         }
     }
 
@@ -886,6 +938,39 @@ mod tests {
             message: msg.into(),
             code: code.map(String::from),
         }
+    }
+
+    #[test]
+    fn chip_names_the_detected_language_while_lazy() {
+        // Before any server runs, the sidebar chip must still answer "which LSP would this be?" —
+        // the lazy start used to hide the language behind a bare "idle".
+        let idle = LspStatus {
+            enabled: true,
+            servers: vec![],
+            detected: Some("rust"),
+        };
+        assert_eq!(idle.chip(), "rust idle");
+        assert!(
+            idle.render().contains("looks like rust"),
+            "`/lsp status` names it too: {}",
+            idle.render()
+        );
+        let nothing = LspStatus {
+            enabled: true,
+            servers: vec![],
+            detected: None,
+        };
+        assert_eq!(
+            nothing.chip(),
+            "no project",
+            "no manifest anywhere ⇒ no server will ever start — say so, don't imply one is pending"
+        );
+        let off = LspStatus {
+            enabled: false,
+            servers: vec![],
+            detected: Some("rust"),
+        };
+        assert_eq!(off.chip(), "off", "disabled wins over detection");
     }
 
     #[test]

@@ -49,17 +49,18 @@ commercial use is allowed.
 
 ```
 origin  → https://github.com/dawnofcd/Aizen_agent.git   (PRIVATE — full source, day-to-day work)
-public  → https://github.com/dawnofcd/aizen.git         (PUBLIC — redirects to aizen-stack/aizen)
+public  → https://github.com/talmetis-labs/aizen.git    (PUBLIC — full source, releases)
 ```
 
-- The **canonical public repo is `aizen-stack/aizen`** (an org). `dawnofcd/aizen` still resolves via
-  GitHub's redirect, but **write `aizen-stack/aizen` in all user-facing URLs, install scripts, and
-  code** so nothing depends on a redirect.
+- The **canonical public repo is `talmetis-labs/aizen`** (renamed from `aizen-stack/aizen` on
+  2026-08-27; that slug and the older `dawnofcd/aizen` both still resolve via GitHub's redirects).
+  **Write `talmetis-labs/aizen` in all user-facing URLs, install scripts, and code** so nothing
+  depends on a redirect.
 - `dawnofcd/Aizen_agent` is private, so an anonymous fetch of it returns 404. That is expected — it
   is not a broken URL. **Never put it in user-facing docs**; the README used to tell people to
   `cargo install --git .../Aizen_agent`, which 404'd for everyone.
-- Release binaries are published to `aizen-stack/aizen`. `src/features/update.rs` has
-  `DEFAULT_REPO = "aizen-stack/aizen"` and `aizen update` reads releases from there — keep it aligned
+- Release binaries are published to `talmetis-labs/aizen`. `src/features/update.rs` has
+  `DEFAULT_REPO = "talmetis-labs/aizen"` and `aizen update` reads releases from there — keep it aligned
   with `install.ps1` (`$Repo`) and `install.sh` (`repo=`).
 - Never push to `main` on either remote without being asked. Branch, then push with `-u`.
 

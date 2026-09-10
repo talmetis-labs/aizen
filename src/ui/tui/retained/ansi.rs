@@ -39,6 +39,87 @@ pub(super) fn pad_to(s: &str, width: usize) -> String {
     format!("{clipped}{}", " ".repeat(width.saturating_sub(w)))
 }
 
+/// Wrap one sanitised row (SGR-only escapes) to `width` display columns. Prefers breaking after
+/// the last space inside the window, hard-breaks a word wider than the window, and preserves all
+/// whitespace byte-for-byte (emitted text may be pre-aligned — collapsing would shift it). The
+/// SGR codes in force at the break are re-emitted at the head of the continuation row, so a
+/// styled note keeps its colour past the fold; escapes are zero-width and never count toward the
+/// window. This is what keeps a long `sandbox:`/`[dense]`/`mcp:` boot note readable instead of
+/// clipped at the pane edge.
+pub(super) fn wrap_keep_sgr(row: &str, width: usize) -> Vec<String> {
+    if width < 4 || console::measure_text_width(row) <= width {
+        return vec![row.to_string()];
+    }
+    // SGR sequences currently in force, rebuilt on the fly: a reset (`\x1b[m` / leading `0`)
+    // clears the stack, anything else stacks on top.
+    fn note_sgr(active: &mut Vec<String>, seq: &str, params: &str) {
+        let first = params.split(';').next().unwrap_or("");
+        if first.is_empty() || first == "0" {
+            active.clear();
+            if params.split(';').any(|p| !p.is_empty() && p != "0") {
+                active.push(seq.to_string());
+            }
+        } else {
+            active.push(seq.to_string());
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut active: Vec<String> = Vec::new();
+    // The last space in `cur` a soft break can land after: (byte end, width through it, SGR then).
+    let mut brk: Option<(usize, usize, Vec<String>)> = None;
+    let mut chars = row.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            let mut fin = None;
+            while let Some(&pc) = chars.peek() {
+                chars.next();
+                if pc.is_ascii_digit() || pc == ';' {
+                    params.push(pc);
+                } else {
+                    fin = Some(pc);
+                    break;
+                }
+            }
+            if fin == Some('m') {
+                let seq = format!("\x1b[{params}m");
+                note_sgr(&mut active, &seq, &params);
+                cur.push_str(&seq);
+            }
+            continue;
+        }
+        let w = console::measure_text_width(&c.to_string()).max(1);
+        if cur_w + w > width {
+            match brk.take() {
+                Some((at, bw, sgr)) => {
+                    let rest = cur.split_off(at);
+                    out.push(std::mem::take(&mut cur));
+                    cur = sgr.concat();
+                    cur.push_str(&rest);
+                    cur_w = cur_w.saturating_sub(bw);
+                }
+                None => {
+                    out.push(std::mem::take(&mut cur));
+                    cur = active.concat();
+                    cur_w = 0;
+                }
+            }
+        }
+        cur.push(c);
+        cur_w += w;
+        if c == ' ' {
+            brk = Some((cur.len(), cur_w, active.clone()));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Strip ALL terminal control sequences INCLUDING colour/SGR, leaving printable text only. Used for
 /// the intro block (rendered as one flat dim line) and where a plain-text guarantee is wanted.
 pub(super) fn sanitize_text(input: &str) -> String {
@@ -116,7 +197,8 @@ fn basic_color(n: u16) -> Color {
 
 /// Fold one SGR parameter list (the `;`-separated numbers before an `m`) into the running style,
 /// resetting to `base` on `0`/`39`. Supports the codes the app actually emits: reset, bold, dim,
-/// italic, underline, the 8+8 basic-colour families, and 256-colour (`38;5;n`) / truecolor (`38;2`).
+/// italic, underline, the 8+8 basic-colour families (fore- and background), and 256-colour
+/// (`38;5;n` / `48;5;n`) / truecolor (`38;2` / `48;2`) — backgrounds carry the diff panes' tints.
 fn apply_sgr(base: Style, cur: Style, params: &str) -> Style {
     let codes: Vec<u16> = params
         .split(';')
@@ -142,7 +224,10 @@ fn apply_sgr(base: Style, cur: Style, params: &str) -> Style {
             }
             30..=37 => style = style.fg(basic_color(codes[i] - 30)),
             39 => style = style.fg(base.fg.unwrap_or(Color::Gray)),
+            40..=47 => style = style.bg(basic_color(codes[i] - 40)),
+            49 => style.bg = base.bg,
             90..=97 => style = style.fg(basic_color(codes[i] - 90 + 8)),
+            100..=107 => style = style.bg(basic_color(codes[i] - 100 + 8)),
             38 => match codes.get(i + 1) {
                 Some(5) => {
                     if let Some(&n) = codes.get(i + 2) {
@@ -161,8 +246,20 @@ fn apply_sgr(base: Style, cur: Style, params: &str) -> Style {
                 _ => {}
             },
             48 => match codes.get(i + 1) {
-                Some(5) => i += 2, // background colour — measured/skipped, foreground is what reads
-                Some(2) => i += 4,
+                Some(5) => {
+                    if let Some(&n) = codes.get(i + 2) {
+                        style = style.bg(Color::Indexed(n as u8));
+                    }
+                    i += 2;
+                }
+                Some(2) => {
+                    if let (Some(&r), Some(&g), Some(&b)) =
+                        (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
+                    {
+                        style = style.bg(Color::Rgb(r as u8, g as u8, b as u8));
+                    }
+                    i += 4;
+                }
                 _ => {}
             },
             _ => {}

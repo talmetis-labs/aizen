@@ -19,6 +19,7 @@ pub mod proctree;
 pub mod read_ledger;
 pub mod recovery;
 pub mod repo_lock;
+pub mod scratch;
 pub mod session_store;
 pub mod slug;
 pub mod steer;

@@ -188,10 +188,19 @@ async fn run(name: &str) -> Result<()> {
         Ok(out) => format!("\n===== {stamp} =====\n{out}\n"),
         Err(e) => format!("\n===== {stamp} (ERROR) =====\n{e}\n"),
     };
+    // Per-job logs are append-only and otherwise unbounded (only `cron remove` ever deleted one).
+    // Single-generation rotation at 1 MiB — a job that fires hourly writes for months before its
+    // first roll, and the tail is all anyone reads.
+    let log = log_path(name);
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() >= 1024 * 1024) {
+        let rolled = log.with_extension("1.log");
+        let _ = std::fs::remove_file(&rolled);
+        let _ = std::fs::rename(&log, &rolled);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path(name))
+        .open(log)
     {
         use std::io::Write;
         let _ = f.write_all(entry.as_bytes());

@@ -55,7 +55,7 @@ pub struct WorkflowSpec {
     pub synthesis: Option<Synthesis>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct WorkflowTask {
     pub id: String,
     #[serde(default = "default_role")]
@@ -70,10 +70,25 @@ pub struct WorkflowTask {
     /// controls it. The CLI never auto-"escalates a tier" — it can't know a gateway's tier names.
     #[serde(default)]
     pub model: Option<String>,
+    /// Dispatch-contract fields, SAME semantics as the `task` tool's args (they build the same
+    /// `TaskContract` / `<output_contract>` the single-dispatch path injects — parity, not a
+    /// parallel implementation).
+    #[serde(default)]
+    pub boundaries: Option<String>,
+    #[serde(default)]
+    pub expected_output: Option<String>,
+    /// TOTAL step budget for this child (clamped to the shared `MAX_STEP_BUDGET` cap). Absent →
+    /// the workflow child defaults (`CHILD_MAX_ITERS`/`CHILD_AUTO_EXTEND`).
+    #[serde(default)]
+    pub max_steps: Option<usize>,
+    /// Optional JSON Schema the child's FINAL answer must satisfy — validated (with one repair
+    /// attempt), and the outcome status carries `json:ok` / `json:invalid`.
+    #[serde(default)]
+    pub expects: Option<serde_json::Value>,
 }
 
 fn default_role() -> String {
-    "reviewer".to_string()
+    "nemesis".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,7 +288,9 @@ async fn run_workflow_with_cancel(
     }
 }
 
-/// Blank/duplicate task-id guard shared by CLI + tool paths.
+/// Blank/duplicate task-id + unknown-role guard shared by CLI + tool paths. (The tool path also
+/// checks roles at `build_spec` so the model gets the error before any slot is reserved; this is
+/// the belt for hand-written CLI spec files.)
 fn validate_spec_ids(spec: &WorkflowSpec) -> Result<()> {
     if spec.tasks.is_empty() {
         bail!("workflow '{}' has no tasks", spec.name);
@@ -288,6 +305,16 @@ fn validate_spec_ids(spec: &WorkflowSpec) -> Result<()> {
                 "workflow '{}' has a duplicate task id '{}'",
                 spec.name,
                 t.id
+            );
+        }
+        // A typo'd role must not silently run under the read-only fallback registry — the spec
+        // author asked for a specific worker.
+        if crate::agent::roles::canonical(&t.role).is_none() {
+            bail!(
+                "workflow '{}', task '{}': {}",
+                spec.name,
+                t.id,
+                crate::agent::task_tool::unknown_role_error(&t.role)
             );
         }
     }
@@ -312,20 +339,25 @@ pub(crate) fn enforce_singular_writer(spec: &WorkflowSpec) -> Result<()> {
 }
 
 /// Does this task resolve to a WRITE-capable sub-agent? Mirrors the runner's resolution
-/// (`run_one_task`): a named `agent` supersedes `role`. Unresolvable slug → coder (write) fallback.
+/// (`run_one_task`): a named `agent` supersedes `role`.
 pub(crate) fn task_is_writer(role: &str, agent: Option<&str>) -> bool {
     if let Some(slug) = agent.map(str::trim).filter(|s| !s.is_empty()) {
         return match crate::agents::load(slug) {
             Some(def) => !crate::agent::task_tool::dispatch_is_read_only(
                 &crate::agent::builtin::agent_registry(&def, std::path::Path::new(".")),
             ),
-            // Unresolvable slug → treat as a writer. Conservative on purpose: the RUNNER falls
-            // back to the task's ROLE scope (default `reviewer`, read-only), so over-counting
-            // here can only refuse/serialize a dispatch that was safe — never the reverse.
+            // Unresolvable slug → treat as a writer. Conservative on purpose: the RUNNER now
+            // REFUSES such a task outright (see `run_one_task`), so over-counting here can only
+            // refuse/serialize a dispatch that was doomed anyway — never the reverse.
             None => true,
         };
     }
-    matches!(role, "coder" | "tester")
+    // A role is a writer iff its access class says so — Execute counts too: it cannot edit
+    // source, but two shell-holding children still race the same working tree. Same table
+    // `role_registry` scopes tools from, legacy aliases included. Unknown role → the
+    // conservative read-only base, so not a writer.
+    crate::agent::roles::canonical(role)
+        .is_some_and(|p| p.access() != crate::agent::roles::AccessClass::ReadOnly)
 }
 
 /// Fan the tasks out, bounded to the process-global sub-agent cap via chunking — shared by the CLI
@@ -666,12 +698,26 @@ async fn run_one_task(
     }
     // A resolvable `agent` slug supersedes `role` (the specialist/fusion path), mirroring the `task`
     // tool. Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
-    let spec = task
+    let named_agent = task
         .agent
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(crate::agents::load);
+        .filter(|s| !s.is_empty());
+    let spec = named_agent.and_then(crate::agents::load);
+    // A slug that names NOTHING is refused, not silently swapped for the role scope: the parent
+    // asked for a specific specialist, and running the task under different powers/prompt would
+    // report a result the parent attributes to expertise that never ran. Same soft wording as the
+    // `task` tool; the workflow carries on with its other tasks.
+    if let (Some(slug), None) = (named_agent, &spec) {
+        return TaskOutcome {
+            id: task.id.clone(),
+            role: task.role.clone(),
+            model: model.to_string(),
+            status: "error".into(),
+            summary: crate::agent::task_tool::unknown_agent_error(slug),
+            iters: 0,
+        };
+    }
     // Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
     // The resolved model is then routed through the model-endpoint registry so a task pinned to
     // another provider's model carries ITS gateway (base_url/api_key) — the caller it inherits from
@@ -681,7 +727,23 @@ async fn run_one_task(
         api_key: api_key.to_string(),
         model: model.to_string(),
     };
-    let (label, ep, registry, system) = match &spec {
+    // The SAME dispatch contract a `task` call carries (boundaries / expected_output / step
+    // budget), built from the task's own fields. `max_steps` is clamped to the shared cap;
+    // absent, the contract states the child's real total (`CHILD_AUTO_EXTEND`) so the prompt
+    // never promises a budget the loop won't honor.
+    let contract = crate::agent::task_tool::TaskContract {
+        boundaries: task.boundaries.clone().filter(|s| !s.trim().is_empty()),
+        expected_output: task
+            .expected_output
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+        max_steps: task
+            .max_steps
+            .map(|n| n.clamp(1, crate::agent::task_tool::MAX_STEP_BUDGET))
+            .unwrap_or(CHILD_AUTO_EXTEND),
+    };
+    let expects = task.expects.as_ref().filter(|v| v.is_object());
+    let (label, ep, registry, mut system) = match &spec {
         Some(def) => {
             let m = task
                 .model
@@ -692,8 +754,14 @@ async fn run_one_task(
             // Registry FIRST: the prompt's tool-routing map is generated from the very names whose
             // schemas ride on this child's request, so the two can never disagree.
             let registry = agent_registry(def, root);
-            let system =
-                build_agent_subagent_prompt(def, &registry.names(), root, &ep.model, date, None);
+            let system = build_agent_subagent_prompt(
+                def,
+                &registry.names(),
+                root,
+                &ep.model,
+                date,
+                Some(&contract),
+            );
             (def.slug(), ep, registry, system)
         }
         None => {
@@ -706,12 +774,16 @@ async fn run_one_task(
                 root,
                 &ep.model,
                 date,
-                None,
+                Some(&contract),
                 Some(task.prompt.as_str()),
             );
             (task.role.clone(), ep, registry, system)
         }
     };
+    // The exact-JSON contract, when the spec asks for one — same wording and precedence as `task`.
+    if let Some(schema) = expects {
+        crate::agent::task_tool::append_output_contract(&mut system, schema);
+    }
 
     let client = http.clone();
     let base = ep.base_url.clone();
@@ -720,6 +792,9 @@ async fn run_one_task(
     // The result-model label (reported back in TaskOutcome) — a separate owned copy so the `move`
     // chat closure below can consume `model_s` without leaving the outcome unable to name the model.
     let result_model = ep.model.clone();
+    // The `expects` repair call must hit the same endpoint this child ran on (not the workflow's).
+    let base_url_repair = ep.base_url.clone();
+    let key_repair = ep.api_key.clone();
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
         let client = client.clone();
         let base = base.clone();
@@ -768,9 +843,17 @@ async fn run_one_task(
             .with_trace_visible(false),
         quiet: true,
         enable_verify_gate: false,
-        // One soft extension reaches the child's total cap; no second continuation layer.
-        max_iters: CHILD_MAX_ITERS,
-        auto_extend_to: CHILD_AUTO_EXTEND,
+        // One soft extension reaches the child's total cap; no second continuation layer. A
+        // per-task `max_steps` (clamped into `contract.max_steps` above) replaces the defaults
+        // with the same start-narrow-then-extend split the `task` tool uses.
+        max_iters: match task.max_steps {
+            Some(_) => contract.max_steps.div_ceil(2).max(1),
+            None => CHILD_MAX_ITERS,
+        },
+        auto_extend_to: match task.max_steps {
+            Some(_) => contract.max_steps,
+            None => CHILD_AUTO_EXTEND,
+        },
         auto_checkpoint: is_writer,
         checkpoint_each_edit: false,
         todo_reminder_every: 0,
@@ -855,6 +938,52 @@ async fn run_one_task(
                 StopReason::Deadline => "deadline",
             };
             let ok = status == "done";
+            let summary = o
+                .final_text
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if status == "cancelled" {
+                        "cancelled by user".to_string()
+                    } else {
+                        crate::agent::task_tool::partial_report_from_messages(&msgs)
+                    }
+                });
+            // `expects` verdict — same validate + one-repair pass as the `task` tool, reported
+            // honestly on the status so the synthesis can trust-or-inspect without re-parsing.
+            let (summary, status) = match expects {
+                None => (summary, status.to_string()),
+                Some(schema) => {
+                    match crate::agent::task_tool::validate_contract(&summary, schema) {
+                        Ok(v) => (
+                            serde_json::to_string_pretty(&v).unwrap_or(summary),
+                            format!("{status} · json:ok"),
+                        ),
+                        Err(first_err) => {
+                            let repaired = crate::agent::task_tool::repair_contract_call(
+                                http,
+                                &base_url_repair,
+                                &key_repair,
+                                &result_model,
+                                schema,
+                                &summary,
+                                &first_err,
+                            )
+                            .await
+                            .map(|r| {
+                                crate::agent::task_tool::validate_contract(&r, schema)
+                                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or(r))
+                            });
+                            match repaired {
+                                Some(Ok(pretty)) => (pretty, format!("{status} · json:ok")),
+                                _ => (
+                                    format!("{summary}\n[contract violation: {first_err}]"),
+                                    format!("{status} · json:invalid"),
+                                ),
+                            }
+                        }
+                    }
+                }
+            };
             let detail = format!("{status} [{} step(s)]", o.iters);
             if ok {
                 child_track.finish_ok(detail);
@@ -869,17 +998,8 @@ async fn run_one_task(
                 id: task.id.clone(),
                 role: label.clone(),
                 model: result_model.clone(),
-                status: status.to_string(),
-                summary: o
-                    .final_text
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        if status == "cancelled" {
-                            "cancelled by user".to_string()
-                        } else {
-                            crate::agent::task_tool::partial_report_from_messages(&msgs)
-                        }
-                    }),
+                status,
+                summary,
                 iters: o.iters,
             }
         }
@@ -1075,10 +1195,13 @@ mod tests {
         let spec: WorkflowSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.name, "review");
         assert_eq!(spec.tasks.len(), 2);
-        assert_eq!(spec.tasks[0].role, "reviewer");
         assert_eq!(
-            spec.tasks[1].role, "reviewer",
-            "missing role defaults to read-only reviewer"
+            spec.tasks[0].role, "reviewer",
+            "explicit legacy name kept as written"
+        );
+        assert_eq!(
+            spec.tasks[1].role, "nemesis",
+            "missing role defaults to the read-only reviewer scope"
         );
         assert!(spec.synthesis.is_none(), "synthesis is optional");
     }
@@ -1112,8 +1235,8 @@ mod tests {
             "agent is optional; defaults to None"
         );
         assert_eq!(
-            spec.tasks[1].role, "reviewer",
-            "no agent + no role defaults to read-only reviewer"
+            spec.tasks[1].role, "nemesis",
+            "no agent + no role defaults to the read-only reviewer scope"
         );
     }
 
@@ -1192,6 +1315,7 @@ mod tests {
                     agent: None,
                     prompt: "edit a".into(),
                     model: None,
+                    ..Default::default()
                 },
                 WorkflowTask {
                     id: "b".into(),
@@ -1199,6 +1323,7 @@ mod tests {
                     agent: None,
                     prompt: "edit b".into(),
                     model: None,
+                    ..Default::default()
                 },
             ],
             synthesis: None,
@@ -1218,6 +1343,7 @@ mod tests {
                     agent: None,
                     prompt: "edit".into(),
                     model: None,
+                    ..Default::default()
                 },
                 WorkflowTask {
                     id: "b".into(),
@@ -1225,6 +1351,7 @@ mod tests {
                     agent: None,
                     prompt: "review".into(),
                     model: None,
+                    ..Default::default()
                 },
             ],
             synthesis: None,
@@ -1234,11 +1361,50 @@ mod tests {
 
     #[test]
     fn task_is_writer_classifies_roles() {
-        assert!(task_is_writer("coder", None));
-        assert!(task_is_writer("tester", None));
-        assert!(!task_is_writer("reviewer", None));
-        assert!(!task_is_writer("planner", None));
+        // Legacy and pantheon names classify identically (one role table).
+        for role in ["coder", "tester", "daedalus", "themis"] {
+            assert!(task_is_writer(role, None), "{role} is a writer");
+        }
+        for role in ["reviewer", "planner", "argus", "metis", "nemesis", "clio"] {
+            assert!(!task_is_writer(role, None), "{role} is read-only");
+        }
         assert!(task_is_writer("reviewer", Some("__no_such_agent__")));
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_task_errors_instead_of_falling_back() {
+        // The runner refuses a task naming an unresolvable specialist BEFORE any network call —
+        // running it under the role scope would attribute the result to expertise that never ran.
+        let http = reqwest::Client::new();
+        let task = WorkflowTask {
+            id: "t1".into(),
+            role: "reviewer".into(),
+            agent: Some("__no_such_agent__".into()),
+            prompt: "review x".into(),
+            model: None,
+            ..Default::default()
+        };
+        let out = run_one_task(
+            &http,
+            "http://localhost:1", // unreachable on purpose: the refusal must come first
+            "k",
+            "m",
+            crate::core::approval::ApprovalMode::Ask,
+            Path::new("."),
+            "2026-08-27",
+            &task,
+            None,
+            crate::core::cancel::TurnCancel::default(),
+            0,
+        )
+        .await;
+        assert_eq!(out.status, "error");
+        assert!(
+            out.summary.starts_with("error: unknown agent"),
+            "got: {}",
+            out.summary
+        );
+        assert_eq!(out.iters, 0, "no model steps were spent");
     }
 
     #[tokio::test]
@@ -1274,6 +1440,7 @@ mod tests {
                 agent: None,
                 prompt: "x".into(),
                 model: None,
+                ..Default::default()
             }],
             synthesis: None,
         };
@@ -1303,6 +1470,7 @@ mod tests {
                     agent: None,
                     prompt: "x".into(),
                     model: None,
+                    ..Default::default()
                 },
                 WorkflowTask {
                     id: "a".into(),
@@ -1310,6 +1478,7 @@ mod tests {
                     agent: None,
                     prompt: "y".into(),
                     model: None,
+                    ..Default::default()
                 },
             ],
             synthesis: None,

@@ -125,12 +125,32 @@ fn whole_file_symbol_hint(is_code: bool, lsp_on: bool, line_count: usize) -> Opt
 /// `aizen skill` path are unaffected.
 /// Stored in ADVERTISED order, not as a set: the system prompt's tool-routing map is generated from
 /// this list and must name tools in the same order the request's `tools` array carries them.
+/// DEFERRED tools (schema reached via `tool_search`) are deliberately absent — the map may only
+/// name what the request advertises.
 static ACTIVE_TOOL_NAMES: Lazy<Mutex<Option<Vec<String>>>> = Lazy::new(|| Mutex::new(None));
+
+/// The DEFERRED half of the surface: tool names + per-server counts, published beside
+/// [`ACTIVE_TOOL_NAMES`]. Names feed the skills `requires:` gate (a deferred tool is callable, so
+/// a skill needing it still applies); counts feed the prompt's deferred-integrations note.
+static DEFERRED_TOOL_SURFACE: Lazy<Mutex<Option<crate::agent::tools::DeferredSurface>>> =
+    Lazy::new(|| Mutex::new(None));
 
 /// Publish the live tool surface (idempotent). ONLY the top-level registry calls this — never the
 /// smaller `role_registry`, so the set is never wrongly shrunk when a sub-agent assembles a prompt.
+///
+/// The deferred half is published only while `tool_search` survived the toolset filter: deferred
+/// tools without their discovery tool are unreachable, and advertising unreachable tools in the
+/// prompt is exactly the drift the routing map exists to prevent.
 fn publish_active_tools(r: &ToolRegistry) {
-    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.names());
+    *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.advertised_names());
+    let deferred = if r.get("tool_search").is_some() {
+        r.deferred_summary()
+    } else {
+        None
+    };
+    *DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = deferred;
 }
 
 /// The published live tool surface in advertised order, or `None` if no session registry has been
@@ -144,8 +164,47 @@ pub fn active_tool_surface() -> Option<Vec<String>> {
 }
 
 /// The published live tool surface as a set, for membership tests (the `<skills>` index filter).
+/// Includes DEFERRED tool names: a deferred tool is callable once discovered through `tool_search`,
+/// so a skill that `requires:` one must not be hidden by the deferral.
 pub fn active_tool_names() -> Option<HashSet<String>> {
-    active_tool_surface().map(|v| v.into_iter().collect())
+    let mut set: HashSet<String> = match active_tool_surface() {
+        Some(v) => v.into_iter().collect(),
+        None => return None,
+    };
+    if let Some((names, _)) = DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        set.extend(names.iter().cloned());
+    }
+    Some(set)
+}
+
+/// The prompt block for the DEFERRED surface, or `None` when nothing is deferred (the common case
+/// — zero bytes added). Appended to the top-level prompt's dynamic lane right after the routing
+/// map, whose "these are the only tools" claim it narrows: deferred integrations exist, and
+/// `tool_search` is the door. Byte-stable across turns of one session (same surface ⇒ same string),
+/// so it costs no cache churn.
+pub fn deferred_tools_note() -> Option<String> {
+    let guard = DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (names, by_server) = guard.as_ref()?;
+    let servers = by_server
+        .iter()
+        .map(|(s, n)| format!("{s} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "# Deferred integrations (via tool_search)\n\
+         Beyond the surface above, {} more MCP tool(s) are connected but not pre-loaded: {}. \
+         When the task needs one of these integrations, find it with `tool_search` (query by \
+         capability) — a match returns the full argument schema, and that tool is then callable \
+         directly by its exact name.\n",
+        names.len(),
+        servers,
+    ))
 }
 
 /// Swap the published surface, returning the previous value — TESTS ONLY.
@@ -156,6 +215,18 @@ pub fn active_tool_names() -> Option<HashSet<String>> {
 #[cfg(test)]
 pub(crate) fn swap_active_tools_for_test(next: Option<Vec<String>>) -> Option<Vec<String>> {
     let mut g = ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, next)
+}
+
+/// Swap the published DEFERRED surface — TESTS ONLY (same save/act/restore discipline as
+/// [`swap_active_tools_for_test`], same reason: process-global state).
+#[cfg(test)]
+pub(crate) fn swap_deferred_tools_for_test(
+    next: Option<crate::agent::tools::DeferredSurface>,
+) -> Option<crate::agent::tools::DeferredSurface> {
+    let mut g = DEFERRED_TOOL_SURFACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     std::mem::replace(&mut *g, next)
 }
 
@@ -182,6 +253,9 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     r.register(Box::new(MemoryList));
     r.register(Box::new(MemoryProfile));
     r.register(Box::new(MemoryAsk));
+    // Top-level only, like the `<sessions>` block that advertises it: a sub-agent serves one
+    // stated task and has no business rummaging through the user's other conversations.
+    r.register(Box::new(SessionRecall));
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::search::SearchFiles::new(
@@ -282,8 +356,28 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // `mcp_<server>_<tool>`. Empty (zero cost) when MCP is unconfigured. Top-level only, like
     // todo/process: sub-agents share the same live connections via the global manager but don't
     // need the surface advertised to them.
-    for t in crate::agent::mcp::discovered_tools() {
-        r.register(t);
+    //
+    // A server the deferral plan marked (pinned `defer: true`, or auto — the combined schema
+    // estimate over `deferAutoTokens`) registers its tools DEFERRED: dispatchable by name, absent
+    // from `defs()`. `tool_search` is their discovery door and registers only when at least one
+    // tool is deferred — a session with a small surface pays neither the tool nor its schema.
+    let mut deferred_entries: Vec<crate::agent::tool_search::DeferredEntry> = Vec::new();
+    for d in crate::agent::mcp::discovered_tools() {
+        if d.deferred {
+            let arc: std::sync::Arc<dyn Tool> = std::sync::Arc::from(d.tool);
+            r.register_deferred(arc.clone(), d.server.clone());
+            deferred_entries.push(crate::agent::tool_search::DeferredEntry {
+                tool: arc,
+                server: d.server,
+            });
+        } else {
+            r.register(d.tool);
+        }
+    }
+    if !deferred_entries.is_empty() {
+        r.register(Box::new(crate::agent::tool_search::ToolSearch::new(
+            deferred_entries,
+        )));
     }
     // CDP browser tools (OPT-IN: `--features browser`, default OFF). Top-level only; they connect
     // lazily to a local Chrome/Edge/Brave and return an actionable error if none is running.
@@ -421,11 +515,18 @@ fn should_register_workflow() -> bool {
 }
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
-/// read/glob/search + web research + skill_load/registry + telegram/notify (when configured) + LSP
-/// navigation (when enabled). NEVER includes `task`, checkpoint, edit/shell, or top-level-only
-/// stateful tools. Factored out so `role_registry` and `agent_registry` cannot drift.
+/// read/glob/search + `git_inspect` + skill_load/registry + LSP navigation (when enabled). NEVER
+/// includes `task`, checkpoint, edit/shell, or top-level-only stateful tools. Factored out so
+/// `role_registry` and `agent_registry` cannot drift.
+///
+/// Two deliberate ABSENCES relative to the old base:
+/// - **telegram/notify**: reaching the user is the PARENT's channel. A dispatched child pinging
+///   the user's Telegram mid-fan-out is noise the parent never sanctioned; whatever a child needs
+///   the user to know rides its result back to the parent, which owns user communication.
+/// - **web research**: a per-role grant now (see [`crate::agent::roles::RoleProfile::web`]) —
+///   `argus` works entirely inside the repository, so its surface stays lean; specialists keep it
+///   (see [`agent_registry`]).
 fn subagent_read_only_base(root: &Path) -> ToolRegistry {
-    use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
     // `memory_list` is read-only, so a sub-agent may inventory what is stored (that's what stops it
@@ -440,13 +541,11 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
         root.to_path_buf(),
     )));
     r.register(Box::new(crate::agent::codebase::CodebaseSearch));
-    r.register(Box::new(WebSearch));
-    r.register(Box::new(WebFetch));
-    r.register(Box::new(WebCrawl));
+    // Read-only git queries for the roles that hold NO shell: without this, a reviewer literally
+    // cannot see the diff it was dispatched to review. Closed argv schema — not a shell escape.
+    r.register(Box::new(GitInspect::new(root.to_path_buf())));
     register_skill_load(&mut r);
     register_skill_registry(&mut r);
-    register_telegram(&mut r);
-    register_notify(&mut r);
     // W17: a private, per-instance `todo_write` scratch plan (never the top-level TodoWrite — that
     // one owns the process-global list + the user's scroll region, which no sub-agent may touch).
     // Self-contained state means concurrent read-only sub-agents (planner/reviewer fan-out) never
@@ -505,13 +604,25 @@ fn register_subagent_lsp_write(r: &mut ToolRegistry, root: &Path) {
     )));
 }
 
+/// The web research trio, granted per role profile / to specialists — not part of the shared base
+/// (see the absence note on [`subagent_read_only_base`]).
+fn register_subagent_web(r: &mut ToolRegistry) {
+    use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
+    r.register(Box::new(WebSearch));
+    r.register(Box::new(WebFetch));
+    r.register(Box::new(WebCrawl));
+}
+
 /// Build a READ/WRITE-scoped registry for a sub-agent of the given `role`. NEVER includes the
 /// `task` tool → a sub-agent physically cannot dispatch further sub-agents (recursion guard).
-/// Scoping is deterministic (documented in `system_prompt.md`):
-/// Every role also gets the read-only web research tools (`web_search`/`web_fetch`).
-/// - `coder` → all builtins (read/glob/edit/shell/process + memory + web)
-/// - `tester` → read/glob + shell/process + memory + web (no `file_edit`)
-/// - `planner` / `reviewer` / unknown → read-only (read/glob + memory + web)
+///
+/// Scoping is deterministic, derived from the ONE role table ([`crate::agent::roles::ROLES`], which
+/// also accepts the legacy names). On top of the shared read-only base:
+/// - `daedalus` (coder) → edit/shell/process + skill authoring + symbolic edit + web
+/// - `themis` (tester) → shell/process + web (no `file_edit`)
+/// - `metis` / `nemesis` / `clio` → read-only + web
+/// - `argus` → read-only, NO web (its whole job is inside the repository)
+/// - unknown → the conservative read-only base
 ///
 /// The shell-capable roles get `process` too, and that pairing is deliberate: `shell_run`'s timeout
 /// message tells the caller to re-run a long command through `process`, which used to be advice a
@@ -520,38 +631,45 @@ fn register_subagent_lsp_write(r: &mut ToolRegistry, root: &Path) {
 /// child can only see the handles it started; one dispatch cannot log or kill a sibling's build.
 pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
     let mut r = subagent_read_only_base(root);
-    match role {
-        "coder" => {
-            r.register(Box::new(FileEdit::new(root.to_path_buf())));
-            r.register(Box::new(FileWrite::new(root.to_path_buf())));
-            r.register(Box::new(FileMove::new(root.to_path_buf())));
-            r.register(Box::new(ShellRun::new(root.to_path_buf())));
-            r.register(Box::new(crate::agent::process::Process::new(
-                root.to_path_buf(),
-            )));
-            r.register(Box::new(SkillSave));
-            register_skill_refine(&mut r);
-            register_subagent_lsp_write(&mut r, root);
-        }
-        "tester" => {
-            r.register(Box::new(ShellRun::new(root.to_path_buf())));
-            r.register(Box::new(crate::agent::process::Process::new(
-                root.to_path_buf(),
-            )));
-        }
-        // planner / reviewer / unknown → read-only (already has LSP nav when enabled).
-        _ => {}
+    let Some(p) = crate::agent::roles::canonical(role) else {
+        // Unknown role → conservative read-only (already has LSP nav + git_inspect when enabled).
+        return r;
+    };
+    if p.web {
+        register_subagent_web(&mut r);
+    }
+    if p.history {
+        // The historian's instrument: read-only recall of recent same-project conversations.
+        // Deliberately NOT in the shared base — transcript access is mnemosyne's job, and every
+        // other role paying its schema (and temptation) bought nothing.
+        r.register(Box::new(SessionRecall));
+    }
+    if p.shell {
+        r.register(Box::new(ShellRun::new(root.to_path_buf())));
+        r.register(Box::new(crate::agent::process::Process::new(
+            root.to_path_buf(),
+        )));
+    }
+    if p.edit {
+        r.register(Box::new(FileEdit::new(root.to_path_buf())));
+        r.register(Box::new(FileWrite::new(root.to_path_buf())));
+        r.register(Box::new(FileMove::new(root.to_path_buf())));
+        r.register(Box::new(SkillSave));
+        register_skill_refine(&mut r);
+        register_subagent_lsp_write(&mut r, root);
     }
     r
 }
 
 /// Build a tool registry for a dispatched SPECIALIST agent (see [`crate::agents`]). Same read-only
-/// base as [`role_registry`], plus a destructive scope derived from the persona's `tools:` frontmatter:
-/// - EMPTY `tools:` → **coder scope** (file_edit + file_write + file_move + shell_run +
-///   skill_save) — the locked default; no wider than the trusted `coder` sub-agent (the `cmd_guard`
-///   floor + per-op approval still apply underneath).
+/// base as [`role_registry`] plus web research, plus a destructive scope derived from the persona's
+/// `tools:` frontmatter:
+/// - EMPTY `tools:` → **read-only** (the safe default; write/process capability must be asked for
+///   explicitly — a card that relied on the old implicit coder scope adds `tools: Edit, Bash`).
 /// - non-empty `tools:` → exactly those, mapped by name (Claude-Code casing accepted via the alias
-///   map in [`canonical_subagent_tool`]; duplicates collapsed).
+///   map in [`canonical_subagent_tool`]; duplicates collapsed; a shell grant carries the scoped
+///   `process` pool with it, the same pairing the built-in roles get). The `cmd_guard` floor +
+///   per-op approval still apply underneath every grant.
 ///
 /// Capability invariants (a third-party persona body is UNTRUSTED): this NEVER grants `task`
 /// (recursion guard) or the top-level-only tools `todo`/`process`/`clarify`/`persona_create`/`mcp_*`
@@ -559,15 +677,16 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
 /// (forward-compatible). Never calls `publish_active_tools` (only the top-level registry does).
 pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistry {
     let mut r = subagent_read_only_base(root);
+    // Specialists keep web research unconditionally (the pre-Pantheon surface): a persona card's
+    // `tools:` names only DESTRUCTIVE grants, so there is no way for a card to ask for web back
+    // if the base dropped it. Role-level web trimming is a built-in-role concern (`argus`).
+    register_subagent_web(&mut r);
+    // A card with NO `tools:` used to receive the full coder scope implicitly — a third-party
+    // persona whose author never asked for edit/shell got both anyway. The safe default is now
+    // READ-ONLY: write and process capability must be requested explicitly in frontmatter
+    // (`tools: Edit, Bash, …`). Older cards that relied on the implicit scope add one line —
+    // see the migration note in docs/REFERENCE.md.
     if def.tools.is_empty() {
-        // Locked default: coder scope.
-        r.register(Box::new(FileEdit::new(root.to_path_buf())));
-        r.register(Box::new(FileWrite::new(root.to_path_buf())));
-        r.register(Box::new(FileMove::new(root.to_path_buf())));
-        r.register(Box::new(ShellRun::new(root.to_path_buf())));
-        r.register(Box::new(SkillSave));
-        register_skill_refine(&mut r);
-        register_subagent_lsp_write(&mut r, root);
         return r;
     }
     let mut granted: HashSet<&'static str> = HashSet::new();
@@ -586,7 +705,15 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
             }
             "file_write" => r.register(Box::new(FileWrite::new(root.to_path_buf()))),
             "file_move" => r.register(Box::new(FileMove::new(root.to_path_buf()))),
-            "shell_run" => r.register(Box::new(ShellRun::new(root.to_path_buf()))),
+            "shell_run" => {
+                r.register(Box::new(ShellRun::new(root.to_path_buf())));
+                // The scoped process pool rides with shell (same pairing as the built-in roles):
+                // shell_run's timeout message says "re-run it through process", and advice a
+                // child cannot act on is worse than none.
+                r.register(Box::new(crate::agent::process::Process::new(
+                    root.to_path_buf(),
+                )));
+            }
             "skill_save" => {
                 // A persona granted skill authoring gets the refine companion too (gated on any
                 // skill existing — see register_skill_refine), so it can evolve, not just mint.
@@ -1369,6 +1496,34 @@ impl Tool for MemoryAsk {
 /// existed the agent had no way to answer "what do you remember about me?" — it could only guess
 /// query terms and report whatever happened to match, which reads as confidently not knowing its
 /// own state. This is the tool that makes the store legible.
+/// The fetch half of "continue the most recent session": a clipped digest of one saved
+/// conversation from the pool the `<sessions>` block lists. Read-only by design — restoring a full
+/// transcript rewrites live history, which stays a USER move (`/resume`), never a tool's.
+struct SessionRecall;
+impl Tool for SessionRecall {
+    fn name(&self) -> &str {
+        "session_recall"
+    }
+    fn description(&self) -> &str {
+        "Digest of a previously saved conversation: opening request + latest exchanges. Use when \
+         the user asks to continue earlier/previous/most-recent work. Default is the newest \
+         conversation for this project; pass name from the <sessions> block for another. \
+         Read-only; the full transcript is only restored by the user typing /resume."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "saved conversation name (optional; default = most recent for this project)"}
+            },
+            "additionalProperties": false
+        })
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        crate::core::session_store::session_digest(args.get("name").and_then(|v| v.as_str()))
+    }
+}
+
 struct MemoryList;
 impl Tool for MemoryList {
     fn name(&self) -> &str {
@@ -2188,7 +2343,7 @@ impl FileEdit {
         let mut out = format!(
             "edited {path} ({})\n{}",
             applied.summary(),
-            diff_preview(&applied.before, &applied.after)
+            diff_preview(&applied.before, &applied.after, applied.start_line)
         );
         // Post-edit LSP fold: NEW diagnostics land in THIS result (zero extra round-trips to
         // discover breakage). Fail-soft + hard-capped inside; a no-op when LSP is off.
@@ -2244,7 +2399,11 @@ impl FileEdit {
                 other => format!("1 replacement, {other} match"),
             };
             summaries.push(format!("  #{n}: {detail}"));
-            diffs.push(diff_preview(&applied.before, &applied.after));
+            diffs.push(diff_preview(
+                &applied.before,
+                &applied.after,
+                applied.start_line,
+            ));
             buf = applied.content;
         }
 
@@ -2445,7 +2604,7 @@ impl Tool for FileWrite {
         // a brand-new file or a no-op rewrite.
         if existed && before != content {
             out.push('\n');
-            out.push_str(&diff_preview(&before, content));
+            out.push_str(&diff_preview(&before, content, 1));
         }
         // Same post-write LSP fold as file_edit — surface new diagnostics in this result.
         if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
@@ -2699,6 +2858,15 @@ struct EditApplied {
     /// Which ladder rung applied: "exact" | "indent" | "ws-norm" | "anchor-trim" | "unescape" |
     /// "blank-norm".
     rung: &'static str,
+    /// 1-based line (in the PRE-edit content) where the replaced region starts — feeds the diff
+    /// preview's `@@` hunk header so the TUI can gutter real line numbers. First match for
+    /// `replace_all`.
+    start_line: usize,
+}
+
+/// 1-based line number of byte offset `at` in `content` (`at` must sit on a char boundary).
+fn line_at(content: &str, at: usize) -> usize {
+    content[..at].matches('\n').count() + 1
 }
 impl EditApplied {
     /// Human summary. The "exact" and "indent" wordings are byte-identical to the original
@@ -2762,12 +2930,14 @@ fn apply_one_edit(
         } else {
             content.replacen(old, new, 1)
         };
+        let start_line = content.find(old).map(|p| line_at(content, p)).unwrap_or(0);
         return Ok(EditApplied {
             content: updated,
             before: old.to_string(),
             after: new.to_string(),
             count,
             rung: "exact",
+            start_line,
         });
     }
     // R2 indent-tolerant (kept uncapped + byte-stable messages — the original fallback).
@@ -2812,6 +2982,7 @@ fn apply_one_edit(
                         after: new.to_string(),
                         count: 1,
                         rung: "blank-norm",
+                        start_line: line_at(content, bs),
                     });
                 }
                 n => bail!(
@@ -2849,12 +3020,14 @@ fn try_pair(
     let count = content.matches(old).count();
     if count == 1 {
         let updated = content.replacen(old, new, 1);
+        let start_line = content.find(old).map(|p| line_at(content, p)).unwrap_or(0);
         return Ok(Some(EditApplied {
             content: updated,
             before: old.to_string(),
             after: new.to_string(),
             count: 1,
             rung,
+            start_line,
         }));
     }
     if count > 1 {
@@ -2890,6 +3063,7 @@ fn block_rung(
                 after: new.to_string(),
                 count: 1,
                 rung,
+                start_line: line_at(content, bs),
             }))
         }
         n => {
@@ -3137,14 +3311,15 @@ fn blank_insensitive_blocks(content: &str, old: &str) -> Vec<(usize, usize)> {
 
 /// A compact **unified diff** of an edit: common leading/trailing lines are trimmed away (so a big
 /// block collapses to just its changed window), the removed lines are prefixed `-`, the added lines
-/// `+`, and a couple of context lines (prefixed with a space) bracket the change. Gives the model
-/// cheap verifiability AND is what the TUI colourises (removed = salmon, added = green) — the lines
+/// `+`, and a couple of context lines (prefixed with a space) bracket the change, under a
+/// `@@ -N,c +N,c @@` hunk header carrying the window's 1-based file line. Gives the model
+/// cheap verifiability AND is what the TUI renders as the side-by-side diff panes — the lines
 /// are `^[-+]`-prefixed at column 0 so the display can pick them out unambiguously. Both sides are
 /// capped so a giant replacement can't flood the result.
 ///
 /// Callers pass the SMALL changed region (single form: `applied.before`/`after`; batch form: each
 /// per-edit before/after), so the prefix/suffix trim is enough — no full LCS needed.
-fn diff_preview(before: &str, after: &str) -> String {
+fn diff_preview(before: &str, after: &str, base_line: usize) -> String {
     const CTX: usize = 2; // context lines kept on each side of the change
     const MAX_SIDE: usize = 40; // cap removed / added lines shown per side
 
@@ -3167,6 +3342,20 @@ fn diff_preview(before: &str, after: &str) -> String {
     let added = &a[p..a.len() - s];
 
     let mut out = String::new();
+    // `@@ -N,c +N,c @@` hunk header anchoring the window in the FILE (`base_line` = 1-based file
+    // line of `before`'s first line; 0 = unknown → header omitted). Counts are the true window
+    // sizes even when the visual cap below elides lines — the `…` note says what was cut. Gives
+    // the model a line anchor for follow-up edits and gives the TUI its gutter numbers.
+    let lead = p.min(CTX);
+    if base_line > 0 {
+        let start = base_line + p - lead;
+        let trail = s.min(CTX);
+        out.push_str(&format!(
+            "@@ -{start},{} +{start},{} @@\n",
+            lead + removed.len() + trail,
+            lead + added.len() + trail
+        ));
+    }
     // leading context (from the shared prefix)
     for line in &b[p.saturating_sub(CTX)..p] {
         out.push_str(&format!(" {line}\n"));
@@ -3450,6 +3639,241 @@ pub(crate) fn drain<R: std::io::Read>(pipe: Option<R>) -> String {
         out.push_str(&String::from_utf8_lossy(&tail_bytes));
     }
     out
+}
+
+// ── git_inspect ──────────────────────────────────────────────────────────────
+
+/// Wall-clock cap for one `git_inspect` query. Generous for `blame` on a large file; a read-only
+/// query that needs longer is a query to narrow, not to wait on.
+const GIT_INSPECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Transcript cap for one `git_inspect` result (chars). A whole-tree `git diff` can be megabytes;
+/// the drain threads already bound RAM, this bounds what rides the conversation.
+const GIT_INSPECT_MAX_CHARS: usize = 20_000;
+
+/// Default / ceiling for `log`'s commit count.
+const GIT_LOG_DEFAULT: usize = 20;
+const GIT_LOG_CAP: usize = 100;
+
+/// Read-only git queries for sub-agents that hold NO shell. Without this, the read-only roles are
+/// blind to version control: a `nemesis` (reviewer) dispatch cannot see the diff it was asked to
+/// review, and a `metis` (planner) cannot check what recently changed. The action set is a CLOSED
+/// enum mapped to fixed argv (exec form, no shell anywhere), with the two model-supplied strings
+/// (`path`, `rev`) validated here — so mutation is impossible by construction, not by prompt.
+///
+/// Shell-capable scopes get it too (it rides `subagent_read_only_base`): redundant next to
+/// `shell_run`, but a uniform base keeps the read-only classification in one place.
+struct GitInspect {
+    root: PathBuf,
+}
+impl GitInspect {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+/// Accept a revision / range argument (`HEAD~3`, `main..HEAD`, `a1b2c3`, `v0.6.6`, `@{u}`,
+/// `HEAD:src/lib.rs`). Refuses anything that could read as a git OPTION (leading `-`) or smuggle
+/// bytes past the argv boundary (whitespace/control chars), and anything absurdly long.
+fn valid_git_rev(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && !s.starts_with('-')
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '/' | '~' | '^' | '@' | '{' | '}' | ':' | '-')
+        })
+}
+
+impl Tool for GitInspect {
+    fn name(&self) -> &str {
+        "git_inspect"
+    }
+    fn description(&self) -> &str {
+        "Inspect the git repository, read-only: working-tree status, commit log, a diff, one \
+         commit, or line-by-line blame. Use it to see WHAT changed and WHEN — a reviewer reading \
+         the actual diff, a planner checking recent history, a tester finding the commit that \
+         broke a build. Never mutates anything (no add/commit/push/checkout — those are not \
+         offered). diff with no rev shows uncommitted changes; blame requires a path."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["status", "log", "diff", "show", "blame"]},
+                "path": {"type": "string", "description": "optional file/dir to narrow to (required for blame)"},
+                "rev": {"type": "string", "description": "optional revision or range, e.g. HEAD~3, main..HEAD, a1b2c3 (status ignores it; show defaults to HEAD)"},
+                "limit": {"type": "integer", "description": "log only: max commits (default 20, cap 100)"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let action = str_arg(args, "action")?;
+        let rev = match args.get("rev").and_then(|v| v.as_str()).map(str::trim) {
+            None | Some("") => None,
+            Some(r) if valid_git_rev(r) => Some(r.to_string()),
+            Some(r) => {
+                return Ok(format!(
+                    "error: rev {r:?} is not a plain revision/range — flags and shell syntax are \
+                     not accepted here"
+                ));
+            }
+        };
+        // The path rides to git AS WRITTEN (a pathspec, resolved by git against the workspace
+        // cwd) rather than through `confine`: canonicalizing on Windows yields a `\\?\` verbatim
+        // path git does not accept, and the `--` separator below already guarantees a hostile
+        // name cannot become an option. Only argv-boundary hygiene is enforced here.
+        let path = match args.get("path").and_then(|v| v.as_str()).map(str::trim) {
+            None | Some("") => None,
+            Some(p)
+                if p.len() <= 500 && !p.starts_with('-') && !p.chars().any(char::is_control) =>
+            {
+                Some(p.to_string())
+            }
+            Some(p) => {
+                return Ok(format!(
+                    "error: path {p:?} is not a plain file path — flags and control characters \
+                     are not accepted here"
+                ));
+            }
+        };
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).clamp(1, GIT_LOG_CAP))
+            .unwrap_or(GIT_LOG_DEFAULT);
+
+        // Fixed argv per action — the only model-shaped bytes are the validated rev + confined path.
+        let mut argv: Vec<String> = vec!["-c".into(), "color.ui=false".into()];
+        match action {
+            "status" => argv.extend(["status".into(), "--short".into(), "--branch".into()]),
+            "log" => {
+                argv.extend([
+                    "log".into(),
+                    "--date=short".into(),
+                    "--format=%h %ad %an — %s".into(),
+                    format!("-n{limit}"),
+                ]);
+                if let Some(r) = &rev {
+                    argv.push(r.clone());
+                }
+            }
+            "diff" => {
+                argv.extend(["diff".into(), "--stat".into(), "--patch".into()]);
+                if let Some(r) = &rev {
+                    argv.push(r.clone());
+                }
+            }
+            "show" => {
+                argv.extend(["show".into(), "--stat".into(), "--patch".into()]);
+                argv.push(rev.clone().unwrap_or_else(|| "HEAD".into()));
+            }
+            "blame" => {
+                let Some(_) = &path else {
+                    return Ok("error: blame requires a path".to_string());
+                };
+                argv.extend(["blame".into(), "--date=short".into()]);
+                if let Some(r) = &rev {
+                    argv.push(r.clone());
+                }
+            }
+            other => {
+                return Ok(format!(
+                    "error: unknown action {other:?} — use status | log | diff | show | blame"
+                ));
+            }
+        }
+        if let Some(p) = &path {
+            argv.push("--".into());
+            argv.push(p.clone());
+        }
+
+        // Same containment discipline as every model-influenced spawn (CLAUDE.md: through
+        // `runner::prepare_*`, never a bare `Command::new`). Exec form: no shell in the path at all.
+        let mut sbx = crate::sandbox::runner::prepare_std(
+            crate::sandbox::request::SandboxRequest::exec(
+                crate::sandbox::CommandOrigin::GitInspect,
+                PathBuf::from("git"),
+                argv,
+                self.root.clone(),
+                self.root.clone(),
+            )
+            .wall_timeout(GIT_INSPECT_TIMEOUT),
+        )?;
+        sbx.command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match sbx.command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
+                return Ok(format!(
+                    "error: could not run git ({e}) — is git installed and on PATH?"
+                ));
+            }
+        };
+        let containment = sbx.contain(&child);
+        let oh = {
+            let pipe = child.stdout.take();
+            std::thread::spawn(move || drain(pipe))
+        };
+        let eh = {
+            let pipe = child.stderr.take();
+            std::thread::spawn(move || drain(pipe))
+        };
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait()? {
+                Some(st) => break Some(st),
+                None if start.elapsed() >= GIT_INSPECT_TIMEOUT => {
+                    crate::core::proctree::kill_tree(&mut child, &containment);
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let (stdout, _) = crate::core::proctree::join_drain(oh, DRAIN_GRACE);
+        let (stderr, _) = crate::core::proctree::join_drain(eh, DRAIN_GRACE);
+        sbx.finish(match status {
+            None => crate::sandbox::runner::Outcome::Timeout,
+            Some(st) => crate::sandbox::runner::Outcome::Exit(st.code()),
+        });
+        let Some(st) = status else {
+            return Ok(format!(
+                "error: git {action} exceeded {}s — narrow it with path/rev/limit",
+                GIT_INSPECT_TIMEOUT.as_secs()
+            ));
+        };
+        if !st.success() {
+            let msg = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
+            return Ok(format!("error: git {action} failed: {}", msg.trim()));
+        }
+        let mut out = stdout;
+        if out.trim().is_empty() {
+            out = match action {
+                "status" => "clean — no uncommitted changes (branch line above absent means \
+                             detached or unborn HEAD)"
+                    .into(),
+                "diff" => "no differences".into(),
+                _ => "(no output)".into(),
+            };
+        }
+        if out.chars().count() > GIT_INSPECT_MAX_CHARS {
+            let clipped: String = out.chars().take(GIT_INSPECT_MAX_CHARS).collect();
+            out = format!(
+                "{clipped}\n… [truncated at {GIT_INSPECT_MAX_CHARS} chars — narrow with \
+                 path/rev/limit]"
+            );
+        }
+        Ok(out.trim_end().to_string())
+    }
 }
 
 // ── skill_load ───────────────────────────────────────────────────────────────
@@ -4061,33 +4485,20 @@ mod tests {
     #[test]
     fn diff_preview_is_a_trimmed_unified_diff() {
         // A localized change in a longer block: the shared prefix/suffix collapse to ±2 context
-        // lines, and the change renders as column-0 `-`/`+` lines (what the TUI colourises).
+        // lines under a `@@` header anchored at the file line, and the change renders as column-0
+        // `-`/`+` lines (what the TUI's diff panes parse).
         let before = "1\n2\n3\n4\n5\nOLD\n7\n8\n9\n10";
         let after = "1\n2\n3\n4\n5\nNEW\n7\n8\n9\n10";
-        let d = diff_preview(before, after);
-        assert!(
-            d.lines().any(|l| l == "-OLD"),
-            "removed line, column-0 '-': {d:?}"
+        let d = diff_preview(before, after, 1);
+        assert_eq!(
+            d, "@@ -4,5 +4,5 @@\n 4\n 5\n-OLD\n+NEW\n 7\n 8",
+            "window = header + ±2 context around the one changed line"
         );
+        // Unknown base (0) omits the header — the TUI then shows the rows without gutter numbers.
+        let d0 = diff_preview(before, after, 0);
         assert!(
-            d.lines().any(|l| l == "+NEW"),
-            "added line, column-0 '+': {d:?}"
-        );
-        assert!(
-            d.lines().any(|l| l == " 5"),
-            "keeps a leading context line: {d:?}"
-        );
-        assert!(
-            d.lines().any(|l| l == " 7"),
-            "keeps a trailing context line: {d:?}"
-        );
-        assert!(
-            !d.contains("--- before") && !d.contains("+++ after"),
-            "no old block headers: {d:?}"
-        );
-        assert!(
-            !d.contains('1'),
-            "far prefix/suffix bulk is trimmed away: {d:?}"
+            !d0.contains("@@"),
+            "no header when the base line is unknown: {d0:?}"
         );
     }
 
@@ -5494,7 +5905,20 @@ mod tests {
         // the read-only base) — but it's the per-instance ScopedTodo, NOT the process-global
         // TodoWrite (which is top-level only, sharing the user's list + scroll region).
         let root = std::env::temp_dir();
-        for role in ["coder", "tester", "planner", "reviewer", "unknown-role"] {
+        for role in [
+            "daedalus",
+            "argus",
+            "metis",
+            "nemesis",
+            "themis",
+            "clio",
+            "mnemosyne",
+            "coder",
+            "tester",
+            "planner",
+            "reviewer",
+            "unknown-role",
+        ] {
             let r = role_registry(role, &root);
             assert!(
                 r.get("todo_write").is_some(),
@@ -5539,17 +5963,243 @@ mod tests {
         // the command that had just timed out. The pool is execution-scope keyed, so granting it here
         // does not let one child observe or kill a sibling's handles.
         let root = std::env::temp_dir();
-        for role in ["coder", "tester"] {
+        for role in ["daedalus", "themis", "coder", "tester"] {
             assert!(
                 role_registry(role, &root).get("process").is_some(),
                 "{role} can start and monitor a long-running command"
             );
         }
-        for role in ["planner", "reviewer", "unknown-role"] {
+        for role in [
+            "argus",
+            "metis",
+            "nemesis",
+            "clio",
+            "mnemosyne",
+            "planner",
+            "reviewer",
+            "unknown-role",
+        ] {
             assert!(
                 role_registry(role, &root).get("process").is_none(),
                 "{role} is read-only — no background command pool"
             );
+        }
+    }
+
+    #[test]
+    fn pantheon_capability_grants_follow_the_role_table() {
+        let root = std::env::temp_dir();
+        // Every role (and the unknown fallback) carries the read-only git window — that is the
+        // whole point of git_inspect: a reviewer with no shell can still see the diff.
+        for role in [
+            "daedalus",
+            "argus",
+            "metis",
+            "nemesis",
+            "themis",
+            "clio",
+            "mnemosyne",
+            "unknown-role",
+        ] {
+            let r = role_registry(role, &root);
+            assert!(r.get("git_inspect").is_some(), "{role} has git_inspect");
+        }
+        // Web research is a per-role grant now: argus and mnemosyne work entirely locally.
+        for role in ["argus", "mnemosyne"] {
+            assert!(
+                role_registry(role, &root).get("web_search").is_none(),
+                "{role} has no web — its job is local"
+            );
+        }
+        for role in ["metis", "nemesis", "themis", "clio", "daedalus"] {
+            assert!(
+                role_registry(role, &root).get("web_search").is_some(),
+                "{role} keeps web research"
+            );
+        }
+        // The unknown fallback stays conservative: no web either.
+        assert!(role_registry("unknown-role", &root)
+            .get("web_search")
+            .is_none());
+        // session_recall is the historian's instrument alone — and mnemosyne stays read-only
+        // (the memory WRITE trio is top-level only; nothing here may mutate memory).
+        assert!(role_registry("mnemosyne", &root)
+            .get("session_recall")
+            .is_some());
+        for role in ["argus", "metis", "nemesis", "themis", "clio", "daedalus"] {
+            assert!(
+                role_registry(role, &root).get("session_recall").is_none(),
+                "{role} has no transcript recall"
+            );
+        }
+        for tool in ["memory_save", "memory_update", "memory_forget"] {
+            assert!(
+                role_registry("mnemosyne", &root).get(tool).is_none(),
+                "mnemosyne cannot mutate memory ({tool})"
+            );
+        }
+        assert!(
+            crate::agent::task_tool::dispatch_is_read_only(&role_registry("mnemosyne", &root)),
+            "mnemosyne is read-only → fans out"
+        );
+        // Legacy aliases land on the same scopes as their canonical names. Compared on the
+        // STABLE surface only: skill_*/lsp_*/symbol_*/repo_map registration is gated on global
+        // state (skills existing, LSP enabled) that parallel tests legitimately flip between the
+        // two builds — equality over those names is a race, not a property of the role table.
+        let stable_names = |role: &str| -> Vec<String> {
+            role_registry(role, &root)
+                .names()
+                .into_iter()
+                .filter(|n| {
+                    !n.starts_with("skill_")
+                        && !n.starts_with("lsp_")
+                        && !n.starts_with("symbol_")
+                        && n != "repo_map"
+                        && n != "read_symbol"
+                })
+                .collect()
+        };
+        for (legacy, canon) in [
+            ("coder", "daedalus"),
+            ("planner", "metis"),
+            ("reviewer", "nemesis"),
+            ("tester", "themis"),
+        ] {
+            assert_eq!(
+                stable_names(legacy),
+                stable_names(canon),
+                "{legacy} == {canon}"
+            );
+        }
+        // A specialist keeps web unconditionally (its `tools:` can only name destructive grants,
+        // so there would be no way to ask for web back).
+        let spec = agent_registry(
+            &crate::agents::AgentDef {
+                name: "S".into(),
+                description: String::new(),
+                color: String::new(),
+                emoji: String::new(),
+                vibe: String::new(),
+                tools: vec!["Read".into()],
+                model: None,
+                base_url: None,
+                api_key_ref: None,
+                body: "b".into(),
+                division: None,
+                source: crate::agents::AgentSource::AizenHome,
+                source_path: std::path::PathBuf::new(),
+            },
+            &root,
+        );
+        assert!(spec.get("web_search").is_some(), "specialists keep web");
+        assert!(
+            spec.get("git_inspect").is_some(),
+            "specialists get git_inspect"
+        );
+    }
+
+    #[test]
+    fn git_inspect_runs_real_queries_through_the_sandbox_runner() {
+        // End-to-end proof of the exec path (SandboxRequest::exec → spawn → drain): a real repo,
+        // real commits, and the closed argv actually reaching git. Skipped where git is absent.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("git not on PATH — skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("aizen-gitinspect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "git {args:?}: {:?}", st);
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@e.st",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+
+        let t = GitInspect::new(dir.clone());
+        // A dirty tree shows in status; the uncommitted edit shows in diff; log names the commit.
+        let status = t.execute(&serde_json::json!({"action": "status"})).unwrap();
+        assert!(
+            status.contains("a.txt"),
+            "status sees the dirty file: {status}"
+        );
+        let diff = t.execute(&serde_json::json!({"action": "diff"})).unwrap();
+        assert!(diff.contains("+two"), "diff carries the patch: {diff}");
+        let log = t
+            .execute(&serde_json::json!({"action": "log", "limit": 5}))
+            .unwrap();
+        assert!(log.contains("first"), "log names the commit: {log}");
+        let blame = t
+            .execute(&serde_json::json!({"action": "blame", "path": "a.txt", "rev": "HEAD"}))
+            .unwrap();
+        assert!(blame.contains("one"), "blame shows the line: {blame}");
+        // A non-repo directory surfaces git's own error as a soft error, not a panic.
+        let outside = std::env::temp_dir().join(format!("aizen-nongit-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let t2 = GitInspect::new(outside.clone());
+        let err = t2
+            .execute(&serde_json::json!({"action": "status"}))
+            .unwrap();
+        assert!(err.starts_with("error: git status failed"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn git_inspect_validates_its_argv_boundary() {
+        // Pure-validation paths: no git spawn happens for any of these.
+        let t = GitInspect::new(std::env::temp_dir());
+        let rej = |args: serde_json::Value| {
+            let out = t.execute(&args).unwrap();
+            assert!(out.starts_with("error:"), "expected refusal, got: {out}");
+            out
+        };
+        // An option smuggled as a rev/path must never reach argv.
+        rej(serde_json::json!({"action": "log", "rev": "--output=/tmp/pwn"}));
+        rej(serde_json::json!({"action": "diff", "rev": "HEAD; rm -rf ."}));
+        rej(serde_json::json!({"action": "diff", "path": "--work-tree=/etc"}));
+        // blame without a path is refused up front.
+        rej(serde_json::json!({"action": "blame"}));
+        // Read-only classification: never destructive, parallel-safe, no workspace effect.
+        assert!(!t.is_destructive());
+        assert!(t.is_concurrency_safe());
+        assert_eq!(
+            t.workspace_effect(&serde_json::json!({"action":"status"})),
+            WorkspaceEffect::None
+        );
+        // Ranges and revisions a real reviewer needs all pass validation.
+        for rev in [
+            "HEAD~3",
+            "main..HEAD",
+            "a1b2c3",
+            "v0.6.6",
+            "@{u}",
+            "HEAD:src/lib.rs",
+        ] {
+            assert!(super::valid_git_rev(rev), "{rev} should be accepted");
+        }
+        for rev in ["-n1", "--help", "a b", "x\ny"] {
+            assert!(!super::valid_git_rev(rev), "{rev} should be refused");
         }
     }
 }

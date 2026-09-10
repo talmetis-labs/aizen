@@ -239,6 +239,11 @@ mod tests {
         assert_eq!(classify_tool("web_search"), Some("web"));
         assert_eq!(classify_tool("task"), Some("delegation"));
         assert_eq!(classify_tool("mcp_github_issues"), Some("mcp"));
+        assert_eq!(
+            classify_tool("tool_search"),
+            Some("mcp"),
+            "the deferred-tool discovery door filters with the mcp bundle"
+        );
         assert_eq!(classify_tool("lsp_references"), Some("lsp"));
         assert_eq!(classify_tool("read_symbol"), Some("lsp"));
         assert_eq!(classify_tool("lsp_hover"), Some("lsp"));

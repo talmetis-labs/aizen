@@ -46,7 +46,12 @@ pub(crate) fn classify_health_probe(
         Ok(latency) if latency.as_millis() > HEALTH_SLOW_MS => tui::HealthKind::Unstable,
         Ok(_) => tui::HealthKind::Ok,
         Err(e) => match client::classify_api_error(&e) {
-            client::ApiErrorKind::Permanent => tui::HealthKind::Down,
+            // Both are "this endpoint will not answer until somebody does something", which is
+            // what the health dot means. They differ in what that something IS, and the error text
+            // beside the dot is where that belongs.
+            client::ApiErrorKind::Permanent | client::ApiErrorKind::SignedOut => {
+                tui::HealthKind::Down
+            }
             client::ApiErrorKind::Transient => tui::HealthKind::Unstable,
             // A probe request can't overflow a context window, but the arm must exist; a 413
             // from a health probe says the endpoint is reachable and objecting — yellow, not red.

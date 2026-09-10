@@ -162,6 +162,10 @@ pub struct CliConfig {
     /// TUI icon style: `"emoji"` (default), `"nerd"` (Nerd Font glyphs), or `"off"`. `None` ⇒ emoji.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<String>,
+    /// TUI colour theme (`/theme`): `"lanes"` colours each kind of work with its own hue; anything
+    /// else — including `None`, the default — is `moonlight`, the all-silver look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_visuals: Option<ResponseVisuals>,
@@ -584,7 +588,13 @@ impl ProviderProfile {
         let api_key = api_key.trim();
         // Codex OAuth profiles store tokens out-of-band; api_key may be a placeholder.
         let codex = crate::llm::oauth_codex::is_codex_base_url(base_url);
-        if api_key.is_empty() && !codex {
+        // The Aizen gateway is the same shape for a different reason: since 2026-09-06 the plan is
+        // bought by signing in, `/v1` takes the session JWT, and the profile deliberately carries no
+        // key — `resolve_endpoint` reads the token at call time. So blank is a real state for this
+        // one endpoint rather than a slip, and no placeholder is written: a placeholder would be
+        // sent as a bearer and come back a 401 naming the wrong problem.
+        let session_backed = crate::llm::gateway::is_gateway_base(base_url);
+        if api_key.is_empty() && !codex && !session_backed {
             anyhow::bail!("provider API key must not be empty");
         }
         let api_key = if api_key.is_empty() && codex {
@@ -1232,6 +1242,26 @@ pub fn mask(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile whose credential lives out of band is allowed to carry none — and only those.
+    ///
+    /// The Aizen plan is bought by signing in: the session token in `session.json` is what opens
+    /// `/v1`, and `resolve_endpoint` reads it at call time. Storing a placeholder instead would send
+    /// the placeholder as a bearer; storing nothing is the honest shape. Every other endpoint still
+    /// has to be given a key here, or the first turn fails at the provider with a bare 401.
+    #[test]
+    fn only_an_out_of_band_credential_may_leave_the_key_blank() {
+        let gw = crate::llm::gateway::openai_base(None);
+        let signed = ProviderProfile::normalized("aizen", &gw, "", "auto")
+            .expect("the Aizen endpoint keeps its credential in session.json");
+        assert_eq!(signed.api_key, "", "no placeholder was invented");
+
+        assert!(
+            ProviderProfile::normalized("openai", "https://api.openai.com/v1", "", "gpt-4o")
+                .is_err(),
+            "every other provider still needs a key"
+        );
+    }
 
     #[test]
     fn self_review_resolution_honors_explicit_values_and_oracle_default() {

@@ -55,12 +55,19 @@ pub(crate) fn prompt_mcp_trust(server_count: usize) {
 
 /// Whether base URL + API key are already present (via the config file OR the `AIZEN_*`/`NG_*` env
 /// vars), so a user who arrives pre-configured (env-only / CI image) is never shown the first-run intro.
+///
+/// A signed-in machine counts too. The session supplies both halves — `resolve_endpoint` fills the
+/// endpoint and the credential from it — and it lives in `~/.aizen/session.json`, the one file the
+/// desktop app signs in to as well. So this is what the CLI's first launch looks like after somebody
+/// signed in over there, and a wizard that opens with "pick a provider, sign in" on that machine is
+/// asking for the thing it already has.
 fn endpoint_ready() -> bool {
     let cfg = cli_config::load();
     let present = |file: Option<String>, suffix: &str| {
         file.filter(|s| !s.trim().is_empty()).is_some() || cli_config::branded_env(suffix).is_some()
     };
-    present(cfg.base_url, "BASE_URL") && present(cfg.api_key, "API_KEY")
+    (present(cfg.base_url, "BASE_URL") && present(cfg.api_key, "API_KEY"))
+        || crate::llm::account::signed_in()
 }
 
 /// Show the first-run intro when: never onboarded AND no usable endpoint yet. (Either condition alone

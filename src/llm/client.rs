@@ -744,7 +744,43 @@ where
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
+                /* A 401 from the Aizen gateway is not "the key in the config is wrong", it is
+                "the credential this call used is finished" — and on a machine that only ever runs
+                the CLI it is the only chance to find that out, since nothing here polls the gateway
+                on a timer. Which credential it was decides the sentence, and only one of the two
+                leaves anything to clean up locally. The URL is taken before the body, because
+                reading the body consumes the response — and only the gateway's own host qualifies,
+                so a wrong key at any other provider still reads as a wrong key. */
+                use crate::llm::gateway::Unauthorized;
+                let url = resp.url().clone();
+                let verdict = (status.as_u16() == 401)
+                    .then(|| crate::llm::gateway::on_unauthorized(url.as_str()));
                 let detail = resp.text().await.unwrap_or_default();
+                match verdict {
+                    // Ending the session here means the NEXT run stops at `resolve_endpoint` with
+                    // the sentence that names the fix, instead of failing at the provider with a
+                    // bare 401 every time.
+                    // Since 2026-09-06 each machine carries its OWN credential and the gateway
+                    // reads its device row on every call, so a 401 here is most often somebody
+                    // cutting this machine on purpose rather than a clock running out. Naming the
+                    // three causes is the difference between "run login again" and a hunt.
+                    Some(Unauthorized::PinEnded) => bail!(
+                        "this machine has been unpinned (HTTP 401), so its credential was removed \
+                         from here. That is what an unpin in the dashboard, a logout from another \
+                         machine, or an account password change all do. \
+                         Run `aizen login` to pin it again. The gateway said: {detail}"
+                    ),
+                    // Nothing was removed, because nothing was stored: the plan is sold by signing
+                    // in and this call carried the session token. Tokens last 30 days, there is no
+                    // refresh route, and a password change anywhere kills every one minted before
+                    // it — so the fix is always the same command, and never a retry.
+                    Some(Unauthorized::SignInAgain) => bail!(
+                        "the Aizen gateway rejected the account session (HTTP 401). A 401 here \
+                         means the session is over — not a hiccup to retry. \
+                         Run `aizen account login` to sign in again. The gateway said: {detail}"
+                    ),
+                    _ => {}
+                }
                 bail!("upstream returned HTTP {status}: {detail}");
             }
             Ok(Err(e)) => {
@@ -781,10 +817,20 @@ fn send_total_budget() -> std::time::Duration {
 pub enum ApiErrorKind {
     /// 429 / 5xx / transport / timeout / mid-stream drop — safe to retry indefinitely with backoff.
     Transient,
-    /// 4xx client/config errors retrying can't fix (auth, bad request, payment, unprocessable).
+    /// 4xx client/config errors retrying can't fix (bad request, payment, unprocessable).
     /// Goal mode retries a small bounded number of times (the provider may be briefly misbehaving)
     /// then stops with the error.
     Permanent,
+    /// 401/403 — authentication is over, and it is over for good.
+    ///
+    /// Its own kind rather than a `Permanent`, because the bounded retries that are right for a
+    /// briefly misbehaving provider are wrong here twice over. The credential is already gone from
+    /// disk by the time this is classified (`gateway::on_unauthorized` takes it at the first 401),
+    /// so every retry is a call that cannot succeed; and since 2026-09-06 a `401` from Aizen is
+    /// usually not an expiry at all but an unpinning — from the dashboard, from another machine's
+    /// logout, or from a password change. A person who did that is waiting to be told to run
+    /// `aizen login`, and a backoff loop shows them a hung window instead.
+    SignedOut,
     /// The request was too big for the model's window — a 413, or a 400 whose body says so.
     /// Neither retrying (it will 4xx identically) nor giving up (the transcript can be shrunk) is
     /// right: the loop's recovery is an emergency clear/compact, then ONE more try.
@@ -810,6 +856,9 @@ pub fn classify_api_error(e: &anyhow::Error) -> ApiErrorKind {
         // The transient 4xx trio comes BEFORE the blanket 4xx arm: 429 is the single most common
         // retryable status there is.
         Some(408 | 425 | 429) => ApiErrorKind::Transient,
+        // And auth comes before it too, for the opposite reason: not "try again sooner" but
+        // "do not try again at all".
+        Some(401 | 403) => ApiErrorKind::SignedOut,
         Some(400..=499) => ApiErrorKind::Permanent,
         // 5xx and any parsed status that isn't a client error: worth another try.
         Some(_) => ApiErrorKind::Transient,
@@ -2150,12 +2199,25 @@ mod tests {
     #[test]
     fn classify_api_error_splits_permanent_from_transient() {
         // Permanent 4xx — retrying can't fix these.
-        for code in ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"] {
+        for code in ["HTTP 400", "HTTP 404"] {
             let e = anyhow::anyhow!("upstream returned {code} Bad Request: nope");
             assert_eq!(
                 classify_api_error(&e),
                 ApiErrorKind::Permanent,
                 "{code} must be Permanent"
+            );
+        }
+        // Auth is its own kind, and it is NOT Permanent: `Permanent` buys a bounded run of
+        // retries, which for a 401 means a run of calls that cannot be built — the credential was
+        // taken from disk at the first one. Since 2026-09-06 a 401 from Aizen usually means the
+        // machine was unpinned on purpose, and the person who did it is waiting for the sentence
+        // that names `aizen login`, not for a backoff to finish.
+        for code in ["HTTP 401", "HTTP 403"] {
+            let e = anyhow::anyhow!("upstream returned {code} Unauthorized: nope");
+            assert_eq!(
+                classify_api_error(&e),
+                ApiErrorKind::SignedOut,
+                "{code} must stop at once"
             );
         }
         // 402/422/451 were the substring-matcher's blind spot: unfixable client errors that fell

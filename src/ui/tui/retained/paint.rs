@@ -8,19 +8,35 @@ use super::*;
 
 pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
+    // A wide terminal docks a status sidebar on the right — live plan, session facts — so the
+    // spare width carries the session's state instead of dead space. Below the
+    // threshold every column stays with the conversation: the sidebar is a use of surplus room,
+    // never competition for it.
+    let (main, side) = if area.width >= SIDEBAR_MIN_TERM_W {
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(SIDEBAR_W)])
+            .split(area);
+        (h[0], Some(h[1]))
+    } else {
+        (area, None)
+    };
     // The composer GROWS DOWNWARD with the draft instead of scrolling one row sideways, so the
     // footer's height is decided here — before the split — from the wrapped draft. `input_layout` is
     // pure over `AppState`, so the same call that sizes the box is the one handed to `draw_footer`
     // to paint it: the two cannot disagree by a row.
-    let layout = input_layout(state, area.width as usize, max_input_rows(area.height));
+    let layout = input_layout(state, main.width as usize, max_input_rows(main.height));
     state.input_row_scroll = layout.scroll; // sticky across frames — see `AppState::input_row_scroll`
     let footer_rows = FOOTER_CHROME_ROWS.saturating_add(layout.rows.len() as u16);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(footer_rows)])
-        .split(area);
+        .split(main);
     draw_transcript(frame, chunks[0], state);
     draw_footer(frame, chunks[1], state, &layout);
+    if let Some(side) = side {
+        draw_sidebar(frame, side, state);
+    }
     // Rects floating ABOVE the transcript this frame. Collected here (rather than inferred later)
     // because only the draw pass knows what was actually painted — the post-draw hyperlink injector
     // writes at absolute coordinates and would otherwise print over them.
@@ -53,6 +69,305 @@ pub(super) fn max_input_rows(height: u16) -> usize {
         .saturating_sub(FOOTER_CHROME_ROWS)
         .saturating_sub(MIN_TRANSCRIPT_ROWS);
     spare.clamp(1, MAX_INPUT_TEXT_ROWS) as usize
+}
+
+/// Terminal width at which the sidebar appears, and the columns it takes. 125 leaves the
+/// conversation at least 91 columns — wider than the box the splash panel needs — so docking can
+/// never crowd the transcript below its comfortable width.
+pub(super) const SIDEBAR_MIN_TERM_W: u16 = 125;
+pub(super) const SIDEBAR_W: u16 = 34;
+
+/// Word-wrap plain text into at most `max_lines` rows of `width` cells, hard-breaking a word wider
+/// than the row and marking an overflowing last row with `…`. Sidebar rows are short; this stays
+/// deliberately simpler than the transcript's wrapper.
+pub(super) fn wrap_plain(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let w = console::measure_text_width(word);
+        let sep = usize::from(!cur.is_empty());
+        if cur_w + sep + w <= width {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            cur_w += sep + w;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        // A single word wider than the row breaks hard rather than producing a row that never ends.
+        let mut rest: &str = word;
+        while console::measure_text_width(rest) > width {
+            let cut = rest
+                .char_indices()
+                .scan(0usize, |acc, (i, c)| {
+                    *acc += console::measure_text_width(&c.to_string());
+                    (*acc <= width).then_some(i + c.len_utf8())
+                })
+                .last()
+                .unwrap_or(rest.len());
+            lines.push(rest[..cut].to_string());
+            rest = &rest[cut..];
+        }
+        cur = rest.to_string();
+        cur_w = console::measure_text_width(&cur);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            last.push('…');
+        }
+    }
+    lines
+}
+
+/// The right-hand status column: health + the live plan + where we are. Reads the
+/// same `AppState` the HUD and transcript read — no second copy of anything, so it can never
+/// disagree with what the main pane shows.
+fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
+    if rect.width < 8 || rect.height < 6 {
+        return;
+    }
+    let accent = Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT));
+    let bold = accent.add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT_DIM));
+    let muted = Style::default().fg(Color::Indexed(crate::ui::theme::MUTED));
+    let faint = Style::default().fg(Color::Indexed(crate::ui::theme::FAINT));
+    // "│ " divider + content + one right margin.
+    let inner = rect.width.saturating_sub(3) as usize;
+    let mut body: Vec<Line> = Vec::new();
+
+    // Header: brand + the same health the idle chip shows.
+    let (hcol, hlabel) = match state.health {
+        HealthKind::Ok => (crate::ui::theme::OK, "ready"),
+        HealthKind::Unstable => (crate::ui::theme::WARN, "unstable"),
+        HealthKind::Down => (crate::ui::theme::ERR, "down"),
+        HealthKind::Unknown => (crate::ui::theme::FAINT, "starting"),
+    };
+    body.push(Line::from(vec![
+        Span::styled("Aizen ", bold),
+        Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), muted),
+        Span::styled("  ● ", Style::default().fg(Color::Indexed(hcol))),
+        Span::styled(hlabel, muted),
+    ]));
+    body.push(Line::default());
+
+    // No model/effort/mode/persona block here: the composer's HUD row already carries all four,
+    // and the sidebar repeating them was pure duplication.
+
+    // No context gauge here: the HUD row under the composer already carries the same permille as
+    // a compact meter, and the sidebar drawing it twice was pure duplication.
+
+    // What it is doing right now — the working caption the footer types out — and for how long.
+    if state.working && !state.work_caption.is_empty() {
+        body.push(Line::styled("Now", bold));
+        let elapsed = state
+            .working_since
+            .map(|t| {
+                format!(
+                    " · {}",
+                    crate::agent::orchestration::fmt_secs(t.elapsed().as_secs())
+                )
+            })
+            .unwrap_or_default();
+        for l in wrap_plain(&format!("{}{elapsed}", state.work_caption), inner, 2) {
+            // Same lane tint as the footer caption, so the sidebar's "Now" agrees with it.
+            body.push(Line::styled(
+                l,
+                match state.work_tint {
+                    Some(c) => Style::default().fg(Color::Indexed(c)),
+                    None => accent,
+                },
+            ));
+        }
+        body.push(Line::default());
+    }
+
+    // The live plan — the same rows the transcript's checklist box holds.
+    let plan = state
+        .plan_id
+        .and_then(|id| state.blocks.iter().find(|b| b.id == id))
+        .and_then(|b| match &b.payload {
+            Payload::Plan(rows) => Some(rows.as_slice()),
+            _ => None,
+        });
+    if let Some(rows) = plan {
+        let done = rows.iter().filter(|r| r.status == 2).count();
+        body.push(Line::from(vec![
+            Span::styled("Todo ", bold),
+            Span::styled(format!("{done}/{}", rows.len()), muted),
+        ]));
+        // Budget: everything above + this section must leave the last row for the cwd footer.
+        let avail = (rect.height as usize)
+            .saturating_sub(body.len())
+            .saturating_sub(2);
+        let mut used = 0usize;
+        let mut shown = 0usize;
+        for r in rows {
+            let (glyph, gstyle, tstyle) = match r.status {
+                2 => (
+                    "✓",
+                    Style::default().fg(Color::Indexed(crate::ui::theme::OK)),
+                    faint,
+                ),
+                1 => ("▸", bold, accent),
+                _ => ("○", faint, muted),
+            };
+            let wrapped = wrap_plain(&r.text, inner.saturating_sub(2), 2);
+            if used + wrapped.len() > avail {
+                break;
+            }
+            used += wrapped.len();
+            shown += 1;
+            for (i, l) in wrapped.into_iter().enumerate() {
+                let lead = if i == 0 {
+                    Span::styled(format!("{glyph} "), gstyle)
+                } else {
+                    Span::styled("  ".to_string(), faint)
+                };
+                body.push(Line::from(vec![lead, Span::styled(l, tstyle)]));
+            }
+        }
+        if shown < rows.len() {
+            body.push(Line::styled(
+                format!("… +{} more", rows.len() - shown),
+                faint,
+            ));
+        }
+        body.push(Line::default());
+    }
+
+    // Where this conversation lives and what else is plugged in.
+    if !state.facts.session.is_empty() {
+        body.push(Line::from(vec![
+            Span::styled("Session ", bold),
+            Span::styled(
+                format!(
+                    "{} turn{}",
+                    state.facts.turns,
+                    if state.facts.turns == 1 { "" } else { "s" }
+                ),
+                muted,
+            ),
+        ]));
+        for l in wrap_plain(&state.facts.session, inner, 2) {
+            body.push(Line::styled(l, muted));
+        }
+        // Token tally lives here now that the context gauge is gone from the sidebar.
+        if !state.facts.tokens.is_empty() {
+            body.push(Line::styled(state.facts.tokens.clone(), muted));
+        }
+        body.push(Line::default());
+    }
+    // What else is plugged in: the provider endpoint, MCP servers, the language servers, and the
+    // memory store.
+    if !state.facts.provider.is_empty() {
+        let mut ps = wrap_plain(&state.facts.provider, inner.saturating_sub(9), 2).into_iter();
+        body.push(Line::from(vec![
+            Span::styled("Provider ", bold),
+            Span::styled(ps.next().unwrap_or_default(), muted),
+        ]));
+        for l in ps {
+            body.push(Line::styled(format!("         {l}"), muted));
+        }
+    }
+    if state.facts.mcp_servers > 0 {
+        body.push(Line::from(vec![
+            Span::styled("MCP ", bold),
+            Span::styled(
+                format!(
+                    "{} server{}",
+                    state.facts.mcp_servers,
+                    if state.facts.mcp_servers == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                muted,
+            ),
+        ]));
+    }
+    if !state.facts.lsp.is_empty() {
+        let mut ls = wrap_plain(&state.facts.lsp, inner.saturating_sub(4), 2).into_iter();
+        body.push(Line::from(vec![
+            Span::styled("LSP ", bold),
+            Span::styled(ls.next().unwrap_or_default(), muted),
+        ]));
+        for l in ls {
+            body.push(Line::styled(format!("    {l}"), muted));
+        }
+    }
+    if state.facts.memory_facts > 0 || state.facts.memory_recalled > 0 {
+        body.push(Line::from(vec![
+            Span::styled("Memory ", bold),
+            Span::styled(
+                format!(
+                    "{} fact{}",
+                    state.facts.memory_facts,
+                    if state.facts.memory_facts == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                muted,
+            ),
+        ]));
+        if state.facts.memory_recalled > 0 {
+            body.push(Line::styled(
+                format!("{} recalled this session", state.facts.memory_recalled),
+                muted,
+            ));
+        }
+    }
+
+    // Assemble: divider column on every row, cwd pinned to the bottom row.
+    let cwd_line = sidebar_cwd(inner);
+    let rows_total = rect.height as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(rows_total);
+    for i in 0..rows_total {
+        let content = if i + 1 == rows_total {
+            Line::styled(cwd_line.clone(), faint)
+        } else {
+            body.get(i).cloned().unwrap_or_default()
+        };
+        let mut spans = vec![Span::styled("│ ", dim)];
+        spans.extend(content.spans);
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), rect);
+}
+
+/// The working directory, clipped from the LEFT so the tail — the part that names the project —
+/// survives. Computed once: the process cwd does not move under the render thread.
+fn sidebar_cwd(width: usize) -> String {
+    static CWD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let full = CWD.get_or_init(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    });
+    let w = console::measure_text_width(full);
+    if w <= width {
+        return full.clone();
+    }
+    let cut: String = full
+        .chars()
+        .rev()
+        .take(width.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{cut}")
 }
 
 /// Resolve the transcript scroll for one frame. Pure so it can be unit-tested without a backend.
@@ -311,7 +626,9 @@ pub(super) fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
         .unwrap_or(0);
     // `spinner caption   12s · Esc to stop` — spinner in moonlight (the structural brand colour),
     // caption in link-blue (live status, distinct from grey transcript prose), the elapsed clock +
-    // stop hint faint at the tail so they inform without pulling the eye.
+    // stop hint faint at the tail so they inform without pulling the eye. The clock rolls into
+    // minute/hour units past 60s (`fmt_secs`: `7m03s`, `2h05m`) — a long run reading `754s` makes
+    // the user do the division.
     //
     // NO drawn caret rides the caption. A `▏` here used to imitate a text cursor, which misread
     // badly for two reasons: the terminal's REAL cursor is already visible (ratatui's
@@ -325,9 +642,29 @@ pub(super) fn working_line(state: &AppState) -> Vec<(String, Line<'static>)> {
             format!("{glyph} "),
             Style::default().fg(Color::Indexed(theme::ACCENT)),
         ),
-        Span::styled(revealed, Style::default().fg(Color::Indexed(theme::LINK))),
         Span::styled(
-            format!("   {elapsed}s · Esc to stop"),
+            revealed,
+            // A tool's action types out in that tool's lane hue; the whimsical verb (no tool
+            // running) keeps the link-blue "live status" tint.
+            Style::default().fg(Color::Indexed(state.work_tint.unwrap_or(theme::LINK))),
+        ),
+        Span::styled(
+            {
+                // `↑N tok` = what the turn's latest request carried (estimated at send, corrected
+                // by provider usage) — absent until the first call of the turn reports in.
+                let sent = if state.sent_tok > 0 {
+                    format!(
+                        " · ↑{} tok",
+                        crate::ui::context_report::fmt_k(state.sent_tok as usize)
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "   {}{sent} · Esc to stop",
+                    crate::agent::orchestration::fmt_secs(elapsed)
+                )
+            },
             Style::default().fg(Color::Indexed(theme::FAINT)),
         ),
     ];

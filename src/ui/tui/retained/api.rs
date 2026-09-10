@@ -95,6 +95,26 @@ pub(crate) fn size() -> (u16, u16) {
     (ROWS.load(Ordering::Relaxed), COLS.load(Ordering::Relaxed))
 }
 
+/// The width CONTENT should lay itself out to: the transcript pane, not the raw grid. When the
+/// terminal is wide enough that the sidebar docks, the pane is `SIDEBAR_W` narrower — text wrapped
+/// to the full grid would have its line tails painted under the sidebar and clipped (the "missing
+/// words on the right" bug). Everything that pre-wraps before emitting (markdown, stream boxes)
+/// must measure against THIS, and `tui::width()` routes here for exactly that reason.
+pub(crate) fn content_width() -> u16 {
+    pane_width_for(COLS.load(Ordering::Relaxed))
+}
+
+/// The transcript pane's columns on a `cols`-wide grid: the sidebar's columns subtracted once it
+/// docks. Factored out of [`content_width`] so pre-activation callers (the intro splash) can ask
+/// about a size the render thread doesn't own yet.
+pub(crate) fn pane_width_for(cols: u16) -> u16 {
+    if cols >= SIDEBAR_MIN_TERM_W {
+        cols - SIDEBAR_W
+    } else {
+        cols
+    }
+}
+
 pub(crate) fn start(intro: &str, status: &str) -> bool {
     if !preferred() {
         return false;
@@ -253,15 +273,29 @@ pub(crate) fn set_ultimate(on: bool) {
 /// Set the working caption target — a running tool's action ("Reading retained.rs") or the whimsical
 /// verb between steps. The typewriter reveal replays only when the text actually changes.
 pub(crate) fn set_work_caption(text: &str) {
-    send(Command::WorkCaption(text.to_string()));
+    send(Command::WorkCaption(text.to_string(), None));
+}
+
+/// [`set_work_caption`] carrying the running tool's work-lane colour, so the caption types out in
+/// the same hue as the tool row it narrates.
+pub(crate) fn set_work_caption_tinted(text: &str, color: u8) {
+    send(Command::WorkCaption(text.to_string(), Some(color)));
 }
 
 pub(crate) fn set_context(permille: u16) {
     send(Command::Context(permille.min(1000)));
 }
 
+pub(crate) fn set_sent_tokens(n: u64) {
+    send(Command::SentTokens(n));
+}
+
 pub(crate) fn set_health(kind: HealthKind) {
     send(Command::Health(kind));
+}
+
+pub(crate) fn set_facts(facts: SessionFacts) {
+    send(Command::Facts(facts));
 }
 
 pub(crate) fn set_selection(sel: SelectionRange) {

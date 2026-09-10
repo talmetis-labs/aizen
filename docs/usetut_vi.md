@@ -264,6 +264,8 @@ Không giới hạn số vòng lặp, tự thử lại khi lỗi API. Aizen ch�
 | `/team` | Các cửa sổ Aizen khác đang làm trong repo này — xem file, diff, commit công việc của chúng | |
 | `/work` | Worktree git tách biệt, mỗi phiên một cái (list · new · remove) | |
 
+Bộ vai dựng sẵn — **Pantheon**: `argus` tìm code · `metis` hoạch định · `daedalus` viết code (vai duy nhất được sửa file) · `nemesis` review · `themis` chạy test (có shell, không sửa file) · `clio` tra cứu web · `mnemosyne` nhớ lại quyết định/lịch sử phiên. Tên cũ `coder/planner/reviewer/tester` vẫn dùng được.
+
 `/team` giúp nhiều phiên Aizen làm chung một repo mà quy được công đúng người; `/work` cô lập mỗi task vào một worktree riêng để không giẫm chân nhau.
 
 Ở terminal: `aizen agents ...`, `aizen team ...`, `aizen work ...`, `aizen workflow ...`.

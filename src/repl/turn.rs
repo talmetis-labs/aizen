@@ -17,7 +17,9 @@ use crate::llm::client;
 use crate::repl::postturn::{
     chore_chat, maybe_auto_compact, maybe_evolve_persona, maybe_run_secretary,
 };
-use crate::ui::context_report::resolve_ctx_window;
+use crate::ui::context_report::{
+    ctx_permille, resolve_ctx_window, usage_ctx_tokens, usage_input_tokens,
+};
 use crate::ui::image_input;
 use crate::ui::{splash, theme, tui};
 use crate::{
@@ -153,8 +155,23 @@ pub(crate) async fn run_agent_turn(
     let key = ep.api_key.as_str();
     let model = ep.model.as_str();
     let eager_on = eager_enabled();
+    let window = resolve_ctx_window(model).0;
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        if eager_on {
+        // LIVE context meter + `↑N tok` chip, fed per send: `msgs`+`defs` are exactly the request
+        // going out, so the gauge tracks tool results growing the context MID-turn (the idle
+        // status refresh never sees that). The chars/4 estimate moves both the moment the request
+        // leaves; the provider's real usage on the reply corrects them — and the context size is
+        // remembered so the idle refresh keeps the real number instead of stomping it (see
+        // `status_text`). This closure is the ONLY writer of either: sub-agent and chore calls
+        // answer for other contexts and must not steer the main meter.
+        let est = msgs
+            .iter()
+            .map(agent::estimate_message_tokens)
+            .sum::<usize>()
+            + agent::estimate_defs_tokens(&defs);
+        tui::set_ctx_permille(ctx_permille(est, window));
+        tui::set_sent_tokens(est as u64);
+        let turn = if eager_on {
             // Read-only calls start the moment their streamed args complete.
             let starter = agent::eager_starter(registry, cfg);
             client::stream_chat_with_tools_eager(
@@ -169,7 +186,19 @@ pub(crate) async fn run_agent_turn(
             .await
         } else {
             client::stream_chat_with_tools(http, base, key, model, &msgs, &defs).await
+        }?;
+        if let Some(u) = &turn.usage {
+            let real = usage_ctx_tokens(u);
+            if real > 0 {
+                tui::set_ctx_real_tokens(real as u64);
+                tui::set_ctx_permille(ctx_permille(real, window));
+            }
+            let sent = usage_input_tokens(u);
+            if sent > 0 {
+                tui::set_sent_tokens(sent as u64);
+            }
         }
+        Ok(turn)
     };
     // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
     let sum_ep = summarizer_endpoint(base, key, model);
