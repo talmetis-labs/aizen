@@ -184,6 +184,12 @@ Pantheon sub-agent roster and the Tool Search slimming carried over from the pri
   detection in prose.
 
 ### Fixed
+- **Sandboxed `git` (and any child) can reach `/dev/null` again on Linux.** The Landlock backend
+  granted only the workspace roots, so a sandboxed child that opened a standard pseudo-device died
+  with `Permission denied` on a path that belongs to no workspace — `git status` opens `/dev/null`
+  read-write and fell over exactly there, which broke `git_inspect` under the sandbox runner on
+  Landlock kernels (Windows and macOS were unaffected; the macOS backend already allows `/dev`). The
+  Linux ruleset now also grants the safe pseudo-devices `/dev/{null,zero,full,random,urandom,tty}`.
 - **A window resize can no longer shred the frame.** Dragging the terminal edge — especially with
   the transcript scrolling at the same time — could leave the screen a collage of torn glyphs and
   stale rows that no amount of further scrolling repaired. ratatui does clear on every resize it

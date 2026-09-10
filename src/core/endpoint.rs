@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn the_session_token_never_goes_to_another_provider() {
         assert_eq!(session_key("https://api.openai.com/v1"), None);
-        assert_eq!(session_key("https://generativelanguage.googleapis.com/v1beta"), None);
+        assert_eq!(
+            session_key("https://generativelanguage.googleapis.com/v1beta"),
+            None
+        );
         assert_eq!(session_key(""), None);
     }
 
@@ -203,7 +206,10 @@ mod tests {
     fn a_blank_saved_value_counts_as_absent() {
         assert_eq!(non_empty(Some("".to_string())), None);
         assert_eq!(non_empty(Some("   ".to_string())), None);
-        assert_eq!(non_empty(Some("ak_x".to_string())), Some("ak_x".to_string()));
+        assert_eq!(
+            non_empty(Some("ak_x".to_string())),
+            Some("ak_x".to_string())
+        );
         assert_eq!(non_empty(None), None);
     }
 

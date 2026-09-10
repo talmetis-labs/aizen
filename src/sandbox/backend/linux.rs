@@ -322,6 +322,23 @@ fn build_ruleset(fs: &FsPolicy) -> Result<Option<OwnedFd>, String> {
             ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR,
         );
     }
+    // The safe pseudo-devices every ordinary child assumes are just there. Landlock is default-deny,
+    // so with only the workspace roots granted a sandboxed `git` dies with "Permission denied" on a
+    // path that belongs to no workspace: `git status` opens /dev/null O_RDWR and fell over exactly
+    // there on Landlock kernels (the macOS backend already allows all of /dev, which is why only
+    // Linux saw this). Each of these is a single char device, granted the full governed mask so the
+    // writable ones (null/zero/full) take writes; the dir bits are inert on a device node. Absent
+    // nodes are skipped by `add` via `open_path_fd`, so this stays portable across kernels/distros.
+    for dev in [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+    ] {
+        add(std::path::Path::new(dev), handled);
+    }
     Ok(Some(ruleset))
 }
 

@@ -100,7 +100,9 @@ fn show(data: &Value) {
                     "no"
                 },
                 s(e, "status"),
-                e.get("calls_30d").map(|v| v.to_string()).unwrap_or_default(),
+                e.get("calls_30d")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
             );
             // A probe error is why an endpoint is not working; it belongs next to the row, not in
             // a --json nobody runs.
@@ -111,7 +113,9 @@ fn show(data: &Value) {
         }
     }
     if let (Some(used), Some(max)) = (
-        data.get("endpoints").and_then(|v| v.as_array()).map(|a| a.len()),
+        data.get("endpoints")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
         data.get("max").and_then(|v| v.as_u64()),
     ) {
         eprintln!("{used}/{max} endpoints used");
@@ -243,7 +247,11 @@ async fn set(
         body.insert("api_key".into(), json!(""));
     } else if let Some(k) = key {
         // `--key` with no value means "ask me"; `--key <k>` supplies it outright.
-        let k = if k.is_empty() { ask_key("new provider key")? } else { k };
+        let k = if k.is_empty() {
+            ask_key("new provider key")?
+        } else {
+            k
+        };
         body.insert("api_key".into(), json!(k));
     }
 

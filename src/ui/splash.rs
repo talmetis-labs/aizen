@@ -543,7 +543,9 @@ fn body_rows() -> Vec<String> {
         if who.is_empty() {
             style("signed in").color256(ACCENT).to_string()
         } else {
-            style(format!("signed in as {who}")).color256(ACCENT).to_string()
+            style(format!("signed in as {who}"))
+                .color256(ACCENT)
+                .to_string()
         }
     } else {
         style("not set").red().to_string()

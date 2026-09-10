@@ -7,13 +7,13 @@ pub mod apps;
 pub mod coop_cmd;
 pub mod custom_cmd;
 pub mod key_cmd;
-pub mod sub_cmd;
 pub mod memory_cmd;
 pub mod persona_cmd;
 pub mod run_cmds;
 pub mod sandbox_cmd;
 pub mod sessions;
 pub mod skill_cmd;
+pub mod sub_cmd;
 pub mod time;
 pub mod where_report;
 

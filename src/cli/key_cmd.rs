@@ -228,10 +228,16 @@ async fn reveal(id: Option<String>, json: bool) -> Result<()> {
     // One extra read, to turn a server refusal into the sentence that explains it. Asking the
     // server for the plan key's string is not a mistake this command should let somebody make and
     // then have to interpret.
-    if all_keys().await.iter().any(|k| s(k, "id") == id && is_main(k)) {
+    if all_keys()
+        .await
+        .iter()
+        .any(|k| s(k, "id") == id && is_main(k))
+    {
         eprintln!("✖ '{id}' is your plan, and a plan has no key string — nothing emits it.");
         eprintln!("  To call models here, sign in: `aizen account login`.");
-        eprintln!("  To hold a key of your own (a seller's model, an SDK), make one in the dashboard.");
+        eprintln!(
+            "  To hold a key of your own (a seller's model, an SDK), make one in the dashboard."
+        );
         std::process::exit(2);
     }
     let path = format!("/auth/keys/reveal/{}", account::encode_segment(&id));
@@ -272,17 +278,28 @@ async fn loadout_ls(id: Option<String>, json: bool) -> Result<()> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let max = data.get("max").and_then(|v| v.as_u64()).unwrap_or(MAX_LOADOUT as u64);
+    let max = data
+        .get("max")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(MAX_LOADOUT as u64);
     let auto = {
         let a = s(&data, "auto");
-        if a.is_empty() { AUTO.to_string() } else { a }
+        if a.is_empty() {
+            AUTO.to_string()
+        } else {
+            a
+        }
     };
 
     if entries.is_empty() {
         // Not an empty table — a broken key. On a plan key an empty loadout is a hard "no", so the
         // user would otherwise meet it as a 403 on their first call.
-        println!("The loadout is EMPTY, and on the plan key that means it can call nothing at all.");
-        println!("(An empty allow-list means 'no restriction' on ordinary keys — not on this one.)");
+        println!(
+            "The loadout is EMPTY, and on the plan key that means it can call nothing at all."
+        );
+        println!(
+            "(An empty allow-list means 'no restriction' on ordinary keys — not on this one.)"
+        );
         println!();
         println!("Load a plan into it:  aizen key loadout set <plan> [<plan> …]");
         println!("See what you can load: aizen sub plan ls");
@@ -291,7 +308,10 @@ async fn loadout_ls(id: Option<String>, json: bool) -> Result<()> {
 
     println!("{:<4} {:<32} {:<10} {}", "#", "PLAN", "KIND", "CALLABLE");
     for (i, e) in entries.iter().enumerate() {
-        let ok = e.get("resolvable").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ok = e
+            .get("resolvable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         println!(
             "{:<4} {:<32} {:<10} {}",
             i + 1,
@@ -304,11 +324,15 @@ async fn loadout_ls(id: Option<String>, json: bool) -> Result<()> {
     }
     println!();
     println!("{}/{max} used. Order is preference order.", entries.len());
-    match entries
-        .iter()
-        .find(|e| e.get("resolvable").and_then(|v| v.as_bool()).unwrap_or(false))
-    {
-        Some(first) => println!("`{auto}` resolves to '{}' — the first callable entry.", s(first, "model")),
+    match entries.iter().find(|e| {
+        e.get("resolvable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }) {
+        Some(first) => println!(
+            "`{auto}` resolves to '{}' — the first callable entry.",
+            s(first, "model")
+        ),
         // Every entry unusable is the same practical state as empty, and just as invisible.
         None => println!("⚠ No entry is callable right now, so `{auto}` resolves to nothing."),
     }
@@ -318,7 +342,10 @@ async fn loadout_ls(id: Option<String>, json: bool) -> Result<()> {
 /// What the server refuses on write, refused here first so the user gets a sentence, not a 400.
 fn check_loadout(names: &[String]) -> Result<(), String> {
     if names.len() > MAX_LOADOUT {
-        return Err(format!("a loadout holds at most {MAX_LOADOUT} plans (got {})", names.len()));
+        return Err(format!(
+            "a loadout holds at most {MAX_LOADOUT} plans (got {})",
+            names.len()
+        ));
     }
     for (i, n) in names.iter().enumerate() {
         let t = n.trim();
@@ -331,10 +358,15 @@ fn check_loadout(names: &[String]) -> Result<(), String> {
             ));
         }
         if t.contains('*') {
-            return Err(format!("patterns are not allowed in a plan loadout (got: {t})"));
+            return Err(format!(
+                "patterns are not allowed in a plan loadout (got: {t})"
+            ));
         }
         if t.chars().count() > 200 {
-            return Err(format!("'{}…' is longer than 200 characters", &t.chars().take(30).collect::<String>()));
+            return Err(format!(
+                "'{}…' is longer than 200 characters",
+                &t.chars().take(30).collect::<String>()
+            ));
         }
         if names[..i].iter().any(|p| p == n) {
             return Err(format!("'{t}' is listed twice"));
@@ -362,7 +394,9 @@ async fn put_loadout(id: &str, names: Vec<String>, json: bool) -> Result<()> {
         return print_json(&out);
     }
     if empty {
-        println!("✔ Loadout cleared — the plan key can now call NOTHING until something is loaded.");
+        println!(
+            "✔ Loadout cleared — the plan key can now call NOTHING until something is loaded."
+        );
     } else {
         println!("✔ Loadout set ({} entries).", names.len());
     }
@@ -377,7 +411,12 @@ async fn loadout_set(models: Vec<String>, id: Option<String>, json: bool) -> Res
 }
 
 /// `add`/`rm` on a route that only accepts a whole list: read, modify, write.
-async fn loadout_edit(models: Vec<String>, id: Option<String>, json: bool, adding: bool) -> Result<()> {
+async fn loadout_edit(
+    models: Vec<String>,
+    id: Option<String>,
+    json: bool,
+    adding: bool,
+) -> Result<()> {
     if models.is_empty() {
         eprintln!("✖ name at least one plan");
         std::process::exit(2);
@@ -432,7 +471,9 @@ async fn models(only: Option<&str>, json: bool) -> Result<()> {
     let loadout = account::get(&loadout_route(&id))
         .await
         .unwrap_or_else(|e| bail(e));
-    let combos_doc = account::get("/auth/combos").await.unwrap_or_else(|e| bail(e));
+    let combos_doc = account::get("/auth/combos")
+        .await
+        .unwrap_or_else(|e| bail(e));
     let combos = combos_doc
         .get("combos")
         .and_then(|v| v.as_array())
@@ -468,8 +509,12 @@ async fn models(only: Option<&str>, json: bool) -> Result<()> {
 
     if entries.is_empty() {
         match only {
-            Some(w) => println!("'{w}' is not in the loadout — `aizen key loadout ls` shows what is."),
-            None => println!("The loadout is empty, so there is nothing to call. See `aizen key loadout ls`."),
+            Some(w) => {
+                println!("'{w}' is not in the loadout — `aizen key loadout ls` shows what is.")
+            }
+            None => println!(
+                "The loadout is empty, so there is nothing to call. See `aizen key loadout ls`."
+            ),
         }
         return Ok(());
     }
@@ -477,15 +522,25 @@ async fn models(only: Option<&str>, json: bool) -> Result<()> {
     let mut any_models = false;
     for e in &entries {
         let name = s(e, "model");
-        let callable = e.get("resolvable").and_then(|v| v.as_bool()).unwrap_or(false);
+        let callable = e
+            .get("resolvable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         println!(
             "{name}{}",
-            if callable { "" } else { "   (not callable right now)" }
+            if callable {
+                ""
+            } else {
+                "   (not callable right now)"
+            }
         );
         let combo = combos
             .iter()
             .find(|c| s(c, "listing_id") == name || s(c, "name") == name);
-        match combo.and_then(|c| c.get("models")).and_then(|m| m.as_array()) {
+        match combo
+            .and_then(|c| c.get("models"))
+            .and_then(|m| m.as_array())
+        {
             Some(ms) if !ms.is_empty() => {
                 any_models = true;
                 for m in ms {
@@ -517,7 +572,9 @@ mod tests {
     /// owner's email, and matching `main` reported those accounts as having no plan key at all.
     #[test]
     fn the_plan_key_is_found_by_its_flag() {
-        assert!(is_main(&json!({ "label": "owner@example.com", "plan_key": true })));
+        assert!(is_main(
+            &json!({ "label": "owner@example.com", "plan_key": true })
+        ));
         assert!(!is_main(&json!({ "label": "main", "plan_key": false })));
         assert!(!is_main(&json!({ "label": "laptop", "plan_key": false })));
     }
@@ -545,10 +602,16 @@ mod tests {
     fn a_loadout_refuses_what_the_server_refuses() {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(check_loadout(&v(&["a", "b"])).is_ok());
-        assert!(check_loadout(&v(&[])).is_ok(), "clearing is legal, if drastic");
+        assert!(
+            check_loadout(&v(&[])).is_ok(),
+            "clearing is legal, if drastic"
+        );
         assert!(check_loadout(&v(&["a", "a"])).is_err(), "duplicate");
         assert!(check_loadout(&v(&["auto"])).is_err(), "reserved name");
-        assert!(check_loadout(&v(&["AUTO"])).is_err(), "reserved name, any case");
+        assert!(
+            check_loadout(&v(&["AUTO"])).is_err(),
+            "reserved name, any case"
+        );
         assert!(check_loadout(&v(&["aizen/*"])).is_err(), "pattern");
         assert!(check_loadout(&v(&[""])).is_err(), "blank");
         assert!(check_loadout(&v(&["x"; 11])).is_err(), "over the ceiling");
@@ -562,7 +625,11 @@ mod tests {
         assert_eq!(key_string(&json!("ak_abc")), "ak_abc");
         assert_eq!(key_string(&json!({ "key": "ak_abc" })), "ak_abc");
         assert_eq!(key_string(&json!({ "api_key": "ak_abc" })), "ak_abc");
-        assert_eq!(key_string(&json!({ "key_prefix": "ak_abc" })), "", "a prefix is not the key");
+        assert_eq!(
+            key_string(&json!({ "key_prefix": "ak_abc" })),
+            "",
+            "a prefix is not the key"
+        );
     }
 
     #[test]

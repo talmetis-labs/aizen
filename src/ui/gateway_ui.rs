@@ -243,11 +243,7 @@ fn show_status(pin: Option<&Pin>, profile: &str, cfg: &GatewayConfig) {
         } else {
             format!("  ({})", cfg.key.label)
         };
-        println!(
-            "{} {}…{label}",
-            style("plan key").dim(),
-            cfg.key.key_prefix
-        );
+        println!("{} {}…{label}", style("plan key").dim(), cfg.key.key_prefix);
     }
     if let Some(pin) = gateway::load_pin() {
         if !pin.device_id.is_empty() {
@@ -434,8 +430,10 @@ pub(crate) fn unpair_lines(unpaired: Option<&gateway::Unpaired>) -> Vec<String> 
             ),
             format!(
                 "  {}",
-                style("Its credential stops working on the next call. No other machine is affected.")
-                    .dim()
+                style(
+                    "Its credential stops working on the next call. No other machine is affected."
+                )
+                .dim()
             ),
         ];
     }

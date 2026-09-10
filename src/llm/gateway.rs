@@ -637,7 +637,10 @@ fn refusal(code: u16, text: &str) -> Fail {
         ),
         401 | 403 => Fail::new(
             FailKind::Fatal,
-            format!("the gateway refused the pairing: {}", server_says(code, text)),
+            format!(
+                "the gateway refused the pairing: {}",
+                server_says(code, text)
+            ),
         ),
         429 => Fail::new(FailKind::Transient, "asked too often — backing off"),
         500..=599 => Fail::new(
@@ -1204,7 +1207,9 @@ pub fn adopt(profile: &str, ready: &Ready, activate: bool) -> Result<Adopted> {
         // Turned into an absolute moment at the one instant both clocks agree — the answer just
         // arrived — because a stored duration is only readable next to the timestamp it counts
         // from, and that second field is a second thing to get wrong.
-        token_expires_at: (ready.expires_in > 0).then(|| now_secs() + ready.expires_in).unwrap_or(0),
+        token_expires_at: (ready.expires_in > 0)
+            .then(|| now_secs() + ready.expires_in)
+            .unwrap_or(0),
         label: if ready.label.trim().is_empty() {
             cfg.map(|c| c.key.label.clone()).unwrap_or_default()
         } else {
@@ -1523,7 +1528,9 @@ pub fn is_device_token(credential: &str) -> bool {
 
 /// The pinned profile's credential, if this machine has one. `None` when nothing is pinned.
 fn pinned_credential(profile: Option<&str>) -> Option<String> {
-    key_for(profile).map(|(_, k)| k).filter(|k| !k.trim().is_empty())
+    key_for(profile)
+        .map(|(_, k)| k)
+        .filter(|k| !k.trim().is_empty())
 }
 
 /// Is the pin on this machine one the dashboard cannot cut? `None` when there is no pin.
@@ -1855,7 +1862,11 @@ mod tests {
         let said = "Đường này đã đổi, và câu này là của máy chủ.";
         let f = refusal(409, &format!(r#"{{"error":"{said}"}}"#));
         assert!(f.message.contains(said), "{}", f.message);
-        assert!(!f.message.contains("20"), "no invented number: {}", f.message);
+        assert!(
+            !f.message.contains("20"),
+            "no invented number: {}",
+            f.message
+        );
     }
 
     /// A refusal with no words left is the one case where a client may speak: it says the number

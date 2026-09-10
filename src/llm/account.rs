@@ -236,7 +236,11 @@ async fn send(rb: reqwest::RequestBuilder) -> Result<Value, AuthError> {
     Ok(json)
 }
 
-async fn authed(method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, AuthError> {
+async fn authed(
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, AuthError> {
     let token = token().ok_or(AuthError::NotSignedIn)?;
     let url = format!("{}{}", web_url(), path);
     let mut rb = client()?.request(method, &url).bearer_auth(&token);
@@ -665,7 +669,10 @@ pub fn is_listing_id(s: &str) -> bool {
 /// `/auth/subscriptions/` as the id and strips a trailing `/confirm` from the END, rather than
 /// splitting at the first `/`. An id with a slash in it is the normal case there, not an edge one.
 pub fn encode_listing(id: &str) -> String {
-    id.split('/').map(encode_segment).collect::<Vec<_>>().join("/")
+    id.split('/')
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Encode one path segment. The unreserved set of RFC 3986 passes through untouched.
@@ -692,12 +699,21 @@ mod tests {
     fn a_listing_id_is_cut_from_the_end() {
         assert!(is_listing_id("nbz/glm-5-air"));
         assert!(is_listing_id("a/b"));
-        assert!(is_listing_id("two/slashes/here"), "a deeper namespace is legal");
-        assert!(is_listing_id("mine/gpt-4o"), "well-formed — just not a subscription");
+        assert!(
+            is_listing_id("two/slashes/here"),
+            "a deeper namespace is legal"
+        );
+        assert!(
+            is_listing_id("mine/gpt-4o"),
+            "well-formed — just not a subscription"
+        );
         assert!(!is_listing_id("no-slash"));
         assert!(!is_listing_id("/leading"));
         assert!(!is_listing_id("trailing/"));
-        assert!(!is_listing_id("a//b"), "an empty middle segment is not a namespace");
+        assert!(
+            !is_listing_id("a//b"),
+            "an empty middle segment is not a namespace"
+        );
         assert!(!is_listing_id("-starts-with-dash/x"));
         assert!(!is_listing_id("UPPER/case"));
     }

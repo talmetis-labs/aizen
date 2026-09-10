@@ -1954,7 +1954,9 @@ async fn sign_in_door(http: &reqwest::Client) -> Option<PinnedConnection> {
     match crate::cli::account_cmd::browser_login(&crate::llm::account::web_url()).await {
         Ok(session) => {
             if let Err(e) = crate::llm::account::save(&session) {
-                line_warn(&format!("signed in, but the session could not be saved: {e}"));
+                line_warn(&format!(
+                    "signed in, but the session could not be saved: {e}"
+                ));
                 return None;
             }
             line_ok(&if session.email.is_empty() {
@@ -2085,7 +2087,11 @@ async fn prompt_gateway_pin(
                 line_ok("already signed in — using the account session, which needs no key");
                 return Ok(Some(session_connection(http).await));
             }
-            if yn(theme, "Sign in with your browser instead? (no key needed)", true)? {
+            if yn(
+                theme,
+                "Sign in with your browser instead? (no key needed)",
+                true,
+            )? {
                 if let Some(conn) = sign_in_door(http).await {
                     return Ok(Some(conn));
                 }
@@ -2414,9 +2420,14 @@ fn leaving_lines(name: &str, left: &crate::llm::gateway::Left) -> Vec<String> {
         out.push("  Its gateway pin and the local credential went with it.".to_string());
     }
     if left.signed_out {
-        out.push("  The account session went too — that row's credential WAS the session, so".to_string());
+        out.push(
+            "  The account session went too — that row's credential WAS the session, so"
+                .to_string(),
+        );
         out.push("  leaving it behind would keep this machine able to spend.".to_string());
-        out.push("  The token is not revoked: it stays valid elsewhere until it expires.".to_string());
+        out.push(
+            "  The token is not revoked: it stays valid elsewhere until it expires.".to_string(),
+        );
     }
     out
 }

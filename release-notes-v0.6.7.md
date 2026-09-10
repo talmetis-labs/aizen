@@ -98,6 +98,14 @@ Both read the one `~/.aizen/session.json`, so signing in on either side signs in
 - The **desktop window** watches the shared files and updates its account card live when
   `aizen account login` or `aizen logout` runs in a terminal beside it.
 
+### Also fixed
+
+- **Sandboxed `git` can reach `/dev/null` again on Linux.** The Landlock filesystem allow-list
+  granted only the workspace roots, so a sandboxed child opening a standard pseudo-device hit
+  `Permission denied` — `git status` opens `/dev/null` read-write and broke `git_inspect` under the
+  sandbox on Landlock kernels (Windows/macOS were fine). The Linux ruleset now also grants
+  `/dev/{null,zero,full,random,urandom,tty}`.
+
 ### Compatibility
 
 - Existing config-file setups (`base URL` + `API key`, or the `AIZEN_*` environment variables) are

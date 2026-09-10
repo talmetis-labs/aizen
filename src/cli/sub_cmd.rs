@@ -35,10 +35,10 @@
 //!     boolean it is truthy in three cases out of three;
 //!   * `price_change: "gone"` and `status: "cancelled"` are states to show plainly, not errors.
 
+use crate::cli::gate;
 use crate::cli_args::{ComboCmd, ModelCmd, PlanCmd, PluginCmd, SubCmd};
 use crate::llm::account::{self, AuthError};
 use anyhow::Result;
-use crate::cli::gate;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -77,7 +77,9 @@ pub async fn run(cmd: SubCmd) -> Result<()> {
         },
         SubCmd::Plugin { cmd } => match cmd {
             PluginCmd::Ls { json } => plugin_ls(json).await,
-            PluginCmd::Quote { slug, code, json } => plugin_quote(&slug, code.as_deref(), json).await,
+            PluginCmd::Quote { slug, code, json } => {
+                plugin_quote(&slug, code.as_deref(), json).await
+            }
             PluginCmd::Buy {
                 slug,
                 code,
@@ -152,7 +154,10 @@ fn print_json(v: &Value) -> Result<()> {
 }
 
 fn arr(data: &Value, k: &str) -> Vec<Value> {
-    data.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default()
+    data.get(k)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Own endpoints are called by prefix, and they are billed at the far end — never through here.
@@ -176,7 +181,9 @@ fn require_listing(id: &str) -> bool {
 /* ------------------------------------------------------------------ plan */
 
 async fn plan_ls(json: bool) -> Result<()> {
-    let data = account::get("/auth/plans").await.unwrap_or_else(|e| bail(e));
+    let data = account::get("/auth/plans")
+        .await
+        .unwrap_or_else(|e| bail(e));
     if json {
         return print_json(&data);
     }
@@ -221,13 +228,19 @@ async fn plan_ls(json: bool) -> Result<()> {
 
 async fn plan_buy(plan_id: &str, yes: bool, json: bool) -> Result<()> {
     // Look the plan up first — its price, karma eligibility, and whether it is already current.
-    let data = account::get("/auth/plans").await.unwrap_or_else(|e| bail(e));
+    let data = account::get("/auth/plans")
+        .await
+        .unwrap_or_else(|e| bail(e));
     let plans = arr(&data, "plans");
     let Some(plan) = plans.iter().find(|p| s(p, "id") == plan_id) else {
         eprintln!("✖ no plan '{plan_id}' — run `aizen sub plan ls`");
         std::process::exit(2);
     };
-    if plan.get("current").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if plan
+        .get("current")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         println!("You are already on '{}'.", s(plan, "name"));
         return Ok(());
     }
@@ -290,7 +303,9 @@ fn combo_price(c: &Value) -> String {
 }
 
 async fn combo_ls(json: bool) -> Result<()> {
-    let data = account::get("/auth/combos").await.unwrap_or_else(|e| bail(e));
+    let data = account::get("/auth/combos")
+        .await
+        .unwrap_or_else(|e| bail(e));
     if json {
         return print_json(&data);
     }
@@ -303,7 +318,10 @@ async fn combo_ls(json: bool) -> Result<()> {
             // `subscribed` and `usable` are different questions: a combo you have bought can still
             // be uncallable because your plan sells a different unit. Show the wall, not the sale.
             let usable = c.get("usable").and_then(|v| v.as_bool()).unwrap_or(false);
-            let subscribed = c.get("subscribed").and_then(|v| v.as_bool()).unwrap_or(false);
+            let subscribed = c
+                .get("subscribed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let mut flags = Vec::new();
             if subscribed {
                 flags.push("subscribed".to_string());
@@ -336,11 +354,9 @@ async fn combo_ls(json: bool) -> Result<()> {
     // A null plan is "no plan running", which is not the same as a plan with an empty name: it
     // means usage is paid from the wallet.
     match data.get("plan") {
-        Some(p) if !p.is_null() => eprintln!(
-            "plan: {} (sold by {})",
-            s(p, "name"),
-            s(p, "sell_unit")
-        ),
+        Some(p) if !p.is_null() => {
+            eprintln!("plan: {} (sold by {})", s(p, "name"), s(p, "sell_unit"))
+        }
         _ => eprintln!("plan: none — usage is paid from the wallet"),
     }
     wallet_line(&data);
@@ -389,7 +405,11 @@ async fn model_ls(all: bool, json: bool) -> Result<()> {
                 s(x, "listing_id"),
                 if display.is_empty() { seller } else { display },
                 s(x, "status"),
-                if change == "same" { "" } else { change.as_str() },
+                if change == "same" {
+                    ""
+                } else {
+                    change.as_str()
+                },
                 note,
             );
         }
@@ -433,7 +453,9 @@ async fn model_add(listing_id: &str, yes: bool, json: bool) -> Result<()> {
     // The plan key carries Aizen's own plans only, so a seller's listing is subscribed here and
     // still 403s through that key. Which side this id falls on is the server's to say — so say the
     // rule rather than guess the verdict from the namespace.
-    println!("  A seller's model is not callable through the plan key: put it on a key of your own");
+    println!(
+        "  A seller's model is not callable through the plan key: put it on a key of your own"
+    );
     println!("  (`aizen key ls`). The plan key carries Aizen's own plans only.");
     Ok(())
 }
@@ -454,7 +476,9 @@ async fn model_confirm(listing_id: &str, yes: bool, json: bool) -> Result<()> {
         "/auth/subscriptions/{}/confirm",
         account::encode_listing(listing_id)
     );
-    let out = account::post(&path, Value::Null).await.unwrap_or_else(|e| bail(e));
+    let out = account::post(&path, Value::Null)
+        .await
+        .unwrap_or_else(|e| bail(e));
     if json {
         return print_json(&out);
     }
@@ -470,7 +494,10 @@ async fn model_rm(listing_id: &str, yes: bool, json: bool) -> Result<()> {
     if let Some(code) = gate(&lines, yes) {
         std::process::exit(code);
     }
-    let path = format!("/auth/subscriptions/{}", account::encode_listing(listing_id));
+    let path = format!(
+        "/auth/subscriptions/{}",
+        account::encode_listing(listing_id)
+    );
     let out = account::delete(&path).await.unwrap_or_else(|e| bail(e));
     if json {
         return print_json(&out);
@@ -494,7 +521,9 @@ fn owned_state(p: &Value) -> &str {
 }
 
 async fn plugin_ls(json: bool) -> Result<()> {
-    let data = account::get("/auth/plugins").await.unwrap_or_else(|e| bail(e));
+    let data = account::get("/auth/plugins")
+        .await
+        .unwrap_or_else(|e| bail(e));
     if json {
         return print_json(&data);
     }
@@ -551,7 +580,9 @@ async fn plugin_quote(slug: &str, code: Option<&str>, json: bool) -> Result<()> 
 }
 
 async fn plugin_buy(slug: &str, code: Option<&str>, yes: bool, json: bool) -> Result<()> {
-    let data = account::get("/auth/plugins").await.unwrap_or_else(|e| bail(e));
+    let data = account::get("/auth/plugins")
+        .await
+        .unwrap_or_else(|e| bail(e));
     let plugins = arr(&data, "plugins");
     let Some(plugin) = plugins.iter().find(|p| s(p, "slug") == slug) else {
         eprintln!("✖ no plugin '{slug}' — run `aizen sub plugin ls`");
@@ -597,7 +628,8 @@ async fn plugin_buy(slug: &str, code: Option<&str>, yes: bool, json: bool) -> Re
     if s(plugin, "live_version").is_empty() {
         // Paying for something with nothing to download is a legitimate choice (backing an author),
         // but it must be a choice.
-        lines.push("⚠ No version has been released yet — there is nothing to download.".to_string());
+        lines
+            .push("⚠ No version has been released yet — there is nothing to download.".to_string());
     }
     lines.push(format!(
         "wallet: {} karma",
@@ -635,7 +667,12 @@ async fn plugin_download(slug: &str, out: Option<PathBuf>) -> Result<()> {
     .unwrap_or_else(|e| bail(e));
     let dest = out.unwrap_or_else(|| PathBuf::from(name.unwrap_or_else(|| format!("{slug}.zip"))));
     std::fs::write(&dest, &bytes)?;
-    println!("✔ Saved {} ({} bytes) → {}", slug, bytes.len(), dest.display());
+    println!(
+        "✔ Saved {} ({} bytes) → {}",
+        slug,
+        bytes.len(),
+        dest.display()
+    );
     Ok(())
 }
 
@@ -647,8 +684,14 @@ mod tests {
     /// The trap: `null` and `0` mean opposite things for a quota, and both are falsy.
     #[test]
     fn null_and_zero_are_different_answers() {
-        assert_eq!(num(&json!({ "quota_units": null }), "quota_units", "unlimited"), "unlimited");
-        assert_eq!(num(&json!({ "quota_units": 0 }), "quota_units", "unlimited"), "0");
+        assert_eq!(
+            num(&json!({ "quota_units": null }), "quota_units", "unlimited"),
+            "unlimited"
+        );
+        assert_eq!(
+            num(&json!({ "quota_units": 0 }), "quota_units", "unlimited"),
+            "0"
+        );
         assert_eq!(num(&json!({}), "quota_units", "unlimited"), "unlimited");
     }
 
@@ -693,6 +736,9 @@ mod tests {
     #[test]
     fn an_own_endpoint_is_refused_before_the_round_trip() {
         assert!(!require_listing("mine/gpt-4o"));
-        assert!(account::is_listing_id("mine/gpt-4o"), "well-formed — refused on meaning, not shape");
+        assert!(
+            account::is_listing_id("mine/gpt-4o"),
+            "well-formed — refused on meaning, not shape"
+        );
     }
 }
