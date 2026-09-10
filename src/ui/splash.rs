@@ -1,5 +1,9 @@
-//! The Aizen landing splash — a hermes-style title + a bordered panel listing the agent's tools
-//! and the CLI's commands. One cohesive moonlight-silver accent (no rainbow), rich structure.
+//! The Aizen landing splash — the block-art wordmark centred ABOVE one bordered panel that holds
+//! the body (info, tools, commands) with the braille sun mark docked INSIDE on its right flank.
+//! One cohesive moonlight-silver accent (no rainbow), rich structure. The layout is chosen
+//! against the width the pane will ACTUALLY have (the retained sidebar's columns subtracted) —
+//! the old docked layout measured the raw terminal instead, and the difference clipped the
+//! panel's right edge. A pane too narrow for the flank stacks the sun above the wordmark.
 //! Rendered once when you open the interactive menu (bare `aizen`). [`render`] builds it as a string
 //! (so the sticky TUI can print it into its scroll region); [`print`] writes that string to stdout.
 
@@ -16,6 +20,11 @@ const TITLE: [u8; 5] = [255, 253, 251, 248, 245];
 /// TUI so headers / item names / the input box all speak one colour ("the one who holds the moon").
 pub const ACCENT: u8 = crate::ui::theme::ACCENT;
 const INNER: usize = 78;
+/// Braille sun width in glyphs (`DW / 2` in [`sun_lines`]).
+const SUN_W: usize = 32;
+/// Total columns of the wide layout: frame chrome (4) + content column + gap + the sun docked on
+/// the frame's right flank.
+const WIDE_TOTAL: usize = 4 + INNER + 2 + SUN_W;
 
 /// Agent tools, grouped (mirrors `agent::builtin` — keep in sync). Conditional/dynamic tools
 /// (telegram_* when configured, mcp_<server>_<tool> from ~/.aizen/mcp.json) are not counted here.
@@ -327,66 +336,111 @@ pub(crate) fn logo_is_sixel() -> bool {
     false
 }
 
-/// Print the sun mark, centred over the wordmark: a real sixel image where supported, else braille.
-/// `allow_sixel` is false for the retained backend, whose alt-screen renderer can't pass a raw DCS
-/// image through — there we always take the braille path so the intro is pure printable text.
-fn push_sun(out: &mut String, allow_sixel: bool) {
+/// Print the sun mark: a real sixel image where supported, else the braille rows centred over
+/// `width`. `allow_sixel` is false for the retained backend, whose alt-screen renderer can't pass
+/// a raw DCS image through — there we always take the braille path so the intro is pure printable
+/// text.
+fn push_sun(out: &mut String, allow_sixel: bool, width: usize) {
     if allow_sixel && logo_is_sixel() {
         out.push_str("       "); // nudge the image toward the wordmark's centre
         out.push_str(&sun_sixel());
         out.push('\n');
     } else {
-        for line in sun_lines() {
-            let _ = writeln!(out, " {}", style(&line).color256(ACCENT).bold());
+        for line in sun_rows(width) {
+            let _ = writeln!(out, "{line}");
         }
     }
 }
 
-/// Append the Aizen logo: the sun mark, then the block-art wordmark (silver gradient), then the
-/// tagline. The sun + silver wordmark = the logo's noir lockup translated to the terminal.
+/// The braille sun as styled rows centred over `width` — the stacked shape the narrow landing
+/// screen and the welcome banner print verbatim (the wide landing screen instead docks the raw
+/// [`sun_lines`] inside its frame, on the right flank).
+fn sun_rows(width: usize) -> Vec<String> {
+    let ind = " ".repeat(width.saturating_sub(SUN_W) / 2);
+    sun_lines()
+        .iter()
+        .map(|l| format!("{ind}{}", style(l).color256(ACCENT).bold()))
+        .collect()
+}
+
+/// The block-art wordmark (silver gradient) + tagline as styled rows centred over `width`.
+fn wordmark_rows(word: &str, width: usize) -> Vec<String> {
+    let w = word.chars().count() * 6 - 1; // 5-col glyphs joined by 1-col gaps
+    let ind = " ".repeat(width.saturating_sub(w) / 2);
+    let mut rows: Vec<String> = (0..5)
+        .map(|row| {
+            let line: String = word
+                .chars()
+                .map(|c| glyph(c)[row])
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{ind}{}", style(line).color256(TITLE[row]).bold())
+        })
+        .collect();
+    const TAGLINE: &str = "ARTIFICIAL INTELLIGENCE AGENT";
+    let ind = " ".repeat(width.saturating_sub(TAGLINE.chars().count()) / 2);
+    rows.push(format!(
+        "{ind}{}",
+        style(TAGLINE).color256(crate::ui::theme::MUTED)
+    ));
+    rows
+}
+
+/// Append the Aizen logo for the unframed welcome banner: the sun mark above, then the centred
+/// block-art wordmark + tagline.
 fn push_title(out: &mut String, word: &str, allow_sixel: bool) {
     out.push('\n');
-    push_sun(out, allow_sixel);
+    push_sun(out, allow_sixel, INNER + 4);
     out.push('\n');
-    for row in 0..5 {
-        let line: String = word
-            .chars()
-            .map(|c| glyph(c)[row])
-            .collect::<Vec<_>>()
-            .join(" ");
-        let _ = writeln!(out, "  {}", style(line).color256(TITLE[row]).bold());
+    for r in wordmark_rows(word, INNER + 4) {
+        let _ = writeln!(out, "{r}");
     }
-    let _ = writeln!(
-        out,
-        "  {}",
-        style("ARTIFICIAL INTELLIGENCE AGENT").color256(crate::ui::theme::MUTED)
-    );
     out.push('\n');
 }
 
 // ── bordered panel ───────────────────────────────────────────────────────────
 
-fn rule(out: &mut String, left: &str, right: &str) {
+fn rule(out: &mut String, left: &str, right: &str, inner: usize) {
     // The frame sits one step quieter than the content so the panel reads as a calm moonlit border,
     // not a bright cage (the design keeps panel chrome near-invisible).
     let _ = writeln!(
         out,
         "{}",
-        style(format!("{left}{}{right}", "─".repeat(INNER + 2)))
+        style(format!("{left}{}{right}", "─".repeat(inner + 2)))
             .color256(crate::ui::theme::ACCENT_DIM)
     );
 }
 
-/// Append one boxed line, padding the (possibly styled) content to the inner width. Uses
-/// `measure_text_width` so ANSI color codes don't throw off the alignment.
-fn boxline(out: &mut String, content: &str) {
-    let pad = INNER.saturating_sub(measure_text_width(content));
+/// Border the body rows into the moonlit panel. With `sun`, the raw braille mark (32-glyph rows
+/// from [`sun_lines`]) docks INSIDE the frame on its right flank, vertically centred against the
+/// body — the text column keeps its full `INNER` width, so the panel is content wall-to-wall
+/// instead of a narrow card floating in a wide window. Content is padded ANSI-aware
+/// (`measure_text_width`) so colour codes never throw off the right border.
+fn frame(rows: &[String], sun: Option<&[String]>) -> String {
+    let extra = if sun.is_some() { 2 + SUN_W } else { 0 };
+    let mut out = String::new();
+    rule(&mut out, "╭", "╮", INNER + extra);
+    let total = rows.len().max(sun.map_or(0, |s| s.len()));
+    let off = sun.map_or(0, |s| total.saturating_sub(s.len()) / 2);
     let b = style("│").color256(crate::ui::theme::ACCENT_DIM);
-    let _ = writeln!(out, "{b} {content}{} {b}", " ".repeat(pad));
-}
-
-fn boxblank(out: &mut String) {
-    boxline(out, "");
+    for i in 0..total {
+        let row = rows.get(i).map(String::as_str).unwrap_or("");
+        let pad = " ".repeat(INNER.saturating_sub(measure_text_width(row)));
+        match sun {
+            Some(s) => {
+                let flank = match i.checked_sub(off).and_then(|j| s.get(j)) {
+                    Some(l) => style(l).color256(ACCENT).bold().to_string(),
+                    None => " ".repeat(SUN_W),
+                };
+                let _ = writeln!(out, "{b} {row}{pad}  {flank} {b}");
+            }
+            None => {
+                let _ = writeln!(out, "{b} {row}{pad} {b}");
+            }
+        }
+    }
+    rule(&mut out, "╰", "╯", INNER + extra);
+    out
 }
 
 /// Pack `sep`-separated items into as few lines as possible, each (visible) no wider than `avail`.
@@ -413,107 +467,146 @@ fn wrap_items(items: &str, sep: &str, avail: usize) -> Vec<String> {
     lines
 }
 
-/// Build the whole landing screen (title + info/tools/commands panel) as a string. The sun mark uses
-/// a sixel image where the terminal supports it (classic/plain output can pass a DCS payload through).
+/// Build the whole landing screen (centred wordmark over one panel, the sun on the panel's right
+/// flank) as a string. The sun mark uses a sixel image where the terminal supports it
+/// (classic/plain output can pass a DCS payload through); the plain path lays out against the raw
+/// terminal, which IS its pane.
 pub fn render() -> String {
-    render_inner(true)
+    let avail = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(0);
+    render_inner(true, avail)
 }
 
 /// Text-only landing screen for the RETAINED backend: its alt-screen renderer sanitizes CSI but a
 /// raw sixel DCS image would survive as garbage, so the sun is always the braille approximation and
-/// nothing DCS-bearing reaches the frame. Identical panel/body otherwise.
+/// nothing DCS-bearing reaches the frame. Laid out against the width the transcript pane WILL have
+/// once the backend takes the grid (sidebar subtracted) — measuring the raw terminal here is
+/// exactly what used to push the panel's right edge under the sidebar and clip it.
 pub fn render_text_only() -> String {
-    render_inner(false)
+    render_inner(false, crate::ui::tui::splash_width())
 }
 
-fn render_inner(allow_sixel: bool) -> String {
+fn render_inner(allow_sixel: bool, avail: usize) -> String {
     let mut out = String::new();
-    push_title(&mut out, "AIZEN", allow_sixel);
+    out.push('\n');
+    // The wordmark sits OUTSIDE the panel, centred over its full width; the braille sun docks
+    // INSIDE the panel on its right flank when `avail` can hold the wide layout. Two suns cannot
+    // take that flank: a sixel sun is a raster DCS (pixels, not columns — it cannot be merged into
+    // a character frame) and stays stacked above; and a pane below WIDE_TOTAL stacks the braille
+    // sun above the wordmark rather than letting the flank clip off the pane's right edge.
+    let sixel_sun = allow_sixel && logo_is_sixel();
+    let sun_right = !sixel_sun && avail >= WIDE_TOTAL;
+    let frame_w = if sun_right { WIDE_TOTAL } else { INNER + 4 };
+    if sixel_sun {
+        push_sun(&mut out, true, frame_w);
+        out.push('\n');
+    } else if !sun_right {
+        for line in sun_rows(frame_w) {
+            let _ = writeln!(out, "{line}");
+        }
+        out.push('\n');
+    }
+    for r in wordmark_rows("AIZEN", frame_w) {
+        let _ = writeln!(out, "{r}");
+    }
+    out.push('\n');
 
+    let sun = sun_right.then(sun_lines);
+    out.push_str(&frame(&body_rows(), sun.as_deref()));
+    out
+}
+
+/// The panel body — endpoint info, tools, commands — as plain rows ([`frame`] adds the borders).
+fn body_rows() -> Vec<String> {
     let cfg = cli_config::load();
-    let model = cfg.model.as_deref().unwrap_or("(not set)");
-    let endpoint = cfg.base_url.as_deref().unwrap_or("(not set)");
-    let key = if cfg.api_key.is_some() {
+    // What the first turn will use, not what the config file happens to hold. A machine that
+    // signed in from the desktop app has no config row at all — the session in
+    // `~/.aizen/session.json` is its endpoint and its credential — and a panel reading the file
+    // alone opened with "key: not set" in red on a machine that could call a model right then.
+    let resolved = crate::core::endpoint::resolve_endpoint(None, None, None).ok();
+    let model = resolved
+        .as_ref()
+        .map(|(_, _, m)| m.as_str())
+        .or(cfg.model.as_deref())
+        .unwrap_or("(not set)");
+    let endpoint = resolved
+        .as_ref()
+        .map(|(b, _, _)| b.as_str())
+        .or(cfg.base_url.as_deref())
+        .unwrap_or("(not set)");
+    let key = if cfg.api_key.is_some() || cli_config::branded_env("API_KEY").is_some() {
         style("configured").color256(ACCENT).to_string()
+    } else if let Some(sess) = crate::llm::account::load() {
+        // The session is the credential. Named, so the panel says whose plan this window spends.
+        let who = sess.email.trim();
+        if who.is_empty() {
+            style("signed in").color256(ACCENT).to_string()
+        } else {
+            style(format!("signed in as {who}"))
+                .color256(ACCENT)
+                .to_string()
+        }
     } else {
         style("not set").red().to_string()
     };
 
-    rule(&mut out, "╭", "╮");
-    boxline(
-        &mut out,
-        &format!(
-            "{} {}",
-            style("Aizen").color256(ACCENT).bold(),
-            style(format!(
-                "v{} · {} · {}",
-                env!("CARGO_PKG_VERSION"),
-                model,
-                endpoint
-            ))
-            .dim()
-        ),
-    );
-    boxline(&mut out, &format!("{} {key}", style("key:").dim()));
-    boxblank(&mut out);
+    let mut rows: Vec<String> = Vec::new();
+    rows.push(format!(
+        "{} {}",
+        style("Aizen").color256(ACCENT).bold(),
+        style(format!(
+            "v{} · {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            model,
+            endpoint
+        ))
+        .dim()
+    ));
+    rows.push(format!("{} {key}", style("key:").dim()));
+    rows.push(String::new());
 
-    boxline(
-        &mut out,
-        &format!(
-            "{}{}",
-            crate::ui::icons::g(crate::ui::icons::hdr_tools()),
-            style("Agent tools").color256(ACCENT).bold()
-        ),
-    );
+    rows.push(format!(
+        "{}{}",
+        crate::ui::icons::g(crate::ui::icons::hdr_tools()),
+        style("Agent tools").color256(ACCENT).bold()
+    ));
     for (label, items) in TOOL_GROUPS {
-        boxline(
-            &mut out,
-            &format!(
-                "  {}{} {}",
-                crate::ui::icons::g(crate::ui::icons::tool_group(label)),
-                style(format!("{label:<9}")).dim(),
-                style(*items).color256(ACCENT)
-            ),
-        );
+        rows.push(format!(
+            "  {}{} {}",
+            crate::ui::icons::g(crate::ui::icons::tool_group(label)),
+            style(format!("{label:<9}")).dim(),
+            style(*items).color256(ACCENT)
+        ));
     }
     #[cfg(feature = "browser")]
     for line in wrap_items(BROWSER_TOOLS, ", ", INNER.saturating_sub(14)) {
-        boxline(
-            &mut out,
-            &format!(
-                "  {}{} {}",
-                crate::ui::icons::g(crate::ui::icons::tool_group("browser")),
-                style(format!("{:<9}", "browser")).dim(),
-                style(line).color256(ACCENT)
-            ),
-        );
+        rows.push(format!(
+            "  {}{} {}",
+            crate::ui::icons::g(crate::ui::icons::tool_group("browser")),
+            style(format!("{:<9}", "browser")).dim(),
+            style(line).color256(ACCENT)
+        ));
     }
-    boxblank(&mut out);
+    rows.push(String::new());
 
-    boxline(
-        &mut out,
-        &format!(
-            "{}{}",
-            crate::ui::icons::g(crate::ui::icons::hdr_commands()),
-            style("Commands").color256(ACCENT).bold()
-        ),
-    );
+    rows.push(format!(
+        "{}{}",
+        crate::ui::icons::g(crate::ui::icons::hdr_commands()),
+        style("Commands").color256(ACCENT).bold()
+    ));
     // Indent is 2 cols → wrap to INNER-2 so styled lines never overrun the right border.
     for line in wrap_items(COMMANDS, " · ", INNER - 2) {
-        boxline(&mut out, &format!("  {}", style(line).color256(ACCENT)));
+        rows.push(format!("  {}", style(line).color256(ACCENT)));
     }
-    boxblank(&mut out);
+    rows.push(String::new());
 
-    boxline(
-        &mut out,
-        &format!(
-            "{}",
-            style(format!("{TOOL_COUNT} tools · {COMMAND_COUNT} commands · type to chat · /help · Esc/Ctrl-C to exit"))
-                .dim()
-        ),
+    rows.push(
+        style(format!("{TOOL_COUNT} tools · {COMMAND_COUNT} commands · type to chat · /help · Esc/Ctrl-C to exit"))
+            .dim()
+            .to_string(),
     );
-    rule(&mut out, "╰", "╯");
-    out
+    rows
 }
 
 /// Render the landing screen to stdout (plain line-REPL path).
@@ -526,22 +619,33 @@ pub fn print() {
 pub fn welcome() -> String {
     let mut out = String::new();
     push_title(&mut out, "AIZEN", true);
+    // Prose lines centred under the centred logo (indent computed on the PLAIN text — styling
+    // would inflate the measure).
+    let center = |text: &str| {
+        format!(
+            "{}{text}",
+            " ".repeat(INNER.saturating_sub(measure_text_width(text)) / 2)
+        )
+    };
     let _ = writeln!(
         out,
-        "  {}",
-        style("Welcome to Aizen — your agentic coding companion.")
+        "{}",
+        style(center("Welcome to Aizen — your agentic coding companion."))
             .color256(ACCENT)
             .bold()
     );
     let _ = writeln!(
         out,
-        "  {}",
-        style("One fast binary: chat · tools · automation · a memory that learns you.").dim()
+        "{}",
+        style(center(
+            "One fast binary: chat · tools · automation · a memory that learns you."
+        ))
+        .dim()
     );
     let _ = writeln!(
         out,
-        "  {}",
-        style("Let's get you connected — about 30 seconds.").dim()
+        "{}",
+        style(center("Let's get you connected — about 30 seconds.")).dim()
     );
     out
 }
@@ -657,19 +761,103 @@ mod tests {
         );
     }
 
-    /// Every bordered line must be exactly the box width — a wider one means content overran the
-    /// right border (the Commands-row overflow regression).
+    /// Every bordered line must be exactly the layout's one width — a wider row means content
+    /// overran the right border (the Commands-row overflow regression), a narrower one a broken
+    /// flank. Both layouts, deterministically: wide (sun on the right flank) and narrow (stacked).
     #[test]
     fn no_boxed_line_overflows() {
-        let expected = INNER + 4; // "│ " + INNER + " │"
-        for line in render().lines() {
-            if line.contains('│') {
-                assert_eq!(
-                    measure_text_width(line),
-                    expected,
-                    "boxed line overruns border: {line:?}"
-                );
-            }
+        for (avail, want) in [(200usize, WIDE_TOTAL), (80, INNER + 4)] {
+            let widths: Vec<usize> = render_inner(false, avail)
+                .lines()
+                .filter(|l| l.contains('│'))
+                .map(measure_text_width)
+                .collect();
+            assert!(!widths.is_empty());
+            assert!(
+                widths.iter().all(|w| *w == want),
+                "boxed rows drift at avail={avail}: {widths:?}"
+            );
         }
+    }
+
+    /// The wide layout: wordmark ABOVE the frame centred over its full width, and the braille sun
+    /// INSIDE the frame on its right flank — never past the pane's width (the "hidden text" bug —
+    /// the old docked layout sized itself against the full terminal while the retained transcript
+    /// pane is narrower once the sidebar docks; the layout now receives the pane's width).
+    #[test]
+    fn wide_layout_centres_wordmark_above_and_docks_sun_right() {
+        let out = render_inner(false, 200);
+        let plain: Vec<String> = out
+            .lines()
+            .map(|l| console::strip_ansi_codes(l).to_string())
+            .collect();
+        let top = plain
+            .iter()
+            .position(|l| l.contains('╭'))
+            .expect("top rule");
+        let bottom = plain
+            .iter()
+            .position(|l| l.contains('╰'))
+            .expect("bottom rule");
+        // Wordmark above the frame, centred over WIDE_TOTAL columns.
+        let word = plain
+            .iter()
+            .position(|l| l.contains("█████"))
+            .expect("wordmark row");
+        assert!(word < top, "wordmark must sit above the frame");
+        let tag = plain
+            .iter()
+            .position(|l| l.contains("ARTIFICIAL INTELLIGENCE AGENT"))
+            .expect("tagline row");
+        let ind = plain[tag].chars().take_while(|c| *c == ' ').count();
+        let want = (WIDE_TOTAL - 29) / 2; // tagline is 29 cols wide
+        assert!(
+            ind.abs_diff(want) <= 1,
+            "tagline off-centre: indent {ind}, want ~{want}"
+        );
+        // Braille sun: inside the borders, on the RIGHT of the text column.
+        let sun: Vec<(usize, usize)> = plain
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                l.chars()
+                    .position(|c| ('⠁'..='⣿').contains(&c))
+                    .map(|p| (i, p))
+            })
+            .collect();
+        assert!(!sun.is_empty(), "no braille sun on the wide landing screen");
+        assert!(
+            sun.iter().all(|&(i, _)| top < i && i < bottom),
+            "sun escaped the frame"
+        );
+        assert!(
+            sun.iter().all(|&(_, p)| p > INNER),
+            "sun must dock on the right flank, not in the text column"
+        );
+    }
+
+    /// A pane too narrow for the right flank stacks sun and wordmark ABOVE the frame instead of
+    /// letting the flank clip — nothing braille or block-art between the rules.
+    #[test]
+    fn narrow_layout_stacks_sun_and_wordmark_above_the_frame() {
+        let out = render_inner(false, 80);
+        let plain: Vec<String> = out
+            .lines()
+            .map(|l| console::strip_ansi_codes(l).to_string())
+            .collect();
+        let top = plain
+            .iter()
+            .position(|l| l.contains('╭'))
+            .expect("top rule");
+        let sun_last = plain
+            .iter()
+            .rposition(|l| l.chars().any(|c| ('⠁'..='⣿').contains(&c)))
+            .expect("no braille sun on the narrow landing screen");
+        let word = plain
+            .iter()
+            .position(|l| l.contains("█████"))
+            .expect("wordmark row");
+        assert!(sun_last < word, "sun stacks above the wordmark");
+        assert!(word < top, "wordmark sits above the frame");
     }
 }

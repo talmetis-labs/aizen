@@ -284,12 +284,12 @@ fn refuse_write(registry: &ToolRegistry, name: &str, args: &Value) -> Option<Str
                 list.iter()
                     .position(|t| {
                         // Judge the shape that will actually run: a task with no `role` runs as
-                        // `reviewer` (workflow_tool's default), while the task tool's own oracle
-                        // defaults to `coder` — asking it about the bare value would refuse a
-                        // dispatch that was read-only all along.
+                        // `nemesis` (workflow_tool's read-only default), while the task tool's own
+                        // oracle defaults to `daedalus` — asking it about the bare value would
+                        // refuse a dispatch that was read-only all along.
                         let mut t = t.clone();
                         if let Some(o) = t.as_object_mut() {
-                            o.entry("role").or_insert_with(|| json!("reviewer"));
+                            o.entry("role").or_insert_with(|| json!("nemesis"));
                         }
                         !task.is_concurrency_safe_for(&t)
                     })

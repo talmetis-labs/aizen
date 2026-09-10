@@ -8,7 +8,7 @@ It is the single source of truth for:
 - the **license: Apache-2.0** since 2026-08-03 — *not* PolyForm Noncommercial — and the **CLA**
   every contributor agrees to (`CLA.md`, enforced by `.github/workflows/cla.yml`; the DCO sign-off it
   replaced is gone),
-- the **two git remotes** (`origin` = private `dawnofcd/Aizen_agent`, `public` = `aizen-stack/aizen`)
+- the **two git remotes** (`origin` = private `dawnofcd/Aizen_agent`, `public` = `talmetis-labs/aizen`)
   and which slug belongs in user-facing URLs,
 - build/verify commands and the known distribution gaps.
 

@@ -12,7 +12,7 @@ code, runs your shell, verifies its own work, and remembers how *you* like thing
 
 <br/>
 
-[![Latest release](https://img.shields.io/github/v/release/aizen-stack/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/aizen-stack/aizen/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/talmetis-labs/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/talmetis-labs/aizen/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-00b894?style=for-the-badge)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-e17055?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
@@ -35,26 +35,31 @@ https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/aizen-stack/aizen/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.ps1 | iex
 ```
 
 ```bash
 # Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/aizen-stack/aizen/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.sh | sh
 ```
 
 Then open a new terminal:
 
 ```bash
-aizen config     # base URL → API key → pick a model
-aizen            # land in the REPL and start typing
+aizen account login   # on an Aizen plan? sign in — no key to fetch, nothing to paste
+aizen config          # or bring your own: base URL → API key → pick a model
+aizen                 # land in the REPL and start typing
 ```
 
 That's the whole setup. No env vars, no config file to hand-edit.
 
+An Aizen plan is bought by signing in: the session opens the gateway on its own, and nothing but the
+token is written to disk. On a machine that cannot open a browser — SSH, a container, CI — pair it
+instead with `aizen login`, which approves a short code and comes back with a key.
+
 <sub>Prefer to do it by hand? Grab a binary from the
-[latest release](https://github.com/aizen-stack/aizen/releases/latest) — or build it yourself with
-`cargo install --git https://github.com/aizen-stack/aizen`. Upgrade or roll back any time with
+[latest release](https://github.com/talmetis-labs/aizen/releases/latest) — or build it yourself with
+`cargo install --git https://github.com/talmetis-labs/aizen`. Upgrade or roll back any time with
 `aizen update`. The Windows `.exe` is unsigned, so SmartScreen will ask: *More info → Run anyway*.</sub>
 
 ## System Architecture
@@ -102,7 +107,7 @@ That's the whole setup. No env vars, no config file to hand-edit.
 
 | **Unified REPL** | One chat + agent loop, no mode switch. Live HUD: model · tokens · turn · `% context`. Markdown, tables, diagrams, image input. |
 | **Agent loop** | Parallel reads, approval-gated writes, LSP-powered symbolic edits, sub-agent dispatch, and a verify gate that must pass before "done". |
-| **Multi-agent** | `aizen workflow` fans out role-scoped sub-agents and synthesises one answer. |
+| **Multi-agent** | The Pantheon: seven capability-scoped sub-agents (`argus` finds · `metis` plans · `daedalus` builds · `nemesis` reviews · `themis` tests · `clio` researches · `mnemosyne` recalls); `aizen workflow` fans them out and synthesises one answer. |
 | **Web + browser** | Search, fetch, and a katana-style crawler — all SSRF-guarded. Opt-in CDP tools drive a real Chrome. |
 | **Extensible** | MCP servers (stdio/HTTP, OAuth 2.1), markdown slash-command macros, outbound notify channels. |
 | **Recoverable** | Git-backed checkpoints — `/timemachine` rewinds a bad turn. |

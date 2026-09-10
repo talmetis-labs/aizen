@@ -54,7 +54,7 @@ pub(crate) use crate::ui::effort_ui::*;
 use crate::ui::menus::{apps_menu, run_discord, run_telegram};
 pub(crate) use crate::ui::plain_input::read_input_box;
 pub(crate) use crate::ui::provider_ui::*;
-use crate::ui::{config_ui, icons, splash, theme, tui};
+use crate::ui::{config_ui, gateway_ui, icons, splash, theme, tui};
 
 // The `clap` type tree (every subcommand enum) lives in its own file — see `cli_args`.
 use cli_args::*;
@@ -66,6 +66,40 @@ use clap::Parser;
 use console::{style, Style};
 use dialoguer::theme::ColorfulTheme;
 use types::Message;
+
+/// The model a fresh window labels itself with: the one its first turn would use.
+///
+/// `resolve_endpoint` rather than the config's `model` field, because a machine signed in from the
+/// desktop app has no `model` in its config at all — the session supplies `auto` — and the old read
+/// put "(no model)" in the status bar of a window that was about to call one. The config is still
+/// the fallback for a window that cannot resolve anything yet, so `/config` has a label to replace.
+fn launch_model_label() -> String {
+    resolve_endpoint(None, None, None)
+        .ok()
+        .map(|(_, _, model)| model)
+        .or_else(|| cli_config::load().model)
+        .unwrap_or_else(|| "(no model)".to_string())
+}
+
+/// What the REPL says on a turn that could not resolve an endpoint.
+///
+/// `resolve_endpoint`'s own sentence, not a summary of it. It already tells "not signed in" apart
+/// from "no model" and from "the gateway ended this pairing", and the fixed "Not set up yet —
+/// /config" that stood here sent somebody whose desktop window had just signed them out to a
+/// setup screen for something only `/login` fixes. The session is one file, `~/.aizen/session.json`,
+/// shared with the desktop app, and the turn after the other side signs out is exactly where a
+/// window that is already open finds out — so that turn has to name the right door.
+///
+/// The second line maps the command-line words in that sentence to this window's slash commands.
+fn not_ready_lines(e: &anyhow::Error) -> [String; 2] {
+    [
+        style(format!("{e}")).dim().to_string(),
+        theme::muted(
+            "in this window: /login signs in · /config sets up a provider · /model picks a model",
+        )
+        .to_string(),
+    ]
+}
 
 /// Suppress Windows "hard error" dialogs process-wide (and for every child we spawn, which inherits
 /// our error mode). `SEM_FAILCRITICALERRORS` is the one that matters here: it turns the modal
@@ -149,6 +183,13 @@ async fn main() -> Result<()> {
         },
         Commands::Config { cmd } => config_ui::run_config(cmd).await,
         Commands::Auth { cmd } => config_ui::run_auth(cmd).await,
+        Commands::Login(args) => gateway_ui::login(args).await,
+        Commands::Logout(args) => gateway_ui::logout_all(args).await,
+        Commands::Gateway { cmd } => gateway_ui::run_gateway(cmd).await,
+        Commands::Account { cmd } => cli::account_cmd::run(cmd).await,
+        Commands::Sub { cmd } => cli::sub_cmd::run(cmd).await,
+        Commands::Custom { cmd } => cli::custom_cmd::run(cmd).await,
+        Commands::Key { cmd } => cli::key_cmd::run(cmd).await,
         Commands::Models(args) => run_models(args).await,
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Reach { cmd } => run_reach(cmd).await,
@@ -317,39 +358,80 @@ async fn run_menu() -> Result<()> {
 /// mockup shows them); the graphical context meter is still fed via `tui::set_ctx_permille` and the
 /// retained backend's footer tints the mode/persona chips as it draws the row.
 fn status_text(history: &[Message], model: &str) -> String {
-    let toks = session_tokens(history);
+    // The meter + token chip prefer the provider-reported size of this conversation's most recent
+    // request (recorded by the turn's chat closure) over the chars/4 estimate — the estimate only
+    // carries a fresh thread, or one whose provider never reports usage. The real number is
+    // cleared on thread switches and compaction, so it can never describe a history it no longer
+    // matches.
+    let toks = tui::ctx_real_tokens()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| session_tokens(history));
     let (window, _) = resolve_ctx_window(model);
     // Feed the graphical context meter (per-mille for sub-1% resolution); the footer draws the bar.
-    let permille = (toks as f64 / window as f64 * 1000.0)
-        .round()
-        .clamp(0.0, 1000.0) as u16;
-    tui::set_ctx_permille(permille);
+    tui::set_ctx_permille(ctx_permille(toks, window));
     // One "turn" = one user message that opened an exchange (system prompt at [0] is not a turn).
     let turns = history.iter().filter(|m| m.role == "user").count();
     let turns_chip = format!("  ·  {turns} turn{}", if turns == 1 { "" } else { "s" });
-    let tok_chip = format!("  ·  ~{}/{} tok", fmt_k(toks), fmt_k(window));
+    let tok_plain = format!("~{}/{} tok", fmt_k(toks), fmt_k(window));
+    let tok_chip = format!("  ·  {tok_plain}");
     let approval = approval_mode();
-    let mode = if cli_config::ultimate_enabled() {
-        "  ·  ✦ ultimate"
+    let mode_label = if cli_config::ultimate_enabled() {
+        "ultimate"
     } else if approval == ApprovalMode::Yolo {
-        "  ·  ⚡ yolo"
+        "yolo"
     } else if approval == ApprovalMode::Smart {
-        "  ·  ◆ smart"
+        "smart"
     } else {
         ""
     };
+    let mode = match mode_label {
+        "ultimate" => "  ·  ✦ ultimate",
+        "yolo" => "  ·  ⚡ yolo",
+        "smart" => "  ·  ◆ smart",
+        _ => "",
+    };
     // Active persona chip — so it's always visible WHICH character aizen is role-playing (not just a
     // one-off "now playing" line that scrolls away). `🎭 Name`, styled by the footer's chip pass.
-    let persona = cli_config::load()
-        .persona
-        .map(|p| format!("  ·  🎭 {p}"))
-        .unwrap_or_default();
+    let cfg = cli_config::load();
+    let persona_name = cfg.persona.clone().unwrap_or_default();
+    let persona = if persona_name.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  🎭 {persona_name}")
+    };
     let todos = crate::agent::todo::status_summary()
         .map(|s| format!("  ·  {s}"))
         .unwrap_or_default();
     let agents = crate::agent::orchestration::hud_chip()
         .map(|s| format!("  ·  {s}"))
         .unwrap_or_default();
+    // Same numbers, typed, for the retained sidebar — published from the exact spot that formats
+    // the HUD string, so the two surfaces can never drift apart. No-op on the classic path.
+    // Model/effort/mode/persona stay OFF the sidebar: the HUD row above already shows them.
+    tui::set_facts(tui::SessionFacts {
+        tokens: tok_plain,
+        turns,
+        session: crate::core::session_store::current_session_slug().unwrap_or_default(),
+        // Named profile when one is active; otherwise the bare endpoint host so the row still
+        // says WHERE requests go for a hand-edited base_url.
+        provider: cfg.active_provider.clone().unwrap_or_else(|| {
+            cfg.base_url
+                .as_deref()
+                .map(|u| {
+                    let no_scheme = u.split("://").nth(1).unwrap_or(u);
+                    no_scheme.split('/').next().unwrap_or(no_scheme).to_string()
+                })
+                .unwrap_or_default()
+        }),
+        mcp_servers: crate::agent::mcp::load_config()
+            .ok()
+            .flatten()
+            .map(|c| c.servers.len())
+            .unwrap_or(0),
+        lsp: crate::agent::lsp::LSP.status().chip(),
+        memory_facts: crate::memory::live_fact_count(),
+        memory_recalled: crate::memory::stats::session_counters().0 as usize,
+    });
     format!("{model}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
 }
 
@@ -500,9 +582,7 @@ pub(crate) fn fmt_time_ago(built_unix: u64) -> String {
 /// the input box stays pinned at the bottom, and Esc/Ctrl-C cancels an in-flight turn.
 async fn run_menu_sticky() -> Result<()> {
     let http = http_client()?;
-    let mut model_label = cli_config::load()
-        .model
-        .unwrap_or_else(|| "(no model)".to_string());
+    let mut model_label = launch_model_label();
     // Pin this window to the model it launched with, so another window's `/model` (which rewrites the
     // shared cli-config.json) can't retarget this one on its next turn. Skipped when no model is set
     // yet — a first-run window must still adopt whatever `/config`/`/model` configures here.
@@ -542,6 +622,11 @@ async fn run_menu_sticky() -> Result<()> {
     // and neither had any collector before.
     crate::core::recovery::sweep_expired();
     sweep_orphan_temps();
+    // Same policy for the two other self-inflicted accumulators: abandoned per-run scratch dirs
+    // (the place the prompt tells the model to put throwaway files) and sandbox private-tmp dirs
+    // whose Drop never ran. Both were previously swept only by `aizen sandbox doctor` or not at all.
+    crate::core::scratch::sweep_stale();
+    let _ = crate::sandbox::backend::guarded::sweep_stale_tmp();
     // Publish this window to the repository's session registry so the OTHER aizen windows (and the
     // one that eventually reviews and commits) can see it exists, what it is doing, and which files
     // it has changed. Best-effort: a registry failure never blocks the REPL.
@@ -689,12 +774,10 @@ async fn run_menu_sticky() -> Result<()> {
                 ));
                 let (base_url, api_key, model) = match resolve_endpoint(None, None, None) {
                     Ok(t) => t,
-                    Err(_) => {
-                        tui::emit_line(
-                            &style("Not set up yet — /config (or /model to pick a model).")
-                                .dim()
-                                .to_string(),
-                        );
+                    Err(e) => {
+                        for line in not_ready_lines(&e) {
+                            tui::emit_line(&line);
+                        }
                         continue;
                     }
                 };
@@ -958,9 +1041,7 @@ async fn run_menu_plain() -> Result<()> {
     }
 
     let http = http_client()?;
-    let mut model_label = cli_config::load()
-        .model
-        .unwrap_or_else(|| "(no model)".to_string());
+    let mut model_label = launch_model_label();
     cli_config::pin_session_model(&model_label); // see the sticky REPL: per-window model, not per-disk
     let mut history: Vec<Message> = Vec::new();
     let mut input_history: Vec<String> = Vec::new(); // recallable past prompts (↑/↓ in the box)
@@ -1046,11 +1127,10 @@ async fn run_menu_plain() -> Result<()> {
         // A normal message → the unified chat+agent loop over the running conversation.
         let (base_url, api_key, model) = match resolve_endpoint(None, None, None) {
             Ok(t) => t,
-            Err(_) => {
-                println!(
-                    "{}",
-                    style("Not set up yet — run /config (or /model to pick a model).").dim()
-                );
+            Err(e) => {
+                for line in not_ready_lines(&e) {
+                    println!("{line}");
+                }
                 continue;
             }
         };

@@ -123,10 +123,13 @@ pub(crate) fn fmt_elapsed(ms: Option<u64>) -> String {
 }
 
 /// Lay out one tool-call line under the transcript, mockup-style but result-below: the call
-/// `<icon> <name>   <target>` on its own line (icon + name in moonlight accent, target dim silver),
-/// then an indented `└ <digest> · <time>` line beneath it — the result digest tinted by state
-/// (running = faint, ok = green, err = salmon) and carrying the wall-clock run time. A still-running
-/// call (empty digest) is just the call line; the result line is added when the digest lands.
+/// `<icon> <name>   <target>` on its own line (icon + name in the tool's WORK-LANE colour under
+/// the `lanes` theme — blue read, gold edit, mauve shell, cyan web, violet memory, pink
+/// delegation/asking, teal plan — so a glance down the transcript shows what kind of work
+/// happened; the default `moonlight` theme paints them silver; target dim silver), then an
+/// indented `└ <digest> · <time>` line beneath it — the result digest tinted by state (running =
+/// faint, ok = green, err = salmon) and carrying the wall-clock run time. A still-running call
+/// (empty digest) is just the call line; the result line is added when the digest lands.
 pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
     use crate::ui::theme;
     let _ = width; // stacked layout no longer needs the frame width to right-align
@@ -135,13 +138,13 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
     } else {
         format!("{} ", t.icon)
     };
-    let name_styled = theme::accent(&t.name).to_string();
+    let name_styled = theme::lane(&t.name, &t.name).to_string();
     let call_line = if t.target.is_empty() {
-        format!("{}{}", theme::accent(&icon), name_styled)
+        format!("{}{}", theme::lane(&t.name, &icon), name_styled)
     } else {
         format!(
             "{}{}   {}",
-            theme::accent(&icon),
+            theme::lane(&t.name, &icon),
             name_styled,
             theme::accent_dim(&t.target)
         )
@@ -168,23 +171,30 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
 }
 
 /// Render the in-place plan panel as a boxed checklist: a `☑ done/total · plan` header row, then one
-/// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses. Done rows
-/// are green + dim-struck, the in-progress row is bright moonlight, pending rows are faint.
+/// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses — but in
+/// the PLAN lane's teal, so the panel reads as "progress" from across the room the same way a tool
+/// row's hue reads as its kind of work. Done rows are green + dim-struck, the in-progress row is
+/// bright moonlight, pending rows are faint.
 pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
     use crate::ui::theme;
+    // The frame tint: the plan/checkpoint lane's teal under the `lanes` theme, the quiet dim
+    // silver every box wears under `moonlight`.
+    let frame_color = if theme::lanes_enabled() {
+        theme::LANE_PLAN
+    } else {
+        theme::ACCENT_DIM
+    };
+    let frame = |s: String| console::style(s).color256(frame_color).to_string();
     let done = rows.iter().filter(|r| r.status == 2).count();
     let header = format!("☑ {done}/{} · plan", rows.len());
     // Inner width: cap so the box doesn't sprawl on a very wide pane; leave room for `│ ` + ` │`.
     let inner = width.saturating_sub(2).min(72).max(12);
     let bar = "─".repeat(inner);
     let mut out = Vec::new();
-    out.push(
-        theme::accent_dim(format!(
-            "╭─ {} ─╮",
-            pad_to(&header, inner.saturating_sub(4))
-        ))
-        .to_string(),
-    );
+    out.push(frame(format!(
+        "╭─ {} ─╮",
+        pad_to(&header, inner.saturating_sub(4))
+    )));
     for r in rows {
         let glyph = match r.status {
             2 => "✓",
@@ -209,55 +219,217 @@ pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
         let pad = inner.saturating_sub(4 + console::measure_text_width(&clipped));
         out.push(format!(
             "{} {} {}{} {}",
-            theme::accent_dim("│"),
+            frame("│".to_string()),
             g,
             styled,
             " ".repeat(pad),
-            theme::accent_dim("│")
+            frame("│".to_string())
         ));
     }
-    out.push(theme::accent_dim(format!("╰{bar}╯")).to_string());
+    out.push(frame(format!("╰{bar}╯")));
     out
 }
 
-/// Render a boxed diff preview: a `diff · <path>  +A −D` header, then the `+`/`−` lines (green /
-/// salmon) inside the same rounded frame. Lines are clipped to the inner width.
+/// One display cell of the diff panes: `(line number, kind, text)` — kind 0 = context, 1 = added,
+/// 2 = removed; number 0 = unknown (headerless hunk → blank gutter).
+type DiffCell = (usize, u8, String);
+
+/// Pair one hunk's unified rows into side-by-side rows: context appears on BOTH sides, a run of
+/// removed lines pairs positionally with the run of added lines that follows it (the GitHub /
+/// OpenCode alignment), and the unpaired remainder gets a blank cell opposite.
+fn pair_diff_rows(h: &crate::ui::tui::DiffHunk) -> Vec<(Option<DiffCell>, Option<DiffCell>)> {
+    let mut out: Vec<(Option<DiffCell>, Option<DiffCell>)> = Vec::new();
+    let (mut o, mut n) = (h.start_old, h.start_new);
+    // Removed cells waiting for an added partner; flushed unpaired at a context row / hunk end.
+    let mut pending: std::collections::VecDeque<DiffCell> = std::collections::VecDeque::new();
+    for (kind, text) in &h.rows {
+        match kind {
+            2 => {
+                pending.push_back((o, 2, text.clone()));
+                o = o.saturating_add(1);
+            }
+            1 => {
+                let left = pending.pop_front();
+                out.push((left, Some((n, 1, text.clone()))));
+                n = n.saturating_add(1);
+            }
+            _ => {
+                while let Some(c) = pending.pop_front() {
+                    out.push((Some(c), None));
+                }
+                out.push(((o, 0, text.clone()).into(), (n, 0, text.clone()).into()));
+                o = o.saturating_add(1);
+                n = n.saturating_add(1);
+            }
+        }
+    }
+    while let Some(c) = pending.pop_front() {
+        out.push((Some(c), None));
+    }
+    out
+}
+
+/// Render one pane cell to exactly `w` display columns: `NNN ± text` with the whole padded run
+/// background-tinted for a changed row, quiet faint/muted for context, plain spaces for the blank
+/// side of an unpaired row. `numw` = gutter digits (0 = no gutter).
+fn diff_cell(cell: Option<&DiffCell>, numw: usize, w: usize) -> String {
+    use crate::ui::theme;
+    let Some((num, kind, text)) = cell else {
+        return " ".repeat(w);
+    };
+    let gut = if numw > 0 {
+        if *num > 0 {
+            format!("{num:>numw$} ")
+        } else {
+            " ".repeat(numw + 1)
+        }
+    } else {
+        String::new()
+    };
+    let mark = match kind {
+        1 => '+',
+        2 => '−',
+        _ => ' ',
+    };
+    let lead = format!("{gut}{mark} ");
+    let clipped = clip_to(text, w.saturating_sub(console::measure_text_width(&lead)));
+    let pad = w
+        .saturating_sub(console::measure_text_width(&lead) + console::measure_text_width(&clipped));
+    match kind {
+        1 => theme::diff_add(format!("{lead}{clipped}{}", " ".repeat(pad))).to_string(),
+        2 => theme::diff_del(format!("{lead}{clipped}{}", " ".repeat(pad))).to_string(),
+        _ => format!(
+            "{}{}{}",
+            theme::faint(lead),
+            theme::muted(clipped),
+            " ".repeat(pad)
+        ),
+    }
+}
+
+/// Render a boxed diff preview. Wide enough, it becomes the side-by-side panes of the OpenCode /
+/// GitHub review look — old on the left, new on the right, real file line numbers in the gutters,
+/// removed rows on a deep-red tint and added rows on a deep-green one, context quiet between
+/// them. Narrow, the same rows stack as a single unified column. The header keeps the
+/// `diff · <path>  +A −D` shape with the counts in their semantic colours.
 pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     use crate::ui::theme;
-    let inner = width.saturating_sub(2).min(84).max(12);
-    let bar = "─".repeat(inner);
-    let header = format!("diff · {}   +{} −{}", d.path, d.adds, d.dels);
+    // The box takes the full width it is handed (the transcript pane): a wide terminal buys the
+    // panes real code columns. The old 100-column clamp left half the pane empty while both sides
+    // clipped code at "…".
+    let inner = width.saturating_sub(2).max(12);
     let mut out = Vec::new();
-    out.push(
-        theme::accent_dim(format!(
-            "╭─ {} ─╮",
-            pad_to(&header, inner.saturating_sub(4))
-        ))
-        .to_string(),
+
+    // ── header ──────────────────────────────────────────────────────────────
+    let counts_plain = format!("+{} −{}", d.adds, d.dels);
+    let counts_w = console::measure_text_width(&counts_plain);
+    // The header's fixed columns sum to 8: "╭─ " (3) + "  " before the counts (2) + the TWO
+    // spaces before the dash run (1 in the format string + 1 leading the run itself) + "╮" (1).
+    // With the row budgeted at `inner + 2` like every other row, that leaves label+counts+fill =
+    // inner − 6. This subtracted 5, painting every header one column wider than the box — the old
+    // 100-column clamp kept the overhang inside the pane, so nobody saw it.
+    let label = clip_to(
+        &format!("diff · {}", d.path),
+        inner.saturating_sub(6 + counts_w).max(8),
     );
-    for (is_add, content) in &d.lines {
-        let budget = inner.saturating_sub(4);
-        let clipped = clip_to(content, budget.saturating_sub(2));
-        let body = if *is_add {
-            format!("+ {clipped}")
+    let fill = inner.saturating_sub(6 + console::measure_text_width(&label) + counts_w);
+    out.push(format!(
+        "{}{}  {} {}{}",
+        theme::accent_dim("╭─ "),
+        // Under the `lanes` theme the label rides the EDIT lane's gold — the diff box is what an
+        // edit-lane tool just did, so its title matches the `file_edit` row that produced it. The
+        // frame stays quiet silver either way: a gold outline around a whole code box would shout;
+        // one gold word ties them together. Moonlight keeps the label bright silver as it was.
+        console::style(&label).color256(if theme::lanes_enabled() {
+            theme::LANE_EDIT
         } else {
-            format!("− {clipped}")
-        };
-        let pad = inner.saturating_sub(2 + console::measure_text_width(&body));
-        let styled = if *is_add {
-            theme::ok(&body).to_string()
-        } else {
-            theme::err(&body).to_string()
-        };
-        out.push(format!(
-            "{} {}{} {}",
-            theme::accent_dim("│"),
-            styled,
-            " ".repeat(pad),
-            theme::accent_dim("│")
-        ));
+            theme::ACCENT
+        }),
+        format!(
+            "{} {}",
+            theme::ok(format!("+{}", d.adds)),
+            theme::err(format!("−{}", d.dels))
+        ),
+        theme::accent_dim(format!(" {}", "─".repeat(fill))),
+        theme::accent_dim("╮"),
+    ));
+
+    // ── gutter width: digits of the last line any hunk reaches (0 = no numbers anywhere) ──
+    let mut max_line = 0usize;
+    for h in &d.hunks {
+        if h.start_old == 0 {
+            continue;
+        }
+        let dels = h.rows.iter().filter(|(k, _)| *k == 2).count();
+        let adds = h.rows.iter().filter(|(k, _)| *k == 1).count();
+        let ctx = h.rows.len() - dels - adds;
+        max_line = max_line
+            .max(h.start_old + ctx + dels)
+            .max(h.start_new + ctx + adds);
     }
-    out.push(theme::accent_dim(format!("╰{bar}╯")).to_string());
+    let numw = if max_line == 0 {
+        0
+    } else {
+        max_line.to_string().len().max(3)
+    };
+
+    // Side-by-side needs room for two readable panes; below that the rows stack unified.
+    let side_by_side = inner >= 58;
+    for (i, h) in d.hunks.iter().enumerate() {
+        if i > 0 {
+            // Between hunks: a quiet broken rule, so far-apart windows don't read as adjacent.
+            out.push(format!(
+                "{} {} {}",
+                theme::accent_dim("│"),
+                theme::faint("┄".repeat(inner.saturating_sub(2))),
+                theme::accent_dim("│")
+            ));
+        }
+        if side_by_side {
+            let pane_l = inner.saturating_sub(5) / 2;
+            let pane_r = inner.saturating_sub(5) - pane_l;
+            for (l, r) in pair_diff_rows(h) {
+                out.push(format!(
+                    "{} {} {} {} {}",
+                    theme::accent_dim("│"),
+                    diff_cell(l.as_ref(), numw, pane_l),
+                    theme::faint("│"),
+                    diff_cell(r.as_ref(), numw, pane_r),
+                    theme::accent_dim("│"),
+                ));
+            }
+        } else {
+            let (mut o, mut n) = (h.start_old, h.start_new);
+            for (kind, text) in &h.rows {
+                let num = match kind {
+                    1 => {
+                        let v = n;
+                        n = n.saturating_add(1);
+                        v
+                    }
+                    2 => {
+                        let v = o;
+                        o = o.saturating_add(1);
+                        v
+                    }
+                    _ => {
+                        let v = o;
+                        o = o.saturating_add(1);
+                        n = n.saturating_add(1);
+                        v
+                    }
+                };
+                let cell = (num, *kind, text.clone());
+                out.push(format!(
+                    "{} {} {}",
+                    theme::accent_dim("│"),
+                    diff_cell(Some(&cell), numw, inner.saturating_sub(2)),
+                    theme::accent_dim("│"),
+                ));
+            }
+        }
+    }
+    out.push(theme::accent_dim(format!("╰{}╯", "─".repeat(inner))).to_string());
     out
 }
 

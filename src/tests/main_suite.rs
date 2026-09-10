@@ -705,6 +705,58 @@ fn most_recent_session_prefers_this_project_over_a_newer_foreign_one() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The `<sessions>` block and `session_recall` are the model-visible replacement for the retired
+/// `last.json` pointer: a fresh conversation must SEE this project's recent conversations and be
+/// able to pull a digest, or "continue the most recent session" degrades to the model spelunking
+/// the filesystem for transcripts (the regression that motivated both).
+#[test]
+fn sessions_block_and_digest_surface_recent_work_to_the_model() {
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let home = std::env::temp_dir().join(format!("aizen-sess-block-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::env::set_var("AIZEN_HOME", &home);
+    set_session_slug(None);
+    std::fs::create_dir_all(sessions_dir()).unwrap();
+
+    let history = vec![
+        Message::system("lane".to_string()),
+        Message::user("please fix the composer wrapping bug".to_string()),
+        Message::assistant("done — the composer now wraps downward".to_string()),
+    ];
+    save_session(&history, "fix-composer-0821", Some("m1")).unwrap();
+
+    let block = crate::core::session_store::recent_sessions_block()
+        .expect("a non-empty pool must render a block");
+    assert!(block.starts_with("<sessions>") && block.trim_end().ends_with("</sessions>"));
+    assert!(block.contains("fix-composer-0821"), "row names the file");
+    assert!(
+        block.contains("please fix the composer"),
+        "row carries the topic snippet: {block}"
+    );
+    assert!(
+        block.contains("session_recall"),
+        "the block must say HOW to continue"
+    );
+
+    // Default digest resolves to the newest same-project conversation; both ends of the
+    // conversation appear, and the restore path is stated as the user's move.
+    let digest = crate::core::session_store::session_digest(None).unwrap();
+    assert!(digest.contains("fix-composer-0821"));
+    assert!(digest.contains("please fix the composer wrapping bug"));
+    assert!(digest.contains("wraps downward"));
+    assert!(digest.contains("/resume"));
+    // By-name works; a name that does not exist reports plainly instead of guessing.
+    assert!(crate::core::session_store::session_digest(Some("fix-composer-0821")).is_ok());
+    let err = crate::core::session_store::session_digest(Some("no-such-session"))
+        .expect_err("unknown name must error");
+    assert!(err.to_string().contains("no-such-session"));
+
+    std::env::remove_var("AIZEN_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Every saved file must carry provenance (project key/root/slug + timestamps), `created` must
 /// survive re-saves, and a pre-provenance bare-array file must still load.
 #[test]

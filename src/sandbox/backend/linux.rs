@@ -77,6 +77,7 @@ struct PathBeneathAttr {
 
 // Landlock filesystem access rights.
 const ACCESS_FS_EXECUTE: u64 = 1 << 0;
+const ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
 const ACCESS_FS_READ_FILE: u64 = 1 << 2;
 const ACCESS_FS_READ_DIR: u64 = 1 << 3;
 const ACCESS_FS_V1_MASK: u64 = (1 << 13) - 1; // execute..make_sym
@@ -321,6 +322,29 @@ fn build_ruleset(fs: &FsPolicy) -> Result<Option<OwnedFd>, String> {
             p,
             ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR,
         );
+    }
+    // The safe pseudo-devices every ordinary child assumes are just there. Landlock is default-deny,
+    // so with only the workspace roots granted a sandboxed `git` dies with "Permission denied" on a
+    // path that belongs to no workspace: `git status` opens /dev/null O_RDWR and fell over exactly
+    // there on Landlock kernels (the macOS backend already allows all of /dev, which is why only
+    // Linux saw this).
+    //
+    // These are FILES, not directories, so they get only the file-applicable rights. Handing a
+    // path-beneath rule the directory-only bits (as the workspace roots get via `handled`) makes
+    // `landlock_add_rule` return EINVAL for a non-directory — and `add` swallows that, so the grant
+    // would silently vanish and the device stay blocked. Read + write covers an O_RDWR open;
+    // ioctl-dev lets a child probe a tty. All masked by `handled`, so older ABIs just drop the bits
+    // they don't govern; absent nodes are skipped by `open_path_fd`. Portable across kernels/distros.
+    let dev_access = ACCESS_FS_READ_FILE | ACCESS_FS_WRITE_FILE | ACCESS_FS_IOCTL_DEV;
+    for dev in [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+    ] {
+        add(std::path::Path::new(dev), dev_access);
     }
     Ok(Some(ruleset))
 }

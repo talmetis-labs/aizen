@@ -127,13 +127,32 @@ pub(crate) fn block_for_tool<T>(f: impl std::future::Future<Output = Result<T>>)
     })
 }
 
+/// The deferred half of a registry's surface: tool names (registration order) and per-origin
+/// counts (first-appearance order). Published as a pair so the prompt note and the skills gate
+/// read one consistent snapshot.
+pub type DeferredSurface = (Vec<String>, Vec<(String, usize)>);
+
+/// One registry slot: the tool plus how it is surfaced to the model.
+///
+/// `deferred` tools are REGISTERED but not ADVERTISED: they execute normally when called by name,
+/// yet their schema never rides on the request. The model reaches them through `tool_search`,
+/// whose results carry the full schema in-band — so a large MCP surface costs tokens only when it
+/// is actually used, and the request's `tools` array stays byte-stable for the prefix cache.
+struct Entry {
+    tool: std::sync::Arc<dyn Tool>,
+    deferred: bool,
+    /// Where a deferred tool came from (the MCP server key) — feeds the per-server counts in the
+    /// prompt's deferred-surface note. `None` for every advertised tool.
+    origin: Option<String>,
+}
+
 /// The set of tools advertised to the model. Insertion order is the advertised order.
 /// Stored as `Arc<dyn Tool>` so a call can be moved onto a `spawn_blocking` thread (`'static`
 /// requirement) without cloning the tool itself; `register` keeps the `Box` signature so the ~40
 /// existing call sites compile unchanged.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: Vec<std::sync::Arc<dyn Tool>>,
+    tools: Vec<Entry>,
 }
 
 impl ToolRegistry {
@@ -142,42 +161,99 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(std::sync::Arc::from(tool));
+        self.tools.push(Entry {
+            tool: std::sync::Arc::from(tool),
+            deferred: false,
+            origin: None,
+        });
+    }
+
+    /// Register a tool WITHOUT advertising its schema on the request. It stays fully dispatchable
+    /// (`get`/`get_arc` find it), so a model that learned its name — from a `tool_search` result —
+    /// calls it like any other tool. `origin` labels the surface it was deferred from (server key).
+    /// Takes an `Arc` rather than a `Box` because the caller typically also hands the same handle
+    /// to the `tool_search` index.
+    pub fn register_deferred(&mut self, tool: std::sync::Arc<dyn Tool>, origin: String) {
+        self.tools.push(Entry {
+            tool,
+            deferred: true,
+            origin: Some(origin),
+        });
     }
 
     /// Look up a tool by exact name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
-            .find(|t| t.name() == name)
-            .map(|a| a.as_ref())
+            .find(|e| e.tool.name() == name)
+            .map(|e| e.tool.as_ref())
     }
 
     /// Look up a tool by exact name as an owned handle — for moving into a `spawn_blocking`
     /// closure (which needs `'static`).
     pub fn get_arc(&self, name: &str) -> Option<std::sync::Arc<dyn Tool>> {
-        self.tools.iter().find(|t| t.name() == name).cloned()
+        self.tools
+            .iter()
+            .find(|e| e.tool.name() == name)
+            .map(|e| e.tool.clone())
     }
 
-    /// The `tools` array for the chat request.
+    /// The `tools` array for the chat request — the ADVERTISED surface only. Deferred tools are
+    /// deliberately absent: their schemas travel in `tool_search` results instead, which keeps this
+    /// array (and the prefix cache built over it) byte-stable however many integrations connect.
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools
             .iter()
-            .map(|t| ToolDef::function(t.name(), t.description(), t.parameters()))
+            .filter(|e| !e.deferred)
+            .map(|e| ToolDef::function(e.tool.name(), e.tool.description(), e.tool.parameters()))
             .collect()
     }
 
-    /// The registered tool names (advertised order) — used to publish the live tool surface so the
-    /// skills index can hide skills whose `requires:` tool isn't present in this build/session.
+    /// EVERY registered tool name (advertised + deferred), in registration order — the dispatchable
+    /// surface. The skills `requires:` gate uses this: a skill whose tool is deferred still works,
+    /// because a deferred tool is callable once discovered.
     pub fn names(&self) -> Vec<String> {
-        self.tools.iter().map(|t| t.name().to_string()).collect()
+        self.tools
+            .iter()
+            .map(|e| e.tool.name().to_string())
+            .collect()
+    }
+
+    /// The ADVERTISED tool names (advertised order) — exactly the names in `defs()`, so the prompt's
+    /// routing map and the request's `tools` array can never disagree.
+    pub fn advertised_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|e| !e.deferred)
+            .map(|e| e.tool.name().to_string())
+            .collect()
+    }
+
+    /// The deferred surface: every deferred tool name (registration order) plus per-origin counts
+    /// (first-appearance order). `None` when nothing is deferred — the common case, costing nothing.
+    pub fn deferred_summary(&self) -> Option<DeferredSurface> {
+        let mut names = Vec::new();
+        let mut by_origin: Vec<(String, usize)> = Vec::new();
+        for e in self.tools.iter().filter(|e| e.deferred) {
+            names.push(e.tool.name().to_string());
+            let origin = e.origin.clone().unwrap_or_default();
+            match by_origin.iter_mut().find(|(o, _)| *o == origin) {
+                Some((_, n)) => *n += 1,
+                None => by_origin.push((origin, 1)),
+            }
+        }
+        if names.is_empty() {
+            None
+        } else {
+            Some((names, by_origin))
+        }
     }
 
     /// Every registered tool. Lets a test sweep the WHOLE surface (rather than a hand-listed
     /// sample that silently stops covering tools added later).
     #[cfg(test)]
     pub fn tools(&self) -> impl Iterator<Item = &std::sync::Arc<dyn Tool>> {
-        self.tools.iter()
+        self.tools.iter().map(|e| &e.tool)
     }
 
     /// Keep only tools for which `keep(name)` is true (Hermes `disabled_toolsets` filter).
@@ -185,7 +261,7 @@ impl ToolRegistry {
     where
         F: FnMut(&str) -> bool,
     {
-        self.tools.retain(|t| keep(t.name()));
+        self.tools.retain(|e| keep(e.tool.name()));
     }
 }
 
@@ -545,6 +621,72 @@ mod tests {
             msg.contains(r#"{"glb":"**/*.rs"}"#),
             "echoes the args: {msg}"
         );
+    }
+
+    /// A named no-op tool, for exercising the registry's advertised/deferred split.
+    struct Dummy(&'static str);
+    impl Tool for Dummy {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "a dummy tool for registry tests, long enough to be a usable description"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn execute(&self, _args: &Value) -> Result<String> {
+            Ok(format!("ran {}", self.0))
+        }
+    }
+
+    #[test]
+    fn deferred_tools_are_dispatchable_but_never_advertised() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(Dummy("visible_one")));
+        r.register_deferred(std::sync::Arc::new(Dummy("hidden_one")), "srv_a".into());
+        r.register_deferred(std::sync::Arc::new(Dummy("hidden_two")), "srv_a".into());
+        r.register_deferred(std::sync::Arc::new(Dummy("hidden_three")), "srv_b".into());
+        r.register(Box::new(Dummy("visible_two")));
+
+        // The request advertises only the non-deferred tools, in registration order.
+        let advertised: Vec<String> = r.defs().into_iter().map(|d| d.function.name).collect();
+        assert_eq!(advertised, vec!["visible_one", "visible_two"]);
+        assert_eq!(r.advertised_names(), advertised);
+
+        // But EVERY tool is dispatchable — a deferred tool called by name still runs.
+        assert_eq!(
+            r.names(),
+            vec![
+                "visible_one",
+                "hidden_one",
+                "hidden_two",
+                "hidden_three",
+                "visible_two"
+            ]
+        );
+        let hidden = r.get_arc("hidden_two").expect("deferred is dispatchable");
+        assert_eq!(hidden.execute(&json!({})).unwrap(), "ran hidden_two");
+
+        // The deferred summary carries names + per-origin counts, first-appearance order.
+        let (names, by_origin) = r.deferred_summary().expect("has deferred tools");
+        assert_eq!(names, vec!["hidden_one", "hidden_two", "hidden_three"]);
+        assert_eq!(
+            by_origin,
+            vec![("srv_a".to_string(), 2), ("srv_b".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn deferred_summary_is_none_without_deferred_tools() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(Dummy("only_visible")));
+        assert!(r.deferred_summary().is_none());
+        // And `retain` drops deferred tools like any other (the toolset filter path).
+        r.register_deferred(std::sync::Arc::new(Dummy("mcp_x_y")), "x".into());
+        r.retain(|n| !n.starts_with("mcp_"));
+        assert!(r.deferred_summary().is_none());
+        assert!(r.get("mcp_x_y").is_none());
     }
 
     /// PINS the tokio behavior `block_for_tool` depends on: `block_in_place` + `Handle::block_on`

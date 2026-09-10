@@ -374,6 +374,117 @@ fn dynamic_mcp_tools_appear_only_when_connected() {
     assert!(map.contains("`mcp_postgres_query`"));
 }
 
+// ── 5b. DEFERRED tools: out of the request, reachable through tool_search ────────────────────
+
+/// An MCP-shaped stand-in (the real wrapper needs a live connection).
+struct FakeMcp(&'static str);
+impl crate::agent::tools::Tool for FakeMcp {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "[MCP fake] Query rows from the configured database, read-only"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"sql": {"type": "string"}},
+            "required": ["sql"]
+        })
+    }
+    fn execute(&self, _args: &Value) -> anyhow::Result<String> {
+        Ok("rows".into())
+    }
+}
+
+#[test]
+fn deferred_tools_leave_the_request_but_stay_dispatchable_through_tool_search() {
+    use crate::agent::tool_search::{DeferredEntry, ToolSearch};
+    use std::sync::Arc;
+
+    // Exactly what `default_registry_in` does for a server the deferral plan marked.
+    let mut registry = coder_registry();
+    let mut entries = Vec::new();
+    for name in ["mcp_fake_query", "mcp_fake_insert"] {
+        let arc: Arc<dyn crate::agent::tools::Tool> = Arc::new(FakeMcp(name));
+        registry.register_deferred(arc.clone(), "fake".into());
+        entries.push(DeferredEntry {
+            tool: arc,
+            server: "fake".into(),
+        });
+    }
+    registry.register(Box::new(ToolSearch::new(entries)));
+
+    // The request: no deferred schema, but the discovery door is advertised.
+    let def_names: Vec<String> = registry
+        .defs()
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    assert!(!def_names.iter().any(|n| n.starts_with("mcp_fake_")));
+    assert!(def_names.iter().any(|n| n == "tool_search"));
+
+    // The prompt: the map (advertised names) routes tool_search under the MCP heading and never
+    // names a deferred tool — the note, not the map, is what mentions the deferred surface.
+    let advertised = registry.advertised_names();
+    assert_eq!(def_names, advertised, "map input == request tools, always");
+    let map = tool_routing::routing_map(&advertised).unwrap();
+    assert!(map.contains("`tool_search`"), "{map}");
+    assert!(map.contains("connected integrations"), "{map}");
+    assert!(!map.contains("mcp_fake_"), "{map}");
+
+    // Dispatch: a deferred tool called by exact name still runs (this is what makes a
+    // tool_search result actionable without ever touching the request's tools array).
+    let hidden = registry.get_arc("mcp_fake_query").expect("dispatchable");
+    assert_eq!(
+        hidden.execute(&serde_json::json!({"sql": "x"})).unwrap(),
+        "rows"
+    );
+
+    // Discovery: the search result carries the exact name + the full schema in-band.
+    let search = registry.get("tool_search").unwrap();
+    let out = search
+        .execute(&serde_json::json!({"query": "query database"}))
+        .unwrap();
+    assert!(out.contains("## mcp_fake_query"), "{out}");
+    assert!(out.contains("\"required\":[\"sql\"]"), "{out}");
+
+    // The skills gate sees the WHOLE dispatchable surface (advertised ∪ deferred)…
+    let (names, by_server) = registry.deferred_summary().expect("deferred present");
+    assert_eq!(names.len(), 2);
+    assert_eq!(by_server, vec![("fake".to_string(), 2)]);
+}
+
+#[test]
+fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferred() {
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let names = coder_registry().names();
+    let prior = builtin::swap_active_tools_for_test(Some(names));
+    let prior_deferred = builtin::swap_deferred_tools_for_test(Some((
+        vec!["mcp_gh_create_issue".into(), "mcp_gh_list_repos".into()],
+        vec![("gh".to_string(), 2)],
+    )));
+
+    let top = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
+    assert!(top.contains("# Deferred integrations"), "note present");
+    assert!(top.contains("gh (2)"), "per-server count rendered");
+    assert!(top.contains("`tool_search`"), "the note names the door");
+    assert!(
+        !top.contains("mcp_gh_create_issue"),
+        "deferred tool names stay out of the prompt — the count is the advertisement"
+    );
+
+    // No deferred surface ⇒ the note vanishes entirely (zero bytes for the common case).
+    builtin::swap_deferred_tools_for_test(None);
+    let bare = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
+    assert!(!bare.contains("# Deferred integrations"));
+
+    builtin::swap_deferred_tools_for_test(prior_deferred);
+    builtin::swap_active_tools_for_test(prior);
+}
+
 // ── 6. model-emitted calls: unknown names and bad arguments fail safely ──────────────────────
 
 /// Drive the real loop with a scripted model and hand back the messages it saw on its LAST call —

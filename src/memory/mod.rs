@@ -1727,6 +1727,25 @@ pub fn cmd_compact() -> Result<()> {
     Ok(())
 }
 
+/// Live-fact count for the retained sidebar, cached for a minute: the HUD refresh publishes facts
+/// a few times per turn, and a full store parse per publish would put hundreds of file reads on
+/// the turn path for a number that moves a handful of times a day.
+pub fn live_fact_count() -> usize {
+    use std::time::{Duration, Instant};
+    static CACHE: std::sync::Mutex<Option<(Instant, usize)>> = std::sync::Mutex::new(None);
+    let mut slot = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, n)) = *slot {
+        if at.elapsed() < Duration::from_secs(60) {
+            return n;
+        }
+    }
+    let n = store::load_all()
+        .map(|all| bloat::supersede::active(&all).len())
+        .unwrap_or(0);
+    *slot = Some((Instant::now(), n));
+    n
+}
+
 // ── reconcile (M2b) + doctor ─────────────────────────────────────────────
 
 /// Everything one batch pass needs, gathered from disk: the pairs to judge and the live pool the

@@ -9,7 +9,7 @@ security reports are taken seriously.
 
 Instead, report privately through one of:
 
-- GitHub's [private vulnerability reporting](https://github.com/aizen-stack/aizen/security/advisories/new)
+- GitHub's [private vulnerability reporting](https://github.com/talmetis-labs/aizen/security/advisories/new)
   (Security tab → Report a vulnerability), or
 - a direct private message to the maintainer.
 

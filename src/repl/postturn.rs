@@ -541,7 +541,13 @@ pub(crate) async fn compact_history(
                 .map(|t| t.content.unwrap_or_default())
         }
     };
-    agent::compact::compact_history(history, summarize, COMPACT_KEEP_TURNS).await
+    let out = agent::compact::compact_history(history, summarize, COMPACT_KEEP_TURNS).await;
+    if out.is_ok() {
+        // The recorded real context size predates the cut — let the estimate carry the meter until
+        // the next model call reports usage for the compacted history.
+        tui::clear_ctx_real_tokens();
+    }
+    out
 }
 
 /// `/compact` — resolve the endpoint, then summarize older turns now (manual compaction).

@@ -10,7 +10,8 @@
 //! Isolation invariants: the sub-agent uses a NON-streaming chat call (it runs silently; only
 //! its final text returns to the parent, which streams its own synthesis), and a `quiet` config
 //! (no nested progress trace). It inherits the parent's `--yes` (an explicit autonomy opt-in is
-//! transitive) and runs its own verify gate so a `coder` sub-agent self-checks before returning.
+//! transitive) and runs its own verify gate so a write-capable sub-agent self-checks before
+//! returning.
 //!
 //! Async-from-sync: `Tool::execute` is synchronous but `run_agent` is async. We bridge with
 //! `block_in_place` + the CURRENT runtime's `block_on` — deliberately the same runtime the
@@ -18,9 +19,9 @@
 //! BOTH executor paths: barrier calls run on a runtime worker; parallel calls run on
 //! `spawn_blocking` threads where `block_in_place` is a verified pass-through (pinned by
 //! `tools::tests::bridge_works_inside_spawn_blocking`). Parallelism policy: READ-ONLY dispatches
-//! (planner/reviewer/read-only specialists) are concurrency-safe and fan out, capped by the
-//! sub-agent gate; WRITER dispatches (coder/tester) stay serial — parallelize reads, serialize
-//! writes.
+//! (argus/metis/nemesis/clio and read-only specialists) are concurrency-safe and fan out, capped
+//! by the sub-agent gate; WRITER dispatches (daedalus/themis) stay serial — parallelize reads,
+//! serialize writes.
 
 use crate::agent::tools::Tool;
 use crate::agent::{build_system_prompt, AgentConfig};
@@ -39,8 +40,9 @@ You are a focused sub-agent dispatched to do ONE task and report back.
 - output_discipline: your FINAL message is the RETURN VALUE to the orchestrating agent — it is not shown to a human. Return the result/finding directly: no greeting, no \"I'll help\", no sign-off.
 - completeness: finish the bounded dispatched task, not just its easiest part. If the request actually contains independent subsystems, error groups, or review angles, that decomposition is the PARENT's job to fan out — do not widen this child into a whole-repository cleanup, and do not try to delegate it onward.
 - plan: for anything past a few steps, write the steps down first with whatever planning tool `# Tool routing` lists, then work them off one at a time and flip each to done as you finish it. Consult it as you go so you don't stop halfway.
-- verify: before returning, check your own work with the tools you have — read the edited region back, run the build/tests when shell is in scope. Say what you verified and what you could not.
+- verify: before returning, check your own work with the tools you have — read the edited region back, run the build/tests when shell is in scope. Never claim an edit, command, or test succeeded unless its tool output shows it. Say what you verified and what you could not.
 - scope: do only the dispatched task; do not widen it. If you are genuinely blocked, state exactly what is done, what remains, and what blocks you.
+- capability: the tools listed under # Tool routing are ALL you have. A capability you lack is a boundary of this dispatch — report the gap; never work around it through another tool.
 - workspace: file/shell ops resolve relative paths against the working directory but may reach elsewhere on disk; you cannot dispatch further sub-agents.
 - contract: if a <contract> block follows, its boundaries, expected output, and step budget are BINDING.
 </subagent>";
@@ -125,8 +127,8 @@ pub(crate) fn subagent_wall_deadline() -> Option<std::time::Instant> {
 /// top-level default (25), while the explicit argument remains capped at [`MAX_STEP_BUDGET`].
 const DEFAULT_STEP_BUDGET: usize = 25;
 
-/// Ceiling on an explicit total `max_steps`.
-const MAX_STEP_BUDGET: usize = 80;
+/// Ceiling on an explicit total `max_steps` (shared with the workflow runner's per-task budgets).
+pub(crate) const MAX_STEP_BUDGET: usize = 80;
 
 /// The dispatch CONTRACT the parent attaches to a spawn (the Anthropic multi-agent lesson:
 /// under-specified delegation is where sub-agents duplicate and drift — objective, boundaries,
@@ -216,20 +218,20 @@ impl TaskTool {
     }
 }
 
-/// A one-line role brief appended to the sub-agent system prompt. MUST stay consistent with the
-/// tool scoping in `builtin::role_registry` (read-only roles get no edit/shell tools).
+/// A one-line role brief appended to the sub-agent system prompt — from the ONE role table
+/// ([`crate::agent::roles::ROLES`]), which is also what `builtin::role_registry` scopes tools
+/// from, so brief and grants cannot drift. Unknown roles get the conservative assistant line
+/// (their registry is the read-only base).
 fn role_brief(role: &str) -> &'static str {
-    match role {
-        "coder" => "coder — implement the change. Tools: read/glob/edit files, run shell (build/test/search), memory. Read before editing; make sure your change compiles.",
-        "planner" => "planner — produce a concrete, ordered plan. READ-ONLY: read/glob files + memory; you cannot edit files or run shell.",
-        "reviewer" => "reviewer — assess correctness/security/quality and report findings with file:line. READ-ONLY: read/glob files + memory; you cannot edit or run shell.",
-        "tester" => "tester — run and analyze tests/builds, report results. Tools: read/glob files, run shell, memory; you cannot edit files.",
-        _ => "assistant — investigate and report concisely. READ-ONLY: read/glob files + memory.",
-    }
+    crate::agent::roles::canonical(role)
+        .map(|p| p.brief)
+        .unwrap_or(
+            "assistant — investigate and report concisely. READ-ONLY: read/glob files + memory.",
+        )
 }
 
 /// Build the sub-agent system prompt: the SLIM base (no persona/soul/user_memory — a focused
-/// role-worker pays no identity tax; coder/tester get `<project_context>` since build/test
+/// role-worker pays no identity tax; the build/test roles get `<project_context>` since those
 /// conventions are exactly their job) + the stable preamble + the role brief + the optional
 /// dispatch contract. Shared with the workflow fan-out.
 ///
@@ -246,7 +248,9 @@ pub(crate) fn build_subagent_prompt(
     task: Option<&str>,
 ) -> String {
     let cwd = root.display().to_string();
-    let include_ctx = matches!(role, "coder" | "tester");
+    // `<project_context>` (build/test conventions) rides with the roles whose job is building and
+    // testing — a table flag, so a new role opts in declaratively.
+    let include_ctx = crate::agent::roles::canonical(role).is_some_and(|p| p.project_context);
     let mut s = crate::agent::build_role_scoped_subagent_base_prompt(
         tools,
         &cwd,
@@ -258,7 +262,13 @@ pub(crate) fn build_subagent_prompt(
     );
     s.push('\n');
     s.push_str(SUBAGENT_PREAMBLE);
-    s.push_str(&format!("\n<role>\n{}\n</role>\n", role_brief(role)));
+    // Brief + the role's embedded working-method prompt (unknown roles carry only the generic
+    // brief — their registry is the bare read-only base and needs no method doctrine).
+    let brief = role_brief(role);
+    match crate::agent::roles::canonical(role) {
+        Some(p) => s.push_str(&format!("\n<role>\n{brief}\n\n{}</role>\n", p.prompt)),
+        None => s.push_str(&format!("\n<role>\n{brief}\n</role>\n")),
+    }
     if let Some(c) = contract {
         s.push_str(&c.render());
     }
@@ -441,8 +451,10 @@ impl TaskTool {
     }
 
     /// Resolve a dispatch from the tool args. A non-empty `agent` slug that [`crate::agents::load`]
-    /// resolves takes the SPECIALIST path; otherwise (no `agent`, or an unknown one) it falls back to
-    /// the existing `role` path unchanged.
+    /// resolves takes the SPECIALIST path; with no `agent` it takes the `role` path. An UNKNOWN
+    /// slug still falls through to the role path here (this resolver stays infallible for the
+    /// no-network probes), but `execute` refuses it up front with [`unknown_agent_error`] — see
+    /// the note at the fall-through.
     ///
     /// Precedence, highest first:
     /// ```text
@@ -458,7 +470,7 @@ impl TaskTool {
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let contract = TaskContract::from_args(args);
+        let mut contract = TaskContract::from_args(args);
         let expects = args.get("expects").filter(|v| v.is_object()).cloned();
         // The assignment, used to narrow `<skills>` to what this one job needs. A spawn pays for its
         // whole prompt with no cache to amortize it, so a broad index is cost the sub-agent's single
@@ -524,13 +536,30 @@ impl TaskTool {
                         expects: None,
                     };
                 }
-                // Unknown agent → fall through to the role path (graceful, never an error).
+                // Unknown agent → fall through to the role path. Reached only by the
+                // no-network probes (`is_concurrency_safe_for`): `execute` refuses an
+                // unresolvable slug with `unknown_agent_error` BEFORE resolving, so this
+                // fallback can classify but never actually run with substituted powers —
+                // the worst a mis-probe can do is schedule a dispatch that immediately
+                // returns its refusal string.
             }
+            // No agent and no role → the SAFE read-only default (`argus`), never a writer: a
+            // dispatch that needs to edit says so. The label is the CANONICAL name even when the
+            // caller wrote a legacy alias — the result header doubles as the deprecation nudge.
             let role = args
                 .get("role")
                 .and_then(|v| v.as_str())
-                .unwrap_or("coder")
+                .unwrap_or("argus")
                 .to_string();
+            let label = crate::agent::roles::canonical(&role)
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| role.clone());
+            // No explicit budget → the PROFILE's default answers, not a scattered constant.
+            if args.get("max_steps").is_none() {
+                if let Some(p) = crate::agent::roles::canonical(&role) {
+                    contract.max_steps = p.default_max_steps.clamp(1, MAX_STEP_BUDGET);
+                }
+            }
             let ep = self.resolve_endpoint(arg_model);
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
             let system = build_subagent_prompt(
@@ -543,7 +572,7 @@ impl TaskTool {
                 task,
             );
             Dispatch {
-                label: role,
+                label,
                 registry,
                 system,
                 model: ep.model,
@@ -556,10 +585,7 @@ impl TaskTool {
         // The output contract rides the SYSTEM prompt (an instruction, not a hope) — the harness
         // then validates the final text against it (see `validate_contract`).
         if let Some(schema) = expects {
-            d.system.push_str(&format!(
-                "\n<output_contract>\nYour FINAL message must be EXACTLY one JSON object valid \
-                 against this schema (no prose before or after, no code fences):\n{schema}\n</output_contract>\n"
-            ));
+            append_output_contract(&mut d.system, &schema);
             d.expects = Some(schema);
         }
         d
@@ -572,12 +598,13 @@ impl Tool for TaskTool {
     }
     fn description(&self) -> &str {
         "Dispatch exactly ONE bounded sub-agent (fresh context) and return its result. Use for a \
-         focused investigation or contained implementation with one clear scope. For independent \
-         angles, file groups, or error groups use `workflow` instead: read-only children fan out, while \
-         coder/tester children stay serial on the shared working tree. Do not hand one child a \
-         whole-repository cleanup. The child cannot dispatch further sub-agents. Prefer a named \
-         specialist via `agent` when one fits; otherwise choose coder (read/edit/shell), tester \
-         (shell, no edit), or planner/reviewer (read-only)."
+         focused investigation or contained implementation with one clear scope; for independent \
+         angles or file groups use `workflow` (read-only children fan out; writers stay serial — \
+         never give two children the same files). The child cannot dispatch further sub-agents. \
+         Prefer a named specialist via `agent`; otherwise pick the role: daedalus implements (the \
+         only editor), themis runs tests/builds, argus finds code, metis plans, nemesis reviews, \
+         clio researches docs/deps, mnemosyne recalls prior decisions/history — all but \
+         daedalus/themis are read-only and fan out."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -585,7 +612,7 @@ impl Tool for TaskTool {
             "properties": {
                 "prompt": {"type": "string", "description": "the complete, self-contained task for the sub-agent"},
                 "agent": {"type": "string", "description": "optional specialist slug from <agents> (e.g. \"code-reviewer\"); when set and it resolves, it supersedes role and decides the tool scope"},
-                "role": {"type": "string", "enum": ["coder", "planner", "reviewer", "tester"], "description": "generic sub-agent role (default coder); used when no agent is given (or it doesn't resolve)"},
+                "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "role when no agent is given: argus=find code · metis=plan · daedalus=implement (the only editor) · nemesis=review · themis=test (shell, no edit) · clio=web research · mnemosyne=prior decisions/history. Default argus (read-only); legacy role names accepted"},
                 "model": {"type": "string", "description": "optional model override for the sub-agent"},
                 "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
@@ -624,6 +651,33 @@ impl Tool for TaskTool {
         // Depth guard (belt-and-suspenders; the sub-registry already excludes `task`).
         if self.depth >= 1 {
             bail!("task is depth-capped at 1 — a sub-agent cannot dispatch further sub-agents");
+        }
+        // An `agent` slug that does not resolve is a SOFT error, never a silent fallback: the old
+        // fall-through landed on the role path whose default is the WRITE-CAPABLE coder scope, so
+        // a typo in a specialist name quietly traded a scoped persona for full edit/shell. The
+        // model recovers by fixing the slug or dispatching a role instead. (Checked before the
+        // slot: no reason to hold concurrency capacity for a refusal.)
+        if let Some(slug) = args
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if crate::agents::load(slug).is_none() {
+                return Ok(unknown_agent_error(slug));
+            }
+        } else if let Some(role) = args
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Same discipline for roles: an unknown value is refused with the real list, not
+            // silently run under the read-only fallback registry — the caller asked for a
+            // specific worker and would mis-attribute the result.
+            if crate::agent::roles::canonical(role).is_none() {
+                return Ok(unknown_role_error(role));
+            }
         }
         // Concurrency gate: each sub-agent is a whole model loop — cap how many run at once
         // (below the tool-level MAX_PARALLEL: N loops × N tool threads oversubscribes a CLI).
@@ -1044,8 +1098,8 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
 }
 
 impl TaskTool {
-    /// ONE bounded repair call (no tools, non-streaming): echo the validation error and the bad
-    /// reply, ask for corrected JSON. Best-effort — `None` on any failure.
+    /// ONE bounded repair call — the sync bridge over [`repair_contract_call`] for this tool's
+    /// synchronous `execute`. Best-effort — `None` on any failure.
     fn repair_contract(
         &self,
         base_url: &str,
@@ -1055,45 +1109,100 @@ impl TaskTool {
         prev: &str,
         err: &str,
     ) -> Option<String> {
-        let sys = Message::system(format!(
-            "You repair JSON output. Reply with ONLY one JSON object valid against this schema (no prose, no code fences):\n{schema}"
-        ));
-        let usr = Message::user(format!(
-            "The previous reply was not valid against the contract: {err}\n\nPrevious reply:\n{prev}\n\nReply with ONLY the corrected JSON."
-        ));
         let client = self.client.clone();
-        let base = base_url.to_string();
-        let key = api_key.to_string();
-        let model = model.to_string();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                // Same ceiling + cancel discipline as the main chat closure. This call runs AFTER
-                // `run_agent_loop` returned, where neither `cfg.deadline` (a loop-boundary check)
-                // nor the loop's own per-call timeout can reach it — and the sub-agent SLOT is
-                // still held by the caller. Unbounded, a gateway that answers 200 and then drips
-                // here reproduced the exact permanent-slot-strand `SUBAGENT_CALL_TIMEOUT` exists
-                // to prevent: the slot held for the process lifetime, every later dispatch refused.
-                let deadline = subagent_call_timeout();
-                let cancel = crate::core::cancel::current().unwrap_or_default();
-                let msgs = [sys, usr];
-                let call =
-                    crate::llm::client::chat_with_tools(&client, &base, &key, &model, &msgs, &[]);
-                match crate::core::cancel::race(&cancel, tokio::time::timeout(deadline, call)).await
-                {
-                    Some(Ok(Ok(t))) => t.content,
-                    // Timeout, API error, or cancellation — repair is best-effort by contract.
-                    _ => None,
-                }
-            })
+            tokio::runtime::Handle::current().block_on(repair_contract_call(
+                &client, base_url, api_key, model, schema, prev, err,
+            ))
         })
     }
+}
+
+/// ONE bounded repair call (no tools, non-streaming): echo the validation error and the bad
+/// reply, ask for corrected JSON. Best-effort — `None` on any failure. Shared by the `task` tool
+/// (through its sync bridge) and the workflow runner, so the two `expects` paths cannot drift.
+pub(crate) async fn repair_contract_call(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    schema: &Value,
+    prev: &str,
+    err: &str,
+) -> Option<String> {
+    let sys = Message::system(format!(
+        "You repair JSON output. Reply with ONLY one JSON object valid against this schema (no prose, no code fences):\n{schema}"
+    ));
+    let usr = Message::user(format!(
+        "The previous reply was not valid against the contract: {err}\n\nPrevious reply:\n{prev}\n\nReply with ONLY the corrected JSON."
+    ));
+    // Same ceiling + cancel discipline as the main chat closure. This call runs AFTER
+    // `run_agent_loop` returned, where neither `cfg.deadline` (a loop-boundary check)
+    // nor the loop's own per-call timeout can reach it — and the sub-agent SLOT is
+    // still held by the caller. Unbounded, a gateway that answers 200 and then drips
+    // here reproduced the exact permanent-slot-strand `SUBAGENT_CALL_TIMEOUT` exists
+    // to prevent: the slot held for the process lifetime, every later dispatch refused.
+    let deadline = subagent_call_timeout();
+    let cancel = crate::core::cancel::current().unwrap_or_default();
+    let msgs = [sys, usr];
+    let call = crate::llm::client::chat_with_tools(client, base_url, api_key, model, &msgs, &[]);
+    match crate::core::cancel::race(&cancel, tokio::time::timeout(deadline, call)).await {
+        Some(Ok(Ok(t))) => t.content,
+        // Timeout, API error, or cancellation — repair is best-effort by contract.
+        _ => None,
+    }
+}
+
+/// Append the `<output_contract>` block for an `expects` schema to a sub-agent system prompt.
+/// Shared by the `task` tool and the workflow runner — one wording, one precedence rule (the
+/// exact-JSON contract overrides the role's prose report shape).
+pub(crate) fn append_output_contract(system: &mut String, schema: &Value) {
+    system.push_str(&format!(
+        "\n<output_contract>\nYour FINAL message must be EXACTLY one JSON object valid \
+         against this schema (no prose before or after, no code fences):\n{schema}\n</output_contract>\n"
+    ));
+}
+
+/// The soft error for a dispatch naming a specialist slug that does not resolve. Shared with the
+/// workflow runner — both surfaces must refuse the same way instead of silently falling back to a
+/// generic (and possibly write-capable) role scope.
+pub(crate) fn unknown_agent_error(slug: &str) -> String {
+    const MAX_LISTED: usize = 12;
+    let installed = crate::agents::list();
+    let mut msg = format!("error: unknown agent {slug:?} — nothing was dispatched");
+    if installed.is_empty() {
+        msg.push_str(" (no specialist agents are installed)");
+    } else {
+        let names: Vec<String> = installed
+            .iter()
+            .take(MAX_LISTED)
+            .map(|d| d.slug())
+            .collect();
+        msg.push_str(&format!(". Installed: {}", names.join(", ")));
+        if installed.len() > MAX_LISTED {
+            msg.push_str(&format!(" (+{} more)", installed.len() - MAX_LISTED));
+        }
+    }
+    msg.push_str(". Use an exact slug, or drop `agent` and set `role` for a generic dispatch.");
+    msg
+}
+
+/// The soft error for an unknown built-in role name. Same contract as [`unknown_agent_error`]:
+/// refuse with the real list, never substitute a different worker.
+pub(crate) fn unknown_role_error(role: &str) -> String {
+    let names: Vec<&str> = crate::agent::roles::ROLES.iter().map(|p| p.name).collect();
+    format!(
+        "error: unknown role {role:?} — nothing was dispatched. Roles: {} (legacy \
+         coder/planner/reviewer/tester also accepted).",
+        names.join(", ")
+    )
 }
 
 /// Does a resolved sub-agent registry grant NO write-capable tool? Checked against the exact set
 /// a sub-agent scope can add (`canonical_subagent_tool`'s whole range + the role add-ons), so the
 /// parallel policy tracks the ACTUAL granted scope. The shared read-only base also carries gated
-/// OUTWARD tools (skill_install / telegram / notify) may carry approval-gated network side effects,
-/// but they do not mutate repository/workspace state and remain parallel-safe. Repository metadata
+/// OUTWARD tools (e.g. skill_install) that may have approval-gated network side effects, but they
+/// do not mutate repository/workspace state and remain parallel-safe. Repository metadata
 /// writers such as `checkpoint` are excluded from the read-only base entirely.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
     WRITERS.iter().all(|w| r.get(w).is_none())
@@ -1366,6 +1475,32 @@ mod tests {
     }
 
     #[test]
+    fn unknown_agent_slug_is_refused_not_substituted() {
+        // The old fall-through ran the dispatch under the ROLE path (default coder = full write
+        // scope). A typo'd specialist name must refuse before any network/slot, telling the model
+        // how to recover — never silently trade a scoped persona for edit/shell powers.
+        let t = tool(0);
+        let out = t
+            .execute(&serde_json::json!({"prompt": "review x", "agent": "__no_such_agent__"}))
+            .unwrap();
+        assert!(out.starts_with("error: unknown agent"), "got: {out}");
+        assert!(out.contains("nothing was dispatched"), "got: {out}");
+        assert!(out.contains("set `role`"), "recovery path named: {out}");
+    }
+
+    #[test]
+    fn unknown_role_is_refused_not_substituted() {
+        // Same discipline as an unknown agent slug: the caller asked for a specific worker, and
+        // running under the read-only fallback would mis-attribute the result.
+        let t = tool(0);
+        let out = t
+            .execute(&serde_json::json!({"prompt": "x", "role": "wizard"}))
+            .unwrap();
+        assert!(out.starts_with("error: unknown role"), "got: {out}");
+        assert!(out.contains("argus"), "the real list is named: {out}");
+    }
+
+    #[test]
     fn role_registry_scopes_tools_and_never_includes_task() {
         let root = std::env::temp_dir();
         let coder = crate::agent::builtin::role_registry("coder", &root);
@@ -1443,7 +1578,8 @@ mod tests {
         assert!(p.contains("<subagent>"), "preamble present");
         assert!(p.contains("output_discipline"));
         assert!(p.contains("cannot dispatch further sub-agents"));
-        assert!(p.contains("reviewer —"), "role brief present");
+        // The legacy name canonicalizes onto the pantheon brief, which leads with both names.
+        assert!(p.contains("nemesis (reviewer) —"), "role brief present");
         // no always-on user_memory block in a sub-agent prompt
         assert!(!p.contains("\n<user_memory>\n"));
         // SLIM: no identity costume in a role-worker prompt.
@@ -1456,18 +1592,23 @@ mod tests {
     #[test]
     fn read_only_dispatches_parallelize_writers_do_not() {
         let t = tool(0);
-        // Read-only roles → concurrency-safe (parallelize reads).
-        assert!(t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x","role":"planner"})));
-        assert!(t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x","role":"reviewer"})));
+        // Read-only roles → concurrency-safe (parallelize reads) — legacy and pantheon names.
+        for role in ["planner", "reviewer", "argus", "metis", "nemesis", "clio"] {
+            assert!(
+                t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x","role":role})),
+                "{role} fans out"
+            );
+        }
         // Writers (edit/shell in scope) → serial (serialize writes).
-        assert!(!t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x","role":"coder"})));
+        for role in ["coder", "tester", "daedalus", "themis"] {
+            assert!(
+                !t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x","role":role})),
+                "{role} stays serial"
+            );
+        }
         assert!(
-            !t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x","role":"tester"})),
-            "tester has shell"
-        );
-        assert!(
-            !t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x"})),
-            "default role is coder"
+            t.is_concurrency_safe_for(&serde_json::json!({"prompt":"x"})),
+            "the no-role default is argus — read-only, so it fans out"
         );
         // Depth 1 never parallelizes (it never runs at all — the depth guard refuses it).
         assert!(
@@ -1483,8 +1624,15 @@ mod tests {
         for (role, read_only) in [
             ("planner", true),
             ("reviewer", true),
+            ("argus", true),
+            ("metis", true),
+            ("nemesis", true),
+            ("clio", true),
+            ("mnemosyne", true),
             ("coder", false),
             ("tester", false),
+            ("daedalus", false),
+            ("themis", false),
         ] {
             let r = crate::agent::builtin::role_registry(role, &root);
             assert_eq!(dispatch_is_read_only(&r), read_only, "role {role}");
@@ -1501,8 +1649,14 @@ mod tests {
         for (role, want_gate) in [
             ("coder", true),
             ("tester", true),
+            ("daedalus", true),
+            ("themis", true),
             ("planner", false),
             ("reviewer", false),
+            ("argus", false),
+            ("metis", false),
+            ("nemesis", false),
+            ("clio", false),
         ] {
             let r = crate::agent::builtin::role_registry(role, &root);
             let sub_verify_gate = !dispatch_is_read_only(&r);
@@ -1518,6 +1672,9 @@ mod tests {
         // every destructive tool in every role registry must be a known workspace WRITER or a
         // known OUTWARD tool (side effects land outside the workspace — aizen's own stores,
         // notifications — so two of them cannot race on repository state).
+        // telegram_send/notify are no longer listed: reaching the user is the PARENT's channel,
+        // and `subagent_read_only_base` stopped registering them — a role registry that grows one
+        // back should fail this sweep loudly.
         const OUTWARD_OK: &[&str] = &[
             "memory_forget",
             "memory_save",
@@ -1525,11 +1682,9 @@ mod tests {
             "skill_refine",
             "skill_forget",
             "skill_install",
-            "notify",
-            "telegram_send",
         ];
         let root = std::env::current_dir().unwrap();
-        for role in ["planner", "reviewer", "coder", "tester"] {
+        for role in ["argus", "metis", "daedalus", "nemesis", "themis", "clio"] {
             let reg = crate::agent::builtin::role_registry(role, &root);
             for tool in reg.tools() {
                 if tool.is_destructive() {
@@ -1970,17 +2125,31 @@ mod tests {
     }
 
     #[test]
-    fn agent_registry_empty_tools_is_coder_scope() {
+    fn agent_registry_empty_tools_is_the_safe_read_only_default() {
+        // The old implicit coder scope handed a third-party persona edit/shell its author never
+        // asked for. Empty `tools:` is now READ-ONLY; write/process must be requested explicitly.
         let root = std::env::temp_dir();
         let r = crate::agent::builtin::agent_registry(&agent_def("S", &[], None, "b"), &root);
-        assert!(
-            r.get("file_edit").is_some(),
-            "empty tools → coder scope (edit)"
-        );
-        assert!(r.get("shell_run").is_some(), "coder scope (shell)");
-        assert!(r.get("skill_save").is_some());
+        assert!(r.get("file_edit").is_none(), "no implicit edit");
+        assert!(r.get("file_write").is_none(), "no implicit write");
+        assert!(r.get("shell_run").is_none(), "no implicit shell");
+        assert!(r.get("process").is_none(), "no implicit process pool");
+        assert!(r.get("skill_save").is_none(), "no implicit skill authoring");
         assert!(r.get("file_read").is_some(), "read-only base present");
+        assert!(r.get("web_search").is_some(), "specialists keep web");
         assert!(r.get("task").is_none(), "NO recursion: never grants task");
+        assert!(
+            dispatch_is_read_only(&r),
+            "the default card classifies read-only → fans out, no verify gate"
+        );
+        // The explicit path still grants — and a shell grant carries the scoped process pool.
+        let rw = crate::agent::builtin::agent_registry(
+            &agent_def("S", &["Edit", "Bash"], None, "b"),
+            &root,
+        );
+        assert!(rw.get("file_edit").is_some() && rw.get("shell_run").is_some());
+        assert!(rw.get("process").is_some(), "process rides with shell");
+        assert!(!dispatch_is_read_only(&rw));
     }
 
     #[test]
@@ -2114,8 +2283,8 @@ mod tests {
             "took the fusion specialist path"
         );
         assert!(
-            d.registry.get("file_edit").is_some(),
-            "empty tools → coder scope"
+            d.registry.get("file_edit").is_none(),
+            "empty tools → the safe read-only default (no implicit edit)"
         );
 
         // Explicit model arg beats def.model.
@@ -2124,11 +2293,13 @@ mod tests {
         );
         assert_eq!(d2.model, "arg-model");
 
-        // Unknown agent → graceful fall back to the role path (unchanged).
+        // Unknown agent → the RESOLVER still falls back to the role path (execute refuses it
+        // earlier; see `unknown_agent_slug_is_refused_not_substituted`). The label answers with
+        // the CANONICAL role name — the deprecation nudge.
         let d3 = t.resolve_dispatch(
             &serde_json::json!({"prompt": "x", "agent": "nonexistent", "role": "tester"}),
         );
-        assert_eq!(d3.label, "tester", "unknown agent falls back to role");
+        assert_eq!(d3.label, "themis", "the role path labels canonically");
         assert!(
             d3.system.contains("<role>"),
             "role path uses the role brief, not a specialist block"

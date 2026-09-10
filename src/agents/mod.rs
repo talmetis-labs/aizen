@@ -18,7 +18,7 @@
 //! description: Reviews diffs for correctness, security, and style
 //! color: blue                    # cosmetic
 //! emoji: 🔍                      # cosmetic
-//! tools: Read, Grep, Edit, Bash  # OPTIONAL — absent ⇒ default coder scope (read/edit/shell)
+//! tools: Read, Grep, Edit, Bash  # OPTIONAL — absent ⇒ READ-ONLY (write/shell must be asked for)
 //! model: claude-opus-4-8         # OPTIONAL — per-specialist model override
 //! base_url: https://api.x.ai/v1  # OPTIONAL — the gateway that model lives on (beats the registry)
 //! api_key_ref: env:XAI_KEY       # OPTIONAL — `env:VAR` ONLY; a literal key here is ignored
@@ -83,7 +83,8 @@ pub struct AgentDef {
     pub color: String,
     pub emoji: String,
     pub vibe: String,
-    /// Optional `tools:` (parsed list). EMPTY = default coder scope (read/edit/shell).
+    /// Optional `tools:` (parsed list). EMPTY = the safe read-only default (write/process
+    /// capability must be requested explicitly; see `builtin::agent_registry`).
     pub tools: Vec<String>,
     /// Optional `model:` override for the dispatched sub-agent.
     pub model: Option<String>,
@@ -413,7 +414,7 @@ pub fn render_card(def: &AgentDef) -> String {
         meta.push(format!("model:    {m}"));
     }
     let scope = if def.tools.is_empty() {
-        "(default: read/edit/shell — coder scope)".to_string()
+        "(default: read-only — add `tools: Edit, Bash` to grant write/shell)".to_string()
     } else {
         def.tools.join(", ")
     };
