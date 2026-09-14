@@ -48,16 +48,23 @@ pub(crate) fn system_prompt_bundle_in(
         model,
         Some(frozen),
     );
-    // L2 session working memory (temporary, budget-capped). Empty → no tag (zero cost).
-    let sess_budget = memory::settings().session_mem_max_tokens;
-    if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
-        bundle.dynamic.push('\n');
-        bundle.dynamic.push_str(&block);
-        bundle.dynamic.push('\n');
+    // L2 session working memory (temporary, budget-capped). It grows as the agent works — the
+    // post-turn learning pass files candidates into it — so on the REPL it rides the USER turn
+    // (`fold_context_into_query`), where the bytes are new anyway, and never the dynamic lane,
+    // which must stay byte-stable for the prefix cache. A hostbot lane has no fold step and no
+    // cached prefix to protect the same way, so it keeps the block here.
+    if root.is_some() {
+        let sess_budget = memory::settings().session_mem_max_tokens;
+        if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
+            bundle.dynamic.push('\n');
+            bundle.dynamic.push_str(&block);
+            bundle.dynamic.push('\n');
+        }
     }
     // Recent saved conversations, so "continue the most recent session" is visible to the MODEL —
     // the startup resume hint only ever reached the terminal. REPL surfaces only (`root` is None):
     // a hostbot lane carries its own per-chat history and terminal sessions would be noise there.
+    // Adopted once per conversation (see `session_store::recent_sessions_block`).
     if root.is_none() {
         if let Some(block) = crate::core::session_store::recent_sessions_block() {
             bundle.dynamic.push('\n');
@@ -71,6 +78,11 @@ pub(crate) fn system_prompt_bundle_in(
 /// the result before constructing a fresh prompt prefix. Startup, `/clear`, `/handoff`, session load,
 /// and one-shot/captured runs are the only callers that should use this path.
 pub(crate) fn refreshed_system_prompt_bundle(model: &str) -> agent::PromptBundle {
+    // Everything the dynamic lane adopts for a conversation is re-read here and nowhere else: the
+    // frozen core, the persona's self-memory, and the `<sessions>` rows. Between boundaries the
+    // lane is rebuilt from these adopted copies byte-for-byte.
+    crate::core::session_store::clear_sessions_block_cache();
+    persona::forget_adopted_self();
     let frozen = memory::refresh_frozen_core();
     system_prompt_bundle_with_core(model, &frozen)
 }
@@ -236,6 +248,13 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
         out = format!("{block}\n\n{out}");
     }
+    // L2 session working memory: the notes the learning pass filed during THIS conversation. It
+    // changes between turns, which is exactly why it rides here and not in the dynamic lane.
+    if let Some(block) =
+        memory::session_mem::process_prompt_block(memory::settings().session_mem_max_tokens)
+    {
+        out = format!("{block}\n\n{out}");
+    }
     if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
         memory::pending::open_turn(pairs);
         out = format!("{block}\n\n{out}");
@@ -268,7 +287,8 @@ pub(crate) fn strip_recall_blocks(history: &mut [Message]) {
         };
         let mut cur = content;
         loop {
-            let next = strip_skill_prefix(memory::strip_recall_prefix(cur));
+            let next =
+                strip_skill_prefix(strip_session_mem_prefix(memory::strip_recall_prefix(cur)));
             if next.len() == cur.len() {
                 break;
             }
@@ -288,6 +308,96 @@ pub(crate) fn strip_skill_prefix(content: &str) -> &str {
     match content.split_once("\n\n") {
         Some((_, rest)) => rest,
         None => content,
+    }
+}
+
+/// Peel one leading `<session_memory>` block (folded by [`fold_context_into_query`]). The tag has
+/// to open at position 0, which only our own folding produces; the block carries no blank line
+/// inside, so the first one after its closing tag is the boundary.
+pub(crate) fn strip_session_mem_prefix(content: &str) -> &str {
+    if !content.starts_with("<session_memory>\n") {
+        return content;
+    }
+    match content.split_once("</session_memory>\n\n") {
+        Some((_, rest)) => rest,
+        None => content,
+    }
+}
+
+#[cfg(test)]
+mod lane_stability_tests {
+    use super::{
+        active_system_prompt_bundle, fold_context_into_query, refreshed_system_prompt_bundle,
+        strip_recall_blocks,
+    };
+    use crate::core::session_store::{autosave_last, set_session_slug};
+    use crate::core::types::Message;
+    use crate::memory::session_mem::{
+        clear_process_session_mem, process_session_mem, SessionNoteKind,
+    };
+
+    /// The invariant every turn relies on: between two conversation boundaries the dynamic lane
+    /// is byte-identical, whatever happened in between — this conversation's own autosave (which
+    /// used to bump the `<sessions>` row for it every turn) and a note filed by the learning pass
+    /// (which used to re-render `<session_memory>` in the lane). Both now land where the bytes
+    /// are new anyway: the file is skipped, the note rides the user turn.
+    #[test]
+    fn dynamic_lane_is_byte_identical_across_an_autosave_and_a_session_note() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-lane-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        clear_process_session_mem();
+
+        let model = "m";
+        let boundary = refreshed_system_prompt_bundle(model);
+
+        // Turn 1 happens: the conversation autosaves under a fresh slug, and learning files a note.
+        let history = vec![
+            Message::system("lane".to_string()),
+            Message::user("please fix the parser".to_string()),
+            Message::assistant("done".to_string()),
+        ];
+        autosave_last(&history, Some(model));
+        process_session_mem().note(
+            "the parser lives in src/parse.rs",
+            SessionNoteKind::Candidate,
+            None,
+            8,
+        );
+
+        // Turn 2 rebuilds the lane from the adopted copies.
+        let next = active_system_prompt_bundle(model);
+        assert_eq!(boundary.stable, next.stable, "stable lane");
+        assert_eq!(
+            boundary.dynamic, next.dynamic,
+            "dynamic lane must not change within a conversation"
+        );
+        assert!(
+            !next.dynamic.contains("<session_memory>"),
+            "session notes ride the user turn, not the lane"
+        );
+
+        // …and the note reaches the model on the user turn, then leaves with the other per-turn
+        // blocks at compaction time.
+        let typed = "now add a test for it";
+        let sent = fold_context_into_query(typed);
+        assert!(
+            sent.contains("<session_memory>") && sent.contains("src/parse.rs"),
+            "{sent}"
+        );
+        assert!(sent.ends_with(&format!("\n\n{typed}")), "{sent}");
+        let mut turn = vec![Message::user(sent)];
+        strip_recall_blocks(&mut turn);
+        assert_eq!(turn[0].content.as_deref(), Some(typed));
+
+        clear_process_session_mem();
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

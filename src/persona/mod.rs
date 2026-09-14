@@ -401,7 +401,34 @@ pub fn prompt_block() -> Option<String> {
 /// the character has no self-memory yet.
 pub fn self_block() -> Option<String> {
     let slug = active_slug()?;
-    self_mem::self_block(&slug, SELF_BLOCK_MAX_TOKENS)
+    let key = (aizen_home(), slug.clone());
+    if let Ok(adopted) = ADOPTED_SELF.lock() {
+        if let Some((k, block)) = adopted.as_ref() {
+            if *k == key {
+                return block.clone();
+            }
+        }
+    }
+    let block = self_mem::self_block(&slug, SELF_BLOCK_MAX_TOKENS);
+    if let Ok(mut adopted) = ADOPTED_SELF.lock() {
+        *adopted = Some((key, block.clone()));
+    }
+    block
+}
+
+/// The `<self>` block adopted for the current conversation, keyed by (home, persona slug). The
+/// self-store is rewritten by the post-turn reflection pass, and the block sits in the dynamic
+/// system lane ahead of the whole transcript — so re-reading it every turn would bust the prefix
+/// cache each time the character learned something. Like the frozen core, it is adopted at a
+/// conversation boundary and reused byte-for-byte until the next one.
+static ADOPTED_SELF: Mutex<Option<((PathBuf, String), Option<String>)>> = Mutex::new(None);
+
+/// Drop the adopted `<self>` block so the next build re-reads the store. Called at conversation
+/// boundaries by `refreshed_system_prompt_bundle`.
+pub fn forget_adopted_self() {
+    if let Ok(mut adopted) = ADOPTED_SELF.lock() {
+        *adopted = None;
+    }
 }
 
 #[cfg(test)]
@@ -741,6 +768,13 @@ mod tests {
                 8,
             )
             .unwrap();
+            // Within a conversation the block is the adopted copy (byte-stable for the prefix
+            // cache), so new experience shows up at the next conversation boundary, not mid-way.
+            assert!(
+                self_block().is_none(),
+                "adopted copy is reused until a boundary"
+            );
+            forget_adopted_self();
             let block = self_block().expect("self block renders once there is experience");
             assert!(block.contains("force-push"));
         });
