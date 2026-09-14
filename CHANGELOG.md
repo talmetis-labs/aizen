@@ -7,6 +7,62 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+Phase 0 of the 2026-09-14 quality plan (`docs/execution-plan-2026-09-14.md`): the harness stops
+handing the model false inputs, and starts measuring what it sends.
+
+### Added
+- **Per-request usage ledger in every session file.** Each model call's input, output, cached
+  and cache-write tokens are appended to `meta.usage` on autosave (rows capped, totals exact,
+  turn-numbered, safe across `/resume` and across processes). `/cost` shows the session's cached
+  share of input plus the current turn's own hit rate, and the status line's `⛁ N% cached` chip
+  now uses the shape-corrected input as its denominator (Anthropic-style gateways report
+  `prompt_tokens` *exclusive* of the cache read, so the old figure could exceed 100 %) and shows a
+  `0%` miss once the session has ever hit — the signal that something rewrote the prefix.
+- **`aizen prompt-size --live`** — the lanes as a prompt cache sees them: every block's size, a
+  rebuild check (two consecutive builds byte-identical?), and any content that will differ on the
+  next turn (ages, message counts, clock times), with a STABLE / VOLATILE verdict.
+- **Verify gate for Go, Maven, Gradle, .NET and Python.** `go build ./...` then `go vet`,
+  `mvn -q -DskipTests compile`, `gradle -q compileJava` (through the repo's wrapper), `dotnet
+  build`, and a Python byte-compile pass. A toolchain that is not installed is "nothing ran", not
+  a failure. When nothing could run at all after an edit, the model is asked once to run the
+  project's own build or test command and quote the result before finishing, instead of reaching
+  "done" unverified in silence.
+- **Log- and report-shaped result budgets.** `shell_run` / `process` / `git_inspect` output is
+  cut to 16 k chars around the FIRST error line with a large tail (the verdict lives at the end),
+  never head-⅔/tail-⅓ — a `cargo test` with three failures reaches the model with all three.
+  `task` / `workflow` reports are cut to 24 k chars by whole `## ` sections with the omitted
+  sections named, so a reviewer's findings 4–9 are no longer the part that vanishes.
+- **`/approval <mode>` is session-scoped; `--persist` saves it.** A `/yolo` in one window used to
+  write `yolo` into the shared config and arm every other window and every cron job on the
+  machine. `/yolo` and `/smart` now toggle this window only; `/approval yolo --persist` is the
+  explicit way to change the saved default.
+
+### Fixed
+- **The dynamic prompt lane is byte-stable within a conversation**, so a warm prefix cache holds
+  across turns. `<sessions>` rows carry the file's calendar day instead of "3m ago", drop the live
+  message count, never list the conversation being autosaved, and are adopted once per
+  conversation; session working memory (rewritten by the learning pass between turns) rides the
+  user turn beside recall and skills; the persona's `<self>` block is adopted at the boundary like
+  the frozen core. `prompt-size --live` reports STABLE on this build; it reported two volatile
+  markers before.
+- **`file_read` is cut exactly once, by itself.** The loop used to re-slice a read by keywords
+  taken from the file *path* and hand the model a head + "…elided…" + keyword-window splice — text
+  that does not exist in that order, so an `old_string` copied across the seam never matched.
+  Ranged (`start`/`end`) and `number:true` reads, which bypassed the budget entirely, now get a
+  contiguous head of the requested range with a marker naming the exact `start` to continue from.
+  Relevance cuts on `search_files` / `web_fetch` keep the tool's trailing "…capped at N — narrow
+  the query" hint, which the old cut deleted.
+- **`smart` no longer auto-runs a multi-line command by its first word.** `ls\nrm -rf build` was
+  one segment whose program was `ls`; newlines are command separators now. Read-only programs
+  with writing flags ask (`find -delete`/`-exec`, `fd -x`, `sort -o`, `env CMD`, `git log
+  --output=`), `git branch`/`tag`/`remote` are read-only only in their listing shapes
+  (`git branch feature` creates, `git branch -d` deletes), `cargo fmt` only with `--check`,
+  `cargo clippy` not with `--fix`, and `npm test` / `audit` / `view` / `outdated` ask. bash's
+  `&>` redirect (`cargo build &> build.log`) is no longer misread as file blanking and blocked.
+- **`cli-config.json` is written atomically** (staged temp + rename + owner-only), with the last
+  good file kept as `cli-config.prev.json`; a crash mid-save used to leave a truncated file that
+  loaded as defaults, endpoint and key gone.
+
 ## [0.6.7] — 2026-09-11
 
 Subscriptions arrive. An Aizen plan is now sold by **signing in**, not by pasting a key: sign in

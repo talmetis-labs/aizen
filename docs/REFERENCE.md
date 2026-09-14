@@ -633,14 +633,23 @@ Behavior worth knowing:
   scratch dirs are swept automatically a week after their run ends.
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
-  choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval` is the persisted
-  three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo` pre-authorizes
-  all non-floor operations. Legacy `/smart` and `/yolo` aliases remain accepted. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
+  choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval ask|smart|yolo`
+  is the three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo`
+  pre-authorizes all non-floor operations. It applies to **this window only** unless you add
+  `--persist`, which writes it to `cli-config.json` as the default every new window, `aizen serve`
+  lane and cron job starts from — a one-off `/yolo` in one terminal no longer arms the whole
+  machine. Legacy `/smart` and `/yolo` toggles are session-scoped the same way. Non-TTY (CI/pipes) safely denies unless `--yes` is set;
   under `aizen serve` the prompt is routed to your phone. The hard `cmd_guard` floor blocks catastrophic
   commands underneath all of these.
-- **Verify gate** — after an editing run, a fast typecheck (`cargo check` / a `typecheck`
-  npm script / `npx tsc --noEmit`) runs once before the agent reports done; on failure the
-  errors are fed back for one fix turn. Skips silently for unrecognized projects.
+- **Verify gate** — after an editing run, a fast check runs before the agent reports done and
+  its errors are fed back for a fix turn: `cargo check`, a `typecheck` npm script or
+  `npx tsc --noEmit`, `go build ./...` then `go vet ./...`, `mvn -q -DskipTests compile`,
+  `gradle -q compileJava` (through the repo's wrapper when it ships one), `dotnet build`, or a
+  Python byte-compile pass (`python -m compileall`, syntax only — Python has no universal
+  typecheck). A toolchain that is not installed counts as "nothing ran", never as a failure. When
+  nothing could run at all — no recognised manifest, no toolchain — the model is asked once to
+  run the project's own build or test command and quote the result before finishing, instead of
+  reaching "done" unverified in silence.
 - **Sub-agents (the Pantheon)** — the agent can call the `task` tool to delegate a self-contained
   sub-task to a fresh role-scoped sub-agent. Seven built-in roles, each with its own tool scope
   and embedded working method: `argus` (searcher — read-only, repo-local), `metis` (planner —
