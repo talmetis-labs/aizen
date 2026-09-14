@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::core::types::{
     CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions,
-    ToolCall, ToolCallDelta, ToolDef, Usage,
+    ToolCall, ToolCallDelta, ToolDef, Usage, UsageRow,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,27 +27,65 @@ pub struct CostMeter {
     /// Prompt-cache input tokens read back this session (the prompt_cache breakpoint payoff). 0 ⇒
     /// caching off / unsupported by the provider — the `/cost` cache line only shows when > 0.
     cache_read_tokens: AtomicU64,
-    /// The MOST RECENT usage-carrying call (prompt / cached / completion) — the live cache-hit-rate
+    /// Prompt-cache WRITE tokens this session (Anthropic-style gateways bill these at a premium).
+    cache_write_tokens: AtomicU64,
+    /// Input tokens that actually went out with each request, cache reads and writes included
+    /// (`Usage::input_total`, shape-corrected) — the honest denominator for "N % cached".
+    input_tokens: AtomicU64,
+    /// The MOST RECENT usage-carrying call (input / cached / completion) — the live cache-hit-rate
     /// signal for the status line. Session totals above answer "what did this cost"; these answer
     /// "is the prompt cache warm RIGHT NOW".
-    last_prompt_tokens: AtomicU64,
+    last_input_tokens: AtomicU64,
     last_cached_tokens: AtomicU64,
     last_completion_tokens: AtomicU64,
+    /// The user turn the next recorded call belongs to. Bumped by the REPL at each user turn and
+    /// NEVER reset (see [`CostMeter::reset`]): a process-monotonic number keeps a session file's
+    /// rows ordered even when the conversation is resumed after another one in the same process.
+    turn: AtomicU64,
+    /// Sequence number of the last recorded row, process-monotonic and never reset — together with
+    /// [`process_epoch`] it is the cursor a session file keeps so a later save appends only the
+    /// rows it has not persisted yet.
+    seq: AtomicU64,
+    /// Per-call rows since the last [`CostMeter::reset`], `(seq, row)`, capped at [`USAGE_ROWS_CAP`].
+    rows: std::sync::Mutex<Vec<(u64, UsageRow)>>,
 }
+
+/// Rows the in-memory ledger keeps before dropping the oldest. A 165-call turn (the largest seen
+/// on a real machine) is 166 rows; 5,000 covers weeks of one conversation at ~50 B per row.
+pub const USAGE_ROWS_CAP: usize = 5_000;
 
 static COST_METER: CostMeter = CostMeter {
     prompt_tokens: AtomicU64::new(0),
     completion_tokens: AtomicU64::new(0),
     calls_with_usage: AtomicU64::new(0),
     cache_read_tokens: AtomicU64::new(0),
-    last_prompt_tokens: AtomicU64::new(0),
+    cache_write_tokens: AtomicU64::new(0),
+    input_tokens: AtomicU64::new(0),
+    last_input_tokens: AtomicU64::new(0),
     last_cached_tokens: AtomicU64::new(0),
     last_completion_tokens: AtomicU64::new(0),
+    turn: AtomicU64::new(0),
+    seq: AtomicU64::new(0),
+    rows: std::sync::Mutex::new(Vec::new()),
 };
 
 /// The process-global cost meter (real provider-reported tokens this session).
 pub fn cost_meter() -> &'static CostMeter {
     &COST_METER
+}
+
+/// This process's identity for the usage-ledger cursor: nanoseconds at first use. A session file
+/// records the epoch it was last written under; a different epoch means "another process wrote
+/// this", so every row the live meter holds is new to the file regardless of sequence numbers.
+pub fn process_epoch() -> u64 {
+    static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1)
+            .max(1)
+    })
 }
 
 /// Does this model name route to an Anthropic model (which honors `cache_control` and rejects
@@ -134,24 +172,54 @@ impl CostMeter {
             .fetch_add(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
         self.completion_tokens
             .fetch_add(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.cache_read_tokens
-            .fetch_add(u.cache_read(), Ordering::Relaxed);
+        let input = u.input_total();
+        let cached = u.cache_read();
+        let cache_write = u.cache_write();
+        let output = u.completion_tokens.unwrap_or(0);
+        self.cache_read_tokens.fetch_add(cached, Ordering::Relaxed);
+        self.cache_write_tokens
+            .fetch_add(cache_write, Ordering::Relaxed);
+        self.input_tokens.fetch_add(input, Ordering::Relaxed);
         self.calls_with_usage.fetch_add(1, Ordering::Relaxed);
-        self.last_prompt_tokens
-            .store(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.last_cached_tokens
-            .store(u.cache_read(), Ordering::Relaxed);
-        self.last_completion_tokens
-            .store(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.last_input_tokens.store(input, Ordering::Relaxed);
+        self.last_cached_tokens.store(cached, Ordering::Relaxed);
+        self.last_completion_tokens.store(output, Ordering::Relaxed);
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let row = UsageRow {
+            turn: self.turn.load(Ordering::Relaxed),
+            input,
+            output,
+            cached,
+            cache_write,
+        };
+        if let Ok(mut rows) = self.rows.lock() {
+            rows.push((seq, row));
+            if rows.len() > USAGE_ROWS_CAP {
+                let excess = rows.len() - USAGE_ROWS_CAP;
+                rows.drain(..excess);
+            }
+        }
     }
 
-    /// `(prompt, cached, completion)` of the most recent usage-carrying call; `None` before any.
+    /// Mark the start of a user turn: every call recorded until the next one is attributed to it.
+    pub fn begin_turn(&self) {
+        self.turn.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The turn number the next recorded call will carry (0 before the first `begin_turn`).
+    pub fn current_turn(&self) -> u64 {
+        self.turn.load(Ordering::Relaxed)
+    }
+
+    /// `(input, cached, completion)` of the most recent usage-carrying call; `None` before any.
+    /// `input` is the shape-corrected total (cache reads and writes included), so `cached * 100 /
+    /// input` is a real percentage on every provider.
     pub fn last_call(&self) -> Option<(u64, u64, u64)> {
         if self.calls_with_usage.load(Ordering::Relaxed) == 0 {
             return None;
         }
         Some((
-            self.last_prompt_tokens.load(Ordering::Relaxed),
+            self.last_input_tokens.load(Ordering::Relaxed),
             self.last_cached_tokens.load(Ordering::Relaxed),
             self.last_completion_tokens.load(Ordering::Relaxed),
         ))
@@ -168,15 +236,70 @@ impl CostMeter {
     pub fn cache_read(&self) -> u64 {
         self.cache_read_tokens.load(Ordering::Relaxed)
     }
-    /// Reset on `/clear` (a fresh conversation starts a fresh cost tally).
+    /// Prompt-cache input tokens WRITTEN this session (0 on providers that do not report writes).
+    pub fn cache_write(&self) -> u64 {
+        self.cache_write_tokens.load(Ordering::Relaxed)
+    }
+    /// Input tokens sent this session, cache reads and writes included — the denominator that
+    /// makes `cache_read() * 100 / input_total()` the session's real cache hit rate.
+    pub fn input_total(&self) -> u64 {
+        self.input_tokens.load(Ordering::Relaxed)
+    }
+
+    /// The ledger cursor `(epoch, seq)` after the most recent record — what a session file stores
+    /// so its next save can ask [`CostMeter::rows_since`] for only the rows it has not seen.
+    pub fn cursor(&self) -> (u64, u64) {
+        (process_epoch(), self.seq.load(Ordering::Relaxed))
+    }
+
+    /// Rows a session file has not persisted yet. Same epoch: the rows after `last_seq`. A
+    /// different epoch (the file was last written by another process, or never): every row the
+    /// meter holds, since none of them can be in the file.
+    pub fn rows_since(&self, epoch: u64, last_seq: u64) -> Vec<UsageRow> {
+        let same_process = epoch == process_epoch();
+        self.rows
+            .lock()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(seq, _)| !same_process || *seq > last_seq)
+                    .map(|(_, row)| row.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `(turn, calls, input, cached)` summed over the rows of the CURRENT turn; `None` when no call
+    /// of this turn reported usage. This is the "did the prefix cache hold across the turn" probe.
+    pub fn last_turn_summary(&self) -> Option<(u64, u64, u64, u64)> {
+        let turn = self.current_turn();
+        let rows = self.rows.lock().ok()?;
+        let mut calls = 0u64;
+        let mut input = 0u64;
+        let mut cached = 0u64;
+        for (_, row) in rows.iter().filter(|(_, r)| r.turn == turn) {
+            calls += 1;
+            input += row.input;
+            cached += row.cached;
+        }
+        (calls > 0).then_some((turn, calls, input, cached))
+    }
+
+    /// Reset on `/clear` (a fresh conversation starts a fresh cost tally). `turn` and `seq` are
+    /// deliberately NOT reset: both are process-monotonic cursors, and a session file resumed
+    /// after another conversation relies on them to keep its rows ordered and unduplicated.
     pub fn reset(&self) {
         self.prompt_tokens.store(0, Ordering::Relaxed);
         self.completion_tokens.store(0, Ordering::Relaxed);
         self.calls_with_usage.store(0, Ordering::Relaxed);
         self.cache_read_tokens.store(0, Ordering::Relaxed);
-        self.last_prompt_tokens.store(0, Ordering::Relaxed);
+        self.cache_write_tokens.store(0, Ordering::Relaxed);
+        self.input_tokens.store(0, Ordering::Relaxed);
+        self.last_input_tokens.store(0, Ordering::Relaxed);
         self.last_cached_tokens.store(0, Ordering::Relaxed);
         self.last_completion_tokens.store(0, Ordering::Relaxed);
+        if let Ok(mut rows) = self.rows.lock() {
+            rows.clear();
+        }
     }
 }
 
@@ -2310,6 +2433,78 @@ mod tests {
         );
         m.reset();
         assert_eq!(m.cache_read(), 0);
+    }
+
+    #[test]
+    fn cost_meter_last_call_uses_the_shape_corrected_input() {
+        // Anthropic-style: `prompt_tokens` EXCLUDES the cache read. Dividing cached by prompt
+        // would report 4000 % — the denominator must be the total that actually went out.
+        let m = CostMeter::default();
+        m.record(&Usage {
+            prompt_tokens: Some(1_000),
+            completion_tokens: Some(20),
+            cache_read_input_tokens: Some(40_000),
+            cache_creation_input_tokens: Some(500),
+            ..Default::default()
+        });
+        assert_eq!(m.last_call(), Some((41_500, 40_000, 20)));
+        assert_eq!(m.input_total(), 41_500);
+        assert_eq!(m.cache_write(), 500);
+    }
+
+    #[test]
+    fn cost_meter_ledger_rows_follow_turns_and_cursor() {
+        let m = CostMeter::default();
+        let usage = |p: u64, c: u64| Usage {
+            prompt_tokens: Some(p),
+            completion_tokens: Some(5),
+            prompt_tokens_details: Some(crate::core::types::PromptTokensDetails {
+                cached_tokens: Some(c),
+            }),
+            ..Default::default()
+        };
+        m.begin_turn();
+        m.record(&usage(1_000, 0));
+        m.record(&usage(1_200, 900));
+        m.begin_turn();
+        m.record(&usage(1_400, 1_100));
+        m.record(&Usage::default()); // all-None: not a call, not a row
+
+        let (epoch, seq) = m.cursor();
+        assert_eq!(seq, 3, "three usage-carrying calls → three rows");
+        assert_eq!(epoch, process_epoch());
+
+        let all = m.rows_since(0, 0);
+        assert_eq!(
+            all.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![1, 1, 2],
+            "rows carry the turn that was current when they were recorded"
+        );
+        assert_eq!(all[1].cached, 900);
+        assert_eq!(
+            all[1].input, 1_200,
+            "OpenAI shape: cached is a subset of prompt"
+        );
+        // A file written by THIS process at seq 2 gets only the row after it.
+        assert_eq!(m.rows_since(epoch, 2).len(), 1);
+        // A file written by ANOTHER process gets everything, whatever seq it recorded.
+        assert_eq!(m.rows_since(epoch.wrapping_add(1), 99).len(), 3);
+        // The current turn's probe sums its own rows only.
+        assert_eq!(m.last_turn_summary(), Some((2, 1, 1_400, 1_100)));
+
+        m.reset();
+        assert!(m.rows_since(0, 0).is_empty(), "reset drops the rows");
+        assert_eq!(m.last_turn_summary(), None);
+        assert_eq!(
+            m.cursor().1,
+            3,
+            "…but never the sequence: a resumed file must not re-append the same rows"
+        );
+        assert_eq!(
+            m.current_turn(),
+            2,
+            "…nor the turn counter, so row order stays monotonic"
+        );
     }
 
     #[test]

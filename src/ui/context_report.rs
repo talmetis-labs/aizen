@@ -110,13 +110,27 @@ pub(crate) fn usage_ctx_tokens(u: &Usage) -> usize {
 /// prompt + cache reads/writes, whichever wire shape — see [`usage_ctx_tokens`]). Feeds the working
 /// line's `↑N tok` chip, which describes the request, not the whole exchange.
 pub(crate) fn usage_input_tokens(u: &Usage) -> usize {
-    let p = u.prompt_tokens.unwrap_or(0);
-    let cached = u.cache_read();
-    (if cached > p {
-        p + cached + u.cache_creation_input_tokens.unwrap_or(0)
-    } else {
-        p
-    }) as usize
+    u.input_total() as usize
+}
+
+/// The status line's prompt-cache chip (`⛁ 78% cached`) for the most recent call, given that
+/// call's shape-corrected input, its cached tokens, and the session's cached total so far.
+///
+/// Silent only while the provider has never reported a cache read this session (a local server
+/// with no cache accounting would otherwise show `0%` forever). Once one call has hit, a later
+/// `0%` is exactly the signal this chip exists for: something rewrote the prefix.
+pub(crate) fn cache_label(
+    last_input: u64,
+    last_cached: u64,
+    session_cached: u64,
+) -> Option<String> {
+    if last_input == 0 || (last_cached == 0 && session_cached == 0) {
+        return None;
+    }
+    Some(format!(
+        "⛁ {}% cached",
+        (last_cached * 100 / last_input).min(100)
+    ))
 }
 
 /// Compact a token count for display: `12.4K` / `300`.
@@ -158,15 +172,43 @@ pub(crate) fn print_cost(history: &[Message], model: &str) {
                 style("set rates for a $ estimate: aizen config set --price-in <$/1M> --price-out <$/1M>").dim()
             )),
         }
-        // Prompt-cache payoff (only when the provider reported cache reads → confirms caching works).
-        let cached = client::cost_meter().cache_read();
-        if cached > 0 {
+        // Prompt-cache payoff (only when the provider reported cache traffic → confirms caching
+        // works). The share is over the shape-corrected input total, never over `prompt_tokens`,
+        // which Anthropic-style gateways report EXCLUSIVE of the cache read.
+        let meter = client::cost_meter();
+        let cached = meter.cache_read();
+        let written = meter.cache_write();
+        if cached > 0 || written > 0 {
+            let input_total = meter.input_total();
+            let pct = (cached * 100)
+                .checked_div(input_total)
+                .unwrap_or(0)
+                .min(100);
             line.push_str(&format!(
                 "  ·  {}",
-                style(format!("{} cached @ ~0.1× in", fmt_k(cached as usize))).color256(theme::OK)
+                style(format!(
+                    "⛁ {pct}% of input cached ({} read @ ~0.1×, {} written)",
+                    fmt_k(cached as usize),
+                    fmt_k(written as usize)
+                ))
+                .color256(theme::OK)
             ));
         }
         tui::emit_line(&line);
+        // The current turn on its own: "did the prefix cache hold across THIS turn's calls" is the
+        // question a sudden cost jump raises, and the session total hides it.
+        if let Some((turn, calls, input, turn_cached)) = meter.last_turn_summary() {
+            let pct = (turn_cached * 100).checked_div(input).unwrap_or(0).min(100);
+            tui::emit_line(
+                &style(format!(
+                    "   turn #{turn}: {calls} call{} · {} in · ⛁ {pct}% cached",
+                    if calls == 1 { "" } else { "s" },
+                    fmt_k(input as usize),
+                ))
+                .dim()
+                .to_string(),
+            );
+        }
     } else {
         // No real usage from the provider → fall back to the context-size estimate (not a $ figure).
         let est = session_tokens(history);
@@ -193,19 +235,29 @@ pub(crate) fn system_block_chars(system: &str) -> Vec<(&'static str, usize)> {
         ("persona", "persona"),
         ("persona memory", "self"),
         ("user memory", "user_memory"),
+        ("session memory", "session_memory"),
         ("skills index", "skills"),
+        ("sessions", "sessions"),
         ("project context", "project_context"),
         ("agents index", "agents"),
     ];
     let mut rows = Vec::new();
     let mut tagged = 0usize;
     for (label, tag) in BLOCKS {
-        let open = format!("<{tag}>");
+        // An injected block always opens at the start of a line; the base prose mentions some of
+        // these tags mid-sentence ("…injected as <environment>…"), and matching the mention would
+        // swallow the whole base into the block.
+        let open = format!("<{tag}>\n");
         let close = format!("</{tag}>");
-        if let (Some(s), Some(e)) = (system.find(&open), system.find(&close)) {
-            if e >= s {
+        let start = if system.starts_with(&open) {
+            Some(0)
+        } else {
+            system.find(&format!("\n{open}")).map(|i| i + 1)
+        };
+        if let Some(s) = start {
+            if let Some(rel) = system[s..].find(&close) {
                 // Tags are ASCII, so byte slicing lands on char boundaries.
-                let c = system[s..e + close.len()].chars().count();
+                let c = system[s..s + rel + close.len()].chars().count();
                 tagged += c;
                 rows.push((*label, c));
             }
@@ -332,6 +384,127 @@ pub(crate) fn print_context(history: &[Message], model: &str) {
     ));
 }
 
+/// Content in a prompt lane that is bound to read differently on the next turn — relative ages
+/// ("3m ago", "2 day(s) ago", "just now"), live message counts ("12 msgs"), clock times and
+/// second-precision timestamps. A prompt cache matches the prefix byte-for-byte, so one such
+/// token invalidates everything after it on every turn. Returns `(enclosing tag, snippet)` pairs
+/// in document order; the tag is `"-"` when the match is outside any `<block>`.
+pub(crate) fn volatile_markers(text: &str) -> Vec<(String, String)> {
+    static MARKERS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = MARKERS.get_or_init(|| {
+        regex::Regex::new(
+            r"(?x)
+              \b\d+\s?(?:m|h|d|min|mins|hour\(s\)|hours?|day\(s\)|days?)\s+ago\b
+            | \bjust\ now\b
+            | \b\d+\s+msgs?\b
+            | \d{4}-\d{2}-\d{2}[T\ ]\d{2}:\d{2}
+            | \b\d{1,2}:\d{2}:\d{2}\b
+            ",
+        )
+        .expect("static regex")
+    });
+    re.find_iter(text)
+        .map(|m| (enclosing_tag(text, m.start()), m.as_str().to_string()))
+        .collect()
+}
+
+/// The `<tag>` block that contains byte offset `idx`, or `"-"` outside every block.
+fn enclosing_tag(text: &str, idx: usize) -> String {
+    static OPEN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = OPEN.get_or_init(|| regex::Regex::new(r"<([a-z_]+)>").expect("static regex"));
+    let mut best = "-".to_string();
+    for cap in re.captures_iter(text) {
+        let open = cap.get(0).expect("whole match");
+        if open.start() >= idx {
+            break;
+        }
+        let name = &cap[1];
+        let close = format!("</{name}>");
+        match text[open.end()..].find(&close) {
+            Some(rel) if open.end() + rel > idx => best = name.to_string(),
+            Some(_) => {}
+            None => best = name.to_string(),
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 #[path = "../tests/context_breakdown.rs"]
 mod context_breakdown_tests;
+
+#[cfg(test)]
+mod volatile_markers_tests {
+    use super::volatile_markers;
+
+    #[test]
+    fn finds_ages_counts_and_clocks_and_names_their_block() {
+        let lane = "<user_memory>\n- prefers tabs\n</user_memory>\n<sessions>\nSaved conversations.\n\
+                    - fix-composer-0821 (12 msgs, 3m ago): \"please fix\"\n- other (2 msgs, 2 day(s) ago)\n\
+                    </sessions>\nbuilt 2026-09-14T10:22:05\n";
+        let found = volatile_markers(lane);
+        let snippets: Vec<&str> = found.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(
+            snippets,
+            vec![
+                "12 msgs",
+                "3m ago",
+                "2 msgs",
+                "2 day(s) ago",
+                "2026-09-14T10:22"
+            ]
+        );
+        assert!(found[..4].iter().all(|(tag, _)| tag == "sessions"));
+        assert_eq!(found[4].0, "-", "the timestamp sits outside every block");
+    }
+
+    #[test]
+    fn a_day_precision_date_and_plain_prose_are_stable() {
+        let lane = "<environment>\ncwd: /repo\ndate: 2026-09-14\nmodel: m\n</environment>\n\
+                    <skills>\n- rust-release: cut a release in 3 steps\n</skills>\n";
+        assert!(
+            volatile_markers(lane).is_empty(),
+            "{:?}",
+            volatile_markers(lane)
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_label_tests {
+    use super::cache_label;
+
+    #[test]
+    fn silent_until_the_provider_has_ever_reported_a_cache_read() {
+        assert_eq!(cache_label(0, 0, 0), None, "no usage at all");
+        assert_eq!(
+            cache_label(5_000, 0, 0),
+            None,
+            "a provider with no cache accounting must not show 0 % forever"
+        );
+    }
+
+    #[test]
+    fn shows_the_hit_and_then_the_miss() {
+        assert_eq!(
+            cache_label(10_000, 7_800, 7_800).as_deref(),
+            Some("⛁ 78% cached")
+        );
+        // The next call missed entirely — the session has cached before, so say so out loud:
+        // this is the "something rewrote the prefix" signal.
+        assert_eq!(
+            cache_label(10_000, 0, 7_800).as_deref(),
+            Some("⛁ 0% cached")
+        );
+    }
+
+    #[test]
+    fn never_exceeds_one_hundred_percent() {
+        // Defensive: the input is already shape-corrected, but a gateway that double-reports
+        // must not paint `4000% cached` on the status line.
+        assert_eq!(
+            cache_label(1_000, 40_000, 40_000).as_deref(),
+            Some("⛁ 100% cached")
+        );
+    }
+}

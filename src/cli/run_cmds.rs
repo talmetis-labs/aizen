@@ -15,7 +15,7 @@ use crate::core::{cli_config, session_store, types};
 use crate::features::crawl;
 use crate::llm::client;
 use crate::memory;
-use crate::ui::context_report::resolve_ctx_window;
+use crate::ui::context_report::{resolve_ctx_window, system_block_chars, volatile_markers};
 use crate::{arm_lsp_session, eager_enabled};
 use anyhow::{Context, Result};
 use console::style;
@@ -27,6 +27,7 @@ use types::Message;
 pub(crate) fn run_prompt_size(
     model: Option<String>,
     show_tools: bool,
+    live: bool,
     as_json: bool,
 ) -> Result<()> {
     let model = model
@@ -68,8 +69,34 @@ pub(crate) fn run_prompt_size(
         .collect();
     per_tool.sort_by(|a, b| b.0.cmp(&a.0));
 
+    // `--live`: the lanes as a prompt cache sees them. A second build of the same lanes must be
+    // byte-identical (else something in the build is nondeterministic), and neither lane may carry
+    // content that reads differently next turn — that is the prefix bust the HUD's `⛁ N% cached`
+    // chip later reports as a drop to the tool-schema floor.
+    let audit = live.then(|| {
+        let again = active_system_prompt_bundle(&model);
+        let stable_rows = system_block_chars(&bundle.stable);
+        let dynamic_rows = system_block_chars(&bundle.dynamic);
+        let volatile = volatile_markers(&bundle.stable)
+            .into_iter()
+            .map(|(tag, snip)| ("stable", tag, snip))
+            .chain(
+                volatile_markers(&bundle.dynamic)
+                    .into_iter()
+                    .map(|(tag, snip)| ("dynamic", tag, snip)),
+            )
+            .collect::<Vec<_>>();
+        (
+            again.stable == bundle.stable,
+            again.dynamic == bundle.dynamic,
+            stable_rows,
+            dynamic_rows,
+            volatile,
+        )
+    });
+
     if as_json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "model": model,
             "system_prompt": { "bytes": prompt, "stable_bytes": stable, "dynamic_bytes": dynamic },
             "tools": { "count": defs.len(), "json_bytes": tools_bytes },
@@ -79,6 +106,22 @@ pub(crate) fn run_prompt_size(
                 .map(|(n, name)| serde_json::json!({ "name": name, "bytes": n }))
                 .collect::<Vec<_>>(),
         });
+        if let Some((stable_same, dynamic_same, stable_rows, dynamic_rows, volatile)) = &audit {
+            let rows = |rows: &[(&str, usize)]| {
+                rows.iter()
+                    .map(|(label, chars)| serde_json::json!({ "block": label, "chars": chars }))
+                    .collect::<Vec<_>>()
+            };
+            out["live"] = serde_json::json!({
+                "rebuild_identical": { "stable": stable_same, "dynamic": dynamic_same },
+                "blocks": { "stable": rows(stable_rows), "dynamic": rows(dynamic_rows) },
+                "volatile": volatile
+                    .iter()
+                    .map(|(lane, tag, snip)| serde_json::json!({ "lane": lane, "block": tag, "text": snip }))
+                    .collect::<Vec<_>>(),
+                "prefix_stable": *stable_same && *dynamic_same && volatile.is_empty(),
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -111,8 +154,55 @@ pub(crate) fn run_prompt_size(
         for (n, name) in &per_tool {
             println!("    {n:>6} B  {name}");
         }
-    } else {
-        println!("\n  (--tools for per-tool sizes, --json for machine output)");
+    }
+    if let Some((stable_same, dynamic_same, stable_rows, dynamic_rows, volatile)) = &audit {
+        println!("\n  Lanes by block (chars, ~tokens):");
+        for (lane, rows) in [("stable", stable_rows), ("dynamic", dynamic_rows)] {
+            for (label, chars) in rows {
+                if *chars == 0 {
+                    continue;
+                }
+                // The dynamic lane's untagged remainder is the generated tool-routing map (plus
+                // the deferred-tools note); the stable lane's is the base prompt itself.
+                let label = match (lane, *label) {
+                    ("dynamic", "base instructions") => "tool routing map",
+                    _ => label,
+                };
+                println!("    {lane:<8} {label:<18} {chars:>7}  ~{}", chars / 4);
+            }
+        }
+        let verdict = |same: bool| if same { "identical" } else { "CHANGED" };
+        println!(
+            "\n  Rebuild check        : stable {} · dynamic {}",
+            verdict(*stable_same),
+            verdict(*dynamic_same)
+        );
+        if volatile.is_empty() {
+            println!("  Volatile content     : none");
+        } else {
+            println!(
+                "  Volatile content     : {} marker(s) that will differ next turn",
+                volatile.len()
+            );
+            for (lane, tag, snip) in volatile.iter().take(12) {
+                println!("    {lane:<8} <{tag}>  \"{snip}\"");
+            }
+            if volatile.len() > 12 {
+                println!("    … {} more", volatile.len() - 12);
+            }
+        }
+        let prefix_ok = *stable_same && *dynamic_same && volatile.is_empty();
+        println!(
+            "  Verdict              : prefix {}",
+            if prefix_ok {
+                "STABLE — a warm cache should hit on every turn".to_string()
+            } else {
+                "VOLATILE — the cached prefix will miss on the next turn".to_string()
+            }
+        );
+    }
+    if !show_tools && audit.is_none() {
+        println!("\n  (--tools for per-tool sizes, --live for the cache audit, --json for machine output)");
     }
     Ok(())
 }

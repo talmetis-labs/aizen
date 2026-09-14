@@ -109,6 +109,9 @@ pub(crate) fn seat_user_message(
     history: &mut Vec<Message>,
     model: &str,
 ) {
+    // Every model call from here until the next seated user message — the loop, its sub-agents,
+    // the post-turn chores — is billed to this turn in the usage ledger.
+    client::cost_meter().begin_turn();
     let sent = fold_context_into_query(line);
     refresh_dynamic_prompt_lane(history, model);
     if images.is_empty() {

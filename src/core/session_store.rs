@@ -6,7 +6,7 @@
 //! the REPL layer. Anything that writes to `sessions/` should go through here so the naming,
 //! provenance and crash-flush rules cannot fork.
 
-use crate::core::types::Message;
+use crate::core::types::{Message, UsageRow};
 use crate::core::{cli_config, config};
 use crate::memory;
 use crate::ui::{theme, tui};
@@ -134,6 +134,80 @@ pub(crate) struct SessionMeta {
     pub(crate) created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) updated: Option<String>,
+    /// Provider-reported token usage of every model call this conversation made, appended on each
+    /// save (see [`merge_usage_ledger`]). Absent until the first call that reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<UsageLedger>,
+}
+
+/// The per-conversation usage ledger persisted in [`SessionMeta`]: running totals plus the
+/// per-call rows behind them. Totals are kept separately so capping `rows` never loses money.
+///
+/// `epoch` / `last_seq` are the cost meter's cursor at the last save: the next save appends only
+/// the rows recorded after it (same process), or every row the meter holds (another process — its
+/// rows cannot be in this file). `turn_base` is added to the meter's process-local turn numbers so
+/// a file resumed across processes keeps its `turn` column monotonic instead of restarting at 1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UsageLedger {
+    #[serde(default)]
+    pub(crate) epoch: u64,
+    #[serde(default)]
+    pub(crate) last_seq: u64,
+    #[serde(default)]
+    pub(crate) turn_base: u64,
+    #[serde(default)]
+    pub(crate) calls: u64,
+    #[serde(default)]
+    pub(crate) input: u64,
+    #[serde(default)]
+    pub(crate) output: u64,
+    #[serde(default)]
+    pub(crate) cached: u64,
+    #[serde(default)]
+    pub(crate) cache_write: u64,
+    #[serde(default)]
+    pub(crate) rows: Vec<UsageRow>,
+}
+
+/// Rows a session file keeps; the oldest are dropped past this, the totals above stay exact.
+pub(crate) const USAGE_ROWS_ON_DISK: usize = crate::llm::client::USAGE_ROWS_CAP;
+
+/// Fold the rows the meter recorded since `existing` was written into a new ledger. Pure so the
+/// cursor arithmetic is testable without the process-global meter: `cursor` is the meter's
+/// `(epoch, seq)` now, `fresh` is what `rows_since(existing.epoch, existing.last_seq)` returned.
+/// Returns `None` only when there is nothing at all to write.
+pub(crate) fn merge_usage_ledger(
+    existing: Option<UsageLedger>,
+    cursor: (u64, u64),
+    fresh: Vec<UsageRow>,
+) -> Option<UsageLedger> {
+    if fresh.is_empty() {
+        // Nothing new: keep what the file has (or keep it absent) and leave its cursor alone, so
+        // a save that raced ahead of the first model call does not stamp an empty ledger.
+        return existing;
+    }
+    let mut ledger = existing.unwrap_or_default();
+    if ledger.epoch != cursor.0 {
+        // Another process (or none) wrote this file: its turn numbers restart at 1, so shift them
+        // past whatever the file already holds.
+        ledger.turn_base = ledger.rows.iter().map(|r| r.turn).max().unwrap_or(0);
+    }
+    for mut row in fresh {
+        row.turn += ledger.turn_base;
+        ledger.calls += 1;
+        ledger.input += row.input;
+        ledger.output += row.output;
+        ledger.cached += row.cached;
+        ledger.cache_write += row.cache_write;
+        ledger.rows.push(row);
+    }
+    if ledger.rows.len() > USAGE_ROWS_ON_DISK {
+        let excess = ledger.rows.len() - USAGE_ROWS_ON_DISK;
+        ledger.rows.drain(..excess);
+    }
+    ledger.epoch = cursor.0;
+    ledger.last_seq = cursor.1;
+    Some(ledger)
 }
 
 /// On-disk shape of a saved session: `{"version":2,"meta":{…},"messages":[…]}`. The
@@ -201,6 +275,8 @@ pub(crate) fn save_session(history: &[Message], name: &str, model: Option<&str>)
                 .or_else(|| cli_config::load().model),
             created: None,
             updated: None,
+            // Filled by `write_session` from the cost meter, never by the caller.
+            usage: None,
         },
     )
 }
@@ -301,15 +377,30 @@ pub(crate) fn write_session(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     config::harden_dir(&dir);
     let path = dir.join(format!("{}.json", sanitize_name(name)));
-    let existing_created = std::fs::read(&path)
+    let existing_meta = std::fs::read(&path)
         .ok()
         .and_then(|b| parse_session_bytes(&b))
-        .and_then(|(_, m)| m.and_then(|m| m.created));
+        .and_then(|(_, m)| m);
+    let existing_created = existing_meta.as_ref().and_then(|m| m.created.clone());
     let now = chrono::Local::now().to_rfc3339();
     meta.created = existing_created
         .or(meta.created)
         .or_else(|| Some(now.clone()));
     meta.updated = Some(now);
+    // Append the model calls recorded since this file was last written. The file's own cursor
+    // decides what is new, so a save-as under another name gets the whole ledger and a resumed
+    // conversation never re-appends rows it already holds.
+    let existing_usage = existing_meta.and_then(|m| m.usage);
+    let (seen_epoch, seen_seq) = existing_usage
+        .as_ref()
+        .map(|u| (u.epoch, u.last_seq))
+        .unwrap_or((0, 0));
+    let meter = crate::llm::client::cost_meter();
+    meta.usage = merge_usage_ledger(
+        existing_usage,
+        meter.cursor(),
+        meter.rows_since(seen_epoch, seen_seq),
+    );
     let file = SessionFileRef {
         version: 2,
         meta: &meta,
@@ -691,18 +782,18 @@ fn clip_line(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// "2h ago"-style age from a millisecond mtime, for the `<sessions>` rows.
-fn age_label(mtime_ms: Option<u64>) -> String {
-    let Some(ms) = mtime_ms else {
-        return "age unknown".to_string();
-    };
-    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let secs = now.saturating_sub(ms) / 1000;
-    match secs {
-        0..=3599 => format!("{}m ago", (secs / 60).max(1)),
-        3600..=86_399 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86_400),
-    }
+/// Calendar day of a millisecond mtime (`2026-09-14`), for the `<sessions>` rows. A day and not
+/// an age on purpose: "3m ago" re-renders on every turn, and one changed byte in the dynamic lane
+/// invalidates the cached transcript behind it.
+fn day_label(mtime_ms: Option<u64>) -> String {
+    mtime_ms
+        .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "date unknown".to_string())
 }
 
 /// Parse one pool file just far enough for a `<sessions>` row: turn count, provenance, and the
@@ -733,15 +824,56 @@ fn read_session_brief(path: &std::path::Path) -> Option<(usize, Option<SessionMe
 /// Same honesty rules as [`most_recent_session`]: prefer files that prove they are this project's,
 /// and when only foreign/unlabeled ones exist, offer the single best with its origin stated. Cost
 /// is bounded the same way too — newest-first, at most a handful of files parsed.
+/// The `<sessions>` block adopted for the current conversation, keyed by the pool directory it was
+/// built from. Built once per conversation boundary (see [`clear_sessions_block_cache`]) rather
+/// than once per turn: the block rides in the dynamic system lane, which sits ahead of the whole
+/// transcript in the request, and a prompt cache matches bytes — so a block that re-rendered on
+/// every turn (it used to carry "3m ago" ages and the live message count of the very conversation
+/// being autosaved) re-billed the entire transcript once per user turn. The key makes the cache
+/// safe for tests that point `AIZEN_HOME` at a fresh directory.
+static SESSIONS_BLOCK_CACHE: Mutex<Option<(std::path::PathBuf, Option<String>)>> = Mutex::new(None);
+
+/// Forget the adopted `<sessions>` block so the next build re-reads the pool. Called at every
+/// conversation boundary (startup, `/clear`, `/resume`, `/handoff`, restore).
+pub(crate) fn clear_sessions_block_cache() {
+    if let Ok(mut cache) = SESSIONS_BLOCK_CACHE.lock() {
+        *cache = None;
+    }
+}
+
 pub(crate) fn recent_sessions_block() -> Option<String> {
+    let dir = sessions_dir();
+    if let Ok(cache) = SESSIONS_BLOCK_CACHE.lock() {
+        if let Some((cached_dir, block)) = cache.as_ref() {
+            if *cached_dir == dir {
+                return block.clone();
+            }
+        }
+    }
+    let block = build_recent_sessions_block();
+    if let Ok(mut cache) = SESSIONS_BLOCK_CACHE.lock() {
+        *cache = Some((dir, block.clone()));
+    }
+    block
+}
+
+/// Render the `<sessions>` rows from the pool. Byte-stable across a conversation by construction:
+/// rows carry the file's calendar day (not an age), no message count, and never the conversation
+/// currently being autosaved (whose file changes every turn).
+fn build_recent_sessions_block() -> Option<String> {
     const EXAMINE_CAP: usize = 8;
     const ROWS_CAP: usize = 3;
     let here_key = config::project_key();
+    let current = current_session_slug().map(|s| sanitize_name(&s));
     let stats = stat_sessions();
     let mut mine: Vec<String> = Vec::new();
     let mut fallback: Option<String> = None;
-    for s in stats.iter().take(EXAMINE_CAP) {
-        let Some((turns, meta, snippet)) = read_session_brief(&s.path) else {
+    for s in stats
+        .iter()
+        .filter(|s| current.as_deref() != Some(s.name.as_str()))
+        .take(EXAMINE_CAP)
+    {
+        let Some((_turns, meta, snippet)) = read_session_brief(&s.path) else {
             continue;
         };
         let same = meta
@@ -754,11 +886,7 @@ pub(crate) fn recent_sessions_block() -> Option<String> {
             } else {
                 format!(": \"{snippet}\"")
             };
-            format!(
-                "- {} ({turns} msgs, {}{origin}){snip}",
-                s.name,
-                age_label(s.mtime_ms)
-            )
+            format!("- {} ({}{origin}){snip}", s.name, day_label(s.mtime_ms))
         };
         if same {
             mine.push(row(""));
@@ -1097,3 +1225,181 @@ pub(crate) fn autosave_last(history: &[Message], model: Option<&str>) {
 /// Latch so a persistent autosave failure warns ONCE per streak instead of every turn (and reports
 /// once when writes start working again).
 static AUTOSAVE_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod sessions_block_tests {
+    use super::{
+        clear_sessions_block_cache, recent_sessions_block, save_session, sessions_dir,
+        set_session_slug,
+    };
+    use crate::core::types::Message;
+
+    fn history(topic: &str) -> Vec<Message> {
+        vec![
+            Message::system("lane".to_string()),
+            Message::user(topic.to_string()),
+            Message::assistant("ok".to_string()),
+        ]
+    }
+
+    #[test]
+    fn sessions_block_is_byte_stable_for_the_conversation_and_skips_the_live_file() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-sess-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+
+        save_session(&history("fix the parser"), "fix-parser-0901", Some("m")).unwrap();
+        clear_sessions_block_cache();
+        let first = recent_sessions_block().expect("one saved file renders a block");
+        assert!(first.contains("fix-parser-0901"));
+        assert!(
+            crate::ui::context_report::volatile_markers(&first).is_empty(),
+            "no ages, counts or clocks may ride in the lane: {first}"
+        );
+        assert!(
+            first.contains("(20"),
+            "rows carry the file's calendar day: {first}"
+        );
+
+        // A file that appears mid-conversation (another window's autosave) must NOT re-render the
+        // block this conversation already adopted — that is the byte-stability the cache needs.
+        save_session(&history("add a feature"), "add-feature-0902", Some("m")).unwrap();
+        let again = recent_sessions_block().unwrap();
+        assert_eq!(
+            again, first,
+            "adopted block is reused verbatim within a conversation"
+        );
+
+        // At the next conversation boundary the pool is re-read…
+        clear_sessions_block_cache();
+        let refreshed = recent_sessions_block().unwrap();
+        assert!(refreshed.contains("add-feature-0902"));
+
+        // …and the conversation currently being autosaved never lists itself: its file changes
+        // every turn, so a row for it could never be stable.
+        set_session_slug(Some("add-feature-0902".to_string()));
+        clear_sessions_block_cache();
+        let without_self = recent_sessions_block().unwrap();
+        assert!(without_self.contains("fix-parser-0901"));
+        assert!(!without_self.contains("add-feature-0902"), "{without_self}");
+
+        set_session_slug(None);
+        clear_sessions_block_cache();
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod usage_ledger_tests {
+    use super::{merge_usage_ledger, SessionMeta, UsageLedger, USAGE_ROWS_ON_DISK};
+    use crate::core::types::UsageRow;
+
+    fn row(turn: u64, input: u64, cached: u64) -> UsageRow {
+        UsageRow {
+            turn,
+            input,
+            output: 10,
+            cached,
+            cache_write: 0,
+        }
+    }
+
+    #[test]
+    fn nothing_fresh_leaves_the_file_alone() {
+        assert_eq!(merge_usage_ledger(None, (7, 3), vec![]), None);
+        let existing = UsageLedger {
+            epoch: 1,
+            last_seq: 4,
+            calls: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_usage_ledger(Some(existing.clone()), (7, 9), vec![]),
+            Some(existing),
+            "an empty append must not advance the cursor or touch the totals"
+        );
+    }
+
+    #[test]
+    fn first_save_starts_a_ledger_and_stamps_the_cursor() {
+        let led = merge_usage_ledger(None, (7, 2), vec![row(1, 1_000, 0), row(1, 1_200, 900)])
+            .expect("fresh rows create a ledger");
+        assert_eq!((led.epoch, led.last_seq), (7, 2));
+        assert_eq!(
+            (led.calls, led.input, led.output, led.cached),
+            (2, 2_200, 20, 900)
+        );
+        assert_eq!(led.turn_base, 0, "an empty file has nothing to shift past");
+        assert_eq!(led.rows.len(), 2);
+    }
+
+    #[test]
+    fn same_process_appends_without_shifting_turns() {
+        let first =
+            merge_usage_ledger(None, (7, 2), vec![row(1, 100, 0), row(1, 100, 80)]).unwrap();
+        let second = merge_usage_ledger(Some(first), (7, 3), vec![row(2, 100, 90)]).unwrap();
+        assert_eq!(second.last_seq, 3);
+        assert_eq!(second.calls, 3);
+        assert_eq!(
+            second.rows.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![1, 1, 2],
+            "the meter's turn counter is already monotonic within one process"
+        );
+    }
+
+    #[test]
+    fn another_process_shifts_turns_past_the_file() {
+        // Written by process 7 through turn 3; process 8 resumes it and its meter counts from 1.
+        let old = merge_usage_ledger(None, (7, 5), vec![row(2, 100, 0), row(3, 100, 0)]).unwrap();
+        let resumed = merge_usage_ledger(Some(old), (8, 1), vec![row(1, 100, 50)]).unwrap();
+        assert_eq!(resumed.turn_base, 3);
+        assert_eq!(resumed.rows.last().unwrap().turn, 4, "1 + base 3");
+        assert_eq!((resumed.epoch, resumed.last_seq), (8, 1));
+        // The second save from process 8 keeps the same base rather than re-deriving it, so the
+        // column stays contiguous: 2, 3, 4, 5.
+        let again = merge_usage_ledger(Some(resumed), (8, 2), vec![row(2, 100, 60)]).unwrap();
+        assert_eq!(again.turn_base, 3);
+        assert_eq!(
+            again.rows.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn rows_are_capped_but_totals_are_not() {
+        let fresh: Vec<UsageRow> = (0..(USAGE_ROWS_ON_DISK as u64 + 10))
+            .map(|_| row(1, 1, 0))
+            .collect();
+        let led = merge_usage_ledger(None, (7, 1), fresh).unwrap();
+        assert_eq!(led.rows.len(), USAGE_ROWS_ON_DISK);
+        assert_eq!(led.calls, USAGE_ROWS_ON_DISK as u64 + 10);
+        assert_eq!(led.input, USAGE_ROWS_ON_DISK as u64 + 10);
+    }
+
+    #[test]
+    fn meta_round_trips_the_ledger_and_tolerates_its_absence() {
+        let meta = SessionMeta {
+            model: Some("m".into()),
+            usage: merge_usage_ledger(None, (7, 1), vec![row(1, 5, 2)]),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let back: SessionMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.usage, meta.usage);
+        // A pre-ledger file (no `usage` key) still parses, with the ledger simply absent.
+        let legacy: SessionMeta = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert_eq!(legacy.usage, None);
+        // …and a ledger written by a newer aizen with extra fields does not take the file down.
+        let newer: SessionMeta = serde_json::from_str(
+            r#"{"usage":{"epoch":1,"last_seq":1,"rows":[{"turn":1,"input":5,"future":9}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.usage.unwrap().rows[0].input, 5);
+    }
+}

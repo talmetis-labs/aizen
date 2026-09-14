@@ -230,6 +230,12 @@ pub(crate) enum Commands {
         /// Per-tool schema sizes, largest first.
         #[arg(long)]
         tools: bool,
+        /// Audit the lanes as a prompt cache sees them: every block's size, a rebuild check
+        /// (are two consecutive builds byte-identical?), and any content that will differ on the
+        /// next turn — ages, message counts, clock times — which is exactly what breaks the cached
+        /// prefix.
+        #[arg(long)]
+        live: bool,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,

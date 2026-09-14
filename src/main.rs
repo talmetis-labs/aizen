@@ -284,7 +284,12 @@ async fn main() -> Result<()> {
         Commands::Apps { cmd } => run_apps(cmd).await,
         Commands::Agents { cmd } => run_agents(cmd).await,
         Commands::Update => features::update::run().await,
-        Commands::PromptSize { model, tools, json } => run_prompt_size(model, tools, json),
+        Commands::PromptSize {
+            model,
+            tools,
+            live,
+            json,
+        } => run_prompt_size(model, tools, live, json),
         Commands::Art => {
             crate::ui::moonscape::run();
             Ok(())
@@ -463,11 +468,9 @@ fn eager_enabled() -> bool {
 /// reports usage and any tokens actually came from cache. The at-a-glance KV-cache health signal —
 /// a sudden drop to 0% mid-session means something is rewriting the prefix.
 fn cache_hit_label() -> Option<String> {
-    let (prompt, cached, _) = client::cost_meter().last_call()?;
-    if prompt == 0 || cached == 0 {
-        return None;
-    }
-    Some(format!("⛁ {}% cached", cached * 100 / prompt))
+    let meter = client::cost_meter();
+    let (input, cached, _) = meter.last_call()?;
+    crate::ui::context_report::cache_label(input, cached, meter.cache_read())
 }
 
 /// Disarms the interactive cancel token AND resets working state however a turn ends — normal

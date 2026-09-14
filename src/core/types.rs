@@ -71,9 +71,7 @@ pub struct Usage {
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
     /// Anthropic-compatible gateways: cache WRITE tokens this call (the breakpoint-creation cost).
-    /// Deserialize-only for now — lets `/cost` grow a write-side line without a wire change.
     #[serde(default)]
-    #[allow(dead_code)]
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
@@ -90,6 +88,47 @@ impl Usage {
             })
             .unwrap_or(0)
     }
+
+    /// Prompt-cache WRITE tokens this call (Anthropic-style gateways only; 0 elsewhere).
+    pub fn cache_write(&self) -> u64 {
+        self.cache_creation_input_tokens.unwrap_or(0)
+    }
+
+    /// Everything that went out WITH the request — live prompt plus cache reads and writes —
+    /// whichever wire shape the provider used. Anthropic-style gateways report `prompt_tokens`
+    /// EXCLUSIVE of `cache_read_input_tokens` (and of cache writes); OpenAI-style report it
+    /// INCLUSIVE (`prompt_tokens_details.cached_tokens` is a subset). A cache read larger than the
+    /// reported prompt cannot be a subset of it, so that is the exclusive-shape signal. This is the
+    /// denominator every "N % cached" figure must use: dividing by the exclusive `prompt_tokens`
+    /// reports hit rates above 100 %.
+    pub fn input_total(&self) -> u64 {
+        let p = self.prompt_tokens.unwrap_or(0);
+        let cached = self.cache_read();
+        if cached > p {
+            p + cached + self.cache_write()
+        } else {
+            p
+        }
+    }
+}
+
+/// One model call's billed tokens, as kept by the cost meter and persisted in the session's usage
+/// ledger. `turn` is the user turn the call belonged to (sub-agent and chore calls share their
+/// parent turn's number), so a per-turn cache hit rate is a filter over rows, not a second store.
+/// All fields default so a ledger written by a newer aizen still loads here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageRow {
+    #[serde(default)]
+    pub turn: u64,
+    /// Input tokens the request carried, cache reads and writes included (see [`Usage::input_total`]).
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cached: u64,
+    #[serde(default)]
+    pub cache_write: u64,
 }
 
 /// OpenAI-style nested cache accounting (`usage.prompt_tokens_details.cached_tokens`).
