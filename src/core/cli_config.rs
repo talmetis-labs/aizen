@@ -942,15 +942,48 @@ impl CliConfig {
     }
 }
 
-/// Effective approval for interactive/persisted callers. `AIZEN_YES` is the explicit environment
-/// escape hatch and forces yolo without mutating the saved preference.
+/// Effective approval for interactive/persisted callers: `AIZEN_YES` (the explicit environment
+/// escape hatch) wins, then this window's session override (`/yolo`, `/approval <mode>` without
+/// `--persist`), then the saved preference. See [`resolve_approval`].
 pub fn approval_mode() -> ApprovalMode {
-    if branded_flag("YES") {
+    resolve_approval(
+        branded_flag("YES"),
+        session_approval(),
+        load().persisted_approval_mode(),
+    )
+}
+
+/// The precedence behind [`approval_mode`], pure so it is testable: environment escape hatch,
+/// then the session override, then what the config file says.
+pub fn resolve_approval(
+    env_yes: bool,
+    session: Option<ApprovalMode>,
+    persisted: ApprovalMode,
+) -> ApprovalMode {
+    if env_yes {
         ApprovalMode::Yolo
     } else {
-        load().persisted_approval_mode()
+        session.unwrap_or(persisted)
     }
 }
+
+/// This window's approval override, if one was set. `/yolo` used to write `yolo` into the shared
+/// `cli-config.json`, which armed every OTHER window on the machine and every cron job that read
+/// the file afterwards — a one-off "just do it" in one terminal became the machine's default. A
+/// session override is what the words mean: this process, until it exits or is told otherwise.
+/// `--persist` on `/approval` is the explicit way to change the saved default.
+pub fn session_approval() -> Option<ApprovalMode> {
+    SESSION_APPROVAL.lock().ok().and_then(|g| *g)
+}
+
+/// Set (or with `None`, clear) this window's approval override.
+pub fn set_session_approval(mode: Option<ApprovalMode>) {
+    if let Ok(mut g) = SESSION_APPROVAL.lock() {
+        *g = mode;
+    }
+}
+
+static SESSION_APPROVAL: std::sync::Mutex<Option<ApprovalMode>> = std::sync::Mutex::new(None);
 
 /// The model THIS process is pinned to, once its REPL has resolved one.
 ///
@@ -1215,16 +1248,28 @@ fn save_unlocked(cfg: &CliConfig, path: &std::path::Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
         crate::core::config::harden_dir(parent);
     }
-    // If the file on disk is currently corrupt, preserve it as `.bak` before we clobber it — so a
-    // hand-edit typo or a partial write doesn't silently destroy the rest of the user's settings.
-    if let Ok(cur) = std::fs::read_to_string(&path) {
-        if serde_json::from_str::<CliConfig>(&cur).is_err() {
-            let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+    let json = serde_json::to_string_pretty(&canonical)? + "\n";
+    // The last GOOD file is kept one deep as `cli-config.prev.json` (rolling, best-effort): this
+    // file holds the API key, the provider rows and the approval level, so a save that goes wrong
+    // must be one rename away from recovery. A file that is currently corrupt — a hand-edit typo,
+    // a partial write — still goes to `.bak` before it is clobbered, exactly as before.
+    if let Ok(cur) = std::fs::read_to_string(path) {
+        if serde_json::from_str::<CliConfig>(&cur).is_ok() {
+            if cur != json {
+                let _ = crate::core::persist::atomic_write_owner_only(
+                    &path.with_extension("prev.json"),
+                    cur.as_bytes(),
+                );
+            }
+        } else {
+            let _ = std::fs::copy(path, path.with_extension("json.bak"));
         }
     }
-    let json = serde_json::to_string_pretty(&canonical)?;
-    std::fs::write(&path, json + "\n").with_context(|| format!("writing {}", path.display()))?;
-    crate::core::config::harden_file(&path);
+    // Staged temp + rename + parent fsync, owner-only: a crash, a full disk or an AV lock in the
+    // middle of a plain `fs::write` used to leave a truncated file, and `load()` then answered
+    // with defaults — endpoint and key gone with no message.
+    crate::core::persist::atomic_write_owner_only(path, json.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -1743,6 +1788,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(new_wins.persisted_approval_mode(), ApprovalMode::Ask);
+    }
+
+    #[test]
+    fn approval_precedence_is_env_then_session_then_saved() {
+        use crate::core::approval::ApprovalMode as M;
+        // The saved file alone.
+        assert_eq!(resolve_approval(false, None, M::Ask), M::Ask);
+        assert_eq!(resolve_approval(false, None, M::Smart), M::Smart);
+        // A `/yolo` in this window overrides the file for this window…
+        assert_eq!(resolve_approval(false, Some(M::Yolo), M::Ask), M::Yolo);
+        // …and can also step DOWN from a saved yolo without rewriting the file.
+        assert_eq!(resolve_approval(false, Some(M::Ask), M::Yolo), M::Ask);
+        // `AIZEN_YES` is the explicit escape hatch and beats both.
+        assert_eq!(resolve_approval(true, Some(M::Ask), M::Ask), M::Yolo);
+        // The override itself round-trips and clears.
+        set_session_approval(Some(M::Smart));
+        assert_eq!(session_approval(), Some(M::Smart));
+        set_session_approval(None);
+        assert_eq!(session_approval(), None);
     }
 
     #[test]

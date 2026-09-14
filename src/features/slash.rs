@@ -514,9 +514,9 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[],
         hidden_aliases: &[],
         hidden: false,
-        description: "set the approval level",
-        argument_hint: "[ask|smart|yolo]",
-        help: "approval level — ask every time, auto-run read-only, or pre-authorize",
+        description: "set the approval level (this window; --persist to save)",
+        argument_hint: "[ask|smart|yolo] [--persist]",
+        help: "approval level — ask every time, auto-run read-only, or pre-authorize; this window only unless --persist",
         stdin: Stdin::Never,
     },
     Builtin {

@@ -1318,18 +1318,35 @@ pub(crate) async fn handle_slash(
             }
         }
         SlashId::Approval => {
-            let requested = arg.split_whitespace().next().unwrap_or("status");
+            let mut words = arg.split_whitespace();
+            let requested = words.next().unwrap_or("status");
+            let persist = words.any(|w| matches!(w, "--persist" | "persist" | "--save"));
             let mut cfg = cli_config::load();
             if requested.is_empty() || matches!(requested, "status" | "st") {
-                tui::emit_line(&style(format!("approval: {} · ask=prompt · smart=read-only auto · yolo=pre-authorized", approval_mode())).dim().to_string());
+                let saved = cfg.persisted_approval_mode();
+                let scope = match cli_config::session_approval() {
+                    Some(s) if s != saved => format!(" (this window; saved default: {saved})"),
+                    _ => String::new(),
+                };
+                tui::emit_line(&style(format!("approval: {}{scope} · ask=prompt · smart=read-only auto · yolo=pre-authorized · add --persist to change the saved default", approval_mode())).dim().to_string());
             } else if let Ok(mode) = requested.parse::<ApprovalMode>() {
-                cfg.set_approval_mode(mode);
-                match cli_config::save(&cfg) {
-                    Ok(_) => tui::emit_line(&style(format!("approval → {mode}")).color256(splash::ACCENT).to_string()),
-                    Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                if persist {
+                    // The explicit way to change the machine's default: the saved file is what
+                    // every new window, `aizen serve` lane and cron job starts from.
+                    cfg.set_approval_mode(mode);
+                    cli_config::set_session_approval(None);
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(&style(format!("approval → {mode} (saved as the default)")).color256(splash::ACCENT).to_string()),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                    }
+                } else {
+                    // This window only: a one-off "just do it" must not arm every other window and
+                    // every cron job on the machine, which is what writing it to disk did.
+                    cli_config::set_session_approval(Some(mode));
+                    tui::emit_line(&style(format!("approval → {mode} (this window only — `/approval {mode} --persist` to make it the default)")).color256(splash::ACCENT).to_string());
                 }
             } else {
-                tui::emit_line(&style("usage: /approval ask|smart|yolo").dim().to_string());
+                tui::emit_line(&style("usage: /approval ask|smart|yolo [--persist]").dim().to_string());
             }
         }
         SlashId::Sandbox => {
@@ -1371,11 +1388,11 @@ pub(crate) async fn handle_slash(
             }
         }
 SlashId::Yolo => {
-            let mut cfg = cli_config::load();
-            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
-            cfg.set_approval_mode(mode);
-            let _ = cli_config::save(&cfg);
-            tui::emit_line(&style(format!("approval → {mode} (legacy /yolo alias)")).color256(splash::ACCENT).to_string());
+            // Session-scoped toggle (see `cli_config::session_approval`): flips THIS window
+            // between yolo and ask, and never touches the saved default.
+            let mode = if approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
+            cli_config::set_session_approval(Some(mode));
+            tui::emit_line(&style(format!("approval → {mode} (this window only; `/approval {mode} --persist` to save)")).color256(splash::ACCENT).to_string());
         }
         SlashId::AutoCopy => {
             // Copy shortcut wording is OS-specific so the status line teaches the right chord.
@@ -1467,11 +1484,10 @@ SlashId::Yolo => {
             }
         }
         SlashId::Smart => {
-            let mut cfg = cli_config::load();
-            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
-            cfg.set_approval_mode(mode);
-            let _ = cli_config::save(&cfg);
-            tui::emit_line(&style(format!("approval → {mode} (legacy /smart alias)")).color256(splash::ACCENT).to_string());
+            // Session-scoped like `/yolo`; `/approval smart --persist` changes the saved default.
+            let mode = if approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
+            cli_config::set_session_approval(Some(mode));
+            tui::emit_line(&style(format!("approval → {mode} (this window only; `/approval {mode} --persist` to save)")).color256(splash::ACCENT).to_string());
         }
         SlashId::Ultimate => {
             let mut cfg = cli_config::load();
