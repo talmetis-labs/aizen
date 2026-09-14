@@ -25,6 +25,22 @@ pub enum VerifyCommand {
     Npm(String),
     /// TypeScript with a `tsconfig.json` but no script: `npx tsc --noEmit`.
     NpxTsc,
+    /// Go module: `go build ./...` (the typecheck), then [`VerifyCommand::GoVet`].
+    GoBuild,
+    /// Go module: `go vet ./...` after a clean build.
+    GoVet,
+    /// Maven project: compile only, tests skipped.
+    Maven,
+    /// Gradle project: `compileJava` through the wrapper when the repo ships one (the
+    /// string is the launcher: `./gradlew`, `gradlew.bat`, or plain `gradle`).
+    Gradle(String),
+    /// .NET project or solution: `dotnet build`, quiet.
+    DotNet,
+    /// Python project: a byte-compile pass over the tree. Python has no universal typecheck and
+    /// the module's contract is "never the test suite", so this is the honest fast rung: it
+    /// catches syntax errors and nothing else. `python3` is tried first, then `python`; a
+    /// missing interpreter is a skip, not a failure (see [`looks_like_missing_tool`]).
+    Python,
     /// A project-supplied command from `./.aizen/verify.json` (trust-gated — see
     /// [`detect_verify_commands`]).
     Custom(String),
@@ -37,10 +53,30 @@ impl VerifyCommand {
             VerifyCommand::Cargo => "cargo check".to_string(),
             VerifyCommand::Npm(script) => format!("npm run {script}"),
             VerifyCommand::NpxTsc => "npx tsc --noEmit".to_string(),
+            VerifyCommand::GoBuild => "go build ./...".to_string(),
+            VerifyCommand::GoVet => "go vet ./...".to_string(),
+            VerifyCommand::Maven => "mvn -q -DskipTests compile".to_string(),
+            VerifyCommand::Gradle(launcher) => format!("{launcher} -q compileJava"),
+            VerifyCommand::DotNet => "dotnet build --nologo -v q".to_string(),
+            VerifyCommand::Python => {
+                const ARGS: &str = r#"-m compileall -q -x "(\.venv|venv|env|node_modules|\.git|build|dist|__pycache__)" ."#;
+                format!("python3 {ARGS} || python {ARGS}")
+            }
             VerifyCommand::Custom(c) => c.clone(),
         }
     }
 }
+
+/// The demand the loop injects when a run edited files but no verify command could run — no
+/// recognised manifest, or a toolchain that is not installed. It exists because the old shape
+/// fell straight through to `Done` in silence: "verified done" was true for Rust and TypeScript
+/// and a fiction everywhere else.
+pub const ABSENCE_DEMAND: &str = "[verify] No build or test command could be run for this project \
+    (looked for Cargo.toml, package.json, tsconfig.json, go.mod, pom.xml, build.gradle, a .csproj/.sln, \
+    pyproject.toml/setup.py and .aizen/verify.json — or the toolchain is not installed here). You edited \
+    files: before finishing, run the project's own build or test command with shell_run and quote its \
+    exit code and any failing lines, or state plainly that no such command exists. Do not report done \
+    on an unverified change.";
 
 /// The outcome of one verify-gate run.
 #[derive(Debug, Clone)]
@@ -56,23 +92,106 @@ pub struct VerifyGateResult {
 /// tail (the summary line, the error count), and that's what the model needs to fix.
 const MAX_OUTPUT_CHARS: usize = 4000;
 
-/// Detect the project's fast-verify command, or `None` if the shape isn't recognized.
+/// Detect the project's fast-verify command, or `None` if the shape isn't recognized. The first
+/// of [`detect_builtin_verify_commands`]; the loop runs the whole list, so today only the tests
+/// (which check one shape at a time) call this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn detect_verify_command(cwd: &Path) -> Option<VerifyCommand> {
-    // Cargo first: a repo may carry both manifests; `cargo check` is the faster, more precise
-    // typecheck for the Rust crate the agent most likely just edited.
+    detect_builtin_verify_commands(cwd).into_iter().next()
+}
+
+/// The built-in verify command list for a project, by manifest, in run order. Cargo first: a repo
+/// may carry both manifests, and `cargo check` is the faster, more precise typecheck for the Rust
+/// crate the agent most likely just edited. Then the Node shapes, then Go (build, then vet), the
+/// JVM builds, .NET, and last the Python byte-compile. Empty when nothing is recognised.
+pub fn detect_builtin_verify_commands(cwd: &Path) -> Vec<VerifyCommand> {
     if cwd.join("Cargo.toml").is_file() {
-        return Some(VerifyCommand::Cargo);
+        return vec![VerifyCommand::Cargo];
     }
     let pkg = cwd.join("package.json");
     if pkg.is_file() {
         if let Some(script) = detect_npm_typecheck_script(&pkg) {
-            return Some(VerifyCommand::Npm(script));
+            return vec![VerifyCommand::Npm(script)];
         }
     }
     if cwd.join("tsconfig.json").is_file() {
-        return Some(VerifyCommand::NpxTsc);
+        return vec![VerifyCommand::NpxTsc];
     }
-    None
+    if cwd.join("go.mod").is_file() {
+        return vec![VerifyCommand::GoBuild, VerifyCommand::GoVet];
+    }
+    if cwd.join("pom.xml").is_file() {
+        return vec![VerifyCommand::Maven];
+    }
+    if cwd.join("build.gradle").is_file() || cwd.join("build.gradle.kts").is_file() {
+        let launcher = if cwd.join("gradlew.bat").is_file() && cfg!(windows) {
+            "gradlew.bat".to_string()
+        } else if cwd.join("gradlew").is_file() && !cfg!(windows) {
+            "./gradlew".to_string()
+        } else {
+            "gradle".to_string()
+        };
+        return vec![VerifyCommand::Gradle(launcher)];
+    }
+    if has_file_with_extension(cwd, &["csproj", "fsproj", "sln"]) {
+        return vec![VerifyCommand::DotNet];
+    }
+    if [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "pytest.ini",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|m| cwd.join(m).is_file())
+    {
+        return vec![VerifyCommand::Python];
+    }
+    Vec::new()
+}
+
+/// Does `dir` (non-recursively) contain a file with one of these extensions?
+fn has_file_with_extension(dir: &Path, exts: &[&str]) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| exts.iter().any(|w| x.eq_ignore_ascii_case(w)))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Did a non-zero exit mean "the toolchain is not installed" rather than "the check failed"?
+/// `sh` answers 127 and `cmd.exe` 9009 for an unknown program, and the wrapper shell's message
+/// is the LAST thing printed. Judged on the tail of the output on purpose: a `python3 … ||
+/// python …` line whose first half is missing and whose second half finds real errors ends with
+/// the errors, and must stay a failure.
+pub fn looks_like_missing_tool(code: Option<i32>, output: &str) -> bool {
+    if matches!(code, Some(0)) {
+        return false; // a check that passed is a pass, whatever a first `||` half printed
+    }
+    if matches!(code, Some(127) | Some(9009)) {
+        return true;
+    }
+    let tail: Vec<&str> = output
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(2)
+        .collect();
+    tail.iter().any(|l| {
+        let l = l.trim();
+        l.contains("is not recognized as an internal or external command")
+            || l.contains("operable program or batch file")
+            || l.ends_with("command not found")
+            || l.ends_with(": not found")
+            || l.starts_with("No module named ")
+            || l.contains(": No module named ")
+    })
 }
 
 /// Walk up from `start` (a directory, or a file's directory) to the nearest ancestor that looks
@@ -94,9 +213,23 @@ pub fn verify_root(start: &Path) -> Option<std::path::PathBuf> {
         start
     };
     loop {
-        let has_manifest = dir.join("Cargo.toml").is_file()
-            || dir.join("package.json").is_file()
-            || dir.join("tsconfig.json").is_file()
+        let has_manifest = [
+            "Cargo.toml",
+            "package.json",
+            "tsconfig.json",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "pytest.ini",
+            "requirements.txt",
+        ]
+        .iter()
+        .any(|m| dir.join(m).is_file())
+            || has_file_with_extension(dir, &["csproj", "fsproj", "sln"])
             || dir.join(".aizen").join("verify.json").is_file();
         if has_manifest {
             return Some(dir.to_path_buf());
@@ -117,7 +250,7 @@ pub fn detect_verify_commands(cwd: &Path) -> Vec<VerifyCommand> {
             return customs;
         }
     }
-    detect_verify_command(cwd).into_iter().collect()
+    detect_builtin_verify_commands(cwd)
 }
 
 /// Parse the trusted `./.aizen/verify.json` commands (≤3 honored; Blocked commands dropped).
@@ -294,6 +427,14 @@ async fn run_one_verify(
                     combined.push('\n');
                 }
                 combined.push_str(&stderr);
+            }
+            // A toolchain that is not installed is "nothing ran", not "the check failed": the
+            // shell wrapper turns a missing `cargo`/`go`/`python` into exit 127 with a one-line
+            // message, and reporting that as a verify FAILURE sent the model chasing a build
+            // error that does not exist.
+            if !output.status.success() && looks_like_missing_tool(output.status.code(), &combined)
+            {
+                return None;
             }
             Some(VerifyGateResult {
                 passed: output.status.success(),
@@ -724,6 +865,75 @@ mod tests {
         std::fs::write(d.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
         assert_eq!(detect_verify_command(&d), Some(VerifyCommand::Cargo));
         assert_eq!(VerifyCommand::Cargo.command_line(), "cargo check");
+    }
+
+    #[test]
+    fn detects_go_jvm_dotnet_and_python_manifests() {
+        let d = temp_dir("go");
+        std::fs::write(d.join("go.mod"), "module x\n").unwrap();
+        assert_eq!(
+            detect_builtin_verify_commands(&d),
+            vec![VerifyCommand::GoBuild, VerifyCommand::GoVet],
+            "build first, vet after a clean build"
+        );
+
+        let d = temp_dir("maven");
+        std::fs::write(d.join("pom.xml"), "<project/>").unwrap();
+        assert_eq!(detect_verify_command(&d), Some(VerifyCommand::Maven));
+
+        let d = temp_dir("gradle");
+        std::fs::write(d.join("build.gradle.kts"), "plugins {}").unwrap();
+        assert!(matches!(
+            detect_verify_command(&d),
+            Some(VerifyCommand::Gradle(l)) if l == "gradle"
+        ));
+
+        let d = temp_dir("dotnet");
+        std::fs::write(d.join("App.csproj"), "<Project/>").unwrap();
+        assert_eq!(detect_verify_command(&d), Some(VerifyCommand::DotNet));
+        assert!(verify_root(&d.join("src")).is_none() || verify_root(&d).is_some());
+
+        let d = temp_dir("python");
+        std::fs::write(d.join("pyproject.toml"), "[project]\nname='x'").unwrap();
+        assert_eq!(detect_verify_command(&d), Some(VerifyCommand::Python));
+        let line = VerifyCommand::Python.command_line();
+        assert!(
+            line.starts_with("python3 -m compileall") && line.contains("|| python -m compileall")
+        );
+
+        let d = temp_dir("nothing");
+        std::fs::write(d.join("README.md"), "hi").unwrap();
+        assert!(detect_builtin_verify_commands(&d).is_empty());
+    }
+
+    #[test]
+    fn missing_toolchain_is_a_skip_not_a_failure() {
+        assert!(looks_like_missing_tool(
+            Some(127),
+            "sh: 1: cargo: not found"
+        ));
+        assert!(looks_like_missing_tool(
+            Some(1),
+            "'go' is not recognized as an internal or external command,\noperable program or batch file."
+        ));
+        assert!(looks_like_missing_tool(
+            Some(1),
+            "/usr/bin/python3: No module named compileall"
+        ));
+        // The first half of `python3 … || python …` missing but the second finding real errors:
+        // the tail is the errors, so this must stay a FAILURE.
+        assert!(!looks_like_missing_tool(
+            Some(1),
+            "sh: python3: command not found\n  File \"x.py\", line 3\n    def (\nSyntaxError: invalid syntax"
+        ));
+        assert!(!looks_like_missing_tool(
+            Some(101),
+            "error[E0599]: no method named `frob`"
+        ));
+        assert!(!looks_like_missing_tool(
+            Some(0),
+            "sh: python3: command not found"
+        ));
     }
 
     #[test]

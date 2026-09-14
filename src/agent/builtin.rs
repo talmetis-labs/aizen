@@ -89,7 +89,11 @@ pub(crate) const NOOP_WRITE_PREFIX: &str = "no change (identical content)";
 /// marker (so the model knows it has a partial view). A range/numbered read is NEVER bounded. Small
 /// files (the common case) stay byte-exact so `old_string` round-trips. `0` disables a cap.
 const FILE_READ_MAX_LINES: usize = 2000;
-const FILE_READ_MAX_BYTES: usize = 200_000;
+/// The ONE read budget. `file_read` is the only authority on how much of a file the model sees:
+/// the loop no longer re-cuts its output (see `agent::is_self_budgeted`), so this number is what
+/// actually reaches the model — roughly the 12 k-char window the loop used to keep, with a little
+/// headroom, and every cut it makes is contiguous and marked with the lines it left out.
+const FILE_READ_MAX_BYTES: usize = 16_000;
 /// Soft threshold (well below the hard `FILE_READ_MAX_LINES` budget): a WHOLE-file read of a
 /// SOURCE file longer than this earns a one-line hint to prefer `lsp_document_symbols` + `read_symbol`
 /// — the single biggest token sink in a real task is reading whole files the model only needs one
@@ -1884,17 +1888,7 @@ impl FileRead {
         if s > e {
             return Ok(String::new());
         }
-        if number {
-            let body = lines[s - 1..e]
-                .iter()
-                .enumerate()
-                .map(|(i, l)| format!("{}|{l}", s + i))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(body)
-        } else {
-            Ok(lines[s - 1..e].join("\n"))
-        }
+        Ok(range_view(&lines, s, e, number, path, max_lines, max_bytes))
     }
 
     /// The `files:[…]` batch form: N files/slices in ONE call — one round-trip instead of a
@@ -1911,7 +1905,7 @@ impl FileRead {
             .unwrap_or(false);
         let shown = &list[..list.len().min(MULTI_READ_MAX_FILES)];
         let per_lines = (FILE_READ_MAX_LINES / shown.len()).max(200);
-        let per_bytes = (FILE_READ_MAX_BYTES / shown.len()).max(20_000);
+        let per_bytes = (FILE_READ_MAX_BYTES / shown.len()).max(4_000);
         let mut out: Vec<String> = Vec::with_capacity(shown.len() + 1);
         for entry in shown {
             let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
@@ -2047,6 +2041,60 @@ fn take_bytes_suffix(s: &str, max: usize) -> &str {
 /// spliced text back as an exact `old_string` — a slice is either fully inside head/tail, which
 /// round-trips, or spans the omitted sentinel, which is a clean exact-miss). Slices are byte-exact
 /// (real line endings preserved — NOT the lossy `lines()` path). `max_*`=0 disables that cap.
+/// A `start`/`end` (or `number:true`) read under the same budget as a whole-file read: the
+/// CONTIGUOUS head of the requested range up to the line/byte cap, then a marker naming what was
+/// left out and the exact `start` to continue from. Contiguous on purpose — a ranged read exists
+/// so the model can copy an `old_string` out of it, and a head+tail or keyword splice would hand
+/// it text that does not occur in the file in that order. Zero for either cap disables it.
+fn range_view(
+    lines: &[&str],
+    s: usize,
+    e: usize,
+    number: bool,
+    path: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (i, line) in lines[s - 1..e].iter().enumerate() {
+        let rendered = if number {
+            format!("{}|{line}", s + i)
+        } else {
+            (*line).to_string()
+        };
+        if max_lines > 0 && shown >= max_lines {
+            break;
+        }
+        if max_bytes > 0 && out.len() + rendered.len() + 1 > max_bytes {
+            if shown == 0 {
+                // One line alone exceeds the budget (minified source): show its head, char-safe.
+                out.push_str(take_bytes_prefix(&rendered, max_bytes));
+                shown = 1;
+            }
+            break;
+        }
+        if shown > 0 {
+            out.push('\n');
+        }
+        out.push_str(&rendered);
+        shown += 1;
+    }
+    let requested = e - s + 1;
+    if shown < requested || (shown == 1 && requested == 1 && out.len() < lines[s - 1].len()) {
+        let last = s + shown.max(1) - 1;
+        let kb = lines[s - 1..e].iter().map(|l| l.len() + 1).sum::<usize>() / 1024;
+        out.push_str(&format!(
+            "\n…[file_read: lines {s}-{e} of {path} are {requested} lines ({kb} KB) — over the read \
+             budget ({max_lines} lines / {} KB). Showing {s}-{last}; continue with start:{}, \
+             end:{e}.]",
+            max_bytes / 1024,
+            last + 1,
+        ));
+    }
+    out
+}
+
 fn budget_view(content: &str, path: &str, max_lines: usize, max_bytes: usize) -> String {
     let total_bytes = content.len();
     let spans = line_byte_spans(content);
@@ -4720,6 +4768,55 @@ mod tests {
         // default (no number) stays byte-exact so old_string round-trips into file_edit cleanly
         let plain = t.execute(&serde_json::json!({"path":"f.txt"})).unwrap();
         assert_eq!(plain, "alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn file_read_range_over_budget_is_contiguous_and_says_how_to_continue() {
+        let root = temp_root("read-range-budget");
+        let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+        std::fs::write(root.join("f.txt"), &body).unwrap();
+        let t = FileRead::new(root);
+        // Line cap of 10 on a 50-line range: the first ten rows, in order, then the marker.
+        let out = t
+            .read_one("f.txt", Some(1), Some(50), false, 10, 0, false)
+            .unwrap();
+        let (shown, marker) = out.split_once("\n…[file_read:").expect("marker present");
+        assert_eq!(
+            shown,
+            (1..=10)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "a contiguous head of the range, nothing spliced"
+        );
+        assert!(marker.contains("Showing 1-10"), "{marker}");
+        assert!(
+            marker.contains("continue with start:11, end:50"),
+            "{marker}"
+        );
+        // `number:true` on the whole file goes through the same budget (it used to bypass it).
+        let numbered = t.read_one("f.txt", None, None, true, 5, 0, false).unwrap();
+        assert!(
+            numbered.starts_with("1|row 1\n2|row 2\n3|row 3\n4|row 4\n5|row 5\n…[file_read:"),
+            "{numbered}"
+        );
+        assert!(
+            numbered.contains("continue with start:6, end:50"),
+            "{numbered}"
+        );
+        // Under budget: byte-exact, no marker (the old_string round-trip invariant).
+        let small = t
+            .read_one("f.txt", Some(3), Some(4), false, 10, 0, false)
+            .unwrap();
+        assert_eq!(small, "row 3\nrow 4");
+        // A byte cap on a range is honoured too.
+        let bytes = t
+            .read_one("f.txt", Some(1), Some(50), false, 0, 20, false)
+            .unwrap();
+        assert!(
+            bytes.starts_with("row 1\nrow 2\nrow 3\n…[file_read:"),
+            "{bytes}"
+        );
     }
 
     #[test]

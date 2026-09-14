@@ -487,6 +487,15 @@ pub struct AgentConfig {
     pub auto_extend_to: usize,
     /// Per-tool result truncation (chars). Bounds history growth cheaply.
     pub max_tool_result_chars: usize,
+    /// Budget for LOG-shaped results (`shell_run`, `process`, `git_inspect`): build and test
+    /// output is the ground truth the verify loop runs on, and at the 4 k default a `cargo test`
+    /// with three failures lost the middle two. Cut tail-weighted around the first error line
+    /// (see [`truncate_log`]), never head-⅔/tail-⅓.
+    pub max_log_result_chars: usize,
+    /// Budget for DELEGATE results (`task`, `workflow`): a sub-agent's report is the whole value
+    /// of the dispatch, and its findings list sits in the middle — exactly what a head+tail cut
+    /// drops. Cut by whole `## ` sections with the omitted ones named (see [`truncate_sections`]).
+    pub max_delegate_result_chars: usize,
     /// Larger budget for the READ/FETCH tools whose output is a document scanned for specifics
     /// (`file_read`/`web_fetch`/`web_crawl`/`search_files`). The reach layer already caps a fetched
     /// page at `FETCH_CAP` (20k); cutting that again to `max_tool_result_chars` (4k) here would drop
@@ -704,6 +713,8 @@ impl Default for AgentConfig {
             auto_extend_to: 50,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
+            max_log_result_chars: 16_000,
+            max_delegate_result_chars: 24_000,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
@@ -929,6 +940,10 @@ where
     // cause. Successful edits and completed todos are evidence too.
     let mut stall = StallLedger::new(todo_done_count());
     let mut verify_attempts = 0usize;
+    // Once per run: when the gate has NOTHING to run (no recognised manifest, toolchain not
+    // installed) the model is asked to run the project's own check before finishing. Without this
+    // an edit in a Python or Go repo reached `Done` with no verification and no trace line.
+    let mut verify_absence_demanded = false;
     // The verify gate PASSED for the current tree state (W8). Set when a check comes back clean;
     // CLEARED by a fresh successful edit (new work must be re-verified). While false and edits
     // exist, the gate re-fires on every "done" claim until it passes or attempts exhaust — so a
@@ -1787,9 +1802,19 @@ where
                     .as_deref()
                     .and_then(verify_gate::verify_root)
                     .unwrap_or(cwd);
-                if let Some(result) =
-                    verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
-                {
+                let gate =
+                    verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await;
+                if gate.is_none() && !verify_absence_demanded && !cfg.cancel.is_cancelled() {
+                    verify_absence_demanded = true;
+                    if !cfg.quiet {
+                        crate::ui::tui::verify_line(
+                            "verify",
+                            "no build/test command could run here — asking the model to run the project's own check",
+                        );
+                    }
+                    demands.push(verify_gate::ABSENCE_DEMAND.to_string());
+                }
+                if let Some(result) = gate {
                     if !cfg.quiet {
                         if result.passed {
                             crate::ui::tui::verify_line(&result.command, "verify gate passed");
@@ -2827,8 +2852,7 @@ async fn execute_calls(
                             .expect("safe ⇒ known");
                         let args = parsed[k].clone().expect("safe ⇒ parsed");
                         let quiet = cfg.quiet;
-                        let max = cfg.max_tool_result_chars;
-                        let max_fetch = cfg.max_fetch_result_chars;
+                        let budgets = cfg.result_budgets();
                         let cancel = cfg.cancel.clone();
                         let exec_ctx = cfg.exec_ctx.clone();
                         (
@@ -2836,7 +2860,7 @@ async fn execute_calls(
                             tokio::task::spawn_blocking(move || {
                                 crate::core::cancel::with_current(cancel, || {
                                     crate::core::exec_ctx::with_current(exec_ctx, || {
-                                        run_tool_body(tool, &args, quiet, max, max_fetch)
+                                        run_tool_body(tool, &args, quiet, budgets)
                                     })
                                 })
                             }),
@@ -3020,14 +3044,13 @@ async fn execute_calls(
                             } else {
                                 let args = args.clone();
                                 let quiet = cfg.quiet;
-                                let max = cfg.max_tool_result_chars;
-                                let max_fetch = cfg.max_fetch_result_chars;
+                                let budgets = cfg.result_budgets();
                                 let cancel = cfg.cancel.clone();
                                 let exec_ctx = cfg.exec_ctx.clone();
                                 tokio::task::spawn_blocking(move || {
                                     crate::core::cancel::with_current(cancel, || {
                                         crate::core::exec_ctx::with_current(exec_ctx, || {
-                                            run_tool_body(tool, &args, quiet, max, max_fetch)
+                                            run_tool_body(tool, &args, quiet, budgets)
                                         })
                                     })
                                 })
@@ -3101,8 +3124,7 @@ pub fn eager_starter<'a>(
 ) -> impl Fn(usize, &ToolCall) -> Option<tokio::task::JoinHandle<String>> + Send + Sync + 'a {
     let barrier_hit = std::sync::atomic::AtomicBool::new(false);
     let started = std::sync::atomic::AtomicUsize::new(0);
-    let max_chars = cfg.max_tool_result_chars;
-    let max_fetch_chars = cfg.max_fetch_result_chars;
+    let budgets = cfg.result_budgets();
     let cancel = cfg.cancel.clone();
     move |_slot, tc| {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3153,7 +3175,7 @@ pub fn eager_starter<'a>(
             // finished streaming early enough for a head start.
             crate::core::exec_ctx::with_current(turn_ctx, || {
                 crate::core::cancel::with_current(turn_cancel, || {
-                    run_tool_body(tool, &args, true, max_chars, max_fetch_chars)
+                    run_tool_body(tool, &args, true, budgets)
                 })
             })
         }))
@@ -3288,13 +3310,40 @@ fn gate_and_approve(
 /// (failures become feedback strings). This is the `spawn_blocking` payload — the existing tool
 /// bridges (`block_in_place` + `Handle::block_on`) work unchanged on blocking threads (pinned by
 /// `tools::tests::bridge_works_inside_spawn_blocking`).
+/// The per-kind result budgets a tool body is cut to, snapshotted from [`AgentConfig`] so the
+/// blocking executor threads carry four numbers instead of a config reference.
+#[derive(Clone, Copy, Debug)]
+pub struct ResultBudgets {
+    /// Everything not named below (`max_tool_result_chars`).
+    pub default: usize,
+    /// Document tools cut by relevance, and the self-budgeted `file_read` safety net.
+    pub fetch: usize,
+    /// Build/test/process logs (`max_log_result_chars`).
+    pub log: usize,
+    /// Sub-agent and workflow reports (`max_delegate_result_chars`).
+    pub delegate: usize,
+}
+
+impl AgentConfig {
+    /// The result budgets this config applies — see [`ResultBudgets`].
+    pub fn result_budgets(&self) -> ResultBudgets {
+        ResultBudgets {
+            default: self.max_tool_result_chars,
+            fetch: self.max_fetch_result_chars,
+            log: self.max_log_result_chars,
+            delegate: self.max_delegate_result_chars,
+        }
+    }
+}
+
 fn run_tool_body(
     tool: std::sync::Arc<dyn tools::Tool>,
     args: &serde_json::Value,
     quiet: bool,
-    max_chars: usize,
-    max_fetch_chars: usize,
+    budgets: ResultBudgets,
 ) -> String {
+    let max_chars = budgets.default;
+    let max_fetch_chars = budgets.fetch;
     if tool.recovery_effect(args) {
         crate::core::recovery::mark_side_effects_possible();
     }
@@ -3330,28 +3379,187 @@ fn run_tool_body(
     // Non-failure only (an error string must survive verbatim — the model's error trail is how it
     // recovers) and only for these tools (an edit diff / shell log is positional, not keyword-scored).
     // Everything else keeps the exact old head+tail behavior at the standard budget.
+    // Logs and delegate reports have their own shapes and their own budgets; both apply to
+    // failures too — a failing `cargo test` IS the log the model needs whole, and a child that
+    // ended in `VerificationFailed` still reports what it found.
+    if is_log_tool(tool.name()) {
+        return truncate_log(&out, budgets.log.max(max_chars));
+    }
+    if is_delegate_tool(tool.name()) {
+        return truncate_sections(&out, budgets.delegate.max(max_chars));
+    }
     if !is_failure_result(&out) && is_relevance_truncatable(tool.name()) {
         let keywords = relevance_keywords(&relevance_query_from_args(args));
         return truncate_relevant(&out, max_fetch_chars.max(max_chars), &keywords);
+    }
+    // `file_read` budgets itself: `budget_view` / the ranged view cut inside the tool and say
+    // exactly which lines were left out and how to ask for them. A second cut here used to
+    // re-slice that contiguous window by keywords taken from the file PATH and hand the model a
+    // head + "…elided…" + keyword-window splice — text that does not exist in that order in the
+    // file, so an `old_string` copied across the seam never matched. The transport cap remains
+    // only as a safety net, far above anything the tool's own budget can produce.
+    if is_self_budgeted(tool.name()) {
+        return truncate_result(&out, max_fetch_chars.max(max_chars) * 4);
     }
     truncate_result(&out, max_chars)
 }
 
 /// Tools whose large output is a document scanned for specifics — relevance-trimming keeps the
 /// matching region instead of a blind head+tail. Edit/shell/memory tools are excluded (their
-/// output is positional or already digested).
+/// output is positional or already digested), and so is `file_read`, which cuts itself (see
+/// [`is_self_budgeted`]).
 fn is_relevance_truncatable(name: &str) -> bool {
-    matches!(
-        name,
-        "file_read" | "web_fetch" | "web_crawl" | "search_files"
-    )
+    matches!(name, "web_fetch" | "web_crawl" | "search_files")
+}
+
+/// Tools whose output is already cut to a budget INSIDE the tool, with a marker that names the
+/// omitted range and the call that fetches it. The loop must not cut them again: the tool's view
+/// is contiguous and the marker is only true if what surrounds it is exactly what the tool wrote.
+fn is_self_budgeted(name: &str) -> bool {
+    matches!(name, "file_read")
+}
+
+/// Tools whose output is a LOG: the verdict is at the end and the first error is wherever the
+/// build put it, so the cut keeps both (see [`truncate_log`]).
+fn is_log_tool(name: &str) -> bool {
+    matches!(name, "shell_run" | "process" | "git_inspect")
+}
+
+/// Tools whose output is a sub-agent's REPORT, structured in `## ` sections; cut by whole
+/// sections with the omitted ones named (see [`truncate_sections`]).
+fn is_delegate_tool(name: &str) -> bool {
+    matches!(name, "task" | "workflow")
+}
+
+/// Cut a build/test/process log to `max` chars the way a developer reads one: the head (the
+/// command's banner, the first lines of context), the region around the FIRST error line the log
+/// contains, and a large tail (test summaries, "could not compile", the exit line all live at the
+/// end). A head-⅔/tail-⅓ cut lost the middle failures of a three-failure `cargo test` and kept
+/// twelve hundred chars of warnings instead. Without any error line the split is head ⅓ / tail ⅔.
+pub fn truncate_log(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max < 96 {
+        return truncate_result(s, max);
+    }
+    static ANCHOR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let anchor = ANCHOR.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)^\s*(?:error(?:\[E\d+\])?[: ]|FAILED\b|failures:|thread '.*' panicked|panicked at|Traceback \(most recent|[A-Za-z]*(?:Error|Exception)\b[: ]|FAIL\b|npm ERR!|✗|×)",
+        )
+        .expect("static regex")
+    });
+    let markers = 96; // three elision markers
+    let usable = max.saturating_sub(markers);
+    let chars: Vec<char> = s.chars().collect();
+    let take = |from: usize, len: usize| -> String {
+        chars[from..(from + len).min(chars.len())].iter().collect()
+    };
+    let first_anchor = anchor.find(s).map(|m| s[..m.start()].chars().count());
+    match first_anchor {
+        Some(at) => {
+            // head ⅙ · error window ⅓ · tail ½ — the window is centred a little before the anchor
+            // so the lines that led to the error come with it.
+            let head_len = usable / 6;
+            let win_len = usable / 3;
+            let tail_len = usable - head_len - win_len;
+            let tail_start = n - tail_len;
+            let win_start = at.saturating_sub(win_len / 4).max(head_len);
+            let win_end = (win_start + win_len).min(tail_start);
+            let head = take(0, head_len);
+            let mut out = head;
+            if win_start > head_len && win_end > win_start {
+                out.push_str(&format!("\n…[{} chars elided]…\n", win_start - head_len));
+                out.push_str(&take(win_start, win_end - win_start));
+            } else if win_end > win_start {
+                out.push_str(&take(head_len, win_end - head_len));
+            }
+            let resume = win_end.max(head_len);
+            if tail_start > resume {
+                out.push_str(&format!("\n…[{} chars elided]…\n", tail_start - resume));
+                out.push_str(&take(tail_start, tail_len));
+            } else {
+                out.push_str(&take(resume, n - resume));
+            }
+            out
+        }
+        None => {
+            let head_len = usable / 3;
+            let tail_len = usable - head_len;
+            format!(
+                "{}\n…[{} chars elided]…\n{}",
+                take(0, head_len),
+                n - head_len - tail_len,
+                take(n - tail_len, tail_len)
+            )
+        }
+    }
+}
+
+/// Cut a sub-agent report to `max` chars by WHOLE `## ` sections, in order, naming every section
+/// that did not fit — a reviewer's findings 4–9 are worth more than a byte-exact prefix of finding
+/// 4. A report with no section headers falls back to the head+tail cut at this larger budget.
+pub fn truncate_sections(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    // Section = a `## ` header line and everything up to the next one; text before the first
+    // header is the preamble (usually the verdict line, always admitted first).
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut cur_title = String::from("(preamble)");
+    let mut cur = String::new();
+    for line in s.split_inclusive('\n') {
+        if let Some(title) = line.strip_prefix("## ") {
+            if !cur.trim().is_empty() || !sections.is_empty() {
+                sections.push((cur_title.clone(), std::mem::take(&mut cur)));
+            } else {
+                cur.clear();
+            }
+            cur_title = format!("## {}", title.trim_end());
+        }
+        cur.push_str(line);
+    }
+    sections.push((cur_title, cur));
+    if sections.len() < 2 {
+        return truncate_result(s, max);
+    }
+    let reserve = 160 + sections.len() * 40; // the omission line
+    let budget = max.saturating_sub(reserve);
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut omitted: Vec<String> = Vec::new();
+    for (title, body) in &sections {
+        let len = body.chars().count();
+        if used + len <= budget {
+            out.push_str(body);
+            used += len;
+        } else {
+            omitted.push(format!("{title} ({len} chars)"));
+        }
+    }
+    if omitted.is_empty() {
+        return out;
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "…[omitted for the {max}-char delegate budget — whole sections, not clipped: {}. Ask the same role for one of them by name if it matters.]…",
+        omitted.join("; ")
+    ));
+    out
 }
 
 /// Pull the relevance-signal string from a call's args: the query/pattern/topic fields these tools
 /// take. `web_fetch`/`web_crawl` carry a URL (its path segments are decent keywords); `search_files`
-/// a `query`/`pattern`; `file_read` a `path`. Joined so [`relevance_keywords`] can tokenize once.
+/// a `query`/`pattern`. A file `path` is deliberately NOT a signal: the words of a path say where
+/// a file lives, not what the model is looking for in it, and scoring lines by "src", "agent" and
+/// the file's own name kept the wrong region.
 fn relevance_query_from_args(args: &serde_json::Value) -> String {
-    const KEYS: &[&str] = &["query", "pattern", "q", "search", "topic", "url", "path"];
+    const KEYS: &[&str] = &["query", "pattern", "q", "search", "topic", "url"];
     let mut parts = Vec::new();
     for k in KEYS {
         if let Some(v) = args.get(*k).and_then(|v| v.as_str()) {
@@ -5034,11 +5242,14 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
     if scores.iter().all(|&x| x == 0) {
         return truncate_result(s, max); // nothing matched → don't distort; keep head+tail
     }
-    // Reserve ~1/4 of the budget for an always-included HEAD (orientation), the rest for the best
-    // window around the peak-scoring region.
+    // Reserve ~1/4 of the budget for an always-included HEAD (orientation), a small fixed TAIL
+    // (tools put their "…[capped at N — narrow the query]" hints at the very end, and a cut that
+    // drops the hint leaves the model reasoning over a list it cannot tell is incomplete), and the
+    // rest for the best window around the peak-scoring region.
+    const TAIL_KEEP: usize = 200;
     let head_budget = (max / 4).min(n);
     let head: String = s.chars().take(head_budget).collect();
-    let body_budget = max.saturating_sub(head.chars().count() + 48); // 48 ≈ two elision markers
+    let body_budget = max.saturating_sub(head.chars().count() + TAIL_KEEP + 64); // 64 ≈ three elision markers
 
     // Find the contiguous line-run maximizing total score under body_budget chars (greedy window
     // grown around the single best line — O(lines), good enough and stable).
@@ -5083,9 +5294,22 @@ pub fn truncate_relevant(s: &str, max: usize, keywords: &[String]) -> String {
         }
     }
     let window: String = lines[lo..=hi].join("\n");
-    let omitted = n.saturating_sub(head.chars().count() + window.chars().count());
+    // Whatever follows the window: appended whole when it is short, else its last TAIL_KEEP chars
+    // behind a marker, so the trailing hint survives either way.
+    let rest: String = lines[hi + 1..].join("\n");
+    let rest_chars = rest.chars().count();
+    let tail = if rest.is_empty() {
+        String::new()
+    } else if rest_chars <= TAIL_KEEP {
+        format!("\n{rest}")
+    } else {
+        let kept: String = rest.chars().skip(rest_chars - TAIL_KEEP).collect();
+        format!("\n…[{} chars elided]…\n{kept}", rest_chars - TAIL_KEEP)
+    };
+    let omitted =
+        n.saturating_sub(head.chars().count() + window.chars().count() + tail.chars().count());
     format!(
-        "{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}"
+        "{head}\n…[{omitted} chars elided — kept the region most relevant to the query]…\n{window}{tail}"
     )
 }
 
@@ -5837,6 +6061,23 @@ mod tests {
         }
     }
 
+    /// `LongReadTool`'s twin named `web_fetch`: a document tool the loop DOES cut by relevance.
+    struct LongFetchTool;
+    impl Tool for LongFetchTool {
+        fn name(&self) -> &str {
+            "web_fetch"
+        }
+        fn description(&self) -> &str {
+            "test stand-in for web_fetch"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn execute(&self, _args: &serde_json::Value) -> Result<String> {
+            LongReadTool.execute(_args)
+        }
+    }
+
     /// Stateful: returns an INCREMENTING value each call, so every invocation surfaces NEW content
     /// regardless of args — models a legitimate poll/consume loop, used to prove a productive
     /// repeated-signature loop is NOT hard-stopped as divergence.
@@ -5935,6 +6176,8 @@ mod tests {
             auto_extend_to: 5,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
+            max_log_result_chars: 16_000,
+            max_delegate_result_chars: 24_000,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
@@ -6041,13 +6284,7 @@ mod tests {
             return denied;
         }
         crate::core::cancel::with_current(cfg.cancel.clone(), || {
-            run_tool_body(
-                tool,
-                &args,
-                cfg.quiet,
-                cfg.max_tool_result_chars,
-                cfg.max_fetch_result_chars,
-            )
+            run_tool_body(tool, &args, cfg.quiet, cfg.result_budgets())
         })
     }
 
@@ -8465,6 +8702,46 @@ mod tests {
         assert_eq!(out.final_text.as_deref(), Some("done"));
     }
 
+    #[tokio::test]
+    async fn verify_gate_with_nothing_to_run_demands_a_manual_check_once() {
+        // Gate ON, an edit lands, but the tree carries no manifest the gate recognises. The old
+        // shape fell through to Done in silence; now the first "done" is intercepted by ONE demand
+        // to run the project's own check, and the second "done" is accepted — the demand fires
+        // once per run and never loops.
+        let r = registry();
+        let dir = std::env::temp_dir().join(format!("aizen-verify-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = AgentConfig {
+            enable_verify_gate: true,
+            approval_mode: crate::core::approval::ApprovalMode::Yolo,
+            workspace_root: Some(dir.clone()),
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("edit something")];
+        let chat = scripted(vec![
+            tool_turn("delete", "{}"), // a successful destructive op arms made_any_edits
+            final_turn("first done"),  // intercepted: nothing to verify with → demand
+            final_turn("second done"), // accepted: the demand is one-shot
+        ]);
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.final_text.as_deref(), Some("second done"));
+        let demands = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|t| t.contains("[verify] No build or test command"))
+            })
+            .count();
+        assert_eq!(demands, 1, "exactly one absence demand");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── GOAL MODE (`/goal <text>`): the real loop paths ─────────────────────────
     // These drive `run_agent_loop` with `cfg.goal = Some(..)` through scripted turns to exercise the
     // ACTUAL goal gate + smart-retry code (not a re-implementation): premature-stop re-poke, the
@@ -9052,24 +9329,33 @@ mod tests {
         // W22: a read/fetch tool's output must be measured against `max_fetch_chars`, NOT the
         // smaller `max_chars` — otherwise the reach layer's 20k fetch gets halved to 4k before
         // relevance-truncation ever sees the full document (the double-cut the plan calls out).
-        let long_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
         let small_budget = 200usize;
         let large_budget = 6000usize;
-        let out = run_tool_body(
-            long_tool,
-            &serde_json::json!({}),
-            true,
-            small_budget,
-            large_budget,
-        );
+        let budgets = ResultBudgets {
+            default: small_budget,
+            fetch: large_budget,
+            log: small_budget,
+            delegate: small_budget,
+        };
+        let fetch_tool = std::sync::Arc::new(LongFetchTool) as std::sync::Arc<dyn Tool>;
+        let out = run_tool_body(fetch_tool, &serde_json::json!({}), true, budgets);
         assert!(
             out.chars().count() > small_budget,
-            "file_read output should use the larger fetch budget, not the small default: got {} chars",
+            "web_fetch output should use the larger fetch budget, not the small default: got {} chars",
             out.chars().count()
         );
         assert!(
             out.chars().count() <= large_budget + 200,
             "still bounded by the larger budget"
+        );
+        // `file_read` budgets ITSELF (contiguous, marked) — the loop must not cut it again. Its
+        // 12 k-char output sits under the 4× safety net and comes back verbatim.
+        let read_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
+        let verbatim = LongReadTool.execute(&serde_json::json!({})).unwrap();
+        let out = run_tool_body(read_tool, &serde_json::json!({}), true, budgets);
+        assert_eq!(
+            out, verbatim,
+            "the loop must not re-cut a self-budgeted read"
         );
 
         // A non-truncatable tool (positional output) stays at the SMALL budget regardless.
@@ -9091,13 +9377,23 @@ mod tests {
             relevance_query_from_args(&serde_json::json!({"other": 1})),
             ""
         );
+        // A file path is where the file lives, not what the model wants from it.
+        assert_eq!(
+            relevance_query_from_args(&serde_json::json!({"path": "src/agent/builtin.rs"})),
+            ""
+        );
     }
 
     #[test]
-    fn is_relevance_truncatable_matches_read_fetch_only() {
-        assert!(is_relevance_truncatable("file_read"));
+    fn is_relevance_truncatable_matches_fetch_and_search_only() {
         assert!(is_relevance_truncatable("web_fetch"));
         assert!(is_relevance_truncatable("search_files"));
+        assert!(
+            !is_relevance_truncatable("file_read"),
+            "file_read cuts itself — a second, keyword-scored cut splices the file"
+        );
+        assert!(is_self_budgeted("file_read"));
+        assert!(!is_self_budgeted("search_files"));
         assert!(
             !is_relevance_truncatable("file_edit"),
             "edit output is positional"
@@ -9105,6 +9401,106 @@ mod tests {
         assert!(
             !is_relevance_truncatable("shell_run"),
             "shell log is positional"
+        );
+    }
+
+    #[test]
+    fn truncate_log_keeps_the_first_error_and_the_tail() {
+        // A build log: a banner, 200 warning lines, the first real error deep in the middle, more
+        // noise, then the verdict at the end.
+        let mut lines: Vec<String> = vec!["exit 101".into(), "   Compiling aizen v0.6.7".into()];
+        lines.extend((1..=200).map(|i| format!("warning: unused variable `w{i}` in src/x.rs")));
+        lines.push("error[E0599]: no method named `frob` found for struct `Parser`".into());
+        lines.push("  --> src/parse.rs:42:10".into());
+        lines.extend((1..=200).map(|i| format!("warning: more noise {i}")));
+        lines.push(
+            "error: could not compile `aizen` (bin \"aizen\") due to 1 previous error".into(),
+        );
+        let log = lines.join("\n");
+        let out = truncate_log(&log, 3_000);
+        assert!(
+            out.starts_with("exit 101\n   Compiling"),
+            "head kept: {out}"
+        );
+        assert!(
+            out.contains("error[E0599]"),
+            "the first error survives the cut: {out}"
+        );
+        assert!(out.contains("src/parse.rs:42:10"), "with its location line");
+        assert!(
+            out.trim_end().ends_with("due to 1 previous error"),
+            "the verdict at the end survives: {out}"
+        );
+        assert!(out.chars().count() <= 3_000, "{}", out.chars().count());
+        // No error line at all: tail-weighted head+tail.
+        let plain: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let out = truncate_log(&plain, 1_000);
+        assert!(out.starts_with("line 1\n"));
+        assert!(out.trim_end().ends_with("line 400"));
+        let head_part = out.split("…[").next().unwrap().chars().count();
+        assert!(head_part < 400, "head is the smaller share: {head_part}");
+    }
+
+    #[test]
+    fn truncate_sections_admits_whole_sections_and_names_the_rest() {
+        let report = format!(
+            "VERDICT: FAIL — 2 blocking findings\n\n## Findings\n{}\n## Coverage gaps\n{}\n## Commands run\n- cargo test\n",
+            (1..=9).map(|i| format!("{i}. [P1] src/a.rs:{i} — finding number {i} with detail")).collect::<Vec<_>>().join("\n"),
+            "x".repeat(900),
+        );
+        let out = truncate_sections(&report, 1_000);
+        assert!(out.starts_with("VERDICT: FAIL"), "preamble first: {out}");
+        assert!(
+            out.contains("finding number 9"),
+            "a section is admitted WHOLE or not at all"
+        );
+        assert!(
+            out.contains("## Commands run\n- cargo test"),
+            "small later sections still fit"
+        );
+        assert!(
+            out.contains("## Coverage gaps (")
+                && out.contains("omitted for the 1000-char delegate budget"),
+            "the dropped section is named, not clipped: {out}"
+        );
+        assert!(
+            !out.contains("xxxxxxxx"),
+            "no fragment of the dropped section leaks"
+        );
+        // No headers: fall back to head+tail at this budget.
+        let flat = "y".repeat(2_000);
+        assert!(truncate_sections(&flat, 500).contains("chars truncated"));
+        // Under budget: untouched.
+        assert_eq!(truncate_sections("## A\nshort\n", 500), "## A\nshort\n");
+    }
+
+    #[test]
+    fn truncate_relevant_keeps_the_trailing_hint() {
+        // 80 filler lines, the match deep in the middle, and the tool's cap hint on the last line.
+        let mut lines: Vec<String> = (1..=80)
+            .map(|i| format!("line {i} filler text here"))
+            .collect();
+        lines[40] = "fn retry_policy() { /* the needle */ }".to_string();
+        lines.push("…[capped at 200 matches — narrow the pattern]".to_string());
+        let text = lines.join("\n");
+        let out = truncate_relevant(&text, 700, &["retry_policy".to_string()]);
+        assert!(
+            out.contains("the needle"),
+            "keeps the matching region: {out}"
+        );
+        assert!(
+            out.trim_end()
+                .ends_with("…[capped at 200 matches — narrow the pattern]"),
+            "the tool's own cap hint must survive the cut: {out}"
+        );
+        assert!(
+            out.starts_with("line 1 filler"),
+            "head kept for orientation"
+        );
+        assert!(
+            out.chars().count() <= 700 + 64,
+            "stays near budget: {}",
+            out.chars().count()
         );
     }
 
