@@ -1396,6 +1396,11 @@ fn line_bad(msg: &str) {
     tui::emit_line(&format!("  {} {}", style("✗").red(), style(msg).red()));
 }
 
+/// `  <msg>` dimmed — guidance for the prompt that follows, kept off the prompt line itself.
+fn line_dim(msg: &str) {
+    tui::emit_line(&format!("  {}", style(msg).dim()));
+}
+
 /// `  ! <msg>` in the warn colour — something to know, but not a stop.
 fn line_warn(msg: &str) {
     tui::emit_line(&format!(
@@ -1427,25 +1432,40 @@ async fn prompt_validated_base_url(
     allow_skip: bool,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
     let mut suggestion: Option<String> = current.map(str::to_string);
+    // The guidance rides on its own dim line, not in the prompt: a long prompt plus a long
+    // URL wraps the live input line, and dialoguer redraws a wrapped line badly (fragments
+    // of the old text survive beside the new one). The prompt itself stays two words, and a
+    // kept value is announced on its own line for the same reason (Enter still keeps it).
+    line_dim("base URL must include the version path, e.g. https://api.openai.com/v1");
     loop {
         let mut input = Input::<String>::with_theme(theme)
-            .with_prompt("Base URL (must include the version path, e.g. https://api.openai.com/v1)")
+            .with_prompt("Base URL")
             .allow_empty(allow_skip);
         if let Some(s) = suggestion.clone() {
-            input = input.default(s);
+            line_dim(&format!("Enter keeps {s}"));
+            input = input.default(s).show_default(false);
         }
         let raw = input.interact_text()?;
-        let base = raw.trim().trim_end_matches('/').to_string();
-        if base.is_empty() {
+        let typed = raw.trim().trim_end_matches('/').to_string();
+        if typed.is_empty() {
             if allow_skip {
                 return Ok(None);
             }
             line_bad("a base URL is required");
             continue;
         }
-        if !(base.starts_with("http://") || base.starts_with("https://")) {
-            line_bad("must start with http:// or https://");
-            suggestion = Some(format!("https://{base}"));
+        // `htps://`, a missing scheme, `https://https://` from a paste over a prefilled
+        // field: read what was meant instead of bouncing the question back.
+        let base = normalize_scheme(&typed);
+        if base != typed {
+            line_warn(&format!("read as {base}"));
+        }
+        if base
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.is_empty())
+        {
+            line_bad("must name a host, e.g. https://api.openai.com/v1");
+            suggestion = None;
             continue;
         }
 
@@ -1493,6 +1513,32 @@ async fn prompt_validated_base_url(
             return Ok(None);
         }
     }
+}
+
+/// Read the scheme the way it was meant: a mistyped one (`htps://`, `http:/`) becomes
+/// `https://` (or `http://` when that is what was typed), a missing one is added, and a doubled
+/// one — a URL pasted over a prefilled `https://` — collapses to the last. Everything after the
+/// last scheme-looking prefix is kept verbatim; `localhost:8080/v1` has no scheme (a port is
+/// not a scheme) and gets `https://` in front.
+fn normalize_scheme(typed: &str) -> String {
+    let mut rest = typed.trim();
+    let mut scheme = "https";
+    while let Some((word, after)) = rest.split_once(':') {
+        let scheme_word = word.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if !scheme_word || !after.starts_with('/') {
+            break;
+        }
+        scheme = if word.eq_ignore_ascii_case("http") {
+            "http"
+        } else {
+            "https"
+        };
+        rest = after.trim_start_matches('/');
+    }
+    format!("{scheme}://{}", rest.trim_end_matches('/'))
 }
 
 /// `Some(base + "/v1")` when `base` has no version-looking final segment, else `None`.
@@ -1566,6 +1612,7 @@ async fn prompt_validated_api_key(
         let entered = Input::<String>::with_theme(theme)
             .with_prompt(prompt)
             .allow_empty(true)
+            .report(false) // the key is visible while typed, never echoed into the scrollback
             .interact_text()?;
         let entered = entered.trim().to_string();
         let candidate = if entered.is_empty() {
@@ -1760,6 +1807,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         ];
         let pick = match Select::with_theme(&theme)
             .with_prompt("Config — pick a section (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2266,6 +2314,7 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Providers (Esc when done)")
+            .report(false)
             .items(&items)
             .default(items.len().saturating_sub(2))
             .interact_opt()?
@@ -2318,6 +2367,7 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
         let existing = &list[pick];
         let action = Select::with_theme(&theme)
             .with_prompt(format!("{} (Esc cancels)", existing.name))
+            .report(false)
             .items(&["use now", "edit endpoint + key + model", "rename", "remove"])
             .default(0)
             .interact_opt()?;
@@ -2670,6 +2720,7 @@ async fn config_edit_pantheon(cfg: &mut cli_config::CliConfig) -> Result<()> {
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Pantheon roles — each above the sub-agent default (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2725,6 +2776,7 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
         let pick = match Select::with_theme(&theme)
             .with_prompt("Sub-agents & roles (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2865,6 +2917,7 @@ fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Op
             let key: String = Input::with_theme(theme)
                 .with_prompt("API key")
                 .allow_empty(true)
+                .report(false)
                 .interact_text()?;
             let key = key.trim();
             Ok((!key.is_empty()).then(|| key.to_string()))
@@ -3011,6 +3064,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Model → endpoint (Esc when done)")
+            .report(false)
             .items(&items)
             .default(items.len().saturating_sub(2))
             .interact_opt()?
@@ -3112,6 +3166,7 @@ async fn config_edit_agent_pins(cfg: &mut cli_config::CliConfig) -> Result<()> {
             .collect();
         let Some(pick) = Select::with_theme(&theme)
             .with_prompt("Specialist agent (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -3341,6 +3396,7 @@ where
         let entered = Input::<String>::with_theme(theme)
             .with_prompt(prompt)
             .allow_empty(true)
+            .report(false) // the key is visible while typed, never echoed into the scrollback
             .interact_text()?;
         let entered = entered.trim().to_string();
         if entered.is_empty() {

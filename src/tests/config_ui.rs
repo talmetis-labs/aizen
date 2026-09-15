@@ -387,3 +387,36 @@ fn a_pin_takes_the_name_it_recorded_not_one_the_user_invents() {
     assert_eq!(pin_profile_name(Some("   ")), default);
     assert_eq!(pin_profile_name(None), default);
 }
+
+/// The Base URL prompt reads a scheme the way it was meant instead of bouncing the question back:
+/// a typo, a missing scheme, and the doubled scheme a paste over a prefilled field produces (the
+/// old retry default was `https://` + the typed text, which is where `https://https://…` came
+/// from). A port is not a scheme.
+#[test]
+fn base_url_scheme_is_read_as_meant() {
+    assert_eq!(normalize_scheme("https://a.com/v1"), "https://a.com/v1");
+    assert_eq!(
+        normalize_scheme("http://localhost:11434/v1"),
+        "http://localhost:11434/v1"
+    );
+    assert_eq!(normalize_scheme("htps://a.com/v1"), "https://a.com/v1");
+    assert_eq!(normalize_scheme("http:/a.com/v1"), "http://a.com/v1");
+    assert_eq!(
+        normalize_scheme("https://https://a.com/v1"),
+        "https://a.com/v1"
+    );
+    assert_eq!(normalize_scheme("a.com/v1/"), "https://a.com/v1");
+    assert_eq!(
+        normalize_scheme("localhost:8080/v1"),
+        "https://localhost:8080/v1"
+    );
+    assert_eq!(
+        normalize_scheme("https://a.com:8443/v1"),
+        "https://a.com:8443/v1"
+    );
+    assert_eq!(
+        normalize_scheme("https://"),
+        "https://",
+        "no host survives to the host check"
+    );
+}
