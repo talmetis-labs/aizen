@@ -854,6 +854,22 @@ async fn run_menu_sticky() -> Result<()> {
                     effort_turn_line(eff.as_deref(), routed),
                     theme::faint(&format!("· {}", shape.as_str()))
                 ));
+                // Architect mode: a strong model plans, the turn applies on the fast one. Runs
+                // BEFORE the registry is built so the registry and every child see the editor
+                // model; the plan is folded in once the user message is seated below.
+                let architect = crate::repl::turn::architect_phase(
+                    &http,
+                    &ep,
+                    eff.as_deref(),
+                    shape,
+                    &line,
+                    turn_cancel.clone(),
+                )
+                .await;
+                let ep = architect
+                    .as_ref()
+                    .map(|(editor, _)| editor.clone())
+                    .unwrap_or(ep);
                 if let Err(e) = crate::core::recovery::checkpoint_history(
                     &history,
                     Some(&line),
@@ -886,6 +902,9 @@ async fn run_menu_sticky() -> Result<()> {
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
                 seat_user_message(&line, images, &mut history, &model);
+                if let Some((_, plan)) = &architect {
+                    crate::agent::architect::attach_plan(&mut history, plan);
+                }
                 let mut cfg = turn_agent_config(turn_cancel.clone(), &model, true);
                 // The tier shapes the harness budgets too (steps, continuations, verify rounds,
                 // self-review, log budget) — see `AgentConfig::apply_effort`.
@@ -1201,6 +1220,22 @@ async fn run_menu_plain() -> Result<()> {
             effort_turn_line(eff.as_deref(), routed),
             theme::faint(&format!("· {}", shape.as_str()))
         );
+        // Architect mode — same hook as the retained REPL; the cancel token is created here
+        // (rather than at the agent config below) so the planner child can observe it too.
+        let turn_cancel = crate::core::cancel::TurnCancel::new();
+        let architect = crate::repl::turn::architect_phase(
+            &http,
+            &ep,
+            eff.as_deref(),
+            shape,
+            &line,
+            turn_cancel.clone(),
+        )
+        .await;
+        let ep = architect
+            .as_ref()
+            .map(|(editor, _)| editor.clone())
+            .unwrap_or(ep);
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
         let persona_before = cli_config::load().persona;
@@ -1219,8 +1254,10 @@ async fn run_menu_plain() -> Result<()> {
         // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
         // history / display.
         seat_user_message(&line, images, &mut history, &model);
+        if let Some((_, plan)) = &architect {
+            crate::agent::architect::attach_plan(&mut history, plan);
+        }
         // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
-        let turn_cancel = crate::core::cancel::TurnCancel::new();
         let mut cfg = turn_agent_config(turn_cancel, &model, false);
         if let Some(t) = eff.as_deref() {
             cfg.apply_effort(t);

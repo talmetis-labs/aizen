@@ -1014,7 +1014,7 @@ where
 /// Run one task as a role-scoped sub-agent (silent; non-streaming). Errors are captured into the
 /// outcome (a failed task never aborts the workflow — its siblings + the synthesis still run).
 #[allow(clippy::too_many_arguments)]
-async fn run_one_task(
+pub(crate) async fn run_one_task(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,

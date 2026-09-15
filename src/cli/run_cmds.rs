@@ -522,6 +522,49 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         }
     }
 
+    // Architect mode (see agent::architect): under max effort a multi-file task is planned first
+    // by metis on the strong model; the loop then applies the plan on the fast model at low
+    // wire effort. Decided before the chat closure borrows `model`.
+    let mut model = model;
+    let mut architect_plan: Option<String> = None;
+    {
+        let tier = cli_config::effort_override().flatten();
+        let shape = crate::core::turn_shape::classify(args.task.trim());
+        if crate::agent::architect::applies(
+            tier.as_deref(),
+            shape,
+            cli_config::architect_mode_enabled(),
+        ) {
+            let ep = cli_config::ResolvedEndpoint {
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+            };
+            let planner = crate::agent::architect::planner_model(&cli_config::load(), &model);
+            eprintln!("architect: metis planning on {planner}…");
+            if let Some(plan) = crate::agent::architect::plan(
+                &http,
+                &ep,
+                cli_approval,
+                std::path::Path::new(&cwd),
+                args.task.trim(),
+                cfg.cancel.clone(),
+                cfg.context_window,
+            )
+            .await
+            {
+                let editor = crate::agent::architect::editor_model(&cli_config::load(), &model);
+                eprintln!(
+                    "{}",
+                    crate::agent::architect::status_line(&planner, &editor, plan.chars().count())
+                );
+                model = editor;
+                cli_config::set_effort_override(Some("low".to_string()));
+                architect_plan = Some(plan);
+            }
+        }
+    }
+
     // The model call, injected into the loop. http_ref/base/key/model are all Copy
     // (&Client / &str), so the closure stays `Fn` across the loop's repeated calls.
     let http_ref = &http;
@@ -564,6 +607,9 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         Message::user_with_images(args.task.trim(), images)
     };
     let mut history = vec![Message::system(&system), asked];
+    if let Some(plan) = &architect_plan {
+        crate::agent::architect::attach_plan(&mut history, plan);
+    }
     // A one-shot run is the canonical single-turn shape (one prompt, many tool steps): give it the
     // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
     // of relying on tool-result clearing alone.

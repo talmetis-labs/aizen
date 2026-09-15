@@ -100,6 +100,56 @@ pub(crate) fn turn_agent_config(
     }
 }
 
+/// Architect mode for one turn (see `agent::architect`). When it applies — `max` effort, a
+/// multi-file request, the mode on — a `metis` child on the planner model writes the plan, and
+/// the turn continues on the editor model at low wire effort: the returned endpoint is the one
+/// to build the registry with, the plan is folded into the user message once it is seated
+/// (`architect::attach_plan`). `None` means the turn runs exactly as it would have.
+pub(crate) async fn architect_phase(
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+    eff: Option<&str>,
+    shape: crate::core::turn_shape::TurnShape,
+    line: &str,
+    cancel: crate::core::cancel::TurnCancel,
+) -> Option<(cli_config::ResolvedEndpoint, String)> {
+    use crate::agent::architect;
+    if !architect::applies(eff, shape, cli_config::architect_mode_enabled()) {
+        return None;
+    }
+    let root = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let planner = architect::planner_model(&cli_config::load(), &ep.model);
+    tui::emit_line(&theme::faint(&format!("architect: metis planning on {planner}…")).to_string());
+    let plan = architect::plan(
+        http,
+        ep,
+        approval_mode(),
+        &root,
+        line,
+        cancel,
+        resolve_ctx_window(&ep.model).0,
+    )
+    .await?;
+    let editor = architect::editor_model(&cli_config::load(), &ep.model);
+    tui::emit_line(
+        &theme::faint(&architect::status_line(
+            &planner,
+            &editor,
+            plan.chars().count(),
+        ))
+        .to_string(),
+    );
+    let mut out = ep.clone();
+    out.model = editor;
+    // The editor types at low wire effort; the harness budgets the `max` tier already applied
+    // to `AgentConfig` stay — a multi-file change on `low`'s twelve steps would be cut off.
+    cli_config::set_effort_override(Some("low".to_string()));
+    Some((out, plan))
+}
+
 /// The nudge role for the endpoint this REPL talks to (saved config or the `AIZEN_BASE_URL`
 /// override — the same two sources `resolve_endpoint` reads first).
 fn nudge_role_for_endpoint() -> crate::agent::NudgeRole {

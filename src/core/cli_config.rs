@@ -91,6 +91,13 @@ pub struct CliConfig {
     /// without an entry use the main model. The cheap-tier half of "effort with teeth".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_by_effort: Option<std::collections::BTreeMap<String, String>>,
+    /// Architect mode: under `max` effort a multi-file turn is planned first by `metis` on the
+    /// strongest model (`models_by_effort.max` / `xhigh`, else the turn's) and then applied by
+    /// the turn's own loop on the fastest (`models_by_effort.low`, else the same) at low wire
+    /// effort with the plan in hand (see `agent::architect`). `None` ⇒ on. `AIZEN_ARCHITECT=0`
+    /// turns it off without a config edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architect_mode: Option<bool>,
     /// Keep the rarely-used built-in tools (workflow, checkpoint, the memory and skill write
     /// surface, …) off the request and behind `tool_search`. `None` ⇒ on for first-party APIs
     /// (api.anthropic.com, api.openai.com) and off elsewhere: some hosted gateways grammar-lock
@@ -1253,6 +1260,18 @@ pub fn auto_copy_enabled() -> bool {
         return matches!(t.as_str(), "1" | "true" | "on" | "yes");
     }
     load().auto_copy.unwrap_or(true)
+}
+
+/// Is architect mode ON (see `agent::architect`)? `AIZEN_ARCHITECT` env wins; otherwise the
+/// `architect_mode` config field, defaulting to ON.
+pub fn architect_mode_enabled() -> bool {
+    if let Ok(v) = std::env::var("AIZEN_ARCHITECT") {
+        return matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        );
+    }
+    load().architect_mode.unwrap_or(true)
 }
 
 /// Is adaptive difficulty→effort routing ON (P3)? `AIZEN_ADAPTIVE_EFFORT` env wins; otherwise the
