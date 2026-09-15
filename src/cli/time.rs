@@ -192,7 +192,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                 }
                 Ok(())
             } else {
-                let (report, compacted) = timemachine::doctor_gc()?;
+                let (report, compacted, pruned) = timemachine::doctor_gc()?;
                 println!(
                     "{} repo {} · worktree {} · {} checkpoint(s)",
                     style("🧹 time metadata cleaned:").color256(splash::ACCENT),
@@ -217,6 +217,22 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
                         c.packed,
                         size(c.before_bytes),
                         size(c.after_bytes)
+                    );
+                }
+                if let Some(p) = pruned.filter(|p| p.pruned > 0) {
+                    let size = |b: u64| {
+                        if b >= 1_048_576 {
+                            format!("{:.1} MB", b as f64 / 1_048_576.0)
+                        } else {
+                            format!("{:.0} KB", b as f64 / 1024.0)
+                        }
+                    };
+                    println!(
+                        "  pruned {} unreachable object(s) of {} · {} → {}",
+                        p.pruned,
+                        p.owned,
+                        size(p.before_bytes),
+                        size(p.after_bytes)
                     );
                 }
                 Ok(())

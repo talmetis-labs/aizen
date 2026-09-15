@@ -1134,6 +1134,138 @@ impl RepoContext {
         oids
     }
 
+    /// Objects in the store's OWN packs, read from each `.idx` with `show-index` — like
+    /// [`RepoContext::loose_object_ids`], an enumeration with no walk and no alternates in it.
+    fn packed_object_ids(&self) -> Vec<String> {
+        let pack_dir = self.store_git_dir.join("objects").join("pack");
+        let mut oids = Vec::new();
+        let Ok(rd) = fs::read_dir(&pack_dir) else {
+            return oids;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "idx") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&p) else {
+                continue;
+            };
+            let Ok(out) = self.git_output_stdin(["show-index"], &bytes, "private-store show-index")
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(oid) = line.split_whitespace().nth(1) {
+                    oids.push(oid.to_string());
+                }
+            }
+        }
+        oids
+    }
+
+    /// Objects reachable from the store's refs. `--missing=allow-any` keeps the walk alive across
+    /// a parent that lives only in the source repository — the case that kills `git gc` here.
+    fn reachable_object_ids(&self) -> Result<HashSet<String>> {
+        let out = self.git(
+            None,
+            ["rev-list", "--objects", "--missing=allow-any", "--all"],
+        )?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Drop every object the store owns that no ref reaches (E5.4, quality plan S8: retention
+    /// deleted refs, never bytes, so a store only ever grew). Selection is by OID, never by the
+    /// history walk the alternates cannot complete: the reachable set comes from a walk that
+    /// tolerates a missing parent, the owned set from the filesystem, and what is kept is
+    /// re-packed from that list before anything is deleted.
+    fn prune_unreachable(&self) -> Result<PruneReport> {
+        let objects = self.store_git_dir.join("objects");
+        let before_bytes = dir_size_bytes(&objects);
+        let owned: HashSet<String> = self
+            .loose_object_ids()
+            .into_iter()
+            .chain(self.packed_object_ids())
+            .collect();
+        let reachable = self.reachable_object_ids()?;
+        let drop: Vec<&String> = owned.iter().filter(|o| !reachable.contains(*o)).collect();
+        if drop.is_empty() {
+            return Ok(PruneReport {
+                owned: owned.len(),
+                pruned: 0,
+                before_bytes,
+                after_bytes: before_bytes,
+            });
+        }
+        let keep: Vec<&String> = owned.iter().filter(|o| reachable.contains(*o)).collect();
+        let pack_dir = objects.join("pack");
+        fs::create_dir_all(&pack_dir)
+            .with_context(|| format!("creating pack dir {}", pack_dir.display()))?;
+        let old_packs: Vec<PathBuf> = fs::read_dir(&pack_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "pack" || x == "idx"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The kept objects go into one fresh pack, named by git after their checksum. When the
+        // kept set equals an old pack's exactly, the names collide and the new pack IS the old
+        // one — it must survive the sweep below, so its name is read back and excluded.
+        let mut fresh_name: Option<String> = None;
+        if !keep.is_empty() {
+            let mut stdin = String::with_capacity(keep.len() * 41);
+            for oid in &keep {
+                stdin.push_str(oid);
+                stdin.push('\n');
+            }
+            let pack_base = strip_windows_verbatim(&pack_dir.join("pack"))
+                .to_string_lossy()
+                .replace('\\', "/");
+            let out = self.git_output_stdin(
+                ["pack-objects", "--non-empty", "-q", &pack_base],
+                stdin.as_bytes(),
+                "private-store pack-objects (prune)",
+            )?;
+            if !out.status.success() {
+                bail!(
+                    "re-packing the reachable objects failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !hash.is_empty() {
+                fresh_name = Some(format!("pack-{hash}"));
+            }
+        }
+        // Only now: the packs listed BEFORE the fresh one, and the unreachable loose copies.
+        for p in old_packs {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if fresh_name.as_deref() == Some(stem) {
+                continue;
+            }
+            let _ = fs::remove_file(p);
+        }
+        for oid in &drop {
+            if oid.len() > 2 {
+                let _ = fs::remove_file(objects.join(&oid[..2]).join(&oid[2..]));
+            }
+        }
+        let _ = self.git_output(None, ["prune-packed", "-q"]);
+        Ok(PruneReport {
+            owned: owned.len(),
+            pruned: drop.len(),
+            before_bytes,
+            after_bytes: dir_size_bytes(&objects),
+        })
+    }
+
     /// Compact the store's loose objects into a pack.
     ///
     /// `git gc` and `git repack` cannot do this job here, and that is not a tuning problem — it is
@@ -3414,7 +3546,7 @@ pub fn doctor_repair() -> Result<DoctorReport> {
 /// Returns the health report plus what compaction reclaimed, so the CLI can report bytes rather than
 /// only "cleaned". The compaction half is `None` when packing could not run — a store that will not
 /// compact is still a store worth reporting on.
-pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>)> {
+pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>, Option<PruneReport>)> {
     let ctx = RepoContext::current()?;
     // Whole-store sweep: block every sibling worktree's ref creation/deletion for the scan+reap so a
     // concurrent `save` can't slip a ref past `for-each-ref`. Store-exclusive ordered before the
@@ -3503,9 +3635,12 @@ pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>)> {
     // and an explicit `gc` is exactly when the user is asking for space back — so compact
     // unconditionally here rather than waiting for `LOOSE_COMPACT_THRESHOLD`. Best-effort: a store
     // that cannot be packed is still a healthy store, and `doctor()` below reports what it finds.
+    // E5.4: drop what no ref reaches first (re-packing the rest by OID), then pack whatever
+    // loose objects remain. Both best-effort: a store that cannot be pruned is still healthy.
+    let pruned = ctx.prune_unreachable().ok();
     let compacted = ctx.compact_objects().ok();
     drop(_lock);
-    Ok((doctor()?, compacted))
+    Ok((doctor()?, compacted, pruned))
 }
 
 /// One private store found while sweeping `~/.aizen/timemachine/`. Two ways a store is an ORPHAN:
@@ -3530,6 +3665,17 @@ pub struct StoreEntry {
     pub superseded_by: Option<String>,
     pub bytes: u64,
     pub checkpoints: usize,
+}
+
+/// What one [`RepoContext::prune_unreachable`] pass reclaimed.
+#[derive(Debug, Clone, Serialize)]
+pub struct PruneReport {
+    /// Objects the store owned before the prune (loose + in its own packs).
+    pub owned: usize,
+    /// Of those, the ones no live ref reached — removed.
+    pub pruned: usize,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 /// What one [`RepoContext::compact_objects`] pass moved into a pack.
@@ -4580,6 +4726,97 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "checkpoint tree became unreadable");
+        // E5.4: the prune's reachability walk must survive the same dangling parent, and it
+        // must keep everything the checkpoint reaches.
+        let prune = ctx
+            .prune_unreachable()
+            .expect("prune must survive a parent that lives only in the (gone) source");
+        assert_eq!(prune.pruned, 0, "everything here is reachable from the ref");
+        let out = git_cmd()
+            .env("GIT_DIR", &store)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .args(["cat-file", "-e", &format!("{commit}^{{tree}}")])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "prune must not touch reachable objects"
+        );
+    }
+
+    /// E5.4 (quality plan S8): an object no ref reaches is removed — loose or packed — and the
+    /// reachable ones come out the other side readable, in one fresh pack.
+    #[test]
+    fn prune_drops_unreachable_objects_and_keeps_reachable_ones() {
+        if !git_available() {
+            return;
+        }
+        let tmp = scratch("prune");
+        let store = tmp.join("store.git");
+        git_in(&tmp, &["init", "-q", "--bare", &store.to_string_lossy()]);
+        let kept_file = tmp.join("kept.txt");
+        fs::write(&kept_file, b"kept\n").unwrap();
+        let blob = git_in(
+            &store,
+            &["hash-object", "-w", "--", &kept_file.to_string_lossy()],
+        );
+        let index = tmp.join("prune.idx");
+        git_in_index(
+            &store,
+            Some(&index),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},kept.txt"),
+            ],
+        );
+        let tree = git_in_index(&store, Some(&index), &["write-tree"]);
+        let commit = git_in(&store, &["commit-tree", &tree, "-m", "checkpoint"]);
+        git_in(&store, &["update-ref", "refs/ng/tm/wt-test/1", &commit]);
+        // A blob nothing references: the shape retention leaves behind when it deletes a ref.
+        let orphan_file = tmp.join("orphan.txt");
+        fs::write(&orphan_file, b"nobody points at me\n").unwrap();
+        let orphan = git_in(
+            &store,
+            &["hash-object", "-w", "--", &orphan_file.to_string_lossy()],
+        );
+        let ctx = ctx_for_store(&tmp, &store);
+        // Pack everything first so the orphan sits INSIDE a pack, the harder case.
+        ctx.compact_objects().expect("compaction");
+        assert_eq!(ctx.loose_object_ids().len(), 0);
+        let report = ctx.prune_unreachable().expect("prune");
+        assert_eq!(report.owned, 4, "blob, tree, commit and the orphan");
+        assert_eq!(report.pruned, 1, "only the orphan goes");
+        let exists = |oid: &str| {
+            git_cmd()
+                .env("GIT_DIR", &store)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_device())
+                .args(["cat-file", "-e", oid])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(!exists(&orphan), "the orphan is gone");
+        assert!(
+            exists(&blob) && exists(&tree) && exists(&commit),
+            "the checkpoint is intact"
+        );
+        let packs: Vec<_> = fs::read_dir(store.join("objects").join("pack"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .collect();
+        assert_eq!(
+            packs.len(),
+            1,
+            "one fresh pack, the old one swept: {packs:?}"
+        );
+        // A second prune finds nothing and changes nothing.
+        let again = ctx.prune_unreachable().expect("prune again");
+        assert_eq!(again.pruned, 0);
     }
 
     /// An empty store is a no-op, not an error: `pack-objects` with no input would fail, and a save
