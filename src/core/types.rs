@@ -15,6 +15,10 @@ pub struct ChatRequest {
     /// from the wire when None → provider default; set from `CliConfig.max_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// The same cap under the name o-series / gpt-5-style models insist on. Never set from config:
+    /// the client moves `max_tokens` here when a provider 400s on it (see `send_chat`'s quirks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     /// Tools the model may call. Omitted from the wire when empty (plain chat).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDef>,
@@ -711,6 +715,7 @@ mod tests {
             stream: false,
             temperature: None,
             max_tokens: None,
+            max_completion_tokens: None,
             tools: Vec::new(),
             tool_choice: None,
             parallel_tool_calls: None,
@@ -738,6 +743,7 @@ mod tests {
             stream: false,
             temperature: None,
             max_tokens: None,
+            max_completion_tokens: None,
             tools: vec![tool],
             tool_choice: Some("auto".into()),
             parallel_tool_calls: Some(true),

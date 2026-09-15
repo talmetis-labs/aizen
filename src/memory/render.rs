@@ -28,10 +28,11 @@ pub fn sanitize_body(s: &str) -> String {
     out
 }
 
-/// Estimate tokens from chars (chars/4) — model-independent, matches the budgeting
-/// approach we adopted (no tiktoken dependency).
+/// Estimate tokens — the shared estimator (`core::tokens`), rounded up so a cap never admits
+/// more than it says. ASCII is exactly `ceil(chars/4)`; Vietnamese and CJK count 1/1.8 per char,
+/// which is why a "2,000-token" memory cap used to admit ~4,000 real tokens of Vietnamese.
 pub fn est_tokens(s: &str) -> usize {
-    s.chars().count().div_ceil(4)
+    crate::core::tokens::estimate_str_ceil(s)
 }
 
 /// Render one entry as a sanitized section.
