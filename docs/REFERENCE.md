@@ -665,6 +665,13 @@ Behavior worth knowing:
   ```json fence, a bare `{"name": …, "arguments": {…}}` reply or Mistral's `[TOOL_CALLS] [...]` —
   is executed when the native `tool_calls` array is empty and every name is a registered tool.
   Prose with no such block, or a block naming an unknown tool, is left exactly as written.
+- **Concise tool output by default** — `shell_run`, `process` and `search_files` take
+  `format: concise | detailed`. Concise, the default, changes nothing for a short result; a log
+  over about 4,000 characters is cut to its status line, the head, the first error and the tail,
+  with a second line stating the line and byte counts and the scratch file that holds the full
+  text; a search past 40 rows shows those rows and counts the rest per file, the whole list on
+  disk. `detailed` returns everything up to the loop's budget (16 KB for logs), and the 16 KB
+  spill still applies above that.
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
   choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval ask|smart|yolo`

@@ -103,6 +103,13 @@ handing the model false inputs, and starts measuring what it sends.
   only (`api.anthropic.com`, `api.openai.com`), because some gateways cannot call a tool that was
   not advertised; `lean_tools` in `cli-config.json` turns it on or off explicitly. The effort line
   now names the shape, and `aizen prompt-size` prints the lean size beside the full one.
+- **`format: concise | detailed` on `shell_run`, `process` and `search_files`**, concise by
+  default. A short result is unchanged. A log over 4,000 chars keeps its status line, the head,
+  the first error and the tail, states on its second line how many lines and bytes there were,
+  and names the scratch file holding all of it; a search past 40 rows shows the first 40 and
+  counts the rest per file, with the whole list on disk. `detailed` returns everything up to the
+  loop budget. A 15 KB `cargo test` log used to ride whole in every later request until it aged
+  out.
 - **Older tool results collapse to one line; big results spill to disk.** A tool result older
   than the eight most recent and longer than 800 chars becomes `[collapsed] shell_run cargo test ·
   412 lines · 28.4 KB · full text at <scratch>/tool-output/0003-shell_run.txt`, once eight of them

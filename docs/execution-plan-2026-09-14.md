@@ -85,15 +85,17 @@ the model · Python fixture cannot fake `Done` · multi-line `rm` is asked · su
 
 **Status 2026-09-15:** implemented E1.1, E1.4, E1.5, E1.6, E1.7, E1.8, E1.11, E1.12, E1.14,
 E1.15, E1.16 (commits `0807671`, `24c92a4`, `99c9a5f`, `b34bbb8` on `feat/e0.1-usage-ledger`),
-then E1.2 (`src/agent/observe.rs`) and E1.13 (`src/agent/lenient.rs`) on the same branch. Not
-yet: E1.3 (`format:` on the log tools), E1.9 (edit-tool polish), E1.10 (async diagnostics),
-E1.17 (Codex parity, first to cut).
+then E1.2 (`src/agent/observe.rs`) and E1.13 (`src/agent/lenient.rs`) (commits `5b062f0`,
+`f1a9c6a`, `a08ac6e`) and E1.3 (`src/agent/result_format.rs`) on the same branch. Not yet: E1.9
+(edit-tool polish), E1.10 (async diagnostics), E1.17 (Codex parity, first to cut).
 Deviations worth knowing: (e) E1.2 keeps the full text of a collapsed result in a scratch spill
 file, not in the read cache — the read cache stores fingerprints and a prefix, never bodies — and
 collapses in batches of eight rather than one per step, because every mid-history rewrite busts
 the prompt cache from that byte on. (f) E1.13 also accepts Mistral's `[TOOL_CALLS] [...]` array
 and Python literals, and its gate is pinned by a scripted-loop test until a local-model tape
-exists. (a) E1.5 nudges retire at the START of the next run rather than at the
+exists. (g) E1.3 `concise` is a shape applied only above a threshold (4,000 chars for a log, 40
+rows for a search), so the common short result is byte-identical to before, and the full text is
+spilled to the scratch dir rather than dropped. (a) E1.5 nudges retire at the START of the next run rather than at the
 end of the current one, because the loop bench and several tests read a run's nudges off its
 history; the cache effect is the same (the new user turn rewrites the prefix from that point
 anyway). Delivery role is `system` on Anthropic-style bases and a tagged user-turn message
