@@ -165,6 +165,14 @@ handing the model false inputs, and starts measuring what it sends.
   stream drops, and replays a stream that died blank.
 
 #### Fixed
+- **The provider wizard leaves a clean transcript.** Navigation menus (the config hub, the
+  provider list, a provider's actions, the switch and model pickers, the sub-agent screens)
+  no longer print a `· prompt  pick` line for every step; an API key is visible while typed
+  and never echoed into the scrollback afterwards; the Base URL prompt is two words with its
+  guidance and the kept value on their own lines, so a long URL no longer wraps the live input
+  line into redraw fragments; and a scheme is read the way it was meant — `htps://`, a
+  missing `https://`, or the `https://https://…` a paste over a prefilled field produced — instead
+  of bouncing the question back with a doubled prefix.
 - **A refreshed Codex token the backend still rejects no longer loops forever.** The 401
   branch refreshed and re-sent with no attempt counter; it now refreshes once, then asks for
   `aizen auth login codex`. The overload and capacity markers are matched against the error
