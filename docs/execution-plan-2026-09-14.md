@@ -89,10 +89,19 @@ then E1.2 (`src/agent/observe.rs`) and E1.13 (`src/agent/lenient.rs`) (commits `
 `f1a9c6a`, `a08ac6e`), E1.3 (`src/agent/result_format.rs`, `db4e8b4`) and E1.9 (edit ladder,
 `compact_edit_diff`, `file_glob` `ignore`, `search_routing!`, `8447991`) and E1.10 (async LSP
 fold with callers, `harness_check_after_edits`) on the same branch. E1.17 (Codex parity) was
-**deferred by the maintainer on 2026-09-15** — parked, not cut: C5 (the 401 refresh loop has no
-attempt counter) and C6 (overload markers matched against the whole body, model output
-included) are a few dozen lines each and can be picked up on their own; C4 (streamed SSE on
-the shared watchdog) is the L part.
+deferred by the maintainer on 2026-09-15 and picked up the same day once the rest of the
+backlog was code-complete (commit `317a7f8`): `responses_codex::stream_turn` consumes the
+SSE frame by frame on the shared two-phase watchdog (`StreamCaps`, injectable for tests),
+paints text live, offers completed calls to the eager starter, keeps completed calls when the
+stream drops and replays a blank stream (C4); one token refresh on 401, then a re-login error
+(C5, `AUTH_REFRESHES`); overload / capacity markers are matched on the parsed error envelope
+only — `classify_envelope` over `error.code` + `error.message` of a non-2xx body or of a
+`response.failed` / `error` frame, never over output text (C6). Deviation (cc):
+`parse_sse_to_chat_turn` survives only as a test seam over the same `SseAccumulator`, and
+argument deltas keyed by the ITEM id (the official Responses shape) are folded into the
+call-id entry when the item closes, so a turn returns one call rather than a nameless twin —
+the buffered parser used to emit both. Pinned against a stub backend (six `#[tokio::test]`s),
+not a live Codex login: this machine has none.
 Deviations worth knowing: (e) E1.2 keeps the full text of a collapsed result in a scratch spill
 file, not in the read cache — the read cache stores fingerprints and a prefix, never bodies — and
 collapses in batches of eight rather than one per step, because every mid-history rewrite busts

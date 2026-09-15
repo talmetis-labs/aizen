@@ -148,8 +148,19 @@ handing the model false inputs, and starts measuring what it sends.
   `max_completion_tokens`), `parallel_tool_calls`, `tool_choice`, `cache_control` or
   `reasoning_effort` drops or renames that field, re-sends, and remembers the model for the
   session. Previously only `reasoning_effort` was handled; the others needed config edits.
+- **The ChatGPT Codex path streams like every other.** A Codex turn used to buffer its whole
+  response before showing anything — a frozen spinner for the entire generation, no eager tool
+  starts, and no stall deadline short of the 300 s socket timeout. It now reads the SSE frame
+  by frame on the same two-phase watchdog as the chat-completions path, paints text as it
+  arrives, offers each completed call to the eager starter, keeps the completed calls when the
+  stream drops, and replays a stream that died blank.
 
 #### Fixed
+- **A refreshed Codex token the backend still rejects no longer loops forever.** The 401
+  branch refreshed and re-sent with no attempt counter; it now refreshes once, then asks for
+  `aizen auth login codex`. The overload and capacity markers are matched against the error
+  envelope only — an answer that merely quoted `server_is_overloaded` was being discarded and
+  re-billed.
 - **Streamed usage is recorded once, from the last report the stream carried**, whatever chunk
   carries it. Providers that attach usage to the final content chunk (llama.cpp, Ollama shims,
   LiteLLM) never registered, so `/cost` stayed blank and the real-usage anchor never armed;
