@@ -24,6 +24,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod mcp_serve;
+pub mod observe;
 pub mod orchestration;
 pub mod process;
 pub mod project_context;
@@ -592,6 +593,19 @@ pub struct AgentConfig {
     pub clear_step_pct: u8,
     /// …or after this many loop iterations since the last clear, whichever comes first.
     pub clear_cooldown_iters: usize,
+    /// Age-based observation collapsing, independent of context %: a tool result older than the
+    /// newest `collapse_after_observations` results and longer than `collapse_min_chars` becomes a
+    /// one-line digest (tool, target, size) naming the scratch file that holds the full text — the
+    /// recent window SWE-agent found optimal, with nothing lost. Fires only once
+    /// `collapse_batch` results qualify, then collapses all of them, so the prompt cache breaks
+    /// once per batch rather than once per step. `0` disables.
+    pub collapse_after_observations: usize,
+    pub collapse_batch: usize,
+    pub collapse_min_chars: usize,
+    /// A raw tool result longer than this many bytes is written to the scratch dir in full BEFORE
+    /// the budget cut, and the cut result ends with the path. `0` disables. `file_read` is exempt
+    /// (its file is already on disk).
+    pub spill_result_over_chars: usize,
     /// Re-show the todo list as a tail reminder every N loop iterations on long runs (recitation
     /// keeps the goal in the model's recent-attention span). `0` disables.
     pub todo_reminder_every: usize,
@@ -785,6 +799,10 @@ impl Default for AgentConfig {
             clear_target_pct: 45,
             clear_step_pct: 10,
             clear_cooldown_iters: 6,
+            collapse_after_observations: 8,
+            collapse_batch: 8,
+            collapse_min_chars: 800,
+            spill_result_over_chars: 16 * 1024,
             todo_reminder_every: 8,
             compact_at_pct: 80,
             context_guard_pct: 90,
@@ -1224,6 +1242,30 @@ where
         // discarded every reply and tool result the turn had already produced.
         if let Some(publish) = cfg.on_progress {
             publish(messages);
+        }
+
+        // AGE-BASED OBSERVATION COLLAPSING (runs BEFORE the estimate so the guards see the slimmer
+        // history): tool results older than the newest `collapse_after_observations`, longer than
+        // `collapse_min_chars`, become one-line digests naming the scratch file with the full text.
+        // Independent of context % — the recent-window shape holds on every model — and batched
+        // (`collapse_batch`) so the provider prompt cache breaks once per batch, not per step. The
+        // percentage-gated clearing below stays as the second line of defense for what this leaves.
+        if cfg.collapse_after_observations > 0 {
+            let stats = observe::collapse_aged(
+                messages,
+                observe::CollapsePolicy {
+                    keep_recent: cfg.collapse_after_observations,
+                    batch: cfg.collapse_batch,
+                    min_chars: cfg.collapse_min_chars,
+                },
+                &mut observe::spill_to_scratch,
+            );
+            if stats.collapsed > 0 && !cfg.quiet {
+                emit_trace(&format!(
+                    "→ collapsed {} older tool result(s) to one line each (−{} chars; full text in scratch)",
+                    stats.collapsed, stats.chars_reclaimed
+                ));
+            }
         }
 
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
@@ -3473,6 +3515,8 @@ pub struct ResultBudgets {
     pub log: usize,
     /// Sub-agent and workflow reports (`max_delegate_result_chars`).
     pub delegate: usize,
+    /// Spill a raw result longer than this many bytes to the scratch dir (`0` = never).
+    pub spill_over: usize,
 }
 
 impl AgentConfig {
@@ -3483,6 +3527,7 @@ impl AgentConfig {
             fetch: self.max_fetch_result_chars,
             log: self.max_log_result_chars,
             delegate: self.max_delegate_result_chars,
+            spill_over: self.spill_result_over_chars,
         }
     }
 }
@@ -3493,8 +3538,6 @@ fn run_tool_body(
     quiet: bool,
     budgets: ResultBudgets,
 ) -> String {
-    let max_chars = budgets.default;
-    let max_fetch_chars = budgets.fetch;
     if tool.recovery_effect(args) {
         crate::core::recovery::mark_side_effects_possible();
     }
@@ -3523,6 +3566,27 @@ fn run_tool_body(
     if !quiet {
         emit_tool_result(seq, tool.name(), args, &out, Some(elapsed_ms));
     }
+    // SPILL BEFORE THE CUT: a raw result past `spill_over` is written to the scratch dir in full,
+    // and the cut result below ends with the path — nothing the tool produced is lost, and the model
+    // fetches the part it needs with `file_read` instead of re-running the command. `file_read` is
+    // exempt: its file is already on disk and its own cut says how to ask for the rest.
+    let spill_note = if budgets.spill_over > 0
+        && out.len() > budgets.spill_over
+        && !is_self_budgeted(tool.name())
+    {
+        observe::spill_to_scratch(tool.name(), &out).map(|p| observe::spill_note(&p, &out))
+    } else {
+        None
+    };
+    let raw_chars = out.chars().count();
+    let cut = cut_result(tool.name(), args, &out, budgets);
+    observe::attach_spill_note(cut, raw_chars, spill_note)
+}
+
+/// The per-kind budget cut for one raw result — see the comments on each arm.
+fn cut_result(name: &str, args: &serde_json::Value, out: &str, budgets: ResultBudgets) -> String {
+    let max_chars = budgets.default;
+    let max_fetch_chars = budgets.fetch;
     // Relevance-aware truncation for the READ/FETCH tools whose output is a large document the model
     // is scanning for specifics (W11/W22): keep the region matching the call's query keywords rather
     // than a blind head+tail, and give it the LARGER `max_fetch_chars` budget so the reach layer's
@@ -3533,15 +3597,15 @@ fn run_tool_body(
     // Logs and delegate reports have their own shapes and their own budgets; both apply to
     // failures too — a failing `cargo test` IS the log the model needs whole, and a child that
     // ended in `VerificationFailed` still reports what it found.
-    if is_log_tool(tool.name()) {
-        return truncate_log(&out, budgets.log.max(max_chars));
+    if is_log_tool(name) {
+        return truncate_log(out, budgets.log.max(max_chars));
     }
-    if is_delegate_tool(tool.name()) {
-        return truncate_sections(&out, budgets.delegate.max(max_chars));
+    if is_delegate_tool(name) {
+        return truncate_sections(out, budgets.delegate.max(max_chars));
     }
-    if !is_failure_result(&out) && is_relevance_truncatable(tool.name()) {
+    if !is_failure_result(out) && is_relevance_truncatable(name) {
         let keywords = relevance_keywords(&relevance_query_from_args(args));
-        return truncate_relevant(&out, max_fetch_chars.max(max_chars), &keywords);
+        return truncate_relevant(out, max_fetch_chars.max(max_chars), &keywords);
     }
     // `file_read` budgets itself: `budget_view` / the ranged view cut inside the tool and say
     // exactly which lines were left out and how to ask for them. A second cut here used to
@@ -3549,10 +3613,10 @@ fn run_tool_body(
     // head + "…elided…" + keyword-window splice — text that does not exist in that order in the
     // file, so an `old_string` copied across the seam never matched. The transport cap remains
     // only as a safety net, far above anything the tool's own budget can produce.
-    if is_self_budgeted(tool.name()) {
-        return truncate_result(&out, max_fetch_chars.max(max_chars) * 4);
+    if is_self_budgeted(name) {
+        return truncate_result(out, max_fetch_chars.max(max_chars) * 4);
     }
-    truncate_result(&out, max_chars)
+    truncate_result(out, max_chars)
 }
 
 /// Tools whose large output is a document scanned for specifics — relevance-trimming keeps the
@@ -6418,6 +6482,10 @@ mod tests {
             clear_target_pct: 45,
             clear_step_pct: 10,
             clear_cooldown_iters: 6,
+            collapse_after_observations: 8,
+            collapse_batch: 8,
+            collapse_min_chars: 800,
+            spill_result_over_chars: 16 * 1024,
             todo_reminder_every: 0, // recitation OFF in unit tests (todo state is process-global)
             compact_at_pct: 80,
             context_guard_pct: 90,
@@ -9560,6 +9628,7 @@ mod tests {
             fetch: large_budget,
             log: small_budget,
             delegate: small_budget,
+            spill_over: 0,
         };
         let fetch_tool = std::sync::Arc::new(LongFetchTool) as std::sync::Arc<dyn Tool>;
         let out = run_tool_body(fetch_tool, &serde_json::json!({}), true, budgets);
