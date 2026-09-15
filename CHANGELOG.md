@@ -36,6 +36,18 @@ handing the model false inputs, and starts measuring what it sends.
   write `yolo` into the shared config and arm every other window and every cron job on the
   machine. `/yolo` and `/smart` now toggle this window only; `/approval yolo --persist` is the
   explicit way to change the saved default.
+- **Record/replay tapes for model calls (`AIZEN_TAPE=record|replay|strict`).** Every model
+  call in the process passes through one tape: `record` appends each answer (with its usage and
+  a fingerprint of what the model was shown, normalised for paths, dates and durations) to
+  `AIZEN_TAPE_FILE`; `replay` answers from the file with no request sent and reports drift;
+  `strict` fails on drift or an exhausted tape. Tools run for real either way.
+- **`aizen bench tasks` — the task suite.** Four fixture crates under `bench-tasks/`
+  (`fix-failing-test`, `fix-build-error`, `add-feature`, and the zero-edit control) are driven
+  through the real loop with the verify gate on; each run is judged on the files — Done reached,
+  `cargo test` exit 0, only `allowed_files` changed — and on steps/tokens against
+  `bench-fixtures/loop-baseline.json` (1.25× slack, repeat-call rate under 2 %). `--record` makes
+  the live calls once and writes the tapes; CI replays them on ubuntu and windows (new `bench`
+  job, which also runs `bench loop`). Tasks without a recorded tape are skipped, not failed.
 
 ### Fixed
 - **The dynamic prompt lane is byte-stable within a conversation**, so a warm prefix cache holds

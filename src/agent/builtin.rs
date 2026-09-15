@@ -145,7 +145,7 @@ static DEFERRED_TOOL_SURFACE: Lazy<Mutex<Option<crate::agent::tools::DeferredSur
 /// The deferred half is published only while `tool_search` survived the toolset filter: deferred
 /// tools without their discovery tool are unreachable, and advertising unreachable tools in the
 /// prompt is exactly the drift the routing map exists to prevent.
-fn publish_active_tools(r: &ToolRegistry) {
+pub(crate) fn publish_active_tools(r: &ToolRegistry) {
     *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.advertised_names());
     let deferred = if r.get("tool_search").is_some() {
         r.deferred_summary()
@@ -245,8 +245,9 @@ fn resolve_root() -> Result<PathBuf> {
 }
 
 /// The built-in tools rooted at `root`. Shared by the top-level registry and the `coder`
-/// sub-agent role.
-fn default_registry_in(root: &Path) -> ToolRegistry {
+/// sub-agent role, and by the task suite (`bench tasks`), which wants the real surface minus the
+/// `task`/`workflow` dispatchers.
+pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     // Registry construction happens exactly once per fresh top-level user turn. Apply any deferred
     // MCP `tools/list_changed` notification here — never from inside an agent run — so the model's

@@ -1017,7 +1017,28 @@ aizen bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a 
 aizen bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
 aizen bench profile                                     # golden set for the profile rollup
 aizen bench dialectic                                   # golden set incl. abstain-when-unknown
+aizen bench loop                                        # loop discipline vs a scripted model (offline)
+aizen bench tasks [--task <id>] [--json]                # task suite: real loop + real tools on fixture crates
+aizen bench tasks --record [--task <id>]                # record the model's answers once (spends tokens)
+aizen bench tasks --update-baseline                     # capture steps/tokens per task as the baseline
 ```
+
+`bench tasks` runs each `bench-tasks/<id>/` (a prompt plus a dependency-free cargo crate) through
+the real agent loop with the verify gate on and every tool rooted in a throwaway copy, then checks
+that the loop reached Done, `cargo test` exits 0, only the task's `allowed_files` changed, and
+steps/tokens stay within 1.25× of `bench-fixtures/loop-baseline.json`. The model's answers come
+from a recorded tape, so the suite runs in CI without a key; a task with no tape is skipped.
+
+### Record and replay model calls (`AIZEN_TAPE`)
+
+Any run can be taped. `AIZEN_TAPE=record` writes one JSON line per model call to
+`AIZEN_TAPE_FILE` (default `.aizen/tapes/<stamp>-<pid>.jsonl`); `AIZEN_TAPE=replay` answers from
+that file instead of the provider, matching calls by position and warning when what the model was
+shown differs from the recording (the workspace root, dates, times, durations and hashes are
+normalised first — set `AIZEN_TAPE_ROOT` when the workspace moved); `AIZEN_TAPE=strict` fails the
+call on such drift or on a tape that runs out. Tools still execute for real on replay; only the
+model is simulated. Record single-threaded flows (`aizen agent`, the task suite) — the REPL's
+background chores race the turn and land on the tape in arrival order.
 
 ## Exit codes
 `0` success · `1` error (bad args, network/HTTP failure, a bench gate FAIL). The agent loop

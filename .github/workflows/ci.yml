@@ -54,6 +54,39 @@ jobs:
       - name: Sandbox capability probe
         run: cargo run --bin aizen -- sandbox doctor --json
 
+  bench:
+    name: loop + task suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # The scripted-model loop bench: loop discipline (steps, loop-stop, verified-done) with no
+      # network and no key.
+      - name: Loop bench
+        run: cargo run --bin aizen -- bench loop
+
+      # The task suite: real loop, real tools, real `cargo test` on the fixture crates, with the
+      # model's answers replayed from bench-tasks/<id>/tapes/. A task with no recorded tape is
+      # reported as skipped, so this gate only bites once tapes are committed (see
+      # bench-tasks/README.md); a recorded task that stops reaching Done, edits the wrong file, or
+      # needs more than 1.25× its baseline steps/tokens fails the job.
+      - name: Task suite
+        run: cargo run --bin aizen -- bench tasks --json
+
   lint:
     name: fmt + clippy (advisory)
     runs-on: ubuntu-latest

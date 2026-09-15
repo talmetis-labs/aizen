@@ -180,6 +180,24 @@ async fn main() -> Result<()> {
             BenchCmd::Dialectic => bench::brain::run_dialectic(),
             BenchCmd::Health => bench::brain::run_health(),
             BenchCmd::Loop => bench::loop_eval::run().await,
+            BenchCmd::Tasks {
+                task,
+                record,
+                live,
+                tape,
+                update_baseline,
+                json,
+            } => {
+                bench::task_eval::run(bench::task_eval::Options {
+                    task,
+                    record,
+                    live,
+                    tape,
+                    update_baseline,
+                    json,
+                })
+                .await
+            }
         },
         Commands::Config { cmd } => config_ui::run_config(cmd).await,
         Commands::Auth { cmd } => config_ui::run_auth(cmd).await,

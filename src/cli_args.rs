@@ -1416,6 +1416,29 @@ pub(crate) enum BenchCmd {
     /// Offline loop-behavior eval (P4): drive the real agent loop with scripted models over ~15
     /// scenarios and report the Section-10 metrics (steps/task, loop-stop rate, verified-done).
     Loop,
+    /// Task suite: the real loop and real tools on the fixture crates under `bench-tasks/`, with
+    /// the model's answers replayed from recorded tapes (offline, no key). `--record` makes the
+    /// live calls once and writes the tapes; a task without a tape is reported as skipped.
+    Tasks {
+        /// Run only this task id.
+        #[arg(long)]
+        task: Option<String>,
+        /// Make the real model calls and write a fresh tape per task (spends tokens).
+        #[arg(long)]
+        record: bool,
+        /// Make the real model calls and leave the tapes alone.
+        #[arg(long)]
+        live: bool,
+        /// Tape name under `bench-tasks/<id>/tapes/`.
+        #[arg(long, default_value = "default")]
+        tape: String,
+        /// Write the passing tasks' steps and tokens as the new baseline.
+        #[arg(long)]
+        update_baseline: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Parser, Debug)]

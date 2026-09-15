@@ -40,14 +40,28 @@ and carry no tool attribution.
 Everything later is gated on numbers this phase produces, so it goes first even though parts of it
 are pure plumbing.
 
-**Status 2026-09-15:** E0.1–E0.8 implemented on branch `feat/e0.1-usage-ledger` (one branch for
-the batch, not one per item; per-item commits can still be split by file). Full suite
-`cargo test --bin aizen`: 1,865 passed, 0 failed, 2 ignored. `aizen prompt-size --live` on the
-branch: prefix STABLE (two volatile markers before). E0.9 and E0.10 not started. Deviations from
-the rows below: E0.3 keeps the dynamic lane at index 1 and makes its contents byte-stable instead
-of moving the lane (see the row); E0.7 ships the manifest coverage, the missing-toolchain skip and
-the absence demand, but not yet the cost-ranked verify ladder or the `/init`-written
-`verify.json` (those move to E1.10 / FL lever F).
+**Status 2026-09-15:** E0.1–E0.8 committed on branch `feat/e0.1-usage-ledger` as seven themed
+commits (f570234..1bfd7a3). Full suite `cargo test --bin aizen` at that point: 1,865 passed, 0
+failed, 2 ignored. `aizen prompt-size --live` on the branch: prefix STABLE (two volatile markers
+before). Deviations from the rows below: E0.3 keeps the dynamic lane at index 1 and makes its
+contents byte-stable instead of moving the lane (see the row); E0.7 ships the manifest coverage,
+the missing-toolchain skip and the absence demand, but not yet the cost-ranked verify ladder or
+the `/init`-written `verify.json` (those move to E1.10 / FL lever F).
+
+**E0.9 / E0.10, same day, same branch (uncommitted at the time of writing):** the tape is hooked
+at the three client functions every model call passes through, not at the `run_agent_loop` seam,
+so sub-agents, chores and the REPL are taped too; two fingerprints per line (system prompt vs
+conversation + tool names) so a drift report says which half moved. The task suite ships four
+fixtures (`fix-failing-test`, `fix-build-error`, `add-feature`, `no-edit-control`); the two
+remaining shapes from QP P6.3 (`refactor-with-tests`, `multi-file-wire`) are Phase 1 additions.
+`task.json` instead of `task.toml` — the tree has no TOML parser and a fixture manifest is not
+worth a new dependency. **No tape has been recorded yet:** the maintainer's machine had no
+endpoint configured during the implementation session, so `bench-fixtures/loop-baseline.json`
+does not exist and the CI `bench` job passes vacuously (every task SKIPPED) until
+`aizen bench tasks --record` and `--update-baseline` are run against a real model and the tapes
+are committed. The harness itself is proven by a synthetic tape in `bench::task_eval::tests`:
+the replayed edit lands, the verify gate and the verify command run `cargo test` in the copy, and
+the diff is exactly the allowed file.
 
 | ID | Item | From | Files | Size | Depends on | Done when |
 |---|---|---|---|---|---|---|
