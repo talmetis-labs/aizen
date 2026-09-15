@@ -367,6 +367,15 @@ digests while streaming and `sync_all`s before the swap; `verify_checksum` refus
 signature is NOT wired — it needs a release signing key only the maintainer can hold, and a
 verification path with no key would verify nothing; the checksum lands with the next release
 built by the updated workflow, so `aizen update` says "unverified" until then.
+E5.3 implemented (`autosave_session_delta` appends to `<slug>.jsonl` and rewrites the envelope
+only when the history was rewritten under it — saved length + fingerprint of the last saved
+message — or the delta passes `DELTA_MAX_LINES`/`DELTA_MAX_BYTES`; every reader goes through
+`read_session_path`, which appends the delta and resolves `blob:<sha256>` references; images
+≥ `BLOB_INLINE_MAX` (4 KB) live once under `sessions/blobs/`; `prune_session_pool` enforces
+`sessions_keep` / `sessions_max_bytes` at autosave, never the live conversation, and
+`gc_blobs` removes unreferenced blobs; recency counts the delta). The "200-turn session under
+5 MB" gate is structural for text (a turn costs one appended line) and measured on a real
+session; a session that pastes many distinct images is bounded by the pool cap, not by 5 MB.
 
 | ID | Item | From | Size | Done when |
 |---|---|---|---|---|

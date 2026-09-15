@@ -352,6 +352,13 @@ handing the model false inputs, and starts measuring what it sends.
   renamed). A release from before checksums still installs, with a plain "unverified" line.
   The staged binary is synced to disk before it replaces the live one, and the previous
   build's backup stays for seven days instead of vanishing at the next launch.
+- **Sessions stop growing without bound, and a long one stops costing a rewrite per turn.**
+  The autosave appends each turn to `<session>.jsonl` and rewrites the full transcript only
+  when the conversation was rewritten (a compaction, a rewound turn) or the delta has grown past
+  20 lines or 1 MiB. A pasted image of 4 KB or more is stored once under `sessions/blobs/` and
+  referenced from the transcript, so the same screenshot never bloats two files. The pool is
+  pruned at autosave — oldest first, never the live conversation — to `sessions_keep` (200)
+  and `sessions_max_bytes` (256 MiB), and blobs nothing references go with them.
 
 ## [0.6.7] — 2026-09-11
 

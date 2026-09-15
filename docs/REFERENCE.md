@@ -613,6 +613,10 @@ aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat 
 Behavior worth knowing:
 - **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
   it writes no session file by default — a file per invocation would bury the pool `/sessions` reads.
+  Saved conversations are bounded: `sessions_keep` (default 200) and `sessions_max_bytes`
+  (default 256 MiB) in the config prune the oldest at autosave, never the live one; each turn
+  appends to `<session>.jsonl` and the `.json` transcript is rewritten only when needed; images
+  of 4 KB or more live once under `sessions/blobs/` by content hash.
   With `--save-session` the finished conversation is written to `~/.aizen/sessions` with the same
   provenance stamp the REPL writes (project key, root and slug), so `/sessions` reopens it without
   caring which surface produced it, and the path is printed to **stderr** — stdout stays the answer.
