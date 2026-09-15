@@ -8,6 +8,39 @@ use super::*;
 /// honest without changing what they assert.
 static GEOM_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The thread currently holding [`GEOM_SLOT_TEST_LOCK`], so a re-acquire on that thread is a no-op.
+static GEOM_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+/// Serialises every test that paints a frame or touches the transcript geometry slot (a
+/// process-wide static): a painter on another thread would otherwise overwrite the slot between a
+/// test's draw and its read — which is how two tests holding the lock still failed together while
+/// four unlocked painters ran beside them. Re-entrant per thread, so a test may hold it across
+/// several paints and `painted_rows` can take it unconditionally.
+struct GeomLock(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl GeomLock {
+    fn acquire() -> Self {
+        let me = std::thread::current().id();
+        let owner = || *GEOM_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        if owner() == Some(me) {
+            return GeomLock(None);
+        }
+        let guard = GEOM_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *GEOM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(me);
+        GeomLock(Some(guard))
+    }
+}
+
+impl Drop for GeomLock {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            *GEOM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+
 #[test]
 fn overlay_menu_hit_maps_rows_scroll_and_dead_zones() {
     let g = OverlayMenuGeom {
@@ -681,9 +714,7 @@ fn the_row_cache_is_an_lru_not_a_flush() {
 
 #[test]
 fn a_frame_renders_the_viewport_not_the_session() {
-    let _geom = GEOM_SLOT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _geom = GeomLock::acquire();
     let mut state = AppState::new("intro", "status");
     for i in 0..2_000 {
         state.push_text(BlockKind::Generic, format!("line-{i}"), true);
@@ -791,9 +822,7 @@ fn a_failed_tool_row_shows_its_tail_and_a_hint() {
 
 #[test]
 fn tool_seq_is_found_by_transcript_row_through_the_window() {
-    let _geom = GEOM_SLOT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _geom = GeomLock::acquire();
     {
         let mut g = geom::transcript_geom_slot().lock().unwrap();
         g.rows_offset = 100;
@@ -1365,6 +1394,7 @@ fn verify_line_reads_green_success() {
 /// only end-to-end check there is that the footer's height, its rules and its text rows agree — the
 /// layout arithmetic being right is no use if the widgets are handed the wrong rects.
 fn painted_rows(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
+    let _geom = GeomLock::acquire(); // painting writes the geometry slot
     let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
     term.draw(|f| draw(f, state)).unwrap();
     let buf = term.backend().buffer().clone();
