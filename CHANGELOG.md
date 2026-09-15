@@ -279,6 +279,17 @@ handing the model false inputs, and starts measuring what it sends.
   you add `--yes`, and name the files they restored in the receipt. On the retained TUI
   `/diff --patch` renders each file through the same diff box an edit result gets instead of a
   monochrome dump.
+- **The screensaver waits for a quiet screen, and CJK wraps to the budget.** The idle
+  screensaver (sixel hosts) now needs 15 s without a key AND 60 s without new transcript output,
+  so it no longer covers a long diff or answer you are still reading. Over-long tokens in
+  rendered markdown are split by display width, not by character count — CJK paragraphs came
+  out about twice the width budget.
+- **LSP servers and the `/init` index warm up in the background after the first frame.** The
+  REPL starts as before (nothing runs before the screen is up), then a background task enables
+  the LSP runtime, starts the servers for the languages the project's files use, and refreshes
+  an existing `/init` index incrementally — so the first edit of a session already gets
+  diagnostics and the first `codebase_search` sees today's files. Startup time is unchanged;
+  `AIZEN_NO_WARMUP=1` turns the warm-up off.
 
 ## [0.6.7] — 2026-09-11
 

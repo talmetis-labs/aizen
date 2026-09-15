@@ -685,6 +685,12 @@ Behavior worth knowing:
   successful edits the loop runs the project's fast check itself and appends the verdict to the
   last edit's result; a pass satisfies the verify gate. `harness_check_after_edits` (default 3,
   `0` off) sizes the batch.
+- **LSP and the `/init` index warm up after the first frame** — once the retained screen is
+  up, a background task enables the LSP runtime and starts a server for each language the
+  project's files use (one `documentSymbol` probe per language, so the first edit of the session
+  already gets diagnostics), then refreshes an existing `/init` index incrementally. It never
+  builds an index unasked, and nothing runs before the screen is usable. `AIZEN_NO_WARMUP=1`
+  turns it off.
 - **Edits: `replace_all` on every rung, `dry_run`, and a diff the model does not re-read** —
   `file_edit` matches on a ladder (exact, indentation-tolerant, whitespace-normalized, …) and
   `replace_all` now applies on whichever rung matches. `dry_run: true` shows the diff and writes

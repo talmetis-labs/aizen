@@ -247,7 +247,16 @@ before the restore, `--yes` on a dirty tree, `emit_patch_boxes` for `/diff --pat
 (t): the dirty-tree confirmation is a second command (`/undo --yes`) rather than a modal y/n —
 the approval menu's rows and grants are about tools, and a slash handler has no clean inline
 prompt on the plain REPL; "dirty" means the working tree differs from the current checkpoint,
-measured with the same diff the stat uses, not `git status`.
+measured with the same diff the stat uses, not `git status`. E3.6 implemented
+(`retained::output_quiet_for` + `OUTPUT_QUIET_SECS` in the idle check; `char_chunks` by display
+width) and E3.7 implemented (`warm_up_after_first_frame` in `main.rs`: a background thread after
+the retained surface is up — LSP runtime + one `documentSymbol` probe per language present
+(`discovery::probe_files`, roots inside the project only), then an incremental `/init` refresh when an index exists).
+Deviation (u): the warm-up refreshes only an EXISTING index; it never builds one unasked,
+because a first `/init` is a user decision (it scans and redacts the whole repo).
+**Phase 3 is code-complete** on `feat/e0.1-usage-ledger`; its gates (frame time at 3,000
+blocks, a visible 429, first-edit diagnostics) are pinned structurally or wait for a terminal
+session on a real endpoint.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
