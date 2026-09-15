@@ -306,6 +306,15 @@ at 0.20 and refuses none wrongly at any threshold — but the fixtures carry no 
 so the over-injection side (the reason the gate exists) is not measurable here and the
 threshold stays at 0.34 until live audit data says otherwise. The live gate
 (2–3 facts per turn at ≥ 31 % citation) needs sessions on a real endpoint to measure.
+E4.4 implemented (`repl::learning_queue`: `finish_turn` spawns the secretary + reflection on
+a copy of `last_turn_slice`; `drain_learning_before_turn` joins ≤ 5 s at turn start,
+`drain_learning_before_exit` ≤ 60 s on quit/EOF with Esc; `chore_call_timeout` 60 s,
+`AIZEN_CHORE_CALL_SECS`, never above the sub-agent ceiling; `summarizer_endpoint` falls back
+to `models_by_effort.low`). Deviation (y): auto-compaction stays inline — it rewrites the
+history the next prompt is built from — under the same 600 s block, now with a 60 s cap per
+summary call. The "next prompt < 1 s" gate is structural (nothing model-bound remains between
+`finish_turn` and the prompt except a compaction that fires only over the context threshold)
+and is measured on a real endpoint.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

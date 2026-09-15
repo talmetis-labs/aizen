@@ -315,6 +315,14 @@ handing the model false inputs, and starts measuring what it sends.
   (`get_by_id`, `getById`, `rate-limit`), so "get by id" finds `get_by_id` instead of
   scoring zero. `aizen bench memory` prints the gate's admissions per split with a threshold
   sweep, which is what the gate is tuned on.
+- **The next prompt no longer waits for the last turn's learning.** The end-of-turn secretary
+  and the persona reflection now run in the background on a copy of the turn; the next turn
+  waits at most 5 s for them (so what the last turn taught is visible to recall) and otherwise
+  goes ahead while they finish. `/quit` waits up to 60 s for a pass still running (Esc skips).
+  Auto-compaction stays inline, since it rewrites the conversation. Chore calls — summaries,
+  the secretary, reflections, reconcile — are capped at 60 s each (`AIZEN_CHORE_CALL_SECS`)
+  instead of 300 s, and when no `summarizer` role is configured they go to
+  `models_by_effort.low` before falling back to the main model.
 
 ## [0.6.7] — 2026-09-11
 
