@@ -1609,6 +1609,7 @@ pub fn tool_call_begin(icon: &str, name: &str, target: &str) -> u64 {
     let seq = next_tool_seq();
     if retained::is_running() {
         retained::tool_event(retained::ToolEvent {
+            body: String::new(),
             seq,
             icon: icon.to_string(),
             name: name.to_string(),
@@ -1625,6 +1626,63 @@ pub fn tool_call_begin(icon: &str, name: &str, target: &str) -> u64 {
 /// opened by [`tool_call_begin`] in place; on the classic path it renders the whole call line plus
 /// the indented `└ <digest> · <time>` result line once, so both surfaces read the same. `elapsed_ms`
 /// is the wall-clock run time (`None` → no time shown, e.g. restored transcripts).
+/// How much of a tool result's tail a row keeps for expansion — the decisive part of a build log
+/// lives at its end.
+pub const TOOL_BODY_KEEP_CHARS: usize = 12_000;
+/// Tool bodies kept for `Ctrl-E`, newest last.
+const TOOL_BODIES_KEEP: usize = 64;
+
+fn tool_bodies() -> &'static Mutex<std::collections::VecDeque<(u64, String, String)>> {
+    static S: OnceLock<Mutex<std::collections::VecDeque<(u64, String, String)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// The tail of `body` a row keeps (see [`TOOL_BODY_KEEP_CHARS`]).
+pub fn tool_body_tail(body: &str) -> String {
+    let n = body.chars().count();
+    if n <= TOOL_BODY_KEEP_CHARS {
+        return body.to_string();
+    }
+    let skip = n - TOOL_BODY_KEEP_CHARS;
+    format!(
+        "…[{skip} chars cut]\n{}",
+        body.chars().skip(skip).collect::<String>()
+    )
+}
+
+/// Remember a finished tool's result for `Ctrl-E` (bounded; a repeat `seq` replaces its entry).
+pub(crate) fn note_tool_body(seq: u64, title: String, body: String) {
+    if body.trim().is_empty() {
+        return;
+    }
+    let mut v = tool_bodies().lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(s, _, _)| *s != seq);
+    v.push_back((seq, title, body));
+    while v.len() > TOOL_BODIES_KEEP {
+        v.pop_front();
+    }
+}
+
+/// `(title, body)` of the tool result with `seq`, if still kept.
+pub fn tool_body(seq: u64) -> Option<(String, String)> {
+    tool_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(s, _, _)| *s == seq)
+        .map(|(_, t, b)| (t.clone(), b.clone()))
+}
+
+/// The most recent kept tool result: `(seq, title, body)`.
+pub fn last_tool_body() -> Option<(u64, String, String)> {
+    tool_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .back()
+        .cloned()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn tool_call_end(
     seq: u64,
     icon: &str,
@@ -1633,7 +1691,10 @@ pub fn tool_call_end(
     digest: &str,
     outcome: ToolOutcome,
     elapsed_ms: Option<u64>,
+    body: &str,
 ) {
+    let tail = tool_body_tail(body);
+    note_tool_body(seq, format!("{name}  {target}  — {digest}"), tail.clone());
     let ev = retained::ToolEvent {
         seq,
         icon: icon.to_string(),
@@ -1642,6 +1703,7 @@ pub fn tool_call_end(
         digest: digest.to_string(),
         state: tool_state(outcome),
         elapsed_ms,
+        body: tail,
     };
     if retained::is_running() {
         retained::tool_event(ev);
@@ -3313,6 +3375,20 @@ fn input_loop(
                     repaint();
                 }
             }
+            Key::Char('\u{5}') => {
+                // Ctrl-E: expand a tool result into the text overlay — the tool under the
+                // selection anchor when a selection sits on a tool row, else the most recent.
+                // (Ctrl-O stays the screenshot key.)
+                let picked = retained::live_selection()
+                    .and_then(|s| retained::tool_seq_at_row(s.anchor_line))
+                    .and_then(tool_body)
+                    .or_else(|| last_tool_body().map(|(_, t, b)| (t, b)));
+                if let Some((title, body)) = picked {
+                    let lines: Vec<String> = body.lines().map(str::to_string).collect();
+                    let _ = text_overlay_open(title, lines);
+                    repaint();
+                }
+            }
             Key::Char('\u{f}') => {
                 // Ctrl-O: grab a clipboard screenshot (Win+Shift+S) as a vision attachment.
                 if let Ok(Some(url)) = crate::ui::image_input::clipboard_image_data_url() {
@@ -4598,6 +4674,35 @@ mod tests {
         let mut r = render().lock().unwrap();
         r.draft.clear();
         r.cursor = 0;
+    }
+
+    #[test]
+    fn tool_bodies_are_kept_bounded_and_found_by_seq() {
+        let base = 900_000 + (std::process::id() as u64 % 1000) * 100;
+        for i in 0..70u64 {
+            note_tool_body(base + i, format!("t{i}"), format!("body {i}"));
+        }
+        assert!(
+            tool_body(base).is_none(),
+            "the oldest fell off the bounded store"
+        );
+        assert_eq!(
+            tool_body(base + 69).map(|(t, _)| t),
+            Some("t69".to_string())
+        );
+        note_tool_body(base + 69, "t69b".into(), "replaced".into());
+        assert_eq!(
+            tool_body(base + 69).map(|(_, b)| b),
+            Some("replaced".to_string())
+        );
+        note_tool_body(base + 1000, "empty".into(), "   ".into());
+        assert!(
+            tool_body(base + 1000).is_none(),
+            "an empty body is not kept"
+        );
+        let tail = tool_body_tail(&"x".repeat(TOOL_BODY_KEEP_CHARS + 5));
+        assert!(tail.starts_with("…[5 chars cut]\n"), "{}", &tail[..24]);
+        assert_eq!(tool_body_tail("short"), "short");
     }
 
     #[test]

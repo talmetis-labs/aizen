@@ -20,6 +20,9 @@ pub(super) struct TranscriptGeom {
     pub(crate) plain_rows: Vec<String>,
     /// Absolute transcript row of `plain_rows[0]` / `sgr_rows[0]`.
     pub(crate) rows_offset: usize,
+    /// The tool `seq` each rendered row belongs to (`None` for prose), parallel to `plain_rows`
+    /// — so a key press with a selection on a tool row can expand THAT tool's result.
+    pub(crate) row_tool_seq: Vec<Option<u64>>,
     /// Raw rendered rows WITH SGR colour codes — used by the hyperlink injector to re-print link
     /// spans baked inside OSC 8 sequences after `terminal.draw()`. Parallel to `plain_rows`.
     pub(crate) sgr_rows: Vec<String>,
@@ -32,6 +35,16 @@ pub(super) struct TranscriptGeom {
 pub(super) fn transcript_geom_slot() -> &'static Mutex<TranscriptGeom> {
     static SLOT: OnceLock<Mutex<TranscriptGeom>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(TranscriptGeom::default()))
+}
+
+/// The tool `seq` painted at absolute transcript row `abs_row` at last draw, if that row belongs
+/// to a tool block.
+pub(crate) fn tool_seq_at_row(abs_row: usize) -> Option<u64> {
+    let g = transcript_geom_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let i = abs_row.checked_sub(g.rows_offset)?;
+    g.row_tool_seq.get(i).copied().flatten()
 }
 
 /// Snapshot of the last transcript geometry for mouse hit-testing (selection / scrollbar drag).

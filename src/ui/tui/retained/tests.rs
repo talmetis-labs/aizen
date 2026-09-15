@@ -741,6 +741,60 @@ fn a_selection_is_rebased_onto_the_rendered_window() {
 }
 
 #[test]
+fn a_failed_tool_row_shows_its_tail_and_a_hint() {
+    let mut ev = ToolEvent {
+        seq: 5,
+        icon: "⚙".into(),
+        name: "shell_run".into(),
+        target: "cargo test".into(),
+        digest: "exit 101".into(),
+        state: ToolState::Err,
+        elapsed_ms: Some(900),
+        body: (1..=9)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let rows = render_tool_row(&ev, 80);
+    let plain = console::strip_ansi_codes(&rows).to_string();
+    assert!(
+        plain.contains("│ line 9") && plain.contains("│ line 4"),
+        "{plain}"
+    );
+    assert!(
+        !plain.contains("│ line 3"),
+        "only the last {AUTO_EXPAND_LINES} lines: {plain}"
+    );
+    assert!(
+        plain.contains("… 3 more line(s) — Ctrl-E expands"),
+        "{plain}"
+    );
+    ev.state = ToolState::Ok;
+    let ok = console::strip_ansi_codes(&render_tool_row(&ev, 80)).to_string();
+    assert!(
+        !ok.contains("│ line"),
+        "a successful call stays two rows: {ok}"
+    );
+    ev.state = ToolState::Err;
+    ev.body.clear();
+    let bare = console::strip_ansi_codes(&render_tool_row(&ev, 80)).to_string();
+    assert_eq!(bare.lines().count(), 2, "no body, no tail: {bare}");
+}
+
+#[test]
+fn tool_seq_is_found_by_transcript_row_through_the_window() {
+    {
+        let mut g = geom::transcript_geom_slot().lock().unwrap();
+        g.rows_offset = 100;
+        g.row_tool_seq = vec![None, Some(7), Some(7), None];
+    }
+    assert_eq!(geom::tool_seq_at_row(101), Some(7));
+    assert_eq!(geom::tool_seq_at_row(103), None);
+    assert_eq!(geom::tool_seq_at_row(50), None, "above the window");
+    assert_eq!(geom::tool_seq_at_row(900), None, "past the window");
+}
+
+#[test]
 fn pruning_keeps_whole_blocks() {
     let mut state = AppState::new("intro", "status");
     for i in 0..BLOCK_LIMIT + 20 {
@@ -917,6 +971,7 @@ fn tool_row_puts_digest_and_time_on_the_line_below() {
         digest: "142 lines".into(),
         state: ToolState::Ok,
         elapsed_ms: Some(1200),
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     let lines: Vec<&str> = row.split('\n').collect();
@@ -941,6 +996,7 @@ fn tool_row_shows_ms_for_subsecond_runs() {
         digest: "3 match(es)".into(),
         state: ToolState::Ok,
         elapsed_ms: Some(940),
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     assert!(
@@ -960,6 +1016,7 @@ fn tool_row_omits_time_when_unknown() {
         digest: "10 lines".into(),
         state: ToolState::Ok,
         elapsed_ms: None,
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     assert!(row.ends_with("└ 10 lines"), "no time appended: {row:?}");
@@ -977,6 +1034,7 @@ fn tool_row_omits_result_line_when_no_digest() {
         digest: String::new(),
         state: ToolState::Running,
         elapsed_ms: None,
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     assert_eq!(row, "⚙ shell_run   cargo check");
@@ -1099,6 +1157,7 @@ fn tool_event_updates_the_same_line_by_seq() {
             digest: String::new(),
             state: ToolState::Running,
             elapsed_ms: None,
+            body: String::new(),
         }),
     );
     assert_eq!(
@@ -1119,6 +1178,7 @@ fn tool_event_updates_the_same_line_by_seq() {
             digest: "10 lines".into(),
             state: ToolState::Ok,
             elapsed_ms: Some(42),
+            body: String::new(),
         }),
     );
     let tools: Vec<&UiBlock> = state

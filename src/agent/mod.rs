@@ -4335,6 +4335,7 @@ fn emit_tool_result(
         &summary,
         Some(ok),
         elapsed_ms,
+        out,
     );
     if ok && !out.trim_start().starts_with("error:") && is_edit_tool(name) {
         emit_edit_diff(&tool_target(name, args), out);

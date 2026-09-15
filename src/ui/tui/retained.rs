@@ -137,6 +137,10 @@ pub(super) struct ToolEvent {
     /// Wall-clock run time of the tool call in milliseconds, appended to the result line (`· 1.2s`).
     /// `None` when unknown (restored transcripts, parallel eager-adoption) → no time is shown.
     pub elapsed_ms: Option<u64>,
+    /// The tail of the result text (see `tui::TOOL_BODY_KEEP_CHARS`) — what the row expands
+    /// into: its last lines are painted under a failed call, and `Ctrl-E` opens all of it.
+    /// Empty for a `Running` event.
+    pub body: String,
 }
 
 /// One checklist row for the plan panel. `status`: 0 = pending (○), 1 = in-progress (▸), 2 = done (✓).
@@ -186,6 +190,8 @@ impl Payload {
                 t.digest.hash(&mut h);
                 (t.state as u8).hash(&mut h);
                 t.elapsed_ms.hash(&mut h);
+                // The tail is painted under a failed row, so it is part of what the cache keys on.
+                t.body.hash(&mut h);
             }
             Payload::Plan(rows) => {
                 for r in rows {

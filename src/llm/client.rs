@@ -809,6 +809,30 @@ fn parse_chunk(data: &str) -> Result<ChatChunk, serde_json::Error> {
 
 /// Tell the user the stream stalled and is being replayed. Routed through the TUI funnel: a raw
 /// `eprintln!` here would be painted over by the retained render thread.
+/// `rate-limited — retrying in 43s (2/3)` / `HTTP 503 — retrying in 2s (1/3)`.
+pub(crate) fn retry_caption(status: u16, attempt: u32, max: u32, delay_ms: u64) -> String {
+    let what = match status {
+        429 => "rate-limited".to_string(),
+        s => format!("HTTP {s}"),
+    };
+    format!(
+        "{what} — retrying in {}s ({attempt}/{max})",
+        delay_ms.div_ceil(1000)
+    )
+}
+
+/// Publish a retried send: the working-line caption (so the spinner reads `rate-limited —
+/// retrying in 43s (2/3)` instead of spinning mutely) and one faint transcript note.
+fn send_retry_note(status: u16, attempt: u32, max: u32, delay_ms: u64) {
+    let text = retry_caption(status, attempt, max, delay_ms);
+    crate::ui::tui::set_work_caption(&text);
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&crate::ui::theme::faint(format!("⟳ {text}")).to_string());
+    } else {
+        eprintln!("⟳ {text}");
+    }
+}
+
 fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
     let line = format!(
         "⟳ stream died before any output ({reason}) — retrying {attempt}/{max} in {delay_ms}ms"
@@ -883,6 +907,10 @@ where
                     let delay = retry_after_ms(&resp)
                         .unwrap_or_else(|| backoff_ms(attempt, BASE_MS, CAP_MS));
                     attempt += 1;
+                    // Say so: a sleep on `Retry-After` used to be indistinguishable from a
+                    // hang. The caption rides the working line; the note lands once in the
+                    // transcript.
+                    send_retry_note(status.as_u16(), attempt, MAX_RETRIES, delay);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
@@ -2624,6 +2652,18 @@ mod tests {
         for s in [200u16, 400, 401, 403, 404, 422, 501] {
             assert!(!is_retryable_status(s), "{s} should NOT be retryable");
         }
+    }
+
+    #[test]
+    fn retry_captions_name_the_wait_and_the_attempt() {
+        assert_eq!(
+            retry_caption(429, 2, 3, 43_000),
+            "rate-limited — retrying in 43s (2/3)"
+        );
+        assert_eq!(
+            retry_caption(503, 1, 3, 1_500),
+            "HTTP 503 — retrying in 2s (1/3)"
+        );
     }
 
     #[test]

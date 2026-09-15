@@ -443,15 +443,21 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain_rows: Vec<String> = Vec::new();
     let mut sgr_rows: Vec<String> = Vec::new();
+    let mut row_tool_seq: Vec<Option<u64>> = Vec::new();
     let mut rows_offset: Option<usize> = None;
     let mut cursor = 0usize;
     for (block, h) in state.blocks.iter().zip(&heights) {
         let end = cursor + h;
         if *h > 0 && end > lo && cursor < hi {
             rows_offset.get_or_insert(cursor);
+            let seq = match &block.payload {
+                Payload::Tool(t) => Some(t.seq),
+                _ => None,
+            };
             for row in state.cache.get_or_render(block, content_width) {
                 plain_rows.push(console::strip_ansi_codes(&row).into_owned());
                 sgr_rows.push(row.clone());
+                row_tool_seq.push(seq);
                 lines.push(styled_row(block.kind, row));
             }
         }
@@ -466,6 +472,7 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     if !working.is_empty() && hi > blocks_total {
         for (plain, styled) in working {
             plain_rows.push(plain);
+            row_tool_seq.push(None);
             lines.push(styled);
         }
     }
@@ -538,6 +545,7 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
             plain_rows,
             sgr_rows,
             rows_offset,
+            row_tool_seq,
             jump_button,
         };
     }
