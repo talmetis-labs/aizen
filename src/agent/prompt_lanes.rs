@@ -430,6 +430,7 @@ pub(crate) fn reset_per_session_state() {
     // starts from the chars/4 estimate until its own first call reports usage.
     tui::clear_ctx_real_tokens();
     tui::reset_session_allow();
+    crate::core::approval::reset_session_grants();
     #[cfg(feature = "browser")]
     crate::agent::browser::release_active();
 }

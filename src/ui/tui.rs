@@ -755,6 +755,9 @@ struct Render {
     /// other overlay: it only exists while the agent loop is BLOCKED waiting on the answer.
     approval_menu_active: bool,
     approval_menu_sel: usize,
+    /// The rows painted for the CURRENT approval (built per call — they name the tool and its
+    /// directory). Index ↔ decision is pinned by `approval_menu_decision`.
+    approval_menu_rows: Vec<String>,
     /// `clarify` answer menu: the question's suggested options plus a trailing "type my own" row.
     question_menu_active: bool,
     question_menu_sel: usize,
@@ -788,6 +791,7 @@ fn render() -> &'static Mutex<Render> {
             text_overlay_lines: Vec::new(),
             approval_menu_active: false,
             approval_menu_sel: 0,
+            approval_menu_rows: Vec::new(),
             question_menu_active: false,
             question_menu_sel: 0,
             question_menu_question: String::new(),
@@ -986,14 +990,26 @@ pub fn reset_session_allow() {
     SESSION_ALLOW.store(false, Ordering::Relaxed);
 }
 
-/// The approval menu's rows, in the order painted. Index ↔ decision is pinned by
-/// [`approval_menu_decision`]; keep the two in lock-step.
-const APPROVAL_MENU_ROWS: [&str; 4] = [
-    "Yes — run this action",
-    "Yes — allow all destructive actions this session",
-    "No — skip this action (the agent continues)",
-    "No — stop the turn and tell it what to do",
-];
+/// The approval menu's rows for one call, in the order painted. Index ↔ decision is pinned by
+/// [`approval_menu_decision`]; keep the two in lock-step. The two `always` rows are the grant
+/// scopes (`core::approval::Grant`): the tool everywhere, or the tool under the directory this
+/// call writes to — the escape from prompt fatigue that is narrower than allow-all.
+fn approval_menu_rows(tool: &str, dir: Option<&str>) -> Vec<String> {
+    vec![
+        "Yes — run this action".to_string(),
+        format!("Yes — always for {tool} this session"),
+        match dir {
+            Some(d) => format!("Yes — always for {tool} under {d} this session"),
+            None => format!("Yes — always for {tool} this session (no directory to scope)"),
+        },
+        "Yes — allow all destructive actions this session".to_string(),
+        "No — skip this action (the agent continues)".to_string(),
+        "No — stop the turn and tell it what to do".to_string(),
+    ]
+}
+
+/// Rows per approval menu (see [`approval_menu_rows`]).
+const APPROVAL_MENU_LEN: usize = 6;
 
 /// Map an approval-menu row to `(answer_char, also_cancel_turn)`. The char is what the blocked
 /// [`ask_approval`] gate receives on its channel ('y' / 'a' / 'n'); `true` in the second slot means
@@ -1002,8 +1018,10 @@ const APPROVAL_MENU_ROWS: [&str; 4] = [
 fn approval_menu_decision(sel: usize) -> (char, bool) {
     match sel {
         0 => ('y', false),
-        1 => ('a', false),
-        2 => ('n', false),
+        1 => ('t', false),
+        2 => ('d', false),
+        3 => ('a', false),
+        4 => ('n', false),
         _ => ('n', true),
     }
 }
@@ -1021,7 +1039,10 @@ fn approval_menu_showing() -> bool {
 /// Under the retained backend this also raises the approval MENU overlay (arrow keys / Enter /
 /// mouse click pick a row); the y/n/a accelerator keys keep working either way, so the menu is a
 /// presentation layer over the same one-char channel, not a second decision path.
-pub fn ask_approval(prompt_line: &str) -> bool {
+/// `tool` and `dir` name what the menu's `always` rows grant; picking one records a session
+/// grant (`core::approval::grant_session`) before answering yes. `y`/`n`/`a` behave as before;
+/// `t` = always for the tool, `d` = always under the dir.
+pub fn ask_approval_for(prompt_line: &str, tool: &str, dir: Option<&std::path::Path>) -> bool {
     if session_allow_all() {
         return true;
     }
@@ -1036,11 +1057,13 @@ pub fn ask_approval(prompt_line: &str) -> bool {
     *approval_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     APPROVAL_PENDING.store(true, Ordering::Relaxed);
     let menu = retained_running();
+    let dir_label = dir.map(|d| d.display().to_string());
     if menu {
         {
             let mut r = render().lock().unwrap();
             r.approval_menu_active = true;
             r.approval_menu_sel = 0;
+            r.approval_menu_rows = approval_menu_rows(tool, dir_label.as_deref());
         }
         repaint_force();
     }
@@ -1057,6 +1080,15 @@ pub fn ask_approval(prompt_line: &str) -> bool {
     match ans {
         'a' => {
             SESSION_ALLOW.store(true, Ordering::Relaxed);
+            true
+        }
+        't' => {
+            crate::core::approval::grant_session(tool, None);
+            true
+        }
+        'd' => {
+            // No directory to scope to → the tool-wide grant, which is what the row said.
+            crate::core::approval::grant_session(tool, dir.map(std::path::Path::to_path_buf));
             true
         }
         'y' => true,
@@ -1214,7 +1246,7 @@ fn overlay_menu_click(
     cancel_tx: &UnboundedSender<()>,
 ) -> bool {
     if APPROVAL_PENDING.load(Ordering::Relaxed) && approval_menu_showing() {
-        if idx >= APPROVAL_MENU_ROWS.len() {
+        if idx >= APPROVAL_MENU_LEN {
             return true; // dead zone inside the panel — swallow, never start a selection under it
         }
         {
@@ -1840,8 +1872,12 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
         // already in the transcript right above — the panel only has to carry the choices.
         Some(retained::OverlaySnapshot {
             title: "approve?".to_string(),
-            lines: APPROVAL_MENU_ROWS.iter().map(|s| s.to_string()).collect(),
-            selected: Some(r.approval_menu_sel.min(APPROVAL_MENU_ROWS.len() - 1)),
+            lines: if r.approval_menu_rows.is_empty() {
+                approval_menu_rows("this tool", None)
+            } else {
+                r.approval_menu_rows.clone()
+            },
+            selected: Some(r.approval_menu_sel.min(APPROVAL_MENU_LEN - 1)),
             hint: "↑↓/click pick · Enter confirm · y/a/n direct · Esc stop".to_string(),
         })
     } else if r.question_menu_active {
@@ -2900,7 +2936,7 @@ fn input_loop(
                 match key {
                     Key::ArrowUp | Key::ArrowDown => {
                         let mut r = render().lock().unwrap();
-                        let last = APPROVAL_MENU_ROWS.len() - 1;
+                        let last = APPROVAL_MENU_LEN - 1;
                         r.approval_menu_sel = match key {
                             Key::ArrowUp => r.approval_menu_sel.saturating_sub(1),
                             _ => (r.approval_menu_sel + 1).min(last),
@@ -2931,6 +2967,8 @@ fn input_loop(
             }
             let decided = match key {
                 Key::Char('y') | Key::Char('Y') => Some('y'),
+                Key::Char('t') | Key::Char('T') => Some('t'),
+                Key::Char('d') | Key::Char('D') => Some('d'),
                 Key::Char('a') | Key::Char('A') => Some('a'),
                 Key::Char('n') | Key::Char('N') => Some('n'),
                 _ => None,
@@ -4569,7 +4607,7 @@ mod tests {
         // When session-allow is set, ask_approval returns true immediately (no input thread needed).
         SESSION_ALLOW.store(true, Ordering::Relaxed);
         assert!(
-            ask_approval("⚙ file_edit x — approve?"),
+            ask_approval_for("⚙ file_edit x — approve?", "file_edit", None),
             "allow-all short-circuits to true"
         );
         reset_session_allow();
@@ -4584,20 +4622,36 @@ mod tests {
     #[test]
     fn approval_menu_rows_and_decisions_stay_in_lockstep() {
         // Every painted row must map to a decision; the mapping is what a click/Enter fires.
-        assert_eq!(APPROVAL_MENU_ROWS.len(), 4);
+        let rows = approval_menu_rows("shell_run", Some("/proj/scripts"));
+        assert_eq!(rows.len(), APPROVAL_MENU_LEN);
         assert_eq!(approval_menu_decision(0), ('y', false), "run once");
-        assert_eq!(approval_menu_decision(1), ('a', false), "session allow");
-        assert_eq!(approval_menu_decision(2), ('n', false), "deny, keep going");
         assert_eq!(
-            approval_menu_decision(3),
+            approval_menu_decision(1),
+            ('t', false),
+            "always for the tool"
+        );
+        assert_eq!(
+            approval_menu_decision(2),
+            ('d', false),
+            "always under the dir"
+        );
+        assert_eq!(approval_menu_decision(3), ('a', false), "session allow");
+        assert_eq!(approval_menu_decision(4), ('n', false), "deny, keep going");
+        assert_eq!(
+            approval_menu_decision(5),
             ('n', true),
             "deny AND stop the turn — the Esc semantic as a row"
         );
-        // Labels and decisions must agree on which half is which: the two allow rows lead.
+        // Labels and decisions must agree on which half is which: the four allow rows lead,
+        // and the grant rows name what they grant.
+        assert!(rows[..4].iter().all(|r| r.starts_with("Yes")), "{rows:?}");
+        assert!(rows[4..].iter().all(|r| r.starts_with("No")), "{rows:?}");
         assert!(
-            APPROVAL_MENU_ROWS[0].starts_with("Yes") && APPROVAL_MENU_ROWS[1].starts_with("Yes")
+            rows[1].contains("shell_run") && rows[2].contains("/proj/scripts"),
+            "{rows:?}"
         );
-        assert!(APPROVAL_MENU_ROWS[2].starts_with("No") && APPROVAL_MENU_ROWS[3].starts_with("No"));
+        let bare = approval_menu_rows("file_edit", None);
+        assert!(bare[2].contains("no directory to scope"), "{bare:?}");
     }
 
     #[test]
@@ -4658,7 +4712,7 @@ mod tests {
         let snap = retained_input_snapshot();
         let overlay = snap.overlay.expect("approval menu must paint an overlay");
         assert_eq!(overlay.title, "approve?");
-        assert_eq!(overlay.lines.len(), APPROVAL_MENU_ROWS.len());
+        assert_eq!(overlay.lines.len(), APPROVAL_MENU_LEN);
         assert_eq!(overlay.selected, Some(2));
         {
             let mut r = render().lock().unwrap();

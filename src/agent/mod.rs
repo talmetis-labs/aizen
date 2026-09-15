@@ -3636,12 +3636,29 @@ fn gate_and_approve(
         smart_allow = false;
     }
     if tool.is_destructive() && !cfg.approval_mode.approves_all() && !smart_allow {
-        // Pre-flight: what the call WILL do, computed before it does anything — a patch for
-        // an edit, the full command and its cwd for a shell — so the user approves the
-        // change, not a basename. Computed only when a question is about to be asked.
-        let preview = tool.preview(args);
-        if !approve(tool.name(), args, cfg, preview.as_ref()) {
-            return Some("error: the user declined this action".to_string());
+        // A standing grant (the menu's `always for <tool> [under <dir>]`, or the project's
+        // `.aizen/approvals.json`) answers without asking — narrower than allow-all, and named
+        // in the transcript so an auto-approval is never silent.
+        let target = tool.workspace_target(args);
+        if let Some(g) = crate::core::approval::granted(tool.name(), target.as_deref()) {
+            let line = format!(
+                "  {} {}",
+                crate::ui::theme::faint("│"),
+                crate::ui::theme::faint(&format!("auto-approved by grant: {}", g.describe()))
+            );
+            if crate::ui::tui::active() {
+                crate::ui::tui::emit_line(&line);
+            } else if !cfg.quiet {
+                eprintln!("{line}");
+            }
+        } else {
+            // Pre-flight: what the call WILL do, computed before it does anything — a patch
+            // for an edit, the full command and its cwd for a shell — so the user approves
+            // the change, not a basename. Computed only when a question is about to be asked.
+            let preview = tool.preview(args);
+            if !approve(tool.name(), args, cfg, preview.as_ref(), target.as_deref()) {
+                return Some("error: the user declined this action".to_string());
+            }
         }
     }
     None
@@ -6035,6 +6052,7 @@ fn approve(
     args: &serde_json::Value,
     cfg: &AgentConfig,
     preview: Option<&crate::agent::tools::ApprovalPreview>,
+    target: Option<&std::path::Path>,
 ) -> bool {
     use std::io::{IsTerminal, Write};
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::AwaitingApproval);
@@ -6071,7 +6089,7 @@ fn approve(
         let hint = if crate::ui::tui::retained_running() {
             "— approve?"
         } else {
-            "— approve? [y]es · [n]o · [a]llow all this session"
+            "— approve? [y]es · [t]ool always · [d]ir always · [a]llow all · [n]o"
         };
         let prompt = format!(
             "{who}{}  {}",
@@ -6085,7 +6103,9 @@ fn approve(
                 show_preview(p);
             }
         }
-        return tokio::task::block_in_place(|| crate::ui::tui::ask_approval(&prompt));
+        return tokio::task::block_in_place(|| {
+            crate::ui::tui::ask_approval_for(&prompt, tool, target)
+        });
     }
     if !std::io::stdin().is_terminal() {
         if crate::hostbot::platforms::telegram::daemon_is_active()

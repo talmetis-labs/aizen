@@ -1328,7 +1328,23 @@ pub(crate) async fn handle_slash(
                     Some(s) if s != saved => format!(" (this window; saved default: {saved})"),
                     _ => String::new(),
                 };
-                tui::emit_line(&style(format!("approval: {}{scope} · ask=prompt · smart=read-only auto · yolo=pre-authorized · add --persist to change the saved default", approval_mode())).dim().to_string());
+                let session = crate::core::approval::session_grants();
+                let project = crate::core::approval::project_grants();
+                tui::emit_line(&style(format!("approval: {}{scope} · ask=prompt · smart=read-only auto · yolo=pre-authorized · add --persist to change the saved default · grants: {} session, {} project (`/approval grants`)", approval_mode(), session.len(), project.len())).dim().to_string());
+            } else if matches!(requested, "grants" | "grant") {
+                // What runs without asking right now: the menu's `always` picks (this window) and
+                // the project's `.aizen/approvals.json`.
+                let session = crate::core::approval::session_grants();
+                let project = crate::core::approval::project_grants();
+                if session.is_empty() && project.is_empty() {
+                    tui::emit_line(&style(format!("no grants: pick `always for <tool>` on an approval, or add {{\"allow\": [{{\"tool\": \"shell_run\", \"under\": \"scripts\"}}]}} to .aizen/{}", crate::core::approval::PROJECT_ALLOWLIST)).dim().to_string());
+                }
+                for g in &session {
+                    tui::emit_line(&style(format!("  session · {}", g.describe())).dim().to_string());
+                }
+                for g in &project {
+                    tui::emit_line(&style(format!("  project · {}", g.describe())).dim().to_string());
+                }
             } else if let Ok(mode) = requested.parse::<ApprovalMode>() {
                 if persist {
                     // The explicit way to change the machine's default: the saved file is what
