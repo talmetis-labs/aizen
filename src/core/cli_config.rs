@@ -300,7 +300,10 @@ pub struct RoleModelConfig {
 
 /// The routable roles. `summarizer` = compaction/handoff summaries; `subagent_default` = the task
 /// tool's fallback model; `oracle` = the self-review reviewer (stronger model recommended);
-/// `apply` = reserved for a future fast-apply edit model (config-only today).
+/// `apply` = reserved for a future fast-apply edit model (config-only today). `pantheon` pins
+/// one of the seven built-in sub-agent roles (`nemesis`, `argus`, … — legacy aliases accepted
+/// as keys) to its own provider/model: above `subagent_default`, below an explicit per-dispatch
+/// `model`. Env `AIZEN_<ROLE>_MODEL` / `_BASE_URL` / `_API_KEY` override it like any other role.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RolesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +314,9 @@ pub struct RolesConfig {
     pub oracle: Option<RoleModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply: Option<RoleModelConfig>,
+    /// Per built-in sub-agent role pins, keyed by role name (see [`crate::agent::roles::ROLES`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pantheon: Option<std::collections::BTreeMap<String, RoleModelConfig>>,
 }
 
 impl RolesConfig {
@@ -320,6 +326,70 @@ impl RolesConfig {
             || self.subagent_default.is_some()
             || self.oracle.is_some()
             || self.apply.is_some()
+            || self.pantheon.as_ref().is_some_and(|m| !m.is_empty())
+    }
+
+    /// The Pantheon pin for a built-in role, by canonical name or legacy alias on either side
+    /// (`reviewer` in the file still pins `nemesis`). `None` for an unpinned or unknown role.
+    pub fn pantheon_entry(&self, role: &str) -> Option<&RoleModelConfig> {
+        let map = self.pantheon.as_ref()?;
+        let want = crate::agent::roles::canonical(role)?.name;
+        map.iter()
+            .find(|(k, _)| crate::agent::roles::canonical(k).is_some_and(|p| p.name == want))
+            .map(|(_, v)| v)
+    }
+
+    /// Pin (or with `None`, unpin) one built-in role. Stored under the canonical name; an
+    /// alias-keyed entry for the same role is replaced, and an emptied map is dropped. An
+    /// unknown role name is ignored — the callers pick from the role table.
+    pub fn set_pantheon(&mut self, role: &str, value: Option<RoleModelConfig>) {
+        let Some(p) = crate::agent::roles::canonical(role) else {
+            return;
+        };
+        let map = self.pantheon.get_or_insert_with(Default::default);
+        map.retain(|k, _| crate::agent::roles::canonical(k).is_none_or(|q| q.name != p.name));
+        if let Some(v) = value {
+            map.insert(p.name.to_string(), v);
+        }
+        if map.is_empty() {
+            self.pantheon = None;
+        }
+    }
+
+    /// Every configured entry with its label — the four routable slots, then the Pantheon map
+    /// — so "which roles reference provider X" is one walk that cannot forget a slot.
+    pub fn entries(&self) -> Vec<(String, &RoleModelConfig)> {
+        let mut out: Vec<(String, &RoleModelConfig)> = [
+            ("subagent_default", &self.subagent_default),
+            ("summarizer", &self.summarizer),
+            ("oracle", &self.oracle),
+            ("apply", &self.apply),
+        ]
+        .into_iter()
+        .filter_map(|(label, slot)| slot.as_ref().map(|r| (label.to_string(), r)))
+        .collect();
+        if let Some(map) = &self.pantheon {
+            out.extend(map.iter().map(|(k, v)| (k.clone(), v)));
+        }
+        out
+    }
+
+    fn entries_mut(&mut self) -> Vec<&mut RoleModelConfig> {
+        let mut out: Vec<&mut RoleModelConfig> = Vec::new();
+        for slot in [
+            &mut self.subagent_default,
+            &mut self.summarizer,
+            &mut self.oracle,
+            &mut self.apply,
+        ] {
+            if let Some(r) = slot.as_mut() {
+                out.push(r);
+            }
+        }
+        if let Some(map) = self.pantheon.as_mut() {
+            out.extend(map.values_mut());
+        }
+        out
     }
 }
 
@@ -343,9 +413,10 @@ pub struct ResolvedEndpoint {
     pub model: String,
 }
 
-/// Resolve a role's endpoint. Per-field precedence: `NG_<ROLE>_MODEL/BASE_URL/API_KEY` env >
+/// Resolve a role's endpoint. Per-field precedence: `AIZEN_<ROLE>_MODEL/BASE_URL/API_KEY` env >
 /// `roles.<role>.*` config > the main endpoint. `api_key_ref` supports `env:VAR` indirection.
-/// Unknown role name ⇒ the main endpoint unchanged.
+/// A built-in sub-agent role name (`nemesis`, or a legacy alias) reads `roles.pantheon`; any
+/// other unknown role name ⇒ the main endpoint unchanged.
 pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
     let up = role.to_ascii_uppercase();
     let cfg = load();
@@ -354,7 +425,7 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
         "subagent_default" => r.subagent_default.clone(),
         "oracle" => r.oracle.clone(),
         "apply" => r.apply.clone(),
-        _ => None,
+        _ => r.pantheon_entry(role).cloned(),
     });
     let profile = rc
         .as_ref()
@@ -466,6 +537,23 @@ pub fn subagent_endpoint(main: &ResolvedEndpoint) -> ResolvedEndpoint {
     endpoint_for_model(&role.model, &role)
 }
 
+/// The endpoint a built-in sub-agent ROLE runs on when the dispatch names no model: env
+/// `AIZEN_<ROLE>_MODEL` / `roles.pantheon.<role>` (a provider profile or per-field override)
+/// resolved on top of `fallback` — normally the already-routed sub-agent default — then routed
+/// through the model-endpoint registry so the role's model carries its own gateway. A role with
+/// nothing pinned, or a name that is not a Pantheon role, is `fallback` unchanged. This is what
+/// lets a reviewer run on a stronger model than the searcher in the same workflow.
+pub fn pantheon_endpoint(role: &str, fallback: &ResolvedEndpoint) -> ResolvedEndpoint {
+    let Some(p) = crate::agent::roles::canonical(role) else {
+        return fallback.clone();
+    };
+    if !role_configured(p.name) {
+        return fallback.clone();
+    }
+    let r = resolve_role(p.name, fallback);
+    endpoint_for_model(&r.model, &r)
+}
+
 /// Resolve the local provider/model assignment for one specialist from one config snapshot.
 pub fn resolve_agent_route(cfg: &CliConfig, agent: &str) -> Option<(AgentRoute, ResolvedEndpoint)> {
     let route = cfg.agent_route(agent)?.clone();
@@ -523,7 +611,7 @@ pub fn role_configured(role: &str) -> bool {
             "subagent_default" => r.subagent_default.as_ref(),
             "oracle" => r.oracle.as_ref(),
             "apply" => r.apply.as_ref(),
-            _ => None,
+            _ => r.pantheon_entry(role),
         })
         .is_some_and(|r| {
             r.provider.is_some()
@@ -789,20 +877,12 @@ impl CliConfig {
             self.active_provider = Some(new.to_string());
         }
         if let Some(roles) = self.roles.as_mut() {
-            for slot in [
-                &mut roles.summarizer,
-                &mut roles.subagent_default,
-                &mut roles.oracle,
-                &mut roles.apply,
-            ] {
-                if slot
-                    .as_ref()
-                    .and_then(|r| r.provider.as_deref())
+            for r in roles.entries_mut() {
+                if r.provider
+                    .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(old))
                 {
-                    if let Some(r) = slot.as_mut() {
-                        r.provider = Some(new.to_string());
-                    }
+                    r.provider = Some(new.to_string());
                 }
             }
         }
@@ -824,15 +904,9 @@ impl CliConfig {
     pub fn provider_references(&self, name: &str) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(roles) = &self.roles {
-            for (label, slot) in [
-                ("subagent_default", &roles.subagent_default),
-                ("summarizer", &roles.summarizer),
-                ("oracle", &roles.oracle),
-                ("apply", &roles.apply),
-            ] {
-                if slot
-                    .as_ref()
-                    .and_then(|r| r.provider.as_deref())
+            for (label, r) in roles.entries() {
+                if r.provider
+                    .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 {
                     out.push(format!("role:{label}"));
@@ -859,20 +933,12 @@ impl CliConfig {
             anyhow::bail!("unknown replacement provider profile: {new}");
         }
         if let Some(roles) = self.roles.as_mut() {
-            for slot in [
-                &mut roles.summarizer,
-                &mut roles.subagent_default,
-                &mut roles.oracle,
-                &mut roles.apply,
-            ] {
-                if slot
-                    .as_ref()
-                    .and_then(|r| r.provider.as_deref())
+            for r in roles.entries_mut() {
+                if r.provider
+                    .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(old))
                 {
-                    if let Some(r) = slot.as_mut() {
-                        r.provider = Some(new.to_string());
-                    }
+                    r.provider = Some(new.to_string());
                 }
             }
         }
@@ -893,20 +959,12 @@ impl CliConfig {
     /// Clear references to a profile; the active root endpoint remains unchanged.
     pub fn clear_provider_references(&mut self, name: &str) {
         if let Some(roles) = self.roles.as_mut() {
-            for slot in [
-                &mut roles.summarizer,
-                &mut roles.subagent_default,
-                &mut roles.oracle,
-                &mut roles.apply,
-            ] {
-                if slot
-                    .as_ref()
-                    .and_then(|r| r.provider.as_deref())
+            for r in roles.entries_mut() {
+                if r.provider
+                    .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 {
-                    if let Some(r) = slot.as_mut() {
-                        r.provider = None;
-                    }
+                    r.provider = None;
                 }
             }
         }
@@ -1536,6 +1594,113 @@ mod tests {
         std::env::set_var("AIZEN_SUMMARIZER_MODEL", "env-model");
         assert_eq!(resolve_role("summarizer", &main).model, "env-model");
         std::env::remove_var("AIZEN_SUMMARIZER_MODEL");
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pantheon_map_pins_built_in_roles_by_name_or_alias() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-pantheon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        let main = ResolvedEndpoint {
+            base_url: "https://main/v1".into(),
+            api_key: "mk".into(),
+            model: "main-model".into(),
+        };
+        // Nothing pinned: every role is the fallback unchanged and reads as unconfigured.
+        assert!(!role_configured("nemesis"));
+        assert_eq!(pantheon_endpoint("nemesis", &main).model, "main-model");
+        assert_eq!(pantheon_endpoint("not-a-role", &main).model, "main-model");
+
+        let mut pantheon = std::collections::BTreeMap::new();
+        // The legacy alias as the KEY still pins the canonical role.
+        pantheon.insert(
+            "reviewer".to_string(),
+            RoleModelConfig {
+                provider: Some("strong-provider".into()),
+                ..Default::default()
+            },
+        );
+        pantheon.insert(
+            "daedalus".to_string(),
+            RoleModelConfig {
+                model: Some("fast-model".into()),
+                ..Default::default()
+            },
+        );
+        save(&CliConfig {
+            providers: Some(vec![ProviderProfile::normalized(
+                "strong-provider",
+                "https://strong/v1",
+                "strong-key",
+                "strong-model",
+            )
+            .unwrap()]),
+            roles: Some(RolesConfig {
+                pantheon: Some(pantheon),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(role_configured("nemesis"));
+        assert!(
+            role_configured("reviewer"),
+            "alias resolves to the pinned role"
+        );
+        assert!(
+            !role_configured("argus"),
+            "an unpinned role stays unconfigured"
+        );
+        // A provider pin carries the provider's endpoint and default model.
+        let r = pantheon_endpoint("nemesis", &main);
+        assert_eq!(
+            (r.model.as_str(), r.base_url.as_str(), r.api_key.as_str()),
+            ("strong-model", "https://strong/v1", "strong-key")
+        );
+        // A model-only pin changes the model and keeps the fallback's gateway.
+        let d = pantheon_endpoint("coder", &main);
+        assert_eq!(
+            (d.model.as_str(), d.base_url.as_str()),
+            ("fast-model", "https://main/v1")
+        );
+        // Unpinned roles are the fallback unchanged — nemesis and argus now differ.
+        assert_eq!(pantheon_endpoint("argus", &main).model, "main-model");
+        // Env beats the map, same as every other role.
+        std::env::set_var("AIZEN_NEMESIS_MODEL", "env-model");
+        assert_eq!(pantheon_endpoint("nemesis", &main).model, "env-model");
+        std::env::remove_var("AIZEN_NEMESIS_MODEL");
+
+        // Provider bookkeeping sees the map: references, rename, clear.
+        let mut cfg = load();
+        assert_eq!(
+            cfg.provider_references("strong-provider"),
+            vec!["role:reviewer"]
+        );
+        cfg.rename_provider("strong-provider", "renamed").unwrap();
+        assert_eq!(cfg.provider_references("renamed"), vec!["role:reviewer"]);
+        cfg.clear_provider_references("renamed");
+        assert!(cfg.provider_references("renamed").is_empty());
+        // `set_pantheon` stores under the canonical name and replaces an alias-keyed entry.
+        let roles = cfg.roles.as_mut().unwrap();
+        roles.set_pantheon(
+            "reviewer",
+            Some(RoleModelConfig {
+                model: Some("x".into()),
+                ..Default::default()
+            }),
+        );
+        let keys: Vec<&String> = roles.pantheon.as_ref().unwrap().keys().collect();
+        assert_eq!(keys, vec!["daedalus", "nemesis"]);
+        roles.set_pantheon("nemesis", None);
+        roles.set_pantheon("coder", None);
+        assert!(roles.pantheon.is_none(), "an emptied map is dropped");
+        assert!(!roles.has_any());
+
         std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }

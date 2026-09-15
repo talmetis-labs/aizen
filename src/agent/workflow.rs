@@ -27,9 +27,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Per-child total hard cap after the one soft extension.
-const CHILD_MAX_ITERS: usize = 15;
-/// Total ceiling for a workflow child (2 × the narrow initial budget).
+/// Total step ceiling for a workflow child that names a specialist card and no `max_steps`. A
+/// built-in role takes its own `RoleProfile::default_max_steps` instead (see
+/// [`child_step_total`]). The loop starts at half the total and extends once to the whole.
 const CHILD_AUTO_EXTEND: usize = 30;
 /// Transient model-call failures a workflow child absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy
@@ -78,7 +78,8 @@ pub struct WorkflowTask {
     #[serde(default)]
     pub expected_output: Option<String>,
     /// TOTAL step budget for this child (clamped to the shared `MAX_STEP_BUDGET` cap). Absent →
-    /// the workflow child defaults (`CHILD_MAX_ITERS`/`CHILD_AUTO_EXTEND`).
+    /// the built-in role's own default (argus 15 … daedalus 45), or `CHILD_AUTO_EXTEND` for a
+    /// specialist card.
     #[serde(default)]
     pub max_steps: Option<usize>,
     /// Optional JSON Schema the child's FINAL answer must satisfy — validated (with one repair
@@ -89,6 +90,41 @@ pub struct WorkflowTask {
 
 fn default_role() -> String {
     "nemesis".to_string()
+}
+
+/// The TOTAL step budget a workflow child runs under: the spec's `max_steps` (clamped to the
+/// shared cap), else the built-in role's own default — a locate job and an implement job no
+/// longer share one number — else [`CHILD_AUTO_EXTEND`] for a specialist card, which has no
+/// profile to ask.
+fn child_step_total(task: &WorkflowTask, specialist: bool) -> usize {
+    task.max_steps
+        .map(|n| n.clamp(1, crate::agent::task_tool::MAX_STEP_BUDGET))
+        .unwrap_or_else(|| {
+            if specialist {
+                CHILD_AUTO_EXTEND
+            } else {
+                crate::agent::roles::canonical(&task.role)
+                    .map(|p| p.default_max_steps)
+                    .unwrap_or(CHILD_AUTO_EXTEND)
+            }
+        })
+}
+
+/// The endpoint a ROLE task runs on: its own `model` routed through the model-endpoint
+/// registry, else the role's Pantheon pin (`roles.pantheon.<role>`) on top of the workflow's
+/// own (registry-routed) endpoint, else that endpoint unchanged. The same ladder the `task`
+/// tool climbs, so `role: nemesis` reaches the reviewer's model in both.
+fn role_task_endpoint(
+    task: &WorkflowTask,
+    caller: &crate::core::cli_config::ResolvedEndpoint,
+) -> crate::core::cli_config::ResolvedEndpoint {
+    match task.model.as_deref() {
+        Some(m) => crate::core::cli_config::endpoint_for_model(m, caller),
+        None => crate::core::cli_config::pantheon_endpoint(
+            &task.role,
+            &crate::core::cli_config::endpoint_for_model(&caller.model, caller),
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,18 +765,16 @@ async fn run_one_task(
     };
     // The SAME dispatch contract a `task` call carries (boundaries / expected_output / step
     // budget), built from the task's own fields. `max_steps` is clamped to the shared cap;
-    // absent, the contract states the child's real total (`CHILD_AUTO_EXTEND`) so the prompt
-    // never promises a budget the loop won't honor.
+    // absent, the contract states the child's real total (the role's own default, or
+    // `CHILD_AUTO_EXTEND` for a specialist) so the prompt never promises a budget the loop
+    // won't honor.
     let contract = crate::agent::task_tool::TaskContract {
         boundaries: task.boundaries.clone().filter(|s| !s.trim().is_empty()),
         expected_output: task
             .expected_output
             .clone()
             .filter(|s| !s.trim().is_empty()),
-        max_steps: task
-            .max_steps
-            .map(|n| n.clamp(1, crate::agent::task_tool::MAX_STEP_BUDGET))
-            .unwrap_or(CHILD_AUTO_EXTEND),
+        max_steps: child_step_total(task, spec.is_some()),
     };
     let expects = task.expects.as_ref().filter(|v| v.is_object());
     let (label, ep, registry, mut system) = match &spec {
@@ -765,8 +799,7 @@ async fn run_one_task(
             (def.slug(), ep, registry, system)
         }
         None => {
-            let m = task.model.as_deref().unwrap_or(model);
-            let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
+            let ep = role_task_endpoint(task, &caller);
             let registry = role_registry(&task.role, root);
             let system = build_subagent_prompt(
                 &task.role,
@@ -843,17 +876,11 @@ async fn run_one_task(
             .with_trace_visible(false),
         quiet: true,
         enable_verify_gate: false,
-        // One soft extension reaches the child's total cap; no second continuation layer. A
-        // per-task `max_steps` (clamped into `contract.max_steps` above) replaces the defaults
-        // with the same start-narrow-then-extend split the `task` tool uses.
-        max_iters: match task.max_steps {
-            Some(_) => contract.max_steps.div_ceil(2).max(1),
-            None => CHILD_MAX_ITERS,
-        },
-        auto_extend_to: match task.max_steps {
-            Some(_) => contract.max_steps,
-            None => CHILD_AUTO_EXTEND,
-        },
+        // One soft extension reaches the child's total cap (`contract.max_steps`: the spec's
+        // `max_steps`, else the role's own default); no second continuation layer. Same
+        // start-narrow-then-extend split the `task` tool uses.
+        max_iters: contract.max_steps.div_ceil(2).max(1),
+        auto_extend_to: contract.max_steps,
         auto_checkpoint: is_writer,
         checkpoint_each_edit: false,
         todo_reminder_every: 0,
@@ -1165,6 +1192,90 @@ fn truncate_summary(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_budget_is_the_role_default_unless_the_spec_says() {
+        let t = |role: &str, max_steps: Option<usize>| WorkflowTask {
+            id: "t".into(),
+            role: role.into(),
+            prompt: "x".into(),
+            max_steps,
+            ..Default::default()
+        };
+        assert_eq!(child_step_total(&t("argus", None), false), 15);
+        assert_eq!(child_step_total(&t("nemesis", None), false), 25);
+        assert_eq!(child_step_total(&t("coder", None), false), 45, "alias");
+        assert_eq!(
+            child_step_total(&t("nemesis", Some(999)), false),
+            crate::agent::task_tool::MAX_STEP_BUDGET
+        );
+        assert_eq!(child_step_total(&t("nemesis", Some(7)), false), 7);
+        // A specialist card has no profile: the flat child ceiling. So does an unknown role
+        // (refused before it runs, but the resolver stays total).
+        assert_eq!(
+            child_step_total(&t("nemesis", None), true),
+            CHILD_AUTO_EXTEND
+        );
+        assert_eq!(
+            child_step_total(&t("weird", None), false),
+            CHILD_AUTO_EXTEND
+        );
+    }
+
+    #[test]
+    fn role_tasks_reach_their_pantheon_model_in_one_workflow() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-wf-pantheon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        let mut pantheon = std::collections::BTreeMap::new();
+        pantheon.insert(
+            "nemesis".to_string(),
+            crate::core::cli_config::RoleModelConfig {
+                model: Some("strong-model".into()),
+                ..Default::default()
+            },
+        );
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            roles: Some(crate::core::cli_config::RolesConfig {
+                pantheon: Some(pantheon),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let caller = crate::core::cli_config::ResolvedEndpoint {
+            base_url: "https://wf/v1".into(),
+            api_key: "wk".into(),
+            model: "wf-model".into(),
+        };
+        let t = |role: &str, model: Option<&str>| WorkflowTask {
+            id: role.into(),
+            role: role.into(),
+            prompt: "x".into(),
+            model: model.map(str::to_string),
+            ..Default::default()
+        };
+        // The pinned reviewer and the unpinned searcher run on different models in one spec.
+        let rev = role_task_endpoint(&t("nemesis", None), &caller);
+        assert_eq!(
+            (rev.model.as_str(), rev.base_url.as_str()),
+            ("strong-model", "https://wf/v1")
+        );
+        assert_eq!(
+            role_task_endpoint(&t("argus", None), &caller).model,
+            "wf-model"
+        );
+        assert_eq!(
+            role_task_endpoint(&t("nemesis", Some("per-task")), &caller).model,
+            "per-task",
+            "the spec's own model beats the pin"
+        );
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn progress_trace_helpers_are_noop_off_tui() {

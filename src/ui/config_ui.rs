@@ -1135,6 +1135,12 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
         "apply",
         role_row_value(roles.and_then(|r| r.apply.as_ref())),
     );
+    // Only the pinned Pantheon roles print — seven "not set" rows would bury the four above.
+    if let Some(map) = roles.and_then(|r| r.pantheon.as_ref()) {
+        for (name, rc) in map {
+            row(name.as_str(), role_row_value(Some(rc)));
+        }
+    }
     match cfg.agent_routes.as_deref().filter(|l| !l.is_empty()) {
         Some(routes) => row(
             "specialists",
@@ -2551,6 +2557,7 @@ fn subagent_hint(cfg: &cli_config::CliConfig) -> String {
         usize::from(r.summarizer.is_some())
             + usize::from(r.oracle.is_some())
             + usize::from(r.apply.is_some())
+            + r.pantheon.as_ref().map_or(0, |m| m.len())
     });
     let mut s = model;
     if mapped > 0 {
@@ -2586,15 +2593,19 @@ const ROLE_ROWS: [(&str, &str, &str); 4] = [
     ),
 ];
 
-fn role_slot<'a>(
-    roles: &'a mut cli_config::RolesConfig,
+/// Store one role row. The four routable slots are fields; any other name is a Pantheon role
+/// and goes into the map under its canonical name (`None` unpins it).
+fn role_set(
+    roles: &mut cli_config::RolesConfig,
     role: &str,
-) -> &'a mut Option<cli_config::RoleModelConfig> {
+    value: Option<cli_config::RoleModelConfig>,
+) {
     match role {
-        "summarizer" => &mut roles.summarizer,
-        "oracle" => &mut roles.oracle,
-        "apply" => &mut roles.apply,
-        _ => &mut roles.subagent_default,
+        "summarizer" => roles.summarizer = value,
+        "oracle" => roles.oracle = value,
+        "apply" => roles.apply = value,
+        "subagent_default" => roles.subagent_default = value,
+        other => roles.set_pantheon(other, value),
     }
 }
 
@@ -2607,7 +2618,70 @@ fn role_get<'a>(
         "summarizer" => r.summarizer.as_ref(),
         "oracle" => r.oracle.as_ref(),
         "apply" => r.apply.as_ref(),
-        _ => r.subagent_default.as_ref(),
+        "subagent_default" => r.subagent_default.as_ref(),
+        other => r.pantheon_entry(other),
+    }
+}
+
+/// One menu row's value for a role: what is pinned, or what it inherits.
+fn role_row_summary(rc: Option<&cli_config::RoleModelConfig>, inherits: &str) -> String {
+    let Some(rc) = rc else {
+        return inherits.to_string();
+    };
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(p) = rc.provider.as_deref() {
+        bits.push(format!("provider {p}"));
+    }
+    if let Some(m) = rc.model.as_deref() {
+        bits.push(m.to_string());
+    }
+    if rc.base_url.is_some() {
+        bits.push("own url".into());
+    }
+    if rc.api_key_ref.is_some() {
+        bits.push("own key".into());
+    }
+    if bits.is_empty() {
+        "not set".into()
+    } else {
+        bits.join(" · ")
+    }
+}
+
+/// The seven built-in sub-agent roles, each pinnable to its own provider/model above the
+/// shared sub-agent default: a reviewer on a strong model, a searcher on a cheap one.
+async fn config_edit_pantheon(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let roles = crate::agent::roles::ROLES;
+    let label = |p: &crate::agent::roles::RoleProfile| {
+        format!("{} ({})", p.name, p.aliases.first().copied().unwrap_or(""))
+    };
+    loop {
+        let mut items: Vec<String> = roles
+            .iter()
+            .map(|p| {
+                format!(
+                    "{:<22}· {}",
+                    label(p),
+                    role_row_summary(role_get(cfg, p.name), "sub-agent default")
+                )
+            })
+            .collect();
+        items.push("Back".to_string());
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Pantheon roles — each above the sub-agent default (Esc when done)")
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(i) if i < roles.len() => i,
+            _ => return Ok(()),
+        };
+        let p = &roles[pick];
+        // The brief's first clause says what the role does; the rest is its tool scope.
+        let what = p.brief.split(". ").next().unwrap_or(p.brief);
+        tui::emit_line(&format!("  {}", style(what).dim()));
+        config_edit_one_role(cfg, p.name, &label(p)).await?;
     }
 }
 
@@ -2623,31 +2697,20 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
         let mut items: Vec<String> = ROLE_ROWS
             .iter()
             .map(|(key, label, _)| {
-                let cur = role_get(cfg, key)
-                    .map(|rc| {
-                        let mut bits: Vec<String> = Vec::new();
-                        if let Some(p) = rc.provider.as_deref() {
-                            bits.push(format!("provider {p}"));
-                        }
-                        if let Some(m) = rc.model.as_deref() {
-                            bits.push(m.to_string());
-                        }
-                        if rc.base_url.is_some() {
-                            bits.push("own url".into());
-                        }
-                        if rc.api_key_ref.is_some() {
-                            bits.push("own key".into());
-                        }
-                        if bits.is_empty() {
-                            "not set".into()
-                        } else {
-                            bits.join(" · ")
-                        }
-                    })
-                    .unwrap_or_else(|| "main endpoint".to_string());
+                let cur = role_row_summary(role_get(cfg, key), "main endpoint");
                 format!("{label:<22}· {cur}")
             })
             .collect();
+        let pinned = cfg
+            .roles
+            .as_ref()
+            .and_then(|r| r.pantheon.as_ref())
+            .map_or(0, |m| m.len());
+        items.push(format!(
+            "{:<22}· {pinned} of {} pinned",
+            "Pantheon roles",
+            crate::agent::roles::ROLES.len()
+        ));
         items.push(format!(
             "{:<22}· {} advanced entr(ies)",
             "Advanced overrides",
@@ -2675,11 +2738,12 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 tui::emit_line(&format!("  {}", style(what).dim()));
                 config_edit_one_role(cfg, key, label).await?;
             }
-            i if i == ROLE_ROWS.len() => {
+            i if i == ROLE_ROWS.len() => config_edit_pantheon(cfg).await?,
+            i if i == ROLE_ROWS.len() + 1 => {
                 line_warn("advanced model→endpoint overrides can supersede provider-based routing");
                 config_edit_model_registry(cfg).await?
             }
-            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins(cfg).await?,
+            i if i == ROLE_ROWS.len() + 2 => config_edit_agent_pins(cfg).await?,
             _ => return Ok(()),
         }
     }
@@ -2905,12 +2969,15 @@ async fn config_edit_one_role(
         None
     };
     let mut roles = cfg.roles.take().unwrap_or_default();
-    let slot = role_slot(&mut roles, role);
-    *slot = (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
-        provider,
-        model,
-        ..Default::default()
-    });
+    role_set(
+        &mut roles,
+        role,
+        (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
+            provider,
+            model,
+            ..Default::default()
+        }),
+    );
     cfg.roles = roles.has_any().then_some(roles);
     Ok(())
 }

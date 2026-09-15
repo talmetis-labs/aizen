@@ -458,7 +458,7 @@ impl TaskTool {
     ///
     /// Precedence, highest first:
     /// ```text
-    /// model:    arg `model` > card `model:` > roles.subagent_default > parent
+    /// model:    arg `model` > card `model:` > roles.pantheon.<role> > roles.subagent_default > parent
     /// base_url: card `base_url:`    > env AIZEN_MODEL_<M>_BASE_URL > model_endpoints > roles.subagent_default > parent
     /// api_key:  card `api_key_ref:` > env AIZEN_MODEL_<M>_API_KEY  > model_endpoints > roles.subagent_default > parent
     /// ```
@@ -560,7 +560,16 @@ impl TaskTool {
                     contract.max_steps = p.default_max_steps.clamp(1, MAX_STEP_BUDGET);
                 }
             }
-            let ep = self.resolve_endpoint(arg_model);
+            // No explicit model → the ROLE's own pin (`roles.pantheon.<role>`) sits above the
+            // shared sub-agent default, so a reviewer can run on a stronger model than the
+            // searcher in the same fan-out.
+            let ep = match arg_model {
+                Some(m) => self.resolve_endpoint(Some(m)),
+                None => crate::core::cli_config::pantheon_endpoint(
+                    &role,
+                    &self.default_subagent_endpoint(),
+                ),
+            };
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
             let system = build_subagent_prompt(
                 &role,
@@ -617,7 +626,7 @@ impl Tool for TaskTool {
                 "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
                 "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
-                "max_steps": {"type": "integer", "description": "TOTAL model-step budget for this child (default 25, cap 80); use workflow instead of raising this for independent work"},
+                "max_steps": {"type": "integer", "description": "TOTAL model-step budget for this child (default set by the role, 15-45; cap 80); use workflow instead of raising this for independent work"},
                 "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the sub-agent replies with ONLY a JSON object and the harness validates it (result header shows json:ok|invalid)"}
             },
             "required": ["prompt"],
@@ -2308,6 +2317,103 @@ mod tests {
             d3.registry.get("shell_run").is_some() && d3.registry.get("file_edit").is_none(),
             "tester scope"
         );
+
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn resolve_dispatch_budgets_follow_the_role_profile() {
+        let t = tool(0);
+        let budget = |args: serde_json::Value| t.resolve_dispatch(&args).max_steps;
+        // Absent `max_steps`, the profile answers — and the profiles differ (audit O4).
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "argus"})),
+            15
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "daedalus"})),
+            45
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "coder"})),
+            45,
+            "alias"
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x"})),
+            15,
+            "default role is argus"
+        );
+        // An explicit budget still wins, clamped to the shared cap.
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "argus", "max_steps": 40})),
+            40
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "daedalus", "max_steps": 999})),
+            MAX_STEP_BUDGET
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_pins_a_role_to_its_pantheon_model() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = std::env::temp_dir().join(format!("aizen-disp-pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+        ]);
+        let mut pantheon = std::collections::BTreeMap::new();
+        pantheon.insert(
+            "nemesis".to_string(),
+            crate::core::cli_config::RoleModelConfig {
+                model: Some("strong-model".into()),
+                ..Default::default()
+            },
+        );
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            roles: Some(crate::core::cli_config::RolesConfig {
+                subagent_default: Some(crate::core::cli_config::RoleModelConfig {
+                    model: Some("cheap-model".into()),
+                    ..Default::default()
+                }),
+                pantheon: Some(pantheon),
+                ..Default::default()
+            }),
+            model_endpoints: Some(vec![crate::core::cli_config::ModelEndpoint {
+                model: "strong-model".into(),
+                base_url: Some("https://strong/v1".into()),
+                api_key_ref: Some("literal-strong-key".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let t = tool(0); // parent endpoint: http://localhost / "k" / model "m"
+                         // The pinned role runs on its model, and that model carries its own gateway.
+        let rev = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "nemesis"}));
+        assert_eq!(rev.model, "strong-model");
+        assert_eq!(rev.base_url, "https://strong/v1");
+        assert_eq!(rev.api_key, "literal-strong-key");
+        // An unpinned role still takes the shared sub-agent default — so in one fan-out the
+        // reviewer and the searcher run on different models.
+        let arg = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "argus"}));
+        assert_eq!(arg.model, "cheap-model");
+        assert_eq!(
+            arg.base_url, "http://localhost",
+            "same gateway as the parent"
+        );
+        // An explicit `model` arg beats the pin.
+        let over = t.resolve_dispatch(
+            &serde_json::json!({"prompt": "x", "role": "nemesis", "model": "other"}),
+        );
+        assert_eq!(over.model, "other");
 
         drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);
