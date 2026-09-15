@@ -346,6 +346,12 @@ handing the model false inputs, and starts measuring what it sends.
   journal before touching anything, removes them with the rest of the update, and names them
   (`time restore`, `time undo`, `time redo`, `/undo`). Every one of them is in the checkpoint
   the restore saved first, so `aizen time redo` brings them back.
+- **`aizen update` verifies what it installs and keeps the way back for a week.** Every
+  release now ships a `<asset>.sha256` beside each binary; the updater digests the download as
+  it streams and refuses to install on a mismatch (the staged file is discarded, nothing is
+  renamed). A release from before checksums still installs, with a plain "unverified" line.
+  The staged binary is synced to disk before it replaces the live one, and the previous
+  build's backup stays for seven days instead of vanishing at the next launch.
 
 ## [0.6.7] — 2026-09-11
 

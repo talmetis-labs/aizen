@@ -360,6 +360,13 @@ and `restore_with_report` / `undo_with_report` / `redo_with_report` hand the lis
 and to `/undo`). Pinned by an end-to-end test on a scratch repository (`git init`, two
 checkpoints, an untracked file between them, restore back and forward). This is the bug the
 2026-08-17 note recorded as "restore cannot delete an untracked file".
+E5.2 implemented in part (release workflow publishes `<asset>.sha256` per asset — one file
+per matrix job, since the jobs upload concurrently; `ReleaseInfo.checksum_url`; `download_to`
+digests while streaming and `sync_all`s before the swap; `verify_checksum` refuses a mismatch;
+`BACKUP_PIN_SECS` keeps the previous build seven days). Deviation (aa): the minisign / ed25519
+signature is NOT wired — it needs a release signing key only the maintainer can hold, and a
+verification path with no key would verify nothing; the checksum lands with the next release
+built by the updated workflow, so `aizen update` says "unverified" until then.
 
 | ID | Item | From | Size | Done when |
 |---|---|---|---|---|
