@@ -437,8 +437,8 @@ impl Tool for Process {
     fn description(&self) -> &str {
         "Run and manage LONG-RUNNING background commands (dev servers, watchers, long builds) that \
          shell_run's cap would kill. action=start returns a proc_<n> handle; then wait (blocks \
-         until exit), log (cursor=<next_cursor> → only new output), status/kill/write. Use \
-         shell_run for quick commands. Handles are private to this agent."
+         until exit), log (cursor → only new output), status/kill/write. Use shell_run for \
+         quick commands."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -447,13 +447,14 @@ impl Tool for Process {
             "properties": {
                 "action": {"type": "string", "enum": ["start", "list", "log", "status", "wait", "kill", "write"]},
                 "command": {"type": "string", "description": "the command (action=start)"},
-                "cwd": {"type": "string", "description": "optional working dir (subdir, ../ or absolute) (action=start)"},
-                "network": {"type": "boolean", "description": "request network access (action=start; default false; approval-gated). Any socket — even binding a port — needs it."},
-                "id": {"type": "string", "description": "a proc_<n> handle (all actions except start/list)"},
-                "cursor": {"type": "integer", "description": "resume point from a previous next_cursor; returns only newer output (action=log/wait)"},
-                "timeout_secs": {"type": "integer", "description": "max seconds to block (action=wait; default 30)"},
-                "input": {"type": "string", "description": "text for the process stdin (action=write)"},
-                "enter": {"type": "boolean", "description": "append newline (action=write; default true)"}
+                "cwd": {"type": "string", "description": "working dir (action=start)"},
+                "network": {"type": "boolean", "description": "network access, even to bind a port (action=start; default false; approval-gated)"},
+                "id": {"type": "string", "description": "proc_<n> handle (all but start/list)"},
+                "cursor": {"type": "integer", "description": "a previous next_cursor: only newer output (log/wait)"},
+                "format": crate::agent::result_format::schema_property(),
+                "timeout_secs": {"type": "integer", "description": "seconds to block (wait; default 30)"},
+                "input": {"type": "string", "description": "stdin text (write)"},
+                "enter": {"type": "boolean", "description": "append newline (write; default true)"}
             },
             "required": ["action"]
         })
@@ -544,15 +545,18 @@ impl Tool for Process {
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
                 let e = lookup(&reg, id, &scope)?;
                 let buf = e.out.lock().unwrap_or_else(|e| e.into_inner());
-                match cursor {
-                    Some(c) => Ok(render_delta(id, &e.status_label(), c, &buf.since(c))),
-                    None => Ok(format!(
+                let out = match cursor {
+                    Some(c) => render_delta(id, &e.status_label(), c, &buf.since(c)),
+                    None => format!(
                         "{id} [{}] next_cursor={}\n{}",
                         e.status_label(),
                         buf.end_offset(),
                         buf.text().trim_end()
-                    )),
-                }
+                    ),
+                };
+                Ok(crate::agent::result_format::finish_log(
+                    "process", args, out,
+                ))
             }
             "status" => {
                 let id = args
@@ -613,24 +617,31 @@ impl Tool for Process {
                     } else {
                         format!("still running after {timeout}s, not killed")
                     };
-                    return Ok(render_delta(&id, &status, c, &delta));
+                    return Ok(crate::agent::result_format::finish_log(
+                        "process",
+                        args,
+                        render_delta(&id, &status, c, &delta),
+                    ));
                 }
-                let out = buf.text();
-                if exited {
-                    Ok(format!(
+                let text = buf.text();
+                let out = if exited {
+                    format!(
                         "{id} {} next_cursor={}\n{}",
                         e.status_label(),
                         buf.end_offset(),
-                        out.trim_end()
-                    ))
+                        text.trim_end()
+                    )
                 } else {
-                    Ok(format!(
+                    format!(
                         "{id} still running after {timeout}s (not killed). next_cursor={} — pass it \
                          as `cursor` next time to get only new output. Latest output:\n{}",
                         buf.end_offset(),
-                        out.trim_end()
-                    ))
-                }
+                        text.trim_end()
+                    )
+                };
+                Ok(crate::agent::result_format::finish_log(
+                    "process", args, out,
+                ))
             }
             "kill" => {
                 let id = args

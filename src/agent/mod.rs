@@ -32,6 +32,7 @@ pub mod prompt_lanes;
 pub mod query_lang;
 pub mod reach;
 pub mod repo_map;
+pub mod result_format;
 pub mod roles;
 pub mod search;
 pub mod task_tool;
@@ -1601,7 +1602,7 @@ where
                             // Shrink once, then retry immediately (the failure was deterministic,
                             // not load — no backoff owed).
                             if overflow_shrinks >= MAX_OVERFLOW_SHRINKS
-                                || !emergency_overflow_shrink(messages, &cfg, schema_overhead)
+                                || !emergency_overflow_shrink(messages, cfg, schema_overhead)
                             {
                                 if nudge_pushed {
                                     messages.pop();
@@ -1810,7 +1811,7 @@ where
                             crate::llm::client::ApiErrorKind::ContextOverflow
                         ) {
                             if overflow_shrinks >= MAX_OVERFLOW_SHRINKS
-                                || !emergency_overflow_shrink(messages, &cfg, schema_overhead)
+                                || !emergency_overflow_shrink(messages, cfg, schema_overhead)
                             {
                                 rollback(messages, empty_nudges, nudge_pushed);
                                 return Err(e);

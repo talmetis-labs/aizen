@@ -3574,7 +3574,8 @@ impl Tool for ShellRun {
             "properties": {
                 "command": {"type": "string"},
                 "cwd": {"type": "string", "description": "optional working dir for the command (a subdir, or a ../ or absolute path elsewhere)"},
-                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where the platform can enforce it). Approval-gated escalation."}
+                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where the platform can enforce it). Approval-gated escalation."},
+                "format": crate::agent::result_format::schema_property()
             },
             "required": ["command"],
             "additionalProperties": false
@@ -3729,7 +3730,11 @@ impl Tool for ShellRun {
                     s.push_str("\n[stderr]\n");
                     s.push_str(&stderr);
                 }
-                Ok(s.trim_end().to_string())
+                Ok(crate::agent::result_format::finish_log(
+                    "shell_run",
+                    args,
+                    s.trim_end().to_string(),
+                ))
             }
             Some(st) => {
                 let mut s = format!("exit {}\n", st.code().unwrap_or(-1));
@@ -3738,7 +3743,11 @@ impl Tool for ShellRun {
                     s.push_str("\n[stderr]\n");
                     s.push_str(&stderr);
                 }
-                Ok(s.trim_end().to_string())
+                Ok(crate::agent::result_format::finish_log(
+                    "shell_run",
+                    args,
+                    s.trim_end().to_string(),
+                ))
             }
         }
     }

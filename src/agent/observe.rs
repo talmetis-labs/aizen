@@ -190,7 +190,7 @@ fn arg_summary(args: &str) -> String {
     String::new()
 }
 
-fn human_size(bytes: usize) -> String {
+pub(crate) fn human_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
