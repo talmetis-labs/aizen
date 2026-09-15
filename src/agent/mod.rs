@@ -12,6 +12,7 @@
 
 pub mod app_catalog;
 pub mod architect;
+pub mod blackboard;
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod builtin;
@@ -340,6 +341,16 @@ pub(crate) fn build_role_scoped_subagent_base_prompt(
     s.push_str(&format!(
         "scratch: {}\n",
         crate::core::scratch::dir().display()
+    ));
+    // The sibling blackboard of the conversation this child is spawned into. The CURRENT
+    // context here is the parent's: the child's own scope is derived after its prompt is built.
+    s.push_str(&format!(
+        "{}\n",
+        crate::agent::blackboard::env_line(
+            &crate::core::exec_ctx::current()
+                .unwrap_or_default()
+                .resource_scope()
+        )
     ));
     s.push_str("</environment>\n");
     if let Some(idx) = crate::skills::gated_index(task) {
@@ -3207,11 +3218,14 @@ async fn execute_calls(
                                 // autosave, the parallel test suite) must WAIT, not fail the edit
                                 // with a lease error the user can't act on. Esc still interrupts —
                                 // the cancel token is threaded into the wait loop.
-                                match crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+                                // Under THIS run's scope: a delegated child (a descendant
+                                // scope) reenters it, a sibling lane or dispatch waits.
+                                match crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
                                     &cwd,
                                     std::time::Duration::from_secs(15),
                                     Some(&cfg.cancel),
                                     tool.name(),
+                                    &cfg.exec_ctx.resource_scope(),
                                 ) {
                                     Ok(lease) => {
                                         *writer_lease = Some(lease);

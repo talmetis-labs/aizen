@@ -1171,6 +1171,12 @@ pub(crate) async fn run_one_task(
     // siblings and the pending synthesis carry on. Esc still stops everything: cancellation flows down
     // from the turn token this was derived from (see `TurnCancel::child`). Armed on the board below.
     let own_cancel = cancel.child();
+    // The parent's scope: the child's is derived UNDER it (so the workspace writer lease sees
+    // the child as the parent's descendant, not a sibling), and the context pack and the
+    // blackboard are the parent conversation's.
+    let parent_scope = crate::core::exec_ctx::current()
+        .unwrap_or_default()
+        .resource_scope();
     let cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
@@ -1178,7 +1184,11 @@ pub(crate) async fn run_one_task(
         // keep tool-body heartbeats off the parent transcript. The workflow board owns progress.
         exec_ctx: crate::core::exec_ctx::current()
             .unwrap_or_default()
-            .with_resource_scope(format!("workflow/{}/{}", parent.unwrap_or(0), task.id))
+            .with_resource_scope(format!(
+                "{parent_scope}/workflow/{}/{}",
+                parent.unwrap_or(0),
+                task.id
+            ))
             .with_trace_visible(false),
         quiet: true,
         // A writer runs alone in its wave (see `schedule`), so its verify gate never contends
@@ -1259,9 +1269,7 @@ pub(crate) async fn run_one_task(
     // What the parent already knows, ahead of the brief — the same pack a `task` dispatch gets.
     let pack = crate::agent::context_pack::gather(
         root,
-        &crate::core::exec_ctx::current()
-            .unwrap_or_default()
-            .resource_scope(),
+        &parent_scope,
         task.context.as_deref().unwrap_or(&[]),
     );
     let mut msgs = vec![
@@ -1271,7 +1279,7 @@ pub(crate) async fn run_one_task(
             &task.prompt,
         )),
     ];
-    match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
+    let outcome = match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
         Ok(o) => {
             let status = match o.stop {
                 StopReason::Done => "done",
@@ -1364,7 +1372,11 @@ pub(crate) async fn run_one_task(
                 iters: 0,
             }
         }
-    }
+    };
+    // File the whole report on the sibling blackboard: a later wave can `file_read` all of
+    // it, not only the part the `<upstream>` block forwards.
+    crate::agent::blackboard::note(&parent_scope, &outcome.id, &outcome.summary);
+    outcome
 }
 
 /// Emit the workflow header line (the fan-out banner) into the sticky-TUI transcript — a moonlight

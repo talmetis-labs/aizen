@@ -297,6 +297,16 @@ pub(crate) fn build_agent_subagent_prompt(
     // The specialist's OWN surface — `agent_registry` narrows tools per the card's `tools:` frontmatter,
     // so a card granting only reads must not be handed the parent's editing/delegation vocabulary.
     crate::agent::append_tool_routing(&mut s, tools);
+    // The sibling blackboard (the role path carries it inside `<environment>`; this path's
+    // environment block is the top-level one, so the line rides after it).
+    s.push_str(&format!(
+        "\n{}\n",
+        crate::agent::blackboard::env_line(
+            &crate::core::exec_ctx::current()
+                .unwrap_or_default()
+                .resource_scope()
+        )
+    ));
     s.push('\n');
     s.push_str(SUBAGENT_PREAMBLE); // AUTHORITATIVE rules, BEFORE the untrusted specialist body
     let name = sanitize_agent_attr(&def.name);
@@ -799,7 +809,7 @@ impl Tool for TaskTool {
             NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let child_ctx = parent_ctx
-            .with_resource_scope(child_scope)
+            .with_resource_scope(child_scope.clone())
             .with_trace_visible(false);
         let cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
@@ -993,6 +1003,13 @@ impl Tool for TaskTool {
             track.finish_err(detail);
         }
         let warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
+        // File the whole report on the sibling blackboard: the parent sees this result cut to
+        // its budget, a later child can `file_read` all of it.
+        crate::agent::blackboard::note(
+            &parent_ctx.resource_scope(),
+            &crate::agent::blackboard::task_note_id(&label, &child_scope),
+            &body,
+        );
         Ok(format!(
             "[task: {header_label}, {} step(s), {stop}{json_tag}]\n{warning}{body}",
             outcome.iters
