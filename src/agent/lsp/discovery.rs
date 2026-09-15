@@ -128,6 +128,44 @@ pub fn detect(anchor: &Path) -> Option<(&'static ServerSpec, PathBuf)> {
     None
 }
 
+/// The warm-up walk gives up after this many directory entries: a huge tree costs a bounded
+/// walk, and a language whose first file sits deeper than that simply starts lazily as before.
+const PROBE_SCAN_CAP: usize = 4_000;
+
+/// One representative source file per language whose project manifest resolves from that
+/// file — the startup warm-up probes each with a `documentSymbol`, which starts the server (and
+/// its cold index) before the first edit needs it. Ignore-aware and capped at
+/// [`PROBE_SCAN_CAP`] entries. A file only counts when its workspace root lies INSIDE `root`:
+/// [`detect`] walks up without bound, so a stray `.js` under `docs/` in a Rust repo would
+/// otherwise bind to a `package.json` in the home directory and start a server rooted there.
+pub fn probe_files(root: &Path) -> Vec<PathBuf> {
+    // `resolve_workspace_root` answers in canonical form (`\\?\C:\…` on Windows), so the
+    // containment test has to compare against the canonical project root too.
+    let root_c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut picked: Vec<(&'static str, PathBuf)> = Vec::new();
+    let mut seen = 0usize;
+    for entry in ignore::WalkBuilder::new(root).build().flatten() {
+        seen += 1;
+        if seen > PROBE_SCAN_CAP || picked.len() == SERVERS.len() {
+            break;
+        }
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(spec) = server_for_path(p) else {
+            continue;
+        };
+        if picked.iter().any(|(lang, _)| *lang == spec.lang) {
+            continue;
+        }
+        if detect(p).is_some_and(|(_, r)| r.starts_with(&root_c)) {
+            picked.push((spec.lang, p.to_path_buf()));
+        }
+    }
+    picked.into_iter().map(|(_, p)| p).collect()
+}
+
 /// Resolve the server's executable to an absolute path, honoring Windows `PATHEXT` (so a node server
 /// installed as `name.cmd` resolves — a bare-name spawn would `ENOENT`). For Rust it also tries
 /// `rustup which rust-analyzer` as a fallback, since the common `rustup component add` install isn't
@@ -274,6 +312,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn probe_files_picks_one_file_per_language_that_has_a_manifest() {
+        let d = sandbox("probe");
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(d.join("src/b.rs"), "fn b() {}\n").unwrap();
+        // A stray script whose nearest package.json (if any) is outside the sandbox: never probed.
+        std::fs::create_dir_all(d.join("docs")).unwrap();
+        std::fs::write(d.join("docs/x.js"), "1\n").unwrap();
+        // A nested web package IS one.
+        std::fs::create_dir_all(d.join("web")).unwrap();
+        std::fs::write(d.join("web/package.json"), "{}\n").unwrap();
+        std::fs::write(d.join("web/app.ts"), "export const a = 1;\n").unwrap();
+        let files = probe_files(&d);
+        let mut langs: Vec<&str> = files
+            .iter()
+            .map(|f| server_for_path(f).map(|s| s.lang).unwrap_or("?"))
+            .collect();
+        langs.sort_unstable();
+        assert_eq!(langs, vec!["rust", "typescript"], "{files:?}");
+        assert!(
+            files.iter().all(|f| !f.ends_with("x.js")),
+            "a script with no manifest inside the project is skipped: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

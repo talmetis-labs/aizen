@@ -70,6 +70,27 @@ const BLOCK_LIMIT: usize = 2048;
 const RESIZE_SETTLE: Duration = Duration::from_millis(400);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Milliseconds since process start at which transcript output last landed (a block pushed,
+/// assistant text appended, a tool row updated). The idle screensaver reads it: a user READING
+/// a long answer is idle on the keyboard but the screen is not stale.
+static LAST_OUTPUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn process_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Record that transcript output just landed.
+fn note_output() {
+    let ms = process_epoch().elapsed().as_millis() as u64;
+    LAST_OUTPUT_MS.store(ms, Ordering::Relaxed);
+}
+
+/// How long the transcript has been quiet — no block, no streamed text, no tool update.
+pub(super) fn output_quiet_for() -> Duration {
+    let now = process_epoch().elapsed().as_millis() as u64;
+    Duration::from_millis(now.saturating_sub(LAST_OUTPUT_MS.load(Ordering::Relaxed)))
+}
 static COLS: AtomicU16 = AtomicU16::new(80);
 static ROWS: AtomicU16 = AtomicU16::new(24);
 
@@ -485,6 +506,7 @@ impl AppState {
     }
 
     fn push_block(&mut self, kind: BlockKind, payload: Payload, complete: bool) -> u64 {
+        note_output();
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.blocks.push(UiBlock {
@@ -508,6 +530,7 @@ impl AppState {
 
     /// A plain-text block (generic emit / intro). Convenience over [`push_block`] + [`Payload::Text`].
     fn push_text(&mut self, kind: BlockKind, content: String, complete: bool) -> u64 {
+        note_output();
         self.push_block(kind, Payload::Text(content), complete)
     }
 
@@ -551,6 +574,7 @@ impl AppState {
     /// the same line instead of appending a second row). A result for an unknown seq (e.g. after
     /// pruning) just pushes a fresh completed row.
     fn apply_tool_event(&mut self, ev: ToolEvent) {
+        note_output();
         if let Some(block) = self.blocks.iter_mut().find(|b| {
             b.kind == BlockKind::Tool && matches!(&b.payload, Payload::Tool(t) if t.seq == ev.seq)
         }) {

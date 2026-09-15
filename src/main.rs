@@ -628,6 +628,7 @@ async fn run_menu_sticky() -> Result<()> {
     }
     tui::set_ultimate(cli_config::ultimate_enabled()); // open the input box in the right colour (gold if ultimate)
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
+    warm_up_after_first_frame();
     {
         let (main, notes) = identity_banner();
         tui::emit_line(&style(main).dim().to_string());
@@ -1322,6 +1323,31 @@ fn arm_lsp_session() {
     if !ARMED.swap(true, Ordering::Relaxed) {
         let _ = crate::agent::lsp::LSP.enable();
     }
+}
+
+/// Warm the two lazy subsystems a first edit or search otherwise pays for inline, AFTER the
+/// first frame is up (nothing here runs before the REPL is usable, so startup is unchanged):
+/// the LSP runtime plus one server per language the project uses (a `documentSymbol` probe on
+/// one file of that language starts the server and its cold index), and an incremental refresh
+/// of an EXISTING `/init` index — never a first build, which scans and redacts the whole repo
+/// and is the user's call. Best-effort and silent: a missing server binary, `/lsp off`, or a
+/// locked index are all skips. `AIZEN_NO_WARMUP=1` turns it off (benchmarks, small machines).
+fn warm_up_after_first_frame() {
+    if std::env::var_os("AIZEN_NO_WARMUP").is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("aizen-warmup".into())
+        .spawn(|| {
+            arm_lsp_session();
+            let root = crate::core::config::project_root();
+            for file in crate::agent::lsp::discovery::probe_files(&root) {
+                let _ = crate::agent::lsp::LSP.document_symbols(&file);
+            }
+            if crate::agent::codebase::load().is_some() {
+                let _ = crate::agent::codebase::build_index(true, None, &|_| {});
+            }
+        });
 }
 
 /// Whether an active persona evolves (records episodes + reflects). `None` ⇒ default ON.

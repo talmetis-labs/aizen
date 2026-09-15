@@ -134,6 +134,10 @@ fn normalize_paste_text(text: &str) -> String {
 /// Idle seconds before the screensaver card is raised (retained backend only). Reset by any key or
 /// mouse event; gated on !working and no open menu/overlay so it never fires mid-task or over a menu.
 const IDLE_SCREENSAVER_SECS: u64 = 15;
+/// The screensaver also needs the TRANSCRIPT quiet this long: a user reading a long diff is
+/// idle on the keyboard for more than 15 s, and covering what they are reading is the audit's
+/// U10.
+const OUTPUT_QUIET_SECS: u64 = 60;
 
 /// Shared list + selection while the overlay is open (owned by the menu input thread).
 static MODEL_MENU: OnceLock<Mutex<ModelMenuState>> = OnceLock::new();
@@ -2745,6 +2749,7 @@ fn input_loop(
                     && !text_overlay_active()
                     && !RETAINED_INFO_OVERLAY.load(Ordering::Relaxed)
                     && last_activity.elapsed() >= Duration::from_secs(IDLE_SCREENSAVER_SECS)
+                    && retained::output_quiet_for() >= Duration::from_secs(OUTPUT_QUIET_SECS)
                 {
                     if let Some(idx) = crate::ui::cards::screensaver_card() {
                         retained::screensaver(Some(idx));
