@@ -1439,6 +1439,14 @@ pub(crate) enum BenchCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Turn-shape statistics over this machine's saved conversations: tool calls per user turn,
+    /// result sizes and how many sit at the cut, repeated calls, the call mix, read : edit. The
+    /// numbers behind the fast-lean plan's §1.2; run before a release and after a loop change.
+    Sessions {
+        /// Print the statistics as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Parser, Debug)]

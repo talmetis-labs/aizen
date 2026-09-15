@@ -6705,6 +6705,12 @@ mod tests {
             .output()
             .is_err()
         {
+            // A developer box without git may skip; CI may not — a skipped end-to-end proof
+            // there is a green check that proved nothing (E6.2, quality plan Q4).
+            assert!(
+                std::env::var("CI").is_err(),
+                "CI must have git on PATH for the git_inspect end-to-end test"
+            );
             eprintln!("git not on PATH — skipping");
             return;
         }

@@ -1,0 +1,8 @@
+{
+  "id": "refactor-with-tests",
+  "prompt": "src/lib.rs computes the same thing three times: `total_cents`, `total_cents_with_tax` and `total_cents_with_discount` each re-sum the line items by hand. Refactor so the summing lives in ONE private helper the three functions share, keep every public signature exactly as it is, and add a unit test in src/lib.rs that exercises the helper through `total_cents_with_tax` on an empty list. `cargo test` (the unit tests plus tests/totals.rs) must pass; do not edit tests/.",
+  "allowed_files": ["src/lib.rs"],
+  "expect": "done",
+  "verify": ["cargo", "test", "--quiet"],
+  "max_steps": 30
+}

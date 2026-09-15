@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
             BenchCmd::Dialectic => bench::brain::run_dialectic(),
             BenchCmd::Health => bench::brain::run_health(),
             BenchCmd::Loop => bench::loop_eval::run().await,
+            BenchCmd::Sessions { json } => bench::sessions_stats::run(json),
             BenchCmd::Tasks {
                 task,
                 record,

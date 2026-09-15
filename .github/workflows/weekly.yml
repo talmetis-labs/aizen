@@ -1,0 +1,36 @@
+name: weekly release test
+
+# The shipped profile (`lto = fat`, `codegen-units = 1`, `strip`) was built on tags only and never
+# tested (quality plan Q5). Once a week, on the maintainer's primary platform, the whole suite runs
+# against the release build — the one users actually get.
+on:
+  schedule:
+    - cron: '17 3 * * 1'   # Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-test:
+    name: cargo test --release (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+      - name: Test the release profile
+        run: cargo test --release --bin aizen
+        env:
+          CI: 'true'
+      - name: Loop bench on the release binary
+        run: cargo run --release --bin aizen -- bench loop

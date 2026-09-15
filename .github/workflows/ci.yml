@@ -88,16 +88,20 @@ jobs:
         run: cargo run --bin aizen -- bench tasks --json
 
   lint:
-    name: fmt + clippy (advisory)
+    name: fmt (gating) + clippy (advisory)
     runs-on: ubuntu-latest
-    # Advisory only: the tree carries pre-existing warnings, so this surfaces fmt/clippy findings
-    # without gating merges. Contributors are asked to clear anything THEY introduce (see CONTRIBUTING).
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Components
         run: rustup component add rustfmt clippy
+      # Gating: the tree is rustfmt-clean (checked 2026-09-15), so a formatting diff is a
+      # regression, not a pre-existing condition.
       - name: Format check
         run: cargo fmt --check
+      # Advisory: the tree carries pre-existing clippy warnings (138 on the 2026-09-15 toolchain),
+      # and `-D warnings` cannot gate until they are cleared. The count is ratcheted locally per
+      # change (no new warning in a touched file); clearing the backlog is its own task. Contributors
+      # are asked to clear anything THEY introduce (see CONTRIBUTING).
       - name: Clippy
-        run: cargo clippy --bin aizen
+        continue-on-error: true
+        run: cargo clippy --bin aizen --tests

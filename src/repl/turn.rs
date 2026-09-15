@@ -515,3 +515,67 @@ pub(crate) fn show_clarify(display: &str) {
         println!("{hint}");
     }
 }
+
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+
+    /// E6.2 (quality plan Q4): `src/repl/` had no tests at all. One user turn goes through the same
+    /// `run_agent_turn` both REPL surfaces call, with the model's answer replayed from a tape, the
+    /// real registry and the real loop — no network, no key. It pins the wiring (config → registry
+    /// → loop → outcome) that only a person at a terminal used to exercise.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the home + tape locks must span the taped turn
+    async fn one_turn_runs_through_the_repl_wiring_on_a_tape() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-repl-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("AIZEN_HOME", &home);
+        let _tape_lock = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tape = home.join("smoke.jsonl");
+        // Fingerprints are deliberately bogus: replay warns and carries on (the documented contract
+        // for a harness that changed underneath a recording).
+        let line = serde_json::json!({
+            "ordinal": 0, "model": "synthetic", "system_fp": "x", "turns_fp": "x",
+            "turn": {"content": "The answer is 4.", "finish_reason": "stop",
+                "usage": {"prompt": 500, "completion": 8, "cached": 0, "cache_write": 0}}
+        });
+        std::fs::write(&tape, line.to_string() + "\n").unwrap();
+        crate::llm::replay::configure(crate::llm::replay::Mode::Replay, &tape, None).unwrap();
+
+        let http = reqwest::Client::new();
+        let ep = cli_config::ResolvedEndpoint {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            api_key: "unused".to_string(),
+            model: "synthetic".to_string(),
+        };
+        let registry = build_turn_registry(&http, &ep).expect("registry");
+        let cfg = turn_agent_config(crate::core::cancel::TurnCancel::new(), "synthetic", false);
+        let mut history = vec![
+            Message::system("You are a test."),
+            Message::user("What is 2 + 2?"),
+        ];
+        let outcome = run_agent_turn(&http, &ep, &cfg, &registry, &mut history)
+            .await
+            .expect("a taped turn completes");
+        crate::llm::replay::disable();
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(outcome.final_text.as_deref(), Some("The answer is 4."));
+        assert!(
+            matches!(outcome.stop, StopReason::Done),
+            "{:?}",
+            outcome.stop
+        );
+        assert!(
+            history.iter().any(|m| m.role == "assistant"),
+            "the assistant turn was appended to the history"
+        );
+    }
+}

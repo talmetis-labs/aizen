@@ -8,6 +8,7 @@
 pub mod brain;
 pub mod loop_eval;
 pub mod metrics;
+pub mod sessions_stats;
 pub mod task_eval;
 
 use crate::memory::embed::{self, Embedder};
