@@ -796,9 +796,54 @@ fn day_label(mtime_ms: Option<u64>) -> String {
         .unwrap_or_else(|| "date unknown".to_string())
 }
 
+/// One `<sessions>` row's worth of a transcript.
+type SessionBrief = (usize, Option<SessionMeta>, String);
+/// A transcript file's identity for the row cache: modification time and size.
+type BriefStamp = (Option<std::time::SystemTime>, u64);
+/// The row cache: path → (stamp it was parsed at, row).
+type BriefCache = std::collections::HashMap<std::path::PathBuf, (BriefStamp, SessionBrief)>;
+
+/// Row cache for [`read_session_brief`], valid while the file's `(mtime, len)` matches (E4.5,
+/// quality plan M7: up to eight 400–750 KB transcripts were parsed at every conversation
+/// boundary to render three rows). Keyed by path, so a test home's pool never collides.
+fn session_brief_cache() -> &'static Mutex<BriefCache> {
+    static CACHE: OnceLock<Mutex<BriefCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Transcripts parsed for a row since process start — a test's way to see the cache work.
+#[cfg(test)]
+static BRIEF_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The `<sessions>` row for one pool file: served from the row cache while the file's
+/// `(mtime, len)` is unchanged, parsed once otherwise.
+fn read_session_brief(path: &std::path::Path) -> Option<SessionBrief> {
+    let fp = std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()));
+    if let Some(fp) = fp {
+        if let Ok(cache) = session_brief_cache().lock() {
+            if let Some((seen, row)) = cache.get(path) {
+                if *seen == fp {
+                    return Some(row.clone());
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    BRIEF_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let row = parse_session_brief(path)?;
+    if let Some(fp) = fp {
+        if let Ok(mut cache) = session_brief_cache().lock() {
+            cache.insert(path.to_path_buf(), (fp, row.clone()));
+        }
+    }
+    Some(row)
+}
+
 /// Parse one pool file just far enough for a `<sessions>` row: turn count, provenance, and the
 /// first user message as the topic snippet.
-fn read_session_brief(path: &std::path::Path) -> Option<(usize, Option<SessionMeta>, String)> {
+fn parse_session_brief(path: &std::path::Path) -> Option<SessionBrief> {
     let (msgs, meta) = std::fs::read(path)
         .ok()
         .and_then(|b| parse_session_bytes(&b))?;
@@ -1269,16 +1314,23 @@ mod sessions_block_tests {
         // A file that appears mid-conversation (another window's autosave) must NOT re-render the
         // block this conversation already adopted — that is the byte-stability the cache needs.
         save_session(&history("add a feature"), "add-feature-0902", Some("m")).unwrap();
+        let parsed_before = super::BRIEF_PARSES.load(std::sync::atomic::Ordering::Relaxed);
         let again = recent_sessions_block().unwrap();
         assert_eq!(
             again, first,
             "adopted block is reused verbatim within a conversation"
         );
 
-        // At the next conversation boundary the pool is re-read…
+        // At the next conversation boundary the pool is re-read — but the unchanged transcript is
+        // NOT re-parsed: its row comes from the (mtime, len) cache; only the new file is parsed.
         clear_sessions_block_cache();
         let refreshed = recent_sessions_block().unwrap();
         assert!(refreshed.contains("add-feature-0902"));
+        assert_eq!(
+            super::BRIEF_PARSES.load(std::sync::atomic::Ordering::Relaxed) - parsed_before,
+            1,
+            "one new transcript parsed, the unchanged one served from the row cache"
+        );
 
         // …and the conversation currently being autosaved never lists itself: its file changes
         // every turn, so a row for it could never be stable.
