@@ -193,6 +193,15 @@ handing the model false inputs, and starts measuring what it sends.
   `path:start-end` from its own read cache — so the child goes to those lines instead of
   searching for them, and does not re-derive what the parent already knows. Capped at 2,500
   chars, reads dropped before findings; nothing is added when there is nothing to hand over.
+- **Workflows chain, and the writer is verified.** A workflow task may name the tasks it waits
+  for (`after`); tasks run in dependency waves, and a chained task receives its dependencies'
+  latest reports in an `<upstream>` block ahead of its brief. Within a wave the read-only tasks
+  fan out first and the wave's one writer runs alone, so a reviewer never reads a tree the
+  implementer is mutating; two writers may share a workflow only when `after` orders them. A
+  task that names `retry_on_fail` and reports `VERDICT: FAIL` re-runs that upstream task once
+  with the failure attached, then runs again; both attempts stay in the trace as `id` and
+  `id#2`. `workflow(mode="implement", prompt=…)` prebuilds daedalus → themis → nemesis with
+  that fix loop, and a workflow writer now runs under the verify gate like a `task` writer.
 
 ## [0.6.7] — 2026-09-11
 

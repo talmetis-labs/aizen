@@ -767,6 +767,8 @@ Spec shape:
     "boundaries": "Do not edit files",
     "expected_output": "Findings with severity and file:line evidence",
     "context": ["what the parent already established — the child does not re-derive it"],
+    "after": ["implement"],               // wait for these tasks; their reports ride in ahead of the brief
+    "retry_on_fail": "implement",         // on VERDICT: FAIL, re-run that task once with the failure, then this one
     "max_steps": 25,                      // total step budget (default: the role's own; cap 80)
     "expects": { "type": "object" }       // JSON Schema the child's answer must satisfy
   }, ... ],
@@ -781,6 +783,18 @@ task never aborts the workflow — its result is captured and the synthesis stil
 **Model diversity (mixture-of-agents):** each task may set its own `model` (e.g. a cheap model
 scouts, a strong one reviews) — else the workflow default. `--trace <path>` writes a JSON audit of
 the fan-out (per-task model + outcome + the synthesis model).
+**Chains and the fix loop:** `after` orders tasks into dependency waves (Kahn order; unknown
+ids and cycles are refused). Within a wave the read-only tasks fan out first and the wave's one
+writer (`daedalus`, or `themis`, which holds a shell) runs alone, so a reviewer never reads a
+tree the implementer is mutating — put the review AFTER the change with `after`. Two writers
+may share a workflow only when `after` orders them. A chained task's brief opens with an
+`<upstream>` block carrying its dependencies' latest reports (4,000 chars each, 12,000 total).
+A task with `retry_on_fail` whose report opens with `VERDICT: FAIL` re-runs the named upstream
+task once with the failure attached, then runs again; the trace keeps both attempts as `id`
+and `id#2`. Workflow writers run under the verify gate like a `task` writer. From the REPL,
+`workflow(mode="implement", prompt="…")` prebuilds implement (daedalus) → verify (themis,
+first line `VERDICT: PASS|FAIL`) → review (nemesis) with that fix loop; the same spec as a
+file is `bench-fixtures/workflows/implement.json`.
 
 ### `aizen crawl <url>` — katana-style web crawler
 BFS over HTTP from a seed URL: extracts links from HTML (`href`/`src`/`action`) and endpoints

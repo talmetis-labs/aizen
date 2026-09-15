@@ -167,7 +167,15 @@ consecutive user turns — and the reading list is "this conversation" (the pare
 scope, newest first) rather than "this turn": the store carries no turn stamp, is cleared on
 compaction, and records only turns with no destructive call, so it is a best-effort list, never
 a promise. The "done when" (no re-reads of the parent's files in fan-out traces) stays
-unmeasured until tapes exist.
+unmeasured until tapes exist. E2.3 implemented (`after`, `waves`, `schedule`, `retry_on_fail`,
+`verdict_failed` in `workflow.rs`; `implement` mode in `workflow_tool.rs`;
+`bench-fixtures/workflows/implement.json`). Deviation (l): the fix loop is a generic
+`retry_on_fail` edge any spec can use rather than preset-only logic, so the CLI spec file gets
+it too; within a wave the readers run BEFORE the writer (a consistent pre-edit snapshot — a
+review that must see the change says `after`); both attempts of a retried task stay in the
+trace as `id` and `id#2`. The "done when" (a themis FAIL triggers exactly one daedalus retry)
+is pinned by `schedule_runs_waves_in_order_and_fix_loops_once` against a scripted runner; the
+unattended live run of `aizen workflow implement.json` waits for an endpoint.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
