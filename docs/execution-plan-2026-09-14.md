@@ -272,6 +272,24 @@ session on a real endpoint.
 
 ## 6. Phase 4 — memory that earns its tokens (2.5 weeks)
 
+**Status 2026-09-15:** E4.1 implemented on `feat/e0.1-usage-ledger`
+(`consolidate::find_duplicate`: lexical at `learn_dedup_threshold`, then MinHash ≥ 0.60 AND
+normalised-token ≥ 0.55 for the 0.45–0.78 band, the stage written on the audit line;
+`consolidate::plan_pass` + `aizen memory consolidate [--apply]`, a model-free store-wide pass
+that retires each duplicate revivably and reinforces its survivor). Deviation (v): the check
+widens across TIERS, not across partitions of the same tier — the same sentence at two anchors
+or two devices stays two facts (the `apply_store_never_merges_across_places` contract holds),
+while a sentence held in another tier is a classification artefact (M3) and reinforces that
+row. Deviation (w): `aizen memory consolidate` did not exist (the plan says "re-run" it;
+`reconcile` is the model-judged pass), so it was written as a local pass and the one-time merge
+needs no endpoint. Live-store run (2026-09-15, backed up first): 466 entries / 424 live, 4
+merges over two rounds (one verify-pipeline fact written four times under a ping-pong of
+`supersedes`; retiring a twin un-hides the row it had buried, hence the rounds), the survivor
+now `sessions: 3`, audit `reinforce` 0 → 4. The frozen core is unchanged (1 entry): the
+survivor is a `place` fact of another project. The 0.45 band floor does not reach the
+Vietnamese restatement cluster (peak lexical 0.44, see `match_text`) — those stay
+`reconcile`'s to judge.
+
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
 | E4.1 | Two-stage dedup (lexical 0.78 across tiers, then MinHash 0.6 + containment); one `consolidate --apply` on the existing store | QP P4.1 (M1, M2) | M | — | `learning-audit.jsonl` shows `reinforce` > 0; core non-empty |

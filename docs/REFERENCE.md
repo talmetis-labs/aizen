@@ -1103,6 +1103,8 @@ aizen memory ask "which package manager should I use?"   # abstains rather than 
 aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
 aizen memory frozen                 # the always-on prompt-prefix core
 aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
+aizen memory consolidate [--apply]  # merge near-duplicates locally (lexical, then MinHash + normalised tokens); dry run by default
+aizen memory reconcile [--apply]    # the model-judged pass for the pairs consolidate leaves in the review band
 aizen memory where                  # the folders + counts, for editing or clearing out many at once
 ```
 

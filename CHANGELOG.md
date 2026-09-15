@@ -290,6 +290,16 @@ handing the model false inputs, and starts measuring what it sends.
   an existing `/init` index incrementally — so the first edit of a session already gets
   diagnostics and the first `codebase_search` sees today's files. Startup time is unchanged;
   `AIZEN_NO_WARMUP=1` turns the warm-up off.
+- **Memory dedup that actually fires, and `aizen memory consolidate`.** A new fact is now
+  checked in two stages — the lexical match at the usual 0.78, then, for the 0.45–0.78 band, a
+  character-level MinHash (≥ 0.60) together with the accent-folded token measure (≥ 0.55) — and
+  against the other tiers too, so a sentence the store already holds as a `user` fact
+  reinforces that row instead of getting a `project` twin. The same tier at another anchor or
+  device still stays separate. `aizen memory consolidate [--apply]` runs the same check over
+  the whole live store without a model call: dry run by default; `--apply` retires each
+  duplicate (revivable with `aizen memory revive <id>`) and reinforces its survivor, in rounds
+  until nothing surfaces, which is what finally lets an inferred fact reach the frozen core.
+  Every merge is on the audit log with the stage that decided it.
 
 ## [0.6.7] — 2026-09-11
 
