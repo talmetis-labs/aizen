@@ -83,6 +83,26 @@ the model · Python fixture cannot fake `Done` · multi-line `rm` is asked · su
 
 ## 3. Phase 1 — loop, client, lean (5 weeks)
 
+**Status 2026-09-15 (same branch, uncommitted at the time of writing):** implemented E1.1, E1.4,
+E1.5, E1.6, E1.7, E1.8, E1.11, E1.12, E1.14, E1.15, E1.16. Not yet: E1.2 (age-based collapsing
+and spill), E1.3 (`format:` on the log tools), E1.9 (edit-tool polish), E1.10 (async
+diagnostics), E1.13 (lenient tool-call recovery), E1.17 (Codex parity, first to cut).
+Deviations worth knowing: (a) E1.5 nudges retire at the START of the next run rather than at the
+end of the current one, because the loop bench and several tests read a run's nudges off its
+history; the cache effect is the same (the new user turn rewrites the prefix from that point
+anyway). Delivery role is `system` on Anthropic-style bases and a tagged user-turn message
+everywhere else. (b) E1.8 keeps `persona_create` on the registry as a DEFERRED tool rather than
+removing it — there is no slash path that mints a character, so removal would have broken the
+"create a persona named X" flow; deferral takes its schema off the request all the same. (c) E1.8
+built-in deferral is ON by default only for first-party APIs (`api.anthropic.com`,
+`api.openai.com`): REFERENCE records a measured A/B on a hosted gateway that grammar-locks
+tool-call names to the advertised set, where a deferred tool can never be called. `lean_tools`
+in `cli-config.json` overrides either way. The six-largest-description trim was not needed for
+the ≤ 55 KB gate (measured 53 KB lean on a coding turn) and was left alone: a tool description is
+the model's instruction for that tool. (d) E1.1 single-turn compaction re-seats the prompt
+verbatim after the boundary note; a failed compaction latches the cadence only on the second
+consecutive failure (one blip should not silence compaction for a whole cooldown).
+
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
 | E1.1 | Compaction for single-turn runs (`plan_compact_cut_at` on an assistant/tool boundary) and touchpoints prepended to every auto-compaction; a failed compaction does not arm `last_compact` | QP P1.1 (L5, L6, L12) | M | E0.10 | a 60-step single-prompt run compacts once and the path list survives |

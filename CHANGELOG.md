@@ -75,6 +75,64 @@ handing the model false inputs, and starts measuring what it sends.
   good file kept as `cli-config.prev.json`; a crash mid-save used to leave a truncated file that
   loaded as defaults, endpoint and key gone.
 
+### Phase 1 (in progress) — loop, client, lean
+
+#### Added
+- **Effort tiers with teeth.** The resolved tier now sets the loop's step cap and extension,
+  continuation budget, verify-and-fix rounds, self-review (`xhigh`/`max`) and log budget — not
+  only the `reasoning_effort` wire string, which half the providers ignore. `models_by_effort`
+  (`{"low": "cheap-model", "max": "strong-model"}`) sends a tier to another model on the same
+  endpoint; the effort line names it.
+- **Compaction for single-turn runs.** One prompt followed by fifty tool steps — the canonical
+  agent shape — could never auto-compact (the cut needed two user turns). It now cuts on an
+  assistant step boundary, keeps the prompt verbatim and the last six steps, and every
+  auto-compaction summary opens with the files and skills the summarized block touched so the
+  continuation does not re-search for paths it already had. The one-shot `aizen agent` run gets
+  the same mid-loop compaction the REPL has.
+- **Two-phase stream deadline.** `AIZEN_STREAM_FIRST_FRAME_SECS` (600) until the first frame
+  parses, then `AIZEN_STREAM_STALL_SECS` (90) between frames. A reasoning model silent for three
+  minutes before its first token was "never started", replayed twice, and billed three times.
+- **Turn shapes, and a lean tool surface.** Each turn is classified from the prompt (English or
+  Vietnamese) as a question, a small edit, a multi-file change or research. A pure question skips
+  the memory-recall and gated-skills blocks and is answered in one request against the cached
+  prefix. The conversation's widest shape picks which rarely-used built-ins ride behind
+  `tool_search` instead of on every request — `workflow`, `persona_create`, the time machine, the
+  memory and skill write surface, `team_status`, `notify`, the crawler outside research, and for
+  questions also `process`, `file_move` and `task`: about 14.5 KB of the 42 KB schema block, the
+  fixed prefix on a coding turn drops from 67 KB to about 53 KB. On by default for first-party APIs
+  only (`api.anthropic.com`, `api.openai.com`), because some gateways cannot call a tool that was
+  not advertised; `lean_tools` in `cli-config.json` turns it on or off explicitly. The effort line
+  now names the shape, and `aizen prompt-size` prints the lean size beside the full one.
+- **Request-shape quirks learned per model.** A 400 that names `max_tokens` (o-series/gpt-5 want
+  `max_completion_tokens`), `parallel_tool_calls`, `tool_choice`, `cache_control` or
+  `reasoning_effort` drops or renames that field, re-sends, and remembers the model for the
+  session. Previously only `reasoning_effort` was handled; the others needed config edits.
+
+#### Fixed
+- **Streamed usage is recorded once, from the last report the stream carried**, whatever chunk
+  carries it. Providers that attach usage to the final content chunk (llama.cpp, Ollama shims,
+  LiteLLM) never registered, so `/cost` stayed blank and the real-usage anchor never armed;
+  cumulative-usage gateways (vLLM, OpenRouter) are no longer at risk of being summed N times. The
+  plain chat path now asks for `stream_options.include_usage` like the tool paths do.
+- **One token estimator** (`core::tokens`) for the context guards, memory caps, schema ratchet,
+  codebase index and MCP budget: ASCII is exactly chars/4 as before; CJK, Hangul, combining marks
+  and precomposed Vietnamese count 1/1.8 per char. Every "N-token" cap used to admit roughly twice
+  that in Vietnamese.
+- **The todo list is scoped to the turn.** Cleared at each user turn unless the previous turn
+  ended abnormally (step cap, deadline, cancel, failed verification, a clarifying question) — then
+  its open items are the continuation plan. A stale item from an edit turn used to cost the next
+  plain question up to two todo-poke round-trips.
+- **Nudges retire, and ride the right role.** Loop nudges (divergence, budget, step limit, todo,
+  …) are stripped at the start of the next run instead of living in history forever; on
+  non-Anthropic endpoints they are delivered as tagged user-turn messages, because the Codex path
+  hoists every system message into its instructions blob (a permanent "you repeated the same
+  call") and many local chat templates reject a mid-history system role.
+- **A failed auto-compaction no longer arms the cooldown** on its first failure (a summarizer
+  blip used to silence compaction for the rest of the cooldown while context climbed); two in a
+  row do.
+- **Context overflow recovery retries up to three shrinks**, not one, while evictable tool
+  results remain.
+
 ## [0.6.7] — 2026-09-11
 
 Subscriptions arrive. An Aizen plan is now sold by **signing in**, not by pasting a key: sign in

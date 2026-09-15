@@ -543,6 +543,16 @@ noise it drops without a word. If a new gateway ever *does* go quiet or lose too
 `AIZEN_DEBUG_STREAM=1` to print the offending frames (capped at 3 per response plus a total) — that
 output is the useful thing to attach to a bug report.
 
+A stream has two deadlines: `AIZEN_STREAM_FIRST_FRAME_SECS` (default 600) until the first frame
+parses — a reasoning model that streams nothing until its answer starts is legitimately silent
+for minutes — and `AIZEN_STREAM_STALL_SECS` (default 90) between frames after that. A stream that
+dies or goes quiet before producing anything is replayed up to twice; once it has produced text or
+a tool call it is never replayed, so nothing is duplicated. Some models reject a request field
+(`max_tokens` on o-series/gpt-5 models, `parallel_tool_calls` or `tool_choice` on strict local
+servers, `cache_control` on some gateways, `reasoning_effort` out of range): the 400 is read, the
+field is dropped or renamed (`max_tokens` → `max_completion_tokens`), the request is re-sent, and
+the model is remembered for the session so it costs one failed call per model, once.
+
 ### `aizen models` — list the provider's models
 ```bash
 aizen models                       # GET {base}/models, marks your default
@@ -604,6 +614,14 @@ Behavior worth knowing:
   typed REPL turn goes through, against the task text. Omit the flag and nothing changes: the
   configured `reasoning_effort` applies and the request is byte-identical to one from a core that
   never had the flag. The tier is named on **stderr**, next to the rest of the trace.
+- **A tier changes the harness, not only the wire.** In the REPL the resolved tier also sets the
+  step cap and its extension, how many fresh budgets a still-progressing run may claim, how many
+  verify-and-fix rounds a broken tree gets, whether the self-review pass runs before Done
+  (`xhigh`/`max`), and how much of a build log reaches the model — so `/effort low` and
+  `/effort max` behave differently even on a provider that ignores `reasoning_effort`. A tier can
+  also change the model: `"models_by_effort": {"low": "cheap-model", "max": "strong-model"}` in
+  `cli-config.json` sends turns of that tier to that model on the same endpoint (the effort line
+  then names it); tiers without an entry use the main model.
 - **Images are attached, not described.** `--image <PATH>` inlines a PNG/JPEG/GIF/WebP (≤ 8 MB) into
   the first user message as an `image_url` data part — the same wire shape the REPL produces when you
   drag a file onto the window or press Ctrl-O to grab a screenshot — so a front-end driving this
@@ -880,6 +898,18 @@ deferred) / `"defer": false` (always advertised), or opt into the automatic budg
 `"deferAutoTokens"` (top-level in mcp.json) and when the combined schema estimate of all connected
 servers exceeds it, the **largest servers defer first** until the advertised remainder fits.
 `/mcp` marks a deferred server with `deferred → tool_search`.
+
+**Built-in tools defer too, where it is safe.** On first-party APIs (`api.anthropic.com`,
+`api.openai.com`) the rarely-used built-ins — `workflow`, `persona_create`, `checkpoint` /
+`checkpoint_view`, the memory and skill write surface (`memory_save`/`update`/`forget`/`ask`/
+`profile`, `skill_save`/`refine`/`forget`/`search`/`install`), `team_status`, `notify`, and
+`web_crawl` outside research turns — ride behind `tool_search` instead of on every request
+(about 14.5 KB of the 42 KB schema block); a conversation that is a pure question also defers
+`process`, `file_move` and `task`. The set is decided by the conversation's shape (question ·
+small edit · multi-file · research, classified from the prompt in English or Vietnamese) and only
+ever widens, so the advertised tool list stays byte-stable. Elsewhere it is off for the reason
+below; `"lean_tools": true` in `cli-config.json` turns it on for a gateway you have checked,
+`false` turns it off everywhere. `aizen prompt-size` prints both sizes.
 
 **Deferral is opt-in — check your provider first.** It requires an endpoint that lets the model
 call a tool whose name is not in the request's `tools` array. First-party APIs (Anthropic, OpenAI)
