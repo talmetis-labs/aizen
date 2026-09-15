@@ -237,7 +237,11 @@ windowed on prefix sums, `rows_offset` through `TranscriptGeom`, `shift_selectio
 pinned structurally — a frame after the first renders at most the window's blocks
 (`a_frame_renders_the_viewport_not_the_session`) — rather than by a timing assertion, which
 would flake on CI; the first frame after `/resume`, a resize or a theme switch still measures
-every block once.
+every block once. E3.4 implemented (`ToolEvent.body`, auto-expanded tail on a failed row,
+`Ctrl-E` → text overlay via `row_tool_seq` / the kept bodies, `send_retry_note` caption + note).
+Deviation (s): the expand key is `Ctrl-E`, not `Ctrl-O` — `Ctrl-O` has been the screenshot key
+since the vision work and is documented as such; and a failed row expands INLINE (its last lines
+under the digest) rather than popping an overlay mid-turn, which would steal the input box.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

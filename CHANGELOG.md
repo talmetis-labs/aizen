@@ -266,6 +266,13 @@ handing the model false inputs, and starts measuring what it sends.
   the scrollbar and hyperlink injection work on the rendered window through a row offset.
   The first frame after a `/resume`, a resize or a theme switch still measures every block
   once.
+- **Tool results expand, and a retry says so.** A failed tool row (`exit 101`) now shows the
+  last six lines of its output under the digest with a `… N more line(s) — Ctrl-E expands`
+  hint; `Ctrl-E` opens a result in the scrollable text overlay — the tool under your selection
+  when the selection sits on a tool row, else the most recent (the last 64 results, 12 k chars
+  of tail each, are kept). A send that backs off on a 429/5xx now says `rate-limited —
+  retrying in 43s (2/3)` on the working line and once in the transcript instead of spinning
+  mutely.
 
 ## [0.6.7] — 2026-09-11
 

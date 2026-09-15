@@ -41,7 +41,9 @@ it for its own paste, so the keystroke never reaches `aizen`):
   turns image-file paths on the line into attachments (you can also type/paste a path). Real image
   files only — prose like `nope.png` that isn't a file stays as text.
 
-Both send the image with your text to a **vision-capable** model. **Ctrl-X** removes the most recent
+Both send the image with your text to a **vision-capable** model. **Ctrl-E** expands a tool result into a scrollable overlay — the one under your selection when it
+sits on a tool row, else the most recent; a failed command already shows its last lines under its
+row. **Ctrl-X** removes the most recent
 attachment (keeps your text); **Esc** clears the line and all attachments at once. Clipboard
 screenshots are downscaled to ≤1568px and encoded inline; the token gauge ignores attachments (they
 ride outside `content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works
