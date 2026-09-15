@@ -164,11 +164,11 @@ impl Tool for LspSymbolBody {
     }
 
     fn description(&self) -> &str {
-        "Read the FULL source of ONE named symbol (function / type / method / const / …) via the \
+        concat!("Read the FULL source of ONE named symbol (function / type / method / const / …) via the \
          language server — its complete body plus file:line range, with no whole-file dump and no \
          line-count cap. Prefer this over file_read when you need a single item, and over \
          lsp_definition when the body may exceed its 120-line cap. Optional `file` disambiguates \
-         same-named symbols. Read-only."
+         same-named symbols. Read-only.", crate::search_routing!())
     }
 
     fn parameters(&self) -> Value {
@@ -318,9 +318,9 @@ impl Tool for LspWorkspaceSymbol {
     }
 
     fn description(&self) -> &str {
-        "Search the whole project for symbols by (fuzzy) name via the language server — \"where is \
+        concat!("Search the whole project for symbols by (fuzzy) name via the language server — \"where is \
          X defined?\" across every file, returning name, kind, and location. Type-aware: matches \
-         declared symbols only, never comments/strings. Read-only."
+         declared symbols only, never comments/strings. Read-only.", crate::search_routing!())
     }
 
     fn parameters(&self) -> Value {

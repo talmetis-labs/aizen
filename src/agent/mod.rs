@@ -3370,10 +3370,7 @@ fn parse_call_args_traced(raw: &str) -> Result<(serde_json::Value, Option<String
     match serde_json::from_str(raw) {
         Ok(v) => Ok((v, None)),
         Err(e) => match lenient::repair_json_object(raw) {
-            Some(v) => Ok((
-                v,
-                Some(format!("repaired malformed JSON arguments ({e})")),
-            )),
+            Some(v) => Ok((v, Some(format!("repaired malformed JSON arguments ({e})")))),
             None => Err(format!("error: invalid JSON arguments: {e}")),
         },
     }
@@ -3567,6 +3564,15 @@ fn run_tool_body(
     if !quiet {
         emit_tool_result(seq, tool.name(), args, &out, Some(elapsed_ms));
     }
+    // The TUI has drawn the full diff; the MODEL gets the removed lines, the `@@` anchor and a
+    // `+N lines` count per hunk, at most three hunks. The added text is what it just wrote — a
+    // ten-edit batch used to echo ~800 of its own lines back and hit the result cut. A dry-run
+    // preview keeps the whole diff: there the diff is the answer.
+    let out = if is_edit_tool(tool.name()) && !out.starts_with(builtin::DRY_RUN_PREFIX) {
+        compact_edit_diff(&out)
+    } else {
+        out
+    };
     // SPILL BEFORE THE CUT: a raw result past `spill_over` is written to the scratch dir in full,
     // and the cut result below ends with the path — nothing the tool produced is lost, and the model
     // fetches the part it needs with `file_read` instead of re-running the command. `file_read` is
@@ -4259,6 +4265,121 @@ fn emit_edit_diff(path: &str, out: &str) {
         return;
     }
     crate::ui::tui::diff_box(path, adds, dels, hunks);
+}
+
+/// Hunks an edit result shows the model before the rest becomes a count.
+const COMPACT_DIFF_MAX_HUNKS: usize = 3;
+
+/// The model-facing form of an edit result: everything before the first `@@` header verbatim
+/// (the `edited …` line, batch summaries), then per hunk the header, context, removed lines and
+/// ONE `+N line(s)` row in place of the added text, at most [`COMPACT_DIFF_MAX_HUNKS`] hunks (the
+/// rest is summed), then everything after the diff section verbatim (the LSP feedback fold). A
+/// result with no `@@` header is returned unchanged.
+fn compact_edit_diff(out: &str) -> String {
+    if !out.lines().any(|l| parse_hunk_header(l).is_some()) {
+        return out.to_string();
+    }
+    let mut res: Vec<String> = Vec::new();
+    let mut in_diff = false;
+    let mut hunks = 0usize;
+    let mut pending_added = 0usize;
+    let mut hidden_hunks = 0usize;
+    let mut hidden_removed = 0usize;
+    let mut hidden_added = 0usize;
+    let mut ended = false;
+    let flush_added = |res: &mut Vec<String>, pending: &mut usize| {
+        if *pending > 0 {
+            res.push(format!("+{} line(s)", *pending));
+            *pending = 0;
+        }
+    };
+    for l in out.lines() {
+        if ended {
+            res.push(l.to_string());
+            continue;
+        }
+        if parse_hunk_header(l).is_some() {
+            flush_added(&mut res, &mut pending_added);
+            in_diff = true;
+            hunks += 1;
+            if hunks > COMPACT_DIFF_MAX_HUNKS {
+                hidden_hunks += 1;
+            } else {
+                res.push(l.to_string());
+            }
+            continue;
+        }
+        if !in_diff {
+            res.push(l.to_string());
+            continue;
+        }
+        let hidden = hunks > COMPACT_DIFF_MAX_HUNKS;
+        match l.as_bytes().first() {
+            Some(b'+') => {
+                if hidden {
+                    hidden_added += 1;
+                } else {
+                    pending_added += 1;
+                }
+            }
+            Some(b'-') => {
+                if hidden {
+                    hidden_removed += 1;
+                } else {
+                    flush_added(&mut res, &mut pending_added);
+                    res.push(l.to_string());
+                }
+            }
+            Some(b' ') => {
+                if !hidden {
+                    flush_added(&mut res, &mut pending_added);
+                    res.push(l.to_string());
+                }
+            }
+            _ if l.starts_with('…') => {
+                // `…(N more lines added/removed)` — fold into the counts.
+                let n: usize = l
+                    .trim_start_matches('…')
+                    .trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .and_then(|w| w.parse().ok())
+                    .unwrap_or(0);
+                if l.contains("added") {
+                    if hidden {
+                        hidden_added += n;
+                    } else {
+                        pending_added += n;
+                    }
+                } else if !hidden {
+                    flush_added(&mut res, &mut pending_added);
+                    res.push(l.to_string());
+                } else {
+                    hidden_removed += n;
+                }
+            }
+            _ => {
+                // The diff section is over (LSP feedback, prose): close it and copy the rest.
+                flush_added(&mut res, &mut pending_added);
+                if hidden_hunks > 0 {
+                    res.push(format!(
+                        "…({hidden_hunks} more hunk(s): -{hidden_removed} +{hidden_added} lines)"
+                    ));
+                }
+                ended = true;
+                res.push(l.to_string());
+            }
+        }
+    }
+    if !ended {
+        flush_added(&mut res, &mut pending_added);
+        if hidden_hunks > 0 {
+            res.push(format!(
+                "…({hidden_hunks} more hunk(s): -{hidden_removed} +{hidden_added} lines)"
+            ));
+        }
+    }
+    res.join("\n")
 }
 
 /// Build the `⎿` summary for a tool result, returning `(ok, text)` (`ok=false` → coloured as a
@@ -6129,6 +6250,47 @@ mod tests {
         assert_eq!(
             parse_hunk_header("edited src/x.rs (1 replacement(s))"),
             None
+        );
+    }
+
+    #[test]
+    fn compact_edit_diff_keeps_removed_lines_counts_added_and_caps_hunks() {
+        let mut out = String::from(
+            "edited src/x.rs (4 edits applied)\n  #1: 1 replacement\n  #2: 1 replacement\n  #3: 1 replacement\n  #4: 1 replacement\n",
+        );
+        for k in 0..4 {
+            let at = 10 * k + 1;
+            out.push_str(&format!(
+                "@@ -{at},3 +{at},4 @@\n ctx{k}\n-old{k}\n+new{k}a\n+new{k}b\n ctx{k}end\n"
+            ));
+        }
+        out.push_str("lsp: 1 new diagnostic\n  error: something");
+        let c = compact_edit_diff(&out);
+        assert!(
+            c.starts_with("edited src/x.rs (4 edits applied)\n  #1: 1 replacement"),
+            "{c}"
+        );
+        assert!(
+            c.contains("-old0") && c.contains("-old2"),
+            "removed lines kept: {c}"
+        );
+        assert!(!c.contains("new0a"), "added text not echoed: {c}");
+        assert_eq!(
+            c.matches("+2 line(s)").count(),
+            3,
+            "one count per shown hunk: {c}"
+        );
+        assert!(
+            c.contains("…(1 more hunk(s): -1 +2 lines)"),
+            "fourth hunk summed: {c}"
+        );
+        assert!(
+            c.ends_with("lsp: 1 new diagnostic\n  error: something"),
+            "trailing fold intact: {c}"
+        );
+        assert_eq!(
+            compact_edit_diff("edited f (1 replacement)"),
+            "edited f (1 replacement)"
         );
     }
 

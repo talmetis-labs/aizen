@@ -97,11 +97,12 @@ impl Tool for SearchFiles {
         "search_files"
     }
     fn description(&self) -> &str {
-        "Search file CONTENT by regular expression (`path` may be a ../ or absolute dir elsewhere). \
-         Respects .gitignore and skips hidden + binary files unless hidden:true. Returns \
-         `path:line: matched text`; context:N adds ±N surrounding lines (grep -C) so a follow-up \
-         file_read is rarely needed. The canonical content search — do NOT shell out to \
-         grep/ripgrep; file_glob matches NAMES, not content. Read-only."
+        concat!(
+            "Search file CONTENT by regular expression. Respects .gitignore and skips hidden + \
+         binary files unless hidden:true. Rows are `path:line: text`; context:N adds ±N lines. \
+         The canonical content search — do NOT shell out to grep/ripgrep. Read-only.",
+            crate::search_routing!()
+        )
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -112,7 +113,7 @@ impl Tool for SearchFiles {
                 "path": {"type": "string", "description": "directory to search (subdir, ../ or absolute)"},
                 "glob": {"type": "string", "description": "file glob, e.g. *.rs or src/**/*.ts"},
                 "ignore_case": {"type": "boolean", "description": "case-insensitive match (default false)"},
-                "hidden": {"type": "boolean", "description": "also search hidden files and .gitignored paths (default false)"},
+                "hidden": {"type": "boolean", "description": "also hidden and .gitignored paths (default false)"},
                 "max_results": {"type": "integer", "description": "cap on matches returned (default 200)"},
                 "context": {"type": "integer", "description": "context lines around each match, grep -C (default 0, max 10)"},
                 "format": crate::agent::result_format::schema_property()

@@ -1139,6 +1139,7 @@ static BROAD_PRUNE: &[&str] = &[
 fn bounded_walk<F>(
     roots: &[(PathBuf, usize)],
     prune: bool,
+    git_aware: bool,
     match_cap: usize,
     budget: &WalkBudget,
     keep: F,
@@ -1153,14 +1154,18 @@ where
             break;
         }
         let mut wb = WalkBuilder::new(root);
+        // Default: SEE hidden files/dirs (dotfiles, .env) and ignored paths — the user asked for
+        // everything. `git_aware` (file_glob `ignore:true`) flips to search_files' semantics:
+        // `.gitignore`/`.ignore` honoured, hidden entries skipped, heavy dirs pruned below.
         wb.follow_links(false) // never chase junctions/symlinks → no reparse-point loops
             .same_file_system(true) // don't cross into other drives/mounts mid-walk
-            .hidden(false) // SEE hidden files/dirs (dotfiles, .env) — the user asked for everything
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .ignore(false)
-            .parents(false)
+            .hidden(git_aware)
+            .git_ignore(git_aware)
+            .git_global(git_aware)
+            .git_exclude(git_aware)
+            .ignore(git_aware)
+            .parents(git_aware)
+            .require_git(false)
             .max_depth(Some(*depth));
         let tx = tx.clone();
         let keep = &keep;
@@ -1180,7 +1185,7 @@ where
                 let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 // Prune heavy/system subtrees on a broad walk (depth>0 so we don't prune a root the
                 // caller explicitly pointed at). This is the single highest-leverage speed-up.
-                if prune && is_dir && dent.depth() > 0 {
+                if (prune || git_aware) && is_dir && dent.depth() > 0 {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if BROAD_PRUNE.iter().any(|b| b.eq_ignore_ascii_case(name)) {
                             return WalkState::Skip;
@@ -2273,23 +2278,30 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        "Find files AND directories by name or glob (*, **, ?) — use this, not a shell command, to \
+        concat!("Find files AND directories by name or glob (*, **, ?) — use this, not a shell command, to \
          locate a file/folder. A bare name (`Cargo.toml`) runs a ranked, typo-tolerant search across \
          the working dir, its parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a \
          `../`/absolute path targets a specific place. Case-insensitive unless the pattern has an \
-         uppercase letter; hidden files included, heavy dirs (node_modules, target, .git) skipped on \
-         a broad search. Not for file CONTENT → use search_files. Read-only."
+         uppercase letter. Sees everything (dotfiles, target/, node_modules/) unless ignore:true; a \
+         bare-name search always skips heavy dirs. Read-only.", crate::search_routing!())
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": {"pattern": {"type": "string", "description": "e.g. src/**/*.rs, ../sibling/**/*.py, or a bare name like 'confg.toml' for a fuzzy lookup"}},
+            "properties": {
+                "pattern": {"type": "string", "description": "e.g. src/**/*.rs, ../sibling/**/*.py, or a bare name like 'confg.toml' for a fuzzy lookup"},
+                "ignore": {"type": "boolean", "description": "honour .gitignore and skip node_modules/target/.git like search_files (default false)"}
+            },
             "required": ["pattern"],
             "additionalProperties": false
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let pattern = str_arg(args, "pattern")?;
+        let git_aware = args
+            .get("ignore")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let now = std::time::SystemTime::now();
         // Split into a literal directory anchor + the glob remainder, so `../x/**/*.rs` and
         // `C:/abs/**/*.rs` reach a SPECIFIC place. A bare-name / bare-`**/name` pattern (no explicit
@@ -2331,7 +2343,7 @@ impl Tool for FileGlob {
             Duration::from_millis(if narrow { 4000 } else { 2500 }),
         );
         let re_ref = &re;
-        let outcome = bounded_walk(&roots, !narrow, 2000, &budget, |p, rel| {
+        let outcome = bounded_walk(&roots, !narrow, git_aware, 2000, &budget, |p, rel| {
             if re_ref.is_match(rel) {
                 return true;
             }
@@ -2404,8 +2416,13 @@ impl Tool for FileGlob {
             if narrow { 400_000 } else { 250_000 },
             Duration::from_millis(if narrow { 4000 } else { 2500 }),
         );
-        let pool = bounded_walk(&roots, !narrow, 6000, &fuzzy_budget, |p, _rel| {
-            match p.file_name().and_then(|n| n.to_str()) {
+        let pool = bounded_walk(
+            &roots,
+            !narrow,
+            git_aware,
+            6000,
+            &fuzzy_budget,
+            |p, _rel| match p.file_name().and_then(|n| n.to_str()) {
                 Some(name) => {
                     let name = name.to_ascii_lowercase();
                     name.contains(needle_ref)
@@ -2413,8 +2430,8 @@ impl Tool for FileGlob {
                         || strsim::jaro_winkler(needle_ref, &name) >= 0.82
                 }
                 None => false,
-            }
-        });
+            },
+        );
         let mut scored: Vec<(f64, PathBuf)> = pool
             .paths
             .into_iter()
@@ -2467,12 +2484,19 @@ impl FileEdit {
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let dry_run = dry_run_arg(args);
 
         if old.is_empty() {
             // create-new path
             let target = confine(&self.root, path, false)?;
             if target.exists() {
                 bail!("{path} exists; provide old_string to edit it, or use file_write to overwrite the whole file");
+            }
+            if dry_run {
+                return Ok(format!(
+                    "{DRY_RUN_PREFIX}: would create {path} ({} bytes); nothing written",
+                    new.len()
+                ));
             }
             crate::core::persist::create_if_absent(&target, new.as_bytes())
                 .with_context(|| format!("creating {}", target.display()))?;
@@ -2489,6 +2513,13 @@ impl FileEdit {
         if applied.content == content {
             return Ok(format!(
                 "{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"
+            ));
+        }
+        if dry_run {
+            return Ok(format!(
+                "{DRY_RUN_PREFIX}: would edit {path} ({}); nothing written\n{}",
+                applied.summary(),
+                diff_preview(&applied.before, &applied.after, applied.start_line)
             ));
         }
         crate::core::persist::compare_and_atomic_write(
@@ -2520,7 +2551,7 @@ impl FileEdit {
     /// Apply an ORDERED list of edits to ONE file in a single atomic write. Collapses what would be N
     /// single `file_edit` round-trips (each invalidating the model's byte offsets) into one call /
     /// one turn — this is the batch form the `edits` argument selects.
-    fn apply_edits(&self, path: &str, edits: &[Value]) -> Result<String> {
+    fn apply_edits(&self, path: &str, edits: &[Value], dry_run: bool) -> Result<String> {
         if edits.is_empty() {
             bail!("file_edit `edits` must be a non-empty array (or omit it and pass new_string for a single edit)");
         }
@@ -2555,11 +2586,12 @@ impl FileEdit {
                 .unwrap_or(false);
             let applied =
                 apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
-            let detail = match applied.rung {
-                "indent" => "1 replacement, indentation-tolerant".to_string(),
-                "exact" if replace_all => format!("{} replacement(s), replace_all", applied.count),
-                "exact" => format!("{} replacement(s)", applied.count),
-                other => format!("1 replacement, {other} match"),
+            let detail = match (applied.rung, applied.count) {
+                ("exact", n) if replace_all => format!("{n} replacement(s), replace_all"),
+                ("exact", n) => format!("{n} replacement(s)"),
+                ("indent", 1) => "1 replacement, indentation-tolerant".to_string(),
+                (other, 1) => format!("1 replacement, {other} match"),
+                (other, n) => format!("{n} replacements, {other} match, replace_all"),
             };
             summaries.push(format!("  #{n}: {detail}"));
             diffs.push(diff_preview(
@@ -2577,6 +2609,14 @@ impl FileEdit {
             return Ok(format!(
                 "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
                 edits.len()
+            ));
+        }
+        if dry_run {
+            return Ok(format!(
+                "{DRY_RUN_PREFIX}: would edit {path} ({} edits); nothing written\n{}\n{}",
+                edits.len(),
+                summaries.join("\n"),
+                diffs.join("\n")
             ));
         }
         crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
@@ -2608,9 +2648,10 @@ impl Tool for FileEdit {
         "Edit a file by exact string replacement. ONE edit → old_string + new_string. SEVERAL edits \
          to the SAME file → pass `edits` instead, in one atomic call (all succeed or nothing is \
          written) — always prefer that over repeat calls. old_string must be unique unless \
-         replace_all; indentation-tolerant retry if the exact text misses. To create or fully \
-         rewrite a whole file, use file_write. Read the file first. An absolute or `../` path may \
-         write outside the working directory."
+         replace_all (which applies on every matching rung, not only the exact one); \
+         indentation-tolerant retry if the exact text misses. dry_run:true shows the diff and \
+         writes nothing. To create or fully rewrite a whole file, use file_write. Read the file \
+         first. An absolute or `../` path may write outside the working directory."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2620,6 +2661,7 @@ impl Tool for FileEdit {
                 "old_string": {"type": "string", "description": "exact text to replace; empty = create new file"},
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean"},
+                "dry_run": {"type": "boolean", "description": "preview the diff, write nothing"},
                 "edits": {
                     "type": "array",
                     "minItems": 1,
@@ -2657,7 +2699,7 @@ impl Tool for FileEdit {
         // An `edits` array selects the batch form; otherwise it's a single old_string/new_string
         // replacement. Batch wins if both are somehow present (a caller that filled `edits` meant it).
         match args.get("edits").and_then(|v| v.as_array()) {
-            Some(edits) => self.apply_edits(&path, edits),
+            Some(edits) => self.apply_edits(&path, edits, dry_run_arg(args)),
             // Name BOTH forms when neither is present. `str_arg` alone would say only "missing
             // new_string", which reads as "this tool cannot batch" — the one wrong lesson to teach a
             // model that merely reached for the batch form and mis-spelled the key.
@@ -3009,6 +3051,16 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Prefix of a `file_edit` result that previewed without writing (`dry_run: true`). The loop
+/// keeps the full diff for such a result — the preview IS the answer.
+pub(crate) const DRY_RUN_PREFIX: &str = "dry-run";
+
+fn dry_run_arg(args: &Value) -> bool {
+    args.get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// The outcome of ONE replacement (pure; computed in memory). `before`/`after` feed the diff
 /// preview; `count`/`rung` feed the human summary (which rung matched is surfaced so a
 /// looser-than-exact match is always visible in the result).
@@ -3035,13 +3087,18 @@ impl EditApplied {
     /// Human summary. The "exact" and "indent" wordings are byte-identical to the original
     /// `file_edit` strings (regression-gated by the existing tests).
     fn summary(&self) -> String {
-        match self.rung {
-            "indent" => "1 replacement, indentation-tolerant match".to_string(),
-            "ws-norm" => "1 replacement, whitespace-normalized match".to_string(),
-            "anchor-trim" => "1 replacement, shared-context-trimmed match".to_string(),
-            "unescape" => "1 replacement, escape-normalized match".to_string(),
-            "blank-norm" => "1 replacement, blank-line-insensitive match".to_string(),
-            _ => format!("{} replacement(s)", self.count),
+        let kind = match self.rung {
+            "indent" => "indentation-tolerant match",
+            "ws-norm" => "whitespace-normalized match",
+            "anchor-trim" => "shared-context-trimmed match",
+            "unescape" => "escape-normalized match",
+            "blank-norm" => "blank-line-insensitive match",
+            _ => return format!("{} replacement(s)", self.count),
+        };
+        if self.count > 1 {
+            format!("{} replacements, {kind}, replace_all", self.count)
+        } else {
+            format!("1 replacement, {kind}")
         }
     }
 }
@@ -3104,25 +3161,33 @@ fn apply_one_edit(
         });
     }
     // R2 indent-tolerant (kept uncapped + byte-stable messages — the original fallback).
-    if let Some(a) = block_rung(content, old, new, trim_norm, "indent", label)? {
+    if let Some(a) = block_rung(content, old, new, trim_norm, "indent", label, replace_all)? {
         return Ok(a);
     }
     let within_caps = old.lines().count() <= LADDER_MAX_LINES && old.len() <= LADDER_MAX_BYTES;
     if within_caps {
         // R3 whitespace-run-normalized.
-        if let Some(a) = block_rung(content, old, new, ws_collapse, "ws-norm", label)? {
+        if let Some(a) = block_rung(
+            content,
+            old,
+            new,
+            ws_collapse,
+            "ws-norm",
+            label,
+            replace_all,
+        )? {
             return Ok(a);
         }
         // R4 anchor-trim: drop a SHARED (old==new) first/last context line from both sides.
         for (o2, n2) in anchor_trim_variants(old, new) {
-            if let Some(a) = try_pair(content, &o2, &n2, "anchor-trim", label)? {
+            if let Some(a) = try_pair(content, &o2, &n2, "anchor-trim", label, replace_all)? {
                 return Ok(a);
             }
         }
         // R5 escape-normalized (only when unescaping actually changes old).
         if let Some(o2) = json_unescape(old) {
             let n2 = json_unescape(new).unwrap_or_else(|| new.to_string());
-            if let Some(a) = try_pair(content, &o2, &n2, "unescape", label)? {
+            if let Some(a) = try_pair(content, &o2, &n2, "unescape", label, replace_all)? {
                 return Ok(a);
             }
         }
@@ -3148,9 +3213,14 @@ fn apply_one_edit(
                         start_line: line_at(content, bs),
                     });
                 }
-                n => bail!(
-                    "old_string (ignoring blank lines) matches {n} blocks in {label}; add more surrounding context to disambiguate"
-                ),
+                n => {
+                    if replace_all {
+                        return Ok(splice_all(content, &ranges, new, "blank-norm"));
+                    }
+                    bail!(
+                        "old_string (ignoring blank lines) matches {n} blocks in {label}; add more surrounding context to disambiguate"
+                    )
+                }
             }
         }
     }
@@ -3176,19 +3246,24 @@ fn try_pair(
     new: &str,
     rung: &'static str,
     label: &str,
+    replace_all: bool,
 ) -> Result<Option<EditApplied>> {
     if old.trim().is_empty() {
         return Ok(None); // a variant that trimmed away all signal proves nothing
     }
     let count = content.matches(old).count();
-    if count == 1 {
-        let updated = content.replacen(old, new, 1);
+    if count == 1 || (count > 1 && replace_all) {
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
         let start_line = content.find(old).map(|p| line_at(content, p)).unwrap_or(0);
         return Ok(Some(EditApplied {
             content: updated,
             before: old.to_string(),
             after: new.to_string(),
-            count: 1,
+            count,
             rung,
             start_line,
         }));
@@ -3196,10 +3271,10 @@ fn try_pair(
     if count > 1 {
         bail!("old_string ({rung} form) matches {count} places in {label}; add more surrounding context to disambiguate");
     }
-    if let Some(a) = block_rung(content, old, new, trim_norm, rung, label)? {
+    if let Some(a) = block_rung(content, old, new, trim_norm, rung, label, replace_all)? {
         return Ok(Some(a));
     }
-    block_rung(content, old, new, ws_collapse, rung, label)
+    block_rung(content, old, new, ws_collapse, rung, label, replace_all)
 }
 
 /// One block-matching rung over normalized lines: exactly 1 block ⇒ apply, >1 ⇒ hard ambiguous
@@ -3211,6 +3286,7 @@ fn block_rung(
     norm: fn(&str) -> String,
     rung: &'static str,
     label: &str,
+    replace_all: bool,
 ) -> Result<Option<EditApplied>> {
     let ranges = normalized_blocks(content, old, norm);
     match ranges.len() {
@@ -3230,11 +3306,47 @@ fn block_rung(
             }))
         }
         n => {
+            if replace_all {
+                return Ok(Some(splice_all(content, &ranges, new, rung)));
+            }
             if rung == "indent" {
                 bail!("old_string (ignoring indentation) matches {n} blocks in {label}; add more surrounding context to disambiguate");
             }
             bail!("old_string ({rung} form) matches {n} blocks in {label}; add more surrounding context to disambiguate");
         }
+    }
+}
+
+/// `replace_all` on a tolerant rung: splice `new` into EVERY matched block (ascending byte ranges;
+/// a block that overlaps the previous splice is skipped). `before`/`start_line` describe the first
+/// block — the diff preview shows one representative hunk, the summary carries the count.
+fn splice_all(
+    content: &str,
+    ranges: &[(usize, usize)],
+    new: &str,
+    rung: &'static str,
+) -> EditApplied {
+    let mut updated = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    for &(bs, be) in ranges {
+        if bs < cursor {
+            continue;
+        }
+        updated.push_str(&content[cursor..bs]);
+        updated.push_str(&preserve_eol(new, &content[bs..be], &content[be..]));
+        cursor = be;
+        count += 1;
+    }
+    updated.push_str(&content[cursor..]);
+    let (fs, fe) = ranges[0];
+    EditApplied {
+        content: updated,
+        before: content[fs..fe].to_string(),
+        after: new.to_string(),
+        count,
+        rung,
+        start_line: line_at(content, fs),
     }
 }
 
@@ -4742,6 +4854,37 @@ mod tests {
     }
 
     #[test]
+    fn file_glob_ignore_true_honours_gitignore_and_prunes_build_dirs() {
+        // The default stays "see everything" (the maintainer asked for it); `ignore:true` opts into
+        // search_files' semantics for the structured walk.
+        let root = temp_root("glob-ignore");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        std::fs::write(root.join("target/debug/app.rs"), "").unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        std::fs::write(root.join("gen/out.rs"), "").unwrap();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        let t = FileGlob::new(root);
+        let all = t
+            .execute(&serde_json::json!({"pattern": "**/*.rs"}))
+            .unwrap();
+        assert!(
+            all.contains("target/debug/app.rs") && all.contains("gen/out.rs"),
+            "default sees everything: {all}"
+        );
+        let lean = t
+            .execute(&serde_json::json!({"pattern": "**/*.rs", "ignore": true}))
+            .unwrap();
+        assert!(lean.contains("src/a.rs"), "{lean}");
+        assert!(
+            !lean.contains("target/debug/app.rs"),
+            "build dir pruned: {lean}"
+        );
+        assert!(!lean.contains("gen/out.rs"), ".gitignore honoured: {lean}");
+    }
+
+    #[test]
     fn file_glob_reaches_outside_the_root() {
         // A `../sibling/...` pattern must escape the working dir (confinement removed, #67). Anchor
         // the tool at a subdir and glob back up into a sibling.
@@ -5226,6 +5369,83 @@ mod tests {
         // LF file → untouched (byte-identical).
         assert_eq!(preserve_eol("X", "b", "\nc"), "X");
         assert_eq!(preserve_eol("X\nY", "b", "\nc"), "X\nY");
+    }
+
+    #[test]
+    fn file_edit_replace_all_reaches_the_tolerant_rungs() {
+        // Two identically-drifted blocks (4-space file, 2-space old_string): replace_all used to
+        // live on the exact rung only, so the indent rung saw 2 blocks and refused.
+        let root = temp_root("edit-replace-all-indent");
+        let drifted = "fn a() {\n    foo();\n    baz();\n}\nfn b() {\n    foo();\n    baz();\n}\n";
+        std::fs::write(root.join("f.rs"), drifted).unwrap();
+        let t = FileEdit::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.rs",
+                "old_string": "  foo();\n  baz();",
+                "new_string": "    bar();\n    baz();",
+                "replace_all": true
+            }))
+            .unwrap();
+        assert!(
+            r.contains("2 replacements, indentation-tolerant match, replace_all"),
+            "got: {r}"
+        );
+        let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
+        assert_eq!(
+            after,
+            "fn a() {\n    bar();\n    baz();\n}\nfn b() {\n    bar();\n    baz();\n}\n"
+        );
+        // Without replace_all the same call still refuses: the 1-match invariant holds.
+        std::fs::write(root.join("g.rs"), drifted).unwrap();
+        let e = t.execute(&serde_json::json!({
+            "path": "g.rs",
+            "old_string": "  foo();\n  baz();",
+            "new_string": "    bar();\n    baz();"
+        }));
+        assert!(e.is_err(), "ambiguous without replace_all");
+    }
+
+    #[test]
+    fn file_edit_dry_run_previews_without_writing() {
+        let root = temp_root("edit-dry-run");
+        let original = "a\nb\nc\n";
+        std::fs::write(root.join("f.txt"), original).unwrap();
+        let t = FileEdit::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.txt", "old_string": "b", "new_string": "B", "dry_run": true
+            }))
+            .unwrap();
+        assert!(r.starts_with("dry-run: would edit f.txt"), "{r}");
+        assert!(r.contains("-b") && r.contains("+B"), "diff shown: {r}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original,
+            "nothing written"
+        );
+        // The batch form and the create-new form honour it too.
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.txt", "dry_run": true,
+                "edits": [
+                    {"old_string": "a", "new_string": "A"},
+                    {"old_string": "c", "new_string": "C"}
+                ]
+            }))
+            .unwrap();
+        assert!(r.starts_with("dry-run: would edit f.txt (2 edits)"), "{r}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original
+        );
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "new.txt", "old_string": "", "new_string": "hello", "dry_run": true
+            }))
+            .unwrap();
+        assert!(r.starts_with("dry-run: would create new.txt"), "{r}");
+        assert!(!root.join("new.txt").exists());
     }
 
     #[test]

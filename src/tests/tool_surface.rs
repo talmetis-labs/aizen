@@ -603,17 +603,22 @@ async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
     // Hermes/Qwen-style `<tool_call>` block with an EMPTY native array: the loop must lift it into
     // a real call and run the tool — not echo the block back as the final answer.
     let registry = coder_registry();
-    let path = scratch_file("hermes.txt", "recovered-marker-7f3a
-");
+    let path = scratch_file(
+        "hermes.txt",
+        "recovered-marker-7f3a
+",
+    );
     let block = serde_json::json!({
         "name": "file_read",
         "arguments": {"path": path.to_string_lossy()}
     });
     let text_turn = ChatTurn {
-        content: Some(format!("Let me read it.
+        content: Some(format!(
+            "Let me read it.
 <tool_call>
 {block}
-</tool_call>")),
+</tool_call>"
+        )),
         tool_calls: Vec::new(),
         finish_reason: Some("stop".into()),
         usage: None,
@@ -639,8 +644,11 @@ async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
 async fn almost_json_arguments_are_repaired_before_dispatch() {
     // A trailing comma is the single most common local-model slip; it must not cost a round trip.
     let registry = coder_registry();
-    let path = scratch_file("comma.txt", "repaired-marker-9c1d
-");
+    let path = scratch_file(
+        "comma.txt",
+        "repaired-marker-9c1d
+",
+    );
     let quoted = serde_json::to_string(&path.to_string_lossy()).unwrap();
     let args = format!("{{\"path\": {quoted},}}");
     let msgs = run_scripted(&registry, vec![tool_call("file_read", &args)]).await;
@@ -788,4 +796,31 @@ fn tool_definitions_never_carry_credential_values() {
         None => std::env::remove_var("TAVILY_API_KEY"),
     }
     assert!(!json.contains(SECRET), "a tool definition leaked a key");
+}
+
+// ── 8. the five search tools end on the same routing sentence ─────────────────────────────
+
+#[test]
+fn the_search_tools_share_one_routing_sentence() {
+    // Each used to name a different subset of its siblings; the model now reads one rule on
+    // whichever tool it is looking at. The LSP pair is checked when the registry carries it.
+    let registry = coder_registry();
+    for name in ["file_glob", "search_files", "codebase_search"] {
+        let t = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        assert!(
+            t.description().ends_with(crate::search_routing!()),
+            "{name}: {}",
+            t.description()
+        );
+    }
+    for name in ["lsp_workspace_symbol", "read_symbol"] {
+        if let Some(t) = registry.get(name) {
+            assert!(
+                t.description().ends_with(crate::search_routing!()),
+                "{name}"
+            );
+        }
+    }
 }
