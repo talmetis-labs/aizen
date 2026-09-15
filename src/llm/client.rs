@@ -708,7 +708,7 @@ const STREAM_STALL_SECS: u64 = 90;
 const STREAM_STALL_ENV: &str = "AIZEN_STREAM_STALL_SECS";
 
 /// Resolve the inter-event stall deadline: env override (clamped 15s..=1800s) or the default.
-fn stream_stall_timeout() -> std::time::Duration {
+pub(crate) fn stream_stall_timeout() -> std::time::Duration {
     let secs = std::env::var(STREAM_STALL_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -727,7 +727,7 @@ const STREAM_FIRST_FRAME_SECS: u64 = 600;
 /// Env override for the first-frame deadline, clamped 15s..=3600s.
 const STREAM_FIRST_FRAME_ENV: &str = "AIZEN_STREAM_FIRST_FRAME_SECS";
 
-fn stream_first_frame_timeout() -> std::time::Duration {
+pub(crate) fn stream_first_frame_timeout() -> std::time::Duration {
     let secs = std::env::var(STREAM_FIRST_FRAME_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -738,7 +738,7 @@ fn stream_first_frame_timeout() -> std::time::Duration {
 
 /// How many times a stream that died BEFORE producing anything is replayed. Bounded and only ever
 /// on the blank case — see `stream_chat_with_tools_eager`.
-const STREAM_BLANK_RETRIES: u32 = 2;
+pub(crate) const STREAM_BLANK_RETRIES: u32 = 2;
 
 /// How many unparseable-frame warnings one stream may print before they collapse into a single
 /// count — and only ever under [`FRAME_DEBUG_ENV`], since the normal path prints none at all.
@@ -833,7 +833,7 @@ fn send_retry_note(status: u16, attempt: u32, max: u32, delay_ms: u64) {
     }
 }
 
-fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
+pub(crate) fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
     let line = format!(
         "⟳ stream died before any output ({reason}) — retrying {attempt}/{max} in {delay_ms}ms"
     );
@@ -1632,8 +1632,16 @@ async fn chat_with_tools_effort_live(
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
-        return crate::llm::responses_codex::stream_turn(client, model, messages, tools, &session)
-            .await;
+        // The finished turn only: this path's callers print the answer themselves.
+        return crate::llm::responses_codex::stream_turn(
+            client,
+            model,
+            messages,
+            tools,
+            &session,
+            crate::llm::responses_codex::StreamSink::default(),
+        )
+        .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = build_chat_body(
@@ -1931,13 +1939,25 @@ async fn stream_chat_with_tools_eager_live(
 ) -> Result<ChatTurn> {
     // Experimental ChatGPT Codex path — full Responses dialect (not /chat/completions).
     if crate::llm::oauth_codex::is_codex_base_url(base_url) {
-        let _ = (api_key, &eager_hook); // bearer comes from the OAuth token store
+        let _ = api_key; // bearer comes from the OAuth token store
         let session = std::env::var("AIZEN_CODEX_SESSION")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
-        return crate::llm::responses_codex::stream_turn(client, model, messages, tools, &session)
-            .await;
+        // Same contract as the chat-completions stream below: text paints as it arrives,
+        // completed calls go to the eager starter, the shared watchdog bounds a stall.
+        return crate::llm::responses_codex::stream_turn(
+            client,
+            model,
+            messages,
+            tools,
+            &session,
+            crate::llm::responses_codex::StreamSink {
+                render: true,
+                eager: eager_hook,
+            },
+        )
+        .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     // ONE config read for the whole request: the effort tier and the body are resolved from it.
