@@ -1168,6 +1168,38 @@ pub async fn stream_chat_with_visual_contract(
     base_url: &str,
     api_key: &str,
     model: &str,
+    messages: Vec<Message>,
+    visual_contract: bool,
+) -> Result<String> {
+    // Tape first (plain-text calls share the tape as content-only turns). See `llm::replay`.
+    if let Some(text) = crate::llm::replay::replay_text(model, &messages)? {
+        return Ok(text);
+    }
+    let recorded_view = if crate::llm::replay::mode() == crate::llm::replay::Mode::Record {
+        Some(messages.clone())
+    } else {
+        None
+    };
+    let text = stream_chat_with_visual_contract_live(
+        client,
+        base_url,
+        api_key,
+        model,
+        messages,
+        visual_contract,
+    )
+    .await?;
+    if let Some(view) = recorded_view {
+        crate::llm::replay::record_text(model, &view, &text)?;
+    }
+    Ok(text)
+}
+
+async fn stream_chat_with_visual_contract_live(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
     mut messages: Vec<Message>,
     visual_contract: bool,
 ) -> Result<String> {
@@ -1389,6 +1421,27 @@ pub async fn chat_with_tools(
 /// the request byte-identical for providers that reject it.
 #[allow(clippy::option_option, clippy::too_many_arguments)]
 pub async fn chat_with_tools_effort(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    effort: Option<String>,
+) -> Result<ChatTurn> {
+    // Tape first: a replayed run never builds a request. See `llm::replay`.
+    if let Some(turn) = crate::llm::replay::replay_turn(model, messages, tools)? {
+        return Ok(turn);
+    }
+    let turn =
+        chat_with_tools_effort_live(client, base_url, api_key, model, messages, tools, effort)
+            .await?;
+    crate::llm::replay::record_turn(model, messages, tools, &turn)?;
+    Ok(turn)
+}
+
+#[allow(clippy::option_option, clippy::too_many_arguments)]
+async fn chat_with_tools_effort_live(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
@@ -1670,6 +1723,28 @@ pub async fn stream_chat_with_tools(
 /// `ChatTurn.eager` keyed by final POSITION; a mid-stream transport error drops them (detached —
 /// eager calls are read-only by policy, so discarding is safe).
 pub async fn stream_chat_with_tools_eager(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    eager_hook: Option<EagerStartFn<'_>>,
+) -> Result<ChatTurn> {
+    // Tape first: a replayed turn is returned whole (nothing streams, nothing starts eagerly — the
+    // executor runs every replayed call normally). See `llm::replay`.
+    if let Some(turn) = crate::llm::replay::replay_turn(model, messages, tools)? {
+        return Ok(turn);
+    }
+    let turn = stream_chat_with_tools_eager_live(
+        client, base_url, api_key, model, messages, tools, eager_hook,
+    )
+    .await?;
+    crate::llm::replay::record_turn(model, messages, tools, &turn)?;
+    Ok(turn)
+}
+
+async fn stream_chat_with_tools_eager_live(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
