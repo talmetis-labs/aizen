@@ -101,6 +101,26 @@ pub trait Tool: Send + Sync {
     fn result_is_error(&self, _result: &str) -> Option<bool> {
         None
     }
+    /// What this call WILL do, computed before it does anything — shown above the approval
+    /// question so the user approves a patch, a full command line and its directory, not a
+    /// basename. Edit tools return the patch (their dry-run); command tools their argv and cwd.
+    /// The default `None` keeps the bare question for tools with nothing to show. Must not
+    /// write, spawn or touch the network: it runs before the user has said yes.
+    fn preview(&self, _args: &Value) -> Option<ApprovalPreview> {
+        None
+    }
+}
+
+/// The pre-flight payload of a destructive call (see [`Tool::preview`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPreview {
+    /// The box title: the repo-relative target of an edit, the tool name for a command.
+    pub title: String,
+    /// The unified diff of the change, when the tool can compute it without writing.
+    pub diff: Option<String>,
+    /// Plain rows to show — the cwd and full command, the destination, byte counts. Wrapped by
+    /// the surface, never clipped here.
+    pub lines: Vec<String>,
 }
 
 /// Drive an async future from the sync `Tool::execute` path, RACED against user cancellation

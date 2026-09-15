@@ -3635,12 +3635,14 @@ fn gate_and_approve(
     if network_requested {
         smart_allow = false;
     }
-    if tool.is_destructive()
-        && !cfg.approval_mode.approves_all()
-        && !smart_allow
-        && !approve(tool.name(), args, cfg)
-    {
-        return Some("error: the user declined this action".to_string());
+    if tool.is_destructive() && !cfg.approval_mode.approves_all() && !smart_allow {
+        // Pre-flight: what the call WILL do, computed before it does anything — a patch for
+        // an edit, the full command and its cwd for a shell — so the user approves the
+        // change, not a basename. Computed only when a question is about to be asked.
+        let preview = tool.preview(args);
+        if !approve(tool.name(), args, cfg, preview.as_ref()) {
+            return Some("error: the user declined this action".to_string());
+        }
     }
     None
 }
@@ -4109,6 +4111,26 @@ fn tool_icon() -> &'static str {
 /// The compact TARGET shown after the raw tool name — a basename / host / clipped query, reusing the
 /// same salient-field extraction as [`tool_trace`] but WITHOUT a verb (the mockup shows the raw tool
 /// name + its target, e.g. `file_read   src/auth.rs`). Empty when there's nothing salient.
+/// A path as the user would type it: relative to the process cwd when under it, forward
+/// slashes, else as given. The approval header and the diff box title use it.
+fn rel_path_display(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    let shown = if path.is_absolute() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|r| r.to_path_buf()))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let s = shown.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        p.to_string()
+    } else {
+        s
+    }
+}
+
 fn tool_target(name: &str, args: &serde_json::Value) -> String {
     let field = |k: &str| args.get(k).and_then(|v| v.as_str());
     let base = |p: &str| basename(p).to_string();
@@ -4116,8 +4138,10 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         "shell_run" | "bash" | "powershell" | "shell" => {
             shell_target(field("command").or_else(|| field("cmd")).unwrap_or(""))
         }
+        // The repo-relative path, not the basename: several `mod.rs` edits in one turn were
+        // indistinguishable in the header and the diff box.
         "file_write" | "write_file" | "file_edit" | "edit_file" | "apply_patch"
-        | "symbol_replace" | "symbol_insert" => base(
+        | "symbol_replace" | "symbol_insert" => rel_path_display(
             field("path")
                 .or_else(|| field("file"))
                 .or_else(|| field("symbol"))
@@ -4125,7 +4149,14 @@ fn tool_target(name: &str, args: &serde_json::Value) -> String {
         ),
         "file_read" | "read_file" => base(field("path").or_else(|| field("file")).unwrap_or("")),
         "file_move" | "move_file" | "rename_file" | "file_rename" => {
-            base(field("from").unwrap_or(""))
+            match field("to").filter(|t| !t.is_empty()) {
+                Some(to) => format!(
+                    "{} → {}",
+                    rel_path_display(field("from").unwrap_or("")),
+                    rel_path_display(to)
+                ),
+                None => rel_path_display(field("from").unwrap_or("")),
+            }
         }
         "file_glob" => {
             first_line_clip(field("pattern").or_else(|| field("glob")).unwrap_or(""), 40)
@@ -5964,7 +5995,47 @@ pub fn truncate_result(s: &str, max: usize) -> String {
 ///
 /// `cfg` supplies the LANE the prompt belongs to: `serve` runs lanes concurrently, so the reply must
 /// go back to the bot+chat that asked, not to whichever lane last wrote the process-global route.
-fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
+/// Render a call's pre-flight payload above its approval question: the patch as a diff box,
+/// the plain rows (cwd, full command, byte counts) as faint lines.
+fn show_preview(p: &crate::agent::tools::ApprovalPreview) {
+    if let Some(diff) = &p.diff {
+        emit_edit_diff(&p.title, diff);
+    }
+    for l in &p.lines {
+        let row = format!(
+            "  {} {}",
+            crate::ui::theme::faint("│"),
+            crate::ui::theme::faint(l)
+        );
+        if crate::ui::tui::active() {
+            crate::ui::tui::emit_line(&row);
+        } else {
+            eprintln!("{row}");
+        }
+    }
+}
+
+/// The preview as plain text for a chat surface (Telegram): the rows, then the patch clipped.
+fn preview_plain(p: &crate::agent::tools::ApprovalPreview) -> String {
+    const DIFF_CHARS: usize = 1_500;
+    let mut s = p.lines.join("\n");
+    if let Some(diff) = &p.diff {
+        let body: String = diff.chars().take(DIFF_CHARS).collect();
+        s.push('\n');
+        s.push_str(&body);
+        if body.len() < diff.len() {
+            s.push_str("\n…");
+        }
+    }
+    s
+}
+
+fn approve(
+    tool: &str,
+    args: &serde_json::Value,
+    cfg: &AgentConfig,
+    preview: Option<&crate::agent::tools::ApprovalPreview>,
+) -> bool {
     use std::io::{IsTerminal, Write};
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::AwaitingApproval);
     struct RestorePhase;
@@ -6007,13 +6078,24 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
             tool_call_line(tool, args),
             style(hint).color256(crate::ui::theme::WARN)
         );
+        // The payload ABOVE the question, unless the session already said allow-all (then
+        // `ask_approval` answers without asking and the box would be noise).
+        if let Some(p) = preview {
+            if !crate::ui::tui::session_allow_all() {
+                show_preview(p);
+            }
+        }
         return tokio::task::block_in_place(|| crate::ui::tui::ask_approval(&prompt));
     }
     if !std::io::stdin().is_terminal() {
         if crate::hostbot::platforms::telegram::daemon_is_active()
             && crate::hostbot::platforms::telegram::is_configured()
         {
-            let prompt = format!("{plain_who}{tool} {}", compact_args(args));
+            let mut prompt = format!("{plain_who}{tool} {}", compact_args(args));
+            if let Some(p) = preview {
+                prompt.push('\n');
+                prompt.push_str(&preview_plain(p));
+            }
             // Bridge to the async approval on the current (multi-thread) runtime; the serve poll
             // loop runs on another worker and delivers the callback. The route comes from THIS
             // turn's context — under concurrent lanes the process-global one belongs to whoever
@@ -6028,6 +6110,9 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
             }
         }
         return false;
+    }
+    if let Some(p) = preview {
+        show_preview(p);
     }
     print!(
         "{who}{}  {} ",
@@ -6363,6 +6448,37 @@ mod tests {
         );
         assert!(plain.contains("main.rs"), "salient target shown: {plain:?}");
         assert!(!plain.contains("Read "), "no English verb: {plain:?}");
+    }
+
+    #[test]
+    fn edit_headers_show_the_relative_path_not_the_basename() {
+        assert_eq!(rel_path_display("src/agent/mod.rs"), "src/agent/mod.rs");
+        assert_eq!(rel_path_display("src\\agent\\mod.rs"), "src/agent/mod.rs");
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("src").join("x.rs");
+        assert_eq!(rel_path_display(&abs.to_string_lossy()), "src/x.rs");
+        let t = tool_target(
+            "file_edit",
+            &serde_json::json!({"path": "src/agent/mod.rs"}),
+        );
+        assert_eq!(
+            t, "src/agent/mod.rs",
+            "two mod.rs edits in one turn stay distinguishable"
+        );
+        let m = tool_target(
+            "file_move",
+            &serde_json::json!({"from": "a/old.rs", "to": "b/new.rs"}),
+        );
+        assert_eq!(m, "a/old.rs → b/new.rs");
+        let plain = preview_plain(&crate::agent::tools::ApprovalPreview {
+            title: "x".into(),
+            diff: Some("d".repeat(2_000)),
+            lines: vec!["cwd: /r".into(), "$ make".into()],
+        });
+        assert!(
+            plain.starts_with("cwd: /r\n$ make\n") && plain.ends_with("\n…"),
+            "{plain}"
+        );
     }
 
     #[test]

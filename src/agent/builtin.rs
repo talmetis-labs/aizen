@@ -2644,6 +2644,31 @@ impl Tool for FileEdit {
     fn name(&self) -> &str {
         "file_edit"
     }
+    /// The patch, from the same dry-run the model can ask for — computed in memory, nothing
+    /// written. An edit that would fail (no match, bad path) has no preview: the failure is
+    /// what the approval would have run into anyway, and refusing to show one lets the
+    /// question fall through to the plain header.
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let mut dry = args.clone();
+        dry.as_object_mut()?
+            .insert("dry_run".to_string(), Value::Bool(true));
+        let out = self.execute(&dry).ok()?;
+        if !out.starts_with(DRY_RUN_PREFIX) {
+            return None;
+        }
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let (first, rest) = out.split_once('\n').unwrap_or((out.as_str(), ""));
+        let summary = first
+            .strip_prefix(DRY_RUN_PREFIX)
+            .map(|s| s.trim_start_matches(':').trim())
+            .unwrap_or(first)
+            .to_string();
+        Some(crate::agent::tools::ApprovalPreview {
+            title: path.to_string(),
+            diff: (!rest.trim().is_empty()).then(|| rest.to_string()),
+            lines: vec![summary],
+        })
+    }
     fn description(&self) -> &str {
         "Edit a file by exact string replacement. ONE edit → old_string + new_string. SEVERAL edits \
          to the SAME file → pass `edits` instead, in one atomic call (all succeed or nothing is \
@@ -2730,6 +2755,38 @@ impl FileWrite {
 impl Tool for FileWrite {
     fn name(&self) -> &str {
         "file_write"
+    }
+    /// Create vs overwrite, with the patch against the current content when overwriting.
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let path = args.get("path")?.as_str()?;
+        let content = args.get("content")?.as_str()?;
+        let target = confine(&self.root, path, false).ok()?;
+        let title = path.to_string();
+        Some(match std::fs::read_to_string(&target) {
+            Ok(before) if before != content => crate::agent::tools::ApprovalPreview {
+                title,
+                diff: Some(diff_preview(&before, content, 1)),
+                lines: vec![format!(
+                    "overwrite {path}: {} → {} bytes",
+                    before.len(),
+                    content.len()
+                )],
+            },
+            Ok(_) => crate::agent::tools::ApprovalPreview {
+                title,
+                diff: None,
+                lines: vec![format!("{path} unchanged (identical content)")],
+            },
+            Err(_) => crate::agent::tools::ApprovalPreview {
+                title,
+                diff: None,
+                lines: vec![format!(
+                    "create {path} ({} bytes, {} line(s))",
+                    content.len(),
+                    content.lines().count()
+                )],
+            },
+        })
     }
     fn description(&self) -> &str {
         "Create a file, or COMPLETELY overwrite an existing one, with the given content — the whole \
@@ -2838,6 +2895,22 @@ impl FileMove {
 impl Tool for FileMove {
     fn name(&self) -> &str {
         "file_move"
+    }
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let from = args.get("from")?.as_str()?;
+        let to = args.get("to")?.as_str()?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Some(crate::agent::tools::ApprovalPreview {
+            title: from.to_string(),
+            diff: None,
+            lines: vec![format!(
+                "move {from} → {to}{}",
+                if overwrite { " (overwrite)" } else { "" }
+            )],
+        })
     }
     fn description(&self) -> &str {
         "Rename or move a file or directory (from → to) in a single call. Use this instead of \
@@ -3671,6 +3744,31 @@ impl ShellRun {
 impl Tool for ShellRun {
     fn name(&self) -> &str {
         "shell_run"
+    }
+    /// The full command line and the directory it runs in — the header clips a command to
+    /// its first word, and `python deploy.py --prod --force-delete` approved as `deploy.py`
+    /// is the audit's first finding.
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let command = args.get("command")?.as_str()?;
+        let dir = match args.get("cwd").and_then(|v| v.as_str()) {
+            Some(c) => confine(&self.root, c, true)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| c.to_string()),
+            None => self.root.display().to_string(),
+        };
+        let mut lines = vec![format!("cwd: {dir}"), format!("$ {command}")];
+        if args
+            .get("network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            lines.push("network: requested".to_string());
+        }
+        Some(crate::agent::tools::ApprovalPreview {
+            title: "shell_run".to_string(),
+            diff: None,
+            lines,
+        })
     }
     fn description(&self) -> &str {
         "Run a shell command in the working directory and return its stdout/stderr + exit code. \
@@ -5404,6 +5502,65 @@ mod tests {
             "new_string": "    bar();\n    baz();"
         }));
         assert!(e.is_err(), "ambiguous without replace_all");
+    }
+
+    #[test]
+    fn previews_show_the_patch_the_command_and_the_destination_before_anything_runs() {
+        use crate::agent::tools::Tool as _;
+        let root =
+            std::env::temp_dir().join(format!("aizen-preview-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let edit = FileEdit::new(root.clone());
+        let p = edit
+            .preview(&serde_json::json!({"path": "a.txt", "old_string": "two", "new_string": "2"}))
+            .expect("an edit previews");
+        assert_eq!(p.title, "a.txt");
+        let diff = p.diff.expect("the patch");
+        assert!(diff.contains("-two") && diff.contains("+2"), "{diff}");
+        assert!(p.lines[0].starts_with("would edit a.txt"), "{:?}", p.lines);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "nothing written"
+        );
+        assert!(
+            edit.preview(
+                &serde_json::json!({"path": "a.txt", "old_string": "zzz", "new_string": "2"})
+            )
+            .is_none(),
+            "a failing edit has no preview"
+        );
+        let write = FileWrite::new(root.clone());
+        let p = write
+            .preview(&serde_json::json!({"path": "a.txt", "content": "one\n2\nthree\n"}))
+            .unwrap();
+        assert!(
+            p.diff.is_some() && p.lines[0].starts_with("overwrite a.txt"),
+            "{:?}",
+            p.lines
+        );
+        let p = write
+            .preview(&serde_json::json!({"path": "new.txt", "content": "x\ny\n"}))
+            .unwrap();
+        assert!(
+            p.diff.is_none() && p.lines[0].starts_with("create new.txt"),
+            "{:?}",
+            p.lines
+        );
+        let shell = ShellRun::new(root.clone());
+        let p = shell
+            .preview(&serde_json::json!({"command": "python deploy.py --prod --force-delete", "network": true}))
+            .unwrap();
+        assert!(p.lines[0].starts_with("cwd: "), "{:?}", p.lines);
+        assert_eq!(p.lines[1], "$ python deploy.py --prod --force-delete");
+        assert_eq!(p.lines[2], "network: requested");
+        let mv = FileMove::new(root.clone());
+        let p = mv
+            .preview(&serde_json::json!({"from": "a.txt", "to": "b.txt", "overwrite": true}))
+            .unwrap();
+        assert_eq!(p.lines[0], "move a.txt → b.txt (overwrite)");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
