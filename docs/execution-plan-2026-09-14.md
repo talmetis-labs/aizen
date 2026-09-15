@@ -288,7 +288,12 @@ merges over two rounds (one verify-pipeline fact written four times under a ping
 now `sessions: 3`, audit `reinforce` 0 → 4. The frozen core is unchanged (1 entry): the
 survivor is a `place` fact of another project. The 0.45 band floor does not reach the
 Vietnamese restatement cluster (peak lexical 0.44, see `match_text`) — those stay
-`reconcile`'s to judge.
+`reconcile`'s to judge. E4.2 implemented (`tiering::mentions_project` and
+`TierProposal.mentions_project`; `decide` re-files a `user` proposal that names the work as
+`place` with the usual clamp; the stored type follows the tier; `bench profile` gains
+`bench-fixtures/tier-hints.jsonl`, 14/14 with the 8 profile cases still green). Deviation (x): existing rows are not
+re-filed — their project is not recoverable from the text and a guessed anchor would be a wrong
+one — so M3's 239 `user` rows stay until touched; the rule guards the write path from here on.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

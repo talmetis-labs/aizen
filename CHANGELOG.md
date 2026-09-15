@@ -300,6 +300,13 @@ handing the model false inputs, and starts measuring what it sends.
   duplicate (revivable with `aizen memory revive <id>`) and reinforces its survivor, in rounds
   until nothing surfaces, which is what finally lets an inferred fact reach the frozen core.
   Every merge is on the audit log with the stage that decided it.
+- **A fact that names the work is filed as a project fact, never a user fact.** A learned
+  sentence that carries a path (`src/core/config.rs`, `C:\work`), a source or manifest file, a
+  project marker ("this repo", "repo này") or the name of the project directory is placed
+  with the work, whatever grammar it was written in — so another project's architecture notes
+  no longer travel with you as preferences. `node.js` is a product, `and/or` and `24/7` are
+  not paths. `aizen bench profile` gains a golden tier-hints set that runs such sentences
+  through the real classifier. Rows learned before this stay where they are.
 
 ## [0.6.7] — 2026-09-11
 
