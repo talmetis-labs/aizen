@@ -241,7 +241,13 @@ every block once. E3.4 implemented (`ToolEvent.body`, auto-expanded tail on a fa
 `Ctrl-E` → text overlay via `row_tool_seq` / the kept bodies, `send_retry_note` caption + note).
 Deviation (s): the expand key is `Ctrl-E`, not `Ctrl-O` — `Ctrl-O` has been the screenshot key
 since the vision work and is documented as such; and a failed row expands INLINE (its last lines
-under the digest) rather than popping an overlay mid-turn, which would steal the input box.
+under the digest) rather than popping an overlay mid-turn, which would steal the input box. E3.5
+implemented (`rewind` alias, `timemachine::undo_target` / `working_tree_differs_from`, the stat
+before the restore, `--yes` on a dirty tree, `emit_patch_boxes` for `/diff --patch`). Deviation
+(t): the dirty-tree confirmation is a second command (`/undo --yes`) rather than a modal y/n —
+the approval menu's rows and grants are about tools, and a slash handler has no clean inline
+prompt on the plain REPL; "dirty" means the working tree differs from the current checkpoint,
+measured with the same diff the stat uses, not `git status`.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

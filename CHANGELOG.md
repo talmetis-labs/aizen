@@ -273,6 +273,12 @@ handing the model false inputs, and starts measuring what it sends.
   of tail each, are kept). A send that backs off on a 429/5xx now says `rate-limited —
   retrying in 43s (2/3)` on the working line and once in the transcript instead of spinning
   mutely.
+- **Rewind you can review.** `/rewind` now exists (an alias of `/undo` — the verification
+  message had been pointing at a command that did not). Both show the rewind's diff stat
+  (files, `+added −deleted`) before applying, refuse to discard work no checkpoint holds unless
+  you add `--yes`, and name the files they restored in the receipt. On the retained TUI
+  `/diff --patch` renders each file through the same diff box an edit result gets instead of a
+  monochrome dump.
 
 ## [0.6.7] — 2026-09-11
 
