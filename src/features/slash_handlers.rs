@@ -339,6 +339,18 @@ async fn slash_init(arg: &str) {
             if !summary.trim().is_empty() {
                 tui::emit_line(&style(summary).dim().to_string());
             }
+            // The verify ladder's knowledge: which commands this project has and how long the
+            // fast rung takes, kept in HOME beside the index (never in the checkout).
+            let root = crate::core::config::project_root();
+            tui::emit_line(&style("  measuring verify commands…").dim().to_string());
+            for line in crate::agent::verify_gate::init_verify(
+                &root,
+                crate::agent::verify_gate::DEFAULT_TIMEOUT_SECS,
+            )
+            .await
+            {
+                tui::emit_line(&style(format!("  {line}")).dim().to_string());
+            }
         }
         Ok(Err(e)) => {
             // A cancel is a clean, expected outcome — show it calmly, not as a hard error.

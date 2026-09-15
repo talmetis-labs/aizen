@@ -1090,6 +1090,9 @@ where
     // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
     // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
     let mut last_edit_dir: Option<std::path::PathBuf> = None;
+    // Every file a successful edit named this run: the narrow rung of the Done ladder (the
+    // sibling test, the module filter) is derived from these.
+    let mut edited_paths: Vec<std::path::PathBuf> = Vec::new();
     // PRE-EDIT VERIFY BASELINE: captured on demand just before the first workspace mutation so the
     // gate can distinguish pre-existing compiler errors from regressions introduced by this run.
     // `None` = not yet captured; `Some` = immutable for the lifetime of the run.
@@ -2011,8 +2014,15 @@ where
                     .as_deref()
                     .and_then(verify_gate::verify_root)
                     .unwrap_or(cwd);
-                let gate =
-                    verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await;
+                // The Done ladder: the typecheck, then the narrowest test the edited files name,
+                // then — on a multi-file change that fits the budget — the suite.
+                let gate = verify_gate::run_verify_ladder(
+                    &gate_dir,
+                    cfg.verify_gate_timeout_secs,
+                    &edited_paths,
+                    cfg.quiet,
+                )
+                .await;
                 if gate.is_none() && !verify_absence_demanded && !cfg.cancel.is_cancelled() {
                     verify_absence_demanded = true;
                     if !cfg.quiet {
@@ -2531,6 +2541,13 @@ where
                     .unwrap_or_else(|_| serde_json::json!({}));
                 if let Some(dir) = t.workspace_target(&args) {
                     last_edit_dir = Some(dir);
+                }
+                if is_edit_tool(&tc.function.name) {
+                    if let Some(p) = edit_target_file(&cfg.effective_root(), &args) {
+                        if !edited_paths.contains(&p) {
+                            edited_paths.push(p);
+                        }
+                    }
                 }
             }
             // A successful edit belongs to the CURRENT phase. The checkpoint is no longer stamped
@@ -3388,6 +3405,24 @@ fn successful_edit_calls(calls: &[ToolCall], results: &[(String, String)]) -> us
                 && !r.starts_with(builtin::DRY_RUN_PREFIX)
         })
         .count()
+}
+
+/// The file a successful edit call named, absolute: `path` as given when absolute, else under
+/// `root`. `None` for calls without a `path` (a patch, a move).
+fn edit_target_file(
+    root: &std::path::Path,
+    args: &serde_json::Value,
+) -> Option<std::path::PathBuf> {
+    let raw = args.get("path").and_then(|v| v.as_str())?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(raw);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    })
 }
 
 /// Append `extra` blocks to the LAST tool result of `turn` (this turn's messages after the
@@ -6788,6 +6823,19 @@ mod tests {
             compact_edit_diff("edited f (1 replacement)"),
             "edited f (1 replacement)"
         );
+    }
+
+    #[test]
+    fn edit_target_file_resolves_relative_paths_under_the_root() {
+        let root = std::path::Path::new("/w/proj");
+        let rel = edit_target_file(root, &serde_json::json!({"path": "src/a.rs"})).unwrap();
+        assert_eq!(rel, root.join("src/a.rs"));
+        let abs = std::env::temp_dir().join("x.py");
+        let got =
+            edit_target_file(root, &serde_json::json!({"path": abs.to_string_lossy()})).unwrap();
+        assert_eq!(got, abs);
+        assert!(edit_target_file(root, &serde_json::json!({"path": "  "})).is_none());
+        assert!(edit_target_file(root, &serde_json::json!({"patch": "…"})).is_none());
     }
 
     #[test]

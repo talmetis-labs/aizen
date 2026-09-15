@@ -11,7 +11,9 @@
 //! `tsconfig.json` → `npx tsc --noEmit`; else `None`. Commands run through the platform shell
 //! (`cmd /C` / `sh -c`) so the npm/npx `.cmd` shims resolve on Windows.
 
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -44,6 +46,24 @@ pub enum VerifyCommand {
     /// A project-supplied command from `./.aizen/verify.json` (trust-gated — see
     /// [`detect_verify_commands`]).
     Custom(String),
+    /// `cargo test -q [--test <target>…] [-- <filter>…]`: the modules the edited Rust files
+    /// define (`name::`) and the integration-test targets edited under `tests/`.
+    CargoTest {
+        filters: Vec<String>,
+        targets: Vec<String>,
+    },
+    /// `<py> -m pytest -q <files>`: the test files that name the edited Python modules.
+    Pytest { py: String, files: Vec<String> },
+    /// `<py> -m unittest -q <files>`: the same when the project shows no pytest.
+    Unittest { py: String, files: Vec<String> },
+    /// `go test <pkgs>`: the packages whose files were edited and that carry `_test.go` files.
+    GoTest(Vec<String>),
+    /// `npx vitest run <files>` / `npx jest <files>`: the sibling test files of the edited
+    /// JS/TS files under the runner `package.json` declares.
+    NodeTest { runner: String, files: Vec<String> },
+    /// The project's whole test suite — detected from the manifest, or `suite` in a trusted
+    /// `.aizen/verify.json`. The last rung of the ladder; see [`plan_ladder`].
+    Suite(String),
 }
 
 impl VerifyCommand {
@@ -63,8 +83,48 @@ impl VerifyCommand {
                 format!("python3 {ARGS} || python {ARGS}")
             }
             VerifyCommand::Custom(c) => c.clone(),
+            VerifyCommand::CargoTest { filters, targets } => {
+                let mut c = String::from("cargo test -q");
+                for t in targets {
+                    c.push_str(" --test ");
+                    c.push_str(t);
+                }
+                if !filters.is_empty() {
+                    c.push_str(" -- ");
+                    c.push_str(&filters.join(" "));
+                }
+                c
+            }
+            VerifyCommand::Pytest { py, files } => {
+                format!("{py} -m pytest -q {}", quote_all(files))
+            }
+            VerifyCommand::Unittest { py, files } => {
+                format!("{py} -m unittest -q {}", quote_all(files))
+            }
+            VerifyCommand::GoTest(pkgs) => format!("go test {}", pkgs.join(" ")),
+            VerifyCommand::NodeTest { runner, files } => match runner.as_str() {
+                "vitest" => format!("npx vitest run {}", quote_all(files)),
+                _ => format!("npx jest {}", quote_all(files)),
+            },
+            VerifyCommand::Suite(c) => c.clone(),
         }
     }
+}
+
+/// Shell-quote a list of relative paths: bare when plain, double-quoted when they carry a
+/// space (the one case both `cmd /C` and `sh -c` agree on).
+fn quote_all(files: &[String]) -> String {
+    files
+        .iter()
+        .map(|f| {
+            if f.chars().any(|c| c.is_whitespace() || c == '"') {
+                format!("\"{}\"", f.replace('"', ""))
+            } else {
+                f.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The demand the loop injects when a run edited files but no verify command could run — no
@@ -288,6 +348,639 @@ fn custom_verify_timeout(cwd: &Path) -> Option<u64> {
     v.get("timeout_secs")?.as_u64().map(|t| t.clamp(10, 600))
 }
 
+/// The verify budget the REPL and `/init` run under when no loop config names one.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 90;
+
+/// How a timed-out command reports itself (the ladder reads it back to tell a slow suite from a
+/// broken one).
+const TIMED_OUT_PREFIX: &str = "verify timed out after ";
+
+// ---------------------------------------------------------------------------------------------
+// The verify ladder (FL lever F): cheapest sufficient check first.
+//
+// Diagnostics on the edited files are rung zero and live in the LSP fold. These are the rungs that
+// spawn a process: the typecheck the gate always ran, the narrowest test the edited files name,
+// and — at Done, on a multi-file change, when it is known to fit the budget — the whole suite.
+// ---------------------------------------------------------------------------------------------
+
+/// Where a verify step sits on the cost ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rung {
+    /// The fast build/typecheck — what the gate always ran.
+    Typecheck,
+    /// The narrowest test the edited files name: a sibling test file, `cargo test -- module::`,
+    /// one Go package.
+    NarrowTest,
+    /// The whole suite — only at Done, only on a multi-file change, only when its last measured
+    /// duration fits the budget (or it has never been measured).
+    FullSuite,
+}
+
+/// One step of the ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub rung: Rung,
+    pub cmd: VerifyCommand,
+}
+
+/// The steps the gate will run, in order, and what it left out and why.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Ladder {
+    pub steps: Vec<Step>,
+    pub skipped: Vec<String>,
+}
+
+/// Choose the steps for one Done-time verification of `edited` under `root`, cheapest first:
+/// the typecheck list, the narrow tests the edited files name, and the suite when the change
+/// touched more than one file and the suite is not known to exceed `budget_secs` (`measured` is
+/// the per-command duration record; a suite that once blew the budget is skipped with a note
+/// rather than re-run blindly — the loop would otherwise spend a fix round on a timeout).
+pub fn plan_ladder(
+    root: &Path,
+    edited: &[PathBuf],
+    budget_secs: u64,
+    measured: &BTreeMap<String, u64>,
+) -> Ladder {
+    let mut ladder = Ladder::default();
+    for cmd in detect_verify_commands(root) {
+        ladder.steps.push(Step {
+            rung: Rung::Typecheck,
+            cmd,
+        });
+    }
+    for cmd in narrow_tests(root, edited) {
+        ladder.steps.push(Step {
+            rung: Rung::NarrowTest,
+            cmd,
+        });
+    }
+    if edited.len() >= 2 {
+        if let Some(suite) = suite_command(root) {
+            let line = suite.command_line();
+            match measured.get(&line) {
+                Some(ms) if *ms > budget_secs.saturating_mul(1000) => ladder.skipped.push(format!(
+                    "{line}: last run took {} s, over the {budget_secs} s verify budget — run it yourself before shipping",
+                    ms / 1000
+                )),
+                _ => ladder.steps.push(Step {
+                    rung: Rung::FullSuite,
+                    cmd: suite,
+                }),
+            }
+        }
+    }
+    ladder
+}
+
+/// The narrowest tests the edited files name, per language, in run order. Pure path and file
+/// inspection: nothing is spawned. A file whose tests cannot be located contributes nothing (the
+/// suite rung covers it at Done); a file outside `root` is ignored.
+pub fn narrow_tests(root: &Path, edited: &[PathBuf]) -> Vec<VerifyCommand> {
+    let mut out = Vec::new();
+    let rel = |p: &Path| -> Option<String> {
+        p.strip_prefix(root)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+    };
+    let ext = |p: &Path| -> String {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let stem = |p: &Path| -> String {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let push_unique = |v: &mut Vec<String>, s: String| {
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    };
+
+    // Rust: the module a file defines is the filter (`name::`); a file under `tests/` is an
+    // integration target. `main`/`lib`/`build` define no module of their own — their tests, if
+    // any, are the crate's, which is the suite's job.
+    if root.join("Cargo.toml").is_file() {
+        let mut filters: Vec<String> = Vec::new();
+        let mut targets: Vec<String> = Vec::new();
+        for p in edited.iter().filter(|p| ext(p) == "rs") {
+            let Some(r) = rel(p) else { continue };
+            let s = stem(p);
+            if let Some(t) = r.strip_prefix("tests/") {
+                if !t.contains('/') {
+                    push_unique(&mut targets, s);
+                }
+                continue;
+            }
+            if !rust_file_has_tests(p) {
+                continue;
+            }
+            let name = if s == "mod" {
+                p.parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                s
+            };
+            if name.is_empty() || matches!(name.as_str(), "main" | "lib" | "build") {
+                continue;
+            }
+            push_unique(&mut filters, format!("{name}::"));
+        }
+        if !filters.is_empty() {
+            out.push(VerifyCommand::CargoTest {
+                filters,
+                targets: Vec::new(),
+            });
+        }
+        if !targets.is_empty() {
+            out.push(VerifyCommand::CargoTest {
+                filters: Vec::new(),
+                targets,
+            });
+        }
+    }
+
+    // Python: the edited test file itself, or `test_<stem>.py` / `<stem>_test.py` beside it, in a
+    // `tests/` or `test/` dir beside it, or under the root's `tests/` / `test/`.
+    let py_edits: Vec<&PathBuf> = edited.iter().filter(|p| ext(p) == "py").collect();
+    if !py_edits.is_empty() {
+        let mut files: Vec<String> = Vec::new();
+        for p in py_edits {
+            let s = stem(p);
+            let hit = if s.starts_with("test_") || s.ends_with("_test") {
+                Some(p.clone())
+            } else {
+                let dir = p.parent().unwrap_or(root);
+                let names = [format!("test_{s}.py"), format!("{s}_test.py")];
+                let mut cands: Vec<PathBuf> = Vec::new();
+                for n in &names {
+                    for base in [
+                        dir.to_path_buf(),
+                        dir.join("tests"),
+                        dir.join("test"),
+                        root.join("tests"),
+                        root.join("test"),
+                    ] {
+                        cands.push(base.join(n));
+                    }
+                }
+                cands.into_iter().find(|c| c.is_file())
+            };
+            if let Some(r) = hit.as_deref().and_then(rel) {
+                push_unique(&mut files, r);
+            }
+        }
+        if !files.is_empty() {
+            let py = python_launcher().to_string();
+            out.push(if uses_pytest(root) {
+                VerifyCommand::Pytest { py, files }
+            } else {
+                VerifyCommand::Unittest { py, files }
+            });
+        }
+    }
+
+    // Go: the package (directory) of each edited file, when it carries any `_test.go`.
+    if root.join("go.mod").is_file() {
+        let mut pkgs: Vec<String> = Vec::new();
+        for p in edited.iter().filter(|p| ext(p) == "go") {
+            let Some(dir) = p.parent() else { continue };
+            let has_tests = std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .any(|e| e.file_name().to_string_lossy().ends_with("_test.go"))
+                })
+                .unwrap_or(false);
+            if !has_tests {
+                continue;
+            }
+            let Some(r) = rel(dir) else { continue };
+            push_unique(
+                &mut pkgs,
+                if r.is_empty() {
+                    "./".to_string()
+                } else {
+                    format!("./{r}/")
+                },
+            );
+        }
+        if !pkgs.is_empty() {
+            out.push(VerifyCommand::GoTest(pkgs));
+        }
+    }
+
+    // JS/TS: the edited test file itself, or `<stem>.test.*` / `<stem>.spec.*` beside it or in a
+    // sibling `__tests__/`, under the runner `package.json` declares (no runner ⇒ no rung: guessing
+    // one spawns the wrong tool).
+    if root.join("package.json").is_file() {
+        if let Some(runner) = node_test_runner(root) {
+            let mut files: Vec<String> = Vec::new();
+            for p in edited
+                .iter()
+                .filter(|p| matches!(ext(p).as_str(), "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs"))
+            {
+                let s = stem(p);
+                let hit = if s.ends_with(".test") || s.ends_with(".spec") {
+                    Some(p.clone())
+                } else {
+                    let dir = p.parent().unwrap_or(root);
+                    let mut cands: Vec<PathBuf> = Vec::new();
+                    for kind in ["test", "spec"] {
+                        for e in ["ts", "tsx", "js", "jsx", "mjs"] {
+                            cands.push(dir.join(format!("{s}.{kind}.{e}")));
+                            cands.push(dir.join("__tests__").join(format!("{s}.{kind}.{e}")));
+                            cands.push(dir.join("__tests__").join(format!("{s}.{e}")));
+                        }
+                    }
+                    cands.into_iter().find(|c| c.is_file())
+                };
+                if let Some(r) = hit.as_deref().and_then(rel) {
+                    push_unique(&mut files, r);
+                }
+            }
+            if !files.is_empty() {
+                out.push(VerifyCommand::NodeTest { runner, files });
+            }
+        }
+    }
+
+    out
+}
+
+/// Does this Rust file carry tests of its own (`#[test]`, `#[cfg(test)]`, `#[tokio::test]`)?
+fn rust_file_has_tests(p: &Path) -> bool {
+    std::fs::read_to_string(p)
+        .map(|s| s.contains("#[test]") || s.contains("#[cfg(test)]") || s.contains("::test]"))
+        .unwrap_or(false)
+}
+
+/// Does the project show pytest — a config that names it, or a requirement on it?
+fn uses_pytest(root: &Path) -> bool {
+    if root.join("pytest.ini").is_file() || root.join("conftest.py").is_file() {
+        return true;
+    }
+    let has = |file: &str, needle: &str| {
+        std::fs::read_to_string(root.join(file))
+            .map(|s| s.contains(needle))
+            .unwrap_or(false)
+    };
+    has("pyproject.toml", "[tool.pytest")
+        || has("pyproject.toml", "pytest")
+        || has("setup.cfg", "[tool:pytest]")
+        || has("tox.ini", "[pytest]")
+        || has("requirements.txt", "pytest")
+        || has("requirements-dev.txt", "pytest")
+        || has("dev-requirements.txt", "pytest")
+}
+
+/// The test runner `package.json` declares: `vitest` or `jest` among the dependencies.
+fn node_test_runner(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let declared = |name: &str| {
+        ["devDependencies", "dependencies"]
+            .iter()
+            .any(|k| json.get(k).and_then(|d| d.get(name)).is_some())
+    };
+    if declared("vitest") {
+        Some("vitest".to_string())
+    } else if declared("jest") {
+        Some("jest".to_string())
+    } else {
+        None
+    }
+}
+
+/// Does `package.json` carry a real `test` script (not npm's "no test specified" stub)?
+fn npm_has_test_script(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|j| {
+            j.get("scripts")?
+                .get("test")?
+                .as_str()
+                .map(|s| !s.contains("no test specified"))
+        })
+        .unwrap_or(false)
+}
+
+/// The interpreter the Python rungs run under: `python` on Windows (where `python3` is the
+/// Store stub), else `python3` when it answers `--version`, else `python`. Probed once; the
+/// probe is a fixed argv, not a model- or repo-influenced spawn.
+fn python_launcher() -> &'static str {
+    static PY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    PY.get_or_init(|| {
+        if cfg!(windows) {
+            return "python";
+        }
+        let ok = std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            "python3"
+        } else {
+            "python"
+        }
+    })
+}
+
+/// The project's whole test suite: `suite` in a trusted `.aizen/verify.json`, else by manifest.
+/// `None` when the project shows no suite (a `package.json` with npm's stub `test` script, a
+/// Python tree with neither pytest nor a `tests/` dir).
+pub fn suite_command(root: &Path) -> Option<VerifyCommand> {
+    if let Some(s) = custom_suite(root) {
+        return Some(VerifyCommand::Suite(s));
+    }
+    let cmd = if root.join("Cargo.toml").is_file() {
+        "cargo test -q".to_string()
+    } else if root.join("package.json").is_file() {
+        if !npm_has_test_script(root) {
+            return None;
+        }
+        "npm test".to_string()
+    } else if root.join("go.mod").is_file() {
+        "go test ./...".to_string()
+    } else if root.join("pom.xml").is_file() {
+        "mvn -q test".to_string()
+    } else if root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file() {
+        let launcher = if root.join("gradlew.bat").is_file() && cfg!(windows) {
+            "gradlew.bat"
+        } else if root.join("gradlew").is_file() && !cfg!(windows) {
+            "./gradlew"
+        } else {
+            "gradle"
+        };
+        format!("{launcher} -q test")
+    } else if has_file_with_extension(root, &["csproj", "fsproj", "sln"]) {
+        "dotnet test --nologo -v q".to_string()
+    } else if [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "pytest.ini",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|m| root.join(m).is_file())
+    {
+        let py = python_launcher();
+        if uses_pytest(root) {
+            format!("{py} -m pytest -q")
+        } else if root.join("tests").is_dir() || root.join("test").is_dir() {
+            format!("{py} -m unittest discover -q")
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    Some(VerifyCommand::Suite(cmd))
+}
+
+/// The `suite` of a trusted `./.aizen/verify.json`, unless `cmd_guard` blocks it.
+fn custom_suite(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(".aizen").join("verify.json")).ok()?;
+    if !crate::agent::mcp::project_trusted() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let s = v.get("suite")?.as_str()?.trim();
+    if s.is_empty()
+        || matches!(
+            crate::agent::cmd_guard::classify(s),
+            crate::agent::cmd_guard::Verdict::Blocked(_)
+        )
+    {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// What the gate has learned about a project's verify commands, kept in HOME — never in the
+/// checkout, for the reason the index lives there too: a generated file must not dirty `git
+/// status`. `/init` fills `commands`/`suite` and times the fast rung; every ladder run refreshes
+/// `measured_ms`, so the next plan knows which rungs fit the budget.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct VerifyRecord {
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub suite: Option<String>,
+    /// command line → last duration in ms (a timeout is recorded as budget + 1).
+    #[serde(default)]
+    pub measured_ms: BTreeMap<String, u64>,
+}
+
+/// `<aizen home>/verify/<dirname>-<hash>.json` for `root`.
+fn record_path(root: &Path) -> PathBuf {
+    let spelled = root.to_string_lossy().replace('\\', "/");
+    let spelled = if cfg!(windows) {
+        spelled.to_ascii_lowercase()
+    } else {
+        spelled
+    };
+    // FNV-1a over the normalized spelling: stable, dependency-free, and only ever a cache key.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in spelled.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    let name: String = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(24)
+        .collect();
+    let name = if name.is_empty() {
+        "project".to_string()
+    } else {
+        name
+    };
+    crate::core::config::aizen_home()
+        .join("verify")
+        .join(format!("{name}-{h:016x}.json"))
+}
+
+/// The record for `root`, empty when none was written yet (or it cannot be read).
+pub fn load_record(root: &Path) -> VerifyRecord {
+    std::fs::read_to_string(record_path(root))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Write the record for `root` atomically.
+pub fn save_record(root: &Path, record: &VerifyRecord) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(record)?;
+    crate::core::persist::atomic_write(&record_path(root), &bytes)
+}
+
+/// Remember how long `command` took under `root`. Best-effort: a record that cannot be written
+/// costs nothing but the next plan's knowledge.
+fn record_duration(root: &Path, command: &str, ms: u64) {
+    let mut record = load_record(root);
+    if record.root.is_empty() {
+        record.root = root.display().to_string();
+    }
+    record.measured_ms.insert(command.to_string(), ms);
+    let _ = save_record(root, &record);
+}
+
+/// Run the Done ladder for `edited` under `root`: every step in order, stopping at the first
+/// failure (its result is the gate result); all-pass returns the last pass; `None` when nothing
+/// could run. Each finished step's duration is recorded for the next plan. A suite that exceeds
+/// the budget is not a failure — it is noted, recorded as over budget so it is not retried
+/// blindly, and the ladder's earlier passes stand.
+pub async fn run_verify_ladder(
+    root: &Path,
+    timeout_secs: u64,
+    edited: &[PathBuf],
+    quiet: bool,
+) -> Option<VerifyGateResult> {
+    let record = load_record(root);
+    let ladder = plan_ladder(root, edited, timeout_secs, &record.measured_ms);
+    if !quiet {
+        for note in &ladder.skipped {
+            crate::ui::tui::verify_line("verify", note);
+        }
+    }
+    if ladder.steps.is_empty() {
+        return None;
+    }
+    let baseline = source_fingerprint(root);
+    let custom_timeout = custom_verify_timeout(root);
+    let mut last_pass: Option<VerifyGateResult> = None;
+    for step in ladder.steps {
+        if crate::core::cancel::current().is_some_and(|c| c.is_cancelled()) {
+            return None;
+        }
+        // A pass that is about to be superseded by the next rung is reported here; the loop
+        // reports the final result itself.
+        if let (false, Some(prev)) = (quiet, &last_pass) {
+            crate::ui::tui::verify_line(
+                &prev.command,
+                &format!("passed ({} ms)", prev.duration_ms),
+            );
+        }
+        let secs = match step.cmd {
+            VerifyCommand::Custom(_) | VerifyCommand::Suite(_) => {
+                custom_timeout.unwrap_or(timeout_secs)
+            }
+            _ => timeout_secs,
+        };
+        let Some(mut r) = run_one_verify(root, &step.cmd, secs).await else {
+            continue;
+        };
+        let timed_out = r.output.starts_with(TIMED_OUT_PREFIX);
+        record_duration(
+            root,
+            &r.command,
+            if timed_out {
+                secs.saturating_mul(1000) + 1
+            } else {
+                r.duration_ms as u64
+            },
+        );
+        r.stable = baseline.is_some() && baseline == source_fingerprint(root);
+        if !r.stable {
+            r.passed = false;
+            r.output = "verification result ignored: the source workspace changed while the command was running. No success was reported; retry after the other writer finishes".to_string();
+            return Some(r);
+        }
+        if !r.passed {
+            if step.rung == Rung::FullSuite && timed_out {
+                if !quiet {
+                    crate::ui::tui::verify_line(
+                        &r.command,
+                        &format!(
+                            "full suite exceeded the {secs} s verify budget — skipped; it will not be retried automatically"
+                        ),
+                    );
+                }
+                continue;
+            }
+            return Some(r);
+        }
+        last_pass = Some(r);
+    }
+    last_pass
+}
+
+/// `/init`'s share of verification: detect the commands and the suite, time the fast rung once,
+/// and keep the result in HOME. Returns the lines to show the user.
+pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
+    let cmds = detect_verify_commands(root);
+    let suite = suite_command(root);
+    let mut record = load_record(root);
+    record.root = root.display().to_string();
+    record.commands = cmds.iter().map(|c| c.command_line()).collect();
+    record.suite = suite.as_ref().map(|s| s.command_line());
+    let mut lines = Vec::new();
+    if cmds.is_empty() && suite.is_none() {
+        lines.push(
+            "verify: no build or test command recognised here — a trusted .aizen/verify.json with \
+             {\"commands\": [...], \"suite\": \"...\"} names them"
+                .to_string(),
+        );
+        let _ = save_record(root, &record);
+        return lines;
+    }
+    for cmd in &cmds {
+        match run_one_verify(root, cmd, timeout_secs).await {
+            Some(r) => {
+                let timed_out = r.output.starts_with(TIMED_OUT_PREFIX);
+                record.measured_ms.insert(
+                    r.command.clone(),
+                    if timed_out {
+                        timeout_secs.saturating_mul(1000) + 1
+                    } else {
+                        r.duration_ms as u64
+                    },
+                );
+                lines.push(format!(
+                    "verify: `{}` {} in {:.1} s",
+                    r.command,
+                    if r.passed {
+                        "passed"
+                    } else if timed_out {
+                        "timed out"
+                    } else {
+                        "FAILED (pre-existing; the gate compares against this baseline)"
+                    },
+                    r.duration_ms as f64 / 1000.0
+                ));
+            }
+            None => lines.push(format!(
+                "verify: `{}` could not run here (toolchain not installed?)",
+                cmd.command_line()
+            )),
+        }
+    }
+    if let Some(s) = &suite {
+        lines.push(format!(
+            "verify: suite `{}` runs at Done on multi-file changes — timed on first use, skipped once it is known to exceed the {timeout_secs} s budget",
+            s.command_line()
+        ));
+    }
+    let _ = save_record(root, &record);
+    lines
+}
+
 /// Parse `package.json` and return the first typecheck-flavored script that exists.
 /// Best-effort: a missing/invalid file or absent `scripts` → `None` (no panic).
 fn detect_npm_typecheck_script(pkg: &Path) -> Option<String> {
@@ -448,7 +1141,7 @@ async fn run_one_verify(
         Err(_) => Some(VerifyGateResult {
             passed: false,
             command: command_line,
-            output: format!("verify timed out after {timeout_secs}s (killed)"),
+            output: format!("{TIMED_OUT_PREFIX}{timeout_secs}s (killed)"),
             duration_ms: start.elapsed().as_millis(),
             stable: true,
         }),
@@ -1144,5 +1837,237 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         assert!(msg.contains("cargo check"));
         assert!(msg.contains("E0308"));
         assert!(msg.contains("Fix these errors"));
+    }
+
+    fn write(p: &Path, s: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, s).unwrap();
+    }
+
+    /// The done-when of E0.7: a Rust edit with tests of its own runs `cargo test -- module::`,
+    /// not the whole suite; a file without tests names no rung; `main`/`lib` never do.
+    #[test]
+    fn narrow_rust_edit_runs_its_module_not_the_suite() {
+        let d = temp_dir("narrow-rust");
+        write(&d.join("Cargo.toml"), "[package]\nname = \"x\"\n");
+        write(
+            &d.join("src/lib.rs"),
+            "pub mod agent;\n#[cfg(test)]\nmod t {}\n",
+        );
+        write(
+            &d.join("src/agent/verify_gate.rs"),
+            "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+        );
+        write(&d.join("src/agent/plain.rs"), "pub fn g() {}\n");
+        write(&d.join("tests/e2e.rs"), "#[test]\nfn it_works() {}\n");
+        let edited = vec![
+            d.join("src/agent/verify_gate.rs"),
+            d.join("src/agent/plain.rs"),
+            d.join("src/lib.rs"),
+        ];
+        let cmds = narrow_tests(&d, &edited);
+        assert_eq!(
+            cmds,
+            vec![VerifyCommand::CargoTest {
+                filters: vec!["verify_gate::".into()],
+                targets: vec![],
+            }],
+            "{cmds:?}"
+        );
+        assert_eq!(cmds[0].command_line(), "cargo test -q -- verify_gate::");
+        let cmds = narrow_tests(&d, &[d.join("tests/e2e.rs")]);
+        assert_eq!(cmds[0].command_line(), "cargo test -q --test e2e");
+
+        // One edited file: no suite. Two: the suite, unless it is known to blow the budget.
+        let one = plan_ladder(&d, &edited[..1], 90, &BTreeMap::new());
+        assert!(
+            one.steps.iter().all(|s| s.rung != Rung::FullSuite),
+            "{one:?}"
+        );
+        assert_eq!(one.steps[0].cmd, VerifyCommand::Cargo, "typecheck first");
+        let two = plan_ladder(&d, &edited[..2], 90, &BTreeMap::new());
+        assert_eq!(
+            two.steps.last().map(|s| (s.rung, s.cmd.command_line())),
+            Some((Rung::FullSuite, "cargo test -q".to_string()))
+        );
+        let mut slow = BTreeMap::new();
+        slow.insert("cargo test -q".to_string(), 200_000u64);
+        let capped = plan_ladder(&d, &edited[..2], 90, &slow);
+        assert!(capped.steps.iter().all(|s| s.rung != Rung::FullSuite));
+        assert_eq!(capped.skipped.len(), 1, "{capped:?}");
+        assert!(capped.skipped[0].contains("200 s"), "{}", capped.skipped[0]);
+    }
+
+    #[test]
+    fn narrow_python_edit_finds_its_sibling_test_under_the_projects_runner() {
+        let d = temp_dir("narrow-py");
+        write(&d.join("requirements.txt"), "");
+        write(&d.join("pkg/calc.py"), "def add(a, b):\n    return a + b\n");
+        write(&d.join("tests/test_calc.py"), "def test_add():\n    pass\n");
+        write(&d.join("pkg/alone.py"), "x = 1\n");
+        let edited = vec![d.join("pkg/calc.py"), d.join("pkg/alone.py")];
+        let cmds = narrow_tests(&d, &edited);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        match &cmds[0] {
+            VerifyCommand::Unittest { files, .. } => {
+                assert_eq!(files, &vec!["tests/test_calc.py".to_string()])
+            }
+            other => panic!("unittest without a pytest signal, got {other:?}"),
+        }
+        write(&d.join("pytest.ini"), "[pytest]\n");
+        let cmds = narrow_tests(&d, &edited);
+        assert!(
+            matches!(&cmds[0], VerifyCommand::Pytest { files, .. } if files == &vec!["tests/test_calc.py".to_string()]),
+            "{cmds:?}"
+        );
+        assert!(cmds[0]
+            .command_line()
+            .contains("-m pytest -q tests/test_calc.py"));
+        // An edited test file is its own narrow rung.
+        let cmds = narrow_tests(&d, &[d.join("tests/test_calc.py")]);
+        assert!(cmds[0].command_line().ends_with("tests/test_calc.py"));
+    }
+
+    #[test]
+    fn narrow_go_and_node_edits_name_their_package_and_sibling() {
+        let d = temp_dir("narrow-go");
+        write(&d.join("go.mod"), "module x\n");
+        write(&d.join("pkg/x.go"), "package pkg\n");
+        write(&d.join("pkg/x_test.go"), "package pkg\n");
+        write(&d.join("other/y.go"), "package other\n");
+        let cmds = narrow_tests(&d, &[d.join("pkg/x.go"), d.join("other/y.go")]);
+        assert_eq!(cmds, vec![VerifyCommand::GoTest(vec!["./pkg/".into()])]);
+        assert_eq!(cmds[0].command_line(), "go test ./pkg/");
+
+        let n = temp_dir("narrow-node");
+        write(&n.join("src/a.ts"), "export const a = 1;\n");
+        write(&n.join("src/a.test.ts"), "test('a', () => {});\n");
+        write(&n.join("package.json"), r#"{"scripts":{"test":"vitest"}}"#);
+        assert!(
+            narrow_tests(&n, &[n.join("src/a.ts")]).is_empty(),
+            "no declared runner ⇒ no rung"
+        );
+        write(
+            &n.join("package.json"),
+            r#"{"scripts":{"test":"vitest"},"devDependencies":{"vitest":"^2"}}"#,
+        );
+        let cmds = narrow_tests(&n, &[n.join("src/a.ts")]);
+        assert_eq!(
+            cmds,
+            vec![VerifyCommand::NodeTest {
+                runner: "vitest".into(),
+                files: vec!["src/a.test.ts".into()],
+            }]
+        );
+        assert_eq!(cmds[0].command_line(), "npx vitest run src/a.test.ts");
+    }
+
+    #[test]
+    fn suite_is_detected_per_manifest_and_absent_for_npm_stub() {
+        let d = temp_dir("suite-cargo");
+        write(&d.join("Cargo.toml"), "[package]\n");
+        assert_eq!(
+            suite_command(&d).map(|c| c.command_line()),
+            Some("cargo test -q".into())
+        );
+        let n = temp_dir("suite-npm");
+        write(
+            &n.join("package.json"),
+            r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
+        );
+        assert_eq!(suite_command(&n), None, "npm's stub is not a suite");
+        write(
+            &n.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"}}"#,
+        );
+        assert_eq!(
+            suite_command(&n).map(|c| c.command_line()),
+            Some("npm test".into())
+        );
+        let g = temp_dir("suite-go");
+        write(&g.join("go.mod"), "module x\n");
+        assert_eq!(
+            suite_command(&g).map(|c| c.command_line()),
+            Some("go test ./...".into())
+        );
+        let p = temp_dir("suite-py");
+        write(&p.join("setup.py"), "");
+        assert_eq!(suite_command(&p), None, "no pytest, no tests/ ⇒ no suite");
+        write(&p.join("tests/test_a.py"), "");
+        assert!(suite_command(&p)
+            .map(|c| c.command_line())
+            .unwrap()
+            .contains("-m unittest discover -q"));
+    }
+
+    #[test]
+    fn verify_record_round_trips_in_home() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_dir("record-home");
+        std::env::set_var("AIZEN_HOME", &home);
+        let d = temp_dir("record-proj");
+        assert!(load_record(&d).measured_ms.is_empty());
+        record_duration(&d, "cargo check", 1234);
+        record_duration(&d, "cargo test -q", 91_001);
+        let rec = load_record(&d);
+        let path = record_path(&d); // resolved while the temp HOME is still set
+        std::env::remove_var("AIZEN_HOME");
+        assert_eq!(rec.measured_ms.get("cargo check"), Some(&1234));
+        assert_eq!(rec.measured_ms.get("cargo test -q"), Some(&91_001));
+        assert_eq!(rec.root, d.display().to_string());
+        assert!(
+            path.starts_with(home.join("verify")),
+            "the record lives in HOME, never in the checkout"
+        );
+    }
+
+    /// The done-when of E0.7: a Python edit whose sibling test fails cannot pass the ladder. The
+    /// fixture uses unittest (pytest is not a given on a dev machine); an interpreter that cannot
+    /// run at all skips the assertion rather than faking it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_python_edit_with_a_failing_sibling_test_cannot_pass_the_ladder() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_dir("ladder-py-home");
+        std::env::set_var("AIZEN_HOME", &home);
+        let d = temp_dir("ladder-py");
+        write(&d.join("requirements.txt"), "");
+        write(&d.join("calc.py"), "def add(a, b):\n    return a - b\n");
+        write(&d.join("tests/__init__.py"), "");
+        write(
+            &d.join("tests/test_calc.py"),
+            "import os\nimport sys\nimport unittest\n\nsys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\nfrom calc import add\n\n\nclass CalcTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n",
+        );
+        let edited = vec![d.join("calc.py")];
+        let result = run_verify_ladder(&d, 60, &edited, true).await;
+        let recorded = load_record(&d);
+        std::env::remove_var("AIZEN_HOME");
+        let Some(r) = result else {
+            eprintln!("skipped: no Python interpreter could run here");
+            return;
+        };
+        assert!(
+            r.command.contains("-m unittest"),
+            "the narrow rung ran and is the gate result: {}",
+            r.command
+        );
+        assert!(
+            !r.passed,
+            "a failing sibling test fails the gate: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("FAIL") || r.output.contains("AssertionError"),
+            "{}",
+            r.output
+        );
+        assert!(
+            recorded.measured_ms.contains_key(&r.command),
+            "the run was timed for the next plan: {recorded:?}"
+        );
     }
 }
