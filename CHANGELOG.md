@@ -172,7 +172,11 @@ handing the model false inputs, and starts measuring what it sends.
   guidance and the kept value on their own lines, so a long URL no longer wraps the live input
   line into redraw fragments; and a scheme is read the way it was meant — `htps://`, a
   missing `https://`, or the `https://https://…` a paste over a prefilled field produced — instead
-  of bouncing the question back with a doubled prefix.
+  of bouncing the question back with a doubled prefix. The same rules now hold across the
+  apps, channel, skills, persona, sessions, time-machine and slash-palette menus: navigation
+  leaves no trace, a webhook URL or auth header is never echoed, and the long-value prompts
+  (channel ids, channel URL, skill URL, a role's Base URL) keep their guidance on a line of
+  their own.
 - **A refreshed Codex token the backend still rejects no longer loops forever.** The 401
   branch refreshed and re-sent with no attempt counter; it now refreshes once, then asks for
   `aizen auth login codex`. The overload and capacity markers are matched against the error
