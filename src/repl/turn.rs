@@ -15,7 +15,7 @@ use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
 use crate::repl::postturn::{
-    chore_chat, maybe_auto_compact, maybe_evolve_persona, maybe_run_secretary,
+    chore_chat, last_turn_slice, maybe_auto_compact, maybe_evolve_persona, maybe_run_secretary,
 };
 use crate::ui::context_report::{
     ctx_permille, resolve_ctx_window, usage_ctx_tokens, usage_input_tokens,
@@ -298,11 +298,10 @@ pub(crate) async fn run_agent_turn(
     agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await
 }
 
-/// How long the post-turn learning passes may take in total before the REPL gives up on them.
-///
-/// Each call already has its own 300s ceiling (`chore_chat` → `subagent_call_timeout`), but three of
-/// them in a row can strand an idle-looking REPL for fifteen minutes. On timeout the user sees a
-/// skip line instead of a spinner that never stops.
+/// How long the inline post-turn work (auto-compaction: several summary calls) may take in total
+/// before the REPL gives up on it. Each call has its own cap (`chore_chat` → `chore_call_timeout`,
+/// 60s); this bounds the sum. On timeout the user sees a skip line instead of a spinner that
+/// never stops. The learning passes no longer run here — see `learning_queue`.
 const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
 
 /// Everything a turn that reached the model must do afterwards, on either surface.
@@ -372,9 +371,20 @@ pub(crate) async fn finish_turn(
     // re-arming, Esc would take the idle branch while the REPL sat awaiting them: to the user the
     // turn had visibly ended and the app was wedged anyway. Cancelling here skips the remaining
     // learning, which is always optional work.
-    let learning = cancellable_slash_labeled("learning from this turn…", async {
-        maybe_run_secretary(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
-        maybe_evolve_persona(http, &ep.base_url, &ep.api_key, &ep.model).await;
+    // E4.4: the secretary and the persona reflection read the turn and write the store; nothing
+    // in the next prompt waits on them except recall, which the next turn's `learning_queue`
+    // drain gives `DRAIN_JOIN` to satisfy. So they run in the background on a copy of the turn,
+    // and only auto-compaction — which rewrites `history` — stays inline.
+    {
+        let turn = last_turn_slice(history).to_vec();
+        let http = http.clone();
+        let ep = ep.clone();
+        crate::repl::learning_queue::LEARNING.spawn(async move {
+            maybe_run_secretary(&turn, &http, &ep.base_url, &ep.api_key, &ep.model).await;
+            maybe_evolve_persona(&http, &ep.base_url, &ep.api_key, &ep.model).await;
+        });
+    }
+    let learning = cancellable_slash_labeled("finishing turn…", async {
         maybe_auto_compact(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
     });
     let learned = match tokio::time::timeout(
@@ -386,13 +396,13 @@ pub(crate) async fn finish_turn(
         Ok(result) => result,
         Err(_) => {
             tui::emit_line(
-                &theme::muted("⏱ post-turn learning exceeded timeout — skipped.").to_string(),
+                &theme::muted("⏱ auto-compaction exceeded its timeout — skipped.").to_string(),
             );
             None
         }
     };
     if learned.is_none() {
-        tui::emit_line(&theme::muted("⏹ skipped the post-turn learning passes.").to_string());
+        tui::emit_line(&theme::muted("⏹ skipped auto-compaction.").to_string());
     }
     // Persistence is NOT optional, so it sits outside that block: a cancelled learning pass must
     // still leave the conversation on disk. `autosave_session` names the session with a model call,

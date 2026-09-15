@@ -461,15 +461,21 @@ fn status_text(history: &[Message], model: &str) -> String {
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
 /// calls (compaction/handoff summaries) are the classic cheap-model candidates — one config field
 /// and every summary routes there.
+/// The endpoint every chore call goes to. The `summarizer` role when one is configured; otherwise
+/// the cheapest model the user configured for this endpoint (`models_by_effort.low`), and only
+/// then the main model — quality plan M6 measured the chores landing on the main coding model at
+/// full effort because nothing else was named.
 fn summarizer_endpoint(base: &str, key: &str, model: &str) -> cli_config::ResolvedEndpoint {
-    cli_config::resolve_role(
-        "summarizer",
-        &cli_config::ResolvedEndpoint {
-            base_url: base.to_string(),
-            api_key: key.to_string(),
-            model: model.to_string(),
-        },
-    )
+    let main = cli_config::ResolvedEndpoint {
+        base_url: base.to_string(),
+        api_key: key.to_string(),
+        model: model.to_string(),
+    };
+    let ep = cli_config::resolve_role("summarizer", &main);
+    if ep.model == main.model && ep.base_url == main.base_url {
+        return cli_config::route_endpoint_for_effort(&ep, Some("low"));
+    }
+    ep
 }
 
 /// Eager tool execution during streaming: ON unless disabled by config (`eager_tools: false`) or
@@ -581,6 +587,34 @@ async fn cancellable_slash_labeled<T>(
     out
 }
 
+/// E4.4: give the previous turn's background learning up to `DRAIN_JOIN` to land, so this turn's
+/// recall can see what the last one taught; a slow pass keeps running and lands later.
+async fn drain_learning_before_turn() {
+    use crate::repl::learning_queue::{DRAIN_JOIN, LEARNING};
+    if LEARNING.in_flight() == 0 {
+        return;
+    }
+    if !LEARNING.drain(DRAIN_JOIN).await {
+        tui::emit_line(
+            &theme::muted("… last turn's learning is still running; going ahead without it.")
+                .to_string(),
+        );
+    }
+}
+
+/// On the way out, let the last turn's learning finish rather than lose it (Esc skips).
+async fn drain_learning_before_exit() {
+    use crate::repl::learning_queue::LEARNING;
+    if LEARNING.in_flight() == 0 {
+        return;
+    }
+    let _ = cancellable_slash_labeled(
+        "finishing learning from the last turn… (Esc skips)",
+        LEARNING.drain(std::time::Duration::from_secs(60)),
+    )
+    .await;
+}
+
 /// Compact "N ago" for a Unix-seconds timestamp (for `/init --status`).
 pub(crate) fn fmt_time_ago(built_unix: u64) -> String {
     let now = chrono::Utc::now().timestamp() as u64;
@@ -690,11 +724,17 @@ async fn run_menu_sticky() -> Result<()> {
     loop {
         let sub = match input.submissions.recv().await {
             Some(s) => s,
-            None => break,
+            None => {
+                drain_learning_before_exit().await;
+                break;
+            }
         };
         tui::note_submission_dequeued();
         match sub {
-            tui::Submission::Quit => break,
+            tui::Submission::Quit => {
+                drain_learning_before_exit().await;
+                break;
+            }
             tui::Submission::Slash(cmd) => {
                 if cmd.trim().is_empty() || slash_is_interactive(&cmd) {
                     // Dialoguer menus / long-running daemons drive the terminal directly → suspend
@@ -882,6 +922,7 @@ async fn run_menu_sticky() -> Result<()> {
                             .to_string(),
                     );
                 }
+                drain_learning_before_turn().await;
                 let persona_before = cli_config::load().persona;
                 // Arm LSP BEFORE building the registry — tools only register while enabled.
                 arm_lsp_session();
@@ -1114,7 +1155,10 @@ async fn run_menu_plain() -> Result<()> {
         print_status_line(&history, &model_label);
         let (line, mut images) = match read_input_box(&input_history)? {
             Some(l) => l,
-            None => break,
+            None => {
+                drain_learning_before_exit().await;
+                break;
+            }
         };
         let mut line = line.trim().to_string();
         // Drag-drop / typed / pasted image-file paths on the line → vision attachments (the other
@@ -1139,7 +1183,10 @@ async fn run_menu_plain() -> Result<()> {
             // a lone slash as ordinary text (a message may legitimately begin with one).
             if line.trim() == "/" {
                 match slash_menu(&mut history, &mut model_label).await {
-                    SlashOutcome::Quit => break,
+                    SlashOutcome::Quit => {
+                        drain_learning_before_exit().await;
+                        break;
+                    }
                     SlashOutcome::Submit(prompt) => line = prompt,
                     SlashOutcome::Continue => continue,
                 }
@@ -1154,7 +1201,10 @@ async fn run_menu_plain() -> Result<()> {
                             format!("{name} {arg}")
                         };
                         match handle_slash(&rest, &mut history, &mut model_label).await {
-                            SlashOutcome::Quit => break,
+                            SlashOutcome::Quit => {
+                                drain_learning_before_exit().await;
+                                break;
+                            }
                             // A custom command expanded to a prompt → run it as a chat turn (not
                             // re-preprocessed).
                             SlashOutcome::Submit(prompt) => line = prompt,
@@ -1239,6 +1289,7 @@ async fn run_menu_plain() -> Result<()> {
             .unwrap_or(ep);
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
+        drain_learning_before_turn().await;
         let persona_before = cli_config::load().persona;
         arm_lsp_session();
         // Registry BEFORE the user message is seated — it publishes the live tool surface that
