@@ -445,6 +445,8 @@ where
                 status: "cancelled".into(),
                 summary: "cancelled by user before start".into(),
                 iters: 0,
+                tokens_in: 0,
+                tokens_out: 0,
             });
         }
     }
@@ -470,6 +472,23 @@ pub struct TaskOutcome {
     pub status: String,
     pub summary: String,
     pub iters: usize,
+    /// Model tokens this child spent (input, output), summed from every call's usage; 0 when
+    /// the provider reported none.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// ` · 12.3k→1.2k tok` for a status line, empty when nothing was reported.
+fn tok_suffix(r: &TaskOutcome) -> String {
+    if r.tokens_in > 0 || r.tokens_out > 0 {
+        format!(
+            " · {}→{} tok",
+            crate::agent::orchestration::fmt_tokens(r.tokens_in),
+            crate::agent::orchestration::fmt_tokens(r.tokens_out)
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Run a workflow: fan out the tasks (bounded), then synthesize. Synthesis streams to stdout.
@@ -562,8 +581,13 @@ async fn run_workflow_with_cancel(
 
     for r in &results {
         eprintln!(
-            "  • {} ({}/{}) — {} [{} step(s)]",
-            r.id, r.role, r.model, r.status, r.iters
+            "  • {} ({}/{}) — {} [{} step(s)]{}",
+            r.id,
+            r.role,
+            r.model,
+            r.status,
+            r.iters,
+            tok_suffix(r)
         );
     }
 
@@ -889,8 +913,13 @@ pub(crate) async fn run_workflow_collect(
     let mut out = format!("[workflow: {}, {} task(s)]\n", spec.name, results.len());
     for r in &results {
         out.push_str(&format!(
-            "  • {} ({}/{}) — {} [{} step(s)]\n",
-            r.id, r.role, r.model, r.status, r.iters
+            "  • {} ({}/{}) — {} [{} step(s)]{}\n",
+            r.id,
+            r.role,
+            r.model,
+            r.status,
+            r.iters,
+            tok_suffix(r)
         ));
     }
     if !synthesize {
@@ -1036,6 +1065,8 @@ pub(crate) async fn run_one_task(
             status: "cancelled".into(),
             summary: "cancelled by user before start".into(),
             iters: 0,
+            tokens_in: 0,
+            tokens_out: 0,
         };
     }
     // A resolvable `agent` slug supersedes `role` (the specialist/fusion path), mirroring the `task`
@@ -1058,6 +1089,8 @@ pub(crate) async fn run_one_task(
             status: "error".into(),
             summary: crate::agent::task_tool::unknown_agent_error(slug),
             iters: 0,
+            tokens_in: 0,
+            tokens_out: 0,
         };
     }
     // Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
@@ -1134,11 +1167,18 @@ pub(crate) async fn run_one_task(
     // The `expects` repair call must hit the same endpoint this child ran on (not the workflow's).
     let base_url_repair = ep.base_url.clone();
     let key_repair = ep.api_key.clone();
+    // Per-child token tally, summed from every call's usage into the outcome and the board row.
+    let tally = std::sync::Arc::new((
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ));
+    let tally_out = tally.clone();
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
         let client = client.clone();
         let base = base.clone();
         let key = key.clone();
         let model = model_s.clone();
+        let tally = tally.clone();
         async move {
             // Same wall-clock deadline as a `task` child (see
             // `task_tool::SUBAGENT_CALL_TIMEOUT`): none of this child's budgets count TIME, so a
@@ -1153,7 +1193,20 @@ pub(crate) async fn run_one_task(
             )
             .await
             {
-                Ok(result) => result,
+                Ok(result) => {
+                    if let Ok(turn) = &result {
+                        if let Some(u) = &turn.usage {
+                            tally
+                                .0
+                                .fetch_add(u.input_total(), std::sync::atomic::Ordering::Relaxed);
+                            tally.1.fetch_add(
+                                u.completion_tokens.unwrap_or(0),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    result
+                }
                 Err(_) => Err(anyhow!(
                     "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
                      raise the limit)",
@@ -1177,7 +1230,7 @@ pub(crate) async fn run_one_task(
     let parent_scope = crate::core::exec_ctx::current()
         .unwrap_or_default()
         .resource_scope();
-    let cfg = AgentConfig {
+    let mut cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
         // Inherit the parent conversation identity but isolate each child's stateful resources and
@@ -1189,7 +1242,8 @@ pub(crate) async fn run_one_task(
                 parent.unwrap_or(0),
                 task.id
             ))
-            .with_trace_visible(false),
+            .with_trace_visible(false)
+            .with_dispatch_label(Some(format!("{label} · {}", task.id))),
         quiet: true,
         // A writer runs alone in its wave (see `schedule`), so its verify gate never contends
         // with siblings for the build lock; a read-only child has nothing to verify.
@@ -1257,6 +1311,8 @@ pub(crate) async fn run_one_task(
         },
     );
     child_track.arm_stop(own_cancel);
+    let child_id = child_track.id();
+    cfg.step_note = Some((child_id, crate::agent::orchestration::note_step));
     if subject.is_empty() {
         wf_trace(&format!("⋯ {} ({label}) running…", task.id));
     } else {
@@ -1279,7 +1335,7 @@ pub(crate) async fn run_one_task(
             &task.prompt,
         )),
     ];
-    let outcome = match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
+    let mut outcome = match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
         Ok(o) => {
             let status = match o.stop {
                 StopReason::Done => "done",
@@ -1355,6 +1411,8 @@ pub(crate) async fn run_one_task(
                 status,
                 summary,
                 iters: o.iters,
+                tokens_in: 0,
+                tokens_out: 0,
             }
         }
         Err(e) => {
@@ -1370,9 +1428,14 @@ pub(crate) async fn run_one_task(
                     crate::agent::task_tool::partial_report_from_messages(&msgs)
                 ),
                 iters: 0,
+                tokens_in: 0,
+                tokens_out: 0,
             }
         }
     };
+    outcome.tokens_in = tally_out.0.load(std::sync::atomic::Ordering::Relaxed);
+    outcome.tokens_out = tally_out.1.load(std::sync::atomic::Ordering::Relaxed);
+    crate::agent::orchestration::add_usage(child_id, outcome.tokens_in, outcome.tokens_out);
     // File the whole report on the sibling blackboard: a later wave can `file_read` all of
     // it, not only the part the `<upstream>` block forwards.
     crate::agent::blackboard::note(&parent_scope, &outcome.id, &outcome.summary);
@@ -1433,6 +1496,8 @@ fn write_trace(path: &Path, name: &str, results: &[TaskOutcome], synth_model: &s
                 "model": r.model,
                 "status": r.status,
                 "iters": r.iters,
+                "tokens_in": r.tokens_in,
+                "tokens_out": r.tokens_out,
                 "summary": r.summary,
             })
         })
@@ -1593,6 +1658,8 @@ mod tests {
             status: status.into(),
             summary: summary.into(),
             iters: 1,
+            tokens_in: 0,
+            tokens_out: 0,
         };
         assert!(verdict_failed(&o("done", "VERDICT: FAIL\n2 tests failed")));
         assert!(verdict_failed(&o(
@@ -1657,6 +1724,8 @@ mod tests {
                     status: "done".into(),
                     summary,
                     iters: 1,
+                    tokens_in: 0,
+                    tokens_out: 0,
                 }
             }
         };
@@ -1736,6 +1805,8 @@ mod tests {
                     status: "done".into(),
                     summary,
                     iters: 1,
+                    tokens_in: 0,
+                    tokens_out: 0,
                 }
             }
         };
@@ -1943,6 +2014,8 @@ mod tests {
                 status: "done".into(),
                 summary: "found a null deref".into(),
                 iters: 3,
+                tokens_in: 0,
+                tokens_out: 0,
             },
             TaskOutcome {
                 id: "perf".into(),
@@ -1951,6 +2024,8 @@ mod tests {
                 status: "done".into(),
                 summary: "n+1 query".into(),
                 iters: 2,
+                tokens_in: 0,
+                tokens_out: 0,
             },
         ];
         let p = build_synthesis_prompt("review", "merge", &results);
@@ -1971,6 +2046,8 @@ mod tests {
             status: "done".into(),
             summary: long,
             iters: 1,
+            tokens_in: 0,
+            tokens_out: 0,
         }];
         let p = build_synthesis_prompt("w", "merge", &results);
         assert!(p.contains("[truncated:"), "must mark truncation: {p}");
@@ -2182,6 +2259,8 @@ mod tests {
             status: "done".into(),
             summary: summary.into(),
             iters: 1,
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 

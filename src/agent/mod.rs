@@ -519,6 +519,10 @@ impl NudgeRole {
     }
 }
 
+/// A delegated child's live step reporter: the orchestration row id and the callback the loop
+/// invokes with `(row, step, tool names)` before each tool batch (see `AgentConfig::step_note`).
+pub type StepNote = (u64, fn(u64, usize, &str));
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Where mid-run nudges go (see [`NudgeRole`]). Default `System`; the REPL sets it per endpoint.
@@ -735,6 +739,10 @@ pub struct AgentConfig {
     /// through every sub-agent spawn, so a boxed `dyn Fn` would cost both derives. `None` ⇒ no
     /// observer (sub-agents and workflow children: their transcripts aren't the user's session).
     pub on_progress: Option<fn(&[Message])>,
+    /// Live step reporter for a delegated child: `(orchestration row id, callback)`. The loop
+    /// calls it with the step number and the tool names of each batch, so `/workflows` shows
+    /// `step 7 · file_edit` instead of only "running". `None` for a top-level turn.
+    pub step_note: Option<StepNote>,
     /// WALL-CLOCK ceiling for this whole run, checked at each loop boundary. `None` ⇒ steps only.
     ///
     /// Every other budget here counts STEPS, and steps are not time: `max_iters` + `auto_extend_to` +
@@ -844,6 +852,7 @@ impl Default for AgentConfig {
             goal: None,
             enable_steering: false,
             on_progress: None,
+            step_note: None,
             deadline: None,
         }
     }
@@ -2476,6 +2485,10 @@ where
             eager.push((k, tokio::task::spawn(async move { canned })));
         }
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::ExecutingTools);
+        if let Some((row, note)) = cfg.step_note {
+            let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+            note(row, iter, &names.join("+"));
+        }
         let results = execute_calls(
             registry,
             &calls,
@@ -5961,6 +5974,21 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
         }
     }
     let _restore_phase = RestorePhase;
+    // WHO is asking: a delegated child's approval used to read exactly like the parent's own
+    // (`Run rm -rf build — approve?`), so the user could not tell a sub-agent's request apart.
+    let plain_who = cfg
+        .exec_ctx
+        .dispatch_label()
+        .map(|l| format!("{l} wants: "))
+        .unwrap_or_default();
+    let who = if plain_who.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} ",
+            style(plain_who.trim_end()).color256(crate::ui::theme::WARN)
+        )
+    };
     // Under the sticky TUI the background input thread owns stdin, so we can't run a blocking y/N
     // read inline. Instead, route a per-action prompt THROUGH that thread: `ask_approval` blocks
     // until it presses [y]es / [n]o / [a]llow-all-session. (Destructive tools force the serial path,
@@ -5975,7 +6003,7 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
             "— approve? [y]es · [n]o · [a]llow all this session"
         };
         let prompt = format!(
-            "{}  {}",
+            "{who}{}  {}",
             tool_call_line(tool, args),
             style(hint).color256(crate::ui::theme::WARN)
         );
@@ -5985,7 +6013,7 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
         if crate::hostbot::platforms::telegram::daemon_is_active()
             && crate::hostbot::platforms::telegram::is_configured()
         {
-            let prompt = format!("{tool} {}", compact_args(args));
+            let prompt = format!("{plain_who}{tool} {}", compact_args(args));
             // Bridge to the async approval on the current (multi-thread) runtime; the serve poll
             // loop runs on another worker and delivers the callback. The route comes from THIS
             // turn's context — under concurrent lanes the process-global one belongs to whoever
@@ -6002,7 +6030,7 @@ fn approve(tool: &str, args: &serde_json::Value, cfg: &AgentConfig) -> bool {
         return false;
     }
     print!(
-        "{}  {} ",
+        "{who}{}  {} ",
         tool_call_line(tool, args),
         style("— run it? [y/N]:").dim()
     );
@@ -6995,6 +7023,7 @@ mod tests {
             // script must not pick up a steer a steering test left behind.
             enable_steering: false,
             on_progress: None, // no live-history publishing in unit tests
+            step_note: None,
             // No wall-clock ceiling in unit tests: a scripted run is instant, so a deadline could only
             // fire spuriously on a loaded CI box and turn an assertion about MaxIters/Divergence into a
             // flake. The deadline tests set it explicitly.

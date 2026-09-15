@@ -755,11 +755,19 @@ impl Tool for TaskTool {
         // The repair call must hit the same endpoint the sub-agent ran on (not the parent's).
         let base_for_repair = base_url.clone();
         let key_for_repair = api_key.clone();
+        // Per-child token tally, summed from every call's usage into the report header and the
+        // `/workflows` row.
+        let tally = std::sync::Arc::new((
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let tally_out = tally.clone();
         let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
             let client = client.clone();
             let base = base.clone();
             let key = key.clone();
             let model = model.clone();
+            let tally = tally.clone();
             async move {
                 // DEADLINE, not just a step budget: see `SUBAGENT_CALL_TIMEOUT`. The timeout must
                 // wrap the call INSIDE this future — the whole loop runs under `block_in_place`
@@ -773,7 +781,21 @@ impl Tool for TaskTool {
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if let Ok(turn) = &result {
+                            if let Some(u) = &turn.usage {
+                                tally.0.fetch_add(
+                                    u.input_total(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                tally.1.fetch_add(
+                                    u.completion_tokens.unwrap_or(0),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                        result
+                    }
                     Err(_) => Err(anyhow::anyhow!(
                         "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
                          raise the limit)",
@@ -810,8 +832,9 @@ impl Tool for TaskTool {
         );
         let child_ctx = parent_ctx
             .with_resource_scope(child_scope.clone())
-            .with_trace_visible(false);
-        let cfg = AgentConfig {
+            .with_trace_visible(false)
+            .with_dispatch_label(Some(header_label.clone()));
+        let mut cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
             cancel: own_cancel.clone(),
             exec_ctx: child_ctx,
@@ -886,6 +909,7 @@ impl Tool for TaskTool {
         // Publish the stop handle only now that the row exists, so the panel never shows a row whose
         // advertised handle isn't wired up yet.
         track.arm_stop(own_cancel);
+        cfg.step_note = Some((track.id(), crate::agent::orchestration::note_step));
 
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
         // MUST run on a Tokio MULTI-THREAD worker thread — `block_in_place` panics on a
@@ -901,36 +925,75 @@ impl Tool for TaskTool {
         // resume — once `execute` returns, the transcript is gone, and a parent that wants more must
         // dispatch fresh. That is why both exits below hand the parent a partial report built from
         // `msgs` while it still exists: it is the only continuation surface there is.
-        let outcome = tokio::task::block_in_place(|| {
-            let _effort = crate::core::cli_config::suppress_effort_override();
-            tokio::runtime::Handle::current().block_on(async {
-                let mut msgs = vec![
-                    Message::system(system.as_str()),
-                    Message::user(crate::agent::context_pack::prepend(pack.as_deref(), prompt)),
-                ];
-                let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs).await
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        let completed_tool_turns = msgs
-                            .iter()
-                            .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-                            .count();
-                        // The transcript dies with this return — salvage the same partial report
-                        // the Ok path gets. Without it, a child that completed 20 tool turns and
-                        // then hit a terminal API error handed the parent one line and no list of
-                        // what it had already touched.
-                        let partial = partial_report_from_messages(&msgs);
-                        return Err(e.context(format!(
+        // One run of the child over a fresh transcript. Called twice at most: a write-capable
+        // child that runs out of time or fails verification gets ONE retry with a tightened
+        // brief (its own partial report attached), and if that also fails the tree goes back
+        // to the checkpoint taken before the dispatch, so half-done edits do not stay.
+        let run_once = |user_text: String| -> Result<(crate::agent::AgentOutcome, Vec<Message>)> {
+            tokio::task::block_in_place(|| {
+                let _effort = crate::core::cli_config::suppress_effort_override();
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut msgs = vec![Message::system(system.as_str()), Message::user(user_text)];
+                    let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs)
+                        .await
+                    {
+                        Ok(o) => o,
+                        Err(e) => {
+                            let completed_tool_turns = msgs
+                                .iter()
+                                .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+                                .count();
+                            // The transcript dies with this return — salvage the same partial report
+                            // the Ok path gets. Without it, a child that completed 20 tool turns and
+                            // then hit a terminal API error handed the parent one line and no list of
+                            // what it had already touched.
+                            let partial = partial_report_from_messages(&msgs);
+                            return Err(e.context(format!(
                             "after {completed_tool_turns} completed tool turn(s) — the workspace \
                              may already contain partial edits from this sub-agent; inspect before \
                              retrying.\nPartial progress before the failure:\n{partial}"
                         )));
-                    }
-                };
-                Ok::<_, anyhow::Error>((o, msgs))
+                        }
+                    };
+                    Ok::<_, anyhow::Error>((o, msgs))
+                })
             })
-        });
+        };
+        let pre_dispatch = if sub_verify_gate {
+            crate::features::timemachine::save(&format!("before {label}"), true)
+                .ok()
+                .map(|s| s.id)
+        } else {
+            None
+        };
+        let first_text = crate::agent::context_pack::prepend(pack.as_deref(), prompt);
+        let mut retried = false;
+        let mut restored: Option<std::result::Result<u32, String>> = None;
+        let outcome = match run_once(first_text.clone()) {
+            Ok((o, msgs)) if sub_verify_gate && needs_retry(&o.stop) => {
+                retried = true;
+                track.set_phase(
+                    crate::agent::orchestration::Phase::Running,
+                    format!("retry: {}", stop_phrase(&o.stop)),
+                );
+                let tightened =
+                    tightened_brief(&first_text, &o.stop, &partial_report_from_messages(&msgs));
+                match run_once(tightened) {
+                    Ok((o2, msgs2)) if needs_retry(&o2.stop) => {
+                        if let Some(id) = pre_dispatch {
+                            restored = Some(
+                                crate::features::timemachine::restore(id)
+                                    .map(|s| s.id)
+                                    .map_err(|e| format!("{e:#}")),
+                            );
+                        }
+                        Ok((o2, msgs2))
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        };
         let (outcome, msgs) = match outcome {
             Ok(o) => o,
             Err(e) => {
@@ -996,13 +1059,40 @@ impl Tool for TaskTool {
         };
         let body_warning = stop_body_warning(&stop_kind);
         let ok = matches!(stop_kind, crate::agent::StopReason::Done);
-        let detail = format!("{} step(s), {stop}{json_tag}", outcome.iters);
+        let tokens_in = tally_out.0.load(std::sync::atomic::Ordering::Relaxed);
+        let tokens_out = tally_out.1.load(std::sync::atomic::Ordering::Relaxed);
+        crate::agent::orchestration::add_usage(track.id(), tokens_in, tokens_out);
+        let retry_tag = if retried { " · retried" } else { "" };
+        let tok_tag = if tokens_in > 0 || tokens_out > 0 {
+            format!(
+                ", {}→{} tok",
+                crate::agent::orchestration::fmt_tokens(tokens_in),
+                crate::agent::orchestration::fmt_tokens(tokens_out)
+            )
+        } else {
+            String::new()
+        };
+        let detail = format!(
+            "{} step(s), {stop}{json_tag}{retry_tag}{tok_tag}",
+            outcome.iters
+        );
         if ok {
             track.finish_ok(detail);
         } else {
             track.finish_err(detail);
         }
-        let warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
+        let mut warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
+        match &restored {
+            Some(Ok(id)) => warning.push_str(&format!(
+                "[AUTO-RESTORED checkpoint #{id}: the retry also failed, so the tree is back to \
+                 before this dispatch; nothing below is applied.]\n"
+            )),
+            Some(Err(e)) => warning.push_str(&format!(
+                "[auto-restore of the pre-dispatch checkpoint FAILED ({e}); the tree may hold \
+                 partial edits from two attempts — inspect before building on it.]\n"
+            )),
+            None => {}
+        }
         // File the whole report on the sibling blackboard: the parent sees this result cut to
         // its budget, a later child can `file_read` all of it.
         crate::agent::blackboard::note(
@@ -1011,10 +1101,52 @@ impl Tool for TaskTool {
             &body,
         );
         Ok(format!(
-            "[task: {header_label}, {} step(s), {stop}{json_tag}]\n{warning}{body}",
+            "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}]\n{warning}{body}",
             outcome.iters
         ))
     }
+}
+
+/// Does a writer's stop reason earn the one retry? Only the two that leave a half-done tree
+/// behind for reasons a tighter brief can fix: it ran out of TIME, or its own check never
+/// passed. A step-budget stop is a scope problem, divergence a reasoning one — neither gets
+/// better by asking again.
+pub(crate) fn needs_retry(stop: &crate::agent::StopReason) -> bool {
+    matches!(
+        stop,
+        crate::agent::StopReason::Deadline | crate::agent::StopReason::VerificationFailed
+    )
+}
+
+fn stop_phrase(stop: &crate::agent::StopReason) -> &'static str {
+    match stop {
+        crate::agent::StopReason::Deadline => "ran out of time",
+        crate::agent::StopReason::VerificationFailed => "failed verification",
+        _ => "stopped",
+    }
+}
+
+/// Most of the partial report a retried child sees: enough to resume, not a second transcript.
+const RETRY_REPORT_CHARS: usize = 4_000;
+
+/// The retry brief: the original request, then what the first attempt reached and the one
+/// instruction that turns a timeout or a failed check into a finishable job — the SMALLEST
+/// change that passes, no restart, no wider scope.
+pub(crate) fn tightened_brief(
+    original: &str,
+    stop: &crate::agent::StopReason,
+    partial: &str,
+) -> String {
+    let mut report: String = partial.trim().chars().take(RETRY_REPORT_CHARS).collect();
+    if report.len() < partial.trim().len() {
+        report.push_str("\n…[clipped]");
+    }
+    format!(
+        "{original}\n\n<retry>\nYour previous attempt {}. Its partial report:\n{report}\nFinish the \
+         SMALLEST change that passes the project's check. Do not start over, do not widen the \
+         scope, and verify before you finish.\n</retry>",
+        stop_phrase(stop)
+    )
 }
 
 /// Deterministic fallback when a child stops without a final answer. Uses only bounded, redacted
@@ -1489,6 +1621,28 @@ mod tests {
             depth,
             0,
         )
+    }
+
+    #[test]
+    fn only_time_and_verification_failures_earn_the_retry() {
+        use crate::agent::StopReason;
+        assert!(needs_retry(&StopReason::Deadline));
+        assert!(needs_retry(&StopReason::VerificationFailed));
+        assert!(!needs_retry(&StopReason::Done));
+        assert!(!needs_retry(&StopReason::MaxIters));
+        assert!(!needs_retry(&StopReason::Divergence));
+        assert!(!needs_retry(&StopReason::Cancelled));
+        let brief = tightened_brief("fix the parser", &StopReason::Deadline, &"p".repeat(5_000));
+        assert!(
+            brief.starts_with("fix the parser\n\n<retry>\nYour previous attempt ran out of time")
+        );
+        assert!(
+            brief.contains("…[clipped]") && brief.contains("SMALLEST change"),
+            "{brief}"
+        );
+        assert!(brief.ends_with("</retry>"));
+        let v = tightened_brief("x", &StopReason::VerificationFailed, "partial");
+        assert!(v.contains("failed verification") && v.contains("partial"));
     }
 
     #[test]
