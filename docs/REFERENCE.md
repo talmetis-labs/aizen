@@ -699,7 +699,11 @@ Behavior worth knowing:
   text; a search past 40 rows shows those rows and counts the rest per file, the whole list on
   disk. `detailed` returns everything up to the loop's budget (16 KB for logs), and the 16 KB
   spill still applies above that.
-- **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
+- **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running, and the
+  prompt shows what the call WILL do first: an edit's patch in the diff box (computed without
+  writing), a write's create-or-overwrite line with its patch, a shell command's directory and
+  full command line, a move's both ends — the same payload reaches a Telegram approval. Edit
+  headers carry the repo-relative path. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
   choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval ask|smart|yolo`
   is the three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo`

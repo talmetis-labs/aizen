@@ -219,6 +219,15 @@ is observable only with an endpoint, which this machine does not have.
 
 ## 5. Phase 3 — the operator surface (3 weeks)
 
+**Status 2026-09-15:** E3.1 implemented on `feat/e0.1-usage-ledger` (`Tool::preview` →
+`ApprovalPreview`; previews on `file_edit` (its own dry-run), `file_write`, `shell_run`,
+`file_move`; `approve` renders the patch through the existing diff box and the rows as faint
+lines above the question, on the TUI, on a plain terminal and in the Telegram message;
+`rel_path_display` in headers and diff-box titles). Deviation (p): the preview is not a new
+overlay panel — it is emitted into the transcript directly above the existing 4-row menu, which
+keeps the menu code untouched and the payload scrollable; and no preview is drawn under a session
+allow-all, where no question is asked.
+
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
 | E3.1 | Pre-flight approval payload: `Tool::preview` with the patch computed before any write, full argv + cwd for shell, repo-relative path in the header | QP P3.1 (U1, U2, U12) | M | E1.9 (`dry_run`) | approving a `file_edit` shows the patch first |

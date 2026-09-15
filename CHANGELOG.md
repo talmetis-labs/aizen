@@ -240,6 +240,18 @@ handing the model false inputs, and starts measuring what it sends.
   synthesis request like the in-conversation tool does (two chars per token of the model's
   window) instead of building an unbounded one from every task's report.
 
+### Phase 3 (in progress) — the operator surface
+
+#### Added
+- **You approve what a call will do, not a basename.** Before a destructive call asks for
+  approval, the tool computes its pre-flight payload without doing anything: `file_edit` shows
+  the patch (its own dry-run) in the diff box, `file_write` says create or overwrite and shows
+  the patch against the current content, `shell_run` shows the directory it will run in and the
+  full command line (`python deploy.py --prod --force-delete` used to ask as `deploy.py`), and
+  `file_move` names both ends. The same payload rides the Telegram approval message. Headers
+  and diff-box titles for edits now carry the repo-relative path, so two `mod.rs` edits in one
+  turn are told apart. Nothing is drawn under a session allow-all.
+
 ## [0.6.7] — 2026-09-11
 
 Subscriptions arrive. An Aizen plan is now sold by **signing in**, not by pasting a key: sign in
