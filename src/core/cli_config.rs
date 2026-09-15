@@ -247,6 +247,14 @@ pub struct CliConfig {
     /// Maximum aggregate Git blob bytes in one snapshot. `None` ⇒ 2 GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timemachine_max_bytes: Option<u64>,
+    /// Saved conversations kept in the pool, newest first; the oldest beyond this are removed at
+    /// autosave — never the one being written. `None` ⇒ 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_keep: Option<usize>,
+    /// Bytes the session pool may hold in total (transcripts, their deltas and image blobs);
+    /// the oldest conversations go first when it is over. `None` ⇒ 256 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_max_bytes: Option<u64>,
     /// Maximum size of one file/blob in a snapshot. `None` ⇒ 512 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timemachine_max_file_bytes: Option<u64>,

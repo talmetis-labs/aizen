@@ -233,6 +233,298 @@ struct SessionFileRef<'a> {
     messages: &'a [Message],
 }
 
+/// An image data URL at or above this size is stored once under `sessions/blobs/<sha256>` and
+/// referenced from the transcript as `blob:<sha256>`; smaller ones stay inline (E5.3, quality plan
+/// S3: base64 screenshots were rewritten into the transcript on every turn).
+const BLOB_INLINE_MAX: usize = 4 * 1024;
+/// The per-turn autosave appends to `<slug>.jsonl` until the delta holds this many lines or bytes;
+/// then the envelope is rewritten in full and the delta starts over.
+const DELTA_MAX_LINES: usize = 20;
+const DELTA_MAX_BYTES: u64 = 1024 * 1024;
+const SESSIONS_KEEP_DEFAULT: usize = 200;
+const SESSIONS_MAX_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+
+fn blobs_dir() -> std::path::PathBuf {
+    sessions_dir().join("blobs")
+}
+
+/// The per-turn delta beside an envelope: `<slug>.jsonl`, one `Message` per line.
+fn delta_path(envelope: &std::path::Path) -> std::path::PathBuf {
+    envelope.with_extension("jsonl")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Replace every large image data URL with a `blob:<sha256>` reference, writing the bytes once
+/// (content-addressed, so the same screenshot pasted twice is stored once). Returns the history
+/// untouched when nothing qualifies, so the common text-only save clones nothing.
+fn externalize_images(history: &[Message]) -> Result<std::borrow::Cow<'_, [Message]>> {
+    let needs = history.iter().any(|m| {
+        m.images
+            .iter()
+            .any(|u| u.len() >= BLOB_INLINE_MAX && !u.starts_with("blob:"))
+    });
+    if !needs {
+        return Ok(std::borrow::Cow::Borrowed(history));
+    }
+    let dir = blobs_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    config::harden_dir(&dir);
+    let mut out = history.to_vec();
+    for m in &mut out {
+        for url in &mut m.images {
+            if url.len() < BLOB_INLINE_MAX || url.starts_with("blob:") {
+                continue;
+            }
+            let id = sha256_hex(url.as_bytes());
+            let path = dir.join(&id);
+            if !path.is_file() {
+                crate::core::persist::atomic_write(&path, url.as_bytes())
+                    .with_context(|| format!("writing image blob {}", path.display()))?;
+                crate::core::persist::harden_owner_only_checked(&path)?;
+            }
+            *url = format!("blob:{id}");
+        }
+    }
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// Turn `blob:<sha256>` references back into the data URLs they stand for. A blob that is gone
+/// (pruned, or the pool was copied without `blobs/`) drops that image rather than failing the
+/// whole conversation: the words are still there.
+fn resolve_blobs(msgs: &mut [Message]) {
+    let dir = blobs_dir();
+    for m in msgs {
+        if m.images.iter().all(|u| !u.starts_with("blob:")) {
+            continue;
+        }
+        let mut kept = Vec::with_capacity(m.images.len());
+        for url in m.images.drain(..) {
+            match url.strip_prefix("blob:") {
+                Some(id) => {
+                    if let Ok(bytes) = std::fs::read(dir.join(id)) {
+                        if let Ok(s) = String::from_utf8(bytes) {
+                            kept.push(s);
+                        }
+                    }
+                }
+                None => kept.push(url),
+            }
+        }
+        m.images = kept;
+    }
+}
+
+/// Read a saved conversation from its envelope path: the envelope, then the `.jsonl` delta the
+/// autosave appended since the last full write, then image blobs resolved. `Err` names why an
+/// unreadable envelope failed; a torn trailing delta line (a write cut mid-way) is simply where
+/// the delta ends.
+pub(crate) fn read_session_path_reason(
+    path: &std::path::Path,
+) -> Result<(Vec<Message>, Option<SessionMeta>), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let (mut msgs, meta) = parse_session_reason(&bytes)?;
+    if let Ok(text) = std::fs::read_to_string(delta_path(path)) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Message>(line) {
+                Ok(m) => msgs.push(m),
+                Err(_) => break,
+            }
+        }
+    }
+    resolve_blobs(&mut msgs);
+    Ok((msgs, meta))
+}
+
+/// [`read_session_path_reason`] for the callers that only branch on success.
+pub(crate) fn read_session_path(
+    path: &std::path::Path,
+) -> Option<(Vec<Message>, Option<SessionMeta>)> {
+    read_session_path_reason(path).ok()
+}
+
+/// What the last full write or delta append left on disk for one slug, so the next autosave can
+/// tell whether `history` merely grew (append) or was rewritten (compaction, `/undo` of a turn —
+/// full write).
+struct DeltaState {
+    slug: String,
+    saved_len: usize,
+    last_fp: u64,
+}
+
+static DELTA_STATE: Mutex<Option<DeltaState>> = Mutex::new(None);
+
+fn message_fingerprint(m: &Message) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(m).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+fn note_saved(slug: &str, history: &[Message]) {
+    let state = history.last().map(|last| DeltaState {
+        slug: slug.to_string(),
+        saved_len: history.len(),
+        last_fp: message_fingerprint(last),
+    });
+    if let Ok(mut g) = DELTA_STATE.lock() {
+        *g = state;
+    }
+}
+
+/// The per-turn autosave (E5.3): append what the conversation gained since the last write to
+/// `<slug>.jsonl`, and rewrite the envelope in full only when the history was rewritten under us,
+/// when the delta has grown past `DELTA_MAX_LINES` / `DELTA_MAX_BYTES`, or when there is no
+/// envelope yet. Before this every turn re-serialized the whole transcript — pretty JSON, every
+/// tool result, every pasted image — so a long session paid O(n²) I/O on an AV-scanned directory.
+pub(crate) fn autosave_session_delta(
+    history: &[Message],
+    name: &str,
+    model: Option<&str>,
+) -> Result<String> {
+    let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
+    let delta = delta_path(&path);
+    let appendable = DELTA_STATE.lock().ok().and_then(|g| {
+        g.as_ref().and_then(|s| {
+            let same = s.slug == name && path.is_file() && s.saved_len > 0;
+            let grew = history.len() >= s.saved_len;
+            let intact = history
+                .get(s.saved_len.wrapping_sub(1))
+                .is_some_and(|m| message_fingerprint(m) == s.last_fp);
+            (same && grew && intact).then_some(s.saved_len)
+        })
+    });
+    if let Some(saved_len) = appendable {
+        let (lines, bytes) = std::fs::read_to_string(&delta)
+            .map(|t| (t.lines().count(), t.len() as u64))
+            .unwrap_or((0, 0));
+        if lines < DELTA_MAX_LINES && bytes < DELTA_MAX_BYTES {
+            if history.len() > saved_len {
+                let fresh = externalize_images(&history[saved_len..])?;
+                let mut buf = Vec::new();
+                for m in fresh.iter() {
+                    serde_json::to_writer(&mut buf, m)?;
+                    buf.push(b'\n');
+                }
+                {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&delta)
+                        .with_context(|| format!("opening {}", delta.display()))?;
+                    f.write_all(&buf)
+                        .with_context(|| format!("appending to {}", delta.display()))?;
+                    f.flush()?;
+                }
+                crate::core::persist::harden_owner_only_checked(&delta)?;
+                note_saved(name, history);
+            }
+            return Ok(path.display().to_string());
+        }
+    }
+    save_session(history, name, model)
+}
+
+/// Remove the oldest conversations beyond `sessions_keep` / `sessions_max_bytes`, never the one
+/// being written. Returns how many were removed. Runs after every autosave; a pool under both
+/// caps costs one directory stat.
+pub(crate) fn prune_session_pool(live: Option<&str>) -> usize {
+    let cfg = cli_config::load();
+    prune_session_pool_with(
+        cfg.sessions_keep.unwrap_or(SESSIONS_KEEP_DEFAULT),
+        cfg.sessions_max_bytes.unwrap_or(SESSIONS_MAX_BYTES_DEFAULT),
+        live,
+    )
+}
+
+fn prune_session_pool_with(keep: usize, max_bytes: u64, live: Option<&str>) -> usize {
+    let stats = stat_sessions(); // newest first
+    let live = live.map(sanitize_name);
+    let size_of = |p: &std::path::Path| {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            + std::fs::metadata(delta_path(p))
+                .map(|m| m.len())
+                .unwrap_or(0)
+    };
+    let blob_bytes: u64 = std::fs::read_dir(blobs_dir())
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    let mut total: u64 = blob_bytes + stats.iter().map(|s| size_of(&s.path)).sum::<u64>();
+    let mut count = stats.len();
+    let mut removed = 0usize;
+    for s in stats.iter().rev() {
+        if count <= keep && total <= max_bytes {
+            break;
+        }
+        if live.as_deref() == Some(s.name.as_str()) {
+            continue;
+        }
+        let bytes = size_of(&s.path);
+        let _ = std::fs::remove_file(&s.path);
+        let _ = std::fs::remove_file(delta_path(&s.path));
+        count -= 1;
+        total = total.saturating_sub(bytes);
+        removed += 1;
+    }
+    if removed > 0 {
+        gc_blobs();
+    }
+    removed
+}
+
+/// Remove image blobs no remaining transcript or delta references. A reference is the literal
+/// `blob:<64 hex>` inside the file, so this is a byte scan, never a parse.
+fn gc_blobs() {
+    let dir = blobs_dir();
+    let Ok(blobs) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let ext = p.extension().and_then(|x| x.to_str());
+            if !matches!(ext, Some("json") | Some("jsonl")) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let mut rest = text.as_str();
+            while let Some(i) = rest.find("blob:") {
+                let cand = &rest[i + 5..];
+                let id: String = cand.chars().take(64).collect();
+                if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    referenced.insert(id);
+                }
+                rest = &rest[i + 5..];
+            }
+        }
+    }
+    for b in blobs.flatten() {
+        let name = b.file_name().to_string_lossy().into_owned();
+        if !referenced.contains(&name) {
+            let _ = std::fs::remove_file(b.path());
+        }
+    }
+}
+
 /// Parse either session format, reporting WHY a file failed. `Err` = unreadable/corrupt (callers
 /// surface that explicitly — a corrupt file must never masquerade as an empty conversation).
 ///
@@ -329,10 +621,7 @@ pub(crate) fn retag_sessions_of_slug(legacy_slug: &str, on_error: &mut dyn FnMut
     let slug = config::project_slug();
     let mut n = 0usize;
     for s in stat_sessions() {
-        let Some((msgs, Some(mut meta))) = std::fs::read(&s.path)
-            .ok()
-            .and_then(|b| parse_session_bytes(&b))
-        else {
+        let Some((msgs, Some(mut meta))) = read_session_path(&s.path) else {
             continue;
         };
         if meta.project_slug.as_deref() != Some(legacy_slug) {
@@ -401,10 +690,11 @@ pub(crate) fn write_session(
         meter.cursor(),
         meter.rows_since(seen_epoch, seen_seq),
     );
+    let stored = externalize_images(history)?;
     let file = SessionFileRef {
         version: 2,
         meta: &meta,
-        messages: history,
+        messages: &stored,
     };
     let mut bytes = serde_json::to_vec_pretty(&file)?;
     bytes.push(b'\n');
@@ -412,12 +702,17 @@ pub(crate) fn write_session(
         .with_context(|| format!("writing {}", path.display()))?;
     // The transcript can contain pasted secrets / .env contents → owner-only.
     crate::core::persist::harden_owner_only_checked(&path)?;
+    // A full write supersedes any delta beside it, and is where the next delta starts from.
+    let _ = std::fs::remove_file(delta_path(&path));
+    note_saved(name, history);
     Ok(path.display().to_string())
 }
 pub(crate) fn load_session(history: &mut Vec<Message>, name: &str, model: &str) -> Result<usize> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
-    let bytes = std::fs::read(&path).with_context(|| format!("no saved session '{name}'"))?;
-    let (loaded, meta) = parse_session_reason(&bytes)
+    if !path.is_file() {
+        anyhow::bail!("no saved session '{name}'");
+    }
+    let (loaded, meta) = read_session_path_reason(&path)
         .map_err(|why| anyhow::anyhow!("session '{name}' is unreadable: {why}"))?;
     *history = loaded;
     // Rebuild BOTH prompt lanes for the CURRENT project + model. The stable lane saved in the file
@@ -577,12 +872,26 @@ pub(crate) fn stat_sessions() -> Vec<SessionStat> {
             if name == "last" {
                 continue;
             }
-            let mtime_ms = e
+            let to_ms = |t: std::time::SystemTime| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
+            };
+            let envelope_ms = e
                 .metadata()
                 .ok()
                 .and_then(|md| md.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64);
+                .and_then(to_ms);
+            // A conversation that only appended deltas since its last full write is as fresh as
+            // its delta, not its envelope.
+            let delta_ms = std::fs::metadata(delta_path(&path))
+                .ok()
+                .and_then(|md| md.modified().ok())
+                .and_then(to_ms);
+            let mtime_ms = match (envelope_ms, delta_ms) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
             out.push(SessionStat {
                 name,
                 path,
@@ -605,10 +914,7 @@ pub(crate) fn stat_sessions() -> Vec<SessionStat> {
 
 /// Read one row's transcript-derived fields. `(None, None)` = unreadable/corrupt.
 pub(crate) fn read_session_row(path: &std::path::Path) -> (Option<usize>, Option<SessionMeta>) {
-    match std::fs::read(path)
-        .ok()
-        .and_then(|b| parse_session_bytes(&b))
-    {
+    match read_session_path(path) {
         Some((m, meta)) => (Some(conversation_len(&m)), meta),
         None => (None, None),
     }
@@ -745,8 +1051,7 @@ pub(crate) fn most_recent_session() -> Option<(String, usize, Option<String>)> {
     // pointer-era transcript from the hint AND (since `last` is never a row) from the picker too.
     // Pre-provenance pool where only the shared `last.json` copy ever existed: re-home that
     // transcript into a real named file once, so it shows up in /sessions from now on.
-    let bytes = std::fs::read(sessions_dir().join("last.json")).ok()?;
-    let (msgs, carried) = parse_session_bytes(&bytes)?;
+    let (msgs, carried) = read_session_path(&sessions_dir().join("last.json"))?;
     if !msgs.iter().any(|m| m.role == "user") {
         return None;
     }
@@ -844,9 +1149,7 @@ fn read_session_brief(path: &std::path::Path) -> Option<SessionBrief> {
 /// Parse one pool file just far enough for a `<sessions>` row: turn count, provenance, and the
 /// first user message as the topic snippet.
 fn parse_session_brief(path: &std::path::Path) -> Option<SessionBrief> {
-    let (msgs, meta) = std::fs::read(path)
-        .ok()
-        .and_then(|b| parse_session_bytes(&b))?;
+    let (msgs, meta) = read_session_path(path)?;
     let snippet = msgs
         .iter()
         .find(|m| m.role == "user" && m.content.as_deref().is_some_and(|c| !c.trim().is_empty()))
@@ -983,9 +1286,12 @@ pub(crate) fn session_digest(name: Option<&str>) -> anyhow::Result<String> {
         }
     };
     let path = sessions_dir().join(format!("{resolved}.json"));
-    let bytes = std::fs::read(&path)
-        .map_err(|_| anyhow::anyhow!("no saved conversation named \"{resolved}\""))?;
-    let (msgs, meta) = parse_session_bytes(&bytes)
+    if !path.is_file() {
+        return Err(anyhow::anyhow!(
+            "no saved conversation named \"{resolved}\""
+        ));
+    }
+    let (msgs, meta) = read_session_path(&path)
         .ok_or_else(|| anyhow::anyhow!("\"{resolved}\" is unreadable (corrupt session file)"))?;
 
     let mut out = format!(
@@ -1065,6 +1371,7 @@ pub(crate) async fn autosave_session(
 pub(crate) fn delete_session(name: &str) -> Result<()> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
     std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    let _ = std::fs::remove_file(delta_path(&path));
     Ok(())
 }
 /// Pick a distinct on-disk slug for a brand-new (unnamed) conversation: the topic suggestion, plus a
@@ -1232,7 +1539,7 @@ pub(crate) fn autosave_last(history: &[Message], model: Option<&str>) {
         // ACL damage, OneDrive/AV lock on ~/.aizen — swallowing it meant the user worked for hours
         // believing the transcript was on disk and found nothing to resume. Say it once per failure
         // streak (not every turn), and say it again after a recovery so the state is never stale.
-        match save_session(history, &name, model) {
+        match autosave_session_delta(history, &name, model) {
             Ok(_) => {
                 if AUTOSAVE_BROKEN.swap(false, std::sync::atomic::Ordering::Relaxed)
                     && !EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed)
@@ -1257,6 +1564,16 @@ pub(crate) fn autosave_last(history: &[Message], model: Option<&str>) {
                     }
                 }
             }
+        }
+        let pruned = prune_session_pool(Some(&name));
+        if pruned > 0 && !EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed) {
+            tui::emit_line(
+                &style(format!(
+                    "· pruned {pruned} old conversation(s) from the pool (sessions_keep / sessions_max_bytes)"
+                ))
+                .dim()
+                .to_string(),
+            );
         }
         update_live_history(history);
         let _ = crate::core::recovery::checkpoint_history(
@@ -1453,5 +1770,148 @@ mod usage_ledger_tests {
         )
         .unwrap();
         assert_eq!(newer.usage.unwrap().rows[0].input, 5);
+    }
+}
+
+#[cfg(test)]
+mod bounded_sessions_tests {
+    use super::*;
+
+    fn with_pool<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-pool-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let out = f();
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        out
+    }
+
+    fn talk(topic: &str) -> Vec<Message> {
+        vec![
+            Message::system("lane"),
+            Message::user(topic.to_string()),
+            Message::assistant("ok".to_string()),
+        ]
+    }
+
+    #[test]
+    fn autosave_appends_a_delta_and_rewrites_only_when_it_must() {
+        with_pool("delta", || {
+            let mut h = talk("one");
+            autosave_session_delta(&h, "delta-0915", Some("m")).unwrap();
+            let json = sessions_dir().join("delta-0915.json");
+            let jsonl = json.with_extension("jsonl");
+            assert!(
+                json.is_file() && !jsonl.exists(),
+                "the first save is a full envelope"
+            );
+            let envelope_len = std::fs::metadata(&json).unwrap().len();
+
+            h.push(Message::user("two".to_string()));
+            h.push(Message::assistant("b".to_string()));
+            autosave_session_delta(&h, "delta-0915", Some("m")).unwrap();
+            assert_eq!(
+                std::fs::metadata(&json).unwrap().len(),
+                envelope_len,
+                "a turn that only grew the history is appended, not rewritten"
+            );
+            assert_eq!(std::fs::read_to_string(&jsonl).unwrap().lines().count(), 2);
+            let (msgs, _) = read_session_path(&json).unwrap();
+            assert_eq!(msgs.len(), 5);
+            assert_eq!(msgs[4].content.as_deref(), Some("b"));
+            assert_eq!(load_session_len(&json), 5);
+
+            // A history rewritten under us (compaction, a rewound turn) cannot be appended to.
+            h.remove(1);
+            autosave_session_delta(&h, "delta-0915", Some("m")).unwrap();
+            assert!(!jsonl.exists(), "the delta was folded into a full write");
+            assert_eq!(read_session_path(&json).unwrap().0.len(), 4);
+
+            // The delta compacts once it holds DELTA_MAX_LINES lines.
+            for i in 0..(DELTA_MAX_LINES + 2) {
+                h.push(Message::user(format!("m{i}")));
+                autosave_session_delta(&h, "delta-0915", Some("m")).unwrap();
+            }
+            let lines = std::fs::read_to_string(&jsonl)
+                .map(|t| t.lines().count())
+                .unwrap_or(0);
+            assert!(lines < DELTA_MAX_LINES, "compacted: {lines} lines left");
+            assert_eq!(
+                read_session_path(&json).unwrap().0.len(),
+                4 + DELTA_MAX_LINES + 2
+            );
+        });
+    }
+
+    fn load_session_len(json: &std::path::Path) -> usize {
+        read_session_path(json).map(|(m, _)| m.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn large_images_live_in_blobs_and_come_back_on_read() {
+        with_pool("blobs", || {
+            let big = format!(
+                "data:image/png;base64,{}",
+                "A".repeat(BLOB_INLINE_MAX + 100)
+            );
+            let h = vec![
+                Message::system("lane"),
+                Message::user_with_images("look", vec![big.clone()]),
+                Message::assistant("ok"),
+            ];
+            save_session(&h, "img-0915", Some("m")).unwrap();
+            let json = sessions_dir().join("img-0915.json");
+            let raw = std::fs::read_to_string(&json).unwrap();
+            assert!(
+                raw.contains("blob:") && !raw.contains(&big),
+                "the transcript holds a reference, not the bytes"
+            );
+            assert_eq!(std::fs::read_dir(blobs_dir()).unwrap().count(), 1);
+            let (msgs, _) = read_session_path(&json).unwrap();
+            assert_eq!(msgs[1].images, vec![big.clone()], "resolved on read");
+            // The same image again is the same blob (content-addressed) …
+            save_session(&h, "img2-0915", Some("m")).unwrap();
+            assert_eq!(std::fs::read_dir(blobs_dir()).unwrap().count(), 1);
+            // … and a blob that is gone drops the image, never the conversation.
+            for e in std::fs::read_dir(blobs_dir()).unwrap().flatten() {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+            let (msgs, _) = read_session_path(&json).unwrap();
+            assert!(msgs[1].images.is_empty());
+            assert_eq!(msgs[1].content.as_deref(), Some("look"));
+        });
+    }
+
+    #[test]
+    fn the_pool_is_pruned_to_the_caps_but_never_the_live_session() {
+        with_pool("prune", || {
+            for i in 0..5 {
+                save_session(
+                    &talk(&format!("topic {i}")),
+                    &format!("s{i}-0915"),
+                    Some("m"),
+                )
+                .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            // Keep two, but s0 (the oldest) is the live one and must survive.
+            let removed = prune_session_pool_with(2, u64::MAX, Some("s0-0915"));
+            assert_eq!(removed, 3, "s1, s2, s3 go; s0 is live, s4 is newest");
+            let mut names: Vec<String> = stat_sessions().into_iter().map(|s| s.name).collect();
+            names.sort();
+            assert_eq!(names, vec!["s0-0915".to_string(), "s4-0915".to_string()]);
+            // A byte cap the pool cannot meet removes everything but the live conversation.
+            let removed = prune_session_pool_with(100, 1, Some("s0-0915"));
+            assert_eq!(removed, 1);
+            assert_eq!(stat_sessions().len(), 1);
+            // No caps hit → nothing removed, nothing scanned away.
+            assert_eq!(prune_session_pool_with(100, u64::MAX, None), 0);
+        });
     }
 }
