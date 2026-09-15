@@ -665,6 +665,13 @@ Behavior worth knowing:
   ```json fence, a bare `{"name": …, "arguments": {…}}` reply or Mistral's `[TOOL_CALLS] [...]` —
   is executed when the native `tool_calls` array is empty and every name is a registered tool.
   Prose with no such block, or a block naming an unknown tool, is left exactly as written.
+- **Diagnostics ride the next result, and the loop checks after three edits** — the post-edit
+  LSP fold waits 300 ms; a slower analysis finishes in the background and its diagnostics — the
+  edited file's, plus new errors in up to three caller files — are appended to the next tool
+  result, or become a demand before Done when the model is about to finish. After every three
+  successful edits the loop runs the project's fast check itself and appends the verdict to the
+  last edit's result; a pass satisfies the verify gate. `harness_check_after_edits` (default 3,
+  `0` off) sizes the batch.
 - **Edits: `replace_all` on every rung, `dry_run`, and a diff the model does not re-read** —
   `file_edit` matches on a ladder (exact, indentation-tolerant, whitespace-normalized, …) and
   `replace_all` now applies on whichever rung matches. `dry_run: true` shows the diff and writes

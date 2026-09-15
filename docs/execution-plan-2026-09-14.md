@@ -87,8 +87,9 @@ the model · Python fixture cannot fake `Done` · multi-line `rm` is asked · su
 E1.15, E1.16 (commits `0807671`, `24c92a4`, `99c9a5f`, `b34bbb8` on `feat/e0.1-usage-ledger`),
 then E1.2 (`src/agent/observe.rs`) and E1.13 (`src/agent/lenient.rs`) (commits `5b062f0`,
 `f1a9c6a`, `a08ac6e`), E1.3 (`src/agent/result_format.rs`, `db4e8b4`) and E1.9 (edit ladder,
-`compact_edit_diff`, `file_glob` `ignore`, `search_routing!`) on the same branch. Not yet: E1.10
-(async diagnostics), E1.17 (Codex parity, first to cut).
+`compact_edit_diff`, `file_glob` `ignore`, `search_routing!`, `8447991`) and E1.10 (async LSP
+fold with callers, `harness_check_after_edits`) on the same branch. Not yet: E1.17 (Codex parity,
+first to cut).
 Deviations worth knowing: (e) E1.2 keeps the full text of a collapsed result in a scratch spill
 file, not in the read cache — the read cache stores fingerprints and a prefix, never bodies — and
 collapses in batches of eight rather than one per step, because every mid-history rewrite busts
@@ -100,7 +101,11 @@ spilled to the scratch dir rather than dropped. (h) E1.9 keeps `file_glob`'s def
 everything" — the maintainer asked for that explicitly when the confine guard was removed, and
 the test pinning it says so — and adds `ignore: true` for `.gitignore` + heavy-dir pruning; the
 diff compaction happens in the loop after the TUI has drawn the full diff, so the screen and the
-model see different shapes on purpose. (a) E1.5 nudges retire at the START of the next run rather than at the
+model see different shapes on purpose. (i) E1.10 keeps a 300 ms inline wait so a warm TypeScript
+or Go server still folds in the same result; only the slow case goes asynchronous. The caller
+scan reports a file only against a baseline it already has, so a project's pre-existing error
+wall is never dumped on the model. The harness check's gate ("the post-edit `cargo check` call
+disappears from suite traces") stays unmeasured until tapes exist. (a) E1.5 nudges retire at the START of the next run rather than at the
 end of the current one, because the loop bench and several tests read a run's nudges off its
 history; the cache effect is the same (the new user turn rewrites the prefix from that point
 anyway). Delivery role is `system` on Anthropic-style bases and a tagged user-turn message

@@ -103,6 +103,14 @@ handing the model false inputs, and starts measuring what it sends.
   only (`api.anthropic.com`, `api.openai.com`), because some gateways cannot call a tool that was
   not advertised; `lean_tools` in `cli-config.json` turns it on or off explicitly. The effort line
   now names the shape, and `aizen prompt-size` prints the lean size beside the full one.
+- **Diagnostics after an edit no longer hold the edit.** The post-edit LSP fold waits 300 ms
+  instead of up to 3.5 s; a slower analysis keeps running and lands on the next tool result (or,
+  if the model is about to finish, as a demand before Done), naming the file and up to three
+  CALLER files whose new errors the server published after the edit. After every three
+  successful edits the loop runs the project's fast check itself (`cargo check`, `tsc`, …) and
+  appends the verdict to the last edit's result; a pass satisfies the verify gate, so the model
+  neither spends a round-trip on the check nor waits for it again at Done.
+  `harness_check_after_edits` (3, `0` off) is the knob.
 - **Edit tool polish.** `replace_all` now applies on every matching rung, not only the exact
   one — two identically indent-drifted blocks used to make the tolerant rung refuse with "add
   more context" and cost a round-trip each. `dry_run: true` on `file_edit` computes and shows the
