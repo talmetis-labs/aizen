@@ -103,6 +103,22 @@ handing the model false inputs, and starts measuring what it sends.
   only (`api.anthropic.com`, `api.openai.com`), because some gateways cannot call a tool that was
   not advertised; `lean_tools` in `cli-config.json` turns it on or off explicitly. The effort line
   now names the shape, and `aizen prompt-size` prints the lean size beside the full one.
+- **Older tool results collapse to one line; big results spill to disk.** A tool result older
+  than the eight most recent and longer than 800 chars becomes `[collapsed] shell_run cargo test ·
+  412 lines · 28.4 KB · full text at <scratch>/tool-output/0003-shell_run.txt`, once eight of them
+  qualify (one history rewrite per batch, so the prompt cache breaks rarely). Independent of
+  context %, so a 32k local model and a 200k hosted one see the same recent-window shape. A raw
+  result over 16 KB is written to the scratch dir in full *before* the budget cut and the cut
+  result ends with the path — nothing a tool produced is lost, and the model reads the part it
+  needs instead of re-running the command. `file_read` is exempt (its file is already on disk).
+- **Lenient tool-call recovery.** Arguments that are almost JSON — a trailing comma, a raw newline
+  inside a string, Python quotes and `True`/`None`, a brace cut off by `max_tokens` — are repaired
+  and traced instead of failing the call; `{not json` still fails. A call the provider left in the
+  text — `<tool_call>…</tool_call>` (Hermes/Qwen templates), a ```json fence, a bare
+  `{"name": …, "arguments": {…}}` reply (Llama 3) or `[TOOL_CALLS] [...]` (Mistral) — is lifted
+  into a real call when `tool_calls` is empty and every name is a registered tool; prose is left
+  alone. Local models used to have such turns echoed to the user as the final answer, or re-sent
+  unchanged as an empty-200 retry.
 - **Request-shape quirks learned per model.** A 400 that names `max_tokens` (o-series/gpt-5 want
   `max_completion_tokens`), `parallel_tool_calls`, `tool_choice`, `cache_control` or
   `reasoning_effort` drops or renames that field, re-sends, and remembers the model for the

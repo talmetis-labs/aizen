@@ -96,6 +96,13 @@ keeping the last few turns verbatim — the cut is always at a user-message boun
 results). `/compact` forces it now. Both also settable non-interactively:
 `aizen config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
 
+Two cheaper measures run before compaction ever triggers, whatever the threshold: tool results
+older than the eight most recent collapse to a one-line digest (tool, target, size, and the scratch
+file holding the full text) once eight of them qualify, and a raw tool result over 16 KB is written
+to the scratch dir in full before the budget cut, so the cut result can point at it. Both are
+batched and file-backed — the prompt cache breaks rarely and nothing a tool produced is lost; the
+agent reads the named file for the part it needs.
+
 The REPL needs a real terminal; piped/CI stdin prints a hint and exits (`AIZEN_MENU=1` forces it).
 
 **Icons** — the TUI uses a curated glyph set. Pick the style in `/config` or `aizen config set --icons
@@ -648,7 +655,16 @@ Behavior worth knowing:
   yours: `/resume`.
 - **Scratch directory** — `<environment>` names a per-run `scratch:` path (under the OS temp dir)
   where the agent is told to put throwaway helper files instead of your repo or cwd; abandoned
-  scratch dirs are swept automatically a week after their run ends.
+  scratch dirs are swept automatically a week after their run ends. Two things land there
+  without being asked: the full text of any tool result over 16 KB (the cut result names the file),
+  and the full text of every tool result that has aged past the eight most recent and been
+  collapsed to a one-line digest — see the context notes under the REPL section.
+- **Calls written as text are still calls** — arguments that are almost JSON (a trailing comma, a
+  raw newline inside a string, Python quotes, a brace cut off by `max_tokens`) are repaired and the
+  repair is traced; a call a local model wrote into its text — `<tool_call>…</tool_call>`, a
+  ```json fence, a bare `{"name": …, "arguments": {…}}` reply or Mistral's `[TOOL_CALLS] [...]` —
+  is executed when the native `tool_calls` array is empty and every name is a registered tool.
+  Prose with no such block, or a block naming an unknown tool, is left exactly as written.
 - **Approval** — destructive tools (`file_edit`, `shell_run`) prompt before running. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
   choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval ask|smart|yolo`
