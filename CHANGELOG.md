@@ -211,6 +211,16 @@ handing the model false inputs, and starts measuring what it sends.
   questions and research never enter it; a planner that produces nothing usable leaves the
   turn as it would have run. `architect_mode: false` in `cli-config.json` or `AIZEN_ARCHITECT=0`
   turns it off. Works in both REPLs and in `aizen agent`.
+- **The writer lease is scoped, and children leave notes for each other.** The workspace
+  writer lease is now keyed by the run's resource scope: a delegated child (a descendant scope)
+  still reenters its parent's lease, but a sibling scope in the same process — the next `serve`
+  lane on the same worktree, a parallel dispatch — waits for the OS lock and, at the timeout, is
+  told which scope holds it. Reentrancy used to be process-wide, so two `serve` lanes shared the
+  lease that was meant to keep them apart. Every delegated child's full report is also filed on
+  a per-conversation blackboard under the scratch dir (`blackboard/<scope>/<child>.md`,
+  append-only), and every child's `<environment>` names the board and the notes already on it,
+  so a later child can `file_read` a sibling's whole report instead of the parent's cut-down
+  relay. No new tool.
 
 ## [0.6.7] — 2026-09-11
 

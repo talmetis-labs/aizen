@@ -740,7 +740,12 @@ Behavior worth knowing:
   findings passed in the `context` arg (up to ten short lines), and up to fifteen
   `path:start-end` locations the parent already read in this conversation (from its read
   cache), capped at 2,500 chars — so the child goes to those lines instead of searching, and
-  does not re-derive what the parent states as established.
+  does not re-derive what the parent states as established. Every child's full report is also
+  filed on the conversation's blackboard (`<scratch>/blackboard/<scope>/<child>.md`, append-only,
+  named in each child's `<environment>` with the notes already there), so a later child can
+  `file_read` a sibling's whole report. The workspace writer lease is keyed by scope: a child
+  reenters its parent's lease, a sibling scope (another `serve` lane, a parallel dispatch)
+  waits for the OS lock and is told who holds it.
   Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
   change flow is one `daedalus` implementation followed by separate `themis` (verify) and
   `nemesis` (review) dispatches.

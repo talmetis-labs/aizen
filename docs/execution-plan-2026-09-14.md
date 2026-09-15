@@ -182,7 +182,15 @@ own verify gate and post-edit harness check rather than a third child — a sepa
 re-run the same commands — and the editor phase keeps the `max` tier's harness budgets, dropping
 only the wire `reasoning_effort` to `low`, because a multi-file change on `low`'s twelve steps
 would be cut off mid-plan. The "done when" (a suite multi-file task passes with lower wall-clock
-than the single-model run) stays unmeasured until tapes and a second model exist.
+than the single-model run) stays unmeasured until tapes and a second model exist. E2.5
+implemented (`workspace_txn::reentry_allowed` + `acquire_scoped`, `src/agent/blackboard.rs`,
+workflow child scopes derived under the parent's). Deviation (n): the lease is not strictly
+non-reentrant across parent/child — the loop holds its lease from the first edit to the end of
+the run, so a strictly non-reentrant child would time out on every "edit, then delegate daedalus"
+turn. Reentry follows scope ancestry instead: a descendant reenters, a sibling waits, which is
+the exclusion the QP's O6 wanted and which two `serve` lanes on one worktree never had. The
+board is per conversation (not per workflow run) and holds finished reports, not live notes: a
+read-only child cannot write files, so the harness files each child's report for it.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
