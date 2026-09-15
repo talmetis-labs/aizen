@@ -95,7 +95,7 @@ impl Bm25Index {
     /// Lucene/Okapi floored IDF: `ln(1 + (N - df + 0.5)/(df + 0.5))` — always ≥ 0, stable on a
     /// tiny personal corpus (a term appearing in every doc still scores a small positive, so an
     /// overlapping doc is never filtered out as a zero).
-    fn idf(&self, term: &str) -> f64 {
+    pub fn idf(&self, term: &str) -> f64 {
         let df = *self.df.get(term).unwrap_or(&0) as f64;
         (1.0 + (self.n_docs - df + 0.5) / (df + 0.5)).ln()
     }
