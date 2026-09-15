@@ -314,7 +314,10 @@ to `models_by_effort.low`). Deviation (y): auto-compaction stays inline — it r
 history the next prompt is built from — under the same 600 s block, now with a 60 s cap per
 summary call. The "next prompt < 1 s" gate is structural (nothing model-bound remains between
 `finish_turn` and the prompt except a compaction that fires only over the context threshold)
-and is measured on a real endpoint.
+and is measured on a real endpoint. E4.5 implemented (`session_store::read_session_brief`
+rows cached per file by `(mtime, len)`; `store::load_from` keeps a per-directory
+`(fingerprint, entry)` map and parses only new or changed files — `write_atomic` renames are
+what invalidate a row; both keyed by directory so a test home gets its own).
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

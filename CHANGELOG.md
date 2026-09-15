@@ -323,6 +323,10 @@ handing the model false inputs, and starts measuring what it sends.
   the secretary, reflections, reconcile — are capped at 60 s each (`AIZEN_CHORE_CALL_SECS`)
   instead of 300 s, and when no `summarizer` role is configured they go to
   `models_by_effort.low` before falling back to the main model.
+- **The prompt-build path stops re-reading the world.** The `<sessions>` rows are cached per
+  transcript file by its modification time and size, and the memory store is parsed
+  incrementally — a recall, the secretary and reconcile each used to re-read and re-parse
+  every fact file; now only new or changed files are parsed and deleted ones drop out.
 
 ## [0.6.7] — 2026-09-11
 
