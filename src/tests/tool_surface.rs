@@ -468,7 +468,7 @@ fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferre
     )));
 
     let top = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
-    assert!(top.contains("# Deferred integrations"), "note present");
+    assert!(top.contains("# Deferred tools"), "note present");
     assert!(top.contains("gh (2)"), "per-server count rendered");
     assert!(top.contains("`tool_search`"), "the note names the door");
     assert!(
@@ -479,7 +479,7 @@ fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferre
     // No deferred surface ⇒ the note vanishes entirely (zero bytes for the common case).
     builtin::swap_deferred_tools_for_test(None);
     let bare = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
-    assert!(!bare.contains("# Deferred integrations"));
+    assert!(!bare.contains("# Deferred tools"));
 
     builtin::swap_deferred_tools_for_test(prior_deferred);
     builtin::swap_active_tools_for_test(prior);

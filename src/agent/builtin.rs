@@ -194,21 +194,49 @@ pub fn deferred_tools_note() -> Option<String> {
     let guard = DEFERRED_TOOL_SURFACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let (names, by_server) = guard.as_ref()?;
-    let servers = by_server
+    guard.as_ref().map(deferred_tools_note_for)
+}
+
+/// The note text for one deferred surface. Built-in deferred tools are NAMED (there are a dozen
+/// and the model must know `checkpoint` exists to ask for it); MCP tools are counted per server
+/// (there can be hundreds). Byte-stable for a stable surface.
+pub(crate) fn deferred_tools_note_for(surface: &crate::agent::tools::DeferredSurface) -> String {
+    let (names, by_origin) = surface;
+    let builtin: Vec<&str> = names
         .iter()
+        .map(String::as_str)
+        .filter(|n| {
+            DEFERRED_ALWAYS.contains(n) || DEFERRED_FOR_QUESTIONS.contains(n) || *n == "web_crawl"
+        })
+        .collect();
+    let mcp: Vec<String> = by_origin
+        .iter()
+        .filter(|(o, _)| o != "builtin")
         .map(|(s, n)| format!("{s} ({n})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "# Deferred integrations (via tool_search)\n\
-         Beyond the surface above, {} more MCP tool(s) are connected but not pre-loaded: {}. \
-         When the task needs one of these integrations, find it with `tool_search` (query by \
-         capability) — a match returns the full argument schema, and that tool is then callable \
-         directly by its exact name.\n",
-        names.len(),
-        servers,
-    ))
+        .collect();
+    let mut s = String::from("# Deferred tools (via tool_search)\nBeyond the surface above, ");
+    if !builtin.is_empty() {
+        s.push_str(&format!(
+            "these built-in tools are registered but not pre-loaded: {}",
+            builtin.join(", ")
+        ));
+    }
+    if !mcp.is_empty() {
+        if !builtin.is_empty() {
+            s.push_str("; and ");
+        }
+        s.push_str(&format!(
+            "{} MCP tool(s) are connected but not pre-loaded: {}",
+            names.len() - builtin.len(),
+            mcp.join(", ")
+        ));
+    }
+    s.push_str(
+        ". When the task needs one, find it with `tool_search` (by name or capability) — a match \
+         returns the full argument schema, and that tool is then callable directly by its exact \
+         name.\n",
+    );
+    s
 }
 
 /// Swap the published surface, returning the previous value — TESTS ONLY.
@@ -366,24 +394,14 @@ pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
     // estimate over `deferAutoTokens`) registers its tools DEFERRED: dispatchable by name, absent
     // from `defs()`. `tool_search` is their discovery door and registers only when at least one
     // tool is deferred — a session with a small surface pays neither the tool nor its schema.
-    let mut deferred_entries: Vec<crate::agent::tool_search::DeferredEntry> = Vec::new();
     for d in crate::agent::mcp::discovered_tools() {
         if d.deferred {
-            let arc: std::sync::Arc<dyn Tool> = std::sync::Arc::from(d.tool);
-            r.register_deferred(arc.clone(), d.server.clone());
-            deferred_entries.push(crate::agent::tool_search::DeferredEntry {
-                tool: arc,
-                server: d.server,
-            });
+            r.register_deferred(std::sync::Arc::from(d.tool), d.server);
         } else {
             r.register(d.tool);
         }
     }
-    if !deferred_entries.is_empty() {
-        r.register(Box::new(crate::agent::tool_search::ToolSearch::new(
-            deferred_entries,
-        )));
-    }
+    install_tool_search(&mut r);
     // CDP browser tools (OPT-IN: `--features browser`, default OFF). Top-level only; they connect
     // lazily to a local Chrome/Edge/Brave and return an actionable error if none is running.
     #[cfg(feature = "browser")]
@@ -476,6 +494,8 @@ pub fn default_registry_with_task(
         Some(r) => r.canonicalize().unwrap_or(r),
         None => resolve_root()?,
     };
+    // Decided before `base_url` moves into the delegation tools below.
+    let lean = crate::core::cli_config::lean_tools_enabled(&base_url);
     let mut r = default_registry_in(&root);
     r.register(Box::new(PersonaCreate));
     r.register(Box::new(crate::agent::task_tool::TaskTool::new(
@@ -505,9 +525,103 @@ pub fn default_registry_with_task(
         )));
     }
     crate::agent::toolsets::apply_toolset_filter(&mut r);
+    // The rarely-used built-ins ride behind `tool_search` instead of on every request; which ones
+    // depends on the conversation's shape (widest turn so far), so the list stays byte-stable.
+    // Only where a non-advertised tool can still be called (`lean_tools`): a grammar-locking
+    // gateway would leave a deferred tool uncallable, silently.
+    if lean {
+        defer_builtins_for_shape(&mut r, crate::core::turn_shape::conversation_shape());
+    }
     // Publish the live surface so the `<skills>` index can hide skills that `require:` an absent tool.
     publish_active_tools(&r);
     Ok(r)
+}
+
+/// Built-in tools a coding turn rarely calls, kept OFF the request and reachable through
+/// `tool_search`: the orchestration and character surfaces, the memory and skill WRITE surfaces,
+/// the time machine, the crawler. Measured at ~14.5 KB of the 42 KB schema block (2026-09-15).
+/// Every one of them stays dispatchable — a model that needs `checkpoint` asks `tool_search` for
+/// it, gets the schema back, and calls it by name.
+const DEFERRED_ALWAYS: &[&str] = &[
+    "workflow",
+    "persona_create",
+    "checkpoint",
+    "checkpoint_view",
+    "memory_save",
+    "memory_update",
+    "memory_forget",
+    "memory_ask",
+    "memory_profile",
+    "skill_save",
+    "skill_refine",
+    "skill_forget",
+    "skill_search",
+    "skill_install",
+    "team_status",
+    "notify",
+];
+
+/// Deferred on top of [`DEFERRED_ALWAYS`] when the conversation is a pure question: nothing is
+/// going to be moved, run in the background, or delegated.
+const DEFERRED_FOR_QUESTIONS: &[&str] = &["file_move", "process", "task"];
+
+/// The built-in names to defer for a conversation shape. `None` (no turn classified yet —
+/// `serve` lanes, `prompt-size`) takes the coding set. Research keeps the crawler; everything
+/// else defers it.
+pub(crate) fn deferred_builtins(
+    shape: Option<crate::core::turn_shape::TurnShape>,
+) -> Vec<&'static str> {
+    use crate::core::turn_shape::TurnShape;
+    let mut out: Vec<&'static str> = DEFERRED_ALWAYS.to_vec();
+    match shape {
+        Some(TurnShape::Research) => {}
+        Some(TurnShape::Question) => {
+            out.push("web_crawl");
+            out.extend_from_slice(DEFERRED_FOR_QUESTIONS);
+        }
+        _ => out.push("web_crawl"),
+    }
+    out
+}
+
+/// Defer the built-ins for `shape` and (re)install `tool_search` over everything deferred.
+pub(crate) fn defer_builtins_for_shape(
+    r: &mut ToolRegistry,
+    shape: Option<crate::core::turn_shape::TurnShape>,
+) {
+    for name in deferred_builtins(shape) {
+        r.defer(name, "builtin");
+    }
+    install_tool_search(r);
+}
+
+/// The schema bytes `tool_search` itself costs once anything is deferred (for `prompt-size`).
+pub(crate) fn tool_search_schema_bytes() -> usize {
+    let t = crate::agent::tool_search::ToolSearch::new(Vec::new());
+    serde_json::to_string(&crate::core::types::ToolDef::function(
+        t.name(),
+        t.description(),
+        t.parameters(),
+    ))
+    .map(|s| s.len())
+    .unwrap_or(0)
+}
+
+/// Register `tool_search` over the registry's deferred tools (built-in and MCP), replacing any
+/// earlier instance. No deferred tools ⇒ no `tool_search` — a small surface pays neither the
+/// tool nor its schema.
+pub(crate) fn install_tool_search(r: &mut ToolRegistry) {
+    r.retain(|n| n != "tool_search");
+    let entries: Vec<crate::agent::tool_search::DeferredEntry> = r
+        .deferred_entries()
+        .into_iter()
+        .map(|(tool, server)| crate::agent::tool_search::DeferredEntry { tool, server })
+        .collect();
+    if !entries.is_empty() {
+        r.register(Box::new(crate::agent::tool_search::ToolSearch::new(
+            entries,
+        )));
+    }
 }
 
 /// Register the `workflow` tool unless the user explicitly opts out. The ~350-token schema is a
@@ -6299,5 +6413,133 @@ mod tests {
         for rev in ["-n1", "--help", "a b", "x\ny"] {
             assert!(!super::valid_git_rev(rev), "{rev} should be refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod deferral_tests {
+    use super::*;
+    use crate::core::turn_shape::TurnShape;
+
+    fn root(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aizen-defer-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn adv(r: &ToolRegistry, name: &str) -> bool {
+        r.advertised_names().iter().any(|n| n == name)
+    }
+
+    #[test]
+    fn coding_shape_defers_the_rare_builtins_behind_tool_search() {
+        let mut r = default_registry_in(&root("coding"));
+        r.register(Box::new(PersonaCreate));
+        let before = r.advertised_names().len();
+        defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
+        for n in [
+            "checkpoint",
+            "memory_save",
+            "skill_save",
+            "persona_create",
+            "web_crawl",
+        ] {
+            assert!(!adv(&r, n), "{n} must not ride the request");
+            assert!(r.get(n).is_some(), "{n} stays dispatchable");
+        }
+        for n in [
+            "file_read",
+            "file_edit",
+            "shell_run",
+            "process",
+            "file_move",
+            "memory_search",
+        ] {
+            assert!(adv(&r, n), "{n} stays advertised on a coding turn");
+        }
+        assert!(adv(&r, "tool_search"), "the door is advertised");
+        assert!(r.advertised_names().len() < before);
+        assert!(r.deferred_entries().iter().all(|(_, o)| o == "builtin"));
+        // Idempotent: a second pass (the registry is rebuilt every turn) changes nothing.
+        let names = r.advertised_names();
+        defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
+        assert_eq!(r.advertised_names(), names);
+    }
+
+    #[test]
+    fn question_shape_defers_more_and_research_keeps_the_crawler() {
+        let mut q = default_registry_in(&root("question"));
+        defer_builtins_for_shape(&mut q, Some(TurnShape::Question));
+        assert!(!adv(&q, "process") && !adv(&q, "file_move"));
+        assert!(adv(&q, "file_read") && adv(&q, "search_files"));
+        let mut rs = default_registry_in(&root("research"));
+        defer_builtins_for_shape(&mut rs, Some(TurnShape::Research));
+        assert!(adv(&rs, "web_crawl"));
+        assert!(!adv(&rs, "checkpoint"));
+    }
+
+    #[test]
+    fn deferred_note_names_builtins_and_counts_mcp_servers() {
+        let surface: crate::agent::tools::DeferredSurface = (
+            vec![
+                "checkpoint".into(),
+                "memory_save".into(),
+                "mcp_github_issue".into(),
+            ],
+            vec![("builtin".into(), 2), ("github".into(), 1)],
+        );
+        let note = deferred_tools_note_for(&surface);
+        assert!(note.contains("checkpoint, memory_save"), "{note}");
+        assert!(
+            note.contains("1 MCP tool(s)") && note.contains("github (1)"),
+            "{note}"
+        );
+        assert!(note.contains("tool_search"));
+        let only_builtin: crate::agent::tools::DeferredSurface =
+            (vec!["workflow".into()], vec![("builtin".into(), 1)]);
+        let note = deferred_tools_note_for(&only_builtin);
+        assert!(!note.contains("MCP"), "{note}");
+    }
+
+    #[test]
+    fn coding_turn_advertised_schema_fits_the_lean_budget() {
+        // The top-level surface with delegation, persona and LSP registered — the maximal shape —
+        // after the coding-turn deferral. Measured 28.2 KB on 2026-09-15 (42.2 KB before).
+        const CEILING: usize = 32_000;
+        let root = root("lean");
+        let mut r = default_registry_in(&root);
+        r.register(Box::new(PersonaCreate));
+        r.register(Box::new(crate::agent::task_tool::TaskTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            root.clone(),
+            0,
+            200_000,
+        )));
+        r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            0,
+            root.clone(),
+            200_000,
+        )));
+        register_subagent_lsp_read(&mut r, &root);
+        register_subagent_lsp_write(&mut r, &root);
+        defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
+        let bytes: usize = r
+            .defs()
+            .iter()
+            .map(|d| serde_json::to_string(d).unwrap().len())
+            .sum();
+        assert!(
+            bytes <= CEILING,
+            "advertised schema on a coding turn is {bytes} B > {CEILING} B"
+        );
     }
 }

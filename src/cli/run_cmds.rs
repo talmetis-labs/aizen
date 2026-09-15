@@ -59,6 +59,20 @@ pub(crate) fn run_prompt_size(
     let total = prompt + tools_bytes;
     // Rough: 4 bytes/token. The real count is tokenizer-specific — this is a budget, not a bill.
     let tok = |b: usize| b / 4;
+    // The LEAN surface: what a coding turn advertises when built-in deferral is on (first-party
+    // APIs by default, `lean_tools: true` elsewhere) — the rare tools move behind `tool_search`.
+    let deferred = agent::builtin::deferred_builtins(None);
+    let lean_tools_bytes: usize = defs
+        .iter()
+        .filter(|d| !deferred.contains(&d.function.name.as_str()))
+        .map(|d| serde_json::to_string(d).map(|s| s.len()).unwrap_or(0))
+        .sum::<usize>()
+        + agent::builtin::tool_search_schema_bytes();
+    let lean_deferred = defs
+        .iter()
+        .filter(|d| deferred.contains(&d.function.name.as_str()))
+        .count();
+    let lean_total = prompt + lean_tools_bytes;
 
     let mut per_tool: Vec<(usize, String)> = defs
         .iter()
@@ -101,6 +115,12 @@ pub(crate) fn run_prompt_size(
             "system_prompt": { "bytes": prompt, "stable_bytes": stable, "dynamic_bytes": dynamic },
             "tools": { "count": defs.len(), "json_bytes": tools_bytes },
             "fixed_total": { "bytes": total, "approx_tokens": tok(total) },
+            "lean": {
+                "tools_json_bytes": lean_tools_bytes,
+                "deferred_count": lean_deferred,
+                "fixed_total_bytes": lean_total,
+                "approx_tokens": tok(lean_total),
+            },
             "per_tool": per_tool
                 .iter()
                 .map(|(n, name)| serde_json::json!({ "name": name, "bytes": n }))
@@ -148,6 +168,11 @@ pub(crate) fn run_prompt_size(
         "  Fixed per turn       : {total:>8} B  ({}, ~{}k tokens)",
         kb(total),
         tok(total) / 1000
+    );
+    println!(
+        "  Lean (coding turn)   : {lean_total:>8} B  ({}, ~{}k tokens; {lean_deferred} tools deferred behind tool_search — on for first-party APIs, `lean_tools` elsewhere)",
+        kb(lean_total),
+        tok(lean_total) / 1000
     );
     if show_tools {
         println!("\n  Per tool, largest first:");
@@ -440,7 +465,7 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         };
         eprintln!(
             "{}",
-            crate::ui::effort_ui::effort_turn_line(tier.as_deref())
+            crate::ui::effort_ui::effort_turn_line(tier.as_deref(), None)
         );
         cli_config::set_effort_override(tier);
     }
@@ -461,6 +486,8 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         ApprovalMode::Ask
     };
     arm_lsp_session();
+    // The task's shape picks the deferred tool set the registry is built with.
+    crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(args.task.trim()));
     // Built BEFORE the prompt: it publishes the live tool surface the routing map is generated from.
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
@@ -479,14 +506,21 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         Some(&frozen),
     );
     let max = args.max_iters.unwrap_or(25).max(1);
-    let cfg = AgentConfig {
+    let mut cfg = AgentConfig {
         max_iters: max,
         auto_extend_to: max.saturating_mul(2),
         approval_mode: cli_approval,
         context_window: resolve_ctx_window(&model).0,
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
+        nudge_role: agent::NudgeRole::for_base_url(&base_url),
         ..Default::default()
     };
+    // The tier gives the harness its budgets too, unless the caller pinned the step cap.
+    if args.max_iters.is_none() {
+        if let Some(t) = cli_config::effort_override().flatten() {
+            cfg.apply_effort(&t);
+        }
+    }
 
     // The model call, injected into the loop. http_ref/base/key/model are all Copy
     // (&Client / &str), so the closure stays `Fn` across the loop's repeated calls.
@@ -530,7 +564,20 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         Message::user_with_images(args.task.trim(), images)
     };
     let mut history = vec![Message::system(&system), asked];
-    let result = agent::run_agent_loop(chat, &cfg, &registry, &mut history).await;
+    // A one-shot run is the canonical single-turn shape (one prompt, many tool steps): give it the
+    // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
+    // of relying on tool-result clearing alone.
+    let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
+    let summarize = move |msgs: Vec<Message>| {
+        let ep = sum_ep.clone();
+        async move {
+            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                .await
+                .map(|t| t.content.unwrap_or_default())
+        }
+    };
+    let result =
+        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await;
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
     if args.save_session {

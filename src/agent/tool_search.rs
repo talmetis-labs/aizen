@@ -42,7 +42,7 @@ pub struct ToolSearch {
 impl ToolSearch {
     pub fn new(entries: Vec<DeferredEntry>) -> Self {
         let description = format!(
-            "Find integration tools that are connected but NOT pre-loaded (deferred MCP tools): {}. \
+            "Find tools that are registered but NOT pre-loaded (deferred built-ins and MCP tools): {}. \
              Search by capability in plain words (e.g. 'create issue', 'query database', 'deploy'). \
              Each match returns the tool's full argument schema; after that, call the matched tool \
              DIRECTLY by its exact name — never route the actual operation through tool_search. \

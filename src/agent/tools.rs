@@ -263,6 +263,24 @@ impl ToolRegistry {
     {
         self.tools.retain(|e| keep(e.tool.name()));
     }
+
+    /// Flip an already-registered tool to DEFERRED (dispatchable by name, absent from `defs()`),
+    /// returning its handle for the `tool_search` index. `None` when no tool has that name.
+    pub fn defer(&mut self, name: &str, origin: &str) -> Option<std::sync::Arc<dyn Tool>> {
+        let e = self.tools.iter_mut().find(|e| e.tool.name() == name)?;
+        e.deferred = true;
+        e.origin = Some(origin.to_string());
+        Some(e.tool.clone())
+    }
+
+    /// Every deferred tool with its origin label, in registration order.
+    pub fn deferred_entries(&self) -> Vec<(std::sync::Arc<dyn Tool>, String)> {
+        self.tools
+            .iter()
+            .filter(|e| e.deferred)
+            .map(|e| (e.tool.clone(), e.origin.clone().unwrap_or_default()))
+            .collect()
+    }
 }
 
 // ── schema-driven argument repair ───────────────────────────────────────────────

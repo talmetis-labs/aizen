@@ -346,7 +346,13 @@ pub async fn run_task(
     // Registry BEFORE prompt, as every real entry point does: the prompt's tool-routing map is
     // generated from the published surface. `task`/`workflow` are left out — the suite measures
     // the single loop, and a fixture crate has nothing to delegate.
-    let registry = agent::builtin::default_registry_in(&work);
+    let mut registry = agent::builtin::default_registry_in(&work);
+    // Same deferred set a real turn of this shape would get, so the suite measures the lean
+    // surface the user sees.
+    agent::builtin::defer_builtins_for_shape(
+        &mut registry,
+        Some(crate::core::turn_shape::classify(&spec.prompt)),
+    );
     agent::builtin::publish_active_tools(&registry);
     let system = agent::build_top_level_system_prompt(
         &work.display().to_string(),

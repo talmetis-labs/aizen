@@ -86,6 +86,19 @@ pub struct CliConfig {
     /// validates). `None` ⇒ field omitted from requests entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Model per effort tier (`{"low": "cheap-model", "max": "strong-model"}`): a turn classified
+    /// or pinned to a tier with an entry here is sent to that model on the SAME endpoint; tiers
+    /// without an entry use the main model. The cheap-tier half of "effort with teeth".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_by_effort: Option<std::collections::BTreeMap<String, String>>,
+    /// Keep the rarely-used built-in tools (workflow, checkpoint, the memory and skill write
+    /// surface, …) off the request and behind `tool_search`. `None` ⇒ on for first-party APIs
+    /// (api.anthropic.com, api.openai.com) and off elsewhere: some hosted gateways grammar-lock
+    /// tool-call names to the advertised set, and there a deferred tool can never be called (see
+    /// REFERENCE, "Tool Search"). `Some(true)` turns it on for a gateway you have checked;
+    /// `Some(false)` turns it off everywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean_tools: Option<bool>,
     /// Auto-detect reasoning effort per-turn (keyword + complexity — see `core::effort`). `None` ⇒
     /// ON (default). `Some(true)` forces ON, `Some(false)` disables it (then only the fixed
     /// `reasoning_effort` above, if any, is used). The per-turn effort is NEVER persisted here.
@@ -1053,6 +1066,63 @@ pub fn effort_override() -> Option<Option<String>> {
         .clone()
 }
 
+/// The host of an endpoint URL (scheme, userinfo, port and path stripped), lowercase.
+fn endpoint_host(base_url: &str) -> String {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// A first-party model API, where a tool whose name is not in the request's `tools` array can
+/// still be called — the property built-in tool deferral needs.
+pub fn is_first_party_api(base_url: &str) -> bool {
+    matches!(
+        endpoint_host(base_url).as_str(),
+        "api.anthropic.com" | "api.openai.com"
+    )
+}
+
+/// Whether built-in tool deferral applies for `base_url` under `cfg` (see `CliConfig::lean_tools`).
+pub fn lean_tools_enabled_in(cfg: &CliConfig, base_url: &str) -> bool {
+    cfg.lean_tools
+        .unwrap_or_else(|| is_first_party_api(base_url))
+}
+
+pub fn lean_tools_enabled(base_url: &str) -> bool {
+    lean_tools_enabled_in(&load(), base_url)
+}
+
+/// The model `models_by_effort` names for `tier`, if any (pure over `cfg`).
+pub fn effort_model_in(cfg: &CliConfig, tier: &str) -> Option<String> {
+    cfg.models_by_effort
+        .as_ref()
+        .and_then(|m| m.get(tier))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `ep` with its model swapped for the one `models_by_effort` names for `tier` — unchanged when
+/// the tier has no entry, is `None`, or names the model already in use.
+pub fn route_endpoint_for_effort(ep: &ResolvedEndpoint, tier: Option<&str>) -> ResolvedEndpoint {
+    let mut out = ep.clone();
+    if let Some(model) = tier.and_then(|t| effort_model_in(&load(), t)) {
+        out.model = model;
+    }
+    out
+}
+
 /// Resolve the `reasoning_effort` to stamp on an outgoing request: the per-turn override when one
 /// is armed (main REPL turns), else the caller-supplied config default (subagents / summarizer /
 /// oracle, which never arm an override). `None` ⇒ omit the field (request stays byte-identical).
@@ -1969,5 +2039,61 @@ mod tests {
         for v in [brand, legacy] {
             std::env::remove_var(v);
         }
+    }
+}
+
+#[cfg(test)]
+mod effort_routing_tests {
+    use super::*;
+
+    #[test]
+    fn lean_tools_is_on_for_first_party_apis_and_configurable_elsewhere() {
+        let cfg = CliConfig::default();
+        assert!(lean_tools_enabled_in(&cfg, "https://api.anthropic.com/v1"));
+        assert!(lean_tools_enabled_in(
+            &cfg,
+            "https://user@API.OpenAI.com:443/v1/"
+        ));
+        assert!(!lean_tools_enabled_in(&cfg, "https://openrouter.ai/api/v1"));
+        assert!(!lean_tools_enabled_in(&cfg, "http://localhost:8080/v1"));
+        assert!(!lean_tools_enabled_in(&cfg, ""));
+        let on = CliConfig {
+            lean_tools: Some(true),
+            ..CliConfig::default()
+        };
+        assert!(lean_tools_enabled_in(&on, "http://localhost:8080/v1"));
+        let off = CliConfig {
+            lean_tools: Some(false),
+            ..CliConfig::default()
+        };
+        assert!(!lean_tools_enabled_in(&off, "https://api.anthropic.com/v1"));
+    }
+
+    #[test]
+    fn models_by_effort_maps_a_tier_to_a_model_and_ignores_the_rest() {
+        let mut cfg = CliConfig::default();
+        assert_eq!(effort_model_in(&cfg, "max"), None);
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("low".to_string(), "cheap-model".to_string());
+        m.insert("max".to_string(), "  ".to_string());
+        cfg.models_by_effort = Some(m);
+        assert_eq!(effort_model_in(&cfg, "low").as_deref(), Some("cheap-model"));
+        assert_eq!(
+            effort_model_in(&cfg, "max"),
+            None,
+            "blank entries do not route"
+        );
+        assert_eq!(effort_model_in(&cfg, "high"), None);
+        // Round-trips through the config file shape.
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains("\"models_by_effort\":{\"low\":\"cheap-model\""),
+            "{json}"
+        );
+        let back: CliConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            effort_model_in(&back, "low").as_deref(),
+            Some("cheap-model")
+        );
     }
 }

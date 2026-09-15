@@ -1318,19 +1318,22 @@ fn classify_health_probe_rules() {
 fn effort_turn_line_names_the_tier_or_default() {
     // The per-turn status line must contain the tier name (or "default" when the field is
     // omitted), regardless of colour stripping under the test harness.
-    assert!(effort_turn_line(Some("high")).contains("high"));
-    assert!(effort_turn_line(Some("low")).contains("low"));
+    assert!(effort_turn_line(Some("high"), None).contains("high"));
+    assert!(effort_turn_line(Some("low"), None).contains("low"));
     assert!(
-        effort_turn_line(Some("xhigh")).contains("xhigh"),
+        effort_turn_line(Some("xhigh"), None).contains("xhigh"),
         "xhigh rung named"
     );
     assert!(
-        effort_turn_line(Some("max")).contains("max"),
+        effort_turn_line(Some("max"), None).contains("max"),
         "max rung named"
     );
-    assert!(effort_turn_line(None).contains("default"), "None ⇒ default");
     assert!(
-        effort_turn_line(Some("high")).contains("effort:"),
+        effort_turn_line(None, None).contains("default"),
+        "None ⇒ default"
+    );
+    assert!(
+        effort_turn_line(Some("high"), None).contains("effort:"),
         "always prefixed"
     );
 }

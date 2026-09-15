@@ -29,7 +29,7 @@ pub(crate) fn resolve_turn_effort(line: &str) -> Option<String> {
 /// The per-turn "effort: <tier>" status line, tinted to match the slider's tier colours (auto =
 /// moonlight · low = green · medium = dim silver · high = gold) so the whole effort feature reads as
 /// one system. `None` ⇒ the field is omitted this turn → shown as a faint "default".
-pub(crate) fn effort_turn_line(eff: Option<&str>) -> String {
+pub(crate) fn effort_turn_line(eff: Option<&str>, routed_model: Option<&str>) -> String {
     // low = green, medium = dim silver; the three "hot" rungs escalate high → xhigh → max
     // (gold → bold gold → salmon) so the eye can tell them apart at a glance.
     let styled = match eff {
@@ -45,7 +45,16 @@ pub(crate) fn effort_turn_line(eff: Option<&str>) -> String {
         Some(other) => console::style(other.to_string()).color256(theme::ACCENT),
         None => console::style("default".to_string()).color256(theme::FAINT),
     };
-    format!("{} {}", theme::faint("  effort:"), styled)
+    match routed_model {
+        // `models_by_effort` sent this tier to another model: say which, next to the tier.
+        Some(m) => format!(
+            "{} {} {}",
+            theme::faint("  effort:"),
+            styled,
+            theme::faint(&format!("· model {m}"))
+        ),
+        None => format!("{} {}", theme::faint("  effort:"), styled),
+    }
 }
 
 /// The current effort setting as a slider index: 0 = auto (auto-detect ON, no pinned tier), 1..=5

@@ -841,7 +841,19 @@ async fn run_menu_sticky() -> Result<()> {
                 };
                 let eff = resolve_turn_effort(effort_src);
                 cli_config::set_effort_override(eff.clone());
-                tui::emit_line(&effort_turn_line(eff.as_deref()));
+                // The turn's shape widens the conversation's, which picks the deferred tool set
+                // the registry below is built with (see `core::turn_shape`).
+                let shape = crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(
+                    effort_src,
+                ));
+                // `models_by_effort` may send this tier to another model on the same endpoint.
+                let ep = cli_config::route_endpoint_for_effort(&ep, eff.as_deref());
+                let routed = (ep.model != model).then_some(ep.model.as_str());
+                tui::emit_line(&format!(
+                    "{} {}",
+                    effort_turn_line(eff.as_deref(), routed),
+                    theme::faint(&format!("· {}", shape.as_str()))
+                ));
                 if let Err(e) = crate::core::recovery::checkpoint_history(
                     &history,
                     Some(&line),
@@ -874,7 +886,12 @@ async fn run_menu_sticky() -> Result<()> {
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
                 seat_user_message(&line, images, &mut history, &model);
-                let cfg = turn_agent_config(turn_cancel.clone(), &model, true);
+                let mut cfg = turn_agent_config(turn_cancel.clone(), &model, true);
+                // The tier shapes the harness budgets too (steps, continuations, verify rounds,
+                // self-review, log budget) — see `AgentConfig::apply_effort`.
+                if let Some(t) = eff.as_deref() {
+                    cfg.apply_effort(t);
+                }
 
                 // Esc pressed DURING prep already cancelled this token — honour it instead of firing
                 // the request anyway. Without this, cancelling in the prep window (the very thing the
@@ -1175,7 +1192,15 @@ async fn run_menu_plain() -> Result<()> {
         };
         let eff = resolve_turn_effort(effort_src);
         cli_config::set_effort_override(eff.clone());
-        println!("{}", effort_turn_line(eff.as_deref()));
+        let shape =
+            crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(effort_src));
+        let ep = cli_config::route_endpoint_for_effort(&ep, eff.as_deref());
+        let routed = (ep.model != model).then_some(ep.model.as_str());
+        println!(
+            "{} {}",
+            effort_turn_line(eff.as_deref(), routed),
+            theme::faint(&format!("· {}", shape.as_str()))
+        );
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
         let persona_before = cli_config::load().persona;
@@ -1196,7 +1221,10 @@ async fn run_menu_plain() -> Result<()> {
         seat_user_message(&line, images, &mut history, &model);
         // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
         let turn_cancel = crate::core::cancel::TurnCancel::new();
-        let cfg = turn_agent_config(turn_cancel, &model, false);
+        let mut cfg = turn_agent_config(turn_cancel, &model, false);
+        if let Some(t) = eff.as_deref() {
+            cfg.apply_effort(t);
+        }
         match run_agent_turn(&http, &ep, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.

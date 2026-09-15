@@ -240,13 +240,21 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     // denominator ("live facts per turn") has to mean turns the user drove.
     memory::stats::note_turn();
     let mut out = fold_retrieval_into_query(query);
+    // A pure question — nothing to change — skips the gated-skills and memory-recall blocks: the
+    // standing facts already ride the frozen core, and a how-to procedure is for doing, not for
+    // answering. The turn then costs one request against the cached prefix. Session working
+    // memory and codebase retrieval stay: a question about THIS repo needs both.
+    let question =
+        crate::core::turn_shape::classify(query) == crate::core::turn_shape::TurnShape::Question;
     // Skills that actually fit THIS question, gated on the same coverage threshold as recall. The
     // always-on `<skills>` index names every applicable procedure regardless of the request; this
     // block is what makes the fitting ones salient without spending the system lane's byte-stable
     // budget on the ones that don't. Folded ABOVE the code but BELOW the facts, matching the
     // "standing truth → how-to → source" reading order.
-    if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
-        out = format!("{block}\n\n{out}");
+    if !question {
+        if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
+            out = format!("{block}\n\n{out}");
+        }
     }
     // L2 session working memory: the notes the learning pass filed during THIS conversation. It
     // changes between turns, which is exactly why it rides here and not in the dynamic lane.
@@ -255,9 +263,11 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     {
         out = format!("{block}\n\n{out}");
     }
-    if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
-        memory::pending::open_turn(pairs);
-        out = format!("{block}\n\n{out}");
+    if !question {
+        if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
+            memory::pending::open_turn(pairs);
+            out = format!("{block}\n\n{out}");
+        }
     }
     out
 }
@@ -413,6 +423,8 @@ pub(crate) fn reset_per_session_state() {
     // thread as a "duplicate" of one that is no longer in context.
     memory::pending::clear();
     crate::agent::todo::clear();
+    // The next turn decides the conversation's shape (and so its deferred tool set) afresh.
+    crate::core::turn_shape::reset_conversation();
     client::cost_meter().reset();
     // The provider-reported context size describes the OLD thread's last request — the new one
     // starts from the chars/4 estimate until its own first call reports usage.
