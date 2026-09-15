@@ -745,7 +745,13 @@ Behavior worth knowing:
   named in each child's `<environment>` with the notes already there), so a later child can
   `file_read` a sibling's whole report. The workspace writer lease is keyed by scope: a child
   reenters its parent's lease, a sibling scope (another `serve` lane, a parallel dispatch)
-  waits for the OS lock and is told who holds it.
+  waits for the OS lock and is told who holds it. An approval a child raises is attributed
+  (`daedalus · fix parser wants: Run …`); `/workflows` shows each child's current step and its
+  own tokens (`12.3k→1.2k tok`), which the `task` result header, the workflow status lines and
+  `--trace` repeat. A write-capable `task` child that runs out of time or fails verification is
+  retried once with a tightened brief (its partial report attached); a second failure restores
+  the checkpoint taken before the dispatch and the result header says `retried` and
+  `AUTO-RESTORED`.
   Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
   change flow is one `daedalus` implementation followed by separate `themis` (verify) and
   `nemesis` (review) dispatches.

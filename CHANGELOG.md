@@ -221,6 +221,16 @@ handing the model false inputs, and starts measuring what it sends.
   append-only), and every child's `<environment>` names the board and the notes already on it,
   so a later child can `file_read` a sibling's whole report instead of the parent's cut-down
   relay. No new tool.
+- **A child's approval says who is asking, its cost is its own, and a writer gets one retry.**
+  An approval raised by a delegated child now reads `daedalus · fix parser wants: Run …` in the
+  TUI, over Telegram and on a plain terminal, instead of looking like the parent's own request.
+  `/workflows` rows show `step 7 · file_edit` while a child runs and `12.3k→1.2k tok` when it
+  has finished; a `task` result header, a workflow status line and `--trace` carry the same
+  per-child tokens (summed from each call's usage, so the session total is no longer the only
+  number). A write-capable `task` child that runs out of time or fails verification is re-run
+  once with a tightened brief carrying its own partial report; if the retry also fails, the tree
+  is restored to the checkpoint taken before the dispatch and the result says so, so half-done
+  edits from two attempts never stay behind unannounced.
 
 ## [0.6.7] — 2026-09-11
 

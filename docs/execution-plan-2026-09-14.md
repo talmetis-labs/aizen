@@ -190,7 +190,16 @@ the run, so a strictly non-reentrant child would time out on every "edit, then d
 turn. Reentry follows scope ancestry instead: a descendant reenters, a sibling waits, which is
 the exclusion the QP's O6 wanted and which two `serve` lanes on one worktree never had. The
 board is per conversation (not per workflow run) and holds finished reports, not live notes: a
-read-only child cannot write files, so the harness files each child's report for it.
+read-only child cannot write files, so the harness files each child's report for it. E2.6
+implemented (`ExecutionContext::dispatch_label` prefixed in every `approve` path,
+`AgentConfig::step_note` → `orchestration::note_step`, `add_usage` + `tokens_in/out` on
+`TaskOutcome` and the board row, one retry with `tightened_brief` for a `Deadline` /
+`VerificationFailed` writer and auto-restore of a pre-dispatch checkpoint). Deviation (o): the
+checkpoint restored is one the `task` tool takes itself before a write-capable dispatch
+(`timemachine::save`, tree-deduplicated), not the loop's pre-edit note — that note is
+process-global and, in a turn that already edited, points at the PARENT's pre-edit tree; and
+the retry is for `task` dispatches only, since workflow children already have the wave-level
+`retry_on_fail` and a second mechanism there would retry twice.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
