@@ -396,6 +396,22 @@ packed orphan and by the dangling-parent fixture). **Phase 5 is code-complete** 
 
 ## 8. Phase 6 — continuous measurement (starts in Phase 0, never ends)
 
+**Status 2026-09-15:** E6.1 fixtures added (`bench-tasks/refactor-with-tests`,
+`bench-tasks/multi-file-wire`, dependency-free crates with tests that describe the behaviour);
+no tape is recorded — this machine has no endpoint — so `bench tasks` reports them SKIPPED
+until the maintainer records one (`--record --task <id>`), and local-model tapes are theirs to
+add. E6.2 implemented in part: `cargo fmt --check` gates CI (the tree is clean),
+`.github/workflows/weekly.yml` runs `cargo test --release` + the loop bench on Windows weekly,
+`src/repl/turn.rs` gains a smoke test (one turn through `run_agent_turn` on a tape), and the
+`git_inspect` end-to-end test fails rather than skips under `CI=true`. Deviation (bb): clippy
+stays advisory — `-D warnings` cannot gate over the 138 pre-existing warnings; the count is
+ratcheted per change and clearing the backlog is its own task. E6.4 implemented as
+`aizen bench sessions [--json]` (`bench/sessions_stats.rs`: calls per user turn, result sizes
+and the count exactly at the 4,096 cut, repeated calls, call mix, read : edit) — a Rust
+subcommand rather than a script, so the single binary stays the only tool; it reads the local
+pool and is run by hand before a release, not in CI. E6.3 (prompt A/B on the suite) is not
+started: it needs recorded tapes to measure against.
+
 | ID | Item | From | Size | When |
 |---|---|---|---|---|
 | E6.1 | Suite grows to six tasks (`refactor-with-tests`, `multi-file-wire`); local-model tapes added | QP P6.3 | M | end of Phase 1 |

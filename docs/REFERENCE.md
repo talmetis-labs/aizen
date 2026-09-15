@@ -1155,7 +1155,10 @@ so a key pasted into a chat is still in that file's message text.
 ```bash
 aizen bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a baseline
 aizen bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
-aizen bench profile                                     # golden set for the profile rollup
+aizen bench profile                                     # golden set for the profile rollup (+ tier hints)
+aizen bench loop                                        # loop discipline on scripted models, no key
+aizen bench tasks [--json] [--record --task <id>]       # the six-task suite on recorded tapes (see bench-tasks/)
+aizen bench sessions [--json]                           # turn-shape statistics of your saved conversations
 aizen bench dialectic                                   # golden set incl. abstain-when-unknown
 aizen bench loop                                        # loop discipline vs a scripted model (offline)
 aizen bench tasks [--task <id>] [--json]                # task suite: real loop + real tools on fixture crates

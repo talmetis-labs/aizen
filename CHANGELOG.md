@@ -365,6 +365,12 @@ handing the model false inputs, and starts measuring what it sends.
   owner-only; a failed run is posted to your configured notify channels. `aizen time gc` now
   removes the objects no checkpoint reaches — retention used to delete checkpoints while the
   store kept every byte — re-packing what is kept before it deletes anything.
+- **Measurement that keeps running.** The task suite grows to six fixtures
+  (`refactor-with-tests`, `multi-file-wire`); `aizen bench sessions [--json]` reports the
+  turn-shape statistics of your saved conversations (calls per turn, result sizes and how many
+  sit at the cut, repeated calls, the call mix, read : edit) so a loop change can be judged on
+  real turns; CI gates `cargo fmt --check`, a weekly workflow tests the release profile on
+  Windows, and the REPL turn has its first test — one turn through the real wiring on a tape.
 
 ## [0.6.7] — 2026-09-11
 

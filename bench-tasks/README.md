@@ -21,6 +21,9 @@ aizen bench tasks --record                 # every task → tapes/default.jsonl
 aizen bench tasks --record --task add-feature --tape sonnet
 ```
 
+The six tasks: `fix-failing-test`, `fix-build-error`, `add-feature`, `refactor-with-tests`,
+`multi-file-wire`, and the zero-edit control `no-edit-control`.
+
 Replay is the default when a tape exists; a task without a tape is reported as SKIPPED. Tapes
 are matched call-by-call, and a run whose prompt or tool surface drifted from the recording says
 so (see `src/llm/replay.rs`). Each fixture manifest carries an empty `[workspace]` table so cargo
