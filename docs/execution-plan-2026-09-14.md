@@ -44,9 +44,21 @@ are pure plumbing.
 commits (f570234..1bfd7a3). Full suite `cargo test --bin aizen` at that point: 1,865 passed, 0
 failed, 2 ignored. `aizen prompt-size --live` on the branch: prefix STABLE (two volatile markers
 before). Deviations from the rows below: E0.3 keeps the dynamic lane at index 1 and makes its
-contents byte-stable instead of moving the lane (see the row); E0.7 ships the manifest coverage,
-the missing-toolchain skip and the absence demand, but not yet the cost-ranked verify ladder or
-the `/init`-written `verify.json` (those move to E1.10 / FL lever F).
+contents byte-stable instead of moving the lane (see the row); E0.7 shipped in two parts:
+the manifest coverage, the missing-toolchain skip and the absence demand with Phase 0, and the
+verify ladder + `/init` measurement last of all, after Phase 6 (commit `afbf597`):
+`plan_ladder` runs the typecheck, then the narrowest test the edited files name
+(`cargo test -- module::` / `--test file`, the sibling `test_x.py` under pytest or unittest,
+`go test ./pkg/`, the sibling `x.test.ts` under vitest or jest), then the suite only at Done on
+a multi-file change and only while its last measured duration fits the verify budget — a suite
+that blows the budget once is recorded and skipped with a note, not retried blindly. The loop
+now keeps every file a successful edit named this run (`edited_paths`) for the narrow rung.
+Deviation (dd): `/init` writes the detected commands, the suite and the timed fast rung to HOME
+(`~/.aizen/verify/<project>-<hash>.json`), not to `.aizen/verify.json` — the index lives in
+HOME for the same reason (a generated file must not dirty the checkout); a trusted
+`.aizen/verify.json` stays the user's override and gains a `suite` key. The done-when is
+pinned by a unittest fixture with a failing sibling test (pytest is not installed here) and by
+`narrow_tests` on a Rust module; the harness check after N edits stays typecheck-only.
 
 **E0.9 / E0.10, same day, same branch (uncommitted at the time of writing):** the tape is hooked
 at the three client functions every model call passes through, not at the `run_agent_loop` seam,

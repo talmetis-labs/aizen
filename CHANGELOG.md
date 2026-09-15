@@ -27,6 +27,15 @@ handing the model false inputs, and starts measuring what it sends.
   a failure. When nothing could run at all after an edit, the model is asked once to run the
   project's own build or test command and quote the result before finishing, instead of reaching
   "done" unverified in silence.
+- **The verify gate climbs a ladder before Done.** After the typecheck it runs the narrowest
+  test the edited files name — `cargo test -- module::` (or `--test file` for an integration
+  test), the sibling `test_x.py` under pytest or unittest, `go test ./pkg/`, the sibling
+  `x.test.ts` under vitest or jest — and, on a change that touched more than one file, the whole
+  suite (`cargo test`, `npm test`, `go test ./...`, `pytest`, …), but only while the suite fits
+  the verify budget: the first run times it, and a suite that blew the budget once is skipped
+  with a note from then on rather than re-run into a timeout. `/init` now detects the commands
+  and the suite and times the fast rung; the record lives in `~/.aizen/verify/`, never in the
+  checkout. A trusted `.aizen/verify.json` may name the `suite` beside its `commands`.
 - **Log- and report-shaped result budgets.** `shell_run` / `process` / `git_inspect` output is
   cut to 16 k chars around the FIRST error line with a large tail (the verdict lives at the end),
   never head-⅔/tail-⅓ — a `cargo test` with three failures reaches the model with all three.

@@ -737,7 +737,16 @@ Behavior worth knowing:
   typecheck). A toolchain that is not installed counts as "nothing ran", never as a failure. When
   nothing could run at all — no recognised manifest, no toolchain — the model is asked once to
   run the project's own build or test command and quote the result before finishing, instead of
-  reaching "done" unverified in silence.
+  reaching "done" unverified in silence. Before Done the gate climbs a ladder, cheapest rung
+  first: the typecheck; the narrowest test the edited files name (`cargo test -- module::` or
+  `--test file`, the sibling `test_x.py` under pytest or unittest, `go test ./pkg/`, the sibling
+  `x.test.ts` under vitest or jest — no declared runner, no rung); and, on a change that touched
+  more than one file, the suite (`cargo test`, `npm test`, `go test ./...`, `pytest`,
+  `mvn test`, `dotnet test`), which runs only while it fits the verify budget — the first run
+  times it, and a suite that blew the budget once is skipped with a note from then on. `/init`
+  detects the commands and the suite and times the fast rung; the record lives in
+  `~/.aizen/verify/<project>.json`, never in the checkout. A trusted `.aizen/verify.json`
+  overrides detection: `{"commands": [...], "suite": "...", "timeout_secs": N}`.
 - **Sub-agents (the Pantheon)** — the agent can call the `task` tool to delegate a self-contained
   sub-task to a fresh role-scoped sub-agent. Seven built-in roles, each with its own tool scope
   and embedded working method: `argus` (searcher — read-only, repo-local), `metis` (planner —
