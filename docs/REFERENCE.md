@@ -65,7 +65,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/logout` | leave Aizen here: the session **and** the pinned key. Revokes neither |
 | `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
 | `/memory [query]` | show your profile, or search memory |
-| `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory |
+| `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory · `coding on\|off` keeps it on coding turns |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
 | `/commands` | your **custom slash commands** — markdown macros you fire (see below) |
 | `/mcp` | MCP lifecycle status: connected tools, generation, health, and per-turn schema pinning (see below) |

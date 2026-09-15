@@ -329,7 +329,14 @@ fixed 65.1 KB → 72.0 KB. The Phase 1 ≤ 55 KB lean gate was measured with the
 alone; the growth is the repository's instruction file, not aizen's overhead. Deviation (z):
 that gate is exceeded in this checkout by design of E4.6 — whether to re-baseline it (≈ 60 KB)
 or cap `<project_context>` lower is the maintainer's call; nothing here truncates a user's
-instructions silently.
+instructions silently. E4.7 implemented (`persona::suppress_for_turn` guard raised by
+`refresh_dynamic_prompt_lane` when `persona_gate_applies(shape, previous_turn_used_tools,
+keep)`; `build_system_prompt_bundle` leaves soul/persona/self out while it is up;
+`turn_shape::current_turn_shape` is this turn's un-widened shape; `persona_for_coding` +
+`/persona coding on|off`; the gate is raised only on the REPL's per-turn path, so hostbot
+lanes keep their persona). **Phase 4 is code-complete** on `feat/e0.1-usage-ledger`; its
+live gates (facts per turn, citation rate, next-prompt latency) wait for sessions on a real
+endpoint.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

@@ -334,6 +334,11 @@ handing the model false inputs, and starts measuring what it sends.
   convention file added, edited or removed during a conversation is noticed at the next user
   turn by a stat, and only then are the prompt lanes rebuilt. A persona reflection that
   restates an insight already on disk reinforces that insight instead of writing a twin.
+- **A persona stays out of coding turns unless you keep it.** The character card, its
+  self-memory and the agent identity — up to ~1,900 tokens a turn — are left out of the prompt
+  on a turn that is an edit, or that follows a turn which used file or shell tools; a question
+  or research turn keeps them, and so does the first turn. `/persona coding on` keeps them on
+  every turn (`persona_for_coding` in config). Telegram and other hosted lanes are untouched.
 
 ## [0.6.7] — 2026-09-11
 
