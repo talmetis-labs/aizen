@@ -359,6 +359,12 @@ handing the model false inputs, and starts measuring what it sends.
   referenced from the transcript, so the same screenshot never bloats two files. The pool is
   pruned at autosave — oldest first, never the live conversation — to `sessions_keep` (200)
   and `sessions_max_bytes` (256 MiB), and blobs nothing references go with them.
+- **Scheduled jobs are registered after their spec exists, log owner-only, and report
+  failures; `aizen time gc` finally reclaims space.** `aizen cron add` writes the job spec
+  atomically before the OS entry and removes it if registration fails; the job log is
+  owner-only; a failed run is posted to your configured notify channels. `aizen time gc` now
+  removes the objects no checkpoint reaches — retention used to delete checkpoints while the
+  store kept every byte — re-packing what is kept before it deletes anything.
 
 ## [0.6.7] — 2026-09-11
 

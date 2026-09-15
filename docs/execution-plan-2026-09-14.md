@@ -376,6 +376,14 @@ message — or the delta passes `DELTA_MAX_LINES`/`DELTA_MAX_BYTES`; every reade
 `gc_blobs` removes unreferenced blobs; recency counts the delta). The "200-turn session under
 5 MB" gate is structural for text (a turn costs one appended line) and measured on a real
 session; a session that pastes many distinct images is bounded by the pool cap, not by 5 MB.
+E5.4 implemented (`cron::add` writes the spec atomically and owner-only before `register_os`
+and removes it on failure; the job log is hardened; `notify_failure` posts a failed run to every
+configured notify channel; `RepoContext::prune_unreachable` — owned objects from the filesystem
+and the store's own pack indexes, reachable ones from `rev-list --objects --missing=allow-any
+--all`, the kept set re-packed by OID before older packs and unreachable loose objects go —
+runs in `doctor_gc` ahead of compaction and `aizen time gc` reports it; pinned by a test with a
+packed orphan and by the dangling-parent fixture). **Phase 5 is code-complete** on
+`feat/e0.1-usage-ledger`.
 
 | ID | Item | From | Size | Done when |
 |---|---|---|---|---|
