@@ -157,6 +157,7 @@ pub(crate) async fn slash_menu(
     let theme = ui_theme();
     match Select::with_theme(&theme)
         .with_prompt("slash command")
+        .report(false) // the command runs right after; the palette is not a transcript line
         .items(&items)
         .default(0)
         .interact_opt()

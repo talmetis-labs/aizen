@@ -1397,7 +1397,7 @@ fn line_bad(msg: &str) {
 }
 
 /// `  <msg>` dimmed — guidance for the prompt that follows, kept off the prompt line itself.
-fn line_dim(msg: &str) {
+pub(crate) fn line_dim(msg: &str) {
     tui::emit_line(&format!("  {}", style(msg).dim()));
 }
 
@@ -1520,7 +1520,7 @@ async fn prompt_validated_base_url(
 /// one — a URL pasted over a prefilled `https://` — collapses to the last. Everything after the
 /// last scheme-looking prefix is kept verbatim; `localhost:8080/v1` has no scheme (a port is
 /// not a scheme) and gets `https://` in front.
-fn normalize_scheme(typed: &str) -> String {
+pub(crate) fn normalize_scheme(typed: &str) -> String {
     let mut rest = typed.trim();
     let mut scheme = "https";
     while let Some((word, after)) = rest.split_once(':') {
@@ -2817,18 +2817,24 @@ async fn prompt_probed_base_url(
     current: Option<&str>,
     inherit_label: &str,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    line_dim(&format!("empty = {inherit_label} · `-` clears"));
     let mut input = Input::<String>::with_theme(theme)
-        .with_prompt(format!("Base URL (empty = {inherit_label}, `-` clears)"))
+        .with_prompt("Base URL")
         .allow_empty(true);
     if let Some(c) = current {
-        input = input.default(c.to_string());
+        line_dim(&format!("Enter keeps {c}"));
+        input = input.default(c.to_string()).show_default(false);
     }
     let raw = input.interact_text()?;
     let raw = raw.trim();
     if raw.is_empty() || raw == "-" {
         return Ok(None);
     }
-    let url = raw.trim_end_matches('/').to_string();
+    let typed = raw.trim_end_matches('/').to_string();
+    let url = normalize_scheme(&typed);
+    if url != typed {
+        line_warn(&format!("read as {url}"));
+    }
     let check = spin_while(
         &format!("checking {url}"),
         client::check_endpoint(http, &url, None),
@@ -3079,6 +3085,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
             let existing = &list[pick];
             let action = match Select::with_theme(&theme)
                 .with_prompt(format!("{} (Esc cancels)", existing.model))
+                .report(false)
                 .items(&["edit", "remove"])
                 .default(0)
                 .interact_opt()?

@@ -532,6 +532,7 @@ pub(crate) async fn timemachine_menu(
         );
         let pick = match Select::with_theme(&theme)
             .with_prompt(prompt)
+            .report(false)
             .items(&items)
             .default(cursor.unwrap_or(0))
             .interact_opt()?
