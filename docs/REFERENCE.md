@@ -751,7 +751,9 @@ Behavior worth knowing:
   `--trace` repeat. A write-capable `task` child that runs out of time or fails verification is
   retried once with a tightened brief (its partial report attached); a second failure restores
   the checkpoint taken before the dispatch and the result header says `retried` and
-  `AUTO-RESTORED`.
+  `AUTO-RESTORED`. A brief under 80 chars that names no file or symbol is refused (`brief too
+  thin`) — a child starts from an empty context, so the brief must say what to look at and what
+  to return.
   Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
   change flow is one `daedalus` implementation followed by separate `themis` (verify) and
   `nemesis` (review) dispatches.

@@ -231,6 +231,14 @@ handing the model false inputs, and starts measuring what it sends.
   once with a tightened brief carrying its own partial report; if the retry also fails, the tree
   is restored to the checkpoint taken before the dispatch and the result says so, so half-done
   edits from two attempts never stay behind unannounced.
+- **Delegation guidance says when not to, and a thin brief is refused.** The system prompt now
+  tells the model what earns a fresh context (a multi-file search, a review, a test run, a
+  scoped change) and what does not (one file it can read, a question it can answer), what a
+  brief carries, and that `nemesis` reads while `themis` runs. A `task` or workflow brief under
+  80 chars that names no file or symbol is refused with the shape of a usable one instead of
+  sending a child to search for its parent's question. `aizen workflow <spec>` caps its
+  synthesis request like the in-conversation tool does (two chars per token of the model's
+  window) instead of building an unbounded one from every task's report.
 
 ## [0.6.7] — 2026-09-11
 

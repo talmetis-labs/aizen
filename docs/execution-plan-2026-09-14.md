@@ -199,7 +199,11 @@ checkpoint restored is one the `task` tool takes itself before a write-capable d
 (`timemachine::save`, tree-deduplicated), not the loop's pre-edit note — that note is
 process-global and, in a turn that already edited, points at the PARENT's pre-edit tree; and
 the retry is for `task` dispatches only, since workflow children already have the wave-level
-`retry_on_fail` and a second mechanism there would retry twice.
+`retry_on_fail` and a second mechanism there would retry twice. E2.7 implemented (delegation
+bullet in `system_prompt.md`, `task_tool::thin_brief` on `task` and on workflow tasks, the CLI
+runner's synthesis cap). **Phase 2 is code-complete** on `feat/e0.1-usage-ledger`; its gate
+(`aizen workflow implement.json` unattended, `/workflows` per-child tokens, attributed approvals)
+is observable only with an endpoint, which this machine does not have.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
