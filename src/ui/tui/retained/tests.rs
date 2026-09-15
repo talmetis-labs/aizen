@@ -641,6 +641,106 @@ fn ultimate_recolours_the_input_box_to_gold() {
 }
 
 #[test]
+fn the_row_cache_is_an_lru_not_a_flush() {
+    let mut cache = RenderCache::default();
+    let block = |id: u64| UiBlock {
+        id,
+        kind: BlockKind::Generic,
+        payload: Payload::Text(format!("row {id}")),
+        complete: true,
+    };
+    let hot = block(0);
+    for id in 1..(CACHE_LIMIT as u64 + 64) {
+        let _ = cache.get_or_render(&block(id), 40);
+        if id % 32 == 0 {
+            let _ = cache.get_or_render(&hot, 40);
+        }
+    }
+    assert!(cache.rows.len() <= CACHE_LIMIT, "{}", cache.rows.len());
+    let hits = cache.hits;
+    let _ = cache.get_or_render(&hot, 40);
+    assert_eq!(
+        cache.hits,
+        hits + 1,
+        "the block touched all along survives eviction"
+    );
+    let misses = cache.misses;
+    let _ = cache.get_or_render(&block(1), 40);
+    assert_eq!(cache.misses, misses + 1, "the coldest block was evicted");
+    // Heights outlive row eviction: placing the viewport never needs a render.
+    assert_eq!(cache.height(&block(2), 40), 1);
+    assert_eq!(cache.misses, misses + 1);
+    cache.forget_before(500);
+    assert!(cache.heights.keys().all(|k| k.id >= 500));
+}
+
+#[test]
+fn a_frame_renders_the_viewport_not_the_session() {
+    let mut state = AppState::new("intro", "status");
+    for i in 0..2_000 {
+        state.push_text(BlockKind::Generic, format!("line-{i}"), true);
+    }
+    let _ = painted_rows(&mut state, 80, 24);
+    let after_first = state.cache.misses;
+    assert!(
+        after_first >= 2_000,
+        "every block is measured once: {after_first}"
+    );
+    let _ = painted_rows(&mut state, 80, 24);
+    assert_eq!(
+        state.cache.misses, after_first,
+        "a second frame at the tail renders nothing new"
+    );
+    state.scroll_from_tail = 1_000;
+    let _ = painted_rows(&mut state, 80, 24);
+    let window = 24 + 2 * (24 + paint::RENDER_MARGIN_ROWS) + 4;
+    let rendered = (state.cache.misses - after_first) as usize;
+    assert!(
+        rendered <= window,
+        "a scroll renders only the new window: {rendered} blocks (cap {window})"
+    );
+    assert!(state.cache.rows.len() <= CACHE_LIMIT);
+    let g = transcript_geom_slot().lock().unwrap();
+    assert!(
+        g.rows_offset > 0 && g.rows_offset <= g.start,
+        "{} / {}",
+        g.rows_offset,
+        g.start
+    );
+    assert!(g.plain_rows.len() <= window);
+}
+
+#[test]
+fn a_selection_is_rebased_onto_the_rendered_window() {
+    let sel = |a: usize, b: usize| SelectionRange {
+        anchor_line: a,
+        anchor_col: 2,
+        cursor_line: b,
+        cursor_col: 5,
+    };
+    // Entirely inside: shifted by the offset.
+    let s = shift_selection(sel(110, 112), 100, 50).unwrap();
+    assert_eq!(
+        (s.anchor_line, s.anchor_col, s.cursor_line, s.cursor_col),
+        (10, 2, 12, 5)
+    );
+    // Starting above the window: clamped to its first row.
+    let s = shift_selection(sel(90, 105), 100, 50).unwrap();
+    assert_eq!((s.anchor_line, s.anchor_col), (0, 0));
+    assert_eq!((s.cursor_line, s.cursor_col), (5, 5));
+    // Ending below it: clamped to its last row, whole row.
+    let s = shift_selection(sel(140, 900), 100, 50).unwrap();
+    assert_eq!((s.cursor_line, s.cursor_col), (49, usize::MAX));
+    // Outside on either side, or an empty window: nothing to highlight.
+    assert!(shift_selection(sel(10, 20), 100, 50).is_none());
+    assert!(shift_selection(sel(200, 210), 100, 50).is_none());
+    assert!(shift_selection(sel(110, 112), 100, 0).is_none());
+    // Reversed anchors are ordered first.
+    let s = shift_selection(sel(112, 110), 100, 50).unwrap();
+    assert!(s.anchor_line <= s.cursor_line);
+}
+
+#[test]
 fn pruning_keeps_whole_blocks() {
     let mut state = AppState::new("intro", "status");
     for i in 0..BLOCK_LIMIT + 20 {

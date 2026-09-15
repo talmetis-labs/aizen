@@ -13,9 +13,13 @@ pub(super) struct TranscriptGeom {
     pub(crate) visible: usize,
     pub(crate) total: usize,
     pub(crate) area: Rect,
-    /// Plain (SGR-stripped) wrapped rows of the full transcript at last draw — used to extract the
-    /// selected text on mouse-up without re-rendering on the input thread.
+    /// Plain (SGR-stripped) wrapped rows of the RENDERED WINDOW at last draw (the viewport plus
+    /// a margin, see `paint::RENDER_MARGIN_ROWS`) — used to extract the selected text on
+    /// mouse-up without re-rendering on the input thread. `plain_rows[i]` is transcript row
+    /// `rows_offset + i`.
     pub(crate) plain_rows: Vec<String>,
+    /// Absolute transcript row of `plain_rows[0]` / `sgr_rows[0]`.
+    pub(crate) rows_offset: usize,
     /// Raw rendered rows WITH SGR colour codes — used by the hyperlink injector to re-print link
     /// spans baked inside OSC 8 sequences after `terminal.draw()`. Parallel to `plain_rows`.
     pub(crate) sgr_rows: Vec<String>,
@@ -237,7 +241,50 @@ pub(crate) fn extract_selection_text(sel: SelectionRange) -> String {
     let g = transcript_geom_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    extract_from_plain_rows(&g.plain_rows, sel)
+    match shift_selection(sel, g.rows_offset, g.plain_rows.len()) {
+        Some(local) => extract_from_plain_rows(&g.plain_rows, local),
+        None => String::new(),
+    }
+}
+
+/// A selection in the flat row space re-based onto a rendered window that starts at absolute
+/// row `offset` and holds `len` rows: rows before the window clamp to its first row, rows past
+/// it to its last. `None` when the selection lies entirely outside the window.
+pub(super) fn shift_selection(
+    sel: SelectionRange,
+    offset: usize,
+    len: usize,
+) -> Option<SelectionRange> {
+    if len == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (
+        (sel.anchor_line, sel.anchor_col),
+        (sel.cursor_line, sel.cursor_col),
+    );
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let end = offset + len;
+    if b.0 < offset || a.0 >= end {
+        return None;
+    }
+    let clamp = |(line, col): (usize, usize)| -> (usize, usize) {
+        if line < offset {
+            (0, 0)
+        } else if line >= end {
+            (len - 1, usize::MAX)
+        } else {
+            (line - offset, col)
+        }
+    };
+    let (a, b) = (clamp(a), clamp(b));
+    Some(SelectionRange {
+        anchor_line: a.0,
+        anchor_col: a.1,
+        cursor_line: b.0,
+        cursor_col: b.1,
+    })
 }
 
 fn extract_from_plain_rows(rows: &[String], sel: SelectionRange) -> String {
