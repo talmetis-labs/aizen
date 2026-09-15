@@ -339,6 +339,13 @@ handing the model false inputs, and starts measuring what it sends.
   on a turn that is an edit, or that follows a turn which used file or shell tools; a question
   or research turn keeps them, and so does the first turn. `/persona coding on` keeps them on
   every turn (`persona_for_coding` in config). Telegram and other hosted lanes are untouched.
+- **`/undo` now removes the file the agent just created.** A restore used to leave behind any
+  file that was created after the target checkpoint and never committed, then fail its own
+  verification and roll back — the most common rewind of all. The restore now stages the
+  working tree the way a checkpoint sees it, records the files the target lacks in the restore
+  journal before touching anything, removes them with the rest of the update, and names them
+  (`time restore`, `time undo`, `time redo`, `/undo`). Every one of them is in the checkpoint
+  the restore saved first, so `aizen time redo` brings them back.
 
 ## [0.6.7] — 2026-09-11
 

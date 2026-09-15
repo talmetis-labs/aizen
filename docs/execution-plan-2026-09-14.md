@@ -352,6 +352,15 @@ endpoint.
 
 ## 7. Phase 5 — persistence and update (1.5 weeks)
 
+**Status 2026-09-15:** E5.1 implemented on `feat/e0.1-usage-ledger` (`apply_tree` stages the
+worktree with `add -A` into the seeded temporary index — a checkpoint's own coverage — then
+`paths_absent_from` lists what the target tree lacks, `restore_in_reported` writes that list
+into the journal before `read-tree --reset -u`, the post-restore verification is unchanged,
+and `restore_with_report` / `undo_with_report` / `redo_with_report` hand the list to the CLI
+and to `/undo`). Pinned by an end-to-end test on a scratch repository (`git init`, two
+checkpoints, an untracked file between them, restore back and forward). This is the bug the
+2026-08-17 note recorded as "restore cannot delete an untracked file".
+
 | ID | Item | From | Size | Done when |
 |---|---|---|---|---|
 | E5.1 | Restore removes files absent from the target tree (journaled, reported) | QP P5.1 (S2) | M | `/undo` succeeds after a run that created a file |
