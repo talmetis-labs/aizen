@@ -532,7 +532,8 @@ windows, so the HUD estimates them from the model name until you set one.
 
 Sub-agent configuration uses the same provider list. In `/config` → **Sub-agents**, choose a saved
 provider and either its default model or a model override for Sub-agent default, Summarizer, Oracle,
-Apply, or an installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:
+Apply, one of the seven Pantheon roles (`roles.pantheon.<role>`, above the sub-agent default), or an
+installed specialist. No endpoint/key is retyped. Scriptable specialist equivalent:
 
 ```bash
 aizen agents set-provider code-reviewer backup              # provider default model
@@ -720,6 +721,11 @@ Behavior worth knowing:
   substituted. With neither given, the dispatch runs as `argus` (the safe read-only default;
   editing must be asked for by name: `role=daedalus`). Read-only dispatches fan out in parallel;
   write-capable ones stay serial. Single depth: a sub-agent cannot spawn further sub-agents.
+  Each role has its own default step budget — argus 15, clio 20, metis / nemesis / mnemosyne 25,
+  themis 30, daedalus 45 (`max_steps` overrides; cap 80) — and can be pinned to its own provider
+  or model: `roles.pantheon.<role>` in `cli-config.json`, or `/config` → Sub-agents → Pantheon
+  roles (env `AIZEN_<ROLE>_MODEL` wins; an explicit `model` on the dispatch beats the pin;
+  unpinned roles take the sub-agent default).
   Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
   change flow is one `daedalus` implementation followed by separate `themis` (verify) and
   `nemesis` (review) dispatches.
@@ -755,7 +761,7 @@ Spec shape:
     // optional dispatch contract — same semantics as the task tool:
     "boundaries": "Do not edit files",
     "expected_output": "Findings with severity and file:line evidence",
-    "max_steps": 25,                      // total step budget for this child (cap 80)
+    "max_steps": 25,                      // total step budget (default: the role's own; cap 80)
     "expects": { "type": "object" }       // JSON Schema the child's answer must satisfy
   }, ... ],
   "synthesis": { "model": "optional-override", "prompt": "optional merge instruction" }

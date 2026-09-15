@@ -174,6 +174,19 @@ handing the model false inputs, and starts measuring what it sends.
 - **Context overflow recovery retries up to three shrinks**, not one, while evictable tool
   results remain.
 
+### Phase 2 (in progress) — the Pantheon
+
+#### Added
+- **Per-role model pins, and budgets sized to the work.** `roles.pantheon.<role>` in
+  `cli-config.json` (or `/config` → Sub-agents → Pantheon roles; env `AIZEN_<ROLE>_MODEL` wins)
+  pins one of the seven built-in sub-agent roles to its own provider or model — above the shared
+  sub-agent default, below an explicit per-dispatch `model` — so a reviewer runs on a strong
+  model and a searcher on a cheap one in the same fan-out, from the `task` tool and from a
+  workflow spec alike. Default step budgets differ by role instead of a flat 25: argus 15, clio
+  20, metis / nemesis / mnemosyne 25, themis 30, daedalus 45; a workflow child without
+  `max_steps` takes the same number. The historian's brief no longer ships three runs of
+  seventeen spaces to every dispatch.
+
 ## [0.6.7] — 2026-09-11
 
 Subscriptions arrive. An Aizen plan is now sold by **signing in**, not by pasting a key: sign in

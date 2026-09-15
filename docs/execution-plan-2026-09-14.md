@@ -88,8 +88,11 @@ E1.15, E1.16 (commits `0807671`, `24c92a4`, `99c9a5f`, `b34bbb8` on `feat/e0.1-u
 then E1.2 (`src/agent/observe.rs`) and E1.13 (`src/agent/lenient.rs`) (commits `5b062f0`,
 `f1a9c6a`, `a08ac6e`), E1.3 (`src/agent/result_format.rs`, `db4e8b4`) and E1.9 (edit ladder,
 `compact_edit_diff`, `file_glob` `ignore`, `search_routing!`, `8447991`) and E1.10 (async LSP
-fold with callers, `harness_check_after_edits`) on the same branch. Not yet: E1.17 (Codex parity,
-first to cut).
+fold with callers, `harness_check_after_edits`) on the same branch. E1.17 (Codex parity) was
+**deferred by the maintainer on 2026-09-15** — parked, not cut: C5 (the 401 refresh loop has no
+attempt counter) and C6 (overload markers matched against the whole body, model output
+included) are a few dozen lines each and can be picked up on their own; C4 (streamed SSE on
+the shared watchdog) is the L part.
 Deviations worth knowing: (e) E1.2 keeps the full text of a collapsed result in a scratch spill
 file, not in the read cache — the read cache stores fingerprints and a prefix, never bodies — and
 collapses in batches of eight rather than one per step, because every mid-history rewrite busts
@@ -147,6 +150,16 @@ block ≤ 55 KB; `/cost` on a local endpoint; single-turn compaction observed on
 ---
 
 ## 4. Phase 2 — the Pantheon (3 weeks)
+
+**Status 2026-09-15:** E2.1 implemented on `feat/e0.1-usage-ledger` (`roles.pantheon` map and
+`pantheon_endpoint` in `cli_config.rs`, differentiated `RoleProfile::default_max_steps`, workflow
+children read the same profile, `/config` → Sub-agents → Pantheon roles). Deviation (j): no static
+`RoleProfile::model` field — a compile-time model name would be a vendor pin inside a binary that
+points at any endpoint, so the config map (plus the existing `AIZEN_<ROLE>_MODEL` env) is the
+whole feature. Workflow children without `max_steps` now take the role's default (argus 15 …
+daedalus 45) instead of the flat 30; a specialist card keeps 30. The "done when" is pinned by
+`resolve_dispatch_pins_a_role_to_its_pantheon_model` and
+`role_tasks_reach_their_pantheon_model_in_one_workflow`.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
