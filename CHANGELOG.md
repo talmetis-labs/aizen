@@ -258,6 +258,14 @@ handing the model false inputs, and starts measuring what it sends.
   `.aizen/approvals.json` (`{"allow": [{"tool": "shell_run", "under": "scripts"}]}`,
   read on every check). `/approval grants` lists what runs without asking; `/clear` forgets the
   session's grants with its allow-all. The hard command guard still runs before any grant.
+- **A long session paints the viewport, not the session.** The transcript painter now keeps
+  each block's rendered height and walks prefix sums to place the viewport, rendering only the
+  blocks that intersect it plus a page of margin on each side; the row cache is a real LRU
+  (least-recently-used quarter evicted when full) instead of being flushed at 512 entries,
+  which past 512 blocks had re-rendered the whole transcript on every frame. Selection, copy,
+  the scrollbar and hyperlink injection work on the rendered window through a row offset.
+  The first frame after a `/resume`, a resize or a theme switch still measures every block
+  once.
 
 ## [0.6.7] — 2026-09-11
 

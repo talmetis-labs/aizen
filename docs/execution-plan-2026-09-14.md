@@ -231,7 +231,13 @@ from two new menu rows, `.aizen/approvals.json` project allowlist, `granted` che
 executor before the question, `/approval grants`). Deviation (q): the menu keeps the `Stop` row
 and the session allow-all row rather than replacing them (six rows, `t`/`d` accelerators), so
 the existing muscle memory (`y`/`a`/`n`/Esc) is unchanged; a grant auto-approval is always
-printed, never silent.
+printed, never silent. E3.3 implemented (`RenderCache` LRU + height table, `draw_transcript`
+windowed on prefix sums, `rows_offset` through `TranscriptGeom`, `shift_selection`, and
+`InjectCtx.rows_offset`). Deviation (r): the "under 10 ms per frame at 3,000 blocks" gate is
+pinned structurally — a frame after the first renders at most the window's blocks
+(`a_frame_renders_the_viewport_not_the_session`) — rather than by a timing assertion, which
+would flake on CI; the first frame after `/resume`, a resize or a theme switch still measures
+every block once.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
