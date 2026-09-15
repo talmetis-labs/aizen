@@ -592,6 +592,63 @@ async fn invalid_arguments_produce_a_controlled_error_not_a_panic() {
     assert!(last_tool_result(&msgs).starts_with("error: invalid JSON arguments"));
 }
 
+fn scratch_file(name: &str, body: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("aizen-lenient-{}-{name}", std::process::id()));
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
+    // Hermes/Qwen-style `<tool_call>` block with an EMPTY native array: the loop must lift it into
+    // a real call and run the tool — not echo the block back as the final answer.
+    let registry = coder_registry();
+    let path = scratch_file("hermes.txt", "recovered-marker-7f3a
+");
+    let block = serde_json::json!({
+        "name": "file_read",
+        "arguments": {"path": path.to_string_lossy()}
+    });
+    let text_turn = ChatTurn {
+        content: Some(format!("Let me read it.
+<tool_call>
+{block}
+</tool_call>")),
+        tool_calls: Vec::new(),
+        finish_reason: Some("stop".into()),
+        usage: None,
+        eager: Vec::new(),
+    };
+    let msgs = run_scripted(&registry, vec![text_turn]).await;
+    let result = last_tool_result(&msgs);
+    assert!(
+        result.contains("recovered-marker-7f3a"),
+        "the tool ran on the recovered call: {result}"
+    );
+    let call = msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        .expect("the assistant turn carries the recovered call");
+    assert!(call.tool_calls[0].id.starts_with("recovered-"));
+    assert_eq!(call.tool_calls[0].function.name, "file_read");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn almost_json_arguments_are_repaired_before_dispatch() {
+    // A trailing comma is the single most common local-model slip; it must not cost a round trip.
+    let registry = coder_registry();
+    let path = scratch_file("comma.txt", "repaired-marker-9c1d
+");
+    let quoted = serde_json::to_string(&path.to_string_lossy()).unwrap();
+    let args = format!("{{\"path\": {quoted},}}");
+    let msgs = run_scripted(&registry, vec![tool_call("file_read", &args)]).await;
+    let result = last_tool_result(&msgs);
+    assert!(result.contains("repaired-marker-9c1d"), "{result}");
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_tool_body_returns_err_rather_than_panicking_on_junk_args() {
     let registry = coder_registry();

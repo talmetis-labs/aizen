@@ -19,6 +19,7 @@ pub mod cmd_guard;
 pub mod codebase;
 pub mod compact;
 pub mod goal;
+pub mod lenient;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
@@ -1818,6 +1819,29 @@ where
             }
         };
 
+        // LENIENT TOOL-CALL RECOVERY: a provider that put the call in the TEXT — `<tool_call>` tags,
+        // a ```json fence, or a bare `{"name": …}` object — and sent an empty `tool_calls` array
+        // used to read as a final answer (the model's "call" echoed to the user) or, with nothing
+        // else in the text, as an empty-200. Lift it into a real call ONLY when the native array is
+        // empty and every name is a registered tool; prose with no such block is left alone. The
+        // arguments go through the same `parse_call_args` repair as native calls.
+        if turn.tool_calls.is_empty() {
+            if let Some(text) = turn.content.as_deref() {
+                if let Some((calls, rest)) =
+                    lenient::extract_text_tool_calls(text, |n| registry.get(n).is_some())
+                {
+                    if !cfg.quiet {
+                        emit_trace(&format!(
+                            "→ recovered {} tool call(s) written as text",
+                            calls.len()
+                        ));
+                    }
+                    turn.tool_calls = calls;
+                    turn.content = rest;
+                }
+            }
+        }
+
         // REAL-USAGE ANCHOR: when the provider reports how many prompt tokens THIS request really
         // was, trust that over chars/4 — the guards then track growth as (estimate delta) on top of
         // the real base. `est_now` was the estimate of the exact request just sent, so the pair is
@@ -3289,10 +3313,27 @@ pub fn eager_starter<'a>(
 /// Parse a call's STRINGIFIED arguments; empty → `{}`. Pure — shared by the safety partition and
 /// both execution paths (parsed exactly once per call).
 fn parse_call_args(raw: &str) -> Result<serde_json::Value, String> {
+    parse_call_args_traced(raw).map(|(v, _)| v)
+}
+
+/// `parse_call_args` plus a note when the strict parse failed and `lenient::repair_json_object`
+/// rescued it (trailing comma, raw newline in a string, brace cut by `max_tokens`, Python quotes).
+/// The note is traced by the executor so a repaired call is never silent; junk that no repair turns
+/// into an object keeps the strict error verbatim.
+fn parse_call_args_traced(raw: &str) -> Result<(serde_json::Value, Option<String>), String> {
     if raw.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), None));
     }
-    serde_json::from_str(raw).map_err(|e| format!("error: invalid JSON arguments: {e}"))
+    match serde_json::from_str(raw) {
+        Ok(v) => Ok((v, None)),
+        Err(e) => match lenient::repair_json_object(raw) {
+            Some(v) => Ok((
+                v,
+                Some(format!("repaired malformed JSON arguments ({e})")),
+            )),
+            None => Err(format!("error: invalid JSON arguments: {e}")),
+        },
+    }
 }
 
 /// Parse and repair one model tool call before any safety classification or execution. The repaired
@@ -3303,13 +3344,19 @@ fn prepare_call_args(
     registry: &ToolRegistry,
     tc: &ToolCall,
 ) -> Result<(serde_json::Value, Option<String>), String> {
-    let args = parse_call_args(&tc.function.arguments)?;
+    let (args, json_note) = parse_call_args_traced(&tc.function.arguments)?;
     let Some(tool) = registry.get(&tc.function.name) else {
-        return Ok((args, None));
+        return Ok((args, json_note));
     };
     match tools::repair_args(&tool.parameters(), &args) {
-        Some((fixed, what)) => Ok((fixed, Some(what))),
-        None => Ok((args, None)),
+        Some((fixed, what)) => Ok((
+            fixed,
+            Some(match json_note {
+                Some(j) => format!("{j}; {what}"),
+                None => what,
+            }),
+        )),
+        None => Ok((args, json_note)),
     }
 }
 
