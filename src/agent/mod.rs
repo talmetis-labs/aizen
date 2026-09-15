@@ -607,6 +607,11 @@ pub struct AgentConfig {
     /// the budget cut, and the cut result ends with the path. `0` disables. `file_read` is exempt
     /// (its file is already on disk).
     pub spill_result_over_chars: usize,
+    /// After this many successful edit-tool calls (across turns, reset by each check) the loop
+    /// runs the project's fast check itself and appends the verdict to the last tool result, so
+    /// the model does not spend a round-trip on `cargo check` between edit batches. A pass
+    /// latches the verify gate as satisfied. `0` disables. Needs `enable_verify_gate`.
+    pub harness_check_after_edits: usize,
     /// Re-show the todo list as a tail reminder every N loop iterations on long runs (recitation
     /// keeps the goal in the model's recent-attention span). `0` disables.
     pub todo_reminder_every: usize,
@@ -804,6 +809,7 @@ impl Default for AgentConfig {
             collapse_batch: 8,
             collapse_min_chars: 800,
             spill_result_over_chars: 16 * 1024,
+            harness_check_after_edits: 3,
             todo_reminder_every: 8,
             compact_at_pct: 80,
             context_guard_pct: 90,
@@ -1049,6 +1055,8 @@ where
     // CUMULATIVE edit flag — set once any successful edit lands; arms the one-shot self-review AND
     // gates the verify gate (a run that never edited has nothing to verify).
     let mut made_any_edits = false;
+    // Successful edit-tool calls since the last harness check (see `harness_check_after_edits`).
+    let mut edits_since_check: usize = 0;
     // WHERE the most recent successful edit landed (a directory), so the verify gate can typecheck
     // the tree the edit actually touched rather than the process cwd. The two differ constantly — a
     // session launched from the home directory editing `Desktop/proj/src/x.js` — exactly the gap the
@@ -1938,6 +1946,14 @@ where
             // the goal gate's `take_pending` drain must only happen at a real Done decision, and a
             // steer left in the mailbox is picked up by the top-of-loop drain for free anyway.
             let mut demands: Vec<String> = Vec::new();
+            // ASYNC FOLDS THAT FINISHED SINCE THE LAST TOOL RESULT: a new error in the edited file,
+            // or in a caller it broke, is a demand — the model fixes it before Done, in the same
+            // combined round-trip as the other gates.
+            for fold in crate::agent::lsp::LSP.take_ready_feedback() {
+                if fold.has_error {
+                    demands.push(format!("{}\nFix these before finishing.", fold.text));
+                }
+            }
             // Set when THIS round's verify ran and failed — self-review must not spend its
             // once-per-run oracle call reviewing code that is known-broken.
             let mut verify_failed_now = false;
@@ -2492,6 +2508,76 @@ where
             // flag gates that stamp: a phase that only talked (todo flipped, no file change) captures
             // nothing.
             made_edits_in_phase = true;
+        }
+
+        // ASYNC DIAGNOSTICS FOLD + HARNESS CHECK. (1) Post-edit diagnostics jobs that outran their
+        // own edit result (the edit no longer waits more than 300 ms for them) land on this turn's
+        // LAST tool result, callers included. (2) Once `harness_check_after_edits` successful edits
+        // have landed, the loop runs the project's fast check itself and appends the verdict, so
+        // the model does not spend a round-trip on `cargo check` before continuing; a pass latches
+        // `verify_passed` (the done gate then skips its own run), a failure is shown and the gate
+        // stays armed. Both ride an existing tool result: a fresh message here would sit between
+        // an assistant `tool_calls` and its results, which strict gateways reject.
+        {
+            let mut extra: Vec<String> = crate::agent::lsp::LSP
+                .take_ready_feedback()
+                .into_iter()
+                .map(|f| f.text)
+                .collect();
+            if edited_this_turn {
+                edits_since_check += successful_edit_calls(&calls, &results);
+            }
+            if cfg.enable_verify_gate
+                && cfg.harness_check_after_edits > 0
+                && edits_since_check >= cfg.harness_check_after_edits
+            {
+                edits_since_check = 0;
+                let cwd = cfg.effective_root();
+                let gate_dir = last_edit_dir
+                    .as_deref()
+                    .and_then(verify_gate::verify_root)
+                    .unwrap_or(cwd);
+                if let Some(result) =
+                    verify_gate::run_verify_gate(&gate_dir, cfg.verify_gate_timeout_secs).await
+                {
+                    let (ok, failure) = match &verify_baseline {
+                        Some(b) => {
+                            let d = verify_gate::compare_to_baseline(b, &result);
+                            if d.passed {
+                                (true, String::new())
+                            } else if d.new_diagnostics.is_empty() {
+                                (false, verify_gate::format_gate_failure(&result))
+                            } else {
+                                (false, verify_gate::format_delta_failure(&result, &d))
+                            }
+                        }
+                        None => (result.passed, verify_gate::format_gate_failure(&result)),
+                    };
+                    if !cfg.quiet {
+                        crate::ui::tui::verify_line(
+                            &result.command,
+                            if ok {
+                                "harness check passed after the edit batch"
+                            } else {
+                                "harness check FAILED after the edit batch"
+                            },
+                        );
+                    }
+                    if ok {
+                        verify_passed = true;
+                        extra.push(format!(
+                            "[harness check] `{}` passed after this edit batch — no separate check call is needed",
+                            result.command
+                        ));
+                    } else {
+                        extra.push(format!(
+                            "[harness check] `{}` FAILED after this edit batch:\n{failure}",
+                            result.command
+                        ));
+                    }
+                }
+            }
+            append_to_last_tool_result(&mut messages[base..], &extra);
         }
 
         // PHASE CHECKPOINT (replaces the old per-edit-turn snapshot). A "phase" is a unit of work the
@@ -3253,6 +3339,37 @@ async fn execute_calls(
 /// edit (result starts with `error:`) changed nothing, so it must NOT arm — otherwise the gate
 /// would run a typecheck and blame the agent for pre-existing breakage. `results` is in `calls`
 /// order (the `execute_calls` contract).
+/// Successful edit-tool calls among this turn's results: an error, a no-op and a dry-run wrote
+/// nothing, so they do not count toward the harness check.
+fn successful_edit_calls(calls: &[ToolCall], results: &[(String, String)]) -> usize {
+    calls
+        .iter()
+        .zip(results)
+        .filter(|(tc, (_, r))| {
+            is_edit_tool(&tc.function.name)
+                && !r.starts_with("error:")
+                && !r.starts_with(builtin::NOOP_WRITE_PREFIX)
+                && !r.starts_with(builtin::DRY_RUN_PREFIX)
+        })
+        .count()
+}
+
+/// Append `extra` blocks to the LAST tool result of `turn` (this turn's messages after the
+/// assistant turn). Nothing is inserted between an assistant `tool_calls` and its results.
+fn append_to_last_tool_result(turn: &mut [Message], extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    if let Some(m) = turn.iter_mut().rev().find(|m| m.role == "tool") {
+        let mut c = m.content.take().unwrap_or_default();
+        for e in extra {
+            c.push_str("\n\n");
+            c.push_str(e);
+        }
+        m.content = Some(c);
+    }
+}
+
 fn turn_made_edits(
     registry: &ToolRegistry,
     calls: &[ToolCall],
@@ -6295,6 +6412,53 @@ mod tests {
     }
 
     #[test]
+    fn successful_edit_calls_counts_only_edits_that_wrote() {
+        let calls = vec![
+            call("1", "file_edit", "{}"),
+            call("2", "file_edit", "{}"),
+            call("3", "file_edit", "{}"),
+            call("4", "file_write", "{}"),
+            call("5", "file_read", "{}"),
+            call("6", "file_edit", "{}"),
+        ];
+        let results: Vec<(String, String)> = vec![
+            ("1".into(), "edited a.rs (1 replacement(s))".into()),
+            ("2".into(), "error: old_string not found".into()),
+            (
+                "3".into(),
+                format!("{}: a.rs unchanged", builtin::NOOP_WRITE_PREFIX),
+            ),
+            ("4".into(), "wrote b.rs (3 line(s))".into()),
+            ("5".into(), "fn main() {}".into()),
+            (
+                "6".into(),
+                format!("{}: would edit c.rs", builtin::DRY_RUN_PREFIX),
+            ),
+        ];
+        assert_eq!(successful_edit_calls(&calls, &results), 2);
+    }
+
+    #[test]
+    fn append_to_last_tool_result_rides_the_last_tool_message() {
+        let mut turn = vec![
+            Message::tool_result("1", "first"),
+            Message::tool_result("2", "second"),
+        ];
+        append_to_last_tool_result(&mut turn, &["[harness check] passed".to_string()]);
+        assert_eq!(turn[0].content.as_deref(), Some("first"));
+        assert_eq!(
+            turn[1].content.as_deref(),
+            Some("second\n\n[harness check] passed")
+        );
+        assert_eq!(turn[1].tool_call_id.as_deref(), Some("2"), "pairing intact");
+        append_to_last_tool_result(&mut turn, &[]);
+        assert_eq!(
+            turn[1].content.as_deref(),
+            Some("second\n\n[harness check] passed")
+        );
+    }
+
+    #[test]
     fn count_diff_counts_only_column0_markers() {
         let out = "edited x (1)\n a\n-gone\n+added\n+also\n…(3 more lines added)\n b";
         assert_eq!(
@@ -6649,6 +6813,7 @@ mod tests {
             collapse_batch: 8,
             collapse_min_chars: 800,
             spill_result_over_chars: 16 * 1024,
+            harness_check_after_edits: 3,
             todo_reminder_every: 0, // recitation OFF in unit tests (todo state is process-global)
             compact_at_pct: 80,
             context_guard_pct: 90,
