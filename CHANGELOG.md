@@ -103,6 +103,16 @@ handing the model false inputs, and starts measuring what it sends.
   only (`api.anthropic.com`, `api.openai.com`), because some gateways cannot call a tool that was
   not advertised; `lean_tools` in `cli-config.json` turns it on or off explicitly. The effort line
   now names the shape, and `aizen prompt-size` prints the lean size beside the full one.
+- **Edit tool polish.** `replace_all` now applies on every matching rung, not only the exact
+  one — two identically indent-drifted blocks used to make the tolerant rung refuse with "add
+  more context" and cost a round-trip each. `dry_run: true` on `file_edit` computes and shows the
+  diff without writing (single, batch and create-new forms). The diff the model gets back keeps
+  the removed lines, the `@@` anchor and one `+N line(s)` row per hunk, at most three hunks; the
+  TUI still draws the full diff. A ten-edit batch used to echo ~800 lines of the model's own text
+  and hit the result cut. `file_glob` takes `ignore: true` to honour `.gitignore` and skip
+  `target/`, `node_modules/`, `.git/` like `search_files` (the default still sees everything, as
+  asked), and the five repository search tools end their descriptions with one shared routing
+  sentence instead of five partial cross-references.
 - **`format: concise | detailed` on `shell_run`, `process` and `search_files`**, concise by
   default. A short result is unchanged. A log over 4,000 chars keeps its status line, the head,
   the first error and the tail, states on its second line how many lines and bytes there were,

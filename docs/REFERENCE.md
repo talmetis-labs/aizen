@@ -665,6 +665,15 @@ Behavior worth knowing:
   ```json fence, a bare `{"name": …, "arguments": {…}}` reply or Mistral's `[TOOL_CALLS] [...]` —
   is executed when the native `tool_calls` array is empty and every name is a registered tool.
   Prose with no such block, or a block naming an unknown tool, is left exactly as written.
+- **Edits: `replace_all` on every rung, `dry_run`, and a diff the model does not re-read** —
+  `file_edit` matches on a ladder (exact, indentation-tolerant, whitespace-normalized, …) and
+  `replace_all` now applies on whichever rung matches. `dry_run: true` shows the diff and writes
+  nothing. The result the model sees keeps the removed lines, the `@@` line anchor and a
+  `+N line(s)` count per hunk (three hunks at most, the rest summed); the terminal still shows
+  the full diff. `file_glob` sees everything by default (dotfiles, `target/`, `node_modules/`);
+  `ignore: true` honours `.gitignore` and skips the heavy dirs the way `search_files` does. The
+  five search tools — `file_glob`, `search_files`, `codebase_search`, `lsp_workspace_symbol`,
+  `read_symbol` — end their descriptions with the same routing sentence.
 - **Concise tool output by default** — `shell_run`, `process` and `search_files` take
   `format: concise | detailed`. Concise, the default, changes nothing for a short result; a log
   over about 4,000 characters is cut to its status line, the head, the first error and the tail,
