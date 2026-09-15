@@ -86,6 +86,10 @@ pub struct WorkflowTask {
     /// attempt), and the outcome status carries `json:ok` / `json:invalid`.
     #[serde(default)]
     pub expects: Option<serde_json::Value>,
+    /// Findings the parent states as established (up to ten short lines) — handed to the child
+    /// in its `<parent_context>` block so it does not re-derive them (see `context_pack`).
+    #[serde(default)]
+    pub context: Option<Vec<String>>,
 }
 
 fn default_role() -> String {
@@ -948,9 +952,20 @@ async fn run_one_task(
     // Drive the loop over a LOCAL transcript (what `run_agent` did internally) so both exits
     // below can hand synthesis a deterministic partial report instead of "(no final answer)" —
     // a child that hit its deadline after twenty tool turns still reports which files it touched.
+    // What the parent already knows, ahead of the brief — the same pack a `task` dispatch gets.
+    let pack = crate::agent::context_pack::gather(
+        root,
+        &crate::core::exec_ctx::current()
+            .unwrap_or_default()
+            .resource_scope(),
+        task.context.as_deref().unwrap_or(&[]),
+    );
     let mut msgs = vec![
         Message::system(system.as_str()),
-        Message::user(task.prompt.as_str()),
+        Message::user(crate::agent::context_pack::prepend(
+            pack.as_deref(),
+            &task.prompt,
+        )),
     ];
     match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
         Ok(o) => {

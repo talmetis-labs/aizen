@@ -132,6 +132,10 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         .and_then(|v| v.as_u64())
                         .map(|n| n as usize),
                     expects: t.get("expects").filter(|v| v.is_object()).cloned(),
+                    context: {
+                        let c = crate::agent::context_pack::findings_from_args(t);
+                        (!c.is_empty()).then_some(c)
+                    },
                 });
             }
             // Singular-writer invariant — shared with CLI `run_workflow` via
@@ -213,7 +217,7 @@ impl Tool for WorkflowTool {
             "type": "object",
             "properties": {
                 "mode": {"type": "string", "enum": ["fanout", "verify"], "description": "fanout: run tasks in parallel and synthesize · verify: refute findings adversarially"},
-                "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (request what the work needs; the harness bounds concurrent width by machine)", "items": {"type": "object", "properties": {
+                "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (the harness bounds the width)", "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string", "description": "complete, self-contained task"},
                     "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "default nemesis (read-only review); daedalus/themis are the writers — at most one writer per workflow. argus=find · metis=plan · clio=web research · mnemosyne=history. Legacy coder/planner/reviewer/tester names are also accepted"},
@@ -221,6 +225,7 @@ impl Tool for WorkflowTool {
                     "model": {"type": "string"},
                     "boundaries": {"type": "string", "description": "what this child must NOT do or touch"},
                     "expected_output": {"type": "string", "description": "the shape/content of the answer wanted back"},
+                    "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
                     "max_steps": {"type": "integer", "description": "TOTAL step budget for this child (cap 80)"},
                     "expects": {"type": "object", "description": "JSON Schema the child's final answer must satisfy (validated; status carries json:ok|json:invalid)"}
                 }, "required": ["prompt"], "additionalProperties": false}},
@@ -418,6 +423,23 @@ mod tests {
         assert!(!task_is_writer("planner", None));
         // An unresolvable agent slug falls back to coder (write) scope at run time → count as writer.
         assert!(task_is_writer("reviewer", Some("__no_such_agent__")));
+    }
+
+    #[test]
+    fn fanout_tasks_carry_context_findings() {
+        let (spec, _) = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [
+                {"prompt": "review a", "context": ["- parser is in a.rs", "  ", "b"]},
+                {"prompt": "plan b"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.tasks[0].context.as_deref(),
+            Some(&["parser is in a.rs".to_string(), "b".to_string()][..])
+        );
+        assert!(spec.tasks[1].context.is_none(), "absent stays absent");
     }
 
     #[test]

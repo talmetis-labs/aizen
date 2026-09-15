@@ -18,6 +18,7 @@ pub mod clarify;
 pub mod cmd_guard;
 pub mod codebase;
 pub mod compact;
+pub mod context_pack;
 pub mod goal;
 pub mod lenient;
 pub mod lsp;
@@ -2674,10 +2675,12 @@ where
                     read_cache_key(&read_cache_scope, &canonical_args(&tc.function.arguments)),
                     ReadCacheEntry {
                         files,
+                        windows: read_windows(&args),
                         msg_index: base + k,
                         call_id: call_id.clone(),
                         result_chars: result.chars().count(),
                         result_prefix: result.chars().take(48).collect(),
+                        seq: READ_CACHE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     },
                 );
             }
@@ -4627,13 +4630,22 @@ struct ReadCacheEntry {
     /// with NO destructive call, so each fingerprint provably equals the content at read time
     /// (nothing in the same turn could have rewritten the file between the read and the record).
     files: Vec<(std::path::PathBuf, crate::core::persist::FileFingerprint)>,
+    /// The requested line window per file, aligned with `files` (see [`read_windows`]) — kept
+    /// so the context pack can say `path:start-end`, not just `path`. The key's canonical
+    /// args are NOT JSON (keys unquoted), so this is recorded here, not re-parsed from there.
+    windows: Vec<ReadWindow>,
     /// Where the result message sat when recorded — revalidated against id+len+prefix below, so a
     /// shifted (compacted) or blanked (evicted) history can never false-match.
     msg_index: usize,
     call_id: String,
     result_chars: usize,
     result_prefix: String,
+    /// Insertion order, so "the newest N reads in a scope" is well-defined — the context
+    /// pack hands a delegated child the parent's most recent reading list.
+    seq: u64,
 }
+
+static READ_CACHE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The short-circuit store, process-global and keyed by `{scope}\u{1f}{canonical args}` so it
 /// SURVIVES the loop that recorded it: history persists across user turns, but the cache used to be
@@ -4678,6 +4690,64 @@ fn read_cache_clear_scope(scope: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|k, _| !k.starts_with(&prefix));
+}
+
+/// The line window a `file_read` call asked for: `(start, Some(end))` for a ranged read,
+/// `(start, None)` for one that ran to the end of the file, `None` for a whole-file read.
+pub(crate) type ReadWindow = Option<(usize, Option<usize>)>;
+
+/// The line window a `file_read` call asked for, per file: `(start, Some(end))` for a ranged
+/// read, `(start, None)` for one that ran to the end of the file, `None` for a whole-file read.
+/// One entry per `files:[…]` item for the batch form, one for the single-path form.
+fn read_windows(args: &serde_json::Value) -> Vec<ReadWindow> {
+    let window = |v: &serde_json::Value| -> ReadWindow {
+        let start = v.get("start").and_then(|x| x.as_u64()).map(|n| n as usize);
+        let end = v.get("end").and_then(|x| x.as_u64()).map(|n| n as usize);
+        match (start, end) {
+            (None, None) => None,
+            (s, e) => Some((s.unwrap_or(1), e)),
+        }
+    };
+    match args.get("files").and_then(|f| f.as_array()) {
+        Some(items) => items.iter().map(window).collect(),
+        None => vec![window(args)],
+    }
+}
+
+/// The locations recorded in `scope`'s read cache, newest first: `(resolved path, line window)`
+/// per file — the parent's own reading list, which `context_pack` hands to a delegated child.
+/// The batch `files:[…]` form yields one row per file; duplicates collapse.
+pub(crate) fn read_cache_recent(scope: &str, max: usize) -> Vec<(std::path::PathBuf, ReadWindow)> {
+    let prefix = format!("{scope}\u{1f}");
+    let mut rows: Vec<(u64, std::path::PathBuf, ReadWindow)> = Vec::new();
+    {
+        let map = read_cache_store().lock().unwrap_or_else(|e| e.into_inner());
+        for (key, entry) in map.iter() {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            for (i, (path, _)) in entry.files.iter().enumerate() {
+                rows.push((
+                    entry.seq,
+                    path.clone(),
+                    entry.windows.get(i).copied().flatten(),
+                ));
+            }
+        }
+    }
+    // Stable sort: files of one batch read keep their spec order under the same seq.
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let mut out: Vec<(std::path::PathBuf, ReadWindow)> = Vec::new();
+    for (_, path, w) in rows {
+        if out.iter().any(|(p, x)| *p == path && *x == w) {
+            continue;
+        }
+        out.push((path, w));
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
 }
 
 fn turn_signature(calls: &[ToolCall]) -> String {
@@ -6112,6 +6182,71 @@ mod tests {
     use super::*;
     use crate::core::types::FunctionCall;
     use std::collections::VecDeque;
+
+    #[test]
+    fn read_cache_recent_lists_newest_first_with_line_windows() {
+        let scope = format!("ctx-pack-test-{}", std::process::id());
+        let fp = crate::core::persist::FileFingerprint::for_bytes(b"x");
+        let entry = |files: Vec<&str>, windows: Vec<ReadWindow>| ReadCacheEntry {
+            files: files
+                .into_iter()
+                .map(|p| (std::path::PathBuf::from(p), fp.clone()))
+                .collect(),
+            windows,
+            msg_index: 0,
+            call_id: "c".into(),
+            result_chars: 0,
+            result_prefix: String::new(),
+            seq: READ_CACHE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        read_cache_insert(
+            read_cache_key(
+                &scope,
+                &canonical_args(r#"{"path":"a.rs","start":10,"end":20}"#),
+            ),
+            entry(
+                vec!["/r/a.rs"],
+                read_windows(&serde_json::json!({"start": 10, "end": 20})),
+            ),
+        );
+        read_cache_insert(
+            read_cache_key(
+                &scope,
+                &canonical_args(r#"{"files":[{"path":"b.rs"},{"path":"c.rs","start":5}]}"#),
+            ),
+            entry(
+                vec!["/r/b.rs", "/r/c.rs"],
+                read_windows(
+                    &serde_json::json!({"files": [{"path": "b.rs"}, {"path": "c.rs", "start": 5}]}),
+                ),
+            ),
+        );
+        read_cache_insert(
+            read_cache_key("ctx-pack-other", &canonical_args(r#"{"path":"z.rs"}"#)),
+            entry(vec!["/r/z.rs"], vec![None]),
+        );
+        let show = |rows: Vec<(std::path::PathBuf, ReadWindow)>| {
+            rows.iter()
+                .map(|(p, w)| {
+                    let p = p.to_string_lossy().replace('\\', "/");
+                    match w {
+                        Some((a, Some(b))) => format!("{p}:{a}-{b}"),
+                        Some((a, None)) => format!("{p}:{a}-"),
+                        None => p,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        // Newest first; the batch read's files keep their order; other scopes stay out.
+        assert_eq!(
+            show(read_cache_recent(&scope, 10)),
+            vec!["/r/b.rs", "/r/c.rs:5-", "/r/a.rs:10-20"]
+        );
+        assert_eq!(show(read_cache_recent(&scope, 1)), vec!["/r/b.rs"]);
+        read_cache_clear_scope(&scope);
+        read_cache_clear_scope("ctx-pack-other");
+        assert!(read_cache_recent(&scope, 10).is_empty());
+    }
     use std::sync::Mutex;
 
     // ── per-lane workspace root ────────────────────────────────────────────

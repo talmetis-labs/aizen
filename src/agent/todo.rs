@@ -62,6 +62,16 @@ pub fn snapshot() -> Vec<Todo> {
     TODOS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The item currently in progress, if any — what a delegated child is told its parent is doing.
+pub fn active_item() -> Option<String> {
+    TODOS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|t| t.status == Status::InProgress)
+        .map(|t| t.content.clone())
+}
+
 /// Wipe the list (called on `/clear` / a fresh conversation).
 pub fn clear() {
     TODOS.lock().unwrap_or_else(|e| e.into_inner()).clear();

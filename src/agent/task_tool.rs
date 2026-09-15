@@ -626,6 +626,7 @@ impl Tool for TaskTool {
                 "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
                 "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
+                "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
                 "max_steps": {"type": "integer", "description": "TOTAL model-step budget for this child (default set by the role, 15-45; cap 80); use workflow instead of raising this for independent work"},
                 "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the sub-agent replies with ONLY a JSON object and the harness validates it (result header shows json:ok|invalid)"}
             },
@@ -785,6 +786,13 @@ impl Tool for TaskTool {
         // tool-body progress from the parent transcript. The orchestration row remains the visible
         // progress surface.
         let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        // What the parent already knows, ahead of the brief: its reading list (from its
+        // read-cache scope), the findings it passed as `context`, and its in-progress todo.
+        let pack = crate::agent::context_pack::gather(
+            &self.root,
+            &parent_ctx.resource_scope(),
+            &crate::agent::context_pack::findings_from_args(args),
+        );
         let child_scope = format!(
             "{}/task/{}",
             parent_ctx.resource_scope(),
@@ -886,7 +894,10 @@ impl Tool for TaskTool {
         let outcome = tokio::task::block_in_place(|| {
             let _effort = crate::core::cli_config::suppress_effort_override();
             tokio::runtime::Handle::current().block_on(async {
-                let mut msgs = vec![Message::system(system.as_str()), Message::user(prompt)];
+                let mut msgs = vec![
+                    Message::system(system.as_str()),
+                    Message::user(crate::agent::context_pack::prepend(pack.as_deref(), prompt)),
+                ];
                 let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs).await
                 {
                     Ok(o) => o,
