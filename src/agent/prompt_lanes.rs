@@ -144,6 +144,15 @@ pub(crate) const CODEBASE_RETRIEVAL_BUDGET_TOKENS: usize = 1500;
 /// Fresh user-turn boundary: refresh only the dynamic lane, preserving stable index 0 byte-for-byte.
 pub(crate) fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &str) {
     migrate_legacy_prompt_lanes(history, model);
+    // E4.6: a convention file added, edited or removed mid-conversation is live on the next
+    // message. The conventions sit in the STABLE lane, so both lanes are rebuilt — the one
+    // per-turn path that may bust the prefix cache, and only when a stat says a file changed.
+    if let Ok(cwd) = std::env::current_dir() {
+        if agent::project_context::conventions_changed(&cwd) {
+            splice_prompt_lanes(history, active_system_prompt_bundle(model));
+            return;
+        }
+    }
     let dynamic = active_system_prompt_bundle(model).dynamic;
     let lead = agent::compact::leading_system_count(history);
     if dynamic.trim().is_empty() {

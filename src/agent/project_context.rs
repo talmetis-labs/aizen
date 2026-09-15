@@ -6,7 +6,10 @@
 //! all) is returned when nothing is found — preserving the byte-stable prompt prefix for projects
 //! that ship no conventions file.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// Max chars of merged project context injected into the prompt — generous but bounded so a giant
 /// committed doc can't blow the context budget (and keeps the cached prefix a sane size).
@@ -15,9 +18,45 @@ const MAX_CONTEXT_CHARS: usize = 12_000;
 /// Hard cap on directories climbed, as insurance against a pathological tree / missing repo root.
 const MAX_CLIMB: usize = 40;
 
-/// Convention filenames, in priority order WITHIN a directory (first found per dir wins, so an
-/// `AGENTS.md` beside a `CLAUDE.md` isn't double-counted).
+/// Convention filenames, in the order they are emitted WITHIN a directory. Both are read when both
+/// exist: the first-found-wins rule let a one-paragraph `AGENTS.md` pointer hide a full
+/// `CLAUDE.md` (quality plan M10 — this repo's own 7 KB file was never in the prompt).
 const CONVENTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+/// `(mtime, len)` of a convention file; `None` when it does not exist.
+type Stamp = (SystemTime, u64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())))
+}
+
+/// What the last load from each working directory read or probed, so a mid-conversation edit can
+/// be noticed by stats alone (quality plan M10: the conventions were never re-read inside a
+/// conversation). Keyed by the canonical cwd, so two sandboxes — or two hostbot lanes — never
+/// see each other's record.
+/// What one load probed: every candidate path and the stamp it had (`None` = absent).
+type Probed = Vec<(PathBuf, Option<Stamp>)>;
+
+fn probed_map() -> &'static Mutex<HashMap<PathBuf, Probed>> {
+    static MAP: OnceLock<Mutex<HashMap<PathBuf, Probed>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Has any convention file on the path from `cwd` to the repo root appeared, changed or vanished
+/// since the last [`load_project_context`] from there? Stats only — reads nothing. `false` when
+/// nothing has been loaded from `cwd` yet: nothing adopted, nothing to refresh.
+pub fn conventions_changed(cwd: &Path) -> bool {
+    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let Ok(map) = probed_map().lock() else {
+        return false;
+    };
+    let Some(probed) = map.get(&start) else {
+        return false;
+    };
+    probed.iter().any(|(path, seen)| stamp(path) != *seen)
+}
 
 /// Load merged project conventions for `cwd`, or `None` if none exist on the path to the repo root.
 ///
@@ -47,20 +86,21 @@ pub fn load_project_context(cwd: &Path) -> Option<String> {
     let label_base = dirs.first().cloned().unwrap_or_else(|| start.clone());
 
     let mut sections: Vec<String> = Vec::new();
+    let mut probed: Probed = Vec::new();
     for dir in &dirs {
         for name in CONVENTION_FILES {
             let path = dir.join(name);
-            match std::fs::read_to_string(&path) {
-                Ok(body) => {
-                    let body = body.trim();
-                    if !body.is_empty() {
-                        sections.push(format!("# {}\n{}", display_label(&path, &label_base), body));
-                    }
-                    break; // one convention file per directory
+            probed.push((path.clone(), stamp(&path)));
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                let body = body.trim();
+                if !body.is_empty() {
+                    sections.push(format!("# {}\n{}", display_label(&path, &label_base), body));
                 }
-                Err(_) => continue,
             }
         }
+    }
+    if let Ok(mut map) = probed_map().lock() {
+        map.insert(start.clone(), probed);
     }
     if sections.is_empty() {
         return None;
@@ -109,6 +149,56 @@ mod tests {
     }
 
     #[test]
+    fn both_convention_files_in_a_directory_are_honoured_agents_first() {
+        let root = sandbox("both");
+        write(&root, "AGENTS.md", "POINTER: see CLAUDE.md");
+        write(&root, "CLAUDE.md", "THE_FULL_RULES");
+        let ctx = load_project_context(&root).unwrap();
+        assert!(
+            ctx.contains("# AGENTS.md") && ctx.contains("POINTER"),
+            "{ctx}"
+        );
+        assert!(
+            ctx.contains("# CLAUDE.md") && ctx.contains("THE_FULL_RULES"),
+            "{ctx}"
+        );
+        assert!(
+            ctx.find("# AGENTS.md") < ctx.find("# CLAUDE.md"),
+            "AGENTS.md first, CLAUDE.md after: {ctx}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_convention_edit_is_noticed_by_stats_until_the_next_load() {
+        let root = sandbox("changed");
+        write(&root, "AGENTS.md", "v1");
+        assert!(
+            !conventions_changed(&root),
+            "nothing loaded yet, nothing to refresh"
+        );
+        let _ = load_project_context(&root);
+        assert!(!conventions_changed(&root), "just loaded");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&root, "AGENTS.md", "v2 — longer");
+        assert!(conventions_changed(&root), "an edit is a change");
+        let _ = load_project_context(&root);
+        assert!(!conventions_changed(&root), "the reload adopts it");
+        write(&root, "CLAUDE.md", "appeared");
+        assert!(
+            conventions_changed(&root),
+            "a file that appears is a change"
+        );
+        let _ = load_project_context(&root);
+        std::fs::remove_file(root.join("CLAUDE.md")).unwrap();
+        assert!(
+            conventions_changed(&root),
+            "a file that vanishes is a change"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn none_when_absent() {
         let root = sandbox("absent");
         assert!(load_project_context(&root).is_none());
@@ -142,19 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_read_compat_and_one_per_dir() {
-        let root = sandbox("compat");
-        // AGENTS.md takes priority over CLAUDE.md within the same dir (only one counted).
-        write(&root, "AGENTS.md", "FROM_AGENTS");
-        write(&root, "CLAUDE.md", "FROM_CLAUDE");
-        let ctx = load_project_context(&root).expect("should load");
-        assert!(ctx.contains("FROM_AGENTS"));
-        assert!(
-            !ctx.contains("FROM_CLAUDE"),
-            "AGENTS.md wins within a dir: {ctx}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-
+    fn claude_md_alone_is_read() {
+        // Both files together are covered by `both_convention_files_in_a_directory_are_honoured_agents_first`
+        // (E4.6 ended the first-found-wins rule); this pins that CLAUDE.md on its own is read.
         let root2 = sandbox("compat2");
         write(&root2, "CLAUDE.md", "ONLY_CLAUDE");
         let ctx2 = load_project_context(&root2).expect("should load");
