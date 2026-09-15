@@ -630,6 +630,16 @@ Behavior worth knowing:
   also change the model: `"models_by_effort": {"low": "cheap-model", "max": "strong-model"}` in
   `cli-config.json` sends turns of that tier to that model on the same endpoint (the effort line
   then names it); tiers without an entry use the main model.
+- **Architect mode under `max`.** A multi-file turn at `max` effort is planned first: `metis` on
+  the strongest configured model (`models_by_effort.max`, else `xhigh`, else the turn's model)
+  writes an ordered plan in prose — file:line anchors, the change and its check per step, what
+  not to touch, the verifying command, no code — and the turn's own loop then applies it on the
+  fastest model (`models_by_effort.low`, else the same model) at low wire effort, the plan folded
+  into the request under `<architect_plan>` and the `max` budgets (steps, verify rounds,
+  self-review) kept. The status line says `architect: plan by metis on X → applying on Y`.
+  Single-file turns, questions and research never enter it; a planner that fails or returns
+  nothing leaves the turn as it would have run. Off with `architect_mode: false` or
+  `AIZEN_ARCHITECT=0`.
 - **Images are attached, not described.** `--image <PATH>` inlines a PNG/JPEG/GIF/WebP (≤ 8 MB) into
   the first user message as an `image_url` data part — the same wire shape the REPL produces when you
   drag a file onto the window or press Ctrl-O to grab a screenshot — so a front-end driving this

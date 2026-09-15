@@ -175,7 +175,14 @@ it too; within a wave the readers run BEFORE the writer (a consistent pre-edit s
 review that must see the change says `after`); both attempts of a retried task stay in the
 trace as `id` and `id#2`. The "done when" (a themis FAIL triggers exactly one daedalus retry)
 is pinned by `schedule_runs_waves_in_order_and_fix_loops_once` against a scripted runner; the
-unattended live run of `aizen workflow implement.json` waits for an endpoint.
+unattended live run of `aizen workflow implement.json` waits for an endpoint. E2.4 implemented
+(`src/agent/architect.rs`, `repl::turn::architect_phase`, hooks in both REPLs and `aizen agent`,
+`architect_mode` config + `AIZEN_ARCHITECT` env). Deviation (m): the "themis" leg is the turn's
+own verify gate and post-edit harness check rather than a third child — a separate themis would
+re-run the same commands — and the editor phase keeps the `max` tier's harness budgets, dropping
+only the wire `reasoning_effort` to `low`, because a multi-file change on `low`'s twelve steps
+would be cut off mid-plan. The "done when" (a suite multi-file task passes with lower wall-clock
+than the single-model run) stays unmeasured until tapes and a second model exist.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

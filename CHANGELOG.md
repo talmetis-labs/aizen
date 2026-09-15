@@ -202,6 +202,15 @@ handing the model false inputs, and starts measuring what it sends.
   with the failure attached, then runs again; both attempts stay in the trace as `id` and
   `id#2`. `workflow(mode="implement", prompt=…)` prebuilds daedalus → themis → nemesis with
   that fix loop, and a workflow writer now runs under the verify gate like a `task` writer.
+- **Architect mode: a strong model thinks, a fast model types.** Under `/effort max` a
+  multi-file turn is planned first by `metis` on the strongest configured model
+  (`models_by_effort.max`, else `xhigh`, else the turn's model) — an ordered plan in prose with
+  file:line anchors and a check per step, no code — and then applied by the turn's own loop on
+  the fastest (`models_by_effort.low`, else the same model) at low wire effort, with the plan
+  folded into the request and the `max` tier's harness budgets untouched. Single-file turns,
+  questions and research never enter it; a planner that produces nothing usable leaves the
+  turn as it would have run. `architect_mode: false` in `cli-config.json` or `AIZEN_ARCHITECT=0`
+  turns it off. Works in both REPLs and in `aizen agent`.
 
 ## [0.6.7] — 2026-09-11
 
