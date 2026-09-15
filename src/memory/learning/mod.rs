@@ -187,6 +187,15 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
             &lineage,
             &tiering::fs_exists,
         );
+        // The stored type follows the placement: a `user`-typed sentence the rule re-filed as
+        // `place` is a project fact for display and filtering too (`mtype_for`).
+        let mtype = if choice.tier != Tier::User
+            && matches!(c.mtype, MemoryType::User | MemoryType::Feedback)
+        {
+            secretary::mtype_for(choice.tier)
+        } else {
+            c.mtype
+        };
         let is_inferred = provenance == ProvenanceKind::Inferred;
         let r = route::route(&c, &s);
 
@@ -213,7 +222,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                     let w = LearnedWrite {
                         name: &c.name,
                         description: "",
-                        mtype: c.mtype,
+                        mtype,
                         body: &clean,
                         source: provenance,
                         confidence: c.confidence * choice.confidence_mult,
@@ -235,7 +244,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
             Route::Store => {
                 apply_store(
                     &clean,
-                    &c.mtype,
+                    &mtype,
                     provenance,
                     c.confidence * choice.confidence_mult,
                     false,
