@@ -178,12 +178,20 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         .unwrap_or_else(|| format!("t{}", i + 1)),
                     role,
                     agent: t.get("agent").and_then(|v| v.as_str()).map(str::to_string),
-                    prompt: t
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("task #{} is missing 'prompt'", i + 1))?
-                        .to_string(),
+                    prompt: {
+                        let p = t
+                            .get("prompt")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("task #{} is missing 'prompt'", i + 1)
+                            })?;
+                        // Same bar as a `task` dispatch: a child cannot work from a line.
+                        if let Some(why) = crate::agent::task_tool::thin_brief(p) {
+                            bail!("task #{}: {why}", i + 1);
+                        }
+                        p.to_string()
+                    },
                     model: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
                     boundaries: opt_str("boundaries"),
                     expected_output: opt_str("expected_output"),
@@ -238,6 +246,9 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("implement mode requires a non-empty 'prompt'"))?;
+            if let Some(why) = crate::agent::task_tool::thin_brief(prompt) {
+                bail!("implement: {why}");
+            }
             Ok((implement_spec(prompt), true))
         }
         "verify" => {
@@ -414,7 +425,7 @@ mod tests {
             "tasks": [{
                 "id": "review-auth",
                 "role": "nemesis",
-                "prompt": "review the auth changes",
+                "prompt": "review the auth changes in src/auth.rs",
                 "boundaries": "Do not edit files",
                 "expected_output": "Findings with severity and file:line",
                 "max_steps": 12,
@@ -446,8 +457,8 @@ mod tests {
         let err = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "edit a", "role": "coder"},
-                {"prompt": "edit b", "role": "coder"}
+                {"prompt": "edit src/a.rs", "role": "coder"},
+                {"prompt": "edit src/b.rs", "role": "coder"}
             ]
         }))
         .unwrap_err()
@@ -457,8 +468,8 @@ mod tests {
         let (spec, synth) = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "edit a", "role": "coder"},
-                {"prompt": "review b", "role": "reviewer"}
+                {"prompt": "edit src/a.rs", "role": "coder"},
+                {"prompt": "review src/b.rs", "role": "reviewer"}
             ]
         }))
         .unwrap();
@@ -484,7 +495,7 @@ mod tests {
         // The per-call cap is now 32 (the model requests what the work needs; concurrent WIDTH is
         // bounded separately by the machine-derived gate). A batch under the cap is accepted…
         let six: Vec<_> = (0..6)
-            .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
+            .map(|i| serde_json::json!({"prompt": format!("review src/t{i}.rs"), "role": "reviewer"}))
             .collect();
         assert!(
             build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_ok(),
@@ -492,7 +503,7 @@ mod tests {
         );
         // …and only an absurd batch past the disaster-stop cap is rejected.
         let too_many: Vec<_> = (0..33)
-            .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
+            .map(|i| serde_json::json!({"prompt": format!("review src/t{i}.rs"), "role": "reviewer"}))
             .collect();
         assert!(
             build_spec(&serde_json::json!({"mode": "fanout", "tasks": too_many})).is_err(),
@@ -544,10 +555,10 @@ mod tests {
         let (spec, _) = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"id": "a", "prompt": "x", "role": "argus"},
-                {"id": "b", "prompt": "x", "role": "clio"},
-                {"id": "c", "prompt": "x", "after": ["a", " b "]},
-                {"id": "d", "prompt": "x", "after": "a, c"}
+                {"id": "a", "prompt": "scan src/x.rs", "role": "argus"},
+                {"id": "b", "prompt": "scan src/x.rs", "role": "clio"},
+                {"id": "c", "prompt": "scan src/x.rs", "after": ["a", " b "]},
+                {"id": "d", "prompt": "scan src/x.rs", "after": "a, c"}
             ]
         }))
         .unwrap();
@@ -555,7 +566,7 @@ mod tests {
         assert_eq!(spec.tasks[3].after, ["a", "c"]);
         let err = build_spec(&serde_json::json!({
             "mode": "fanout",
-            "tasks": [{"id": "a", "prompt": "x", "after": ["nope"]}]
+            "tasks": [{"id": "a", "prompt": "scan src/x.rs", "after": ["nope"]}]
         }))
         .unwrap_err()
         .to_string();
@@ -563,12 +574,32 @@ mod tests {
     }
 
     #[test]
+    fn thin_task_briefs_are_refused_in_fanout_and_implement() {
+        let err = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{"id": "a", "prompt": "review it", "role": "nemesis"}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("task #1: brief too thin"), "{err}");
+        let err = build_spec(&serde_json::json!({"mode": "implement", "prompt": "fix it"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("implement: brief too thin"), "{err}");
+        assert!(build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{"id": "a", "prompt": "review src/parser.rs for off-by-one errors"}]
+        }))
+        .is_ok());
+    }
+
+    #[test]
     fn fanout_tasks_carry_context_findings() {
         let (spec, _) = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "review a", "context": ["- parser is in a.rs", "  ", "b"]},
-                {"prompt": "plan b"}
+                {"prompt": "review src/a.rs", "context": ["- parser is in a.rs", "  ", "b"]},
+                {"prompt": "plan src/b.rs"}
             ]
         }))
         .unwrap();
@@ -585,8 +616,8 @@ mod tests {
         let (spec, _) = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "review a", "role": "reviewer"},
-                {"prompt": "plan b", "role": "planner"}
+                {"prompt": "review src/a.rs", "role": "reviewer"},
+                {"prompt": "plan src/b.rs", "role": "planner"}
             ]
         }))
         .unwrap();

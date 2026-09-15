@@ -629,7 +629,18 @@ async fn run_workflow_with_cancel(
         .as_ref()
         .and_then(|s| s.prompt.as_deref())
         .unwrap_or(default_instruction);
-    let synth_prompt = build_synthesis_prompt_capped(&spec.name, instruction, &results, None);
+    // The same cap the `workflow` tool applies: two chars per token of the model's window, never
+    // below one summary. The CLI passed `None` here, so a 32-task spec could build a ~128 k-char
+    // synthesis request that the endpoint then refused.
+    let window = crate::ui::context_report::resolve_ctx_window(model).0;
+    let synth_prompt = build_synthesis_prompt_capped(
+        &spec.name,
+        instruction,
+        &results,
+        window
+            .checked_mul(2)
+            .filter(|&chars| chars >= SUMMARY_CHAR_CAP),
+    );
 
     // Optional audit trace of the fan-out (per-task model + outcome + the synthesis model). Written
     // BEFORE synthesis so a synthesis failure still leaves the fan-out record. Best-effort.

@@ -725,6 +725,11 @@ impl Tool for TaskTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .context("missing required string arg 'prompt'")?;
+        // A child starts with an empty context: a brief that names nothing to look at sends it
+        // searching for the parent's own question. Refused before a slot or a token is spent.
+        if let Some(why) = thin_brief(prompt) {
+            bail!(why);
+        }
 
         // Agent-vs-role resolution (no network) — a resolvable `agent` slug supersedes `role`. The
         // endpoint rides ALONG the model: `base`/`key` come from the dispatch (registry-routed), not
@@ -1105,6 +1110,45 @@ impl Tool for TaskTool {
             outcome.iters
         ))
     }
+}
+
+/// The shortest brief that is not refused, in chars — below it a brief must at least name a
+/// file or a symbol.
+pub(crate) const THIN_BRIEF_CHARS: usize = 80;
+
+/// Does the brief name something to look at? A path (`src/a.rs`, `dir/`), a file (`main.py`),
+/// a symbol (`parse_kv`, `Foo::bar`, `run()`), or a backticked token all count.
+pub(crate) fn names_a_target(brief: &str) -> bool {
+    brief.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && !"/\\._:()`".contains(c));
+        w.contains('/')
+            || w.contains('\\')
+            || w.contains("::")
+            || w.contains("()")
+            || w.starts_with('`')
+            || w.chars().filter(|c| *c == '_').count() >= 1
+                && w.chars().any(|c| c.is_alphanumeric())
+            || w.rsplit_once('.').is_some_and(|(stem, ext)| {
+                !stem.is_empty()
+                    && (1..=5).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+    })
+}
+
+/// Why a brief is too thin to dispatch, or `None` when it is fine: under
+/// [`THIN_BRIEF_CHARS`] and naming no file or symbol. The message tells the model what a
+/// usable brief carries, and that the alternative is to do the small thing itself.
+pub(crate) fn thin_brief(brief: &str) -> Option<String> {
+    let n = brief.trim().chars().count();
+    if n >= THIN_BRIEF_CHARS || names_a_target(brief) {
+        return None;
+    }
+    Some(format!(
+        "brief too thin ({n} chars, no file or symbol named): a sub-agent starts with an empty \
+         context, so say WHICH files or symbols to look at, WHAT to return (expected_output), \
+         and what is already established (context) — or do this small thing yourself"
+    ))
 }
 
 /// Does a writer's stop reason earn the one retry? Only the two that leave a half-done tree
@@ -1621,6 +1665,45 @@ mod tests {
             depth,
             0,
         )
+    }
+
+    #[test]
+    fn thin_briefs_are_refused_unless_they_name_a_target() {
+        assert!(thin_brief("fix it").is_some());
+        assert!(thin_brief("review the change").is_some());
+        assert!(
+            thin_brief("fix the bug in src/parser.rs").is_none(),
+            "a path"
+        );
+        assert!(
+            thin_brief("find every caller of parse_kv").is_none(),
+            "a symbol"
+        );
+        assert!(thin_brief("read main.py and report").is_none(), "a file");
+        assert!(
+            thin_brief("where is Foo::bar used").is_none(),
+            "a scoped symbol"
+        );
+        assert!(thin_brief("does run() retry?").is_none(), "a call");
+        assert!(
+            thin_brief("look at `Config`").is_none(),
+            "a backticked token"
+        );
+        let long = "summarize what this repository does, who it is for, and how a new \
+                    contributor would build and test it";
+        assert!(long.chars().count() >= THIN_BRIEF_CHARS);
+        assert!(
+            thin_brief(long).is_none(),
+            "a full brief passes without a path"
+        );
+        let why = thin_brief("fix it").unwrap();
+        assert!(why.contains("expected_output") && why.contains("do this small thing yourself"));
+        // The tool refuses before spending a slot or a token.
+        let err = tool(0)
+            .execute(&serde_json::json!({"prompt": "fix it"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("brief too thin"), "{err}");
     }
 
     #[test]
