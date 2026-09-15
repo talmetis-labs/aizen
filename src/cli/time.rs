@@ -32,7 +32,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             Ok(())
         }
         TimeCmd::Restore { id } => {
-            let snap = timemachine::restore(id)?;
+            let (snap, removed) = timemachine::restore_with_report(id)?;
             let label = if snap.label.is_empty() {
                 "(no label)".to_string()
             } else {
@@ -47,6 +47,7 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             // never your chat/history — and because the pre-restore state was auto-snapshotted, you
             // can always go forward again (`aizen time redo`, or restore the newest checkpoint).
             println!("{}", style("  files only — your conversation is untouched · reversible with `aizen time redo`").dim());
+            print_removed(&removed);
             Ok(())
         }
         TimeCmd::Diff {
@@ -57,21 +58,23 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             json,
         } => run_time_diff(from, to, paths, patch, json),
         TimeCmd::Undo => {
-            let snap = timemachine::undo()?;
+            let (snap, removed) = timemachine::undo_with_report()?;
             println!(
                 "{} #{}",
                 style("⏪ undo →").color256(splash::ACCENT),
                 snap.id
             );
+            print_removed(&removed);
             Ok(())
         }
         TimeCmd::Redo => {
-            let snap = timemachine::redo()?;
+            let (snap, removed) = timemachine::redo_with_report()?;
             println!(
                 "{} #{}",
                 style("⏩ redo →").color256(splash::ACCENT),
                 snap.id
             );
+            print_removed(&removed);
             Ok(())
         }
         TimeCmd::Prune { keep } => {
@@ -608,4 +611,28 @@ fn files_restore(id: u32) -> Result<()> {
         style("  (reversible — the pre-restore tree was auto-saved; pick it to go back)").dim()
     );
     Ok(())
+}
+
+/// Name the files a restore removed because the target checkpoint never had them (E5.1). They are
+/// all in the checkpoint the restore saved first, so `aizen time redo` brings them back.
+fn print_removed(removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
+    let more = removed.len().saturating_sub(shown.len());
+    println!(
+        "{}",
+        style(format!(
+            "  removed {} file(s) that checkpoint never had: {}{}",
+            removed.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            }
+        ))
+        .dim()
+    );
 }

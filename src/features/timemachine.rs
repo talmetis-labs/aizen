@@ -445,6 +445,10 @@ struct Journal {
     ref_name: Option<String>,
     #[serde(default)]
     new_oid: Option<String>,
+    /// Paths a restore removes because the target tree never had them (E5.1) — written before
+    /// the update touches the tree, so a crash mid-restore leaves the list for `time doctor`.
+    #[serde(default)]
+    removed: Vec<String>,
 }
 
 impl Journal {
@@ -465,6 +469,7 @@ impl Journal {
             preimage_id: None,
             ref_name: None,
             new_oid: None,
+            removed: Vec::new(),
         }
     }
 }
@@ -2557,11 +2562,51 @@ pub fn clear() -> Result<usize> {
     Ok(n)
 }
 
-fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<()> {
+/// Bring the worktree to `commit`. Returns the paths that were in the worktree (tracked, or
+/// untracked and not ignored — a checkpoint's own coverage) and are absent from `commit`,
+/// which the update removed.
+///
+/// The temporary index is seeded from the source `.git/index` and then staged with `add -A`,
+/// exactly as a checkpoint is captured. Before E5.1 it was only seeded: a file created since
+/// the checkpoint was never in the source index, `read-tree -u` removes only what the index it
+/// starts from knows about, so the file survived and the verification in `restore_in` rolled
+/// the whole restore back — `/undo` failed on the file the agent had just created (quality plan
+/// S2). [`restore_in_reported`] stages and journals the list itself before applying; this is
+/// the one-shot form the rollback paths use.
+fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<Vec<String>> {
+    let staged = stage_for_apply(ctx)?;
+    let removed = paths_absent_from(ctx, &staged.0, commit)?;
+    apply_staged(ctx, &staged, commit)?;
+    Ok(removed)
+}
+
+/// The preflight and the staged temporary index a restore applies from.
+fn stage_for_apply(ctx: &RepoContext) -> Result<TempIndex> {
     ctx.ensure_safe_filters()?;
     reparse_preflight(ctx)?;
     let idx = seed_index(ctx)?;
-    ctx.git(Some(&idx.0), ["read-tree", "--reset", "-u", commit])?;
+    ctx.git(Some(&idx.0), ["add", "-A", "--", "."])?;
+    Ok(idx)
+}
+
+/// Paths in `index` that `commit`'s tree does not have, sorted — what the update will remove.
+fn paths_absent_from(ctx: &RepoContext, index: &Path, commit: &str) -> Result<Vec<String>> {
+    let present = ctx.git(Some(index), ["ls-files", "-z"])?;
+    let target = ctx.git(None, ["ls-tree", "-r", "-z", "--name-only", commit])?;
+    let target: HashSet<&str> = target.split('\0').filter(|s| !s.is_empty()).collect();
+    let mut removed: Vec<String> = present
+        .split('\0')
+        .filter(|p| !p.is_empty() && !target.contains(p))
+        .map(str::to_string)
+        .collect();
+    removed.sort();
+    Ok(removed)
+}
+
+/// The update itself: entries in the staged index that `commit` lacks are removed from the
+/// worktree along with every other change.
+fn apply_staged(ctx: &RepoContext, staged: &TempIndex, commit: &str) -> Result<()> {
+    ctx.git(Some(&staged.0), ["read-tree", "--reset", "-u", commit])?;
     Ok(())
 }
 
@@ -2661,6 +2706,11 @@ fn capture_checkpoint_locked(
 }
 
 pub fn restore(id: u32) -> Result<Snapshot> {
+    restore_with_report(id).map(|(snap, _)| snap)
+}
+
+/// [`restore`], also naming the files it removed because the checkpoint never had them.
+pub fn restore_with_report(id: u32) -> Result<(Snapshot, Vec<String>)> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         &ctx.root,
@@ -2668,7 +2718,7 @@ pub fn restore(id: u32) -> Result<Snapshot> {
         None,
         "time restore",
     )?;
-    restore_in(&ctx, id)
+    restore_in_reported(&ctx, id)
 }
 
 /// Restore-by-id for callers that ALREADY hold the workspace writer lease (the agent loop takes it
@@ -2682,6 +2732,12 @@ pub fn restore_under_lease(id: u32) -> Result<Snapshot> {
 }
 
 fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
+    restore_in_reported(ctx, id).map(|(snap, _)| snap)
+}
+
+/// As [`restore_in`], also returning the paths the restore removed because the target never
+/// had them (E5.1) — every one of them is in the preimage checkpoint saved first.
+fn restore_in_reported(ctx: &RepoContext, id: u32) -> Result<(Snapshot, Vec<String>)> {
     let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
@@ -2723,10 +2779,15 @@ fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
     let mut journal = Journal::new(JournalKind::Restore, ledger.generation);
     journal.target_id = Some(id);
     journal.preimage_id = preimage_id;
+    // E5.1: stage the worktree the way a checkpoint sees it and journal what the restore will
+    // remove BEFORE it removes anything.
+    let staged = stage_for_apply(ctx)?;
+    let removed = paths_absent_from(ctx, &staged.0, &target.commit)?;
+    journal.removed = removed.clone();
     journal.phase = JournalPhase::Applying;
     ctx.save_journal(&journal)?;
 
-    if let Err(apply_error) = apply_tree(ctx, &target.commit) {
+    if let Err(apply_error) = apply_staged(ctx, &staged, &target.commit) {
         if let Some(pid) = preimage_id {
             if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
                 let _ = apply_tree(ctx, &preimage.commit);
@@ -2757,7 +2818,7 @@ fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
     journal.phase = JournalPhase::LedgerCommitted;
     ctx.save_journal(&journal)?;
     ctx.clear_journal()?;
-    Ok(target)
+    Ok((target, removed))
 }
 
 fn save_preimage_locked(
@@ -2809,6 +2870,11 @@ pub fn working_tree_differs_from(id: u32) -> Result<bool> {
 }
 
 pub fn undo() -> Result<Snapshot> {
+    undo_with_report().map(|(snap, _)| snap)
+}
+
+/// [`undo`], also naming the files it removed because the checkpoint never had them.
+pub fn undo_with_report() -> Result<(Snapshot, Vec<String>)> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         &ctx.root,
@@ -2827,10 +2893,15 @@ pub fn undo() -> Result<Snapshot> {
         .find(|s| s.id == current)
         .and_then(|s| s.parent)
         .context("already at the oldest checkpoint")?;
-    restore_in(&ctx, parent)
+    restore_in_reported(&ctx, parent)
 }
 
 pub fn redo() -> Result<Snapshot> {
+    redo_with_report().map(|(snap, _)| snap)
+}
+
+/// [`redo`], also naming the files it removed because the checkpoint never had them.
+pub fn redo_with_report() -> Result<(Snapshot, Vec<String>)> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         &ctx.root,
@@ -2850,7 +2921,7 @@ pub fn redo() -> Result<Snapshot> {
         .max_by_key(|s| s.id)
         .map(|s| s.id)
         .context("already at the newest checkpoint on this branch")?;
-    restore_in(&ctx, child)
+    restore_in_reported(&ctx, child)
 }
 
 pub fn timeline() -> Result<(Vec<Snapshot>, Option<usize>)> {
@@ -4319,6 +4390,57 @@ mod tests {
             reparse_checked: std::cell::Cell::new(true),
             skip_dirs: std::cell::RefCell::new(None),
         }
+    }
+
+    /// E5.1 (quality plan S2): a file created after a checkpoint is untracked until someone
+    /// commits it; restoring that checkpoint must remove it, name it, and the checkpoint taken
+    /// before the restore must bring it back.
+    #[test]
+    fn restore_removes_a_file_the_target_checkpoint_never_had_and_reports_it() {
+        if !git_available() {
+            return;
+        }
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = scratch("restore-home");
+        std::env::set_var("AIZEN_HOME", &home);
+        let root = scratch("restore-repo");
+        let init = git_cmd()
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .output()
+            .expect("git init");
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fs::write(root.join("f1.txt"), "one").unwrap();
+        let ctx = RepoContext::discover(&root).expect("context");
+        let first = save_in(&ctx, "first", false, None).expect("first checkpoint");
+        fs::write(root.join("f2.txt"), "two").unwrap(); // never `git add`ed
+        let second = save_in(&ctx, "second", false, None).expect("second checkpoint");
+        let (snap, removed) = restore_in_reported(&ctx, first.id).expect("restore to first");
+        assert_eq!(snap.id, first.id);
+        assert_eq!(
+            removed,
+            vec!["f2.txt".to_string()],
+            "the file the target never had is named"
+        );
+        assert!(!root.join("f2.txt").exists(), "…and gone");
+        assert_eq!(fs::read_to_string(root.join("f1.txt")).unwrap(), "one");
+        let (back, removed2) = restore_in_reported(&ctx, second.id).expect("forward again");
+        assert_eq!(back.id, second.id);
+        assert!(removed2.is_empty(), "{removed2:?}");
+        assert_eq!(
+            fs::read_to_string(root.join("f2.txt")).unwrap(),
+            "two",
+            "the preimage checkpoint brought it back"
+        );
+        std::env::remove_var("AIZEN_HOME");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// Only genuine loose objects count. `pack/`, `info/`, and git's `tmp_obj_*` scratch files share

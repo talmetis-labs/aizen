@@ -1950,14 +1950,18 @@ SlashId::Yolo => {
                     if dirty && !yes {
                         tui::emit_line(&style(format!("the working tree has changes since checkpoint #{current} that no checkpoint holds — `/diff` shows them; `/undo --yes` (or `/rewind --yes`) rewinds anyway")).color256(crate::ui::theme::WARN).to_string());
                     } else {
-                        match timemachine::undo() {
-                            Ok(s) => {
+                        match timemachine::undo_with_report() {
+                            Ok((s, removed)) => {
                                 let named = if files.is_empty() { String::new() } else {
                                     let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
                                     let more = files.len().saturating_sub(shown.len());
                                     format!(" — {}{}", shown.join(", "), if more > 0 { format!(" (+{more} more)") } else { String::new() })
                                 };
                                 tui::emit_line(&format!("{} checkpoint #{}{named}", style("⏪ rewound to").color256(splash::ACCENT), s.id));
+                                if !removed.is_empty() {
+                                    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
+                                    tui::emit_line(&style(format!("  removed {} file(s) that checkpoint never had: {} — `/redo` brings them back", removed.len(), shown.join(", "))).dim().to_string());
+                                }
                             }
                             Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
                         }
