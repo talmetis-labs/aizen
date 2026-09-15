@@ -726,7 +726,9 @@ mod tests {
                 "add-feature",
                 "fix-build-error",
                 "fix-failing-test",
-                "no-edit-control"
+                "multi-file-wire",
+                "no-edit-control",
+                "refactor-with-tests"
             ]
         );
         for (dir, s) in &specs {

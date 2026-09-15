@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// The two tests below read and write the process-wide transcript geometry slot (one through a
+/// paint, one directly). Run in parallel they see each other's numbers; the lock keeps them
+/// honest without changing what they assert.
+static GEOM_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn overlay_menu_hit_maps_rows_scroll_and_dead_zones() {
     let g = OverlayMenuGeom {
@@ -676,6 +681,9 @@ fn the_row_cache_is_an_lru_not_a_flush() {
 
 #[test]
 fn a_frame_renders_the_viewport_not_the_session() {
+    let _geom = GEOM_SLOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut state = AppState::new("intro", "status");
     for i in 0..2_000 {
         state.push_text(BlockKind::Generic, format!("line-{i}"), true);
@@ -783,6 +791,9 @@ fn a_failed_tool_row_shows_its_tail_and_a_hint() {
 
 #[test]
 fn tool_seq_is_found_by_transcript_row_through_the_window() {
+    let _geom = GEOM_SLOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     {
         let mut g = geom::transcript_geom_slot().lock().unwrap();
         g.rows_offset = 100;
