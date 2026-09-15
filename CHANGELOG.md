@@ -327,6 +327,13 @@ handing the model false inputs, and starts measuring what it sends.
   transcript file by its modification time and size, and the memory store is parsed
   incrementally — a recall, the secretary and reconcile each used to re-read and re-parse
   every fact file; now only new or changed files are parsed and deleted ones drop out.
+- **`CLAUDE.md` is honoured beside `AGENTS.md`, edits are live on the next message, and a
+  character does not learn the same lesson twice.** A directory's `AGENTS.md` and `CLAUDE.md`
+  are both read into `<project_context>` (`AGENTS.md` first, same total cap) — before, the
+  first file found won, so a one-paragraph `AGENTS.md` pointer hid a full `CLAUDE.md`. A
+  convention file added, edited or removed during a conversation is noticed at the next user
+  turn by a stat, and only then are the prompt lanes rebuilt. A persona reflection that
+  restates an insight already on disk reinforces that insight instead of writing a twin.
 
 ## [0.6.7] — 2026-09-11
 

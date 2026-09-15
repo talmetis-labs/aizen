@@ -318,6 +318,18 @@ and is measured on a real endpoint. E4.5 implemented (`session_store::read_sessi
 rows cached per file by `(mtime, len)`; `store::load_from` keeps a per-directory
 `(fingerprint, entry)` map and parses only new or changed files — `write_atomic` renames are
 what invalidate a row; both keyed by directory so a test home gets its own).
+E4.6 implemented (`self_mem::save_insight` returns the id of a near-duplicate live insight —
+same folded text or content-token Jaccard ≥ 0.75 — instead of writing again;
+`project_context::load_project_context` reads both `AGENTS.md` and `CLAUDE.md` per directory
+and records the `(mtime, len)` of every path it probed, keyed by cwd; `conventions_changed`
+is asked in `refresh_dynamic_prompt_lane` and rebuilds both lanes only on a change).
+Measured cost: with this repo's own `CLAUDE.md` (7,092 B) now in `<project_context>` beside
+the 787-byte `AGENTS.md`, `prompt-size` in this checkout reads lean 52.8 KB → 58.5 KB and
+fixed 65.1 KB → 72.0 KB. The Phase 1 ≤ 55 KB lean gate was measured with the pointer file
+alone; the growth is the repository's instruction file, not aizen's overhead. Deviation (z):
+that gate is exceeded in this checkout by design of E4.6 — whether to re-baseline it (≈ 60 KB)
+or cap `<project_context>` lower is the maintainer's call; nothing here truncates a user's
+instructions silently.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|
