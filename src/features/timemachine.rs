@@ -2779,6 +2779,35 @@ fn save_preimage_locked(
     .id)
 }
 
+/// The checkpoints an `undo` would move between — `(current, target)` — without moving. The
+/// REPL shows the change this implies (a diff stat from the working tree to `target`) and asks
+/// before applying when the tree holds work no checkpoint has.
+pub fn undo_target() -> Result<(u32, u32)> {
+    let ctx = RepoContext::current()?;
+    let ledger = ctx.load_ledger()?;
+    let current = ledger
+        .cursor_id
+        .or_else(|| ledger.snapshots.last().map(|s| s.id))
+        .context("no checkpoints yet — save one with `aizen time save`")?;
+    let parent = ledger
+        .snapshots
+        .iter()
+        .find(|s| s.id == current)
+        .and_then(|s| s.parent)
+        .context("already at the oldest checkpoint")?;
+    Ok((current, parent))
+}
+
+/// Does the working tree differ from checkpoint `id`? `true` means a rewind would discard work
+/// that no checkpoint holds.
+pub fn working_tree_differs_from(id: u32) -> Result<bool> {
+    Ok(
+        !diff(&DiffSide::Checkpoint(id), &DiffSide::Working, &[], None)?
+            .files
+            .is_empty(),
+    )
+}
+
 pub fn undo() -> Result<Snapshot> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(

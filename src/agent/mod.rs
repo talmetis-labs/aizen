@@ -4464,6 +4464,49 @@ fn emit_edit_diff(path: &str, out: &str) {
     crate::ui::tui::diff_box(path, adds, dels, hunks);
 }
 
+/// Split a multi-file unified patch (`git diff-tree -p` output) into `(path, patch)` per file —
+/// the path from the `+++ b/…` line, else from the `diff --git a/x b/y` header.
+pub(crate) fn split_patch_by_file(patch: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(block) = cur.take() {
+                out.push(block);
+            }
+            let path = rest
+                .rsplit_once(" b/")
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_else(|| rest.to_string());
+            cur = Some((path, String::new()));
+            continue;
+        }
+        let Some((path, body)) = cur.as_mut() else {
+            continue;
+        };
+        if let Some(p) = line.strip_prefix("+++ b/") {
+            *path = p.trim().to_string();
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if let Some(block) = cur.take() {
+        out.push(block);
+    }
+    out
+}
+
+/// Render a multi-file patch as one diff box per file (`/diff --patch` on the retained TUI;
+/// the same boxes an edit result gets). Files whose patch carries no changed rows are skipped.
+pub(crate) fn emit_patch_boxes(patch: &str) -> usize {
+    let blocks = split_patch_by_file(patch);
+    let n = blocks.len();
+    for (path, body) in blocks {
+        emit_edit_diff(&path, &body);
+    }
+    n
+}
+
 /// Hunks an edit result shows the model before the rest becomes a count.
 const COMPACT_DIFF_MAX_HUNKS: usize = 3;
 
@@ -6469,6 +6512,22 @@ mod tests {
         );
         assert!(plain.contains("main.rs"), "salient target shown: {plain:?}");
         assert!(!plain.contains("Read "), "no English verb: {plain:?}");
+    }
+
+    #[test]
+    fn a_multi_file_patch_splits_per_file_with_the_new_path() {
+        let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                     diff --git a/old.rs b/new.rs\nsimilarity index 90%\n--- a/old.rs\n+++ b/new.rs\n@@ -2 +2 @@\n-p\n+q\n";
+        let blocks = split_patch_by_file(patch);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "src/a.rs");
+        assert!(blocks[0].1.contains("@@ -1 +1 @@") && blocks[0].1.contains("+y"));
+        assert_eq!(blocks[1].0, "new.rs", "a rename is titled by its new path");
+        assert!(
+            !blocks[1].1.contains("+y"),
+            "files do not bleed into each other"
+        );
+        assert!(split_patch_by_file("").is_empty());
     }
 
     #[test]

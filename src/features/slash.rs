@@ -621,7 +621,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         id: SlashId::Undo,
         name: "undo",
-        aliases: &[],
+        aliases: &[("rewind", "alias for /undo")],
         hidden_aliases: &[],
         hidden: false,
         description: "rewind to the previous checkpoint",

@@ -1888,18 +1888,62 @@ SlashId::Yolo => {
             match build_time_diff(from, to, paths, patch) {
                 // Must go through `emit_line`: raw `println!` from inside the REPL is wiped by the
                 // retained render thread's next repaint.
-                Ok(report) => {
-                    for line in diff_lines(&report, "-- <path>") {
+                Ok(mut report) => {
+                    // On the retained TUI a patch goes through the diff boxes an edit result
+                    // gets (colour, side-by-side, gutter numbers) instead of monochrome lines.
+                    let boxed = if tui::retained_running() { report.patch.take() } else { None };
+                    let mut lines = diff_lines(&report, "-- <path>");
+                    if boxed.is_some() && lines.last().is_some_and(|l| l.contains("--patch for the full text")) {
+                        lines.pop();
+                    }
+                    for line in lines {
                         tui::emit_line(&line);
+                    }
+                    if let Some(text) = boxed {
+                        crate::agent::emit_patch_boxes(&text);
+                        if report.patch_truncated {
+                            tui::emit_line(&style("… patch truncated — narrow it with `-- <path>`").dim().to_string());
+                        }
                     }
                 }
                 Err(e) => tui::emit_line(&style(format!("diff: {e}")).color256(crate::ui::theme::WARN).to_string()),
             }
         }
-        SlashId::Undo => match timemachine::undo() {
-            Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏪ rewound to").color256(splash::ACCENT), s.id)),
-            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
-        },
+        // `/undo` (alias `/rewind`): show what the rewind WILL change first, refuse to discard
+        // work no checkpoint holds unless told `--yes`, and name the files it touched after.
+        SlashId::Undo => {
+            let yes = arg.split_whitespace().any(|w| matches!(w, "--yes" | "-y" | "yes"));
+            match timemachine::undo_target() {
+                Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
+                Ok((current, target)) => {
+                    let stat = build_time_diff(Some("working".into()), Some(format!("#{target}")), Vec::new(), false).ok();
+                    let files: Vec<String> = stat.as_ref().map(|r| r.files.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
+                    if let Some(r) = &stat {
+                        tui::emit_line(&style(format!("⏪ rewind to checkpoint #{target}: {} file(s), +{} −{}", r.files.len(), r.total_added(), r.total_deleted())).color256(splash::ACCENT).to_string());
+                        for line in diff_lines(r, "-- <path>").into_iter().skip(1) {
+                            if line.contains("--patch for the full text") { continue; }
+                            tui::emit_line(&line);
+                        }
+                    }
+                    let dirty = timemachine::working_tree_differs_from(current).unwrap_or(false);
+                    if dirty && !yes {
+                        tui::emit_line(&style(format!("the working tree has changes since checkpoint #{current} that no checkpoint holds — `/diff` shows them; `/undo --yes` (or `/rewind --yes`) rewinds anyway")).color256(crate::ui::theme::WARN).to_string());
+                    } else {
+                        match timemachine::undo() {
+                            Ok(s) => {
+                                let named = if files.is_empty() { String::new() } else {
+                                    let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
+                                    let more = files.len().saturating_sub(shown.len());
+                                    format!(" — {}{}", shown.join(", "), if more > 0 { format!(" (+{more} more)") } else { String::new() })
+                                };
+                                tui::emit_line(&format!("{} checkpoint #{}{named}", style("⏪ rewound to").color256(splash::ACCENT), s.id));
+                            }
+                            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
+                        }
+                    }
+                }
+            }
+        }
         SlashId::Redo => match timemachine::redo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
