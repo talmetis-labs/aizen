@@ -1755,6 +1755,134 @@ pub fn live_fact_count() -> usize {
 /// pass parks what it could not call, and the live store because a differently-worded contradiction
 /// scores BELOW the local band and therefore entered as an ordinary fact. Excluding the live side
 /// would mean the one case M2b exists for never reaches it.
+/// What `aizen memory consolidate` did, or would do.
+#[derive(Debug, Default)]
+pub struct ConsolidateReport {
+    pub live: usize,
+    pub pairs: Vec<learning::consolidate::DupPair>,
+    pub applied: usize,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Retiring a row can un-hide the row it had replaced (`active()` lets only a LIVE claimant
+/// bury its predecessor), so one apply can surface the next duplicate. The pass therefore runs
+/// in rounds until a round finds nothing, capped here so a pathological store cannot loop.
+const CONSOLIDATE_MAX_ROUNDS: usize = 8;
+
+/// The store-wide, model-free duplicate pass (E4.1): the two-stage check the write path runs on
+/// every new fact, applied once to what is already there. Dry run unless `apply`. Applying
+/// retires the duplicate with `supersededBy` (revivable with `aizen memory revive <id>`) and
+/// reinforces the survivor under `session_id`, so a fact that was written twice finally counts
+/// as seen twice — which is what admits an inferred fact to the frozen core. A dry run shows the
+/// first round only: later rounds depend on what the writes un-hide.
+pub fn consolidate_store(apply: bool, session_id: &str) -> Result<ConsolidateReport> {
+    let mut report = ConsolidateReport::default();
+    for round in 0..CONSOLIDATE_MAX_ROUNDS {
+        let all = store::load_all()?;
+        let live = bloat::supersede::active(&all);
+        let pairs = learning::consolidate::plan_pass(&live, settings().learn_dedup_threshold);
+        if round == 0 {
+            report.live = live.len();
+        }
+        if pairs.is_empty() || !apply {
+            report.pairs.extend(pairs);
+            return Ok(report);
+        }
+        apply_round(&pairs, &live, session_id, &mut report);
+        report.pairs.extend(pairs);
+    }
+    Ok(report)
+}
+
+/// Write one round of merges: retire each `dup` under its `keep`, reinforce the keeper, audit both.
+fn apply_round(
+    pairs: &[learning::consolidate::DupPair],
+    live: &[MemoryEntry],
+    session_id: &str,
+    report: &mut ConsolidateReport,
+) {
+    for p in pairs {
+        let (Some(keep), Some(dup)) = (
+            live.iter().find(|e| e.id == p.keep),
+            live.iter().find(|e| e.id == p.dup),
+        ) else {
+            continue;
+        };
+        match store::mark_superseded(dup, &keep.id).and_then(|_| store::reinforce(keep, session_id))
+        {
+            Ok(_) => {
+                report.applied += 1;
+                learning::audit::append(learning::audit::AuditEvent {
+                    ts: learning::audit::ts_now(),
+                    session_id,
+                    op: "supersede",
+                    old_id: Some(&dup.id),
+                    new_id: Some(&keep.id),
+                    signal: Some("consolidate"),
+                    verdict: Some(p.stage.label()),
+                    confidence: Some(p.score),
+                    ..Default::default()
+                });
+                learning::audit::append(learning::audit::AuditEvent {
+                    ts: learning::audit::ts_now(),
+                    session_id,
+                    op: "reinforce",
+                    id: Some(&keep.id),
+                    signal: Some("consolidate"),
+                    verdict: Some(p.stage.label()),
+                    ..Default::default()
+                });
+            }
+            Err(e) => report.failed.push((p.dup.clone(), e.to_string())),
+        }
+    }
+}
+
+/// `aizen memory consolidate [--apply]` — print the pass, or what it would do.
+pub fn cmd_consolidate(apply: bool) -> Result<()> {
+    let r = consolidate_store(apply, &learning::default_session_id())?;
+    if r.pairs.is_empty() {
+        tui::emit_line(&format!(
+            "{} live fact(s) — no near-duplicates by the two-stage check.",
+            r.live
+        ));
+        return Ok(());
+    }
+    let mode = if apply {
+        "merged"
+    } else {
+        "dry run — would merge"
+    };
+    tui::emit_line(&format!(
+        "{} live fact(s); {mode} {} duplicate(s):",
+        r.live,
+        r.pairs.len()
+    ));
+    for p in &r.pairs {
+        tui::emit_line(&format!(
+            "  ⌁ {} → keeps {}  ({} {:.2})",
+            p.dup,
+            p.keep,
+            p.stage.label(),
+            p.score
+        ));
+    }
+    if apply {
+        tui::emit_line(&format!(
+            "retired {} (revivable with `aizen memory revive <id>`) and reinforced their survivors.",
+            r.applied
+        ));
+        for (id, why) in &r.failed {
+            tui::emit_line(&format!("  ! {id}: {why}"));
+        }
+    } else {
+        tui::emit_line(
+            "nothing written — `aizen memory consolidate --apply` merges them (and any duplicate a merge un-hides).",
+        );
+    }
+    Ok(())
+}
+
 pub fn reconcile_inputs() -> Result<(Vec<learning::reconcile::Pair>, Vec<MemoryEntry>)> {
     let all = store::load_all()?;
     let live = bloat::supersede::active(&all);
@@ -2079,6 +2207,48 @@ mod tests {
         std::env::set_var("AIZEN_MEM_DENSE", "off");
         assert!(!settings().enable_dense);
         std::env::remove_var("AIZEN_MEM_DENSE");
+    }
+
+    #[test]
+    fn consolidate_apply_retires_the_twin_and_makes_the_survivor_count_twice() {
+        with_recall_home("consolidate", || {
+            fn w(name: &str) -> store::LearnedWrite<'_> {
+                store::LearnedWrite {
+                    name,
+                    mtype: MemoryType::Project,
+                    body: "only rust-analyzer is installed on this machine",
+                    tier: crate::memory::path_scope::Tier::User,
+                    session_id: "s1",
+                    ..Default::default()
+                }
+            }
+            let first = store::add_learned(&w("ra one")).unwrap();
+            let second = store::add_learned(&w("ra two")).unwrap();
+            let dry = consolidate_store(false, "s2").unwrap();
+            assert_eq!(dry.pairs.len(), 1, "{dry:?}");
+            assert_eq!(
+                bloat::supersede::active(&store::load_all().unwrap()).len(),
+                2,
+                "a dry run writes nothing"
+            );
+            let r = consolidate_store(true, "s2").unwrap();
+            assert_eq!(r.applied, 1, "{r:?}");
+            let live = bloat::supersede::active(&store::load_all().unwrap());
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert!(
+                [first.as_str(), second.as_str()].contains(&live[0].id.as_str()),
+                "{live:?}"
+            );
+            assert!(
+                live[0].sessions >= 2,
+                "the survivor now counts as seen in two sessions: {:?}",
+                live[0]
+            );
+            let audit =
+                std::fs::read_to_string(config::cli_memory_dir().join("learning-audit.jsonl"))
+                    .unwrap_or_default();
+            assert!(audit.contains("\"op\":\"reinforce\""), "{audit}");
+        });
     }
 
     /// A temp home for the recall tests: they read the real store, so they need one of their own.

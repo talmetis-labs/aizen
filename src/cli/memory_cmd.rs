@@ -148,6 +148,7 @@ pub(crate) async fn run_memory(cmd: MemoryCmd) -> Result<()> {
         MemoryCmd::Archive => memory::cmd_archive_list(),
         MemoryCmd::Restore { id, as_id } => memory::cmd_restore(&id, as_id.as_deref()),
         MemoryCmd::Compact => memory::cmd_compact(),
+        MemoryCmd::Consolidate { apply } => memory::cmd_consolidate(apply),
         MemoryCmd::Reconcile { apply } => run_memory_reconcile(apply).await,
         MemoryCmd::Doctor => memory::cmd_doctor(),
         MemoryCmd::Where => {

@@ -1662,6 +1662,13 @@ pub(crate) enum MemoryCmd {
     },
     /// Run anti-bloat maintenance (enforce the inferred-fact LRU cap → archive victims).
     Compact,
+    /// Merge near-duplicate facts locally, no model call: the two-stage check the write path uses
+    /// (lexical, then MinHash + normalised tokens), run once over the whole live store. Dry run
+    /// unless `--apply`; applying retires each duplicate (revivable) and reinforces its survivor.
+    Consolidate {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Judge suspicious near-duplicate pairs in one model call (dry run unless `--apply`).
     Reconcile {
         /// Actually write the verdicts. Without this the pass only reports what it would do —
