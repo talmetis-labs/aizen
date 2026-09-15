@@ -226,7 +226,12 @@ lines above the question, on the TUI, on a plain terminal and in the Telegram me
 `rel_path_display` in headers and diff-box titles). Deviation (p): the preview is not a new
 overlay panel — it is emitted into the transcript directly above the existing 4-row menu, which
 keeps the menu code untouched and the payload scrollable; and no preview is drawn under a session
-allow-all, where no question is asked.
+allow-all, where no question is asked. E3.2 implemented (`core::approval::Grant`, session grants
+from two new menu rows, `.aizen/approvals.json` project allowlist, `granted` checked in the
+executor before the question, `/approval grants`). Deviation (q): the menu keeps the `Stop` row
+and the session allow-all row rather than replacing them (six rows, `t`/`d` accelerators), so
+the existing muscle memory (`y`/`a`/`n`/Esc) is unchanged; a grant auto-approval is always
+printed, never silent.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

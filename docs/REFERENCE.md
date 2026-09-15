@@ -703,7 +703,11 @@ Behavior worth knowing:
   prompt shows what the call WILL do first: an edit's patch in the diff box (computed without
   writing), a write's create-or-overwrite line with its patch, a shell command's directory and
   full command line, a move's both ends — the same payload reaches a Telegram approval. Edit
-  headers carry the repo-relative path. In the sticky
+  headers carry the repo-relative path. Two `always` rows grant a scope narrower than
+  allow-all — the tool everywhere, or the tool under the directory this call writes to — for
+  the rest of the window; a project ships standing grants in `.aizen/approvals.json`
+  (`{"allow": [{"tool": "shell_run", "under": "scripts"}]}`), `/approval grants` lists them,
+  and an auto-approved call is named in the transcript. In the sticky
   REPL each one shows an inline **`[y]es · [n]o · [a]llow all this session`** prompt (the `[a]`
   choice is a session-scoped temporary Yolo grant, reset by `/clear`). `/approval ask|smart|yolo`
   is the three-level setting: `ask` prompts, `smart` auto-runs read-only-shaped shell, and `yolo`

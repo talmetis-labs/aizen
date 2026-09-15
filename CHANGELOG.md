@@ -251,6 +251,13 @@ handing the model false inputs, and starts measuring what it sends.
   `file_move` names both ends. The same payload rides the Telegram approval message. Headers
   and diff-box titles for edits now carry the repo-relative path, so two `mod.rs` edits in one
   turn are told apart. Nothing is drawn under a session allow-all.
+- **Grant scopes narrower than allow-all.** The approval menu gains `Yes — always for <tool>
+  this session` and `Yes — always for <tool> under <dir> this session` (`t` / `d` on the
+  keyboard); a later call the grant covers runs without asking and says so in the transcript
+  (`auto-approved by grant: file_edit under src/parser`). A project can ship standing grants in
+  `.aizen/approvals.json` (`{"allow": [{"tool": "shell_run", "under": "scripts"}]}`,
+  read on every check). `/approval grants` lists what runs without asking; `/clear` forgets the
+  session's grants with its allow-all. The hard command guard still runs before any grant.
 
 ## [0.6.7] — 2026-09-11
 
