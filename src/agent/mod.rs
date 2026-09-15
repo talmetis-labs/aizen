@@ -478,8 +478,35 @@ pub fn build_top_level_system_prompt_bundle(
     bundle
 }
 
+/// Which role the loop's mid-run nudges (`push_nudge`) are delivered in.
+///
+/// A `system` message mid-history is what Anthropic-style gateways handle best. The Codex
+/// Responses path hoists EVERY system message into its instructions blob, so "you repeated the
+/// same call" became a permanent instruction and busted the cache; many local chat templates
+/// reject a system role anywhere but first. Everywhere else the nudge rides in the user turn,
+/// tagged so it can be recognised and retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NudgeRole {
+    #[default]
+    System,
+    User,
+}
+
+impl NudgeRole {
+    /// The role for an endpoint: `system` on Anthropic-style bases, `user` elsewhere.
+    pub fn for_base_url(base_url: &str) -> Self {
+        if crate::llm::client::is_anthropic_endpoint(base_url) {
+            NudgeRole::System
+        } else {
+            NudgeRole::User
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Where mid-run nudges go (see [`NudgeRole`]). Default `System`; the REPL sets it per endpoint.
+    pub nudge_role: NudgeRole,
     /// Hard step cap before the one-shot auto-extend.
     pub max_iters: usize,
     /// Extended cap after the single auto-extend (the extension's anti-throttle lesson:
@@ -692,6 +719,31 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// Give the reasoning-effort tier teeth in the HARNESS, not just on the wire. The five tiers
+    /// used to change only the `reasoning_effort` string — a no-op on every provider that ignores
+    /// the field — so `/effort low` and `/effort max` ran the identical loop. Now a tier sets the
+    /// step cap and its extension, how many fresh budgets a still-progressing run may claim, how
+    /// many verify-and-fix rounds a broken tree gets, whether the self-review pass runs before
+    /// Done (`xhigh`/`max` turn it on; lower tiers never turn a user-enabled review off), and how
+    /// much of a build/test log reaches the model. Unknown tiers (provider-specific strings) leave
+    /// the config untouched.
+    pub fn apply_effort(&mut self, tier: &str) {
+        let (iters, extend, continuations, verify, review, log) = match tier {
+            "low" => (12, 18, 1, 1, false, 8_000),
+            "medium" => (25, 50, 3, 2, false, 16_000),
+            "high" => (40, 80, 3, 3, false, 16_000),
+            "xhigh" => (60, 120, 4, 4, true, 24_000),
+            "max" => (90, 180, 5, 5, true, 24_000),
+            _ => return,
+        };
+        self.max_iters = iters;
+        self.auto_extend_to = extend;
+        self.max_continuations = continuations;
+        self.max_verify_attempts = verify;
+        self.enable_self_review = self.enable_self_review || review;
+        self.max_log_result_chars = log;
+    }
+
     /// The directory this run resolves relative paths against and takes its writer lease on:
     /// `workspace_root` when a lane pinned one, else the process cwd. Canonicalized, because the
     /// lease keys workspaces by identity — two spellings of one path must not read as two repos.
@@ -715,6 +767,7 @@ impl Default for AgentConfig {
             max_fetch_result_chars: 12_000,
             max_log_result_chars: 16_000,
             max_delegate_result_chars: 24_000,
+            nudge_role: NudgeRole::System,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
@@ -908,6 +961,30 @@ where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
 {
+    // Nudges are advice for one run. Whatever the previous run left behind is stale now — and
+    // on the Codex path it would be hoisted into the instructions blob for the rest of the
+    // conversation. Strip before the review request is captured, so a user-role nudge can never
+    // be mistaken for the request.
+    retire_nudges(messages);
+    run_agent_loop_body(chat, summarize, oracle, cfg, registry, messages).await
+}
+
+async fn run_agent_loop_body<F, Fut, S, SFut, O, OFut>(
+    chat: F,
+    summarize: Option<S>,
+    oracle: Option<O>,
+    cfg: &AgentConfig,
+    registry: &ToolRegistry,
+    messages: &mut Vec<Message>,
+) -> Result<AgentOutcome>
+where
+    F: Fn(Vec<Message>, Vec<ToolDef>) -> Fut,
+    Fut: Future<Output = Result<ChatTurn>>,
+    S: Fn(Vec<Message>) -> SFut,
+    SFut: Future<Output = Result<String>>,
+    O: Fn(Vec<Message>) -> OFut,
+    OFut: Future<Output = Result<String>>,
+{
     // Capture the real request before verify/todo/goal gates can append synthetic user turns. Prefix
     // stripping keeps automatic memory/codebase retrieval out of the review contract.
     let mut review_request = capture_review_request(messages);
@@ -1001,6 +1078,10 @@ where
     // clearing), not a per-turn cache-shredding trickle: it only re-arms when usage grows by
     // `clear_step_pct` OR `clear_cooldown_iters` iterations have elapsed since the last attempt.
     let mut last_compact: Option<(usize, usize)> = None;
+    // Consecutive failed compaction attempts. One failure does not arm the cadence latch (the
+    // summarizer may just have blipped); two in a row do, so a dead summarizer costs two model
+    // round-trips per cooldown, not one per iteration.
+    let mut compact_failures: usize = 0;
     // Iter of the last todo-recitation reminder (0 = none yet).
     let mut last_todo_reminder = 0usize;
     // P0.1: incomplete-todo pokes this run (cap = max_todo_poke_attempts).
@@ -1070,8 +1151,9 @@ where
             ) {
                 extended = true;
                 cap = cfg.auto_extend_to;
-                push_nudge(
+                push_nudge_as(
                     messages,
+                     cfg.nudge_role,
                     NUDGE_STEP_LIMIT,
                     "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
                 );
@@ -1182,8 +1264,9 @@ where
                 // silent (the model has been told the rule once).
                 if !save_before_clear_warned {
                     save_before_clear_warned = true;
-                    push_nudge(
+                    push_nudge_as(
                         messages,
+                         cfg.nudge_role,
                         NUDGE_SAVE_BEFORE_CLEAR,
                         "Context is filling up, so older tool results will start being dropped from \
                          history to make room. BEFORE that happens: if any earlier command output, \
@@ -1240,11 +1323,13 @@ where
             }
         }
 
-        // MID-LOOP AUTO-COMPACTION (multi-turn callers only): once history crosses `compact_at_pct`
-        // of the window, summarize older turns in place (keeping the last KEEP_TURNS verbatim) —
-        // cheaper than overflowing, and it carries forward more than the wrap-up nudge. Falls through
-        // when the conversation is too short to cut (one user turn → clearing above is its defense)
-        // or when no summarizer was supplied (the plain `run_agent_loop` path).
+        // MID-LOOP AUTO-COMPACTION (callers that supplied a summarizer): once history crosses
+        // `compact_at_pct` of the window, summarize older turns in place — the last KEEP_TURNS user
+        // turns verbatim, or, in a single-turn run, the prompt plus the last KEEP_STEPS steps —
+        // cheaper than overflowing, and it carries forward more than the wrap-up nudge (the summary
+        // opens with the files and skills the summarized block touched). Falls through when there
+        // is nothing older to cut or when no summarizer was supplied (the plain `run_agent_loop`
+        // path).
         if let Some(ref summarize) = summarize {
             if cfg.compact_at_pct > 0
                 && cfg.context_window > 0
@@ -1264,49 +1349,60 @@ where
                     cfg.clear_step_pct,
                     cfg.clear_cooldown_iters,
                 ) {
-                    match compact::compact_history(messages, summarize, compact::KEEP_TURNS).await {
-                        Ok((before, after)) => {
-                            context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
-                            budget_band_shown = None; // …and the running budget signal (P-ctx1)
-                            real_anchor = None; // spliced history invalidates the anchor
-                            stall.forget_successes(); // summarized-away results must not mark a re-read as stale
-                            read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
-                            est_now = estimate_tokens(messages) + schema_overhead;
-                            if !cfg.quiet {
-                                let line =
-                                    format!("→ context: auto-compacted ~{before} → ~{after} tok");
-                                if crate::ui::tui::active() {
-                                    crate::ui::tui::emit_line(&line);
-                                } else {
-                                    eprintln!("{line}");
+                    let arm =
+                        match compact::compact_history(messages, summarize, compact::KEEP_TURNS)
+                            .await
+                        {
+                            Ok((before, after)) => {
+                                compact_failures = 0;
+                                context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
+                                budget_band_shown = None; // …and the running budget signal (P-ctx1)
+                                real_anchor = None; // spliced history invalidates the anchor
+                                stall.forget_successes(); // summarized-away results must not mark a re-read as stale
+                                read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
+                                est_now = estimate_tokens(messages) + schema_overhead;
+                                if !cfg.quiet {
+                                    let line = format!(
+                                        "→ context: auto-compacted ~{before} → ~{after} tok"
+                                    );
+                                    if crate::ui::tui::active() {
+                                        crate::ui::tui::emit_line(&line);
+                                    } else {
+                                        eprintln!("{line}");
+                                    }
                                 }
+                                true
                             }
-                        }
-                        // A failed compaction used to vanish without a trace: the cadence latch
-                        // still armed below, so a down summarizer endpoint meant compaction was
-                        // silently skipped for the rest of the run while context kept climbing.
-                        // Say so — the user can fix the summarizer; nobody can fix what is hidden.
-                        Err(e) => {
-                            if !cfg.quiet {
-                                let line = format!(
+                            // A failed compaction used to vanish without a trace AND arm the cadence
+                            // latch, so one summarizer blip meant compaction was silently skipped for
+                            // the rest of the cooldown while context kept climbing. Say so — the user
+                            // can fix the summarizer — and latch only on the second failure in a row.
+                            Err(e) => {
+                                compact_failures += 1;
+                                if !cfg.quiet {
+                                    let line = format!(
                                     "⚠ context: auto-compact failed ({e:#}) — continuing without \
                                      it; history will rely on tool-result clearing only"
                                 );
-                                if crate::ui::tui::active() {
-                                    crate::ui::tui::emit_line(
-                                        &crate::ui::theme::faint(line).to_string(),
-                                    );
-                                } else {
-                                    eprintln!("{line}");
+                                    if crate::ui::tui::active() {
+                                        crate::ui::tui::emit_line(
+                                            &crate::ui::theme::faint(line).to_string(),
+                                        );
+                                    } else {
+                                        eprintln!("{line}");
+                                    }
                                 }
+                                compact_failures >= COMPACT_FAILURES_BEFORE_LATCH
                             }
-                        }
+                        };
+                    // Arm the cadence after a success (even one that barely dented size — the
+                    // history is now as short as summarizing can make it) or after repeated
+                    // failure; re-attempting every iteration buys nothing and each attempt is a
+                    // model round-trip. Recompute pct against the (possibly shrunk) history so
+                    // the latch reflects the post-compaction size.
+                    if arm {
+                        last_compact = Some((est_now * 100 / cfg.context_window, iter));
                     }
-                    // Arm the cadence even when compaction was a no-op (history too short to cut) or
-                    // barely dented size — re-attempting the same summarize every iteration buys
-                    // nothing and each attempt is a model round-trip. Recompute pct against the
-                    // (possibly shrunk) history so the latch reflects the post-compaction size.
-                    last_compact = Some((est_now * 100 / cfg.context_window, iter));
                 }
             }
         }
@@ -1323,8 +1419,9 @@ where
             if let Some(band) = budget_band(est_now, cfg.context_window) {
                 if budget_band_shown != Some(band) {
                     budget_band_shown = Some(band);
-                    push_nudge(
+                    push_nudge_as(
                         messages,
+                        cfg.nudge_role,
                         NUDGE_BUDGET,
                         &budget_nudge_text(est_now, cfg.context_window),
                     );
@@ -1346,8 +1443,9 @@ where
             && est_now * 100 >= cfg.context_window * cfg.context_guard_pct as usize
         {
             context_warned = true;
-            push_nudge(
+            push_nudge_as(
                 messages,
+                 cfg.nudge_role,
                 NUDGE_CONTEXT,
                 &format!(
                     "Context is nearly full (~{}% of the window). Wrap up now: stop gathering more, act \
@@ -1374,7 +1472,7 @@ where
         // One emergency overflow shrink per iteration: the provider rejecting the request as too
         // big is deterministic, so a second identical failure after a shrink means shrinking is
         // not the answer — surface the error instead of thrashing.
-        let mut overflow_shrunk = false;
+        let mut overflow_shrinks: usize = 0;
 
         let mut turn = if cfg.goal.is_some() {
             const GOAL_PERMANENT_RETRIES: u32 = 3;
@@ -1459,7 +1557,7 @@ where
                             // identically, and giving up abandons a run the transcript can save.
                             // Shrink once, then retry immediately (the failure was deterministic,
                             // not load — no backoff owed).
-                            if overflow_shrunk
+                            if overflow_shrinks >= MAX_OVERFLOW_SHRINKS
                                 || !emergency_overflow_shrink(messages, &cfg, schema_overhead)
                             {
                                 if nudge_pushed {
@@ -1467,7 +1565,7 @@ where
                                 }
                                 return Err(e);
                             }
-                            overflow_shrunk = true;
+                            overflow_shrinks += 1;
                             real_anchor = None; // history shrank under the anchor's feet
                             stall.forget_successes(); // evicted bodies must not mark re-reads stale
                             est_now = estimate_tokens(messages) + schema_overhead;
@@ -1661,19 +1759,20 @@ where
                     }
                     Some(Err(e)) => {
                         // Overflow first: it is deterministic (retrying unchanged 4xxes
-                        // identically) but recoverable (the transcript can be shrunk). One shrink,
-                        // one immediate retry, no backoff — then the error is real.
+                        // identically) but recoverable (the transcript can be shrunk). Shrink and
+                        // retry immediately, no backoff, up to `MAX_OVERFLOW_SHRINKS` times or
+                        // until nothing is left to evict — then the error is real.
                         if matches!(
                             crate::llm::client::classify_api_error(&e),
                             crate::llm::client::ApiErrorKind::ContextOverflow
                         ) {
-                            if overflow_shrunk
+                            if overflow_shrinks >= MAX_OVERFLOW_SHRINKS
                                 || !emergency_overflow_shrink(messages, &cfg, schema_overhead)
                             {
                                 rollback(messages, empty_nudges, nudge_pushed);
                                 return Err(e);
                             }
-                            overflow_shrunk = true;
+                            overflow_shrinks += 1;
                             real_anchor = None;
                             stall.forget_successes();
                             est_now = estimate_tokens(messages) + schema_overhead;
@@ -2160,8 +2259,9 @@ where
             }
             // First flag for this signature: nudge, then fall through to execute so the progress
             // block can judge whether the repeat actually produced new information.
-            push_nudge(
+            push_nudge_as(
                 messages,
+                 cfg.nudge_role,
                 NUDGE_DIVERGENCE,
                 "You repeated the same tool call(s). If this is not producing NEW information, take a DIFFERENT approach or stop and explain what is blocking you.",
             );
@@ -2455,8 +2555,9 @@ where
         }
         if !batch_nudged && single_read_streak >= BATCH_COACH_AFTER {
             batch_nudged = true;
-            push_nudge(
+            push_nudge_as(
                 messages,
+                cfg.nudge_role,
                 NUDGE_BATCH,
                 "[batch] Your last few turns each made a single read-only call. Batch independent \
                  reads/searches into ONE turn as parallel tool calls — file_read takes \
@@ -2562,8 +2663,9 @@ where
         }
         if stall.should_nudge() {
             stall.mark_nudged();
-            push_nudge(
+            push_nudge_as(
                 messages,
+                 cfg.nudge_role,
                 NUDGE_STUCK,
                 "Recent turns added no new evidence (no new result, failure class, completed todo, \
                  or successful edit). STOP retrying variations. Re-read the exact state, take a \
@@ -2597,8 +2699,9 @@ where
             if !hill_climb_reframed {
                 hill_climb_reframed = true;
                 last_hill_climb_reminder = iter;
-                push_nudge(
+                push_nudge_as(
                     messages,
+                    cfg.nudge_role,
                     NUDGE_HILL_CLIMB,
                     "[hill-climb] This goal looks quantifiable. Before more edits, state:\n\
                      1) metric (e.g. ns/op, pass count, binary KB),\n\
@@ -2611,8 +2714,9 @@ where
                 && todo::has_incomplete()
             {
                 last_hill_climb_reminder = iter;
-                push_nudge(
+                push_nudge_as(
                     messages,
+                     cfg.nudge_role,
                     NUDGE_HILL_CLIMB,
                     "[hill-climb] Re-measure the metric before claiming progress. No metric delta → \
                      try a different approach or stop.",
@@ -2661,7 +2765,7 @@ where
                         break;
                     }
                 }
-                push_nudge(messages, NUDGE_TODO, text.trim_end());
+                push_nudge_as(messages, cfg.nudge_role, NUDGE_TODO, text.trim_end());
                 last_todo_reminder = iter;
             }
         }
@@ -4439,11 +4543,18 @@ const IMAGE_TOK: usize = 768;
 /// `content: null`), so the 60/80/90% context guards fired late. Shared with `main.rs`'s
 /// `session_tokens` so the mid-loop guard and the HUD agree on size.
 pub fn estimate_message_tokens(m: &Message) -> usize {
-    let mut chars: usize = m.content.as_ref().map_or(0, |c| c.chars().count());
-    for tc in &m.tool_calls {
-        chars += tc.function.name.chars().count() + tc.function.arguments.chars().count() + 24;
+    // One counter, one division: the weighting lives in `core::tokens` (CJK, combining marks and
+    // precomposed Vietnamese count 1/1.8 each; ASCII stays exactly chars/4).
+    let mut n = crate::core::tokens::Counter::default();
+    if let Some(c) = &m.content {
+        n.add(c);
     }
-    chars / 4 + MSG_OVERHEAD_TOK + m.images.len() * IMAGE_TOK
+    for tc in &m.tool_calls {
+        n.add(&tc.function.name)
+            .add(&tc.function.arguments)
+            .add_light(24);
+    }
+    n.tokens() + MSG_OVERHEAD_TOK + m.images.len() * IMAGE_TOK
 }
 
 /// Sum of [`estimate_message_tokens`]. Callers comparing against the context window must ADD the
@@ -4457,11 +4568,11 @@ fn estimate_tokens(messages: &[Message]) -> usize {
 /// auto-compact so both sides agree on request size (0 before the first loop run).
 static SCHEMA_OVERHEAD_TOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Per-request tool-schema cost: the serialized JSON length / 4. Computed once per loop run (the
-/// defs don't change mid-run) and published to a process-global for the HUD.
+/// Per-request tool-schema cost: the serialized JSON through the shared estimator. Computed once
+/// per loop run (the defs don't change mid-run) and published to a process-global for the HUD.
 pub fn estimate_defs_tokens(defs: &[ToolDef]) -> usize {
     let tok = serde_json::to_string(defs)
-        .map(|s| s.len() / 4)
+        .map(|s| crate::core::tokens::estimate_str(&s))
         .unwrap_or(0);
     SCHEMA_OVERHEAD_TOK.store(tok, std::sync::atomic::Ordering::Relaxed);
     tok
@@ -4556,6 +4667,15 @@ fn is_failure_result(content: &str) -> bool {
     }
     false
 }
+
+/// How many emergency shrinks one run may spend before a context overflow is surfaced as the
+/// error it is. One was a single shot: the second overflow of a long run failed with evictable
+/// bodies still in the transcript. Each shrink halves what is left, so three is plenty — and
+/// `emergency_overflow_shrink` returning `false` (nothing left to evict) ends it sooner.
+const MAX_OVERFLOW_SHRINKS: usize = 3;
+
+/// Consecutive auto-compaction failures before the cadence latch arms anyway (see the loop).
+const COMPACT_FAILURES_BEFORE_LATCH: usize = 2;
 
 /// EMERGENCY OVERFLOW SHRINK — the recovery behind [`crate::llm::client::ApiErrorKind::ContextOverflow`].
 ///
@@ -5157,12 +5277,45 @@ const FLAT_TURNS_BEFORE_NUDGE: usize = 2;
 /// here — if it makes no progress the thrash guard catches it. O(1) memory, cheap String compares.
 const SIG_RING: usize = 6;
 
-/// Append a system nudge, first removing any EARLIER system message of the same kind
-/// (`kind_prefix` must prefix `text`). Scans indices 1.. only — the system prompt at `[0]` is
-/// untouchable — and removes ONLY `role == "system"` messages, so assistant↔tool pairing cannot be
+/// Tag on a nudge delivered in the user turn, so it is never mistaken for something the user
+/// typed and can be found again for de-duplication and retirement.
+const USER_NUDGE_TAG: &str = "[harness] ";
+
+/// Every nudge kind the loop injects. Used by [`retire_nudges`] to strip stale ones at the start
+/// of the next run — a nudge is advice for THIS run, and left in place it rides every later
+/// request as instructions (and, on the Codex path, inside the hoisted instructions blob).
+const NUDGE_KINDS: &[&str] = &[
+    NUDGE_CONTEXT,
+    NUDGE_DIVERGENCE,
+    NUDGE_STEP_LIMIT,
+    NUDGE_TODO,
+    NUDGE_STUCK,
+    NUDGE_HILL_CLIMB,
+    NUDGE_BATCH,
+    NUDGE_SAVE_BEFORE_CLEAR,
+    NUDGE_BUDGET,
+];
+
+/// Is `m` a nudge of `kind_prefix`, in either delivery role?
+fn is_nudge_of_kind(m: &Message, kind_prefix: &str) -> bool {
+    let Some(c) = m.content.as_deref() else {
+        return false;
+    };
+    match m.role.as_str() {
+        "system" => c.starts_with(kind_prefix),
+        "user" => c
+            .strip_prefix(USER_NUDGE_TAG)
+            .is_some_and(|rest| rest.starts_with(kind_prefix)),
+        _ => false,
+    }
+}
+
+/// Append a nudge in `role`, first removing any EARLIER nudge of the same kind (`kind_prefix`
+/// must prefix `text`). Scans indices 1.. only — the system prompt at `[0]` is untouchable — and
+/// removes ONLY messages that are nudges of this kind, so assistant↔tool pairing cannot be
 /// orphaned by construction. The new nudge is always the TAIL message, preserving the caller's
 /// error-rollback contract (`messages.pop()` removes exactly the nudge).
-fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
+fn push_nudge_as(messages: &mut Vec<Message>, role: NudgeRole, kind_prefix: &str, text: &str) {
     debug_assert!(
         text.starts_with(kind_prefix),
         "kind prefix must identify its own nudge text"
@@ -5170,16 +5323,39 @@ fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
     let mut i = messages.len();
     while i > 1 {
         i -= 1;
-        if messages[i].role == "system"
-            && messages[i]
-                .content
-                .as_deref()
-                .is_some_and(|c| c.starts_with(kind_prefix))
+        if is_nudge_of_kind(&messages[i], kind_prefix) {
+            messages.remove(i);
+        }
+    }
+    match role {
+        NudgeRole::System => messages.push(Message::system(text)),
+        NudgeRole::User => messages.push(Message::user(format!("{USER_NUDGE_TAG}{text}"))),
+    }
+}
+
+/// [`push_nudge_as`] in the default `system` role (tests and the paths with no config in reach).
+#[cfg_attr(not(test), allow(dead_code))]
+fn push_nudge(messages: &mut Vec<Message>, kind_prefix: &str, text: &str) {
+    push_nudge_as(messages, NudgeRole::System, kind_prefix, text)
+}
+
+/// Remove every nudge left behind by an EARLIER run. Called at loop entry, not at exit: the
+/// harness tests read the nudges a run injected off its history, and a new user turn rewrites
+/// the cache prefix from that point anyway, so stripping here costs nothing extra. Index 0 (the
+/// system prompt) is never touched. Returns how many were removed.
+pub fn retire_nudges(messages: &mut Vec<Message>) -> usize {
+    let before = messages.len();
+    let mut i = messages.len();
+    while i > 1 {
+        i -= 1;
+        if NUDGE_KINDS
+            .iter()
+            .any(|k| is_nudge_of_kind(&messages[i], k))
         {
             messages.remove(i);
         }
     }
-    messages.push(Message::system(text));
+    before - messages.len()
 }
 
 /// Generic tokens a URL/protocol source contributes that carry no topical signal (scheme, common
@@ -6178,6 +6354,7 @@ mod tests {
             max_fetch_result_chars: 12_000,
             max_log_result_chars: 16_000,
             max_delegate_result_chars: 24_000,
+            nudge_role: NudgeRole::System,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
             exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
@@ -10948,3 +11125,113 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/tool_surface.rs"]
 mod tool_surface_tests;
+
+#[cfg(test)]
+mod effort_and_nudge_tests {
+    use super::*;
+
+    #[test]
+    fn apply_effort_scales_the_harness_budgets_and_never_disables_a_user_review() {
+        let mut low = AgentConfig::default();
+        low.apply_effort("low");
+        let mut max = AgentConfig::default();
+        max.apply_effort("max");
+        assert!(low.max_iters < AgentConfig::default().max_iters);
+        assert!(max.max_iters > AgentConfig::default().max_iters);
+        assert!(low.max_continuations < max.max_continuations);
+        assert!(low.max_verify_attempts < max.max_verify_attempts);
+        assert!(low.max_log_result_chars < max.max_log_result_chars);
+        assert!(!low.enable_self_review && max.enable_self_review);
+        // A user who enabled self-review keeps it on a low turn.
+        let mut reviewed = AgentConfig {
+            enable_self_review: true,
+            ..AgentConfig::default()
+        };
+        reviewed.apply_effort("low");
+        assert!(reviewed.enable_self_review);
+        // Unknown tiers change nothing.
+        let mut odd = AgentConfig::default();
+        odd.apply_effort("minimal");
+        assert_eq!(odd.max_iters, AgentConfig::default().max_iters);
+    }
+
+    #[test]
+    fn nudge_role_follows_the_endpoint() {
+        assert_eq!(
+            NudgeRole::for_base_url("https://api.anthropic.com/v1"),
+            NudgeRole::System
+        );
+        assert_eq!(
+            NudgeRole::for_base_url("http://localhost:8080/v1"),
+            NudgeRole::User
+        );
+        assert_eq!(
+            NudgeRole::for_base_url("https://chatgpt.com/backend-api/codex"),
+            NudgeRole::User
+        );
+    }
+
+    #[test]
+    fn user_role_nudges_are_tagged_deduplicated_and_retired_at_the_next_run() {
+        let mut msgs = vec![Message::system("sys"), Message::user("task")];
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::User,
+            NUDGE_DIVERGENCE,
+            "You repeated the same tool call(s). Stop.",
+        );
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::User,
+            NUDGE_BUDGET,
+            "Context budget: 60%",
+        );
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::User,
+            NUDGE_DIVERGENCE,
+            "You repeated the same tool call(s). Really stop.",
+        );
+        assert_eq!(
+            msgs.len(),
+            4,
+            "the second divergence nudge replaced the first"
+        );
+        assert!(
+            msgs[3].role == "user"
+                && msgs[3]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(USER_NUDGE_TAG)
+        );
+        assert!(msgs[3].content.as_deref().unwrap().contains("Really stop"));
+        // A real user message that merely resembles a nudge is never touched.
+        msgs.push(Message::user("Context budget: what is it?"));
+        push_nudge_as(
+            &mut msgs,
+            NudgeRole::System,
+            NUDGE_BUDGET,
+            "Context budget: 70%",
+        );
+        assert!(msgs
+            .iter()
+            .any(|m| m.content.as_deref() == Some("Context budget: what is it?")));
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| is_nudge_of_kind(m, NUDGE_BUDGET))
+                .count(),
+            1,
+            "one budget nudge across both roles"
+        );
+        let removed = retire_nudges(&mut msgs);
+        assert_eq!(removed, 2, "divergence + budget");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content.as_deref(), Some("sys"));
+        assert_eq!(msgs[1].content.as_deref(), Some("task"));
+        assert_eq!(
+            msgs[2].content.as_deref(),
+            Some("Context budget: what is it?")
+        );
+    }
+}

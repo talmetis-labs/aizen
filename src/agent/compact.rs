@@ -1,9 +1,12 @@
 //! Conversation compaction — the shared core used both by the interactive REPL (between turns) and
 //! by the agent loop (mid-task, for multi-turn callers like `aizen serve`). Older turns are summarized
 //! into one dense `system` note; the system prompt and the last [`KEEP_TURNS`] user turns are kept
-//! verbatim. The cut is always a `user` boundary so the summarized block never ends mid-turn and the
-//! kept tail never begins with an orphan `tool` result (a dangling tool message 400s on strict
-//! gateways).
+//! verbatim. With two or more user turns the cut is a `user` boundary; a SINGLE-turn run (one
+//! prompt, fifty tool steps — the canonical agent shape, which used to be uncompactable) cuts on
+//! an `assistant` boundary instead, keeping the prompt verbatim and the last [`KEEP_STEPS`] steps.
+//! Either way the kept tail never begins with an orphan `tool` result (a dangling tool message
+//! 400s on strict gateways), and the summary is prefixed with the files and skills the summarized
+//! block touched, so the continuation does not re-search for paths it already had.
 //!
 //! The model call is INJECTED as a `summarize` closure rather than hardcoded, so the same core works
 //! for any endpoint, can be driven non-streaming/quiet from the loop, and is unit-testable with a
@@ -15,6 +18,9 @@ use std::future::Future;
 
 /// User turns kept verbatim at the tail; everything older is summarized.
 pub const KEEP_TURNS: usize = 3;
+
+/// Assistant steps (tool-call turns) kept verbatim at the tail of a single-turn run.
+pub const KEEP_STEPS: usize = 6;
 
 /// Stable prefix identifying the compaction-boundary `system` note (P-ctx3). Analogous to Claude
 /// Code's `subtype:"compact_boundary"` marker: everything before this note in history is a lossy
@@ -204,6 +210,40 @@ pub fn plan_compact_cut(history: &[Message], keep_turns: usize) -> Option<usize>
     }
 }
 
+/// The cut for either shape: a `user` boundary when the conversation has two or more user turns
+/// (see [`plan_compact_cut`]), else an `assistant` boundary inside the single turn, keeping the
+/// last `keep_steps` assistant steps verbatim. `None` when there is nothing older to summarize.
+/// The caller tells the shapes apart by the role at the cut.
+pub fn plan_compact_cut_at(
+    history: &[Message],
+    keep_turns: usize,
+    keep_steps: usize,
+) -> Option<usize> {
+    if let Some(cut) = plan_compact_cut(history, keep_turns) {
+        return Some(cut);
+    }
+    let lead = leading_system_count(history);
+    let first_user = history
+        .iter()
+        .enumerate()
+        .skip(lead)
+        .find(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)?;
+    let steps: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(first_user + 1)
+        .filter(|(_, m)| m.role == "assistant")
+        .map(|(i, _)| i)
+        .collect();
+    let keep = keep_steps.max(1);
+    if steps.len() <= keep {
+        return None;
+    }
+    let cut = steps[steps.len() - keep];
+    (cut > first_user + 1).then_some(cut)
+}
+
 /// How many times `history` has been compacted, read from the boundary marker (P-ctx3). Zero if no
 /// boundary note is present. The count lives IN the marker text (`#N`) rather than a side counter,
 /// so it is correct after session save/restore (which only round-trips `messages`) and after a
@@ -243,16 +283,46 @@ fn marker_text(seq: usize, summary: &str) -> String {
 /// running compaction count: the number is read off any PRIOR boundary note (which is about to be
 /// summarized into this one) and incremented, so the count accumulates across successive
 /// compactions even though each old boundary note is folded into the next summary.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn splice_compacted(history: &mut Vec<Message>, cut: usize, summary: &str) {
+    splice_compacted_keeping(history, cut, summary, None);
+}
+
+/// [`splice_compacted`] that re-seats `keep_verbatim` (the single-turn prompt) right after the
+/// boundary note, so the task statement survives its own compaction word for word.
+pub fn splice_compacted_keeping(
+    history: &mut Vec<Message>,
+    cut: usize,
+    summary: &str,
+    keep_verbatim: Option<Message>,
+) {
     let seq = compaction_count(history) + 1;
     let lead = leading_system_count(history).min(cut);
     let prefix: Vec<Message> = history[..lead].to_vec();
     let tail: Vec<Message> = history[cut..].to_vec();
-    let mut rebuilt = Vec::with_capacity(prefix.len() + 1 + tail.len());
+    let mut rebuilt = Vec::with_capacity(prefix.len() + 2 + tail.len());
     rebuilt.extend(prefix);
     rebuilt.push(Message::system(marker_text(seq, summary)));
+    rebuilt.extend(keep_verbatim);
     rebuilt.extend(tail);
     *history = rebuilt;
+}
+
+/// The touchpoints of the summarized block, as the first lines of the summary — the paths and
+/// skills the continuation would otherwise re-search for. Empty when there are none.
+pub fn touchpoints_preamble(tp: &Touchpoints) -> String {
+    let mut s = String::new();
+    if !tp.files.is_empty() {
+        s.push_str("Files referenced: ");
+        s.push_str(&tp.files.join(", "));
+        s.push('\n');
+    }
+    if !tp.skills.is_empty() {
+        s.push_str("Skills loaded: ");
+        s.push_str(&tp.skills.join(", "));
+        s.push('\n');
+    }
+    s
 }
 
 /// Rough size in tokens — for the before/after trace only. Delegates to the shared estimator so
@@ -276,13 +346,21 @@ where
     Fut: Future<Output = Result<String>>,
 {
     let before = approx_tokens(history);
-    let cut = plan_compact_cut(history, keep_turns)
-        .ok_or_else(|| anyhow!("conversation too short to compact (need at least 2 turns)"))?;
+    let cut = plan_compact_cut_at(history, keep_turns, KEEP_STEPS).ok_or_else(|| {
+        anyhow!("conversation too short to compact (need at least 2 turns, or one turn with more than {KEEP_STEPS} steps)")
+    })?;
     let lead = leading_system_count(history).min(cut);
     let older = &history[lead..cut];
     if older.is_empty() {
         anyhow::bail!("nothing older to compact");
     }
+    // Single-turn shape (cut on an assistant step): the prompt is inside the summarized block —
+    // it goes into the transcript so the summary knows the task, AND is re-seated verbatim.
+    let keep_prompt = (history[cut].role == "assistant")
+        .then(|| older.iter().find(|m| m.role == "user").cloned())
+        .flatten();
+    // Harvest what the block touched BEFORE it collapses: once summarized the tool calls are gone.
+    let tp = context_touchpoints(older);
     let transcript = render_transcript(older);
     let prompt = vec![
         Message::system(SUMMARIZE_SYS),
@@ -294,7 +372,8 @@ where
     if summary.trim().is_empty() {
         anyhow::bail!("the model returned an empty summary");
     }
-    splice_compacted(history, cut, summary.trim());
+    let summary = format!("{}{}", touchpoints_preamble(&tp), summary.trim());
+    splice_compacted_keeping(history, cut, &summary, keep_prompt);
     Ok((before, approx_tokens(history)))
 }
 
@@ -476,7 +555,121 @@ mod tests {
     async fn compact_history_errors_when_too_short() {
         let mut h = vec![Message::system("SYS"), user("only one turn")];
         let r = compact_history(&mut h, |_m| async { Ok("x".to_string()) }, KEEP_TURNS).await;
-        assert!(r.is_err(), "a single-turn conversation can't be compacted");
+        assert!(
+            r.is_err(),
+            "a single-turn conversation with no steps can't be compacted"
+        );
+    }
+
+    /// One prompt, N tool steps: the canonical agent run. Older steps collapse into the boundary
+    /// note, the prompt survives verbatim right after it, the last KEEP_STEPS steps stay, and no
+    /// tool result is orphaned.
+    fn step(i: usize, path: &str) -> [Message; 2] {
+        let id = format!("call_{i}");
+        [
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: id.clone(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "file_read".into(),
+                    arguments: format!(r#"{{"path":"{path}"}}"#),
+                },
+            }]),
+            Message::tool_result(id, format!("contents of {path}")),
+        ]
+    }
+
+    #[test]
+    fn single_turn_cut_lands_on_an_assistant_step_boundary() {
+        let mut h = vec![Message::system("SYS"), user("fix the parser")];
+        for i in 0..10 {
+            h.extend(step(i, &format!("src/f{i}.rs")));
+        }
+        // 10 steps, keep 6 → the cut is the 5th step's assistant message (index 2 + 4*2).
+        let cut = plan_compact_cut_at(&h, KEEP_TURNS, 6).unwrap();
+        assert_eq!(cut, 10);
+        assert_eq!(h[cut].role, "assistant");
+        assert_eq!(
+            plan_compact_cut_at(&h, KEEP_TURNS, 10),
+            None,
+            "nothing older than the kept steps"
+        );
+        let short = vec![Message::system("SYS"), user("q"), asst("a")];
+        assert_eq!(plan_compact_cut_at(&short, KEEP_TURNS, 6), None);
+    }
+
+    #[tokio::test]
+    async fn single_turn_run_compacts_keeps_the_prompt_and_carries_touchpoints() {
+        let mut h = vec![Message::system("SYS"), user("fix the parser")];
+        for i in 0..10 {
+            h.extend(step(i, &format!("src/f{i}.rs")));
+        }
+        let (before, after) =
+            compact_history(&mut h, |_m| async { Ok("SUMMARY".to_string()) }, KEEP_TURNS)
+                .await
+                .unwrap();
+        assert!(after < before);
+        assert_eq!(h[0].content.as_deref(), Some("SYS"));
+        let note = h[1].content.as_deref().unwrap();
+        assert!(note.starts_with(COMPACT_MARKER_PREFIX), "{note}");
+        assert!(
+            note.contains("Files referenced: src/f0.rs, src/f1.rs, src/f2.rs, src/f3.rs"),
+            "touchpoints of the summarized block lead the note: {note}"
+        );
+        assert!(
+            !note.contains("src/f4.rs"),
+            "kept steps are not in the preamble: {note}"
+        );
+        assert!(note.contains("SUMMARY"));
+        assert_eq!(h[2].role, "user");
+        assert_eq!(
+            h[2].content.as_deref(),
+            Some("fix the parser"),
+            "prompt verbatim"
+        );
+        assert_eq!(
+            h[3].role, "assistant",
+            "tail starts on a step, never a tool result"
+        );
+        assert_eq!(h.len(), 3 + 6 * 2);
+        // A second compaction of the same turn folds the old note into the new one.
+        for i in 10..20 {
+            h.extend(step(i, &format!("src/g{i}.rs")));
+        }
+        compact_history(
+            &mut h,
+            |_m| async { Ok("SUMMARY2".to_string()) },
+            KEEP_TURNS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction_count(&h), 2);
+        assert_eq!(
+            h.iter()
+                .filter(|m| m
+                    .content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(COMPACT_MARKER_PREFIX)))
+                .count(),
+            1,
+            "one boundary note, not a stack of them"
+        );
+        assert_eq!(h[2].content.as_deref(), Some("fix the parser"));
+    }
+
+    #[tokio::test]
+    async fn multi_turn_summary_also_carries_touchpoints() {
+        let mut h = vec![Message::system("SYS"), user("u1")];
+        h.extend(step(0, "src/old.rs"));
+        h.push(asst("done u1"));
+        h.push(user("u2"));
+        h.push(asst("a2"));
+        compact_history(&mut h, |_m| async { Ok("S".to_string()) }, 1)
+            .await
+            .unwrap();
+        let note = h[1].content.as_deref().unwrap();
+        assert!(note.contains("Files referenced: src/old.rs"), "{note}");
+        assert_eq!(h[2].content.as_deref(), Some("u2"), "user boundary kept");
     }
 
     #[test]

@@ -453,8 +453,14 @@ async fn run_serve_turn(
                 .map(|t| t.content.unwrap_or_default())
         }
     };
+    // Same turn scoping as the REPL: the todo list belongs to one turn's work and carries over
+    // only when the run ended abnormally. (Lanes still share one process-global list — a
+    // per-lane list is a later step.)
+    crate::agent::todo::begin_user_turn();
+    crate::agent::todo::end_turn(true);
     let outcome =
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
+    crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
 
     // The passive learner writes ONE global memory store, so lanes take turns rather than racing to
     // rewrite the same files. Short and off the critical path — the turn's answer is already formed.

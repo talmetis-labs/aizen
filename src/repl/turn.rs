@@ -92,8 +92,21 @@ pub(crate) fn turn_agent_config(
         // stops at 2. `/goal` does not take this branch (goal mode retries transient errors
         // indefinitely, see agent/mod.rs), so raising this never shortens a goal run.
         max_transient_retries: 10,
+        // Where the loop's mid-run nudges go: a `system` message on Anthropic-style gateways, the
+        // user turn everywhere else (the Codex path hoists every system message into its
+        // instructions blob, and many local chat templates reject a mid-history system role).
+        nudge_role: nudge_role_for_endpoint(),
         ..AgentConfig::default()
     }
+}
+
+/// The nudge role for the endpoint this REPL talks to (saved config or the `AIZEN_BASE_URL`
+/// override — the same two sources `resolve_endpoint` reads first).
+fn nudge_role_for_endpoint() -> crate::agent::NudgeRole {
+    let base = cli_config::branded_env("BASE_URL")
+        .or_else(|| cli_config::load().base_url.clone())
+        .unwrap_or_default();
+    crate::agent::NudgeRole::for_base_url(&base)
 }
 
 /// Fold this turn's retrieved context into the outgoing message and seat it in history.
@@ -112,6 +125,11 @@ pub(crate) fn seat_user_message(
     // Every model call from here until the next seated user message — the loop, its sub-agents,
     // the post-turn chores — is billed to this turn in the usage ledger.
     client::cost_meter().begin_turn();
+    // The todo list is scoped to the turn: cleared here unless the previous turn ended abnormally
+    // (its open items are then the continuation plan). Assume THIS turn ends abnormally until
+    // `finish_turn` says otherwise, so a turn that errors out keeps its plan for the retry.
+    crate::agent::todo::begin_user_turn();
+    crate::agent::todo::end_turn(true);
     let sent = fold_context_into_query(line);
     refresh_dynamic_prompt_lane(history, model);
     if images.is_empty() {
@@ -256,6 +274,8 @@ pub(crate) async fn finish_turn(
     // paragraph. Silence here makes those read exactly like `Done`, and the passes below would then
     // file a red tree as a finished task.
     surface_abnormal_stop(outcome);
+    // A turn that did not reach `Done` leaves its plan for the next user turn (see `todo`).
+    crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
     // Goal mode finishes only on a verify-passing `Done`. Clear it here so the next turn is an
     // ordinary capped turn again; Esc leaves the goal armed on purpose, so the user can retry.
     if crate::agent::goal::current_goal().is_some() && matches!(outcome.stop, StopReason::Done) {
