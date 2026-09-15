@@ -159,7 +159,15 @@ points at any endpoint, so the config map (plus the existing `AIZEN_<ROLE>_MODEL
 whole feature. Workflow children without `max_steps` now take the role's default (argus 15 …
 daedalus 45) instead of the flat 30; a specialist card keeps 30. The "done when" is pinned by
 `resolve_dispatch_pins_a_role_to_its_pantheon_model` and
-`role_tasks_reach_their_pantheon_model_in_one_workflow`.
+`role_tasks_reach_their_pantheon_model_in_one_workflow`. E2.2 implemented
+(`src/agent/context_pack.rs`, `read_cache_recent` in `agent/mod.rs`, `context` on `task` and on
+workflow tasks, `todo::active_item`). Deviation (k): the pack rides INSIDE the child's one user
+message ahead of the brief rather than as a second user message — strict providers reject two
+consecutive user turns — and the reading list is "this conversation" (the parent's read-cache
+scope, newest first) rather than "this turn": the store carries no turn stamp, is cleared on
+compaction, and records only turns with no destructive call, so it is a best-effort list, never
+a promise. The "done when" (no re-reads of the parent's files in fan-out traces) stays
+unmeasured until tapes exist.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

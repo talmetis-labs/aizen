@@ -186,6 +186,13 @@ handing the model false inputs, and starts measuring what it sends.
   20, metis / nemesis / mnemosyne 25, themis 30, daedalus 45; a workflow child without
   `max_steps` takes the same number. The historian's brief no longer ships three runs of
   seventeen spaces to every dispatch.
+- **A delegated child starts from the parent's position.** A `task` dispatch and every
+  workflow task open the child's brief with a `<parent_context>` block: the parent's
+  in-progress todo item, the findings it passes as the new `context` arg (up to ten short
+  lines), and up to fifteen locations the parent already read in this conversation, as
+  `path:start-end` from its own read cache — so the child goes to those lines instead of
+  searching for them, and does not re-derive what the parent already knows. Capped at 2,500
+  chars, reads dropped before findings; nothing is added when there is nothing to hand over.
 
 ## [0.6.7] — 2026-09-11
 

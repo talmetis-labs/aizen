@@ -725,7 +725,12 @@ Behavior worth knowing:
   themis 30, daedalus 45 (`max_steps` overrides; cap 80) — and can be pinned to its own provider
   or model: `roles.pantheon.<role>` in `cli-config.json`, or `/config` → Sub-agents → Pantheon
   roles (env `AIZEN_<ROLE>_MODEL` wins; an explicit `model` on the dispatch beats the pin;
-  unpinned roles take the sub-agent default).
+  unpinned roles take the sub-agent default). A child does not start from zero: its brief
+  opens with a `<parent_context>` block carrying the parent's in-progress todo item, the
+  findings passed in the `context` arg (up to ten short lines), and up to fifteen
+  `path:start-end` locations the parent already read in this conversation (from its read
+  cache), capped at 2,500 chars — so the child goes to those lines instead of searching, and
+  does not re-derive what the parent states as established.
   Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
   change flow is one `daedalus` implementation followed by separate `themis` (verify) and
   `nemesis` (review) dispatches.
@@ -761,6 +766,7 @@ Spec shape:
     // optional dispatch contract — same semantics as the task tool:
     "boundaries": "Do not edit files",
     "expected_output": "Findings with severity and file:line evidence",
+    "context": ["what the parent already established — the child does not re-derive it"],
     "max_steps": 25,                      // total step budget (default: the role's own; cap 80)
     "expects": { "type": "object" }       // JSON Schema the child's answer must satisfy
   }, ... ],
