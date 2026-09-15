@@ -294,6 +294,18 @@ Vietnamese restatement cluster (peak lexical 0.44, see `match_text`) — those s
 `bench-fixtures/tier-hints.jsonl`, 14/14 with the 8 profile cases still green). Deviation (x): existing rows are not
 re-filed — their project is not recoverable from the text and a guessed anchor would be a wrong
 one — so M3's 239 `user` rows stay until touched; the rule guards the write path from here on.
+E4.3 implemented (`memory::gate_coverage`: IDF-weighted over the `GATE_QUERY_TERMS = 6`
+heaviest query tokens, covered by any of the top `GATE_TOP_HITS = 3`; the index comes back from
+the same scoped search via `search_scoped_with_index`, no second load; `tokenize` emits an
+identifier's words next to the identifier — snake, kebab and camel; `bench memory` prints a
+gate-admission line per split with a threshold sweep). Measured on the fixtures after the
+change: ranking unchanged (`GATE: PASS` vs baseline; gate recall@5 1.000, paraphrase 0.769);
+at 0.34 the gate admits 10/10 on the gate split and 13/18 on tune, every admission with an
+acceptable fact in the top 3, 2 correct queries refused; the sweep admits one more correct query
+at 0.20 and refuses none wrongly at any threshold — but the fixtures carry no negative queries,
+so the over-injection side (the reason the gate exists) is not measurable here and the
+threshold stays at 0.34 until live audit data says otherwise. The live gate
+(2–3 facts per turn at ≥ 31 % citation) needs sessions on a real endpoint to measure.
 
 | ID | Item | From | Size | Depends on | Done when |
 |---|---|---|---|---|---|

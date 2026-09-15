@@ -307,6 +307,14 @@ handing the model false inputs, and starts measuring what it sends.
   no longer travel with you as preferences. `node.js` is a product, `and/or` and `24/7` are
   not paths. `aizen bench profile` gains a golden tier-hints set that runs such sentences
   through the real classifier. Rows learned before this stay where they are.
+- **Recall that clears its own gate, and identifiers that match their words.** The per-turn
+  memory recall gate now judges the block it will show: query words are weighted by how rare
+  they are in your store, only the six most telling count, and a word is covered when any of
+  the top three facts carries it — a long Vietnamese question is no longer refused for its
+  particles. The tokenizer emits an identifier's words alongside the identifier itself
+  (`get_by_id`, `getById`, `rate-limit`), so "get by id" finds `get_by_id` instead of
+  scoring zero. `aizen bench memory` prints the gate's admissions per split with a threshold
+  sweep, which is what the gate is tuned on.
 
 ## [0.6.7] — 2026-09-11
 
