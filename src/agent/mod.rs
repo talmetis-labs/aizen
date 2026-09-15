@@ -229,24 +229,29 @@ pub fn build_system_prompt_bundle(
     stable.push_str("</environment>\n");
 
     let mut dynamic = String::new();
-    // Durable AGENT operating-identity (who the agent IS across every persona/project) — ABOVE the
-    // persona costume and the user model. HOME-only + sanitized + fail-closed (see `crate::persona::soul`).
-    if let Some(soul) = crate::persona::soul::prompt_block() {
-        dynamic.push_str("\n<agent_identity>\n");
-        dynamic.push_str(soul.trim());
-        dynamic.push_str("\n</agent_identity>\n");
-    }
-    // Active character card (who the agent IS) — before user_memory (who the user is).
-    if let Some(p) = crate::persona::prompt_block() {
-        dynamic.push_str("\n<persona>\n");
-        dynamic.push_str(p.trim());
-        dynamic.push_str("\n</persona>\n");
-        // The character's accumulated experience (who it has BECOME) — only meaningful with a
-        // persona active, so nested under it.
-        if let Some(sb) = crate::persona::self_block() {
-            dynamic.push_str("\n<self>\n");
-            dynamic.push_str(sb.trim());
-            dynamic.push_str("\n</self>\n");
+    // The three identity blocks are left out while the persona gate is raised — a tool-bound
+    // REPL turn, unless `persona_for_coding` is on (E4.7). See `persona::suppress_for_turn`.
+    if !crate::persona::suppressed() {
+        // Durable AGENT operating-identity (who the agent IS across every persona/project) — ABOVE
+        // the persona costume and the user model. HOME-only + sanitized + fail-closed (see
+        // `crate::persona::soul`).
+        if let Some(soul) = crate::persona::soul::prompt_block() {
+            dynamic.push_str("\n<agent_identity>\n");
+            dynamic.push_str(soul.trim());
+            dynamic.push_str("\n</agent_identity>\n");
+        }
+        // Active character card (who the agent IS) — before user_memory (who the user is).
+        if let Some(p) = crate::persona::prompt_block() {
+            dynamic.push_str("\n<persona>\n");
+            dynamic.push_str(p.trim());
+            dynamic.push_str("\n</persona>\n");
+            // The character's accumulated experience (who it has BECOME) — only meaningful with
+            // a persona active, so nested under it.
+            if let Some(sb) = crate::persona::self_block() {
+                dynamic.push_str("\n<self>\n");
+                dynamic.push_str(sb.trim());
+                dynamic.push_str("\n</self>\n");
+            }
         }
     }
     if let Some(fc) = frozen_core {

@@ -1800,7 +1800,28 @@ SlashId::Yolo => {
             }
         }
         SlashId::Persona => {
-            if let Err(e) = personas_menu(history, model_label).await {
+            // `/persona coding on|off|status`: keep the character in the prompt on coding turns
+            // (E4.7). Everything else opens the menu as before.
+            if let Some(rest) = arg.strip_prefix("coding") {
+                let want = rest.trim();
+                let mut cfg = cli_config::load();
+                match want {
+                    "on" | "off" => {
+                        cfg.persona_for_coding = Some(want == "on");
+                        if let Err(e) = cli_config::save(&cfg) {
+                            tui::note_line(&format!("{} {e}", style("persona:").red()));
+                        } else {
+                            tui::emit_line(&format!(
+                                "persona on coding turns: {want} (from your next message)"
+                            ));
+                        }
+                    }
+                    _ => tui::emit_line(&format!(
+                        "persona on coding turns: {} — `/persona coding on|off`",
+                        if cfg.persona_for_coding.unwrap_or(false) { "on" } else { "off" }
+                    )),
+                }
+            } else if let Err(e) = personas_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("persona:").red()));
             }
         }

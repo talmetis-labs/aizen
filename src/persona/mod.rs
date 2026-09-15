@@ -24,6 +24,34 @@
 pub mod migrate_stems;
 pub mod reflect;
 pub mod self_mem;
+
+/// The persona gate (E4.7, quality plan M11): the costume, the character's self-memory and the
+/// agent identity cost up to ~1,900 tokens per turn and do nothing for a coding task. The REPL's
+/// per-turn lane refresh raises this while it builds the lanes for a tool-bound turn, and
+/// [`crate::agent::build_system_prompt_bundle`] leaves the three blocks out while it is up.
+/// Nothing else sets it — a hostbot lane, whose persona IS the product, never sees it.
+static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Raise or lower the gate. Returns a guard that restores the previous state on drop, so a
+/// panic inside the lane build cannot leave the persona switched off for the session.
+#[must_use = "the gate stays raised only while the guard is held"]
+pub fn suppress_for_turn(on: bool) -> SuppressGuard {
+    let prior = SUPPRESSED.swap(on, std::sync::atomic::Ordering::SeqCst);
+    SuppressGuard(prior)
+}
+
+/// Is the persona gate raised for the lane being built right now?
+pub fn suppressed() -> bool {
+    SUPPRESSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub struct SuppressGuard(bool);
+
+impl Drop for SuppressGuard {
+    fn drop(&mut self) {
+        SUPPRESSED.store(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 pub mod soul;
 
 use crate::core::config::aizen_home;

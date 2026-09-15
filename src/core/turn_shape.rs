@@ -336,11 +336,14 @@ pub fn classify(prompt: &str) -> TurnShape {
 
 /// The conversation's shape so far: the widest turn seen since the last reset.
 static CONVERSATION: Mutex<Option<TurnShape>> = Mutex::new(None);
+/// The shape of the turn being seated right now, un-widened — what the persona gate reads.
+static THIS_TURN: Mutex<Option<TurnShape>> = Mutex::new(None);
 
 /// Record this turn's shape and return the conversation's (widened) shape. Widening only, so
 /// the deferred tool set — and with it the advertised tool list — changes at most a few times
 /// per conversation and never flips back and forth.
 pub fn note_turn(shape: TurnShape) -> TurnShape {
+    *THIS_TURN.lock().unwrap_or_else(|e| e.into_inner()) = Some(shape);
     let mut g = CONVERSATION.lock().unwrap_or_else(|e| e.into_inner());
     let next = g.map_or(shape, |cur| cur.max(shape));
     *g = Some(next);
@@ -351,9 +354,15 @@ pub fn conversation_shape() -> Option<TurnShape> {
     *CONVERSATION.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The shape of the current turn alone (not widened by earlier turns), `None` before the first.
+pub fn current_turn_shape() -> Option<TurnShape> {
+    *THIS_TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `/clear`, `/new`, a fresh thread: the next turn decides afresh.
 pub fn reset_conversation() {
     *CONVERSATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *THIS_TURN.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(test)]

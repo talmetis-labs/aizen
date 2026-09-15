@@ -196,6 +196,12 @@ pub struct CliConfig {
     /// durable insights (the `<self>` layer). `None` ⇒ default ON. `Some(false)` ⇒ frozen character.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona_evolve: Option<bool>,
+    /// Keep the persona (costume, self-memory, agent identity) in the prompt on TOOL-BOUND turns
+    /// too — an edit, a multi-file change, or a turn after one that used file/shell tools. `None`
+    /// ⇒ off: those blocks cost up to ~1,900 tokens a turn and do nothing for a coding task, so a
+    /// coding turn drops them and a question or research turn keeps them. `/persona coding on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_for_coding: Option<bool>,
     /// Telegram bot integration (the `aizen serve` daemon + telegram_send/telegram_ask tools).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram: Option<TelegramConfig>,

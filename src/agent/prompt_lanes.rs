@@ -153,7 +153,20 @@ pub(crate) fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &st
             return;
         }
     }
-    let dynamic = active_system_prompt_bundle(model).dynamic;
+    // E4.7: a tool-bound turn — this turn's shape is an edit, or the previous turn worked with
+    // file/shell tools — gets the lanes without the persona blocks unless the user asked to keep
+    // them for coding. The gate is raised only around this build and only on this path.
+    let coding = persona_gate_applies(
+        crate::core::turn_shape::current_turn_shape(),
+        previous_turn_used_tools(history),
+        crate::core::cli_config::load()
+            .persona_for_coding
+            .unwrap_or(false),
+    );
+    let dynamic = {
+        let _gate = persona::suppress_for_turn(coding);
+        active_system_prompt_bundle(model).dynamic
+    };
     let lead = agent::compact::leading_system_count(history);
     if dynamic.trim().is_empty() {
         if lead > 1 {
@@ -164,6 +177,42 @@ pub(crate) fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &st
     } else {
         history.insert(1, Message::system(dynamic));
     }
+}
+
+/// PURE. Should the persona blocks stay out of this turn's lanes? Yes for an edit-shaped turn or
+/// one that follows tool work, unless the user keeps the persona on for coding. A question or a
+/// research turn after a conversational one keeps its character.
+pub(crate) fn persona_gate_applies(
+    shape: Option<crate::core::turn_shape::TurnShape>,
+    previous_turn_used_tools: bool,
+    keep_for_coding: bool,
+) -> bool {
+    use crate::core::turn_shape::TurnShape;
+    if keep_for_coding {
+        return false;
+    }
+    matches!(shape, Some(TurnShape::SmallEdit | TurnShape::MultiFile)) || previous_turn_used_tools
+}
+
+/// Did the most recent turn in `history` call a file, shell or process tool? Read at the next
+/// user-turn boundary, before the new message is seated, so "the last user message" is the
+/// previous turn's.
+pub(crate) fn previous_turn_used_tools(history: &[Message]) -> bool {
+    use crate::agent::tool_routing::{lane_for, Lane};
+    let start = history
+        .iter()
+        .rposition(|m| m.role == "user")
+        .unwrap_or(history.len());
+    history[start..]
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .flat_map(|m| m.tool_calls.iter())
+        .any(|c| {
+            matches!(
+                lane_for(&c.function.name),
+                Some(Lane::FileRead | Lane::FileWrite | Lane::Shell | Lane::Process)
+            )
+        })
 }
 
 /// Rewrite BOTH system lanes in place, preserving every non-system message.
@@ -456,4 +505,82 @@ pub(crate) fn rebuild_system(history: &mut Vec<Message>, model: &str) {
 /// persona mid-chat so the new character applies but the history is preserved.
 pub(crate) fn update_system_prompt(history: &mut Vec<Message>, model: &str) {
     refresh_dynamic_prompt_lane(history, model);
+}
+
+#[cfg(test)]
+mod persona_gate_tests {
+    use super::*;
+    use crate::core::turn_shape::TurnShape;
+
+    #[test]
+    fn the_gate_closes_on_questions_and_opens_on_coding_unless_kept() {
+        assert!(!persona_gate_applies(
+            Some(TurnShape::Question),
+            false,
+            false
+        ));
+        assert!(!persona_gate_applies(
+            Some(TurnShape::Research),
+            false,
+            false
+        ));
+        assert!(
+            !persona_gate_applies(None, false, false),
+            "the first turn keeps its character"
+        );
+        assert!(persona_gate_applies(
+            Some(TurnShape::SmallEdit),
+            false,
+            false
+        ));
+        assert!(persona_gate_applies(
+            Some(TurnShape::MultiFile),
+            false,
+            false
+        ));
+        assert!(
+            persona_gate_applies(Some(TurnShape::Question), true, false),
+            "a question after tool work is still a coding session"
+        );
+        assert!(
+            !persona_gate_applies(Some(TurnShape::MultiFile), true, true),
+            "`persona coding on` keeps the blocks everywhere"
+        );
+    }
+
+    #[test]
+    fn the_previous_turn_is_read_from_its_last_user_message() {
+        let call = |name: &str| crate::core::types::ToolCall {
+            id: "c".to_string(),
+            kind: "function".to_string(),
+            function: crate::core::types::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut h = vec![
+            Message::user("edit it".to_string()),
+            Message::assistant_tool_calls(vec![call("file_edit")]),
+            Message::user("thanks, and what is a monad?".to_string()),
+            Message::assistant("a monoid in the category of endofunctors".to_string()),
+        ];
+        assert!(
+            !previous_turn_used_tools(&h),
+            "the last turn was conversational"
+        );
+        h.push(Message::user("now rename the module".to_string()));
+        h.push(Message::assistant_tool_calls(vec![call("shell_run")]));
+        assert!(previous_turn_used_tools(&h));
+        assert!(!previous_turn_used_tools(&[]));
+    }
+
+    #[test]
+    fn the_flag_is_restored_when_the_guard_drops() {
+        assert!(!persona::suppressed());
+        {
+            let _g = persona::suppress_for_turn(true);
+            assert!(persona::suppressed());
+        }
+        assert!(!persona::suppressed());
+    }
 }
