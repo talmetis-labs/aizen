@@ -517,6 +517,31 @@ fn render_inner(allow_sixel: bool, avail: usize) -> String {
     out
 }
 
+/// `v<version> · <model> · <endpoint>`, elided to fit the header row: the frame pads short rows
+/// but never wraps or clips a long one, so a gateway URL past the inner width used to run
+/// through the right border. The endpoint gives way first (it is the long one), then the model.
+fn header_tail(version: &str, model: &str, endpoint: &str) -> String {
+    const HEAD: usize = "Aizen ".len();
+    let budget = INNER.saturating_sub(HEAD);
+    let elide = |s: &str, max: usize| -> String {
+        if measure_text_width(s) <= max {
+            return s.to_string();
+        }
+        let keep: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{keep}…")
+    };
+    let fixed = measure_text_width(&format!("v{version} ·  · "));
+    let room = budget.saturating_sub(fixed);
+    // The model keeps up to half the room when both are long; the endpoint takes the rest.
+    let model_max = measure_text_width(model).min(room / 2).max(1);
+    let model = elide(model, model_max);
+    let endpoint = elide(
+        endpoint,
+        room.saturating_sub(measure_text_width(&model)).max(1),
+    );
+    format!("v{version} · {model} · {endpoint}")
+}
+
 /// The panel body — endpoint info, tools, commands — as plain rows ([`frame`] adds the borders).
 fn body_rows() -> Vec<String> {
     let cfg = cli_config::load();
@@ -555,13 +580,7 @@ fn body_rows() -> Vec<String> {
     rows.push(format!(
         "{} {}",
         style("Aizen").color256(ACCENT).bold(),
-        style(format!(
-            "v{} · {} · {}",
-            env!("CARGO_PKG_VERSION"),
-            model,
-            endpoint
-        ))
-        .dim()
+        style(header_tail(env!("CARGO_PKG_VERSION"), model, endpoint)).dim()
     ));
     rows.push(format!("{} {key}", style("key:").dim()));
     rows.push(String::new());
@@ -761,11 +780,49 @@ mod tests {
         );
     }
 
+    /// A long gateway URL, a long model id, or both: the header row never exceeds the inner
+    /// width, the endpoint is elided first, and a short pair is left alone.
+    #[test]
+    fn header_row_elides_a_long_endpoint_before_the_model() {
+        let short = header_tail("0.6.8", "gpt-5", "https://api.openai.com/v1");
+        assert_eq!(short, "v0.6.8 · gpt-5 · https://api.openai.com/v1");
+
+        let url = "https://my-very-long-gateway.example.internal/openai/deployments/team-a/v1";
+        let long_url = header_tail("0.6.8", "gpt-5", url);
+        assert!(
+            measure_text_width(&long_url) + "Aizen ".len() <= INNER,
+            "{long_url}"
+        );
+        assert!(long_url.starts_with("v0.6.8 · gpt-5 · https://my-very-long"));
+        assert!(long_url.ends_with('…'));
+
+        let model = "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct-preview";
+        let both = header_tail("0.6.8", model, url);
+        assert!(
+            measure_text_width(&both) + "Aizen ".len() <= INNER,
+            "{both}"
+        );
+        assert!(
+            both.contains("accounts/fireworks"),
+            "the model keeps its head: {both}"
+        );
+        assert!(
+            both.contains("https://my-very"),
+            "the endpoint keeps its head: {both}"
+        );
+    }
+
     /// Every bordered line must be exactly the layout's one width — a wider row means content
     /// overran the right border (the Commands-row overflow regression), a narrower one a broken
     /// flank. Both layouts, deterministically: wide (sun on the right flank) and narrow (stacked).
     #[test]
     fn no_boxed_line_overflows() {
+        // The panel reads the config, the session and the endpoint through `aizen_home()` and
+        // the env; hold the shared lock so a test swapping those beside this one cannot put a
+        // foreign endpoint in the header row.
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (avail, want) in [(200usize, WIDE_TOTAL), (80, INNER + 4)] {
             let widths: Vec<usize> = render_inner(false, avail)
                 .lines()
@@ -786,6 +843,9 @@ mod tests {
     /// pane is narrower once the sidebar docks; the layout now receives the pane's width).
     #[test]
     fn wide_layout_centres_wordmark_above_and_docks_sun_right() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let out = render_inner(false, 200);
         let plain: Vec<String> = out
             .lines()
@@ -840,6 +900,9 @@ mod tests {
     /// letting the flank clip — nothing braille or block-art between the rules.
     #[test]
     fn narrow_layout_stacks_sun_and_wordmark_above_the_frame() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let out = render_inner(false, 80);
         let plain: Vec<String> = out
             .lines()
