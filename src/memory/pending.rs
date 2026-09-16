@@ -124,6 +124,10 @@ pub fn clear() {
 mod tests {
     use super::*;
 
+    /// The ledger is one process-global; the three tests below each clear and refill it, so
+    /// they take turns.
+    static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn p(handle: &str, id: &str) -> Pending {
         Pending {
             handle: handle.into(),
@@ -133,6 +137,7 @@ mod tests {
 
     #[test]
     fn resolve_used_maps_handles_and_ignores_invented_ones() {
+        let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
         open_turn(vec![p("m1", "prefers-pnpm"), p("m2", "windows-sys-pinned")]);
         // Tolerates the bracketed spelling the block itself uses.
@@ -154,6 +159,7 @@ mod tests {
 
     #[test]
     fn delta_is_order_insensitive_and_empty_never_matches() {
+        let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
         // Nothing injected yet → nothing to repeat.
         assert!(!is_same_as_last(&["a".into()]));
@@ -182,6 +188,7 @@ mod tests {
 
     #[test]
     fn clear_forgets_handles_so_a_restored_thread_cannot_confirm_stale_ids() {
+        let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
         open_turn(vec![p("m1", "a")]);
         assert!(!resolve_used(&["m1".into()]).is_empty());

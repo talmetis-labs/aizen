@@ -65,8 +65,13 @@ mod tests {
     use super::*;
     use crate::core::exec_ctx::{self, ExecutionContext};
 
+    /// Both tests write the one process-global slot; run them one at a time. Interleaved, the
+    /// pinned-context test read "default" after its sibling cleared the slot (macOS CI).
+    static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn active_defaults_then_tracks_set() {
+        let _g = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_active(None);
         assert_eq!(active().as_str(), "default");
         set_active(Some(ConversationId::new("telegram:main:42")));
@@ -81,6 +86,7 @@ mod tests {
 
     #[test]
     fn a_pinned_turn_context_wins_over_the_process_global() {
+        let _g = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The concurrency guarantee: a tool body running for lane B must see lane B's conversation
         // even though lane A wrote the process-global slot most recently.
         set_active(Some(ConversationId::new("telegram:laneA:1")));
