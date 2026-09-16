@@ -622,8 +622,8 @@ Behavior worth knowing:
   | `start` | `version`, `model`, `cwd`, `effort`, `images`, `pid` |
   | `text` | `delta` — a fragment of the answer, in order; concatenate them for the raw markdown |
   | `reasoning` | `delta` — the model's reasoning channel, when the provider exposes one |
-  | `tool_call` | `seq`, `name`, `args`, `target` |
-  | `tool_result` | `seq`, `name`, `target`, `ok`, `digest`, `elapsed_ms`, `output` (cut at 64 KB, then `truncated: true`) |
+  | `tool_call` | `seq`, `name`, `args`, `target`, `dispatch` — the delegated sub-agent's label, `null` for the loop's own call |
+  | `tool_result` | `seq`, `name`, `target`, `ok`, `digest`, `elapsed_ms`, `output` (cut at 64 KB, then `truncated: true`), `dispatch` |
   | `plan` | `items[{status: pending \| in_progress \| done, text}]` — the todo panel as last written |
   | `diff` | `path`, `added`, `removed` — the size of an edit (its text is in the `tool_result`) |
   | `verify` | `command`, `detail` — a verify-gate line |
@@ -636,6 +636,9 @@ Behavior worth knowing:
   | `done` | `stop`, `steps`, `final_text`, `question` (with `awaiting_input`), `session`, `usage{calls, input, output, cached, cache_write}` |
   | `error` | `message` — the run died; the exit code is non-zero |
 
+  A delegated child's calls (`task`, `workflow`) are on the stream too, each with its
+  `dispatch` label; children run in parallel, so their calls interleave with each other's and
+  with the parent's — pair a `tool_result` with its `tool_call` by `seq`, never by order.
   `stop` is one of `done`, `divergence`, `max_iters`, `verification_failed`, `awaiting_input`,
   `cancelled`, `deadline`. **Approvals are answered on stdin**: when a destructive call needs a
   decision the run writes `approval_request` and blocks until a line

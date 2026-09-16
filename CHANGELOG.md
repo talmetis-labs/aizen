@@ -14,9 +14,10 @@ handing the model false inputs, and starts measuring what it sends.
 - **`aizen agent --output-format json`** — the run as one JSON object per line on stdout:
   `start`, `text` deltas, `tool_call` / `tool_result`, `plan`, `diff`, `verify`, `warning`,
   `trace`, `hook`, `session`, `done` (stop reason, answer, this run's tokens) and `error`; a
-  destructive call asks with an `approval_request` and reads the answer from stdin. The contract
-  a front-end or a CI script builds on instead of parsing the transcript's glyphs, which every
-  cosmetic change used to break in silence.
+  destructive call asks with an `approval_request` and reads the answer from stdin. A delegated
+  sub-agent's calls are on the stream too, labelled `dispatch` (they interleave: pair by `seq`).
+  The contract a front-end or a CI script builds on instead of parsing the transcript's glyphs,
+  which every cosmetic change used to break in silence.
 - **Hooks.** `hooks` in `cli-config.json` runs your own commands around the loop: `pre_tool`
   (after the safety floor, before the prompt — exit `2` denies, `{"decision":"allow"}`
   pre-approves), `post_tool` (what it prints joins the tool result the model reads) and `stop`.
