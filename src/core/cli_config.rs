@@ -325,7 +325,7 @@ pub struct RoleModelConfig {
     pub reasoning_effort: Option<String>,
 }
 
-/// The routable roles. `summarizer` = compaction/handoff summaries; `subagent_default` = the task
+/// The routable roles. `summarizer` = compaction summaries; `subagent_default` = the task
 /// tool's fallback model; `oracle` = the self-review reviewer (stronger model recommended);
 /// `apply` = reserved for a future fast-apply edit model (config-only today). `pantheon` pins
 /// one of the seven built-in sub-agent roles (`nemesis`, `argus`, … — legacy aliases accepted

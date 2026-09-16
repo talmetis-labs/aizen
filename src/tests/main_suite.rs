@@ -349,7 +349,7 @@ async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_n
     );
 }
 
-/// A background chore call (secretary, persona reflection, compaction, reconcile, handoff,
+/// A background chore call (secretary, persona reflection, compaction, reconcile,
 /// persona-distill) must be TIME-BOUNDED, not merely byte-bounded.
 ///
 /// Every one of those routes the NON-streaming `chat_with_tools`, whose only native guard is
@@ -1160,7 +1160,8 @@ fn restoring_the_legacy_last_pointer_rehomes_it_to_a_named_file() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The `/handoff` seed is conversation content, not prompt prefix: a lane rewrite (what
+/// A handoff seed (the retired `/handoff` wrote one; saved sessions may still carry it) is
+/// conversation content, not prompt prefix: a lane rewrite (what
 /// `/config` and `/model` do via `refresh_prompt_lanes_in_place`) must splice AROUND it.
 /// Before the marker, the splice consumed it and the fresh thread silently lost its context.
 #[test]

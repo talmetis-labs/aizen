@@ -15,16 +15,14 @@ use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
 use crate::repl::postturn::{
-    chore_chat, last_turn_slice, maybe_auto_compact, maybe_evolve_persona, maybe_run_secretary,
+    chore_chat, last_turn_slice, maybe_evolve_persona, maybe_run_secretary,
 };
 use crate::ui::context_report::{
     ctx_permille, resolve_ctx_window, usage_ctx_tokens, usage_input_tokens,
 };
 use crate::ui::image_input;
 use crate::ui::{splash, theme, tui};
-use crate::{
-    approval_mode, cancellable_slash, cancellable_slash_labeled, eager_enabled, summarizer_endpoint,
-};
+use crate::{approval_mode, cancellable_slash, eager_enabled, summarizer_endpoint};
 use anyhow::Result;
 use console::style;
 use types::Message;
@@ -75,6 +73,9 @@ pub(crate) fn turn_agent_config(
         approval_mode: approval_mode(),
         cancel,
         context_window: resolve_ctx_window(model).0,
+        // The auto-compact threshold from `/config` (`compact_threshold_pct`, default 80, `0` off)
+        // arms the loop's own compaction — the one compaction trigger the REPL has.
+        compact_at_pct: crate::compact_threshold_pct(),
         enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
         // Reflect the live manager state (honours `/lsp off` for this turn).
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
@@ -298,12 +299,6 @@ pub(crate) async fn run_agent_turn(
     agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await
 }
 
-/// How long the inline post-turn work (auto-compaction: several summary calls) may take in total
-/// before the REPL gives up on it. Each call has its own cap (`chore_chat` → `chore_call_timeout`,
-/// 60s); this bounds the sum. On timeout the user sees a skip line instead of a spinner that
-/// never stops. The learning passes no longer run here — see `learning_queue`.
-const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
-
 /// Everything a turn that reached the model must do afterwards, on either surface.
 ///
 /// Ordering is load-bearing and was the thing that drifted: the learning passes read the FULL detail
@@ -382,8 +377,9 @@ pub(crate) async fn finish_turn(
     // learning, which is always optional work.
     // E4.4: the secretary and the persona reflection read the turn and write the store; nothing
     // in the next prompt waits on them except recall, which the next turn's `learning_queue`
-    // drain gives `DRAIN_JOIN` to satisfy. So they run in the background on a copy of the turn,
-    // and only auto-compaction — which rewrites `history` — stays inline.
+    // drain gives `DRAIN_JOIN` to satisfy. So they run in the background on a copy of the turn.
+    // Auto-compaction is not a post-turn pass any more: the loop compacts between its own steps
+    // (`compact_at_pct`), so a long turn shrinks mid-flight instead of after it ends.
     {
         let turn = last_turn_slice(history).to_vec();
         let http = http.clone();
@@ -393,28 +389,8 @@ pub(crate) async fn finish_turn(
             maybe_evolve_persona(&http, &ep.base_url, &ep.api_key, &ep.model).await;
         });
     }
-    let learning = cancellable_slash_labeled("finishing turn…", async {
-        maybe_auto_compact(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
-    });
-    let learned = match tokio::time::timeout(
-        std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
-        learning,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            tui::emit_line(
-                &theme::muted("⏱ auto-compaction exceeded its timeout — skipped.").to_string(),
-            );
-            None
-        }
-    };
-    if learned.is_none() {
-        tui::emit_line(&theme::muted("⏹ skipped auto-compaction.").to_string());
-    }
-    // Persistence is NOT optional, so it sits outside that block: a cancelled learning pass must
-    // still leave the conversation on disk. `autosave_session` names the session with a model call,
+    // Persistence is NOT optional: a cancelled learning pass must still leave the conversation on
+    // disk. `autosave_session` names the session with a model call,
     // so it is cancellable too — the local-only writer keeps the transcript either way.
     if cancellable_slash(autosave_session(
         history,

@@ -75,7 +75,7 @@ pub(crate) fn system_prompt_bundle_in(
 }
 
 /// A TRUE conversation boundary: promote pending memory, rebuild from the current store, and adopt
-/// the result before constructing a fresh prompt prefix. Startup, `/clear`, `/handoff`, session load,
+/// the result before constructing a fresh prompt prefix. Startup, `/clear`, session load,
 /// and one-shot/captured runs are the only callers that should use this path.
 pub(crate) fn refreshed_system_prompt_bundle(model: &str) -> agent::PromptBundle {
     // Everything the dynamic lane adopts for a conversation is re-read here and nowhere else: the
@@ -470,7 +470,7 @@ mod lane_stability_tests {
 }
 
 /// Everything a THREAD SWITCH must reset besides history itself: session scratch memory, todos,
-/// the cost tally, destructive-op session grants, and browser page @refs. `/clear`, `/handoff`,
+/// the cost tally, destructive-op session grants, and browser page @refs. `/clear`,
 /// `/resume`, `/sessions` restore and `/recover` all route here so a fresh or restored thread
 /// never inherits the previous one's state (the classic leak: a restored conversation still
 /// "allowed" the old thread's destructive ops and showed its cost).

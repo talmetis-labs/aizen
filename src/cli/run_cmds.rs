@@ -561,6 +561,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         auto_extend_to: max.saturating_mul(2),
         approval_mode: cli_approval,
         context_window: resolve_ctx_window(&model).0,
+        compact_at_pct: crate::compact_threshold_pct(),
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         nudge_role: agent::NudgeRole::for_base_url(&base_url),
         ..Default::default()

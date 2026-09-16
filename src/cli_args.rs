@@ -1278,7 +1278,7 @@ pub(crate) enum ConfigCmd {
         /// Saved provider profile the summarizer runs on (`roles.summarizer.provider`). Empty clears.
         #[arg(long)]
         summarizer_provider: Option<String>,
-        /// Model for compaction/handoff summaries (`roles.summarizer`) — the classic cheap-model
+        /// Model for compaction summaries (`roles.summarizer`) — the classic cheap-model
         /// slot. Empty clears.
         #[arg(long)]
         summarizer_model: Option<String>,

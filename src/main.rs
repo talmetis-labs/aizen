@@ -461,7 +461,7 @@ fn status_text(history: &[Message], model: &str) -> String {
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
-/// calls (compaction/handoff summaries) are the classic cheap-model candidates — one config field
+/// calls (compaction summaries) are the classic cheap-model candidates — one config field
 /// and every summary routes there.
 /// The endpoint every chore call goes to. The `summarizer` role when one is configured; otherwise
 /// the cheapest model the user configured for this endpoint (`models_by_effort.low`), and only
@@ -548,7 +548,7 @@ impl Drop for SteerMailboxGuard {
 
 /// Run a slash command's network call as INTERRUPTIBLE work. `None` means the user pressed Esc.
 ///
-/// Slash handlers that call the model (`/compact`, `/handoff`) used to `await` straight inside the
+/// Slash handlers that call the model (`/compact`) used to `await` straight inside the
 /// REPL loop with no token armed and `WORKING` still false. Two consequences, both bad: the HTTP
 /// client's 300s read timeout became the real ceiling, and `tui::turn_in_flight()` reported false —
 /// so Esc took the idle branch and merely cleared the draft while the REPL sat blocked in the await,

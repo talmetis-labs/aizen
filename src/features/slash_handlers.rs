@@ -1189,50 +1189,6 @@ pub(crate) async fn handle_slash(
                 None => tui::emit_line(&theme::muted("⏹ compact stopped — context unchanged.").to_string()),
             }
         }
-        SlashId::Handoff => {
-            if arg.trim().is_empty() {
-                tui::emit_line(&style("usage: /handoff <new goal> — start a fresh thread carrying only what matters for it").dim().to_string());
-            } else {
-                tui::emit_line(&style("handing off…").dim().to_string());
-                // Same cancellable wrapper as /compact: this is a blocking model call inside the
-                // REPL loop, so without an armed token Esc can't reach it.
-                match cancellable_slash(handoff_now(history, arg.trim())).await {
-                    Some(Ok(summary)) => {
-                        // Fresh thread: new system prompt, the goal-relevant extraction seeded as
-                        // context, todos cleared, destructive-op session grants re-armed (like /clear).
-                        rebuild_system(history, model_label);
-                        // The marker prefix keeps the seed alive through lane rewrites (/config,
-                        // /model, resume) — `leading_system_count` stops at it, so lane splices go
-                        // around the seed instead of overwriting it.
-                        history.push(Message::system(format!(
-                            "{}\n{summary}",
-                            agent::compact::HANDOFF_MARKER_PREFIX
-                        )));
-                        reset_per_session_state();
-                        // The finished conversation keeps its file; the handoff starts a NEW one.
-                        // Without re-slugging, the very next autosave overwrote the previous
-                        // thread's saved transcript with this freshly seeded stub.
-                        let previous = current_session_slug();
-                        set_session_slug(None);
-                        update_live_history(history);
-                        tui::emit_line(&style("handoff — fresh thread seeded with the relevant context").color256(splash::ACCENT).to_string());
-                        // Name the thread being left behind, so the full transcript is findable.
-                        if let Some(prev) = previous {
-                            tui::emit_line(
-                                &style(format!("  (the previous thread stays saved as “{prev}” — /sessions to reopen it)"))
-                                    .dim()
-                                    .to_string(),
-                            );
-                        }
-                        return SlashOutcome::Submit(arg.trim().to_string());
-                    }
-                    Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
-                    // Cancelled before the extraction landed. Nothing was rebuilt, so the current
-                    // thread continues untouched.
-                    None => tui::emit_line(&theme::muted("⏹ handoff stopped — thread unchanged.").to_string()),
-                }
-            }
-        }
         SlashId::Goal => {
             // Goal mode: run cap-free with smart retry until the model declares completion
             // (`goal_complete`) AND the verify gate passes. `/goal off` (or bare `/goal`) turns it off.

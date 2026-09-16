@@ -10,14 +10,36 @@ development log lives in that monorepo's history.
 Phase 0 of the 2026-09-14 quality plan (`docs/execution-plan-2026-09-14.md`): the harness stops
 handing the model false inputs, and starts measuring what it sends.
 
+### Changed
+- **One compaction trigger.** The REPL's post-turn auto-compaction is gone; the `/config`
+  threshold (`compact_threshold_pct`, default 80 %) now arms the loop's own mid-turn compaction,
+  which the one-shot `aizen agent` already used — one trigger for both surfaces, firing between
+  the agent's steps instead of after a turn had already overrun.
+- **Leaner tool schemas.** Tighter descriptions on the always-on tools, and — where `lean_tools`
+  defers — the language-server query and symbolic-edit tools, `codebase_search` and
+  `session_recall` ride behind `tool_search` too (4 of ~2,800 calls across 79 saved sessions).
+  A coding turn's advertised schema drops from 29.6 KB to 20.5 KB; the full surface from 43.4 KB
+  to 40.8 KB. `aizen prompt-size` shows both.
+
+### Removed
+- **`/handoff`.** Zero uses in 64 saved sessions since it landed; mid-turn compaction, `/clear`
+  and `/resume` cover what it did. A saved session that carries a handoff seed still loads.
+- **Percentage-based tool-result clearing** (`clear_at_pct`) and its save-before-clear nudge.
+  Observation collapsing (the newest eight results stay whole, older ones become digests that
+  name their spill file) keeps the same window and leaves nothing older than that to clear; the
+  overflow shrink behind a provider's context-length rejection stays as the safety net.
+
 ### Added
-- **`aizen agent --output-format json`** — the run as one JSON object per line on stdout:
-  `start`, `text` deltas, `tool_call` / `tool_result`, `plan`, `diff`, `verify`, `warning`,
-  `trace`, `hook`, `session`, `done` (stop reason, answer, this run's tokens) and `error`; a
-  destructive call asks with an `approval_request` and reads the answer from stdin. A delegated
-  sub-agent's calls are on the stream too, labelled `dispatch` (they interleave: pair by `seq`).
-  The contract a front-end or a CI script builds on instead of parsing the transcript's glyphs,
-  which every cosmetic change used to break in silence.
+- **`aizen agent --output-format stream-json`** — the run as one JSON record per line on stdout,
+  in the shape Claude Code's `stream-json` uses (the Claude Agent SDK message types): `system` /
+  `init`, `stream_event` deltas, `assistant` and `user` messages carrying `tool_use` /
+  `tool_result` blocks, `control_request` for a destructive call (answered on stdin with a
+  `control_response`), `result` last with the stop reason, the answer and this run's tokens. A
+  delegated sub-agent's records point at the call that spawned it (`parent_tool_use_id`) and
+  name the child (`dispatch`). `--output-format json` prints only the closing `result`. The
+  contract a front-end or a CI script builds on with the parser it already has for Claude Code,
+  instead of parsing the transcript's glyphs, which every cosmetic change used to break in
+  silence.
 - **Hooks.** `hooks` in `cli-config.json` runs your own commands around the loop: `pre_tool`
   (after the safety floor, before the prompt — exit `2` denies, `{"decision":"allow"}`
   pre-approves), `post_tool` (what it prints joins the tool result the model reads) and `stop`.

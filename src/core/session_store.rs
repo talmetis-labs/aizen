@@ -829,7 +829,7 @@ pub(crate) struct SessionInfo {
     pub(crate) meta: Option<SessionMeta>,
     /// Modification time in Unix MILLIseconds. `None` = the filesystem wouldn't say (network share,
     /// FUSE mount, transient ACL error) — rendered as "age unknown" rather than posing as fresh.
-    /// Milliseconds, not seconds, because two saves inside one second are routine (a `/handoff` and
+    /// Milliseconds, not seconds, because two saves inside one second are routine (a `/clear` and
     /// the seeded turn's autosave) and a second-granularity tie fell through to ALPHABETICAL order,
     /// which points the wrong way as often as not while the picker still claims "newest first".
     pub(crate) mtime_ms: Option<u64>,
@@ -904,7 +904,7 @@ pub(crate) fn stat_sessions() -> Vec<SessionStat> {
     for s in &mut out {
         s.recency = s.mtime_ms.map(|ms| ms.min(now_ms));
     }
-    // Milliseconds, not seconds: two saves inside one second are routine (a `/handoff` and the
+    // Milliseconds, not seconds: two saves inside one second are routine (a `/clear` and the
     // seeded turn's autosave), and a second-granularity tie fell through to ALPHABETICAL order,
     // which points the wrong way as often as not while the prompt still says "newest first". Name
     // order remains the last resort so the sort is total and stable.

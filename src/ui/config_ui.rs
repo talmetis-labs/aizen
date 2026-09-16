@@ -2629,7 +2629,7 @@ const ROLE_ROWS: [(&str, &str, &str); 4] = [
     (
         "summarizer",
         "Summarizer",
-        "compaction + handoff summaries (a cheap-fast model fits)",
+        "compaction summaries (a cheap-fast model fits)",
     ),
     (
         "oracle",

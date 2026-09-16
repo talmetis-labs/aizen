@@ -93,9 +93,10 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 **Context window + auto-compact** live in **`/config`** (so the settings stay in one place). The
 window drives the `% context` HUD (auto-detected from `/models` when the provider reports it, else
 estimated by model name, else whatever you type). Auto-compact (default **80%**, the `⊟ 80%` marker
-on the status line) summarizes older turns into one dense note when usage crosses the threshold,
-keeping the last few turns verbatim — the cut is always at a user-message boundary (no orphan tool
-results). `/compact` forces it now. Both also settable non-interactively:
+on the status line) summarizes older turns into one dense note when usage crosses the threshold —
+during a turn, between the agent's steps, so a long task compacts mid-flight instead of after it
+ends — keeping the last few turns verbatim; the cut is always at a user-message boundary (no
+orphan tool results). `/compact` forces it now. Both also settable non-interactively:
 `aizen config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
 
 Two cheaper measures run before compaction ever triggers, whatever the threshold: tool results

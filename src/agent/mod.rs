@@ -600,22 +600,17 @@ pub struct AgentConfig {
     /// one-time "wrap up" nudge. `0` (default) disables the guard — set by the interactive/one-shot
     /// callers from the resolved window; sub-agents leave it 0 (they are bounded + quiet).
     pub context_window: usize,
-    /// Tool-result clearing: keep the most recent N tool results verbatim; OLDER ones whose body
-    /// exceeds `clear_tool_result_min_chars` have their content evicted (the message + `tool_call_id`
-    /// stay intact) once history crosses `clear_at_pct` of `context_window`. The cheap,
-    /// deterministic first line of defense before summarization compaction. `0` disables clearing.
+    /// The overflow shrink (the recovery behind a provider's context-overflow rejection) keeps
+    /// the most recent N tool results verbatim and evicts OLDER bodies longer than
+    /// `clear_tool_result_min_chars` (the message + `tool_call_id` stay intact). Ordinary history
+    /// pressure is handled by observation collapsing (below) and compaction.
     pub keep_recent_tool_results: usize,
-    /// Min chars before an OLD tool result is worth clearing (small results aren't worth the churn).
+    /// Min chars before an OLD tool result is worth evicting in that shrink.
     pub clear_tool_result_min_chars: usize,
-    /// Clearing arm threshold as a percent of `context_window`. `0` disables clearing.
-    pub clear_at_pct: u8,
-    /// Batch-clear DOWN TO this percent of the window in one pass (the floor). Big infrequent
-    /// mutations beat a per-turn trickle: every mid-history rewrite busts the provider prompt
-    /// cache from that byte onward, so clearing rarely-but-thoroughly keeps hit rates alive.
-    pub clear_target_pct: u8,
-    /// Re-fire only after history grows this many percentage points past the last clear…
+    /// Compaction cadence: re-fire only after history grows this many percentage points past the
+    /// last attempt…
     pub clear_step_pct: u8,
-    /// …or after this many loop iterations since the last clear, whichever comes first.
+    /// …or after this many loop iterations since it, whichever comes first.
     pub clear_cooldown_iters: usize,
     /// Age-based observation collapsing, independent of context %: a tool result older than the
     /// newest `collapse_after_observations` results and longer than `collapse_min_chars` becomes a
@@ -828,8 +823,6 @@ impl Default for AgentConfig {
             context_window: 0,
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
-            clear_at_pct: 60,
-            clear_target_pct: 45,
             clear_step_pct: 10,
             clear_cooldown_iters: 6,
             collapse_after_observations: 8,
@@ -1137,21 +1130,15 @@ where
     // band change so the running budget `system` nudge stays cache-stable within a band. Reset when
     // history shrinks (clear/compact) so the signal re-arms honestly against the new, smaller size.
     let mut budget_band_shown: Option<u8> = None;
-    // P-ctx2: one-shot latch — the FIRST time history reaches the clearing threshold we warn the
-    // model to persist anything durable and SKIP that pass, so the eviction happens a turn later
-    // with the important content already saved. Never fires again (subsequent clears are silent).
-    let mut save_before_clear_warned = false;
     // Provider-reported prompt size at the last usage-carrying call (see `RealAnchor`) —
     // invalidated whenever history is mutated (clearing/compaction shrink what we'd send next).
     let mut real_anchor: Option<RealAnchor> = None;
-    // Clearing cadence: (pct-of-window after the last clear, iter at the last clear).
-    let mut last_clear: Option<(usize, usize)> = None;
     // Compaction cadence: (pct-of-window after the last compaction attempt, iter at that attempt).
-    // Mirrors `last_clear`. WITHOUT this, the compaction trigger below re-fires on every consecutive
-    // iteration once history is long enough — each pass re-splices mid-history and busts the prompt
-    // cache from the splice point. The guard makes compaction fire in big infrequent jumps (like
-    // clearing), not a per-turn cache-shredding trickle: it only re-arms when usage grows by
-    // `clear_step_pct` OR `clear_cooldown_iters` iterations have elapsed since the last attempt.
+    // WITHOUT this, the compaction trigger below re-fires on every consecutive iteration once
+    // history is long enough — each pass re-splices mid-history and busts the prompt cache from
+    // the splice point. The guard makes compaction fire in big infrequent jumps, not a per-turn
+    // cache-shredding trickle: it only re-arms when usage grows by `clear_step_pct` OR
+    // `clear_cooldown_iters` iterations have elapsed since the last attempt.
     let mut last_compact: Option<(usize, usize)> = None;
     // Consecutive failed compaction attempts. One failure does not arm the cadence latch (the
     // summarizer may just have blipped); two in a row do, so a dead summarizer costs two model
@@ -1332,96 +1319,6 @@ where
             real_anchor.as_ref(),
         );
 
-        // TOOL-RESULT CLEARING (cheap, deterministic — runs BEFORE the model call): once history
-        // crosses `clear_at_pct` of the window, batch-evict stale tool-result bodies DOWN TO
-        // `clear_target_pct` in one pass. Big infrequent jumps, not a per-turn trickle — every
-        // mid-history rewrite invalidates the provider prompt cache from that byte onward, so the
-        // cadence (`clear_step_pct` growth or `clear_cooldown_iters`) is what keeps hit rates
-        // alive. Error-aware: bulky successes go first; failures are only trimmed (first line
-        // survives) when successes alone can't reach the floor. Off when context_window /
-        // keep_recent / clear_at_pct is 0.
-        if cfg.context_window > 0
-            && cfg.keep_recent_tool_results > 0
-            && cfg.clear_at_pct > 0
-            && est_now * 100 >= cfg.context_window * cfg.clear_at_pct as usize
-        {
-            let pct = est_now * 100 / cfg.context_window;
-            if clearing_due(
-                pct,
-                iter,
-                last_clear,
-                cfg.clear_step_pct,
-                cfg.clear_cooldown_iters,
-            ) {
-                // SAVE-BEFORE-CLEAR (P-ctx2): the first eviction of a run is the moment stale
-                // tool-result bodies leave context for good — the single biggest source of "it
-                // forgot the workaround we found" complaints. So the FIRST time we're due to clear,
-                // don't: warn the model to persist anything durable (memory files, todo_write) while
-                // the results are still here, then let THIS turn run with the warning + full context.
-                // The eviction happens next turn (latch set, cadence NOT armed → clearing_due stays
-                // true), by which point the important content is saved. One-shot; later clears are
-                // silent (the model has been told the rule once).
-                if !save_before_clear_warned {
-                    save_before_clear_warned = true;
-                    push_nudge_as(
-                        messages,
-                         cfg.nudge_role,
-                        NUDGE_SAVE_BEFORE_CLEAR,
-                        "Context is filling up, so older tool results will start being dropped from \
-                         history to make room. BEFORE that happens: if any earlier command output, \
-                         file content, fix, or workaround still matters for this task, save it now — \
-                         write it to a memory file or record it with todo_write. Details you don't \
-                         persist will be gone from context after this.",
-                    );
-                    // Skip the eviction this pass; do NOT arm the cadence, so the next iteration is
-                    // still "due" and actually clears — now that the model has had a turn to save.
-                } else {
-                    // The floor measures history in RAW estimate units (chars/4), but `est_now` — which
-                    // armed this pass — is anchor-corrected. With an active anchor, effective = raw + K
-                    // for a constant offset K (= real-minus-estimate at anchor time), so a target
-                    // expressed in window units must be shifted into raw space by that same K; otherwise
-                    // raw is already below the window target and the eviction loop no-ops every cadence
-                    // step (common once the provider reports more tokens than chars/4 — code, Vietnamese).
-                    // No anchor ⇒ est_now == raw ⇒ offset 0 ⇒ identical to the plain window target.
-                    let raw_now = estimate_tokens(messages) + schema_overhead;
-                    let anchor_offset = est_now.saturating_sub(raw_now);
-                    let target = (cfg.context_window * cfg.clear_target_pct as usize / 100)
-                        .saturating_sub(anchor_offset);
-                    let stats = clear_tool_results_to_floor(
-                        messages,
-                        cfg.keep_recent_tool_results,
-                        cfg.clear_tool_result_min_chars,
-                        target,
-                        schema_overhead,
-                    );
-                    if stats.cleared + stats.failures_trimmed > 0 {
-                        // History shrank under the anchor's feet — the next real usage report re-anchors.
-                        real_anchor = None;
-                        // Cleared result BODIES are gone from context, but their content hashes would
-                        // linger in the success ledger and mark a legitimate RE-READ of that now-evicted
-                        // content as stale. Forget success bodies alongside the cleared history.
-                        stall.forget_successes();
-                        est_now = estimate_tokens(messages) + schema_overhead;
-                        budget_band_shown = None; // history shrank — re-arm the running budget signal (P-ctx1)
-                        if !cfg.quiet {
-                            let line = format!(
-                            "→ context: cleared ~{} chars ({} result(s), {} failure(s) trimmed)",
-                            stats.chars_reclaimed, stats.cleared, stats.failures_trimmed
-                        );
-                            if crate::ui::tui::active() {
-                                crate::ui::tui::emit_line(&line);
-                            } else {
-                                emit_trace(&line);
-                            }
-                        }
-                    }
-                    // Arm the cadence even when nothing was clearable — re-scanning the same
-                    // un-clearable history every iteration buys nothing.
-                    last_clear = Some((est_now * 100 / cfg.context_window, iter));
-                }
-            }
-        }
-
         // MID-LOOP AUTO-COMPACTION (callers that supplied a summarizer): once history crosses
         // `compact_at_pct` of the window, summarize older turns in place — the last KEEP_TURNS user
         // turns verbatim, or, in a single-turn run, the prompt plus the last KEEP_STEPS steps —
@@ -1435,12 +1332,11 @@ where
                 && est_now * 100 >= cfg.context_window * cfg.compact_at_pct as usize
             {
                 let pct = est_now * 100 / cfg.context_window;
-                // CADENCE GUARD (mirror of the clearing path): don't re-compact every iteration once
+                // CADENCE GUARD: don't re-compact every iteration once
                 // history sits above `compact_at_pct`. compact_history keeps the last KEEP_TURNS
                 // verbatim, so a single big turn can leave the result still above threshold — without
                 // this the condition stays true and re-splices (cache-busting) every turn. Re-arm only
-                // on `clear_step_pct` growth or after `clear_cooldown_iters` iters (same knobs as
-                // clearing — one cadence policy for both history-shrinking guards).
+                // on `clear_step_pct` growth or after `clear_cooldown_iters` iters.
                 if clearing_due(
                     pct,
                     iter,
@@ -5918,10 +5814,6 @@ const GOAL_POKE_PREFIX: &str = "[goal]";
 /// shape as the todo-poke and goal pokes rather than a soft system nudge). Shared by both paths so
 /// the transcript reads with one consistent marker for "the harness granted more room".
 const CONTINUE_PREFIX: &str = "[continue]";
-/// Save-before-clear warning (P-ctx2). Mirrors Claude's server-side "preserve important information"
-/// warning: fired ONCE, the turn BEFORE the first tool-result eviction, so the model can persist
-/// anything durable (memory files, todo_write) while the old results are still in context.
-const NUDGE_SAVE_BEFORE_CLEAR: &str = "Context is filling up";
 /// Running context-budget signal (P-ctx1). Like Claude's server-side `<budget>`/`<system_warning>`
 /// pair, but client-side and CACHE-AWARE: refreshed only when usage crosses a new band (see
 /// `budget_band`), never every turn — every mid-history system-message rewrite busts the provider
@@ -6038,7 +5930,6 @@ const NUDGE_KINDS: &[&str] = &[
     NUDGE_STUCK,
     NUDGE_HILL_CLIMB,
     NUDGE_BATCH,
-    NUDGE_SAVE_BEFORE_CLEAR,
     NUDGE_BUDGET,
 ];
 
@@ -7409,8 +7300,6 @@ mod tests {
             context_window: 0, // guard off by default in tests; the guard test sets it explicitly
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
-            clear_at_pct: 60,
-            clear_target_pct: 45,
             clear_step_pct: 10,
             clear_cooldown_iters: 6,
             collapse_after_observations: 8,
@@ -9001,7 +8890,6 @@ mod tests {
             quiet: true,
             context_window: 100,
             context_guard_pct: pct,
-            clear_at_pct: 0,
             compact_at_pct: 0,
             enable_todo_poke: false,
             enable_confidence_gate: false,
@@ -11086,7 +10974,6 @@ mod tests {
         let r = registry();
         let mut c = cfg();
         c.context_window = 1000; // tiny window so a couple of turns cross 50%/90%
-        c.clear_at_pct = 0; // disable clearing so history only grows (isolate the budget signal)
         let big = "X".repeat(3000); // ~750 tok result → crosses bands fast
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         let chat = scripted(vec![
@@ -11107,64 +10994,6 @@ mod tests {
         assert_eq!(
             budget_msgs, 1,
             "the running budget nudge collapses to a single message"
-        );
-    }
-
-    #[tokio::test]
-    async fn save_before_clear_warns_first_then_evicts_next_turn() {
-        // P-ctx2: the FIRST time clearing is due, the loop must WARN (so the model can persist) and
-        // NOT evict yet — the old result bodies are still in context that turn. The eviction happens
-        // on a LATER turn. Assert both: the warning appears, and at least one bulky result gets
-        // blanked to the placeholder by the end (proving the deferral didn't disable clearing).
-        let r = registry();
-        let mut c = cfg();
-        c.max_iters = 10;
-        c.auto_extend_to = 10;
-        c.context_window = 1200; // tiny window
-        c.clear_at_pct = 40; // arm early
-        c.clear_target_pct = 20;
-        c.clear_step_pct = 1; // cadence trivially satisfied so the deferred pass re-fires next turn
-        c.clear_cooldown_iters = 0;
-        c.keep_recent_tool_results = 1; // keep only the newest → older bulky ones are clearable
-        c.clear_tool_result_min_chars = 100;
-        let big = "Y".repeat(2400); // ~600 tok each → a couple crosses the 40% arm
-        let turns: Vec<ChatTurn> = (0..6)
-            .map(|_| tool_turn("echo", &format!(r#"{{"text":"{big}"}}"#)))
-            .collect();
-        let mut messages = vec![Message::system("sys"), Message::user("task")];
-        let _ = run_agent_loop(scripted(turns), &c, &r, &mut messages)
-            .await
-            .unwrap();
-        let warned = messages.iter().any(|m| {
-            m.role == "system"
-                && m.content
-                    .as_deref()
-                    .is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
-        });
-        assert!(
-            warned,
-            "the save-before-clear warning must be injected before eviction"
-        );
-        let evicted = messages
-            .iter()
-            .any(|m| m.role == "tool" && m.content.as_deref() == Some(CLEARED_TOOL_PLACEHOLDER));
-        assert!(
-            evicted,
-            "clearing must still happen (a later turn) — the warning only defers, not disables"
-        );
-        // And the warning is one-shot: exactly one such system message.
-        let warn_count = messages
-            .iter()
-            .filter(|m| {
-                m.role == "system"
-                    && m.content
-                        .as_deref()
-                        .is_some_and(|c| c.starts_with(NUDGE_SAVE_BEFORE_CLEAR))
-            })
-            .count();
-        assert_eq!(
-            warn_count, 1,
-            "the save-before-clear warning fires at most once per run"
         );
     }
 

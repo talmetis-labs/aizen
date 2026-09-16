@@ -30,9 +30,9 @@ pub const KEEP_STEPS: usize = 6;
 /// though the old boundary note itself is summarized away into the new one.
 pub const COMPACT_MARKER_PREFIX: &str = "[Earlier conversation auto-compacted";
 
-/// Stable prefix of the `/handoff` seed note — the distilled context carried into a fresh thread.
-/// Byte-identical to the text every historical handoff already wrote, so saved sessions get the
-/// same treatment retroactively. Like the compaction marker it is conversation CONTENT, not prompt
+/// Stable prefix of the seed note the retired `/handoff` command wrote — the distilled context it
+/// carried into a fresh thread. Kept byte-identical so a saved session that still carries one gets
+/// the same treatment. Like the compaction marker it is conversation CONTENT, not prompt
 /// prefix: [`leading_system_count`] stops at it, so lane rewrites (`/config`, `/model`, resume)
 /// splice around it instead of overwriting it, and a later compaction may fold it into its summary.
 pub const HANDOFF_MARKER_PREFIX: &str = "[handoff context from the previous session]";
@@ -45,27 +45,6 @@ const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to con
     UNFINISHED tasks. Also preserve a REFLECTION section: approaches that were TRIED and FAILED and \
     WHY (errors hit, dead ends, things that did not work) — so the continuation does not repeat \
     them. Use terse bullet points. Do NOT invent anything not in the transcript.";
-
-/// The `/handoff` instruction: unlike compaction (preserve everything densely), a handoff is
-/// GOAL-CONDITIONED — extract only what the NEW objective needs and drop the rest. This is the
-/// fix for long-context drift that summarize-in-place preserves (the Amp lesson: a fresh thread
-/// seeded with relevant context beats an old thread summarized).
-const HANDOFF_SYS: &str = "You extract ONLY the context relevant to a NEW goal from a prior \
-    conversation: decisions, file paths, constraints, gotchas, and command outcomes that bear on \
-    that goal. Omit everything else — unrelated work, dead ends, pleasantries. Terse bullets. Do \
-    NOT invent anything not in the transcript.";
-
-/// Build the `/handoff` summarization prompt (goal-conditioned extraction over the transcript).
-pub fn handoff_prompt(history: &[Message], goal: &str) -> Vec<Message> {
-    let lead = leading_system_count(history);
-    let transcript = render_transcript(history.get(lead..).unwrap_or_default());
-    vec![
-        Message::system(HANDOFF_SYS),
-        Message::user(format!(
-            "NEW GOAL:\n{goal}\n\nPrior conversation:\n\n{transcript}"
-        )),
-    ]
-}
 
 /// Truncate to `max` chars with a `…[+N chars]` marker (char-safe, never splits a codepoint).
 pub fn truncate_chars(s: &str, max: usize) -> String {
@@ -345,6 +324,9 @@ where
     S: Fn(Vec<Message>) -> Fut,
     Fut: Future<Output = Result<String>>,
 {
+    // The prefix cache is about to be invalidated anyway, so this is the one free moment to drop
+    // the stale recall blocks the REPL folded onto older user turns (a no-op elsewhere).
+    crate::agent::prompt_lanes::strip_recall_blocks(history);
     let before = approx_tokens(history);
     let cut = plan_compact_cut_at(history, keep_turns, KEEP_STEPS).ok_or_else(|| {
         anyhow!("conversation too short to compact (need at least 2 turns, or one turn with more than {KEEP_STEPS} steps)")
@@ -381,34 +363,6 @@ where
 mod tests {
     use super::*;
     use crate::core::types::{FunctionCall, ToolCall};
-
-    #[test]
-    fn handoff_prompt_embeds_goal_and_skips_system_prefix() {
-        let history = vec![
-            Message::system("STABLE SYSTEM — never in the transcript"),
-            Message::system("DYNAMIC SYSTEM — never in the transcript"),
-            Message::user("old task about the parser"),
-            Message::assistant("fixed it in src/parse.rs"),
-        ];
-        let p = handoff_prompt(&history, "now optimize the lexer");
-        assert_eq!(p.len(), 2);
-        assert!(p[0]
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("ONLY the context relevant"));
-        let usr = p[1].content.as_deref().unwrap();
-        assert!(usr.contains("NEW GOAL:\nnow optimize the lexer"), "{usr}");
-        assert!(usr.contains("src/parse.rs"), "transcript present");
-        assert!(
-            !usr.contains("STABLE SYSTEM"),
-            "stable system prompt never leaks into the extraction"
-        );
-        assert!(
-            !usr.contains("DYNAMIC SYSTEM"),
-            "dynamic system prompt never leaks into the extraction"
-        );
-    }
 
     fn user(s: &str) -> Message {
         Message::user(s.to_string())
