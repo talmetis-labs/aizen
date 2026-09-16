@@ -1448,52 +1448,55 @@ where
                     cfg.clear_step_pct,
                     cfg.clear_cooldown_iters,
                 ) {
-                    let arm =
-                        match compact::compact_history(messages, summarize, compact::KEEP_TURNS)
-                            .await
-                        {
-                            Ok((before, after)) => {
-                                compact_failures = 0;
-                                context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
-                                budget_band_shown = None; // …and the running budget signal (P-ctx1)
-                                real_anchor = None; // spliced history invalidates the anchor
-                                stall.forget_successes(); // summarized-away results must not mark a re-read as stale
-                                read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
-                                est_now = estimate_tokens(messages) + schema_overhead;
-                                if !cfg.quiet {
-                                    let line = format!(
-                                        "→ context: auto-compacted ~{before} → ~{after} tok"
-                                    );
-                                    if crate::ui::tui::active() {
-                                        crate::ui::tui::emit_line(&line);
-                                    } else {
-                                        emit_trace(&line);
-                                    }
+                    let arm = match compact::compact_history(
+                        messages,
+                        summarize,
+                        compact::KEEP_TURNS,
+                    )
+                    .await
+                    {
+                        Ok((before, after)) => {
+                            compact_failures = 0;
+                            context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
+                            budget_band_shown = None; // …and the running budget signal (P-ctx1)
+                            real_anchor = None; // spliced history invalidates the anchor
+                            stall.forget_successes(); // summarized-away results must not mark a re-read as stale
+                            read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
+                            crate::ui::events::compact_boundary(before, after);
+                            est_now = estimate_tokens(messages) + schema_overhead;
+                            if !cfg.quiet {
+                                let line =
+                                    format!("→ context: auto-compacted ~{before} → ~{after} tok");
+                                if crate::ui::tui::active() {
+                                    crate::ui::tui::emit_line(&line);
+                                } else {
+                                    emit_trace(&line);
                                 }
-                                true
                             }
-                            // A failed compaction used to vanish without a trace AND arm the cadence
-                            // latch, so one summarizer blip meant compaction was silently skipped for
-                            // the rest of the cooldown while context kept climbing. Say so — the user
-                            // can fix the summarizer — and latch only on the second failure in a row.
-                            Err(e) => {
-                                compact_failures += 1;
-                                if !cfg.quiet {
-                                    let line = format!(
+                            true
+                        }
+                        // A failed compaction used to vanish without a trace AND arm the cadence
+                        // latch, so one summarizer blip meant compaction was silently skipped for
+                        // the rest of the cooldown while context kept climbing. Say so — the user
+                        // can fix the summarizer — and latch only on the second failure in a row.
+                        Err(e) => {
+                            compact_failures += 1;
+                            if !cfg.quiet {
+                                let line = format!(
                                     "⚠ context: auto-compact failed ({e:#}) — continuing without \
-                                     it; history will rely on tool-result clearing only"
+                                     it; older results still collapse to digests and the overflow shrink stands"
                                 );
-                                    if crate::ui::tui::active() {
-                                        crate::ui::tui::emit_line(
-                                            &crate::ui::theme::faint(line).to_string(),
-                                        );
-                                    } else {
-                                        emit_trace(&line);
-                                    }
+                                if crate::ui::tui::active() {
+                                    crate::ui::tui::emit_line(
+                                        &crate::ui::theme::faint(line).to_string(),
+                                    );
+                                } else {
+                                    emit_trace(&line);
                                 }
-                                compact_failures >= COMPACT_FAILURES_BEFORE_LATCH
                             }
-                        };
+                            compact_failures >= COMPACT_FAILURES_BEFORE_LATCH
+                        }
+                    };
                     // Arm the cadence after a success (even one that barely dented size — the
                     // history is now as short as summarizing can make it) or after repeated
                     // failure; re-attempting every iteration buys nothing and each attempt is a

@@ -1506,11 +1506,13 @@ pub(crate) struct AgentArgs {
     /// attach produce. A path that is not a readable image fails the run rather than being dropped.
     #[arg(long = "image", value_name = "PATH")]
     pub(crate) image: Vec<String>,
-    /// Output format. `text`: the human transcript (answer on stdout, trace on stderr). `json`:
-    /// one JSON object per line on stdout — `start`, `text`, `tool_call`, `tool_result`, `plan`,
-    /// `approval_request`, `hook`, `done`, … — for a front-end or script driving this run;
-    /// approvals are answered on stdin. The contract is in REFERENCE.md.
-    #[arg(long, value_name = "FORMAT", value_parser = ["text", "json"], default_value = "text")]
+    /// Output format. `text`: the human transcript (answer on stdout, trace on stderr).
+    /// `stream-json`: one JSON record per line on stdout in Claude Code's stream-json shape —
+    /// `system`/`init`, `stream_event` deltas, `assistant` and `user` messages with `tool_use` /
+    /// `tool_result` blocks, `control_request` for approvals (answered on stdin with a
+    /// `control_response`), `result` last — for a front-end or script driving this run. `json`:
+    /// only the closing `result` object. The contract is in REFERENCE.md.
+    #[arg(long, value_name = "FORMAT", value_parser = ["text", "json", "stream-json"], default_value = "text")]
     pub(crate) output_format: String,
 }
 

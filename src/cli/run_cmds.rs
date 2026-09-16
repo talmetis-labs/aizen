@@ -440,8 +440,10 @@ pub(crate) async fn run_chat(args: ChatArgs) -> Result<()> {
 }
 
 pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
-    if args.output_format == "json" {
-        crate::ui::events::enable();
+    match args.output_format.as_str() {
+        "stream-json" => crate::ui::events::enable(true),
+        "json" => crate::ui::events::enable(false),
+        _ => {}
     }
     let result = run_agent_inner(args).await;
     if let Err(e) = &result {
@@ -513,13 +515,6 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // The first event of a JSON run: what is about to happen, before any request goes out.
-    crate::ui::events::start(
-        &model,
-        &cwd,
-        cli_config::effort_override().flatten().as_deref(),
-        images.len(),
-    );
     // Where the cost meter stands now, so the `done` event can sum only this run's calls.
     let usage_cursor = client::cost_meter().cursor();
 
@@ -543,6 +538,16 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         resolve_ctx_window(&model).0,
         None, // cwd IS the project on the CLI path
     )?;
+    // The first record of a machine-readable run — `system` / `init`: what is about to happen and
+    // with what, before any request goes out. The tool list is the one the first request carries.
+    crate::ui::events::start(
+        &model,
+        &cwd,
+        cli_config::effort_override().flatten().as_deref(),
+        images.len(),
+        &registry.advertised_names(),
+        cli_approval.as_str(),
+    );
     let system = agent::build_top_level_system_prompt(
         &cwd,
         std::env::consts::OS,

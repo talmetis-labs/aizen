@@ -609,45 +609,53 @@ aizen agent --max-iters 40 "..."                            # raise the step cap
 aizen agent --save-session "..."                            # keep the transcript for /sessions
 aizen agent --effort high "..."                             # this run only; the config is untouched
 aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat --image for more
-aizen agent --output-format json "..."                      # one JSON event per line on stdout (front-ends, CI)
+aizen agent --output-format stream-json "..."               # one JSON record per line on stdout (front-ends, CI)
 ```
 Behavior worth knowing:
-- **Machine-readable output.** `--output-format json` turns the run into one JSON object per line
-  on stdout, and nothing else on stdout — the contract a front-end, an editor extension or a CI
-  script builds on instead of parsing the human transcript by its leading glyphs. Every line has
-  a `type`; fields are only ever added, so ignore what you do not know:
+- **Machine-readable output.** `--output-format stream-json` turns the run into one JSON record
+  per line on stdout, and nothing else on stdout, in the shape Claude Code's `stream-json` uses
+  (the Claude Agent SDK message types) — so a front-end, an editor extension or a CI script that
+  already reads Claude Code reads an aizen run with the same parser, instead of parsing the human
+  transcript by its leading glyphs. `--output-format json` prints only the closing `result`
+  object. Every record has a `type`, a `uuid` and the run's `session_id`; fields are only ever
+  added, so ignore what you do not know:
 
-  | `type` | fields |
+  | record | fields |
   |---|---|
-  | `start` | `version`, `model`, `cwd`, `effort`, `images`, `pid` |
-  | `text` | `delta` — a fragment of the answer, in order; concatenate them for the raw markdown |
-  | `reasoning` | `delta` — the model's reasoning channel, when the provider exposes one |
-  | `tool_call` | `seq`, `name`, `args`, `target`, `dispatch` — the delegated sub-agent's label, `null` for the loop's own call |
-  | `tool_result` | `seq`, `name`, `target`, `ok`, `digest`, `elapsed_ms`, `output` (cut at 64 KB, then `truncated: true`), `dispatch` |
-  | `plan` | `items[{status: pending \| in_progress \| done, text}]` — the todo panel as last written |
-  | `diff` | `path`, `added`, `removed` — the size of an edit (its text is in the `tool_result`) |
-  | `verify` | `command`, `detail` — a verify-gate line |
-  | `warning` | `kind` (`blocked`, `caution`, `network`), `text` — the safety floor spoke |
-  | `trace` | `text` — any other progress line the transcript would have shown, styling stripped |
-  | `hook` | `event`, `run`, `decision`, `reason`, `context`, `exit`, `timed_out`, `error`, `elapsed_ms` |
-  | `approval_request` | `id`, `tool`, `args`, `who` (a sub-agent's label), `preview{title, lines, diff}` |
-  | `approval` | `id`, `decision` — what stdin answered (`deny` with `reason: "stdin closed"` on EOF) |
-  | `session` | `slug`, `path` (with `--save-session`), or `error` |
-  | `done` | `stop`, `steps`, `final_text`, `question` (with `awaiting_input`), `session`, `usage{calls, input, output, cached, cache_write}` |
-  | `error` | `message` — the run died; the exit code is non-zero |
+  | `system` / `init` | `cwd`, `model`, `tools` (the names the first request advertises), `permissionMode` (`default`, or `bypassPermissions` with `--yes`), plus aizen's `approval_mode`, `version`, `effort`, `images`, `pid` |
+  | `stream_event` | `event{type: content_block_delta, delta{type: text_delta, text}}` — a fragment of the answer as it streams; a `thinking_delta` for the model's reasoning channel, when the provider exposes one |
+  | `assistant` | `message{id, role, model, content[block]}` — one record per finished block: `text`, `thinking`, or `tool_use{id, name, input}`; the blocks of one model turn share `message.id`; `target` names what a tool call is about, and `request_id` names the `control_request` that approved it |
+  | `user` | `message{content[{type: tool_result, tool_use_id, content, is_error}]}` — a call's result (`content` cut at 64 KB); `tool_use_result{name, target, digest, elapsed_ms, truncated, dispatch}` is aizen's own account of it |
+  | `control_request` | `request_id`, `request{subtype: can_use_tool, tool_name, input, tool_use_id, agent_id, title, description, preview}` — a destructive call is waiting for an answer on stdin |
+  | `system` / `permission_denied` | `tool_name`, `tool_use_id`, `request_id`, `message` — the answer was no (or stdin closed) |
+  | `system` / `informational` | `content`, `level` — `info` for a progress line the transcript would have shown, `warning` (with `kind`: `blocked`, `caution`, `network`) when the safety floor spoke |
+  | `system` / `plan` | `items[{status: pending \| in_progress \| done, text}]` — the todo panel as last written |
+  | `system` / `diff` | `path`, `added`, `removed` — the size of an edit (its text is in the `tool_result`) |
+  | `system` / `verify` | `command`, `detail` — a verify-gate line |
+  | `system` / `hook_response` | `hook_name`, `hook_event`, `output`, `exit_code`, `outcome`, plus `decision`, `reason`, `timed_out`, `elapsed_ms` |
+  | `system` / `compact_boundary` | `compact_metadata{trigger, pre_tokens, post_tokens}` — older turns were summarized in place |
+  | `system` / `session_saved`, `session_not_saved` | `slug`, `path` (with `--save-session`), or `error` |
+  | `result` | `subtype` (`success`, `error_max_turns`, `error_during_execution`), `is_error`, `duration_ms`, `num_turns`, `result` (the answer), `usage{input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}`, `permission_denials[]`, plus aizen's `stop`, `question` (with `awaiting_input`), `session`, `calls`; `errors[]` when `is_error` |
 
-  A delegated child's calls (`task`, `workflow`) are on the stream too, each with its
-  `dispatch` label; children run in parallel, so their calls interleave with each other's and
-  with the parent's — pair a `tool_result` with its `tool_call` by `seq`, never by order.
-  `stop` is one of `done`, `divergence`, `max_iters`, `verification_failed`, `awaiting_input`,
-  `cancelled`, `deadline`. **Approvals are answered on stdin**: when a destructive call needs a
-  decision the run writes `approval_request` and blocks until a line
-  `{"type":"approval","id":<id>,"decision":"allow"}` arrives — `deny`, `allow_tool` (this tool for
-  the rest of the run) and `allow_all` (every later call, as `--yes` from here on) are the other
-  answers, and a closed stdin is a deny, exactly as a non-TTY run has always been. Lines that are
-  not a reply to the pending request are ignored. Nothing else changes: `--yes`, `--save-session`,
-  `--effort` and `--image` mean what they mean in text mode, and the exit code is `0` for every
-  `done` (read `stop`) and `1` for `error`.
+  A delegated child's records (`task`, `workflow`) are on the stream too: their
+  `parent_tool_use_id` is the `tool_use` id of the call that spawned them and `dispatch` names
+  the child; the loop's own records carry `null`. Children run in parallel, so their records
+  interleave with each other's and with the parent's — pair a `tool_result` with its `tool_use`
+  by `tool_use_id`, never by order. `stop` is one of `done`, `divergence`, `max_iters`,
+  `verification_failed`, `awaiting_input`, `cancelled`, `deadline`. **Approvals are answered on
+  stdin** with the SDK's control protocol: when a destructive call needs a decision the run
+  writes a `control_request` and blocks until a line
+  `{"type":"control_response","response":{"subtype":"success","request_id":"<id>","response":{"behavior":"allow"}}}`
+  arrives; `{"behavior":"deny","message":"…"}` refuses it, and an allow may widen the grant with
+  `updatedPermissions`: `[{"type":"addRules","rules":[{"toolName":"<tool>"}],"behavior":"allow","destination":"session"}]`
+  allows that tool for the rest of the run, `[{"type":"setMode","mode":"bypassPermissions","destination":"session"}]`
+  allows every later call (as `--yes` from here on). A closed stdin is a deny, exactly as a
+  non-TTY run has always been, and so is `--output-format json`, which has no channel to ask on.
+  Lines that are not a reply to the pending request are ignored. Not on the stream: a cost in
+  dollars (aizen has no price list) and the API's per-message `usage` (the run's total is in
+  `result`). Nothing else changes: `--yes`, `--save-session`, `--effort` and `--image` mean what
+  they mean in text mode, and the exit code is `0` for every `result` that ends a run (read
+  `is_error` and `stop`) and `1` when the run died (a `result` with `errors`).
 - **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
   it writes no session file by default — a file per invocation would bury the pool `/sessions` reads.
   Saved conversations are bounded: `sessions_keep` (default 200) and `sessions_max_bytes`
@@ -872,8 +880,8 @@ sandbox runner as every other child, with the network allowed and Aizen's own se
 from its environment, under a wall clock (`timeout_secs`, default 30). A hook that fails — cannot
 start, exits non-zero other than `2`, or times out — is reported and never stops the run; only a
 deliberate deny blocks. `aizen hooks` lists what is configured; `AIZEN_NO_HOOKS=1` turns every
-hook off. On the JSON stream each run is a `hook` event; in the transcript it is one `→ hook …`
-line.
+hook off. On the stream each run is a `system` / `hook_response` record; in the transcript it is
+one `→ hook …` line.
 
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
@@ -1269,7 +1277,8 @@ background chores race the turn and land on the tape in arrival order.
 ## Exit codes
 `0` success · `1` error (bad args, network/HTTP failure, a bench gate FAIL). The agent loop
 returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr
-(with `--output-format json`, the `stop` field of the `done` event; an `error` event is a `1`).
+(with `--output-format stream-json` or `json`, the `stop` and `is_error` fields of the `result`
+record; a run that died is a `result` with `errors` and a `1`).
 
 ## Safety model
 Three layers, bottom to top. (1) A **hard safety floor** — a deterministic blocklist (`rm -rf /`
