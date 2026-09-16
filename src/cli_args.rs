@@ -110,6 +110,12 @@ pub(crate) enum Commands {
     },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
+    /// Show the lifecycle hooks configured under `hooks` in ~/.aizen/cli-config.json — your own
+    /// commands run before/after tool calls and when a run ends — and whether they are enabled.
+    Hooks {
+        #[arg(long)]
+        json: bool,
+    },
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
     Crawl(CrawlArgs),
     /// Reach doctor: live-probe every web-access backend and show which serves each platform.
@@ -230,6 +236,12 @@ pub(crate) enum Commands {
         /// Per-tool schema sizes, largest first.
         #[arg(long)]
         tools: bool,
+        /// Audit the lanes as a prompt cache sees them: every block's size, a rebuild check
+        /// (are two consecutive builds byte-identical?), and any content that will differ on the
+        /// next turn — ages, message counts, clock times — which is exactly what breaks the cached
+        /// prefix.
+        #[arg(long)]
+        live: bool,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -1266,7 +1278,7 @@ pub(crate) enum ConfigCmd {
         /// Saved provider profile the summarizer runs on (`roles.summarizer.provider`). Empty clears.
         #[arg(long)]
         summarizer_provider: Option<String>,
-        /// Model for compaction/handoff summaries (`roles.summarizer`) — the classic cheap-model
+        /// Model for compaction summaries (`roles.summarizer`) — the classic cheap-model
         /// slot. Empty clears.
         #[arg(long)]
         summarizer_model: Option<String>,
@@ -1410,6 +1422,37 @@ pub(crate) enum BenchCmd {
     /// Offline loop-behavior eval (P4): drive the real agent loop with scripted models over ~15
     /// scenarios and report the Section-10 metrics (steps/task, loop-stop rate, verified-done).
     Loop,
+    /// Task suite: the real loop and real tools on the fixture crates under `bench-tasks/`, with
+    /// the model's answers replayed from recorded tapes (offline, no key). `--record` makes the
+    /// live calls once and writes the tapes; a task without a tape is reported as skipped.
+    Tasks {
+        /// Run only this task id.
+        #[arg(long)]
+        task: Option<String>,
+        /// Make the real model calls and write a fresh tape per task (spends tokens).
+        #[arg(long)]
+        record: bool,
+        /// Make the real model calls and leave the tapes alone.
+        #[arg(long)]
+        live: bool,
+        /// Tape name under `bench-tasks/<id>/tapes/`.
+        #[arg(long, default_value = "default")]
+        tape: String,
+        /// Write the passing tasks' steps and tokens as the new baseline.
+        #[arg(long)]
+        update_baseline: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Turn-shape statistics over this machine's saved conversations: tool calls per user turn,
+    /// result sizes and how many sit at the cut, repeated calls, the call mix, read : edit. The
+    /// numbers behind the fast-lean plan's §1.2; run before a release and after a loop change.
+    Sessions {
+        /// Print the statistics as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -1463,6 +1506,14 @@ pub(crate) struct AgentArgs {
     /// attach produce. A path that is not a readable image fails the run rather than being dropped.
     #[arg(long = "image", value_name = "PATH")]
     pub(crate) image: Vec<String>,
+    /// Output format. `text`: the human transcript (answer on stdout, trace on stderr).
+    /// `stream-json`: one JSON record per line on stdout in Claude Code's stream-json shape —
+    /// `system`/`init`, `stream_event` deltas, `assistant` and `user` messages with `tool_use` /
+    /// `tool_result` blocks, `control_request` for approvals (answered on stdin with a
+    /// `control_response`), `result` last — for a front-end or script driving this run. `json`:
+    /// only the closing `result` object. The contract is in REFERENCE.md.
+    #[arg(long, value_name = "FORMAT", value_parser = ["text", "json", "stream-json"], default_value = "text")]
+    pub(crate) output_format: String,
 }
 
 #[derive(Parser, Debug)]
@@ -1633,6 +1684,13 @@ pub(crate) enum MemoryCmd {
     },
     /// Run anti-bloat maintenance (enforce the inferred-fact LRU cap → archive victims).
     Compact,
+    /// Merge near-duplicate facts locally, no model call: the two-stage check the write path uses
+    /// (lexical, then MinHash + normalised tokens), run once over the whole live store. Dry run
+    /// unless `--apply`; applying retires each duplicate (revivable) and reinforces its survivor.
+    Consolidate {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Judge suspicious near-duplicate pairs in one model call (dry run unless `--apply`).
     Reconcile {
         /// Actually write the verdicts. Without this the pass only reports what it would do —

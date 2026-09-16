@@ -20,9 +20,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
 
-// Letters (any script, incl. composed Vietnamese), numbers, underscore. `\p{L}`/`\p{N}` rely on
-// regex's unicode feature, which is enabled by default.
-static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+// Letters (any script, incl. composed Vietnamese), numbers, underscore — and a hyphen INSIDE a
+// token, so a kebab-case identifier (`rate-limit`) is one token as well as its parts. `\p{L}`/
+// `\p{N}` rely on regex's unicode feature, which is enabled by default.
+static TOKEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+(?:-[\p{L}\p{N}_]+)*").unwrap());
 
 /// Bilingual stopword set: the original 48 English words (verbatim from the extension's proven
 /// tokenizer, globalMemoryStore.ts:233) + ~45 high-frequency Vietnamese function words so VN text
@@ -45,26 +47,63 @@ static STOPWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     .collect()
 });
 
-/// Tokenize: NFC-normalize → lowercase → split on `[\p{L}\p{N}_]+`, drop <2-char tokens + stopwords.
+/// Tokenize: NFC-normalize → split on `[\p{L}\p{N}_-]+` runs → lowercase, drop <2-char tokens +
+/// stopwords. An identifier emits the whole token AND its words (`get_by_id` → `get_by_id`,
+/// `get`, `id`; `getById` likewise; `rate-limit` → `rate-limit`, `rate`, `limit`), so "get by
+/// id" meets `get_by_id` instead of scoring zero against it — half a coding corpus is
+/// identifiers (quality plan M5). Case is read BEFORE lowercasing: that is where the camel
+/// boundaries are.
 pub fn tokenize(s: &str) -> Vec<String> {
     if s.trim().is_empty() {
         return Vec::new();
     }
-    // NFC compose first (free; static compiled data). Cow → str via Deref for to_lowercase().
+    // NFC compose first (free; static compiled data).
     let normalized = ComposingNormalizer::new_nfc().normalize(s);
-    let lowered = normalized.to_lowercase();
     let mut out = Vec::new();
-    for m in TOKEN_RE.find_iter(&lowered) {
-        let t = m.as_str();
-        if t.chars().count() < 2 {
-            continue;
+    for m in TOKEN_RE.find_iter(&normalized) {
+        let raw = m.as_str();
+        push_token(&mut out, raw.to_lowercase());
+        let parts = identifier_parts(raw);
+        if parts.len() > 1 {
+            for p in parts {
+                push_token(&mut out, p.to_lowercase());
+            }
         }
-        if STOPWORDS.contains(t) {
-            continue;
-        }
-        out.push(t.to_string());
     }
     out
+}
+
+fn push_token(out: &mut Vec<String>, t: String) {
+    if t.chars().count() < 2 || STOPWORDS.contains(t.as_str()) {
+        return;
+    }
+    out.push(t);
+}
+
+/// The words of an identifier: snake and kebab segments, then camel boundaries inside each
+/// (`getById` → get, By, Id; `HTTPServer` → HTTP, Server; `v2Beta` → v2, Beta). A plain word
+/// comes back as itself, in one piece.
+fn identifier_parts(raw: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for seg in raw.split(['_', '-']) {
+        if seg.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = seg.chars().collect();
+        let mut start = 0;
+        for i in 1..chars.len() {
+            let (prev, cur) = (chars[i - 1], chars[i]);
+            let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+            let boundary = ((prev.is_lowercase() || prev.is_numeric()) && cur.is_uppercase())
+                || (prev.is_uppercase() && cur.is_uppercase() && next_lower);
+            if boundary {
+                parts.push(chars[start..i].iter().collect());
+                start = i;
+            }
+        }
+        parts.push(chars[start..].iter().collect());
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -80,8 +119,35 @@ mod tests {
 
     #[test]
     fn lowercases_and_keeps_identifiers() {
+        // The whole identifier survives (a literal query for it still matches), and its words
+        // follow; `by` is a stopword, `GPT5` has no boundary to split on.
         let t = tokenize("AiProxy get_by_id GPT5");
-        assert_eq!(t, vec!["aiproxy", "get_by_id", "gpt5"]);
+        assert_eq!(
+            t,
+            vec!["aiproxy", "ai", "proxy", "get_by_id", "get", "id", "gpt5"]
+        );
+    }
+
+    #[test]
+    fn identifiers_emit_the_whole_and_their_parts() {
+        assert_eq!(tokenize("getById"), vec!["getbyid", "get", "id"]);
+        assert_eq!(
+            tokenize("HTTPServer rate-limit"),
+            vec![
+                "httpserver",
+                "http",
+                "server",
+                "rate-limit",
+                "rate",
+                "limit"
+            ]
+        );
+        assert_eq!(identifier_parts("v2Beta"), vec!["v2", "Beta"]);
+        assert_eq!(identifier_parts("plain"), vec!["plain"]);
+        // M5: "get by id" now meets `get_by_id` on every one of its tokens.
+        let q = tokenize("get by id");
+        let d = tokenize("fn get_by_id(x)");
+        assert!(q.iter().all(|t| d.contains(t)), "{q:?} vs {d:?}");
     }
 
     #[test]

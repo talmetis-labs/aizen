@@ -67,6 +67,7 @@ pub(crate) async fn sessions_menu(history: &mut Vec<Message>, model_label: &str)
         };
         let pick = match Select::with_theme(&theme)
             .with_prompt(prompt)
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -139,6 +140,7 @@ pub(crate) async fn sessions_menu(history: &mut Vec<Message>, model_label: &str)
         } else if items[pick] == "Delete a session" {
             if let Ok(Some(i)) = Select::with_theme(&theme)
                 .with_prompt("Delete which session? (Esc to cancel)")
+                .report(false) // the confirmation names it
                 .items(&names)
                 .default(0)
                 .interact_opt()

@@ -1,0 +1,8 @@
+[package]
+name = "fixture_no_edit_control"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]

@@ -1,5 +1,10 @@
 //! The **one** name→capability table, and the compact routing map generated from it.
 //!
+//! [`search_routing!`] is the sentence the five repository search tools (`file_glob`,
+//! `search_files`, `codebase_search`, `lsp_workspace_symbol`, `read_symbol`) end their
+//! descriptions with, so the model reads the same routing rule on whichever one it is looking at
+//! instead of five partial cross-references that each named a different subset.
+//!
 //! Two things used to be written by hand and drift apart:
 //!
 //! 1. `# Tool catalog` — a ~7.3 KB prose list of every tool, baked into `system_prompt.md`. It named
@@ -615,4 +620,13 @@ mod tests {
             );
         }
     }
+}
+
+/// The routing sentence shared by the five search tools — a macro so each `description()` can
+/// `concat!` it into its `&'static str`.
+#[macro_export]
+macro_rules! search_routing {
+    () => {
+        " Routing: NAME→file_glob · CONTENT regex→search_files · CONCEPT→codebase_search · SYMBOL name→lsp_workspace_symbol · symbol BODY→read_symbol."
+    };
 }

@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::core::types::{
     CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions,
-    ToolCall, ToolCallDelta, ToolDef, Usage,
+    ToolCall, ToolCallDelta, ToolDef, Usage, UsageRow,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,27 +27,65 @@ pub struct CostMeter {
     /// Prompt-cache input tokens read back this session (the prompt_cache breakpoint payoff). 0 ⇒
     /// caching off / unsupported by the provider — the `/cost` cache line only shows when > 0.
     cache_read_tokens: AtomicU64,
-    /// The MOST RECENT usage-carrying call (prompt / cached / completion) — the live cache-hit-rate
+    /// Prompt-cache WRITE tokens this session (Anthropic-style gateways bill these at a premium).
+    cache_write_tokens: AtomicU64,
+    /// Input tokens that actually went out with each request, cache reads and writes included
+    /// (`Usage::input_total`, shape-corrected) — the honest denominator for "N % cached".
+    input_tokens: AtomicU64,
+    /// The MOST RECENT usage-carrying call (input / cached / completion) — the live cache-hit-rate
     /// signal for the status line. Session totals above answer "what did this cost"; these answer
     /// "is the prompt cache warm RIGHT NOW".
-    last_prompt_tokens: AtomicU64,
+    last_input_tokens: AtomicU64,
     last_cached_tokens: AtomicU64,
     last_completion_tokens: AtomicU64,
+    /// The user turn the next recorded call belongs to. Bumped by the REPL at each user turn and
+    /// NEVER reset (see [`CostMeter::reset`]): a process-monotonic number keeps a session file's
+    /// rows ordered even when the conversation is resumed after another one in the same process.
+    turn: AtomicU64,
+    /// Sequence number of the last recorded row, process-monotonic and never reset — together with
+    /// [`process_epoch`] it is the cursor a session file keeps so a later save appends only the
+    /// rows it has not persisted yet.
+    seq: AtomicU64,
+    /// Per-call rows since the last [`CostMeter::reset`], `(seq, row)`, capped at [`USAGE_ROWS_CAP`].
+    rows: std::sync::Mutex<Vec<(u64, UsageRow)>>,
 }
+
+/// Rows the in-memory ledger keeps before dropping the oldest. A 165-call turn (the largest seen
+/// on a real machine) is 166 rows; 5,000 covers weeks of one conversation at ~50 B per row.
+pub const USAGE_ROWS_CAP: usize = 5_000;
 
 static COST_METER: CostMeter = CostMeter {
     prompt_tokens: AtomicU64::new(0),
     completion_tokens: AtomicU64::new(0),
     calls_with_usage: AtomicU64::new(0),
     cache_read_tokens: AtomicU64::new(0),
-    last_prompt_tokens: AtomicU64::new(0),
+    cache_write_tokens: AtomicU64::new(0),
+    input_tokens: AtomicU64::new(0),
+    last_input_tokens: AtomicU64::new(0),
     last_cached_tokens: AtomicU64::new(0),
     last_completion_tokens: AtomicU64::new(0),
+    turn: AtomicU64::new(0),
+    seq: AtomicU64::new(0),
+    rows: std::sync::Mutex::new(Vec::new()),
 };
 
 /// The process-global cost meter (real provider-reported tokens this session).
 pub fn cost_meter() -> &'static CostMeter {
     &COST_METER
+}
+
+/// This process's identity for the usage-ledger cursor: nanoseconds at first use. A session file
+/// records the epoch it was last written under; a different epoch means "another process wrote
+/// this", so every row the live meter holds is new to the file regardless of sequence numbers.
+pub fn process_epoch() -> u64 {
+    static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1)
+            .max(1)
+    })
 }
 
 /// Does this model name route to an Anthropic model (which honors `cache_control` and rejects
@@ -134,24 +172,54 @@ impl CostMeter {
             .fetch_add(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
         self.completion_tokens
             .fetch_add(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.cache_read_tokens
-            .fetch_add(u.cache_read(), Ordering::Relaxed);
+        let input = u.input_total();
+        let cached = u.cache_read();
+        let cache_write = u.cache_write();
+        let output = u.completion_tokens.unwrap_or(0);
+        self.cache_read_tokens.fetch_add(cached, Ordering::Relaxed);
+        self.cache_write_tokens
+            .fetch_add(cache_write, Ordering::Relaxed);
+        self.input_tokens.fetch_add(input, Ordering::Relaxed);
         self.calls_with_usage.fetch_add(1, Ordering::Relaxed);
-        self.last_prompt_tokens
-            .store(u.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-        self.last_cached_tokens
-            .store(u.cache_read(), Ordering::Relaxed);
-        self.last_completion_tokens
-            .store(u.completion_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.last_input_tokens.store(input, Ordering::Relaxed);
+        self.last_cached_tokens.store(cached, Ordering::Relaxed);
+        self.last_completion_tokens.store(output, Ordering::Relaxed);
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let row = UsageRow {
+            turn: self.turn.load(Ordering::Relaxed),
+            input,
+            output,
+            cached,
+            cache_write,
+        };
+        if let Ok(mut rows) = self.rows.lock() {
+            rows.push((seq, row));
+            if rows.len() > USAGE_ROWS_CAP {
+                let excess = rows.len() - USAGE_ROWS_CAP;
+                rows.drain(..excess);
+            }
+        }
     }
 
-    /// `(prompt, cached, completion)` of the most recent usage-carrying call; `None` before any.
+    /// Mark the start of a user turn: every call recorded until the next one is attributed to it.
+    pub fn begin_turn(&self) {
+        self.turn.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The turn number the next recorded call will carry (0 before the first `begin_turn`).
+    pub fn current_turn(&self) -> u64 {
+        self.turn.load(Ordering::Relaxed)
+    }
+
+    /// `(input, cached, completion)` of the most recent usage-carrying call; `None` before any.
+    /// `input` is the shape-corrected total (cache reads and writes included), so `cached * 100 /
+    /// input` is a real percentage on every provider.
     pub fn last_call(&self) -> Option<(u64, u64, u64)> {
         if self.calls_with_usage.load(Ordering::Relaxed) == 0 {
             return None;
         }
         Some((
-            self.last_prompt_tokens.load(Ordering::Relaxed),
+            self.last_input_tokens.load(Ordering::Relaxed),
             self.last_cached_tokens.load(Ordering::Relaxed),
             self.last_completion_tokens.load(Ordering::Relaxed),
         ))
@@ -168,15 +236,70 @@ impl CostMeter {
     pub fn cache_read(&self) -> u64 {
         self.cache_read_tokens.load(Ordering::Relaxed)
     }
-    /// Reset on `/clear` (a fresh conversation starts a fresh cost tally).
+    /// Prompt-cache input tokens WRITTEN this session (0 on providers that do not report writes).
+    pub fn cache_write(&self) -> u64 {
+        self.cache_write_tokens.load(Ordering::Relaxed)
+    }
+    /// Input tokens sent this session, cache reads and writes included — the denominator that
+    /// makes `cache_read() * 100 / input_total()` the session's real cache hit rate.
+    pub fn input_total(&self) -> u64 {
+        self.input_tokens.load(Ordering::Relaxed)
+    }
+
+    /// The ledger cursor `(epoch, seq)` after the most recent record — what a session file stores
+    /// so its next save can ask [`CostMeter::rows_since`] for only the rows it has not seen.
+    pub fn cursor(&self) -> (u64, u64) {
+        (process_epoch(), self.seq.load(Ordering::Relaxed))
+    }
+
+    /// Rows a session file has not persisted yet. Same epoch: the rows after `last_seq`. A
+    /// different epoch (the file was last written by another process, or never): every row the
+    /// meter holds, since none of them can be in the file.
+    pub fn rows_since(&self, epoch: u64, last_seq: u64) -> Vec<UsageRow> {
+        let same_process = epoch == process_epoch();
+        self.rows
+            .lock()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(seq, _)| !same_process || *seq > last_seq)
+                    .map(|(_, row)| row.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `(turn, calls, input, cached)` summed over the rows of the CURRENT turn; `None` when no call
+    /// of this turn reported usage. This is the "did the prefix cache hold across the turn" probe.
+    pub fn last_turn_summary(&self) -> Option<(u64, u64, u64, u64)> {
+        let turn = self.current_turn();
+        let rows = self.rows.lock().ok()?;
+        let mut calls = 0u64;
+        let mut input = 0u64;
+        let mut cached = 0u64;
+        for (_, row) in rows.iter().filter(|(_, r)| r.turn == turn) {
+            calls += 1;
+            input += row.input;
+            cached += row.cached;
+        }
+        (calls > 0).then_some((turn, calls, input, cached))
+    }
+
+    /// Reset on `/clear` (a fresh conversation starts a fresh cost tally). `turn` and `seq` are
+    /// deliberately NOT reset: both are process-monotonic cursors, and a session file resumed
+    /// after another conversation relies on them to keep its rows ordered and unduplicated.
     pub fn reset(&self) {
         self.prompt_tokens.store(0, Ordering::Relaxed);
         self.completion_tokens.store(0, Ordering::Relaxed);
         self.calls_with_usage.store(0, Ordering::Relaxed);
         self.cache_read_tokens.store(0, Ordering::Relaxed);
-        self.last_prompt_tokens.store(0, Ordering::Relaxed);
+        self.cache_write_tokens.store(0, Ordering::Relaxed);
+        self.input_tokens.store(0, Ordering::Relaxed);
+        self.last_input_tokens.store(0, Ordering::Relaxed);
         self.last_cached_tokens.store(0, Ordering::Relaxed);
         self.last_completion_tokens.store(0, Ordering::Relaxed);
+        if let Ok(mut rows) = self.rows.lock() {
+            rows.clear();
+        }
     }
 }
 
@@ -585,7 +708,7 @@ const STREAM_STALL_SECS: u64 = 90;
 const STREAM_STALL_ENV: &str = "AIZEN_STREAM_STALL_SECS";
 
 /// Resolve the inter-event stall deadline: env override (clamped 15s..=1800s) or the default.
-fn stream_stall_timeout() -> std::time::Duration {
+pub(crate) fn stream_stall_timeout() -> std::time::Duration {
     let secs = std::env::var(STREAM_STALL_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -594,9 +717,28 @@ fn stream_stall_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Deadline for the FIRST parsed frame — the second phase of the watchdog. A reasoning model that
+/// streams nothing until its answer starts (o-series over chat-completions, some local servers)
+/// is legitimately silent for minutes; the single 90 s deadline read that as "never started",
+/// replayed the request up to twice, and billed the thinking three times. Once any frame has
+/// parsed, the inter-frame deadline (`STREAM_STALL_SECS`) takes over.
+const STREAM_FIRST_FRAME_SECS: u64 = 600;
+
+/// Env override for the first-frame deadline, clamped 15s..=3600s.
+const STREAM_FIRST_FRAME_ENV: &str = "AIZEN_STREAM_FIRST_FRAME_SECS";
+
+pub(crate) fn stream_first_frame_timeout() -> std::time::Duration {
+    let secs = std::env::var(STREAM_FIRST_FRAME_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(15, 3600))
+        .unwrap_or(STREAM_FIRST_FRAME_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// How many times a stream that died BEFORE producing anything is replayed. Bounded and only ever
 /// on the blank case — see `stream_chat_with_tools_eager`.
-const STREAM_BLANK_RETRIES: u32 = 2;
+pub(crate) const STREAM_BLANK_RETRIES: u32 = 2;
 
 /// How many unparseable-frame warnings one stream may print before they collapse into a single
 /// count — and only ever under [`FRAME_DEBUG_ENV`], since the normal path prints none at all.
@@ -667,14 +809,38 @@ fn parse_chunk(data: &str) -> Result<ChatChunk, serde_json::Error> {
 
 /// Tell the user the stream stalled and is being replayed. Routed through the TUI funnel: a raw
 /// `eprintln!` here would be painted over by the retained render thread.
-fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
+/// `rate-limited — retrying in 43s (2/3)` / `HTTP 503 — retrying in 2s (1/3)`.
+pub(crate) fn retry_caption(status: u16, attempt: u32, max: u32, delay_ms: u64) -> String {
+    let what = match status {
+        429 => "rate-limited".to_string(),
+        s => format!("HTTP {s}"),
+    };
+    format!(
+        "{what} — retrying in {}s ({attempt}/{max})",
+        delay_ms.div_ceil(1000)
+    )
+}
+
+/// Publish a retried send: the working-line caption (so the spinner reads `rate-limited —
+/// retrying in 43s (2/3)` instead of spinning mutely) and one faint transcript note.
+fn send_retry_note(status: u16, attempt: u32, max: u32, delay_ms: u64) {
+    let text = retry_caption(status, attempt, max, delay_ms);
+    crate::ui::tui::set_work_caption(&text);
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(&crate::ui::theme::faint(format!("⟳ {text}")).to_string());
+    } else {
+        crate::ui::tui::note_line(&format!("⟳ {text}"));
+    }
+}
+
+pub(crate) fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
     let line = format!(
         "⟳ stream died before any output ({reason}) — retrying {attempt}/{max} in {delay_ms}ms"
     );
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
     } else {
-        eprintln!("{line}");
+        crate::ui::tui::note_line(&line);
     }
 }
 
@@ -741,6 +907,10 @@ where
                     let delay = retry_after_ms(&resp)
                         .unwrap_or_else(|| backoff_ms(attempt, BASE_MS, CAP_MS));
                     attempt += 1;
+                    // Say so: a sleep on `Retry-After` used to be indistinguishable from a
+                    // hang. The caption rides the working line; the note lands once in the
+                    // transcript.
+                    send_retry_note(status.as_u16(), attempt, MAX_RETRIES, delay);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
@@ -914,31 +1084,143 @@ pub fn interactive_backoff_ms(attempt: u32) -> u64 {
     backoff_ms(attempt, BASE_MS, CAP_MS)
 }
 
-/// Models that rejected `reasoning_effort` with a 400 THIS SESSION. Populated reactively — never
-/// guessed from the model name (a name heuristic would mis-serve every gateway that renames models).
-/// The first time a provider 400s on the field we record the model here, so every later turn strips
-/// it up front: at most ONE failed call per model per session, not one per turn.
-static EFFORT_UNSUPPORTED: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::OnceLock::new();
-
-fn effort_unsupported_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    EFFORT_UNSUPPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+/// A request feature some model or gateway rejects with a 400. Learned REACTIVELY, per model,
+/// for the session — never guessed from the model name (a name heuristic mis-serves every gateway
+/// that renames models). The first 400 that names the field records the quirk; every later request
+/// to that model is built without it, so a quirk costs one failed call per model per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Quirk {
+    /// `reasoning_effort` unknown to the model, or the tier we sent out of its range.
+    ReasoningEffort,
+    /// o-series / gpt-5 style: `max_tokens` rejected in favour of `max_completion_tokens`.
+    MaxCompletionTokens,
+    /// Strict local servers that reject `parallel_tool_calls`…
+    ParallelToolCalls,
+    /// …or `tool_choice`.
+    ToolChoice,
+    /// A gateway that does not accept Anthropic `cache_control` breakpoints on the OpenAI wire.
+    CacheControl,
 }
 
-/// Has `model` already rejected `reasoning_effort` this session? (Then we send the field-free wire.)
-fn effort_known_unsupported(model: &str) -> bool {
-    effort_unsupported_set()
+impl Quirk {
+    /// The wire field the provider complained about.
+    pub(crate) fn field(self) -> &'static str {
+        match self {
+            Quirk::ReasoningEffort => "reasoning_effort",
+            Quirk::MaxCompletionTokens => "max_tokens",
+            Quirk::ParallelToolCalls => "parallel_tool_calls",
+            Quirk::ToolChoice => "tool_choice",
+            Quirk::CacheControl => "cache_control",
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Quirk::MaxCompletionTokens => "as max_completion_tokens",
+            Quirk::CacheControl => "without cache breakpoints",
+            _ => "without it",
+        }
+    }
+}
+
+type QuirkMap = std::collections::HashMap<String, std::collections::HashSet<Quirk>>;
+
+static MODEL_QUIRKS: std::sync::OnceLock<std::sync::Mutex<QuirkMap>> = std::sync::OnceLock::new();
+
+fn model_quirks() -> &'static std::sync::Mutex<QuirkMap> {
+    MODEL_QUIRKS.get_or_init(|| std::sync::Mutex::new(QuirkMap::new()))
+}
+
+/// Has `model` already rejected `quirk`'s field this session?
+#[cfg(test)]
+pub(crate) fn quirk_known(model: &str, quirk: Quirk) -> bool {
+    model_quirks()
         .lock()
-        .map(|s| s.contains(model))
+        .map(|m| m.get(model).is_some_and(|s| s.contains(&quirk)))
         .unwrap_or(false)
 }
 
-fn mark_effort_unsupported(model: &str) {
-    if let Ok(mut s) = effort_unsupported_set().lock() {
-        s.insert(model.to_string());
+pub(crate) fn mark_quirk(model: &str, quirk: Quirk) {
+    if let Ok(mut m) = model_quirks().lock() {
+        m.entry(model.to_string()).or_default().insert(quirk);
     }
 }
+
+/// Does `body` still carry a cache breakpoint anywhere?
+fn has_cache_control(body: &ChatRequest) -> bool {
+    body.messages.iter().any(|m| m.cache_control.is_some())
+        || body.tools.iter().any(|t| t.cache_control.is_some())
+}
+
+/// Which request feature does this 400 body blame, among those the request ACTUALLY carried?
+/// Field names are matched loosely (case-insensitive); a field we never sent cannot be "ours", so
+/// an error that merely mentions `max_tokens` on a request without one is left alone.
+pub(crate) fn quirk_blamed(detail: &str, body: &ChatRequest) -> Option<Quirk> {
+    let d = detail.to_ascii_lowercase();
+    if body.reasoning_effort.is_some() && body_blames_effort(&d) {
+        return Some(Quirk::ReasoningEffort);
+    }
+    // OpenAI: "Unsupported parameter: 'max_tokens' is not supported with this model. Use
+    // 'max_completion_tokens' instead." A body that only says the VALUE is too large names no
+    // replacement and says nothing about support — that one is a real error, not a quirk.
+    if body.max_tokens.is_some()
+        && (d.contains("max_completion_tokens")
+            || (d.contains("max_tokens")
+                && (d.contains("unsupported") || d.contains("not supported"))))
+    {
+        return Some(Quirk::MaxCompletionTokens);
+    }
+    if body.parallel_tool_calls.is_some() && d.contains("parallel_tool_calls") {
+        return Some(Quirk::ParallelToolCalls);
+    }
+    if body.tool_choice.is_some() && d.contains("tool_choice") {
+        return Some(Quirk::ToolChoice);
+    }
+    if has_cache_control(body) && d.contains("cache_control") {
+        return Some(Quirk::CacheControl);
+    }
+    None
+}
+
+/// Rebuild `body` without the feature `quirk` names.
+pub(crate) fn apply_quirk(body: &mut ChatRequest, quirk: Quirk) {
+    match quirk {
+        Quirk::ReasoningEffort => body.reasoning_effort = None,
+        Quirk::MaxCompletionTokens => {
+            if let Some(n) = body.max_tokens.take() {
+                body.max_completion_tokens = Some(n);
+            }
+        }
+        Quirk::ParallelToolCalls => body.parallel_tool_calls = None,
+        Quirk::ToolChoice => body.tool_choice = None,
+        Quirk::CacheControl => {
+            for m in &mut body.messages {
+                m.cache_control = None;
+            }
+            for t in &mut body.tools {
+                t.cache_control = None;
+            }
+        }
+    }
+}
+
+/// Strip everything `body.model` is already known to reject, before the first byte goes out.
+fn apply_known_quirks(body: &mut ChatRequest) {
+    let known: Vec<Quirk> = model_quirks()
+        .lock()
+        .map(|m| {
+            m.get(&body.model)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    for q in known {
+        apply_quirk(body, q);
+    }
+}
+
+/// How many distinct quirks one call may learn (one 400 each) before the 400 is treated as real.
+const MAX_QUIRK_RETRIES: usize = 4;
 
 /// Does this error detail blame `reasoning_effort`? Providers word it differently ("unknown parameter
 /// reasoning_effort", "reasoning_effort: unsupported value", "does not support reasoning effort"), so
@@ -948,49 +1230,60 @@ fn body_blames_effort(detail: &str) -> bool {
     d.contains("reasoning_effort") || d.contains("reasoning effort")
 }
 
-/// POST a chat request with a WIRE-LEVEL effort fallback (the model-agnostic way to honour the
-/// per-model effort ceiling): send the tier as configured; if the provider 400s SPECIFICALLY because
-/// of `reasoning_effort` — a model that doesn't take the field at all, or doesn't accept the tier we
-/// sent (e.g. `max` to an o-series that tops out at `high`) — strip the field, remember the model for
-/// the rest of the session, and retry once. Any other error propagates unchanged. Models already
-/// learned-unsupported get the field stripped up front, so the 400 costs one call per model, once.
+/// POST a chat request with WIRE-LEVEL capability fallback: send the body as built; if the
+/// provider 400s SPECIFICALLY because of a field we sent — `reasoning_effort` (unknown, or the tier
+/// out of range), `max_tokens` on a model that wants `max_completion_tokens`, `parallel_tool_calls`
+/// or `tool_choice` on a strict local server, `cache_control` on a gateway that refuses it — rebuild
+/// without that field, remember the model for the rest of the session, and retry. A call can learn
+/// up to `MAX_QUIRK_RETRIES` such fields in a row; any other error propagates unchanged. Quirks
+/// already learned are stripped up front, so each costs one failed call per model, once.
 async fn send_chat(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
     mut body: ChatRequest,
 ) -> Result<reqwest::Response> {
-    if body.reasoning_effort.is_some() && effort_known_unsupported(&body.model) {
-        body.reasoning_effort = None;
-    }
-    let had_effort = body.reasoning_effort.is_some();
-    // `with_provider_auth`, NOT bare `bearer_auth`: Anthropic's native surface wants
-    // `x-api-key` + `anthropic-version`, and OpenCode zen wants `x-opencode-client`. The
-    // `/models` probe already sent them — the actual chat traffic must not be the one path
-    // that forgets. The host test parses the host out of the full URL, so passing the chat
-    // URL (not the base) is fine.
-    match send_with_retry(|| with_provider_auth(client.post(url), url, api_key).json(&body)).await {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            let msg = e.to_string();
-            // Only intervene on the exact "400 blames reasoning_effort" case, and only if we sent it.
-            if had_effort && msg.contains("HTTP 400") && body_blames_effort(&msg) {
-                mark_effort_unsupported(&body.model);
-                body.reasoning_effort = None;
-                let note = format!(
-                    "reasoning_effort not accepted by {} — retrying without it (won't send it again this session)",
-                    body.model
-                );
-                if crate::ui::tui::active() {
-                    crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
-                } else {
-                    eprintln!("{}", crate::ui::theme::faint(note));
-                }
-                send_with_retry(|| with_provider_auth(client.post(url), url, api_key).json(&body))
-                    .await
-            } else {
-                Err(e)
-            }
+    apply_known_quirks(&mut body);
+    let mut learned = 0usize;
+    loop {
+        // `with_provider_auth`, NOT bare `bearer_auth`: Anthropic's native surface wants
+        // `x-api-key` + `anthropic-version`, and OpenCode zen wants `x-opencode-client`. The
+        // `/models` probe already sent them — the actual chat traffic must not be the one path
+        // that forgets. The host test parses the host out of the full URL, so passing the chat
+        // URL (not the base) is fine.
+        let err = match send_with_retry(|| {
+            with_provider_auth(client.post(url), url, api_key).json(&body)
+        })
+        .await
+        {
+            Ok(r) => return Ok(r),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        let quirk = if msg.contains("HTTP 400") {
+            quirk_blamed(&msg, &body)
+        } else {
+            None
+        };
+        let Some(q) = quirk else {
+            return Err(err);
+        };
+        if learned >= MAX_QUIRK_RETRIES {
+            return Err(err);
+        }
+        learned += 1;
+        mark_quirk(&body.model, q);
+        apply_quirk(&mut body, q);
+        let note = format!(
+            "{} not accepted by {} — retrying {} (won't send it again this session)",
+            q.field(),
+            body.model,
+            q.remedy()
+        );
+        if crate::ui::tui::active() {
+            crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+        } else {
+            crate::ui::tui::note_line(&crate::ui::theme::faint(note).to_string());
         }
     }
 }
@@ -1045,6 +1338,38 @@ pub async fn stream_chat_with_visual_contract(
     base_url: &str,
     api_key: &str,
     model: &str,
+    messages: Vec<Message>,
+    visual_contract: bool,
+) -> Result<String> {
+    // Tape first (plain-text calls share the tape as content-only turns). See `llm::replay`.
+    if let Some(text) = crate::llm::replay::replay_text(model, &messages)? {
+        return Ok(text);
+    }
+    let recorded_view = if crate::llm::replay::mode() == crate::llm::replay::Mode::Record {
+        Some(messages.clone())
+    } else {
+        None
+    };
+    let text = stream_chat_with_visual_contract_live(
+        client,
+        base_url,
+        api_key,
+        model,
+        messages,
+        visual_contract,
+    )
+    .await?;
+    if let Some(view) = recorded_view {
+        crate::llm::replay::record_text(model, &view, &text)?;
+    }
+    Ok(text)
+}
+
+async fn stream_chat_with_visual_contract_live(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
     mut messages: Vec<Message>,
     visual_contract: bool,
 ) -> Result<String> {
@@ -1056,20 +1381,12 @@ pub async fn stream_chat_with_visual_contract(
         }
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let body = ChatRequest {
-        model: model.to_string(),
-        messages,
-        stream: true,
-        temperature: None,
-        max_tokens: crate::core::cli_config::load().max_tokens,
-        tools: Vec::new(),
-        tool_choice: None,
-        parallel_tool_calls: None,
-        stream_options: None,
-        reasoning_effort: crate::core::cli_config::resolved_reasoning_effort(
-            crate::core::cli_config::load().reasoning_effort,
-        ),
-    };
+    // The ONE body builder, like the tool-calling paths: this surface used to hand-roll its
+    // request without `stream_options.include_usage`, then read `chunk.usage` — so `aizen chat`
+    // turns never reached `/cost` on providers that only send usage when asked.
+    let cfg = crate::core::cli_config::load();
+    let effort = crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone());
+    let body = build_chat_body(&cfg, model, &messages, &[], true, effort);
 
     let mut spin = Some(crate::ui::spinner::Spinner::start("thinking"));
 
@@ -1095,6 +1412,10 @@ pub async fn stream_chat_with_visual_contract(
     // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
     // eager handles to detach and its caller already prints the error.
     let stall = stream_stall_timeout();
+    let first_cap = stream_first_frame_timeout();
+    let mut seen_frame = false;
+    // The last usage report seen; recorded ONCE after the stream ends (see below).
+    let mut last_usage: Option<Usage> = None;
     // Re-armed only by frames that PARSE, same as the tool-calling path: a `data: {"type":"ping"}`
     // keepalive reaches this loop as an event but must not keep a dead turn alive.
     let mut last_useful = std::time::Instant::now();
@@ -1102,7 +1423,8 @@ pub async fn stream_chat_with_visual_contract(
     // EVERY frame, and one warn per token buries the reply.
     let mut bad_frames: usize = 0;
     loop {
-        let remaining = stall.saturating_sub(last_useful.elapsed());
+        let cap = if seen_frame { stall } else { first_cap };
+        let remaining = cap.saturating_sub(last_useful.elapsed());
         let event = match tokio::time::timeout(remaining, stream.next()).await {
             Ok(Some(Ok(e))) => e,
             Ok(Some(Err(e))) => {
@@ -1112,8 +1434,13 @@ pub async fn stream_chat_with_visual_contract(
             Ok(None) => break,
             Err(_) => {
                 stream_err = Some(anyhow!(
-                    "SSE stream error: timeout — no data for {}s",
-                    stall.as_secs()
+                    "SSE stream error: timeout — no data for {}s{}",
+                    cap.as_secs(),
+                    if seen_frame {
+                        " (stream stalled mid-response)"
+                    } else {
+                        " (stream never started)"
+                    }
                 ));
                 break;
             }
@@ -1130,12 +1457,12 @@ pub async fn stream_chat_with_visual_contract(
         match parse_chunk(&event.data) {
             Ok(chunk) => {
                 last_useful = std::time::Instant::now();
-                // Same final-chunk-only guard as the tool-calling path: without it, `aizen chat`
-                // turns were invisible to `/cost` — the one surface that never recorded usage.
+                seen_frame = true;
+                // Keep the LAST usage report whatever chunk carries it — the final empty-choices
+                // chunk (OpenAI), the last content chunk (llama.cpp, Ollama shims), or a cumulative
+                // object on every chunk (vLLM/LiteLLM/OpenRouter). Recorded once, after the loop.
                 if let Some(u) = &chunk.usage {
-                    if chunk.choices.is_empty() {
-                        cost_meter().record(u);
-                    }
+                    last_usage = Some(u.clone());
                 }
                 if let Some(choice) = chunk.choices.first() {
                     if let Some(content) = &choice.delta.content {
@@ -1165,6 +1492,9 @@ pub async fn stream_chat_with_visual_contract(
         }
     }
 
+    if let Some(u) = &last_usage {
+        cost_meter().record(u);
+    }
     spin.take();
     if frame_debug() && bad_frames > MAX_FRAME_WARNS {
         eprintln!(
@@ -1223,6 +1553,7 @@ pub(crate) fn build_chat_body(
         stream,
         temperature: None,
         max_tokens: cfg.max_tokens,
+        max_completion_tokens: None,
         tools: tool_defs,
         tool_choice: if tools.is_empty() {
             None
@@ -1274,14 +1605,43 @@ pub async fn chat_with_tools_effort(
     tools: &[ToolDef],
     effort: Option<String>,
 ) -> Result<ChatTurn> {
+    // Tape first: a replayed run never builds a request. See `llm::replay`.
+    if let Some(turn) = crate::llm::replay::replay_turn(model, messages, tools)? {
+        return Ok(turn);
+    }
+    let turn =
+        chat_with_tools_effort_live(client, base_url, api_key, model, messages, tools, effort)
+            .await?;
+    crate::llm::replay::record_turn(model, messages, tools, &turn)?;
+    Ok(turn)
+}
+
+#[allow(clippy::option_option, clippy::too_many_arguments)]
+async fn chat_with_tools_effort_live(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    effort: Option<String>,
+) -> Result<ChatTurn> {
     if crate::llm::oauth_codex::is_codex_base_url(base_url) {
         let _ = api_key;
         let session = std::env::var("AIZEN_CODEX_SESSION")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
-        return crate::llm::responses_codex::stream_turn(client, model, messages, tools, &session)
-            .await;
+        // The finished turn only: this path's callers print the answer themselves.
+        return crate::llm::responses_codex::stream_turn(
+            client,
+            model,
+            messages,
+            tools,
+            &session,
+            crate::llm::responses_codex::StreamSink::default(),
+        )
+        .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = build_chat_body(
@@ -1555,15 +1915,49 @@ pub async fn stream_chat_with_tools_eager(
     tools: &[ToolDef],
     eager_hook: Option<EagerStartFn<'_>>,
 ) -> Result<ChatTurn> {
+    // Tape first: a replayed turn is returned whole (nothing streams, nothing starts eagerly — the
+    // executor runs every replayed call normally). See `llm::replay`.
+    if let Some(turn) = crate::llm::replay::replay_turn(model, messages, tools)? {
+        return Ok(turn);
+    }
+    let turn = stream_chat_with_tools_eager_live(
+        client, base_url, api_key, model, messages, tools, eager_hook,
+    )
+    .await?;
+    crate::llm::replay::record_turn(model, messages, tools, &turn)?;
+    Ok(turn)
+}
+
+async fn stream_chat_with_tools_eager_live(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    eager_hook: Option<EagerStartFn<'_>>,
+) -> Result<ChatTurn> {
     // Experimental ChatGPT Codex path — full Responses dialect (not /chat/completions).
     if crate::llm::oauth_codex::is_codex_base_url(base_url) {
-        let _ = (api_key, &eager_hook); // bearer comes from the OAuth token store
+        let _ = api_key; // bearer comes from the OAuth token store
         let session = std::env::var("AIZEN_CODEX_SESSION")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
-        return crate::llm::responses_codex::stream_turn(client, model, messages, tools, &session)
-            .await;
+        // Same contract as the chat-completions stream below: text paints as it arrives,
+        // completed calls go to the eager starter, the shared watchdog bounds a stall.
+        return crate::llm::responses_codex::stream_turn(
+            client,
+            model,
+            messages,
+            tools,
+            &session,
+            crate::llm::responses_codex::StreamSink {
+                render: true,
+                eager: eager_hook,
+            },
+        )
+        .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     // ONE config read for the whole request: the effort tier and the body are resolved from it.
@@ -1627,6 +2021,11 @@ pub async fn stream_chat_with_tools_eager(
         // reach this loop as events but carry nothing — cannot keep a dead turn alive. (Comment-style
         // `: ping` keepalives never surface as events at all; this closes the data-frame variant.)
         let idle_cap = stream_stall_timeout();
+        // Two phases: until the first frame PARSES the generous first-frame deadline applies (a
+        // reasoning model can be silent for minutes before its answer starts); after that, the
+        // inter-frame cap.
+        let first_cap = stream_first_frame_timeout();
+        let mut seen_frame = false;
         let mut last_useful = std::time::Instant::now();
         // Has this stream produced anything a retry would duplicate? Text, a tool-call fragment, or a
         // usage report all count. Governs both the watchdog's error wording and blank-stream replay.
@@ -1641,7 +2040,8 @@ pub async fn stream_chat_with_tools_eager(
         // breaks parsing usually breaks EVERY frame, which is one line per token over the live UI.
         let mut bad_frames: usize = 0;
         loop {
-            let remaining = idle_cap.saturating_sub(last_useful.elapsed());
+            let cap = if seen_frame { idle_cap } else { first_cap };
+            let remaining = cap.saturating_sub(last_useful.elapsed());
             let event = match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(Ok(e))) => e,
                 Ok(Some(Err(e))) => {
@@ -1650,11 +2050,11 @@ pub async fn stream_chat_with_tools_eager(
                 }
                 Ok(None) => break, // stream ended without [DONE]
                 Err(_) => {
-                    // No useful frame for `idle_cap`. Name it as a stall so the transcript says why the
+                    // No useful frame for `cap`. Name it as a stall so the transcript says why the
                     // turn ended, and mark it Transient-shaped ("timeout") for goal-mode classification.
                     stream_err = Some(anyhow!(
                         "SSE stream error: timeout — no data for {}s{}",
-                        idle_cap.as_secs(),
+                        cap.as_secs(),
                         if produced {
                             " (stream stalled mid-response)"
                         } else {
@@ -1673,15 +2073,19 @@ pub async fn stream_chat_with_tools_eager(
             match parse_chunk(&event.data) {
                 Ok(chunk) => {
                     last_useful = std::time::Instant::now(); // a real chunk re-arms the watchdog
-                                                             // Record usage ONLY on the final chunk (choices empty). Spec-compliant OpenAI sends
-                                                             // usage=null until then, but some gateways (vLLM/LiteLLM/OpenRouter) attach a
-                                                             // CUMULATIVE usage object to EVERY chunk — without this guard an N-chunk stream sums it
-                                                             // N times and inflates /cost (and calls_with_usage) ~N×.
+                    seen_frame = true;
+                    // Keep the LAST usage report whatever chunk carries it: the final empty-choices
+                    // chunk (spec OpenAI), the last content chunk (llama.cpp, Ollama shims, LiteLLM
+                    // in some modes — these never registered before, so `/cost` stayed blank and
+                    // the real-usage anchor never armed), or a cumulative object on EVERY chunk
+                    // (vLLM/OpenRouter). It is recorded ONCE after the loop, so the cumulative
+                    // shape is not summed N times. A report with completion tokens, or the final
+                    // chunk shape, proves the call was billed — a zero-token report on the role
+                    // chunk does not, and must not disarm the blank-stream replay.
                     if let Some(u) = &chunk.usage {
-                        if chunk.choices.is_empty() {
-                            cost_meter().record(u);
-                            final_usage = Some(u.clone());
-                            produced = true; // a usage report means the call really was billed
+                        final_usage = Some(u.clone());
+                        if chunk.choices.is_empty() || u.completion_tokens.unwrap_or(0) > 0 {
+                            produced = true;
                         }
                     }
                     if let Some(choice) = chunk.choices.first() {
@@ -1702,6 +2106,7 @@ pub async fn stream_chat_with_tools_eager(
                                 spin.take();
                             }
                             reasoning.push_str(raw);
+                            crate::ui::events::reasoning(raw); // a no-op off the JSON stream
                         }
                         if let Some(content) = &choice.delta.content {
                             spin.take(); // stop+clear the spinner before the first token prints
@@ -1710,7 +2115,9 @@ pub async fn stream_chat_with_tools_eager(
                             if !shown.is_empty() {
                                 full.push_str(&shown); // history keeps the RAW markdown
                                 crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
-                                if retained_display {
+                                if crate::ui::events::on() {
+                                    crate::ui::events::text(&shown); // one `text` event per delta
+                                } else if retained_display {
                                     crate::ui::tui::assistant_stream_delta(&shown);
                                 } else {
                                     let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
@@ -1757,11 +2164,15 @@ pub async fn stream_chat_with_tools_eager(
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
                         } else {
-                            eprintln!("\n{warn}");
+                            crate::ui::tui::note_line(&format!("\n{warn}"));
                         }
                     }
                 }
             }
+        }
+        // Usage is recorded here, once, from the last report the stream carried (see above).
+        if let Some(u) = &final_usage {
+            cost_meter().record(u);
         }
         spin.take(); // stream ended (e.g. empty turn) — ensure the spinner is gone
                      // Debug-only tally, for the same reason the per-frame lines are: these frames are
@@ -1776,13 +2187,15 @@ pub async fn stream_chat_with_tools_eager(
             if crate::ui::tui::active() {
                 crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
             } else {
-                eprintln!("\n{line}");
+                crate::ui::tui::note_line(&format!("\n{line}"));
             }
         }
         let tail = think.finish();
         if !tail.is_empty() {
             full.push_str(&tail);
-            if retained_display {
+            if crate::ui::events::on() {
+                crate::ui::events::text(&tail);
+            } else if retained_display {
                 crate::ui::tui::assistant_stream_delta(&tail);
             } else {
                 let rendered = md.push(&tail);
@@ -1791,7 +2204,9 @@ pub async fn stream_chat_with_tools_eager(
                 }
             }
         }
-        if retained_display {
+        if crate::ui::events::on() {
+            // Every delta already went out as an event; there is no display line to close.
+        } else if retained_display {
             crate::ui::tui::assistant_stream_finish(stream_err.is_some());
         } else {
             let closing = md.finish(); // flush the final partial line + close any dangling code fence
@@ -1854,7 +2269,7 @@ pub async fn stream_chat_with_tools_eager(
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
                     } else {
-                        eprintln!("{note}");
+                        crate::ui::tui::note_line(note);
                     }
                 }
                 for h in eager_by_slot.into_values() {
@@ -1869,7 +2284,7 @@ pub async fn stream_chat_with_tools_eager(
             if crate::ui::tui::active() {
                 crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
             } else {
-                eprintln!("{note}");
+                crate::ui::tui::note_line(&note);
             }
             if finish_reason.is_none() {
                 finish_reason = Some("tool_calls".to_string());
@@ -2114,16 +2529,146 @@ mod tests {
         // A model is "supported" until it 400s once; then it's remembered for the session.
         let model = "test-only-effort-model-xyz"; // unique so it can't collide with another test
         assert!(
-            !effort_known_unsupported(model),
+            !quirk_known(model, Quirk::ReasoningEffort),
             "unseen model starts supported"
         );
-        mark_effort_unsupported(model);
+        mark_quirk(model, Quirk::ReasoningEffort);
         assert!(
-            effort_known_unsupported(model),
+            quirk_known(model, Quirk::ReasoningEffort),
             "marked model is remembered"
         );
         // An unrelated model is unaffected by the mark above.
-        assert!(!effort_known_unsupported("some-other-model-abc"));
+        assert!(!quirk_known("some-other-model-abc", Quirk::ReasoningEffort));
+    }
+
+    #[test]
+    fn first_frame_timeout_defaults_and_clamps_the_env_override() {
+        std::env::remove_var(STREAM_FIRST_FRAME_ENV);
+        assert_eq!(
+            stream_first_frame_timeout().as_secs(),
+            STREAM_FIRST_FRAME_SECS
+        );
+        std::env::set_var(STREAM_FIRST_FRAME_ENV, "900");
+        assert_eq!(stream_first_frame_timeout().as_secs(), 900);
+        std::env::set_var(STREAM_FIRST_FRAME_ENV, "1");
+        assert_eq!(stream_first_frame_timeout().as_secs(), 15, "floor");
+        std::env::set_var(STREAM_FIRST_FRAME_ENV, "99999");
+        assert_eq!(stream_first_frame_timeout().as_secs(), 3600, "ceiling");
+        std::env::set_var(STREAM_FIRST_FRAME_ENV, "soon");
+        assert_eq!(
+            stream_first_frame_timeout().as_secs(),
+            STREAM_FIRST_FRAME_SECS
+        );
+        std::env::remove_var(STREAM_FIRST_FRAME_ENV);
+        std::env::remove_var(STREAM_STALL_ENV);
+        assert!(
+            stream_first_frame_timeout() > stream_stall_timeout(),
+            "the first frame gets the longer wait by default"
+        );
+    }
+
+    fn quirk_body(model: &str) -> ChatRequest {
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let tool = ToolDef::function("t", "d", serde_json::json!({"type":"object"}));
+        let mut b = build_chat_body(
+            &cfg,
+            model,
+            &[Message::user("hi")],
+            &[tool],
+            false,
+            Some("high".into()),
+        );
+        b.max_tokens = Some(2048);
+        b.messages[0].cache_control = Some(CacheControl::ephemeral());
+        b
+    }
+
+    #[test]
+    fn quirk_blamed_names_only_fields_the_request_carried() {
+        let body = quirk_body("quirk-test-model");
+        assert_eq!(
+            quirk_blamed("upstream returned HTTP 400 Bad Request: Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.", &body),
+            Some(Quirk::MaxCompletionTokens)
+        );
+        assert_eq!(
+            quirk_blamed("HTTP 400: max_tokens must be at most 4096", &body),
+            None,
+            "a value complaint is a real error, not a quirk"
+        );
+        assert_eq!(
+            quirk_blamed("HTTP 400: unknown field `parallel_tool_calls`", &body),
+            Some(Quirk::ParallelToolCalls)
+        );
+        assert_eq!(
+            quirk_blamed("HTTP 400: tool_choice is not supported", &body),
+            Some(Quirk::ToolChoice)
+        );
+        assert_eq!(
+            quirk_blamed(
+                "HTTP 400: messages[0].cache_control: extra fields not permitted",
+                &body
+            ),
+            Some(Quirk::CacheControl)
+        );
+        assert_eq!(
+            quirk_blamed(
+                "HTTP 400: Unsupported value: 'reasoning_effort' does not support 'high'",
+                &body
+            ),
+            Some(Quirk::ReasoningEffort)
+        );
+        let mut bare = quirk_body("quirk-test-model");
+        bare.max_tokens = None;
+        assert_eq!(
+            quirk_blamed(
+                "HTTP 400: max_tokens is not supported, use max_completion_tokens",
+                &bare
+            ),
+            None,
+            "a field we never sent cannot be ours"
+        );
+    }
+
+    #[test]
+    fn apply_quirk_rebuilds_the_body_without_the_field() {
+        let mut body = quirk_body("quirk-test-model");
+        apply_quirk(&mut body, Quirk::MaxCompletionTokens);
+        assert_eq!(
+            (body.max_tokens, body.max_completion_tokens),
+            (None, Some(2048))
+        );
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("max_tokens").is_none());
+        assert_eq!(v["max_completion_tokens"], 2048);
+        apply_quirk(&mut body, Quirk::ParallelToolCalls);
+        apply_quirk(&mut body, Quirk::ToolChoice);
+        assert!(body.parallel_tool_calls.is_none() && body.tool_choice.is_none());
+        assert!(has_cache_control(&body));
+        apply_quirk(&mut body, Quirk::CacheControl);
+        assert!(!has_cache_control(&body));
+        apply_quirk(&mut body, Quirk::ReasoningEffort);
+        assert!(body.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn known_quirks_are_stripped_before_the_first_byte_and_stay_per_model() {
+        let model = "quirk-test-model-known-zz";
+        assert!(!quirk_known(model, Quirk::MaxCompletionTokens));
+        mark_quirk(model, Quirk::MaxCompletionTokens);
+        mark_quirk(model, Quirk::CacheControl);
+        assert!(quirk_known(model, Quirk::MaxCompletionTokens));
+        assert!(!quirk_known(
+            "quirk-test-other-model",
+            Quirk::MaxCompletionTokens
+        ));
+        let mut body = quirk_body(model);
+        apply_known_quirks(&mut body);
+        assert_eq!(
+            (body.max_tokens, body.max_completion_tokens),
+            (None, Some(2048))
+        );
+        assert!(!has_cache_control(&body));
+        assert!(body.parallel_tool_calls.is_some(), "unlearned fields stay");
     }
 
     #[test]
@@ -2134,6 +2679,18 @@ mod tests {
         for s in [200u16, 400, 401, 403, 404, 422, 501] {
             assert!(!is_retryable_status(s), "{s} should NOT be retryable");
         }
+    }
+
+    #[test]
+    fn retry_captions_name_the_wait_and_the_attempt() {
+        assert_eq!(
+            retry_caption(429, 2, 3, 43_000),
+            "rate-limited — retrying in 43s (2/3)"
+        );
+        assert_eq!(
+            retry_caption(503, 1, 3, 1_500),
+            "HTTP 503 — retrying in 2s (1/3)"
+        );
     }
 
     #[test]
@@ -2310,6 +2867,78 @@ mod tests {
         );
         m.reset();
         assert_eq!(m.cache_read(), 0);
+    }
+
+    #[test]
+    fn cost_meter_last_call_uses_the_shape_corrected_input() {
+        // Anthropic-style: `prompt_tokens` EXCLUDES the cache read. Dividing cached by prompt
+        // would report 4000 % — the denominator must be the total that actually went out.
+        let m = CostMeter::default();
+        m.record(&Usage {
+            prompt_tokens: Some(1_000),
+            completion_tokens: Some(20),
+            cache_read_input_tokens: Some(40_000),
+            cache_creation_input_tokens: Some(500),
+            ..Default::default()
+        });
+        assert_eq!(m.last_call(), Some((41_500, 40_000, 20)));
+        assert_eq!(m.input_total(), 41_500);
+        assert_eq!(m.cache_write(), 500);
+    }
+
+    #[test]
+    fn cost_meter_ledger_rows_follow_turns_and_cursor() {
+        let m = CostMeter::default();
+        let usage = |p: u64, c: u64| Usage {
+            prompt_tokens: Some(p),
+            completion_tokens: Some(5),
+            prompt_tokens_details: Some(crate::core::types::PromptTokensDetails {
+                cached_tokens: Some(c),
+            }),
+            ..Default::default()
+        };
+        m.begin_turn();
+        m.record(&usage(1_000, 0));
+        m.record(&usage(1_200, 900));
+        m.begin_turn();
+        m.record(&usage(1_400, 1_100));
+        m.record(&Usage::default()); // all-None: not a call, not a row
+
+        let (epoch, seq) = m.cursor();
+        assert_eq!(seq, 3, "three usage-carrying calls → three rows");
+        assert_eq!(epoch, process_epoch());
+
+        let all = m.rows_since(0, 0);
+        assert_eq!(
+            all.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![1, 1, 2],
+            "rows carry the turn that was current when they were recorded"
+        );
+        assert_eq!(all[1].cached, 900);
+        assert_eq!(
+            all[1].input, 1_200,
+            "OpenAI shape: cached is a subset of prompt"
+        );
+        // A file written by THIS process at seq 2 gets only the row after it.
+        assert_eq!(m.rows_since(epoch, 2).len(), 1);
+        // A file written by ANOTHER process gets everything, whatever seq it recorded.
+        assert_eq!(m.rows_since(epoch.wrapping_add(1), 99).len(), 3);
+        // The current turn's probe sums its own rows only.
+        assert_eq!(m.last_turn_summary(), Some((2, 1, 1_400, 1_100)));
+
+        m.reset();
+        assert!(m.rows_since(0, 0).is_empty(), "reset drops the rows");
+        assert_eq!(m.last_turn_summary(), None);
+        assert_eq!(
+            m.cursor().1,
+            3,
+            "…but never the sequence: a resumed file must not re-append the same rows"
+        );
+        assert_eq!(
+            m.current_turn(),
+            2,
+            "…nor the turn counter, so row order stays monotonic"
+        );
     }
 
     #[test]

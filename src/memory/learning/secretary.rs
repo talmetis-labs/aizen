@@ -456,6 +456,7 @@ pub fn apply_facts(
                 tier: f.tier,
                 anchor: f.anchor.clone(),
                 mentions_machine: tiering::mentions_machine(&f.text),
+                mentions_project: tiering::mentions_project(&f.text, &lin),
             },
             &lin,
             &tiering::fs_exists,

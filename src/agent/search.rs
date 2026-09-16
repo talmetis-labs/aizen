@@ -97,24 +97,26 @@ impl Tool for SearchFiles {
         "search_files"
     }
     fn description(&self) -> &str {
-        "Search file CONTENT by regular expression (`path` may be a ../ or absolute dir elsewhere). \
-         Respects .gitignore and skips hidden + binary files unless hidden:true. Returns \
-         `path:line: matched text`; context:N adds ±N surrounding lines (grep -C) so a follow-up \
-         file_read is rarely needed. The canonical content search — do NOT shell out to \
-         grep/ripgrep; file_glob matches NAMES, not content. Read-only."
+        concat!(
+            "Search file CONTENT by regular expression. Respects .gitignore and skips hidden + \
+         binary files unless hidden:true. Rows are `path:line: text`; context:N adds ±N lines. \
+         The canonical content search — do NOT shell out to grep/ripgrep. Read-only.",
+            crate::search_routing!()
+        )
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "pattern": {"type": "string", "description": "a regular expression to match against each line"},
-                "path": {"type": "string", "description": "optional directory to limit the search (a subdir, or a ../ or absolute path elsewhere)"},
-                "glob": {"type": "string", "description": "optional file glob to restrict which files are searched, e.g. *.rs or src/**/*.ts"},
+                "pattern": {"type": "string", "description": "regular expression matched against each line"},
+                "path": {"type": "string", "description": "directory to search (subdir, ../ or absolute)"},
+                "glob": {"type": "string", "description": "file glob, e.g. *.rs or src/**/*.ts"},
                 "ignore_case": {"type": "boolean", "description": "case-insensitive match (default false)"},
-                "hidden": {"type": "boolean", "description": "also search hidden files and .gitignored paths (default false)"},
-                "max_results": {"type": "integer", "description": "cap on matches returned (default 200)"},
-                "context": {"type": "integer", "description": "lines of context around each match, grep -C style (default 0, max 10)"}
+                "hidden": {"type": "boolean", "description": "also hidden and .gitignored paths (default false)"},
+                "max_results": {"type": "integer", "description": "cap (default 200)"},
+                "context": {"type": "integer", "description": "±N lines around each match (default 0, max 10)"},
+                "format": crate::agent::result_format::schema_property()
             },
             "required": ["pattern"]
         })
@@ -307,37 +309,85 @@ impl Tool for SearchFiles {
         // grep's own convention: `path:line:` marks a MATCH row, `path-line-` a context row, `--`
         // separates non-contiguous groups — a shape every model already knows how to read.
         let mut lines: Vec<String> = Vec::new();
-        for (rel, rows) in &results {
+        // Which file each row belongs to and whether it is a match row (not context, not `--`), so
+        // the concise view can count what it hides per file.
+        let mut owner: Vec<usize> = Vec::new();
+        let mut is_match_row: Vec<bool> = Vec::new();
+        for (f, (rel, rows)) in results.iter().enumerate() {
             let mut prev: Option<usize> = None;
             for (n, shown, is_match) in rows {
                 if !lines.is_empty() && ctx > 0 && prev.is_none_or(|p| *n != p + 1) {
                     lines.push("--".to_string());
+                    owner.push(f);
+                    is_match_row.push(false);
                 }
                 if *is_match {
                     lines.push(format!("{}:{}: {}", rel.display(), n, shown));
                 } else {
                     lines.push(format!("{}-{}- {}", rel.display(), n, shown));
                 }
+                owner.push(f);
+                is_match_row.push(*is_match);
                 prev = Some(*n);
             }
         }
-        let mut out = format!("{shown_matches} match(es) in {files_hit} file(s):");
-        out.push('\n');
-        out.push_str(&lines.join("\n"));
+        let header = format!("{shown_matches} match(es) in {files_hit} file(s):");
+        let mut trailer = String::new();
         if truncated.load(Ordering::Relaxed) {
-            out.push_str(&format!(
+            trailer.push_str(&format!(
                 "\n…[capped at {max_results} matches — narrow the pattern or set path/glob]"
             ));
         }
         if budget_hit.load(Ordering::Relaxed) {
-            out.push_str("\n…[search budget reached before the whole tree was scanned — narrow with path/glob]");
+            trailer.push_str("\n…[search budget reached before the whole tree was scanned — narrow with path/glob]");
         }
         if skipped_large > 0 {
-            out.push_str(&format!(
+            trailer.push_str(&format!(
                 "\n…[skipped {skipped_large} file(s) larger than {} MB]",
                 MAX_FILE_BYTES / (1024 * 1024)
             ));
         }
+        let full = format!("{header}\n{}{trailer}", lines.join("\n"));
+        let keep = crate::agent::result_format::CONCISE_SEARCH_ROWS;
+        if crate::agent::result_format::from_args(args)
+            == crate::agent::result_format::ResultFormat::Detailed
+            || lines.len() <= keep
+        {
+            return Ok(full);
+        }
+        // CONCISE (default): the first rows verbatim, the hidden rows as per-file counts, and the
+        // whole list on disk — the model narrows or reads the file instead of re-searching.
+        let path = crate::agent::observe::spill_to_scratch("search_files", &full);
+        let mut per_file: Vec<(usize, usize)> = Vec::new();
+        for i in keep..lines.len() {
+            if !is_match_row[i] {
+                continue;
+            }
+            match per_file.last_mut() {
+                Some((f, c)) if *f == owner[i] => *c += 1,
+                _ => per_file.push((owner[i], 1)),
+            }
+        }
+        let hidden: usize = per_file.iter().map(|(_, c)| c).sum();
+        let mut listing: Vec<String> = per_file
+            .iter()
+            .take(12)
+            .map(|(f, c)| format!("{} ({c})", results[*f].0.display()))
+            .collect();
+        if per_file.len() > 12 {
+            listing.push("…".to_string());
+        }
+        let mut out = format!("{header}\n{}", lines[..keep].join("\n"));
+        out.push_str(&format!(
+            "\n…[{hidden} more match(es) in {} file(s): {}",
+            per_file.len(),
+            listing.join(", ")
+        ));
+        if let Some(p) = path {
+            out.push_str(&format!(" · full list at {} (file_read it)", p.display()));
+        }
+        out.push_str(" · format:\"detailed\" for every row, or narrow with path/glob]");
+        out.push_str(&trailer);
         Ok(out)
     }
 }
@@ -504,5 +554,39 @@ mod tests {
         let t = SearchFiles::new(root);
         let out = t.execute(&serde_json::json!({"pattern": "xxxxx"})).unwrap();
         assert!(out.contains("skipped 1 file"), "skip reported: {out}");
+    }
+
+    #[test]
+    fn concise_shows_the_first_rows_and_counts_the_rest_per_file() {
+        let root = tmp("concise-rows");
+        let many: String = (1..=60).map(|i| format!("needle {i}\n")).collect();
+        std::fs::write(root.join("a.txt"), &many).unwrap();
+        let few: String = (1..=5).map(|i| format!("needle b{i}\n")).collect();
+        std::fs::write(root.join("b.txt"), &few).unwrap();
+        let t = SearchFiles::new(root);
+        let keep = crate::agent::result_format::CONCISE_SEARCH_ROWS;
+        let rows = |out: &str| {
+            out.lines()
+                .filter(|l| l.starts_with("a.txt:") || l.starts_with("b.txt:"))
+                .count()
+        };
+
+        let out = t
+            .execute(&serde_json::json!({"pattern": "needle"}))
+            .unwrap();
+        assert!(out.starts_with("65 match(es) in 2 file(s):"), "{out}");
+        assert_eq!(rows(&out), keep, "concise shows the first rows: {out}");
+        assert!(
+            out.contains("…[25 more match(es) in 2 file(s): a.txt (20), b.txt (5)"),
+            "{out}"
+        );
+        assert!(out.contains("full list at "), "{out}");
+        assert!(out.contains("format:\"detailed\""), "{out}");
+
+        let all = t
+            .execute(&serde_json::json!({"pattern": "needle", "format": "detailed"}))
+            .unwrap();
+        assert_eq!(rows(&all), 65, "detailed shows every row: {all}");
+        assert!(!all.contains("more match(es)"), "{all}");
     }
 }

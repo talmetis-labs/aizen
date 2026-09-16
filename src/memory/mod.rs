@@ -208,6 +208,32 @@ pub fn search_filtered_scoped_cat(
     cat: Option<crate::memory::category::Category>,
     sel: &ScopeSel,
 ) -> Result<Vec<Hit>> {
+    search_scoped_inner(query, k, dim, cat, sel, false).map(|(hits, _)| hits)
+}
+
+/// As [`search_filtered_scoped`], also returning the BM25 index over the scoped candidate set:
+/// the recall gate weights the query by corpus IDF, and building the index here costs one pass
+/// over tokens already in memory instead of a second store load.
+pub(crate) fn search_scoped_with_index(
+    query: &str,
+    k: usize,
+    sel: &ScopeSel,
+) -> Result<(Vec<Hit>, Bm25Index)> {
+    let (hits, idx) = search_scoped_inner(query, k, None, None, sel, true)?;
+    Ok((
+        hits,
+        idx.unwrap_or_else(|| Bm25Index::build(std::iter::empty::<&[String]>())),
+    ))
+}
+
+fn search_scoped_inner(
+    query: &str,
+    k: usize,
+    dim: Option<Dimension>,
+    cat: Option<crate::memory::category::Category>,
+    sel: &ScopeSel,
+    want_index: bool,
+) -> Result<(Vec<Hit>, Option<Bm25Index>)> {
     let all = store::load_all()?;
     let mut active = bloat::supersede::active(&all);
     let cfg = settings();
@@ -217,6 +243,8 @@ pub fn search_filtered_scoped_cat(
     let exclude: HashSet<String> = core.source_ids.into_iter().collect();
     let lin = path_scope::Lineage::current();
     active.retain(|e| sel.admits(e, &lin));
+    let gate_index =
+        want_index.then(|| Bm25Index::build(active.iter().map(|e| e.tokens.as_slice())));
 
     // Default path is the exact-BM25 lexical floor. `enable_dense` fuses a dense tier (RRF) with a
     // persistent per-fact embedding cache; `enable_fuzzy` adds the Jaro-Winkler bridge. Both OFF by
@@ -275,7 +303,7 @@ pub fn search_filtered_scoped_cat(
             .then(b.entry.mtime_ms.cmp(&a.entry.mtime_ms))
     });
     hits.truncate(k);
-    Ok(hits)
+    Ok((hits, gate_index))
 }
 
 /// Read the already-adopted frozen core for the current device without rebuilding it.
@@ -320,13 +348,61 @@ pub fn load_style() -> Option<String> {
 /// so this only caps ranking work).
 const RECALL_CANDIDATES: usize = 12;
 
-/// Minimum lexical coverage for the TOP hit before a recall block is injected at all.
+/// Minimum [`gate_coverage`] before a recall block is injected at all.
 ///
 /// Without a gate, BM25 keeps anything scoring above zero, so one shared common word ("file",
 /// "run", "lỗi") drags a block into nearly every turn — spending tokens and, worse, teaching the
 /// model to ignore the block because it is usually irrelevant. Mirrors the codebase-retrieval gate
-/// (`agent::codebase::gate_passes`), which had the same problem for the same reason.
-const RECALL_GATE_COVERAGE: f64 = 0.34;
+/// (`agent::codebase::gate_passes`), which had the same problem for the same reason. Re-tuned
+/// with `aizen bench memory --split all` (the gate-admission lines) when the coverage became
+/// IDF-weighted over the top hits (E4.3).
+pub(crate) const RECALL_GATE_COVERAGE: f64 = 0.34;
+
+/// The recall gate judges the block it will show: a query token counts as covered when any of
+/// the top `GATE_TOP_HITS` hits carries it.
+pub(crate) const GATE_TOP_HITS: usize = 3;
+/// Only the `GATE_QUERY_TERMS` heaviest (highest-IDF) query tokens are judged, so a long
+/// Vietnamese question is scored on its six most telling words, not on every particle it was
+/// typed with (quality plan M4: at 0.34 of ALL tokens such queries could not clear the old gate,
+/// and 1.1 facts were injected per turn).
+pub(crate) const GATE_QUERY_TERMS: usize = 6;
+
+/// IDF-weighted coverage of the query by the top hits — see [`RECALL_GATE_COVERAGE`]. Tokens
+/// are weighted by `idx` (the corpus the hits were ranked in); a word the corpus has never
+/// seen weighs the most and is never covered, so a query about something the store does not
+/// know stays hard to admit. Empty query → 0.0.
+pub(crate) fn gate_coverage(query_tokens: &[String], hits: &[Hit], idx: &Bm25Index) -> f64 {
+    let distinct: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+    if distinct.is_empty() {
+        return 0.0;
+    }
+    let mut weighted: Vec<(&str, f64)> = distinct
+        .iter()
+        .map(|t| (*t, idx.idf(t).max(1e-9)))
+        .collect();
+    weighted.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    weighted.truncate(GATE_QUERY_TERMS);
+    let shown: HashSet<&str> = hits
+        .iter()
+        .take(GATE_TOP_HITS)
+        .flat_map(|h| h.entry.tokens.iter().map(String::as_str))
+        .collect();
+    let total: f64 = weighted.iter().map(|(_, w)| w).sum();
+    let covered: f64 = weighted
+        .iter()
+        .filter(|(t, _)| shown.contains(t))
+        .map(|(_, w)| w)
+        .sum();
+    if total <= 0.0 {
+        0.0
+    } else {
+        covered / total
+    }
+}
 
 /// The marker every recall block starts with. Fixed so callers can strip stale blocks out of old
 /// user turns by prefix match rather than by re-deriving what was injected.
@@ -373,12 +449,12 @@ pub fn recall_block(query: &str, budget_tokens: usize) -> Option<(String, Vec<pe
     // The working view: only facts true HERE (see `ScopeSel::admits`). Read-only — this is not the
     // agent's `memory_search` tool, so it must NOT record reuse: the fact was offered, not used.
     // Phase 3's `used` report is what earns a confirmation.
-    let hits = search_filtered_scoped(query, RECALL_CANDIDATES, None, &ScopeSel::default_view())
-        .ok()
-        .filter(|h| !h.is_empty())?;
-
-    let q: HashSet<String> = tokenize(query).into_iter().collect();
-    if lexical_coverage(&q, &hits[0].entry.tokens) < RECALL_GATE_COVERAGE {
+    let (hits, idx) =
+        search_scoped_with_index(query, RECALL_CANDIDATES, &ScopeSel::default_view()).ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+    if gate_coverage(&tokenize(query), &hits, &idx) < RECALL_GATE_COVERAGE {
         return None;
     }
 
@@ -1755,6 +1831,134 @@ pub fn live_fact_count() -> usize {
 /// pass parks what it could not call, and the live store because a differently-worded contradiction
 /// scores BELOW the local band and therefore entered as an ordinary fact. Excluding the live side
 /// would mean the one case M2b exists for never reaches it.
+/// What `aizen memory consolidate` did, or would do.
+#[derive(Debug, Default)]
+pub struct ConsolidateReport {
+    pub live: usize,
+    pub pairs: Vec<learning::consolidate::DupPair>,
+    pub applied: usize,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Retiring a row can un-hide the row it had replaced (`active()` lets only a LIVE claimant
+/// bury its predecessor), so one apply can surface the next duplicate. The pass therefore runs
+/// in rounds until a round finds nothing, capped here so a pathological store cannot loop.
+const CONSOLIDATE_MAX_ROUNDS: usize = 8;
+
+/// The store-wide, model-free duplicate pass (E4.1): the two-stage check the write path runs on
+/// every new fact, applied once to what is already there. Dry run unless `apply`. Applying
+/// retires the duplicate with `supersededBy` (revivable with `aizen memory revive <id>`) and
+/// reinforces the survivor under `session_id`, so a fact that was written twice finally counts
+/// as seen twice — which is what admits an inferred fact to the frozen core. A dry run shows the
+/// first round only: later rounds depend on what the writes un-hide.
+pub fn consolidate_store(apply: bool, session_id: &str) -> Result<ConsolidateReport> {
+    let mut report = ConsolidateReport::default();
+    for round in 0..CONSOLIDATE_MAX_ROUNDS {
+        let all = store::load_all()?;
+        let live = bloat::supersede::active(&all);
+        let pairs = learning::consolidate::plan_pass(&live, settings().learn_dedup_threshold);
+        if round == 0 {
+            report.live = live.len();
+        }
+        if pairs.is_empty() || !apply {
+            report.pairs.extend(pairs);
+            return Ok(report);
+        }
+        apply_round(&pairs, &live, session_id, &mut report);
+        report.pairs.extend(pairs);
+    }
+    Ok(report)
+}
+
+/// Write one round of merges: retire each `dup` under its `keep`, reinforce the keeper, audit both.
+fn apply_round(
+    pairs: &[learning::consolidate::DupPair],
+    live: &[MemoryEntry],
+    session_id: &str,
+    report: &mut ConsolidateReport,
+) {
+    for p in pairs {
+        let (Some(keep), Some(dup)) = (
+            live.iter().find(|e| e.id == p.keep),
+            live.iter().find(|e| e.id == p.dup),
+        ) else {
+            continue;
+        };
+        match store::mark_superseded(dup, &keep.id).and_then(|_| store::reinforce(keep, session_id))
+        {
+            Ok(_) => {
+                report.applied += 1;
+                learning::audit::append(learning::audit::AuditEvent {
+                    ts: learning::audit::ts_now(),
+                    session_id,
+                    op: "supersede",
+                    old_id: Some(&dup.id),
+                    new_id: Some(&keep.id),
+                    signal: Some("consolidate"),
+                    verdict: Some(p.stage.label()),
+                    confidence: Some(p.score),
+                    ..Default::default()
+                });
+                learning::audit::append(learning::audit::AuditEvent {
+                    ts: learning::audit::ts_now(),
+                    session_id,
+                    op: "reinforce",
+                    id: Some(&keep.id),
+                    signal: Some("consolidate"),
+                    verdict: Some(p.stage.label()),
+                    ..Default::default()
+                });
+            }
+            Err(e) => report.failed.push((p.dup.clone(), e.to_string())),
+        }
+    }
+}
+
+/// `aizen memory consolidate [--apply]` — print the pass, or what it would do.
+pub fn cmd_consolidate(apply: bool) -> Result<()> {
+    let r = consolidate_store(apply, &learning::default_session_id())?;
+    if r.pairs.is_empty() {
+        tui::emit_line(&format!(
+            "{} live fact(s) — no near-duplicates by the two-stage check.",
+            r.live
+        ));
+        return Ok(());
+    }
+    let mode = if apply {
+        "merged"
+    } else {
+        "dry run — would merge"
+    };
+    tui::emit_line(&format!(
+        "{} live fact(s); {mode} {} duplicate(s):",
+        r.live,
+        r.pairs.len()
+    ));
+    for p in &r.pairs {
+        tui::emit_line(&format!(
+            "  ⌁ {} → keeps {}  ({} {:.2})",
+            p.dup,
+            p.keep,
+            p.stage.label(),
+            p.score
+        ));
+    }
+    if apply {
+        tui::emit_line(&format!(
+            "retired {} (revivable with `aizen memory revive <id>`) and reinforced their survivors.",
+            r.applied
+        ));
+        for (id, why) in &r.failed {
+            tui::emit_line(&format!("  ! {id}: {why}"));
+        }
+    } else {
+        tui::emit_line(
+            "nothing written — `aizen memory consolidate --apply` merges them (and any duplicate a merge un-hides).",
+        );
+    }
+    Ok(())
+}
+
 pub fn reconcile_inputs() -> Result<(Vec<learning::reconcile::Pair>, Vec<MemoryEntry>)> {
     let all = store::load_all()?;
     let live = bloat::supersede::active(&all);
@@ -2079,6 +2283,48 @@ mod tests {
         std::env::set_var("AIZEN_MEM_DENSE", "off");
         assert!(!settings().enable_dense);
         std::env::remove_var("AIZEN_MEM_DENSE");
+    }
+
+    #[test]
+    fn consolidate_apply_retires_the_twin_and_makes_the_survivor_count_twice() {
+        with_recall_home("consolidate", || {
+            fn w(name: &str) -> store::LearnedWrite<'_> {
+                store::LearnedWrite {
+                    name,
+                    mtype: MemoryType::Project,
+                    body: "only rust-analyzer is installed on this machine",
+                    tier: crate::memory::path_scope::Tier::User,
+                    session_id: "s1",
+                    ..Default::default()
+                }
+            }
+            let first = store::add_learned(&w("ra one")).unwrap();
+            let second = store::add_learned(&w("ra two")).unwrap();
+            let dry = consolidate_store(false, "s2").unwrap();
+            assert_eq!(dry.pairs.len(), 1, "{dry:?}");
+            assert_eq!(
+                bloat::supersede::active(&store::load_all().unwrap()).len(),
+                2,
+                "a dry run writes nothing"
+            );
+            let r = consolidate_store(true, "s2").unwrap();
+            assert_eq!(r.applied, 1, "{r:?}");
+            let live = bloat::supersede::active(&store::load_all().unwrap());
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert!(
+                [first.as_str(), second.as_str()].contains(&live[0].id.as_str()),
+                "{live:?}"
+            );
+            assert!(
+                live[0].sessions >= 2,
+                "the survivor now counts as seen in two sessions: {:?}",
+                live[0]
+            );
+            let audit =
+                std::fs::read_to_string(config::cli_memory_dir().join("learning-audit.jsonl"))
+                    .unwrap_or_default();
+            assert!(audit.contains("\"op\":\"reinforce\""), "{audit}");
+        });
     }
 
     /// A temp home for the recall tests: they read the real store, so they need one of their own.
@@ -2921,6 +3167,60 @@ mod tests {
 
         std::env::remove_var("AIZEN_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_gate_weighs_the_informative_words_and_pools_the_top_hits() {
+        let mk = |id: &str, body: &str| MemoryEntry {
+            id: id.into(),
+            name: id.into(),
+            body: body.into(),
+            tokens: tokenize(body),
+            ..Default::default()
+        };
+        // `file` is in every fact (near-zero IDF); the rest are rare.
+        let corpus = [
+            mk("a", "file oauth login button"),
+            mk("b", "file rate limit per key"),
+            mk("c", "file deploy pipeline fly"),
+            mk("d", "file vitest runner"),
+        ];
+        let idx = Bm25Index::build(corpus.iter().map(|e| e.tokens.as_slice()));
+        let hit = |e: &MemoryEntry| Hit {
+            entry: e.clone(),
+            score: 1.0,
+        };
+        // A common shared word alone admits almost nothing: `file` weighs next to nothing
+        // against two rare, uncovered words.
+        let q = tokenize("file zzz yyy");
+        assert!(gate_coverage(&q, &[hit(&corpus[3])], &idx) < 0.1);
+        // Pooling: the first hit covers `oauth login`, the second `rate limit` — together they
+        // cover the query, and only the top three hits count.
+        let q = tokenize("oauth login rate limit");
+        let one = gate_coverage(&q, &[hit(&corpus[0])], &idx);
+        let two = gate_coverage(&q, &[hit(&corpus[0]), hit(&corpus[1])], &idx);
+        assert!(one > 0.4 && one < 0.6, "{one}");
+        assert!((two - 1.0).abs() < 1e-9, "{two}");
+        let fourth = gate_coverage(
+            &q,
+            &[
+                hit(&corpus[2]),
+                hit(&corpus[3]),
+                hit(&corpus[3]),
+                hit(&corpus[0]),
+            ],
+            &idx,
+        );
+        assert!(
+            fourth < 1e-9,
+            "a fourth hit is not shown, so it cannot cover: {fourth}"
+        );
+        // The denominator is the six heaviest words: eight rare query words with six covered
+        // still score on the six that count, never on the two lightest.
+        let q = tokenize("oauth login button rate limit key deploy pipeline file file");
+        let cov = gate_coverage(&q, &[hit(&corpus[0]), hit(&corpus[1])], &idx);
+        assert!(cov > 0.7, "{cov}");
+        assert_eq!(gate_coverage(&[], &[hit(&corpus[0])], &idx), 0.0);
     }
 
     #[test]

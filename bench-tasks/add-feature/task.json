@@ -1,0 +1,8 @@
+{
+  "id": "add-feature",
+  "prompt": "Add `pub fn parse_pairs(s: &str) -> Vec<(&str, &str)>` to src/lib.rs: split the input on ';', parse each piece with the existing `parse_kv`, and skip pieces that do not parse. The integration test in tests/parse_pairs.rs already describes the behaviour; make `cargo test` pass without editing the tests.",
+  "allowed_files": ["src/lib.rs"],
+  "expect": "done",
+  "verify": ["cargo", "test", "--quiet"],
+  "max_steps": 30
+}

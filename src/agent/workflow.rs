@@ -27,10 +27,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Per-child total hard cap after the one soft extension.
-const CHILD_MAX_ITERS: usize = 15;
-/// Total ceiling for a workflow child (2 × the narrow initial budget).
+/// Total step ceiling for a workflow child that names a specialist card and no `max_steps`. A
+/// built-in role takes its own `RoleProfile::default_max_steps` instead (see
+/// [`child_step_total`]). The loop starts at half the total and extends once to the whole.
 const CHILD_AUTO_EXTEND: usize = 30;
+/// Fix loops a `retry_on_fail` task may trigger: one. A second FAIL is reported, not retried —
+/// a change that does not pass after one targeted fix needs a person, not a third attempt.
+const FIX_LOOPS: usize = 1;
+/// Per-dependency and total caps for the `<upstream>` block a chained task receives.
+const UPSTREAM_TASK_CHARS: usize = 4_000;
+const UPSTREAM_TOTAL_CHARS: usize = 12_000;
+/// The failure text a re-dispatched task receives in its `<fix_request>`.
+const FIX_REQUEST_CHARS: usize = 6_000;
 /// Transient model-call failures a workflow child absorbs per turn before giving up (see
 /// `AgentConfig::max_transient_retries`). Matches the `task` tool's sub-agent policy
 /// (`SUBAGENT_TRANSIENT_RETRIES`) — kept EQUAL on purpose: both are unwatched loops on the same
@@ -78,17 +86,371 @@ pub struct WorkflowTask {
     #[serde(default)]
     pub expected_output: Option<String>,
     /// TOTAL step budget for this child (clamped to the shared `MAX_STEP_BUDGET` cap). Absent →
-    /// the workflow child defaults (`CHILD_MAX_ITERS`/`CHILD_AUTO_EXTEND`).
+    /// the built-in role's own default (argus 15 … daedalus 45), or `CHILD_AUTO_EXTEND` for a
+    /// specialist card.
     #[serde(default)]
     pub max_steps: Option<usize>,
     /// Optional JSON Schema the child's FINAL answer must satisfy — validated (with one repair
     /// attempt), and the outcome status carries `json:ok` / `json:invalid`.
     #[serde(default)]
     pub expects: Option<serde_json::Value>,
+    /// Findings the parent states as established (up to ten short lines) — handed to the child
+    /// in its `<parent_context>` block so it does not re-derive them (see `context_pack`).
+    #[serde(default)]
+    pub context: Option<Vec<String>>,
+    /// Ids of the tasks this one waits for. Tasks without `after` run in the first wave; a
+    /// task runs in the wave after the last of its dependencies and receives their latest
+    /// reports in an `<upstream>` block ahead of its brief (see [`schedule`]). Unknown ids,
+    /// self-references and cycles are refused at validation.
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// One fix loop: when THIS task's report opens with a FAIL verdict, the named task (which
+    /// must be one of its `after`) is re-run once with the failure attached, then this task runs
+    /// again. `verify` (themis) naming `implement` (daedalus) is the canonical pair.
+    #[serde(default)]
+    pub retry_on_fail: Option<String>,
 }
 
 fn default_role() -> String {
     "nemesis".to_string()
+}
+
+/// The TOTAL step budget a workflow child runs under: the spec's `max_steps` (clamped to the
+/// shared cap), else the built-in role's own default — a locate job and an implement job no
+/// longer share one number — else [`CHILD_AUTO_EXTEND`] for a specialist card, which has no
+/// profile to ask.
+fn child_step_total(task: &WorkflowTask, specialist: bool) -> usize {
+    task.max_steps
+        .map(|n| n.clamp(1, crate::agent::task_tool::MAX_STEP_BUDGET))
+        .unwrap_or_else(|| {
+            if specialist {
+                CHILD_AUTO_EXTEND
+            } else {
+                crate::agent::roles::canonical(&task.role)
+                    .map(|p| p.default_max_steps)
+                    .unwrap_or(CHILD_AUTO_EXTEND)
+            }
+        })
+}
+
+/// The endpoint a ROLE task runs on: its own `model` routed through the model-endpoint
+/// registry, else the role's Pantheon pin (`roles.pantheon.<role>`) on top of the workflow's
+/// own (registry-routed) endpoint, else that endpoint unchanged. The same ladder the `task`
+/// tool climbs, so `role: nemesis` reaches the reviewer's model in both.
+fn role_task_endpoint(
+    task: &WorkflowTask,
+    caller: &crate::core::cli_config::ResolvedEndpoint,
+) -> crate::core::cli_config::ResolvedEndpoint {
+    match task.model.as_deref() {
+        Some(m) => crate::core::cli_config::endpoint_for_model(m, caller),
+        None => crate::core::cli_config::pantheon_endpoint(
+            &task.role,
+            &crate::core::cli_config::endpoint_for_model(&caller.model, caller),
+        ),
+    }
+}
+
+/// Kahn layering of the `after` graph: wave 0 = tasks with no dependencies, wave k = tasks whose
+/// dependencies all sit in earlier waves; spec order within a wave. Unknown ids, self-references,
+/// cycles, and a `retry_on_fail` that is not one of the task's own `after` are errors that name
+/// the task.
+pub(crate) fn waves(tasks: &[WorkflowTask]) -> Result<Vec<Vec<usize>>> {
+    let index: std::collections::HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str(), i))
+        .collect();
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        let mut d = Vec::new();
+        for a in &t.after {
+            let a = a.trim();
+            let Some(&j) = index.get(a) else {
+                bail!("task '{}': `after` names unknown task '{a}'", t.id);
+            };
+            if tasks[j].id == t.id {
+                bail!("task '{}': `after` names itself", t.id);
+            }
+            if !d.contains(&j) {
+                d.push(j);
+            }
+        }
+        if let Some(r) = t
+            .retry_on_fail
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !t.after.iter().any(|a| a.trim() == r) {
+                bail!(
+                    "task '{}': `retry_on_fail` must name one of its own `after` tasks (got '{r}')",
+                    t.id
+                );
+            }
+        }
+        deps.push(d);
+    }
+    let mut wave_of: Vec<Option<usize>> = vec![None; tasks.len()];
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let wave: Vec<usize> = (0..tasks.len())
+            .filter(|&i| wave_of[i].is_none() && deps[i].iter().all(|&j| wave_of[j].is_some()))
+            .collect();
+        if wave.is_empty() {
+            break;
+        }
+        let k = out.len();
+        for &i in &wave {
+            wave_of[i] = Some(k);
+        }
+        out.push(wave);
+    }
+    if let Some(i) = wave_of.iter().position(Option::is_none) {
+        bail!("task '{}': `after` forms a cycle", tasks[i].id);
+    }
+    Ok(out)
+}
+
+/// `implement#2` → `implement`: the task a retried outcome belongs to.
+fn base_id(id: &str) -> &str {
+    match id.rsplit_once('#') {
+        Some((base, n)) if !base.is_empty() && n.parse::<usize>().is_ok() => base,
+        _ => id,
+    }
+}
+
+/// Does a report open with a FAIL verdict? Only the first few non-empty lines count — the report
+/// contract says "verdict first" — so a PASS report that mentions a flaky failure further down is
+/// not a FAIL. An errored or cancelled task has no verdict at all.
+pub(crate) fn verdict_failed(o: &TaskOutcome) -> bool {
+    if matches!(o.status.as_str(), "error" | "cancelled") {
+        return false;
+    }
+    o.summary
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(4)
+        .any(|l| {
+            let lower = l.to_ascii_lowercase();
+            let verdict_line = lower.starts_with("verdict")
+                || lower.starts_with("**verdict")
+                || lower.starts_with("- verdict")
+                || lower.starts_with("- **verdict");
+            (verdict_line && lower.contains("fail")) || lower.starts_with("fail")
+        })
+}
+
+fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push_str("\n…[clipped]");
+    t
+}
+
+/// The task as the runner should see it: `after` dependencies' latest reports in an `<upstream>`
+/// block ahead of the brief, and — for a retry — the attempt number on the id so the trace keeps
+/// every attempt apart.
+fn with_upstream(
+    task: &WorkflowTask,
+    results: &[TaskOutcome],
+    latest: &std::collections::HashMap<String, usize>,
+    attempt: Option<usize>,
+) -> WorkflowTask {
+    let mut t = task.clone();
+    if let Some(n) = attempt {
+        t.id = format!("{}#{n}", task.id);
+    }
+    let mut block = String::new();
+    let mut omitted = 0usize;
+    for dep in &task.after {
+        let Some(&idx) = latest.get(dep.trim()) else {
+            continue;
+        };
+        let r = &results[idx];
+        let part = format!(
+            "=== {} (role={}, {}) ===\n{}\n",
+            r.id,
+            r.role,
+            r.status,
+            clip_chars(r.summary.trim(), UPSTREAM_TASK_CHARS)
+        );
+        if block.chars().count() + part.chars().count() > UPSTREAM_TOTAL_CHARS {
+            omitted += 1;
+            continue;
+        }
+        block.push_str(&part);
+    }
+    if block.is_empty() && omitted == 0 {
+        return t;
+    }
+    if omitted > 0 {
+        block.push_str(&format!(
+            "({omitted} upstream report(s) omitted for size)\n"
+        ));
+    }
+    t.prompt = format!(
+        "<upstream>\nReports of the tasks this one waits for:\n{block}</upstream>\n\n{}",
+        task.prompt
+    );
+    t
+}
+
+/// The re-dispatch of a task whose downstream verifier reported FAIL: its normal brief and
+/// upstream, plus the verifier's report in a `<fix_request>`.
+fn with_fix_request(
+    target: &WorkflowTask,
+    failure: &str,
+    attempt: usize,
+    results: &[TaskOutcome],
+    latest: &std::collections::HashMap<String, usize>,
+) -> WorkflowTask {
+    let mut t = with_upstream(target, results, latest, Some(attempt));
+    t.prompt = format!(
+        "{}\n\n<fix_request>\nThe verifier reported FAIL on your change. Fix it in place — do not \
+         start over and do not widen the scope. Its report:\n{}\n</fix_request>",
+        t.prompt,
+        clip_chars(failure.trim(), FIX_REQUEST_CHARS)
+    );
+    t
+}
+
+fn record(
+    results: &mut Vec<TaskOutcome>,
+    latest: &mut std::collections::HashMap<String, usize>,
+    outcome: TaskOutcome,
+) {
+    let base = base_id(&outcome.id).to_string();
+    results.push(outcome);
+    latest.insert(base, results.len() - 1);
+}
+
+/// One fix loop for task `i`: when its latest report opens with a FAIL verdict and it names
+/// `retry_on_fail`, re-run that upstream task with the failure attached, then re-run `i`.
+async fn fix_loop<F, Fut>(
+    tasks: &[WorkflowTask],
+    i: usize,
+    results: &mut Vec<TaskOutcome>,
+    latest: &mut std::collections::HashMap<String, usize>,
+    cancel: &crate::core::cancel::TurnCancel,
+    run: &F,
+) where
+    F: Fn(WorkflowTask) -> Fut,
+    Fut: std::future::Future<Output = TaskOutcome>,
+{
+    let task = &tasks[i];
+    let Some(target) = task
+        .retry_on_fail
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(j) = tasks.iter().position(|t| t.id == target) else {
+        return;
+    };
+    for round in 0..FIX_LOOPS {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let Some(&idx) = latest.get(task.id.as_str()) else {
+            return;
+        };
+        if !verdict_failed(&results[idx]) {
+            return;
+        }
+        let attempt = round + 2;
+        let failure = results[idx].summary.clone();
+        let fixed = run(with_fix_request(
+            &tasks[j], &failure, attempt, results, latest,
+        ))
+        .await;
+        record(results, latest, fixed);
+        if cancel.is_cancelled() {
+            return;
+        }
+        let again = run(with_upstream(task, results, latest, Some(attempt))).await;
+        record(results, latest, again);
+    }
+}
+
+/// Run the tasks wave by wave (see [`waves`]). Within a wave the read-only tasks fan out `width`
+/// at a time and THEN the wave's writer (at most one — [`enforce_singular_writer`]) runs alone, so
+/// a reviewer never reads a tree the implementer is mutating; a spec that wants the review AFTER
+/// the change says so with `after`. A chained task receives its dependencies' latest reports; a
+/// task whose report opens with FAIL and names `retry_on_fail` triggers one fix loop
+/// ([`fix_loop`]). Retries are recorded as `<id>#2` outcomes so the trace keeps both attempts and
+/// downstream tasks see the latest. Tasks never started (cancel) are marked cancelled.
+///
+/// Generic over the runner so the ordering and the fix loop are testable without a model.
+pub(crate) async fn schedule<F, Fut>(
+    tasks: &[WorkflowTask],
+    width: usize,
+    model: &str,
+    cancel: &crate::core::cancel::TurnCancel,
+    run: F,
+) -> Vec<TaskOutcome>
+where
+    F: Fn(WorkflowTask) -> Fut,
+    Fut: std::future::Future<Output = TaskOutcome>,
+{
+    let width = width.max(1);
+    // Validated before we get here; an invalid graph runs flat rather than dropping tasks.
+    let waves = waves(tasks).unwrap_or_else(|_| vec![(0..tasks.len()).collect()]);
+    let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
+    let mut latest: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    'waves: for wave in &waves {
+        let (writers, readers): (Vec<usize>, Vec<usize>) = wave
+            .iter()
+            .copied()
+            .partition(|&i| task_is_writer(&tasks[i].role, tasks[i].agent.as_deref()));
+        for chunk in readers.chunks(width) {
+            if cancel.is_cancelled() {
+                break 'waves;
+            }
+            let futs: Vec<Fut> = chunk
+                .iter()
+                .map(|&i| {
+                    started.insert(i);
+                    run(with_upstream(&tasks[i], &results, &latest, None))
+                })
+                .collect();
+            for o in futures_util::future::join_all(futs).await {
+                record(&mut results, &mut latest, o);
+            }
+            for &i in chunk {
+                fix_loop(tasks, i, &mut results, &mut latest, cancel, &run).await;
+            }
+        }
+        for &i in &writers {
+            if cancel.is_cancelled() {
+                break 'waves;
+            }
+            started.insert(i);
+            let o = run(with_upstream(&tasks[i], &results, &latest, None)).await;
+            record(&mut results, &mut latest, o);
+            fix_loop(tasks, i, &mut results, &mut latest, cancel, &run).await;
+        }
+    }
+    for (i, t) in tasks.iter().enumerate() {
+        if !started.contains(&i) {
+            results.push(TaskOutcome {
+                id: t.id.clone(),
+                role: t.role.clone(),
+                model: model.to_string(),
+                status: "cancelled".into(),
+                summary: "cancelled by user before start".into(),
+                iters: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+            });
+        }
+    }
+    results
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +472,23 @@ pub struct TaskOutcome {
     pub status: String,
     pub summary: String,
     pub iters: usize,
+    /// Model tokens this child spent (input, output), summed from every call's usage; 0 when
+    /// the provider reported none.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// ` · 12.3k→1.2k tok` for a status line, empty when nothing was reported.
+fn tok_suffix(r: &TaskOutcome) -> String {
+    if r.tokens_in > 0 || r.tokens_out > 0 {
+        format!(
+            " · {}→{} tok",
+            crate::agent::orchestration::fmt_tokens(r.tokens_in),
+            crate::agent::orchestration::fmt_tokens(r.tokens_out)
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Run a workflow: fan out the tasks (bounded), then synthesize. Synthesis streams to stdout.
@@ -202,8 +581,13 @@ async fn run_workflow_with_cancel(
 
     for r in &results {
         eprintln!(
-            "  • {} ({}/{}) — {} [{} step(s)]",
-            r.id, r.role, r.model, r.status, r.iters
+            "  • {} ({}/{}) — {} [{} step(s)]{}",
+            r.id,
+            r.role,
+            r.model,
+            r.status,
+            r.iters,
+            tok_suffix(r)
         );
     }
 
@@ -245,7 +629,18 @@ async fn run_workflow_with_cancel(
         .as_ref()
         .and_then(|s| s.prompt.as_deref())
         .unwrap_or(default_instruction);
-    let synth_prompt = build_synthesis_prompt_capped(&spec.name, instruction, &results, None);
+    // The same cap the `workflow` tool applies: two chars per token of the model's window, never
+    // below one summary. The CLI passed `None` here, so a 32-task spec could build a ~128 k-char
+    // synthesis request that the endpoint then refused.
+    let window = crate::ui::context_report::resolve_ctx_window(model).0;
+    let synth_prompt = build_synthesis_prompt_capped(
+        &spec.name,
+        instruction,
+        &results,
+        window
+            .checked_mul(2)
+            .filter(|&chars| chars >= SUMMARY_CHAR_CAP),
+    );
 
     // Optional audit trace of the fan-out (per-task model + outcome + the synthesis model). Written
     // BEFORE synthesis so a synthesis failure still leaves the fan-out record. Best-effort.
@@ -318,22 +713,30 @@ fn validate_spec_ids(spec: &WorkflowSpec) -> Result<()> {
             );
         }
     }
+    // The `after` graph: unknown ids, self-references, cycles, a stray `retry_on_fail`.
+    waves(&spec.tasks).with_context(|| format!("workflow '{}'", spec.name))?;
     Ok(())
 }
 
-/// At most ONE write-capable task per fan-out (capability resolved the same way as `run_one_task`).
-/// Public so the tool path and tests share one source of truth.
+/// At most ONE write-capable task per WAVE (capability resolved the same way as `run_one_task`):
+/// two writers may share a workflow only when `after` orders one behind the other. Public so
+/// the tool path and tests share one source of truth. Also surfaces `after` graph errors.
 pub(crate) fn enforce_singular_writer(spec: &WorkflowSpec) -> Result<()> {
-    let writers = spec
-        .tasks
-        .iter()
-        .filter(|t| task_is_writer(&t.role, t.agent.as_deref()))
-        .count();
-    if writers > 1 {
-        bail!(
-            "at most ONE write-capable task per workflow (a coder/tester role or a write-scoped agent) \
-             — parallel writers race edits; keep the write singular and fan out the reads"
-        );
+    for wave in waves(&spec.tasks)? {
+        let writers: Vec<&str> = wave
+            .iter()
+            .map(|&i| &spec.tasks[i])
+            .filter(|t| task_is_writer(&t.role, t.agent.as_deref()))
+            .map(|t| t.id.as_str())
+            .collect();
+        if writers.len() > 1 {
+            bail!(
+                "at most ONE write-capable task per wave (a coder/tester role or a write-scoped \
+                 agent; here: {}) — parallel writers race edits; order them with `after` so one \
+                 waits for the other, and fan out the reads",
+                writers.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -417,35 +820,9 @@ async fn fan_out_tracked(
     context_window: usize,
 ) -> Vec<TaskOutcome> {
     let width = max_parallel.clamp(1, crate::agent::task_tool::max_parallel_subagents_pub());
-    let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
-    for chunk in tasks.chunks(width) {
-        if cancel.is_cancelled() {
-            // Skip not-yet-started tasks; mark them cancelled so the parent doesn't synthesize junk.
-            for t in chunk {
-                results.push(TaskOutcome {
-                    id: t.id.clone(),
-                    role: t.role.clone(),
-                    model: model.to_string(),
-                    status: "cancelled".into(),
-                    summary: "cancelled by user before start".into(),
-                    iters: 0,
-                });
-            }
-            // Also mark any remaining tasks past this chunk.
-            let done = results.len();
-            for t in tasks.iter().skip(done) {
-                results.push(TaskOutcome {
-                    id: t.id.clone(),
-                    role: t.role.clone(),
-                    model: model.to_string(),
-                    status: "cancelled".into(),
-                    summary: "cancelled by user before start".into(),
-                    iters: 0,
-                });
-            }
-            break;
-        }
-        let futs = chunk.iter().map(|t| {
+    schedule(tasks, width, model, &cancel, |t: WorkflowTask| {
+        let cancel = cancel.clone();
+        async move {
             run_one_task(
                 http,
                 base_url,
@@ -454,15 +831,15 @@ async fn fan_out_tracked(
                 approval_mode,
                 root,
                 date,
-                t,
+                &t,
                 parent,
-                cancel.clone(),
+                cancel,
                 context_window,
             )
-        });
-        results.extend(futures_util::future::join_all(futs).await);
-    }
-    results
+            .await
+        }
+    })
+    .await
 }
 
 /// [`run_workflow`]'s COLLECTING sibling for the in-conversation `workflow` tool: same validation
@@ -547,8 +924,13 @@ pub(crate) async fn run_workflow_collect(
     let mut out = format!("[workflow: {}, {} task(s)]\n", spec.name, results.len());
     for r in &results {
         out.push_str(&format!(
-            "  • {} ({}/{}) — {} [{} step(s)]\n",
-            r.id, r.role, r.model, r.status, r.iters
+            "  • {} ({}/{}) — {} [{} step(s)]{}\n",
+            r.id,
+            r.role,
+            r.model,
+            r.status,
+            r.iters,
+            tok_suffix(r)
         ));
     }
     if !synthesize {
@@ -672,7 +1054,7 @@ where
 /// Run one task as a role-scoped sub-agent (silent; non-streaming). Errors are captured into the
 /// outcome (a failed task never aborts the workflow — its siblings + the synthesis still run).
 #[allow(clippy::too_many_arguments)]
-async fn run_one_task(
+pub(crate) async fn run_one_task(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
@@ -694,6 +1076,8 @@ async fn run_one_task(
             status: "cancelled".into(),
             summary: "cancelled by user before start".into(),
             iters: 0,
+            tokens_in: 0,
+            tokens_out: 0,
         };
     }
     // A resolvable `agent` slug supersedes `role` (the specialist/fusion path), mirroring the `task`
@@ -716,6 +1100,8 @@ async fn run_one_task(
             status: "error".into(),
             summary: crate::agent::task_tool::unknown_agent_error(slug),
             iters: 0,
+            tokens_in: 0,
+            tokens_out: 0,
         };
     }
     // Model precedence: per-task `model` > the specialist's `def.model` > the workflow default.
@@ -729,18 +1115,16 @@ async fn run_one_task(
     };
     // The SAME dispatch contract a `task` call carries (boundaries / expected_output / step
     // budget), built from the task's own fields. `max_steps` is clamped to the shared cap;
-    // absent, the contract states the child's real total (`CHILD_AUTO_EXTEND`) so the prompt
-    // never promises a budget the loop won't honor.
+    // absent, the contract states the child's real total (the role's own default, or
+    // `CHILD_AUTO_EXTEND` for a specialist) so the prompt never promises a budget the loop
+    // won't honor.
     let contract = crate::agent::task_tool::TaskContract {
         boundaries: task.boundaries.clone().filter(|s| !s.trim().is_empty()),
         expected_output: task
             .expected_output
             .clone()
             .filter(|s| !s.trim().is_empty()),
-        max_steps: task
-            .max_steps
-            .map(|n| n.clamp(1, crate::agent::task_tool::MAX_STEP_BUDGET))
-            .unwrap_or(CHILD_AUTO_EXTEND),
+        max_steps: child_step_total(task, spec.is_some()),
     };
     let expects = task.expects.as_ref().filter(|v| v.is_object());
     let (label, ep, registry, mut system) = match &spec {
@@ -765,8 +1149,7 @@ async fn run_one_task(
             (def.slug(), ep, registry, system)
         }
         None => {
-            let m = task.model.as_deref().unwrap_or(model);
-            let ep = crate::core::cli_config::endpoint_for_model(m, &caller);
+            let ep = role_task_endpoint(task, &caller);
             let registry = role_registry(&task.role, root);
             let system = build_subagent_prompt(
                 &task.role,
@@ -795,11 +1178,18 @@ async fn run_one_task(
     // The `expects` repair call must hit the same endpoint this child ran on (not the workflow's).
     let base_url_repair = ep.base_url.clone();
     let key_repair = ep.api_key.clone();
+    // Per-child token tally, summed from every call's usage into the outcome and the board row.
+    let tally = std::sync::Arc::new((
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ));
+    let tally_out = tally.clone();
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
         let client = client.clone();
         let base = base.clone();
         let key = key.clone();
         let model = model_s.clone();
+        let tally = tally.clone();
         async move {
             // Same wall-clock deadline as a `task` child (see
             // `task_tool::SUBAGENT_CALL_TIMEOUT`): none of this child's budgets count TIME, so a
@@ -814,7 +1204,20 @@ async fn run_one_task(
             )
             .await
             {
-                Ok(result) => result,
+                Ok(result) => {
+                    if let Ok(turn) = &result {
+                        if let Some(u) = &turn.usage {
+                            tally
+                                .0
+                                .fetch_add(u.input_total(), std::sync::atomic::Ordering::Relaxed);
+                            tally.1.fetch_add(
+                                u.completion_tokens.unwrap_or(0),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    result
+                }
                 Err(_) => Err(anyhow!(
                     "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
                      raise the limit)",
@@ -832,28 +1235,35 @@ async fn run_one_task(
     // siblings and the pending synthesis carry on. Esc still stops everything: cancellation flows down
     // from the turn token this was derived from (see `TurnCancel::child`). Armed on the board below.
     let own_cancel = cancel.child();
-    let cfg = AgentConfig {
+    // The parent's scope: the child's is derived UNDER it (so the workspace writer lease sees
+    // the child as the parent's descendant, not a sibling), and the context pack and the
+    // blackboard are the parent conversation's.
+    let parent_scope = crate::core::exec_ctx::current()
+        .unwrap_or_default()
+        .resource_scope();
+    let mut cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
         // Inherit the parent conversation identity but isolate each child's stateful resources and
         // keep tool-body heartbeats off the parent transcript. The workflow board owns progress.
         exec_ctx: crate::core::exec_ctx::current()
             .unwrap_or_default()
-            .with_resource_scope(format!("workflow/{}/{}", parent.unwrap_or(0), task.id))
-            .with_trace_visible(false),
+            .with_resource_scope(format!(
+                "{parent_scope}/workflow/{}/{}",
+                parent.unwrap_or(0),
+                task.id
+            ))
+            .with_trace_visible(false)
+            .with_dispatch_label(Some(format!("{label} · {}", task.id))),
         quiet: true,
-        enable_verify_gate: false,
-        // One soft extension reaches the child's total cap; no second continuation layer. A
-        // per-task `max_steps` (clamped into `contract.max_steps` above) replaces the defaults
-        // with the same start-narrow-then-extend split the `task` tool uses.
-        max_iters: match task.max_steps {
-            Some(_) => contract.max_steps.div_ceil(2).max(1),
-            None => CHILD_MAX_ITERS,
-        },
-        auto_extend_to: match task.max_steps {
-            Some(_) => contract.max_steps,
-            None => CHILD_AUTO_EXTEND,
-        },
+        // A writer runs alone in its wave (see `schedule`), so its verify gate never contends
+        // with siblings for the build lock; a read-only child has nothing to verify.
+        enable_verify_gate: is_writer,
+        // One soft extension reaches the child's total cap (`contract.max_steps`: the spec's
+        // `max_steps`, else the role's own default); no second continuation layer. Same
+        // start-narrow-then-extend split the `task` tool uses.
+        max_iters: contract.max_steps.div_ceil(2).max(1),
+        auto_extend_to: contract.max_steps,
         auto_checkpoint: is_writer,
         checkpoint_each_edit: false,
         todo_reminder_every: 0,
@@ -912,6 +1322,8 @@ async fn run_one_task(
         },
     );
     child_track.arm_stop(own_cancel);
+    let child_id = child_track.id();
+    cfg.step_note = Some((child_id, crate::agent::orchestration::note_step));
     if subject.is_empty() {
         wf_trace(&format!("⋯ {} ({label}) running…", task.id));
     } else {
@@ -921,11 +1333,20 @@ async fn run_one_task(
     // Drive the loop over a LOCAL transcript (what `run_agent` did internally) so both exits
     // below can hand synthesis a deterministic partial report instead of "(no final answer)" —
     // a child that hit its deadline after twenty tool turns still reports which files it touched.
+    // What the parent already knows, ahead of the brief — the same pack a `task` dispatch gets.
+    let pack = crate::agent::context_pack::gather(
+        root,
+        &parent_scope,
+        task.context.as_deref().unwrap_or(&[]),
+    );
     let mut msgs = vec![
         Message::system(system.as_str()),
-        Message::user(task.prompt.as_str()),
+        Message::user(crate::agent::context_pack::prepend(
+            pack.as_deref(),
+            &task.prompt,
+        )),
     ];
-    match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
+    let mut outcome = match run_agent_loop(chat, &cfg, &registry, &mut msgs).await {
         Ok(o) => {
             let status = match o.stop {
                 StopReason::Done => "done",
@@ -1001,6 +1422,8 @@ async fn run_one_task(
                 status,
                 summary,
                 iters: o.iters,
+                tokens_in: 0,
+                tokens_out: 0,
             }
         }
         Err(e) => {
@@ -1016,9 +1439,18 @@ async fn run_one_task(
                     crate::agent::task_tool::partial_report_from_messages(&msgs)
                 ),
                 iters: 0,
+                tokens_in: 0,
+                tokens_out: 0,
             }
         }
-    }
+    };
+    outcome.tokens_in = tally_out.0.load(std::sync::atomic::Ordering::Relaxed);
+    outcome.tokens_out = tally_out.1.load(std::sync::atomic::Ordering::Relaxed);
+    crate::agent::orchestration::add_usage(child_id, outcome.tokens_in, outcome.tokens_out);
+    // File the whole report on the sibling blackboard: a later wave can `file_read` all of
+    // it, not only the part the `<upstream>` block forwards.
+    crate::agent::blackboard::note(&parent_scope, &outcome.id, &outcome.summary);
+    outcome
 }
 
 /// Emit the workflow header line (the fan-out banner) into the sticky-TUI transcript — a moonlight
@@ -1075,6 +1507,8 @@ fn write_trace(path: &Path, name: &str, results: &[TaskOutcome], synth_model: &s
                 "model": r.model,
                 "status": r.status,
                 "iters": r.iters,
+                "tokens_in": r.tokens_in,
+                "tokens_out": r.tokens_out,
                 "summary": r.summary,
             })
         })
@@ -1165,6 +1599,330 @@ fn truncate_summary(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chained(id: &str, role: &str, after: &[&str], retry: Option<&str>) -> WorkflowTask {
+        WorkflowTask {
+            id: id.into(),
+            role: role.into(),
+            prompt: format!("do {id}"),
+            after: after.iter().map(|s| s.to_string()).collect(),
+            retry_on_fail: retry.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn waves_layer_by_after_and_refuse_bad_graphs() {
+        let tasks = vec![
+            chained("a", "argus", &[], None),
+            chained("b", "nemesis", &["a"], None),
+            chained("c", "clio", &[], None),
+            chained("d", "metis", &["b", "c"], None),
+        ];
+        assert_eq!(waves(&tasks).unwrap(), vec![vec![0, 2], vec![1], vec![3]]);
+        let err = |tasks: Vec<WorkflowTask>| waves(&tasks).unwrap_err().to_string();
+        assert!(err(vec![chained("a", "argus", &["zzz"], None)]).contains("unknown task 'zzz'"));
+        assert!(err(vec![
+            chained("a", "argus", &["b"], None),
+            chained("b", "argus", &["a"], None)
+        ])
+        .contains("cycle"));
+        assert!(err(vec![chained("a", "argus", &["a"], None)]).contains("itself"));
+        assert!(err(vec![
+            chained("a", "daedalus", &[], None),
+            chained("v", "themis", &[], Some("a"))
+        ])
+        .contains("retry_on_fail"));
+    }
+
+    #[test]
+    fn singular_writer_is_per_wave_so_after_orders_two_writers() {
+        let spec = |tasks| WorkflowSpec {
+            name: "w".into(),
+            tasks,
+            synthesis: None,
+        };
+        let err = enforce_singular_writer(&spec(vec![
+            chained("i", "daedalus", &[], None),
+            chained("v", "themis", &[], None),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("write-capable") && err.contains("after"),
+            "{err}"
+        );
+        enforce_singular_writer(&spec(vec![
+            chained("i", "daedalus", &[], None),
+            chained("v", "themis", &["i"], Some("i")),
+            chained("r", "nemesis", &["v"], None),
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn verdict_failed_reads_the_opening_lines_only() {
+        let o = |status: &str, summary: &str| TaskOutcome {
+            id: "v".into(),
+            role: "themis".into(),
+            model: "m".into(),
+            status: status.into(),
+            summary: summary.into(),
+            iters: 1,
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        assert!(verdict_failed(&o("done", "VERDICT: FAIL\n2 tests failed")));
+        assert!(verdict_failed(&o(
+            "done",
+            "## Report\n- Verdict — FAIL (3/40)"
+        )));
+        assert!(verdict_failed(&o("done", "FAIL: cargo test exit 101")));
+        assert!(!verdict_failed(&o(
+            "done",
+            "VERDICT: PASS\nall green; one flaky test failed once then passed"
+        )));
+        assert!(!verdict_failed(&o(
+            "done",
+            "Verdict: INCONCLUSIVE — no toolchain"
+        )));
+        assert!(
+            !verdict_failed(&o("error", "VERDICT: FAIL")),
+            "an errored task has no verdict"
+        );
+        assert!(
+            !verdict_failed(&o("done", "l1\nl2\nl3\nl4\nverdict: fail")),
+            "past the opening lines"
+        );
+        assert_eq!(base_id("implement#2"), "implement");
+        assert_eq!(base_id("c#hash"), "c#hash");
+        assert_eq!(base_id("plain"), "plain");
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_waves_in_order_and_fix_loops_once() {
+        use std::sync::{Arc, Mutex};
+        let tasks = vec![
+            chained("implement", "daedalus", &[], None),
+            chained("verify", "themis", &["implement"], Some("implement")),
+            chained("review", "nemesis", &["verify"], None),
+            chained("scout", "argus", &[], None),
+        ];
+        let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let verify_calls = Arc::new(Mutex::new(0usize));
+        let run = |task: WorkflowTask| {
+            let log = log.clone();
+            let verify_calls = verify_calls.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push((task.id.clone(), task.prompt.clone()));
+                let summary = if task.id.starts_with("verify") {
+                    let mut n = verify_calls.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        "VERDICT: FAIL\nassertion failed at src/a.rs:7".to_string()
+                    } else {
+                        "VERDICT: PASS\n40 passed".to_string()
+                    }
+                } else {
+                    format!("{} done", task.id)
+                };
+                TaskOutcome {
+                    id: task.id,
+                    role: task.role,
+                    model: "m".into(),
+                    status: "done".into(),
+                    summary,
+                    iters: 1,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                }
+            }
+        };
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let results = schedule(&tasks, 4, "m", &cancel, run).await;
+        let order: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        // Wave 0: the reader (scout) fans out first, then the writer (implement) alone. Wave 1:
+        // verify FAILs → implement#2 with the failure, verify#2 → PASS. Wave 2: review.
+        assert_eq!(
+            order,
+            [
+                "scout",
+                "implement",
+                "verify",
+                "implement#2",
+                "verify#2",
+                "review"
+            ]
+        );
+        let prompts = log.lock().unwrap();
+        let prompt_of = |id: &str| {
+            prompts
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, p)| p.clone())
+                .unwrap()
+        };
+        let fix = prompt_of("implement#2");
+        assert!(
+            fix.contains("<fix_request>") && fix.contains("assertion failed at src/a.rs:7"),
+            "{fix}"
+        );
+        assert!(
+            prompt_of("verify#2").contains("=== implement#2 (role=daedalus, done) ==="),
+            "the re-run sees the fixed attempt"
+        );
+        let review = prompt_of("review");
+        assert!(
+            review.contains("=== verify#2 (role=themis, done) ===")
+                && review.contains("VERDICT: PASS"),
+            "{review}"
+        );
+        assert!(
+            !prompt_of("implement").contains("<upstream>"),
+            "a first-wave task has no upstream"
+        );
+        assert_eq!(results.len(), 6, "both attempts stay in the trace");
+        assert!(results.iter().all(|r| r.status == "done"));
+    }
+
+    #[tokio::test]
+    async fn schedule_does_not_loop_on_a_second_fail_and_caps_upstream() {
+        use std::sync::{Arc, Mutex};
+        let tasks = vec![
+            chained("implement", "daedalus", &[], None),
+            chained("verify", "themis", &["implement"], Some("implement")),
+        ];
+        let calls = Arc::new(Mutex::new(0usize));
+        let run = |task: WorkflowTask| {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                let summary = if task.id.starts_with("verify") {
+                    "VERDICT: FAIL\nstill broken".to_string()
+                } else {
+                    "x".repeat(UPSTREAM_TASK_CHARS + 500)
+                };
+                TaskOutcome {
+                    id: task.id,
+                    role: task.role,
+                    model: "m".into(),
+                    status: "done".into(),
+                    summary,
+                    iters: 1,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                }
+            }
+        };
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let results = schedule(&tasks, 2, "m", &cancel, run).await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            4,
+            "implement, verify, implement#2, verify#2 — then stop"
+        );
+        assert_eq!(results.len(), 4);
+        assert!(
+            verdict_failed(results.last().unwrap()),
+            "the second FAIL is reported as is"
+        );
+        // The upstream block clips a long report rather than forwarding it whole.
+        let latest = std::collections::HashMap::from([("implement".to_string(), 0usize)]);
+        let v = with_upstream(&tasks[1], &results, &latest, None);
+        assert!(v.prompt.contains("…[clipped]"), "{}", v.prompt.len());
+        assert!(v.prompt.chars().count() < UPSTREAM_TASK_CHARS + 400);
+    }
+
+    #[test]
+    fn child_budget_is_the_role_default_unless_the_spec_says() {
+        let t = |role: &str, max_steps: Option<usize>| WorkflowTask {
+            id: "t".into(),
+            role: role.into(),
+            prompt: "x".into(),
+            max_steps,
+            ..Default::default()
+        };
+        assert_eq!(child_step_total(&t("argus", None), false), 15);
+        assert_eq!(child_step_total(&t("nemesis", None), false), 25);
+        assert_eq!(child_step_total(&t("coder", None), false), 45, "alias");
+        assert_eq!(
+            child_step_total(&t("nemesis", Some(999)), false),
+            crate::agent::task_tool::MAX_STEP_BUDGET
+        );
+        assert_eq!(child_step_total(&t("nemesis", Some(7)), false), 7);
+        // A specialist card has no profile: the flat child ceiling. So does an unknown role
+        // (refused before it runs, but the resolver stays total).
+        assert_eq!(
+            child_step_total(&t("nemesis", None), true),
+            CHILD_AUTO_EXTEND
+        );
+        assert_eq!(
+            child_step_total(&t("weird", None), false),
+            CHILD_AUTO_EXTEND
+        );
+    }
+
+    #[test]
+    fn role_tasks_reach_their_pantheon_model_in_one_workflow() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aizen-wf-pantheon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AIZEN_HOME", &dir);
+        let mut pantheon = std::collections::BTreeMap::new();
+        pantheon.insert(
+            "nemesis".to_string(),
+            crate::core::cli_config::RoleModelConfig {
+                model: Some("strong-model".into()),
+                ..Default::default()
+            },
+        );
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            roles: Some(crate::core::cli_config::RolesConfig {
+                pantheon: Some(pantheon),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let caller = crate::core::cli_config::ResolvedEndpoint {
+            base_url: "https://wf/v1".into(),
+            api_key: "wk".into(),
+            model: "wf-model".into(),
+        };
+        let t = |role: &str, model: Option<&str>| WorkflowTask {
+            id: role.into(),
+            role: role.into(),
+            prompt: "x".into(),
+            model: model.map(str::to_string),
+            ..Default::default()
+        };
+        // The pinned reviewer and the unpinned searcher run on different models in one spec.
+        let rev = role_task_endpoint(&t("nemesis", None), &caller);
+        assert_eq!(
+            (rev.model.as_str(), rev.base_url.as_str()),
+            ("strong-model", "https://wf/v1")
+        );
+        assert_eq!(
+            role_task_endpoint(&t("argus", None), &caller).model,
+            "wf-model"
+        );
+        assert_eq!(
+            role_task_endpoint(&t("nemesis", Some("per-task")), &caller).model,
+            "per-task",
+            "the spec's own model beats the pin"
+        );
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn progress_trace_helpers_are_noop_off_tui() {
@@ -1267,6 +2025,8 @@ mod tests {
                 status: "done".into(),
                 summary: "found a null deref".into(),
                 iters: 3,
+                tokens_in: 0,
+                tokens_out: 0,
             },
             TaskOutcome {
                 id: "perf".into(),
@@ -1275,6 +2035,8 @@ mod tests {
                 status: "done".into(),
                 summary: "n+1 query".into(),
                 iters: 2,
+                tokens_in: 0,
+                tokens_out: 0,
             },
         ];
         let p = build_synthesis_prompt("review", "merge", &results);
@@ -1295,6 +2057,8 @@ mod tests {
             status: "done".into(),
             summary: long,
             iters: 1,
+            tokens_in: 0,
+            tokens_out: 0,
         }];
         let p = build_synthesis_prompt("w", "merge", &results);
         assert!(p.contains("[truncated:"), "must mark truncation: {p}");
@@ -1506,6 +2270,8 @@ mod tests {
             status: "done".into(),
             summary: summary.into(),
             iters: 1,
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 

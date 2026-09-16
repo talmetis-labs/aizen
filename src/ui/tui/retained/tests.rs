@@ -3,6 +3,44 @@
 
 use super::*;
 
+/// The two tests below read and write the process-wide transcript geometry slot (one through a
+/// paint, one directly). Run in parallel they see each other's numbers; the lock keeps them
+/// honest without changing what they assert.
+static GEOM_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The thread currently holding [`GEOM_SLOT_TEST_LOCK`], so a re-acquire on that thread is a no-op.
+static GEOM_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+/// Serialises every test that paints a frame or touches the transcript geometry slot (a
+/// process-wide static): a painter on another thread would otherwise overwrite the slot between a
+/// test's draw and its read — which is how two tests holding the lock still failed together while
+/// four unlocked painters ran beside them. Re-entrant per thread, so a test may hold it across
+/// several paints and `painted_rows` can take it unconditionally.
+struct GeomLock(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl GeomLock {
+    fn acquire() -> Self {
+        let me = std::thread::current().id();
+        let owner = || *GEOM_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        if owner() == Some(me) {
+            return GeomLock(None);
+        }
+        let guard = GEOM_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *GEOM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(me);
+        GeomLock(Some(guard))
+    }
+}
+
+impl Drop for GeomLock {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            *GEOM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+
 #[test]
 fn overlay_menu_hit_maps_rows_scroll_and_dead_zones() {
     let g = OverlayMenuGeom {
@@ -641,6 +679,162 @@ fn ultimate_recolours_the_input_box_to_gold() {
 }
 
 #[test]
+fn the_row_cache_is_an_lru_not_a_flush() {
+    let mut cache = RenderCache::default();
+    let block = |id: u64| UiBlock {
+        id,
+        kind: BlockKind::Generic,
+        payload: Payload::Text(format!("row {id}")),
+        complete: true,
+    };
+    let hot = block(0);
+    for id in 1..(CACHE_LIMIT as u64 + 64) {
+        let _ = cache.get_or_render(&block(id), 40);
+        if id % 32 == 0 {
+            let _ = cache.get_or_render(&hot, 40);
+        }
+    }
+    assert!(cache.rows.len() <= CACHE_LIMIT, "{}", cache.rows.len());
+    let hits = cache.hits;
+    let _ = cache.get_or_render(&hot, 40);
+    assert_eq!(
+        cache.hits,
+        hits + 1,
+        "the block touched all along survives eviction"
+    );
+    let misses = cache.misses;
+    let _ = cache.get_or_render(&block(1), 40);
+    assert_eq!(cache.misses, misses + 1, "the coldest block was evicted");
+    // Heights outlive row eviction: placing the viewport never needs a render.
+    assert_eq!(cache.height(&block(2), 40), 1);
+    assert_eq!(cache.misses, misses + 1);
+    cache.forget_before(500);
+    assert!(cache.heights.keys().all(|k| k.id >= 500));
+}
+
+#[test]
+fn a_frame_renders_the_viewport_not_the_session() {
+    let _geom = GeomLock::acquire();
+    let mut state = AppState::new("intro", "status");
+    for i in 0..2_000 {
+        state.push_text(BlockKind::Generic, format!("line-{i}"), true);
+    }
+    let _ = painted_rows(&mut state, 80, 24);
+    let after_first = state.cache.misses;
+    assert!(
+        after_first >= 2_000,
+        "every block is measured once: {after_first}"
+    );
+    let _ = painted_rows(&mut state, 80, 24);
+    assert_eq!(
+        state.cache.misses, after_first,
+        "a second frame at the tail renders nothing new"
+    );
+    state.scroll_from_tail = 1_000;
+    let _ = painted_rows(&mut state, 80, 24);
+    let window = 24 + 2 * (24 + paint::RENDER_MARGIN_ROWS) + 4;
+    let rendered = (state.cache.misses - after_first) as usize;
+    assert!(
+        rendered <= window,
+        "a scroll renders only the new window: {rendered} blocks (cap {window})"
+    );
+    assert!(state.cache.rows.len() <= CACHE_LIMIT);
+    let g = transcript_geom_slot().lock().unwrap();
+    assert!(
+        g.rows_offset > 0 && g.rows_offset <= g.start,
+        "{} / {}",
+        g.rows_offset,
+        g.start
+    );
+    assert!(g.plain_rows.len() <= window);
+}
+
+#[test]
+fn a_selection_is_rebased_onto_the_rendered_window() {
+    let sel = |a: usize, b: usize| SelectionRange {
+        anchor_line: a,
+        anchor_col: 2,
+        cursor_line: b,
+        cursor_col: 5,
+    };
+    // Entirely inside: shifted by the offset.
+    let s = shift_selection(sel(110, 112), 100, 50).unwrap();
+    assert_eq!(
+        (s.anchor_line, s.anchor_col, s.cursor_line, s.cursor_col),
+        (10, 2, 12, 5)
+    );
+    // Starting above the window: clamped to its first row.
+    let s = shift_selection(sel(90, 105), 100, 50).unwrap();
+    assert_eq!((s.anchor_line, s.anchor_col), (0, 0));
+    assert_eq!((s.cursor_line, s.cursor_col), (5, 5));
+    // Ending below it: clamped to its last row, whole row.
+    let s = shift_selection(sel(140, 900), 100, 50).unwrap();
+    assert_eq!((s.cursor_line, s.cursor_col), (49, usize::MAX));
+    // Outside on either side, or an empty window: nothing to highlight.
+    assert!(shift_selection(sel(10, 20), 100, 50).is_none());
+    assert!(shift_selection(sel(200, 210), 100, 50).is_none());
+    assert!(shift_selection(sel(110, 112), 100, 0).is_none());
+    // Reversed anchors are ordered first.
+    let s = shift_selection(sel(112, 110), 100, 50).unwrap();
+    assert!(s.anchor_line <= s.cursor_line);
+}
+
+#[test]
+fn a_failed_tool_row_shows_its_tail_and_a_hint() {
+    let mut ev = ToolEvent {
+        seq: 5,
+        icon: "⚙".into(),
+        name: "shell_run".into(),
+        target: "cargo test".into(),
+        digest: "exit 101".into(),
+        state: ToolState::Err,
+        elapsed_ms: Some(900),
+        body: (1..=9)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let rows = render_tool_row(&ev, 80);
+    let plain = console::strip_ansi_codes(&rows).to_string();
+    assert!(
+        plain.contains("│ line 9") && plain.contains("│ line 4"),
+        "{plain}"
+    );
+    assert!(
+        !plain.contains("│ line 3"),
+        "only the last {AUTO_EXPAND_LINES} lines: {plain}"
+    );
+    assert!(
+        plain.contains("… 3 more line(s) — Ctrl-E expands"),
+        "{plain}"
+    );
+    ev.state = ToolState::Ok;
+    let ok = console::strip_ansi_codes(&render_tool_row(&ev, 80)).to_string();
+    assert!(
+        !ok.contains("│ line"),
+        "a successful call stays two rows: {ok}"
+    );
+    ev.state = ToolState::Err;
+    ev.body.clear();
+    let bare = console::strip_ansi_codes(&render_tool_row(&ev, 80)).to_string();
+    assert_eq!(bare.lines().count(), 2, "no body, no tail: {bare}");
+}
+
+#[test]
+fn tool_seq_is_found_by_transcript_row_through_the_window() {
+    let _geom = GeomLock::acquire();
+    {
+        let mut g = geom::transcript_geom_slot().lock().unwrap();
+        g.rows_offset = 100;
+        g.row_tool_seq = vec![None, Some(7), Some(7), None];
+    }
+    assert_eq!(geom::tool_seq_at_row(101), Some(7));
+    assert_eq!(geom::tool_seq_at_row(103), None);
+    assert_eq!(geom::tool_seq_at_row(50), None, "above the window");
+    assert_eq!(geom::tool_seq_at_row(900), None, "past the window");
+}
+
+#[test]
 fn pruning_keeps_whole_blocks() {
     let mut state = AppState::new("intro", "status");
     for i in 0..BLOCK_LIMIT + 20 {
@@ -817,6 +1011,7 @@ fn tool_row_puts_digest_and_time_on_the_line_below() {
         digest: "142 lines".into(),
         state: ToolState::Ok,
         elapsed_ms: Some(1200),
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     let lines: Vec<&str> = row.split('\n').collect();
@@ -841,6 +1036,7 @@ fn tool_row_shows_ms_for_subsecond_runs() {
         digest: "3 match(es)".into(),
         state: ToolState::Ok,
         elapsed_ms: Some(940),
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     assert!(
@@ -860,6 +1056,7 @@ fn tool_row_omits_time_when_unknown() {
         digest: "10 lines".into(),
         state: ToolState::Ok,
         elapsed_ms: None,
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     assert!(row.ends_with("└ 10 lines"), "no time appended: {row:?}");
@@ -877,6 +1074,7 @@ fn tool_row_omits_result_line_when_no_digest() {
         digest: String::new(),
         state: ToolState::Running,
         elapsed_ms: None,
+        body: String::new(),
     };
     let row = plain(&render_tool_row(&ev, 60));
     assert_eq!(row, "⚙ shell_run   cargo check");
@@ -999,6 +1197,7 @@ fn tool_event_updates_the_same_line_by_seq() {
             digest: String::new(),
             state: ToolState::Running,
             elapsed_ms: None,
+            body: String::new(),
         }),
     );
     assert_eq!(
@@ -1019,6 +1218,7 @@ fn tool_event_updates_the_same_line_by_seq() {
             digest: "10 lines".into(),
             state: ToolState::Ok,
             elapsed_ms: Some(42),
+            body: String::new(),
         }),
     );
     let tools: Vec<&UiBlock> = state
@@ -1194,6 +1394,7 @@ fn verify_line_reads_green_success() {
 /// only end-to-end check there is that the footer's height, its rules and its text rows agree — the
 /// layout arithmetic being right is no use if the widgets are handed the wrong rects.
 fn painted_rows(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
+    let _geom = GeomLock::acquire(); // painting writes the geometry slot
     let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
     term.draw(|f| draw(f, state)).unwrap();
     let buf = term.backend().buffer().clone();

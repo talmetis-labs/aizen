@@ -30,7 +30,6 @@ pub enum SlashId {
     Help,
     Init,
     Where,
-    Handoff,
     Goal,
     Model,
     Provider,
@@ -171,17 +170,6 @@ pub const BUILTINS: &[Builtin] = &[
         description: "show project root, zone slug, git, and data locations",
         argument_hint: "",
         help: "show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)",
-        stdin: Stdin::Never,
-    },
-    Builtin {
-        id: SlashId::Handoff,
-        name: "handoff",
-        aliases: &[],
-        hidden_aliases: &[],
-        hidden: false,
-        description: "start a fresh thread carrying only what matters",
-        argument_hint: "<goal>",
-        help: "",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -385,7 +373,7 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "reopen the last conversation with its context",
         argument_hint: "[name]",
-        help: "reopen the last conversation FROM THIS PROJECT (or a named one); /handoff <goal> starts a fresh thread carrying only what that goal needs",
+        help: "reopen the last conversation FROM THIS PROJECT (or a named one)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -514,9 +502,9 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[],
         hidden_aliases: &[],
         hidden: false,
-        description: "set the approval level",
-        argument_hint: "[ask|smart|yolo]",
-        help: "approval level — ask every time, auto-run read-only, or pre-authorize",
+        description: "set the approval level (this window; --persist to save)",
+        argument_hint: "[ask|smart|yolo] [--persist]",
+        help: "approval level — ask every time, auto-run read-only, or pre-authorize; this window only unless --persist",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -621,7 +609,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         id: SlashId::Undo,
         name: "undo",
-        aliases: &[],
+        aliases: &[("rewind", "alias for /undo")],
         hidden_aliases: &[],
         hidden: false,
         description: "rewind to the previous checkpoint",
@@ -1035,7 +1023,6 @@ mod tests {
         let names: std::collections::HashSet<String> = list().into_iter().map(|c| c.name).collect();
         for name in [
             "init",
-            "handoff",
             "goal",
             "lsp",
             "reach",
@@ -1328,10 +1315,6 @@ mod tests {
             cmd("/goal làm cho xong bản release rồi báo tôi"),
             ("goal".into(), "làm cho xong bản release rồi báo tôi".into())
         );
-        assert!(matches!(
-            classify("/handoff finish the retry work"),
-            Verdict::Command { .. }
-        ));
         assert!(matches!(
             classify("/memory what did I say about MCP"),
             Verdict::Command { .. }

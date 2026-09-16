@@ -373,8 +373,33 @@ pub fn record_episode(persona_slug: &str, body: &str, importance: u8) -> Result<
     Ok(Some(id))
 }
 
-/// Persist a reflected insight (the durable character layer). Prunes insights to their cap.
+/// Content-token Jaccard at or above which two insights are the same lesson. The same bar the
+/// episode path already uses against insights ("evolution already distilled it").
+const INSIGHT_DUP_JACCARD: f64 = 0.75;
+
+/// The id of a live insight that already says what `body` says — the same text after whitespace
+/// and case folding, or content-token Jaccard at or above [`INSIGHT_DUP_JACCARD`].
+fn duplicate_insight(persona_slug: &str, body: &str) -> Option<String> {
+    let cand = content_tokens(body);
+    let norm = normalize(body);
+    list(persona_slug)
+        .into_iter()
+        .filter(|m| m.kind == Kind::Insight)
+        .find(|m| {
+            normalize(&m.body) == norm
+                || jaccard(&cand, &content_tokens(&m.body)) >= INSIGHT_DUP_JACCARD
+        })
+        .map(|m| m.id)
+}
+
+/// Persist a reflected insight (the durable character layer). A near-duplicate of an insight
+/// already on disk is NOT written again — its id comes back instead, so the caller wires its
+/// co-fire edges to the existing lesson (quality plan M8: three copies of one insight re-spent
+/// the `<self>` budget three times). Prunes insights to their cap.
 pub fn save_insight(persona_slug: &str, body: &str, importance: u8) -> Result<String> {
+    if let Some(existing) = duplicate_insight(persona_slug, body) {
+        return Ok(existing);
+    }
     let id = write(persona_slug, Kind::Insight, importance.max(5), body)?;
     prune(persona_slug);
     Ok(id)
@@ -976,6 +1001,28 @@ pub fn reset(persona_slug: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_insight_is_not_written_twice() {
+        with_home("insight-dedup", || {
+            let first =
+                save_insight("kira", "verify the build before claiming it is done", 8).unwrap();
+            // Same lesson, fewer function words, different case: the content tokens agree.
+            let again = save_insight("kira", "Verify build before claiming done", 7).unwrap();
+            assert_eq!(
+                again, first,
+                "the same lesson lands on the existing insight"
+            );
+            let n = list("kira")
+                .into_iter()
+                .filter(|m| m.kind == Kind::Insight)
+                .count();
+            assert_eq!(n, 1);
+            let other =
+                save_insight("kira", "ask before force-pushing a shared branch", 8).unwrap();
+            assert_ne!(other, first, "a different lesson is written");
+        });
+    }
 
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _g = crate::core::config::TEST_HOME_LOCK

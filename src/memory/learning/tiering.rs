@@ -26,6 +26,8 @@
 //! ambiguous case clamps down, never up.
 
 use crate::memory::path_scope::{is_ancestor, Lineage, Tier};
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// Confidence multiplier for an anchor that had to be clamped (the write path named a place
 /// that does not contain the cwd — plausible, but we trust it less).
@@ -44,6 +46,10 @@ pub struct TierProposal {
     /// Does the fact text talk about the machine (toolchain, paths, hardware)? Only consulted
     /// when a `place` proposal collapses to the home dir and we must pick `Device` vs `User`.
     pub mentions_machine: bool,
+    /// Does the fact text name the work — a path, a source file, a project marker or name
+    /// ([`mentions_project`])? A `user` proposal that does is re-filed as `place`: a fact about
+    /// a project is never about the person, whatever grammar it was written in.
+    pub mentions_project: bool,
 }
 
 /// The resolved placement. `confidence_mult` is applied by the caller to its own confidence.
@@ -96,6 +102,10 @@ impl TierChoice {
 /// walked up to a directory that HAS been, instead of writing an anchor that can never match.
 pub fn decide(p: &TierProposal, lin: &Lineage, exists: &dyn Fn(&str) -> bool) -> TierChoice {
     match p.tier {
+        // A `user` fact that names a project or a path is about that project (M3): file it
+        // where the work is, with the clamp a mis-named place gets. At home there is no
+        // project to anchor to and `decide_place` falls back honestly.
+        Some(Tier::User) if p.mentions_project => decide_place(p, lin, exists, CLAMP_PENALTY),
         Some(Tier::User) => TierChoice::user(),
         Some(Tier::Device) => TierChoice::device(&lin.device),
         Some(Tier::Place) => decide_place(p, lin, exists, CLAMP_PENALTY),
@@ -238,14 +248,168 @@ pub fn proposal_from_mtype(
         MemoryType::User | MemoryType::Feedback => TierProposal {
             tier: Some(Tier::User),
             anchor: None,
-            mentions_machine: false,
+            mentions_machine: mentions_machine(body),
+            mentions_project: mentions_project(body, lin),
         },
         MemoryType::Project | MemoryType::Reference => TierProposal {
             tier: Some(Tier::Place),
             anchor: Some(lin.narrowest_project_or_cwd()),
             mentions_machine: mentions_machine(body),
+            mentions_project: true,
         },
     }
+}
+
+/// Does the fact text name the work rather than the person — a path, a source file, a project
+/// marker, or the name of a place in the lineage? Quality plan M3: 239 `tier: user` rows on the
+/// measured store were other projects' architecture notes, filed as `user` because the extractor
+/// keyed the tier off the sentence's grammar ("I …", "prefer …"). A fact that names a project or
+/// a path is about that project — it is `place`, never `user` — and [`decide`] enforces it.
+///
+/// Deliberately narrow: a product name that looks like a file (`node.js`, `next.js`) is a
+/// preference, not a path, so the extension list leaves `js`/`ts`/`go`/`c` out; `and/or`, `w/o`
+/// are not paths; a single generic word (`src`, `docs`) taken from the lineage is not a name.
+pub fn mentions_project(text: &str, lin: &Lineage) -> bool {
+    let low = text.to_lowercase();
+    if PROJECT_MARKERS.iter().any(|m| low.contains(m)) {
+        return true;
+    }
+    if RE_DRIVE_PATH.is_match(&low) || RE_SOURCE_FILE.is_match(&low) {
+        return true;
+    }
+    if has_slash_path(&low) {
+        return true;
+    }
+    project_names(lin).iter().any(|name| has_word(&low, name))
+}
+
+/// Phrases that name the work explicitly, in either language the store holds.
+const PROJECT_MARKERS: &[&str] = &[
+    "this repo",
+    "the repo",
+    "this project",
+    "this codebase",
+    "the codebase",
+    "this crate",
+    "this workspace",
+    "in the repo",
+    "monorepo",
+    "cargo.toml",
+    "package.json",
+    "pyproject",
+    "repo này",
+    "dự án này",
+    "codebase này",
+    "project này",
+    "trong repo",
+    "trong dự án",
+];
+
+static RE_DRIVE_PATH: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[a-z]:[\\/]").expect("regex"));
+static RE_SOURCE_FILE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b[\w-]+\.(?:rs|py|pyi|tsx|jsx|mjs|cjs|toml|yml|yaml|lock|md|sh|ps1|cpp|hpp)\b")
+        .expect("regex")
+});
+
+/// `a/b` with real segments on both sides: `src/main.rs`, `docs/plan`, `./scripts` — but not
+/// `and/or`, `w/o`, `24/7`.
+fn has_slash_path(low: &str) -> bool {
+    let b = low.as_bytes();
+    let is_seg = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.');
+    for (i, &c) in b.iter().enumerate() {
+        if c != b'/' && c != b'\\' {
+            continue;
+        }
+        let mut l = i;
+        while l > 0 && is_seg(b[l - 1]) {
+            l -= 1;
+        }
+        let mut r = i + 1;
+        while r < b.len() && is_seg(b[r]) {
+            r += 1;
+        }
+        let (left, right) = (&low[l..i], &low[i + 1..r]);
+        if left.is_empty() || right.is_empty() {
+            continue;
+        }
+        if left.bytes().all(|c| c.is_ascii_digit()) && right.bytes().all(|c| c.is_ascii_digit()) {
+            continue; // 24/7, 3/4
+        }
+        if matches!(
+            left,
+            "and" | "w" | "he" | "she" | "his" | "her" | "yes" | "s"
+        ) {
+            continue;
+        }
+        if left.contains('.') || right.contains('.') || (left.len() >= 3 && right.len() >= 3) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Names of the places in the lineage below home — the project directory's basename and the
+/// like. Generic directory words are not names.
+fn project_names(lin: &Lineage) -> Vec<String> {
+    const GENERIC: &[&str] = &[
+        "src",
+        "lib",
+        "app",
+        "apps",
+        "bin",
+        "test",
+        "tests",
+        "docs",
+        "doc",
+        "home",
+        "desktop",
+        "documents",
+        "projects",
+        "project",
+        "code",
+        "work",
+        "dev",
+        "repos",
+        "repo",
+        "github",
+        "source",
+        "sources",
+        "tmp",
+        "temp",
+        "users",
+        "user",
+    ];
+    let mut names: Vec<String> = Vec::new();
+    for place in lin.places.iter().chain(std::iter::once(&lin.cwd)) {
+        if at_or_above_home(place, lin.home.as_deref()) {
+            continue;
+        }
+        let Some(base) = place.trim_end_matches('/').rsplit('/').next() else {
+            continue;
+        };
+        let base = base.to_ascii_lowercase();
+        if base.len() < 3 || GENERIC.contains(&base.as_str()) || names.contains(&base) {
+            continue;
+        }
+        names.push(base);
+    }
+    names
+}
+
+/// Whole-word, case-folded containment: `aizen` in "the aizen repl", not in "aizenite".
+fn has_word(low: &str, word: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = low[start..].find(word) {
+        let i = start + pos;
+        let j = i + word.len();
+        let before_ok = i == 0 || !low.as_bytes()[i - 1].is_ascii_alphanumeric();
+        let after_ok = j >= low.len() || !low.as_bytes()[j].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = j;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -267,6 +431,65 @@ mod tests {
     }
     fn none_exist(_: &str) -> bool {
         false
+    }
+
+    /// A lineage that knows its project directory, the way `Lineage::current` builds one.
+    fn lin_in_project() -> Lineage {
+        Lineage {
+            cwd: "c:/users/admin/work/aizen/src".to_string(),
+            places: vec![
+                "c:/users/admin/work/aizen/src".to_string(),
+                "c:/users/admin/work/aizen".to_string(),
+            ],
+            device: "dev-deadbeef".to_string(),
+            home: Some("c:/users/admin".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_fact_that_names_the_work_is_never_a_user_fact() {
+        let lin = lin_in_project();
+        for text in [
+            "I keep the config in src/core/config.rs",
+            "prefer rustls in this repo",
+            "my notes live under C:\\work\\notes",
+            "the aizen binary must stay a single static file",
+            "Cargo.toml uses license = Apache-2.0",
+            "tôi muốn giữ README.md dưới 110 dòng",
+        ] {
+            assert!(mentions_project(text, &lin), "{text:?} names the work");
+            let c = decide(
+                &TierProposal {
+                    tier: Some(Tier::User),
+                    anchor: None,
+                    mentions_machine: false,
+                    mentions_project: true,
+                },
+                &lin,
+                &all_exist,
+            );
+            assert_eq!(c.tier, Tier::Place, "{text:?} is re-filed as place");
+            assert_eq!(c.anchor.as_deref(), Some("c:/users/admin/work/aizen/src"));
+        }
+        for text in [
+            "prefers terse answers",
+            "I like node.js and next.js",
+            "reply in Vietnamese and/or English",
+            "available 24/7 on weekdays",
+            "my name is Bao",
+        ] {
+            assert!(
+                !mentions_project(text, &lin),
+                "{text:?} is about the person"
+            );
+        }
+        // Generic directory words in the lineage are not project names.
+        assert!(
+            !mentions_project("put it in src", &lin),
+            "a generic directory word is not a project name"
+        );
+        let names = project_names(&lin);
+        assert_eq!(names, vec!["aizen"], "{names:?}");
     }
 
     #[test]
@@ -307,6 +530,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: Some("c:/users/admin/proj".into()),
                 mentions_machine: false,
+                mentions_project: false,
             },
             &l,
             &all_exist,
@@ -323,6 +547,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: Some("c:/users/admin/other".into()),
                 mentions_machine: false,
+                mentions_project: false,
             },
             &l,
             &all_exist,
@@ -344,6 +569,7 @@ mod tests {
                     tier: Some(Tier::Place),
                     anchor: Some(above.into()),
                     mentions_machine: false,
+                    mentions_project: false,
                 },
                 &l,
                 &all_exist,
@@ -365,6 +591,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: Some("c:/users/admin".into()),
                 mentions_machine: false,
+                mentions_project: false,
             },
             &l,
             &all_exist,
@@ -377,6 +604,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: None,
                 mentions_machine: true,
+                mentions_project: false,
             },
             &l,
             &all_exist,
@@ -395,6 +623,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: Some("c:/users/admin/proj/src/agent/lsp".into()),
                 mentions_machine: false,
+                mentions_project: false,
             },
             &l,
             &exists,
@@ -410,6 +639,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: Some("c:/users/admin/proj/ghost".into()),
                 mentions_machine: false,
+                mentions_project: false,
             },
             &l,
             &none_exist,
@@ -435,6 +665,7 @@ mod tests {
                 tier: Some(Tier::Place),
                 anchor: Some("C:/Users/Admin/Proj".into()),
                 mentions_machine: false,
+                mentions_project: false,
             },
             &l,
             &all_exist,

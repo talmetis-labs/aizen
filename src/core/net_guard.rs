@@ -192,8 +192,14 @@ mod tests {
         assert!(!is_blocked_ip(&ip("99.64.0.1")), "just outside CGNAT");
     }
 
+    // Every `guard_url` test holds the shared lock: `opt_out_env_disables_the_guard` flips the
+    // process-wide opt-out under it, and a reader running beside it saw "not a url" accepted
+    // (Windows CI).
     #[test]
     fn guard_url_blocks_literal_private_and_localhost() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(guard_url("http://127.0.0.1/").is_err());
         assert!(guard_url("http://169.254.169.254/latest/meta-data/").is_err());
         assert!(guard_url("http://localhost:8080/admin").is_err());
@@ -204,11 +210,17 @@ mod tests {
 
     #[test]
     fn guard_url_allows_literal_public_ip() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(guard_url("http://1.1.1.1/").is_ok());
     }
 
     #[test]
     fn guard_url_rejects_non_http_scheme() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(guard_url("file:///etc/passwd").is_err());
         assert!(guard_url("ftp://example.com/").is_err());
         assert!(guard_url("not a url").is_err());

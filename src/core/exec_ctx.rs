@@ -65,6 +65,9 @@ struct Inner {
     persona: Option<String>,
     /// Where an approval prompt goes this turn. `None` ⇒ the platform's process-global fallback.
     approval_route: Option<ApprovalRoute>,
+    /// The delegated child this context runs — role and brief subject (`daedalus · fix parser`)
+    /// — so an approval it raises says who is asking. `None` for a top-level turn.
+    dispatch_label: Option<String>,
 }
 
 impl Default for Inner {
@@ -75,6 +78,7 @@ impl Default for Inner {
             trace_visible: true,
             persona: None,
             approval_route: None,
+            dispatch_label: None,
         }
     }
 }
@@ -117,6 +121,7 @@ impl ExecutionContext {
             trace_visible: self.0.trace_visible,
             persona: self.0.persona.clone(),
             approval_route: self.0.approval_route.clone(),
+            dispatch_label: self.0.dispatch_label.clone(),
         };
         f(&mut next);
         Self(Arc::new(next))
@@ -157,6 +162,16 @@ impl ExecutionContext {
     /// Pin where an approval prompt for this turn is delivered.
     pub fn with_approval_route(&self, route: Option<ApprovalRoute>) -> Self {
         self.with(|i| i.approval_route = route)
+    }
+
+    /// Name the delegated child this context runs (role · brief subject), so an approval it
+    /// raises and the `/workflows` row say who is asking.
+    pub fn with_dispatch_label(&self, label: Option<String>) -> Self {
+        self.with(|i| i.dispatch_label = label)
+    }
+    /// The delegated child's label, if this context runs one.
+    pub fn dispatch_label(&self) -> Option<String> {
+        self.0.dispatch_label.clone()
     }
     /// The turn's approval route, if any.
     pub fn approval_route(&self) -> Option<ApprovalRoute> {

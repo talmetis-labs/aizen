@@ -1,0 +1,29 @@
+{
+  "name": "implement",
+  "tasks": [
+    {
+      "id": "implement",
+      "role": "daedalus",
+      "prompt": "Add `pub fn parse_pairs(s: &str) -> Vec<(&str, &str)>` to src/lib.rs: split the input on ';', parse each piece with the existing `parse_kv`, and skip pieces that do not parse. The integration test in tests/parse_pairs.rs already describes the behaviour; make `cargo test` pass without editing the tests.",
+      "boundaries": "Edit only src/lib.rs. Do not touch the tests.",
+      "expected_output": "What changed, with file:line, and the build or test command you ran."
+    },
+    {
+      "id": "verify",
+      "role": "themis",
+      "after": ["implement"],
+      "retry_on_fail": "implement",
+      "prompt": "Verify the change reported above: run `cargo test --quiet`. Your FIRST line must be exactly `VERDICT: PASS` or `VERDICT: FAIL` (`VERDICT: INCONCLUSIVE` only if nothing could run), then the exact command, its exit code, and the decisive failing output with file:line.",
+      "boundaries": "Do not edit files."
+    },
+    {
+      "id": "review",
+      "role": "nemesis",
+      "after": ["verify"],
+      "prompt": "Review the change (git_inspect diff) with the verify report above in mind. Findings with severity and file:line, then one line: safe to merge, or not, and why."
+    }
+  ],
+  "synthesis": {
+    "prompt": "Report in order: what was implemented (implement), the test verdict with its evidence (verify — if it failed after the retry, say so first), and the review findings (review)."
+  }
+}

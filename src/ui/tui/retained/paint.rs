@@ -396,6 +396,10 @@ pub(super) fn resolve_transcript_scroll(
     (tail_start - clamped, clamped, total)
 }
 
+/// Rows rendered beyond a page on each side of the viewport, so a wheel step never lands on an
+/// unrendered block and the hyperlink injector's rejoin window has real rows to scan.
+pub(super) const RENDER_MARGIN_ROWS: usize = 8;
+
 pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -403,43 +407,88 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     // Leave 1 cell on the right for the scrollbar track when content overflows — content already
     // reserves `width-2` so the thumb never paints over text.
     let content_width = area.width.saturating_sub(2).max(8);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut plain_rows: Vec<String> = Vec::new();
-    let mut sgr_rows: Vec<String> = Vec::new();
+    // 1. Heights only: the prefix sums place the viewport without rendering a single row.
+    let mut heights: Vec<usize> = Vec::with_capacity(state.blocks.len());
+    let mut blocks_total = 0usize;
     for block in &state.blocks {
-        let rows = state.cache.get_or_render(block, content_width);
-        for row in rows {
-            plain_rows.push(console::strip_ansi_codes(&row).into_owned());
-            sgr_rows.push(row.clone());
-            lines.push(styled_row(block.kind, row));
-        }
-    }
-    // Apply selection reverse highlight before scrolling into the viewport.
-    if let Some(sel) = state.selection {
-        apply_selection_highlight(&mut lines, sel);
+        let h = state.cache.height(block, content_width);
+        heights.push(h);
+        blocks_total += h;
     }
     // The working indicator rides the BOTTOM of the transcript (Claude-CLI style) rather than a HUD
     // pill: a brand-bloom spinner (the ✦ mark opening out through ✶✷✹✺ and back) + a typewriter
     // caption that reads the agent's current action ("Reading retained.rs") or a whimsical verb
-    // between steps. Blue caption (the aizen link-blue) so it reads as "live status", not transcript
-    // prose. Appended after the selection highlight so a drag can't accidentally reverse-video the
-    // spinner; it counts toward `total` so the tail-follow keeps it pinned to the last row as output
-    // streams.
-    if state.working {
-        for (plain, styled) in working_line(state) {
-            plain_rows.push(plain);
-            lines.push(styled);
-        }
-    }
-    let total = lines.len();
+    // between steps. It counts toward `total` so the tail-follow keeps it pinned to the last row as
+    // output streams, and is rendered only when the window reaches the tail.
+    let working: Vec<(String, Line<'static>)> = if state.working {
+        working_line(state)
+    } else {
+        Vec::new()
+    };
+    let total = blocks_total + working.len();
     let visible = area.height as usize;
     let (start, scroll, last) =
         resolve_transcript_scroll(state.scroll_from_tail, state.last_total, total, visible);
     state.scroll_from_tail = scroll;
     state.last_total = last;
+    // 2. Render only the blocks that intersect the viewport plus a margin — a page each side for a
+    //    smooth wheel, and the rows the hyperlink injector scans past the edges. Everything else
+    //    stays a height. At 3,000 blocks this is O(viewport) per frame instead of O(session).
+    let margin = visible + RENDER_MARGIN_ROWS;
+    let lo = start.saturating_sub(margin);
+    let hi = start
+        .saturating_add(visible)
+        .saturating_add(margin)
+        .min(total);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut plain_rows: Vec<String> = Vec::new();
+    let mut sgr_rows: Vec<String> = Vec::new();
+    let mut row_tool_seq: Vec<Option<u64>> = Vec::new();
+    let mut rows_offset: Option<usize> = None;
+    let mut cursor = 0usize;
+    for (block, h) in state.blocks.iter().zip(&heights) {
+        let end = cursor + h;
+        if *h > 0 && end > lo && cursor < hi {
+            rows_offset.get_or_insert(cursor);
+            let seq = match &block.payload {
+                Payload::Tool(t) => Some(t.seq),
+                _ => None,
+            };
+            for row in state.cache.get_or_render(block, content_width) {
+                plain_rows.push(console::strip_ansi_codes(&row).into_owned());
+                sgr_rows.push(row.clone());
+                row_tool_seq.push(seq);
+                lines.push(styled_row(block.kind, row));
+            }
+        }
+        cursor = end;
+        if cursor >= hi {
+            break;
+        }
+    }
+    // The first rendered row's absolute index; with nothing rendered, the tail (where the working
+    // line lives) or the window's own start.
+    let rows_offset = rows_offset.unwrap_or(blocks_total.min(lo));
+    if !working.is_empty() && hi > blocks_total {
+        for (plain, styled) in working {
+            plain_rows.push(plain);
+            row_tool_seq.push(None);
+            lines.push(styled);
+        }
+    }
+    // Apply the selection reverse highlight inside the rendered window (the selection lives in
+    // the flat row space; rows outside the window are not on screen).
+    if let Some(sel) = state.selection {
+        if let Some(local) = super::geom::shift_selection(sel, rows_offset, lines.len()) {
+            apply_selection_highlight(&mut lines, local);
+        }
+    }
     let paragraph = Paragraph::new(Text::from(lines))
         .style(Style::default().fg(Color::Gray))
-        .scroll((start.min(u16::MAX as usize) as u16, 0));
+        .scroll((
+            start.saturating_sub(rows_offset).min(u16::MAX as usize) as u16,
+            0,
+        ));
     frame.render_widget(paragraph, area);
 
     // Dim vertical scrollbar when content overflows the viewport. Style is quiet (FAINT track,
@@ -495,6 +544,8 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
             area,
             plain_rows,
             sgr_rows,
+            rows_offset,
+            row_tool_seq,
             jump_button,
         };
     }

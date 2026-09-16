@@ -699,13 +699,30 @@ fn wrap_plain(text: &str, budget: usize) -> Vec<String> {
 }
 
 /// Split into pieces of at most `budget` chars (a coarse width proxy; code is ~all single-width).
+/// Split an over-long token into pieces of at most `budget` DISPLAY cells — not chars: a CJK
+/// character is two cells wide, and chunking by chars handed the terminal rows twice the
+/// budget. A single char wider than the budget still gets its own piece.
 fn char_chunks(s: &str, budget: usize) -> Vec<String> {
     let budget = budget.max(4);
-    let chars: Vec<char> = s.chars().collect();
-    if chars.is_empty() {
+    if s.is_empty() {
         return vec![String::new()];
     }
-    chars.chunks(budget).map(|c| c.iter().collect()).collect()
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for c in s.chars() {
+        let w = console::measure_text_width(&c.to_string()).max(1);
+        if cur_w + w > budget && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(c);
+        cur_w += w;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 // ── block classifiers ────────────────────────────────────────────────────────────
@@ -1008,6 +1025,26 @@ fn highlight(line: &str, lang: &str) -> String {
 mod tests {
     use super::*;
     use console::strip_ansi_codes;
+
+    #[test]
+    fn over_long_tokens_split_by_display_width_not_chars() {
+        // Ten CJK chars are twenty cells: a budget of 8 cells is four chars per piece.
+        let cjk = "汉字汉字汉字汉字汉字";
+        let pieces = char_chunks(cjk, 8);
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        assert!(
+            pieces.iter().all(|p| console::measure_text_width(p) <= 8),
+            "{pieces:?}"
+        );
+        assert_eq!(pieces.concat(), cjk, "nothing dropped");
+        // ASCII is unchanged: eight chars per piece.
+        let ascii = char_chunks(&"a".repeat(20), 8);
+        assert_eq!(
+            ascii.iter().map(String::len).collect::<Vec<_>>(),
+            vec![8, 8, 4]
+        );
+        assert_eq!(char_chunks("", 8), vec![String::new()]);
+    }
 
     fn render_all(md: &str) -> String {
         let mut s = MarkdownStream::new(true, 80);

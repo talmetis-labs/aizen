@@ -62,9 +62,44 @@ pub fn snapshot() -> Vec<Todo> {
     TODOS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The item currently in progress, if any — what a delegated child is told its parent is doing.
+pub fn active_item() -> Option<String> {
+    TODOS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|t| t.status == Status::InProgress)
+        .map(|t| t.content.clone())
+}
+
 /// Wipe the list (called on `/clear` / a fresh conversation).
 pub fn clear() {
     TODOS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Set by the turn driver when a run ends: `true` means the open items are the model's own plan
+/// for unfinished work (step cap, deadline, cancel, a failed verification, a clarifying question)
+/// and the user's next message is usually "continue", so the list must survive the boundary.
+static CARRY_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record how the turn that just ran ended. Call with `true` before a turn starts as well, so a
+/// turn that errors out (no outcome at all) keeps its plan for the retry.
+pub fn end_turn(abnormal: bool) {
+    CARRY_OVER.store(abnormal, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The user-turn boundary: the list is scoped to one turn's work. It used to be process-global
+/// and cleared only by `/new`, `/clear` and `/resume`, so a stale item from an edit turn made the
+/// next plain question cost up to two todo-poke round-trips, and `serve` lanes poked each other
+/// over one shared list. Cleared here unless the previous turn ended abnormally (see
+/// [`end_turn`]) — then its open items are the continuation plan and stay. Returns whether the
+/// list was cleared.
+pub fn begin_user_turn() -> bool {
+    if CARRY_OVER.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    clear();
+    true
 }
 
 /// True when any item is still pending or in_progress (empty list → false).
@@ -299,12 +334,12 @@ impl Tool for TodoWrite {
         "todo_write"
     }
     fn description(&self) -> &str {
-        "Track a multi-step task as a visible checklist. Send the COMPLETE current list every call \
-         (it REPLACES the previous one). Use it to plan multi-file / hard-to-undo work and to mark \
-         progress: set ONE item to in_progress at a time, flip it to done before starting the next. \
-         Not for trivial one-step tasks. Optional confidence (0–100) at assign/done and \
-         hill_climbable (0–100) for quantifiable goals. The list is shown to the user and resets on \
-         /clear. Leaving items incomplete will block Done (harness poke)."
+        "Track a multi-step task as a visible checklist. Send the COMPLETE list every call (it \
+         REPLACES the previous one). Use it for multi-file or hard-to-undo work: ONE item \
+         in_progress at a time, flip it to done before starting the next. Not for trivial \
+         one-step tasks. Optional confidence (0–100) at assign/done and hill_climbable (0–100) \
+         for quantifiable goals. Shown to the user; resets on /clear. Incomplete items block \
+         Done (harness poke)."
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()
@@ -631,5 +666,46 @@ mod tests {
             phase_boundary_crossed(&before, &after).as_deref(),
             Some("C")
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_scope_tests {
+    use super::*;
+
+    fn seed() {
+        set(vec![
+            Todo::new("done thing", Status::Done),
+            Todo::new("open thing", Status::Pending),
+        ]);
+    }
+
+    #[test]
+    fn a_normal_end_clears_the_list_at_the_next_user_turn() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seed();
+        end_turn(false);
+        assert!(begin_user_turn(), "cleared");
+        assert!(snapshot().is_empty());
+        assert!(
+            !has_incomplete(),
+            "a plain question after an edit turn owes no todo poke"
+        );
+        clear();
+    }
+
+    #[test]
+    fn an_abnormal_end_carries_the_plan_over_exactly_once() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seed();
+        end_turn(true);
+        assert!(!begin_user_turn(), "kept for the continuation");
+        assert!(has_incomplete());
+        // The carry-over is one-shot: the turn after that starts clean again unless it also
+        // ended abnormally.
+        end_turn(false);
+        assert!(begin_user_turn());
+        assert!(snapshot().is_empty());
+        clear();
     }
 }

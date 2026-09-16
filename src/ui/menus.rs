@@ -135,10 +135,12 @@ async fn discord_setup() -> Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     };
+    println!(
+        "{}",
+        style("comma-separated · right-click a channel → Copy Channel ID").dim()
+    );
     let chans: String = Input::with_theme(&theme)
-        .with_prompt(
-            "Allowed channel id(s), comma-separated (right-click a channel → Copy Channel ID)",
-        )
+        .with_prompt("Allowed channel ids")
         .with_initial_text(cur_ch)
         .allow_empty(true)
         .interact_text()
@@ -362,6 +364,7 @@ async fn app_catalog_menu() -> Result<()> {
 
     let pick = match Select::with_theme(&theme)
         .with_prompt("Apps — pick one (✓ = connected → manage; ○ → connect). Esc to go back")
+        .report(false)
         .items(&items)
         .default(0)
         .interact_opt()?
@@ -407,6 +410,7 @@ async fn apps_manage_menu(key: &str, label: &str) -> Result<()> {
     items.push("Back");
     let pick = match Select::with_theme(&theme)
         .with_prompt(format!("{label} — connected (Esc to go back)"))
+        .report(false)
         .items(&items)
         .default(0)
         .interact_opt()?
@@ -497,6 +501,7 @@ async fn discord_app_menu() -> Result<()> {
     ];
     let pick = match Select::with_theme(&theme)
         .with_prompt(format!("Discord — {bot} · {hook} (Esc to go back)"))
+        .report(false)
         .items(&items)
         .default(0)
         .interact_opt()?
@@ -537,6 +542,7 @@ pub(crate) async fn apps_menu() -> Result<()> {
     items.push("Back".to_string());
     let pick = match Select::with_theme(&theme)
         .with_prompt("Apps & integrations (Esc to go back)")
+        .report(false)
         .items(&items)
         .default(0)
         .interact_opt()?
@@ -572,6 +578,7 @@ async fn webhook_app_menu(ch: notify::Channel) -> Result<()> {
     };
     let pick = match Select::with_theme(&theme)
         .with_prompt(format!("{} — {status} (Esc to go back)", ch.label()))
+        .report(false)
         .items(&items)
         .default(0)
         .interact_opt()?
@@ -604,20 +611,31 @@ async fn webhook_app_setup(ch: notify::Channel) -> Result<()> {
     let cur = notify::channel_url(ch, &cfg)
         .map(|u| cli_config::mask(&u))
         .unwrap_or_else(|| "none".to_string());
+    // A webhook URL carries its token, so the typed line is cleared on Enter and only the
+    // masked current value ever shows.
+    println!("{}", style(format!("current {cur} — Enter to keep")).dim());
     let entered: String = Input::with_theme(&theme)
-        .with_prompt(format!(
-            "{} URL (current {cur} — Enter to keep)",
-            ch.label()
-        ))
+        .with_prompt(format!("{} URL", ch.label()))
         .allow_empty(true)
+        .report(false)
         .interact_text()
         .context("reading URL")?;
     let entered = entered.trim().to_string();
     if !entered.is_empty() {
-        if !entered.starts_with("http://") && !entered.starts_with("https://") {
-            anyhow::bail!("that doesn't look like a URL (must start with http:// or https://)");
+        let url = crate::ui::config_ui::normalize_scheme(&entered);
+        if url
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.is_empty())
+        {
+            anyhow::bail!("that doesn't look like a URL (must name a host)");
         }
-        notify::set_channel_url(&mut n, ch, Some(entered));
+        if url != entered.trim_end_matches('/') {
+            println!(
+                "{}",
+                style(format!("read as {}", cli_config::mask(&url))).dim()
+            );
+        }
+        notify::set_channel_url(&mut n, ch, Some(url));
     }
     if ch == notify::Channel::Webhook {
         let cur_auth = n
@@ -625,11 +643,17 @@ async fn webhook_app_setup(ch: notify::Channel) -> Result<()> {
             .as_deref()
             .map(cli_config::mask)
             .unwrap_or_else(|| "none".to_string());
-        let auth: String = Input::with_theme(&theme)
-            .with_prompt(format!(
-                "Auth header — e.g. 'Authorization: Bearer …' (current {cur_auth} — Enter to skip)"
+        println!(
+            "{}",
+            style(format!(
+                "e.g. Authorization: Bearer … · current {cur_auth} — Enter to skip"
             ))
+            .dim()
+        );
+        let auth: String = Input::with_theme(&theme)
+            .with_prompt("Auth header")
             .allow_empty(true)
+            .report(false)
             .interact_text()
             .context("reading auth header")?;
         let auth = auth.trim();
@@ -742,8 +766,12 @@ fn skill_new_interactive() -> Result<()> {
 /// Prompt for a URL and fetch a skill from it.
 async fn skill_fetch_interactive() -> Result<()> {
     let theme = ui_theme();
+    println!(
+        "{}",
+        style("raw markdown, e.g. a gist or raw GitHub link").dim()
+    );
     let url: String = Input::with_theme(&theme)
-        .with_prompt("Skill URL (raw markdown, e.g. a gist/raw GitHub link)")
+        .with_prompt("Skill URL")
         .interact_text()?;
     if url.trim().is_empty() {
         anyhow::bail!("a URL is required");
@@ -772,6 +800,7 @@ fn skill_delete_interactive(skills: &[skill::Skill]) {
         .collect();
     if let Ok(Some(i)) = Select::with_theme(&theme)
         .with_prompt("Retire which skill? (archived, not erased — Esc to cancel)")
+        .report(false)
         .items(&labels)
         .default(0)
         .interact_opt()
@@ -858,6 +887,7 @@ pub(crate) async fn skills_menu() -> Result<()> {
         };
         let pick = match Select::with_theme(&theme)
             .with_prompt(prompt)
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -896,6 +926,7 @@ fn skill_restore_interactive(retired: &[skill::Skill]) {
     let names: Vec<String> = retired.iter().map(|s| s.name.clone()).collect();
     let Ok(Some(i)) = Select::with_theme(&theme)
         .with_prompt("Restore which retired skill? (Esc to cancel)")
+        .report(false)
         .items(&names)
         .default(0)
         .interact_opt()
@@ -946,6 +977,7 @@ async fn skill_search_interactive() -> Result<()> {
     items.push("Cancel".to_string());
     let pick = match Select::with_theme(&theme)
         .with_prompt("Install which skill?")
+        .report(false)
         .items(&items)
         .default(0)
         .interact_opt()?
@@ -1294,6 +1326,7 @@ pub(crate) async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Re
         );
         let pick = match Select::with_theme(&theme)
             .with_prompt(prompt)
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -1372,6 +1405,7 @@ pub(crate) async fn personas_menu(history: &mut Vec<Message>, model: &str) -> Re
                     .with_prompt(
                         "Retire which persona? (card + self-memory archived — Esc to cancel)",
                     )
+                    .report(false)
                     .items(&names)
                     .default(0)
                     .interact_opt()
@@ -1429,6 +1463,7 @@ pub(crate) async fn telegram_menu() -> Result<()> {
     ];
     let pick = match Select::with_theme(&theme)
         .with_prompt(format!("Telegram — {status} (Esc to go back)"))
+        .report(false)
         .items(&items)
         .default(if configured { 2 } else { 0 })
         .interact_opt()?

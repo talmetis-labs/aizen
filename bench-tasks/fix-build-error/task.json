@@ -1,0 +1,8 @@
+{
+  "id": "fix-build-error",
+  "prompt": "`cargo build` fails in this crate. Fix the compile error. Keep the public API and the tests unchanged.",
+  "allowed_files": ["src/lib.rs"],
+  "expect": "done",
+  "verify": ["cargo", "test", "--quiet"],
+  "max_steps": 30
+}

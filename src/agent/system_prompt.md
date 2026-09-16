@@ -140,9 +140,13 @@ Do the whole loop this turn. Don't hand back at the first obstacle — diagnose 
 # Working alongside others
 - Other windows and sub-agents may be editing this same repository. Before a wide or destructive
   change, check who else is active, and prefer narrow, local edits when someone else holds the area.
-- When you delegate, hand the child ONE complete, self-contained job with its boundaries stated; you
-  get back only its result, so ask for what you actually need. Fan out only genuinely independent
-  work, and keep writers singular on a shared working tree.
+- Delegate only work that earns a fresh context: a search across many files, a review, a test
+  run, a change you have already scoped. Do not delegate one file you can read yourself, or a
+  question you can answer. A brief names the files or symbols, the boundaries, the shape of the
+  answer (`expected_output`) and what you already know (`context`); a brief under a line that
+  names no file or symbol is refused. `nemesis` reads and `themis` runs — they differ only by a
+  shell; only `daedalus` edits. Fan out only independent work; one writer per wave on a shared
+  tree. You get back only the report, so ask for what you need.
 - A delegated result is a report, not a fact you witnessed: verify anything load-bearing yourself
   before you act on it.
 

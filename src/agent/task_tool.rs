@@ -297,6 +297,16 @@ pub(crate) fn build_agent_subagent_prompt(
     // The specialist's OWN surface — `agent_registry` narrows tools per the card's `tools:` frontmatter,
     // so a card granting only reads must not be handed the parent's editing/delegation vocabulary.
     crate::agent::append_tool_routing(&mut s, tools);
+    // The sibling blackboard (the role path carries it inside `<environment>`; this path's
+    // environment block is the top-level one, so the line rides after it).
+    s.push_str(&format!(
+        "\n{}\n",
+        crate::agent::blackboard::env_line(
+            &crate::core::exec_ctx::current()
+                .unwrap_or_default()
+                .resource_scope()
+        )
+    ));
     s.push('\n');
     s.push_str(SUBAGENT_PREAMBLE); // AUTHORITATIVE rules, BEFORE the untrusted specialist body
     let name = sanitize_agent_attr(&def.name);
@@ -458,7 +468,7 @@ impl TaskTool {
     ///
     /// Precedence, highest first:
     /// ```text
-    /// model:    arg `model` > card `model:` > roles.subagent_default > parent
+    /// model:    arg `model` > card `model:` > roles.pantheon.<role> > roles.subagent_default > parent
     /// base_url: card `base_url:`    > env AIZEN_MODEL_<M>_BASE_URL > model_endpoints > roles.subagent_default > parent
     /// api_key:  card `api_key_ref:` > env AIZEN_MODEL_<M>_API_KEY  > model_endpoints > roles.subagent_default > parent
     /// ```
@@ -560,7 +570,16 @@ impl TaskTool {
                     contract.max_steps = p.default_max_steps.clamp(1, MAX_STEP_BUDGET);
                 }
             }
-            let ep = self.resolve_endpoint(arg_model);
+            // No explicit model → the ROLE's own pin (`roles.pantheon.<role>`) sits above the
+            // shared sub-agent default, so a reviewer can run on a stronger model than the
+            // searcher in the same fan-out.
+            let ep = match arg_model {
+                Some(m) => self.resolve_endpoint(Some(m)),
+                None => crate::core::cli_config::pantheon_endpoint(
+                    &role,
+                    &self.default_subagent_endpoint(),
+                ),
+            };
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
             let system = build_subagent_prompt(
                 &role,
@@ -597,28 +616,26 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Dispatch exactly ONE bounded sub-agent (fresh context) and return its result. Use for a \
-         focused investigation or contained implementation with one clear scope; for independent \
-         angles or file groups use `workflow` (read-only children fan out; writers stay serial — \
-         never give two children the same files). The child cannot dispatch further sub-agents. \
-         Prefer a named specialist via `agent`; otherwise pick the role: daedalus implements (the \
-         only editor), themis runs tests/builds, argus finds code, metis plans, nemesis reviews, \
-         clio researches docs/deps, mnemosyne recalls prior decisions/history — all but \
-         daedalus/themis are read-only and fan out."
+        "Dispatch ONE bounded sub-agent (fresh context) and return its result. Use for a \
+         focused investigation or a contained implementation with one clear scope; for \
+         independent angles or file groups use `workflow` (read-only children fan out; writers \
+         stay serial — never give two children the same files). The child cannot dispatch \
+         further sub-agents. Prefer a named specialist via `agent`; otherwise pick a `role`."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "the complete, self-contained task for the sub-agent"},
-                "agent": {"type": "string", "description": "optional specialist slug from <agents> (e.g. \"code-reviewer\"); when set and it resolves, it supersedes role and decides the tool scope"},
+                "agent": {"type": "string", "description": "optional specialist slug from <agents>; when it resolves it supersedes role and decides the tool scope"},
                 "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "role when no agent is given: argus=find code · metis=plan · daedalus=implement (the only editor) · nemesis=review · themis=test (shell, no edit) · clio=web research · mnemosyne=prior decisions/history. Default argus (read-only); legacy role names accepted"},
                 "model": {"type": "string", "description": "optional model override for the sub-agent"},
-                "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
+                "label": {"type": "string", "description": "short tag echoed in the result header when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
                 "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
-                "max_steps": {"type": "integer", "description": "TOTAL model-step budget for this child (default 25, cap 80); use workflow instead of raising this for independent work"},
-                "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the sub-agent replies with ONLY a JSON object and the harness validates it (result header shows json:ok|invalid)"}
+                "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
+                "max_steps": {"type": "integer", "description": "TOTAL model-step budget (default per role, 15-45; cap 80); prefer workflow over raising this for independent work"},
+                "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the child replies with ONLY that JSON and the harness validates it (header shows json:ok|invalid)"}
             },
             "required": ["prompt"],
             "additionalProperties": false
@@ -705,6 +722,11 @@ impl Tool for TaskTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .context("missing required string arg 'prompt'")?;
+        // A child starts with an empty context: a brief that names nothing to look at sends it
+        // searching for the parent's own question. Refused before a slot or a token is spent.
+        if let Some(why) = thin_brief(prompt) {
+            bail!(why);
+        }
 
         // Agent-vs-role resolution (no network) — a resolvable `agent` slug supersedes `role`. The
         // endpoint rides ALONG the model: `base`/`key` come from the dispatch (registry-routed), not
@@ -735,11 +757,19 @@ impl Tool for TaskTool {
         // The repair call must hit the same endpoint the sub-agent ran on (not the parent's).
         let base_for_repair = base_url.clone();
         let key_for_repair = api_key.clone();
+        // Per-child token tally, summed from every call's usage into the report header and the
+        // `/workflows` row.
+        let tally = std::sync::Arc::new((
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let tally_out = tally.clone();
         let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
             let client = client.clone();
             let base = base.clone();
             let key = key.clone();
             let model = model.clone();
+            let tally = tally.clone();
             async move {
                 // DEADLINE, not just a step budget: see `SUBAGENT_CALL_TIMEOUT`. The timeout must
                 // wrap the call INSIDE this future — the whole loop runs under `block_in_place`
@@ -753,7 +783,21 @@ impl Tool for TaskTool {
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if let Ok(turn) = &result {
+                            if let Some(u) = &turn.usage {
+                                tally.0.fetch_add(
+                                    u.input_total(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                tally.1.fetch_add(
+                                    u.completion_tokens.unwrap_or(0),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                        result
+                    }
                     Err(_) => Err(anyhow::anyhow!(
                         "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
                          raise the limit)",
@@ -776,15 +820,23 @@ impl Tool for TaskTool {
         // tool-body progress from the parent transcript. The orchestration row remains the visible
         // progress surface.
         let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        // What the parent already knows, ahead of the brief: its reading list (from its
+        // read-cache scope), the findings it passed as `context`, and its in-progress todo.
+        let pack = crate::agent::context_pack::gather(
+            &self.root,
+            &parent_ctx.resource_scope(),
+            &crate::agent::context_pack::findings_from_args(args),
+        );
         let child_scope = format!(
             "{}/task/{}",
             parent_ctx.resource_scope(),
             NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let child_ctx = parent_ctx
-            .with_resource_scope(child_scope)
-            .with_trace_visible(false);
-        let cfg = AgentConfig {
+            .with_resource_scope(child_scope.clone())
+            .with_trace_visible(false)
+            .with_dispatch_label(Some(header_label.clone()));
+        let mut cfg = AgentConfig {
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
             cancel: own_cancel.clone(),
             exec_ctx: child_ctx,
@@ -859,6 +911,7 @@ impl Tool for TaskTool {
         // Publish the stop handle only now that the row exists, so the panel never shows a row whose
         // advertised handle isn't wired up yet.
         track.arm_stop(own_cancel);
+        cfg.step_note = Some((track.id(), crate::agent::orchestration::note_step));
 
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
         // MUST run on a Tokio MULTI-THREAD worker thread — `block_in_place` panics on a
@@ -874,33 +927,75 @@ impl Tool for TaskTool {
         // resume — once `execute` returns, the transcript is gone, and a parent that wants more must
         // dispatch fresh. That is why both exits below hand the parent a partial report built from
         // `msgs` while it still exists: it is the only continuation surface there is.
-        let outcome = tokio::task::block_in_place(|| {
-            let _effort = crate::core::cli_config::suppress_effort_override();
-            tokio::runtime::Handle::current().block_on(async {
-                let mut msgs = vec![Message::system(system.as_str()), Message::user(prompt)];
-                let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs).await
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        let completed_tool_turns = msgs
-                            .iter()
-                            .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-                            .count();
-                        // The transcript dies with this return — salvage the same partial report
-                        // the Ok path gets. Without it, a child that completed 20 tool turns and
-                        // then hit a terminal API error handed the parent one line and no list of
-                        // what it had already touched.
-                        let partial = partial_report_from_messages(&msgs);
-                        return Err(e.context(format!(
+        // One run of the child over a fresh transcript. Called twice at most: a write-capable
+        // child that runs out of time or fails verification gets ONE retry with a tightened
+        // brief (its own partial report attached), and if that also fails the tree goes back
+        // to the checkpoint taken before the dispatch, so half-done edits do not stay.
+        let run_once = |user_text: String| -> Result<(crate::agent::AgentOutcome, Vec<Message>)> {
+            tokio::task::block_in_place(|| {
+                let _effort = crate::core::cli_config::suppress_effort_override();
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut msgs = vec![Message::system(system.as_str()), Message::user(user_text)];
+                    let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs)
+                        .await
+                    {
+                        Ok(o) => o,
+                        Err(e) => {
+                            let completed_tool_turns = msgs
+                                .iter()
+                                .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+                                .count();
+                            // The transcript dies with this return — salvage the same partial report
+                            // the Ok path gets. Without it, a child that completed 20 tool turns and
+                            // then hit a terminal API error handed the parent one line and no list of
+                            // what it had already touched.
+                            let partial = partial_report_from_messages(&msgs);
+                            return Err(e.context(format!(
                             "after {completed_tool_turns} completed tool turn(s) — the workspace \
                              may already contain partial edits from this sub-agent; inspect before \
                              retrying.\nPartial progress before the failure:\n{partial}"
                         )));
-                    }
-                };
-                Ok::<_, anyhow::Error>((o, msgs))
+                        }
+                    };
+                    Ok::<_, anyhow::Error>((o, msgs))
+                })
             })
-        });
+        };
+        let pre_dispatch = if sub_verify_gate {
+            crate::features::timemachine::save(&format!("before {label}"), true)
+                .ok()
+                .map(|s| s.id)
+        } else {
+            None
+        };
+        let first_text = crate::agent::context_pack::prepend(pack.as_deref(), prompt);
+        let mut retried = false;
+        let mut restored: Option<std::result::Result<u32, String>> = None;
+        let outcome = match run_once(first_text.clone()) {
+            Ok((o, msgs)) if sub_verify_gate && needs_retry(&o.stop) => {
+                retried = true;
+                track.set_phase(
+                    crate::agent::orchestration::Phase::Running,
+                    format!("retry: {}", stop_phrase(&o.stop)),
+                );
+                let tightened =
+                    tightened_brief(&first_text, &o.stop, &partial_report_from_messages(&msgs));
+                match run_once(tightened) {
+                    Ok((o2, msgs2)) if needs_retry(&o2.stop) => {
+                        if let Some(id) = pre_dispatch {
+                            restored = Some(
+                                crate::features::timemachine::restore(id)
+                                    .map(|s| s.id)
+                                    .map_err(|e| format!("{e:#}")),
+                            );
+                        }
+                        Ok((o2, msgs2))
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        };
         let (outcome, msgs) = match outcome {
             Ok(o) => o,
             Err(e) => {
@@ -966,18 +1061,133 @@ impl Tool for TaskTool {
         };
         let body_warning = stop_body_warning(&stop_kind);
         let ok = matches!(stop_kind, crate::agent::StopReason::Done);
-        let detail = format!("{} step(s), {stop}{json_tag}", outcome.iters);
+        let tokens_in = tally_out.0.load(std::sync::atomic::Ordering::Relaxed);
+        let tokens_out = tally_out.1.load(std::sync::atomic::Ordering::Relaxed);
+        crate::agent::orchestration::add_usage(track.id(), tokens_in, tokens_out);
+        let retry_tag = if retried { " · retried" } else { "" };
+        let tok_tag = if tokens_in > 0 || tokens_out > 0 {
+            format!(
+                ", {}→{} tok",
+                crate::agent::orchestration::fmt_tokens(tokens_in),
+                crate::agent::orchestration::fmt_tokens(tokens_out)
+            )
+        } else {
+            String::new()
+        };
+        let detail = format!(
+            "{} step(s), {stop}{json_tag}{retry_tag}{tok_tag}",
+            outcome.iters
+        );
         if ok {
             track.finish_ok(detail);
         } else {
             track.finish_err(detail);
         }
-        let warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
+        let mut warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
+        match &restored {
+            Some(Ok(id)) => warning.push_str(&format!(
+                "[AUTO-RESTORED checkpoint #{id}: the retry also failed, so the tree is back to \
+                 before this dispatch; nothing below is applied.]\n"
+            )),
+            Some(Err(e)) => warning.push_str(&format!(
+                "[auto-restore of the pre-dispatch checkpoint FAILED ({e}); the tree may hold \
+                 partial edits from two attempts — inspect before building on it.]\n"
+            )),
+            None => {}
+        }
+        // File the whole report on the sibling blackboard: the parent sees this result cut to
+        // its budget, a later child can `file_read` all of it.
+        crate::agent::blackboard::note(
+            &parent_ctx.resource_scope(),
+            &crate::agent::blackboard::task_note_id(&label, &child_scope),
+            &body,
+        );
         Ok(format!(
-            "[task: {header_label}, {} step(s), {stop}{json_tag}]\n{warning}{body}",
+            "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}]\n{warning}{body}",
             outcome.iters
         ))
     }
+}
+
+/// The shortest brief that is not refused, in chars — below it a brief must at least name a
+/// file or a symbol.
+pub(crate) const THIN_BRIEF_CHARS: usize = 80;
+
+/// Does the brief name something to look at? A path (`src/a.rs`, `dir/`), a file (`main.py`),
+/// a symbol (`parse_kv`, `Foo::bar`, `run()`), or a backticked token all count.
+pub(crate) fn names_a_target(brief: &str) -> bool {
+    brief.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && !"/\\._:()`".contains(c));
+        w.contains('/')
+            || w.contains('\\')
+            || w.contains("::")
+            || w.contains("()")
+            || w.starts_with('`')
+            || w.chars().filter(|c| *c == '_').count() >= 1
+                && w.chars().any(|c| c.is_alphanumeric())
+            || w.rsplit_once('.').is_some_and(|(stem, ext)| {
+                !stem.is_empty()
+                    && (1..=5).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+    })
+}
+
+/// Why a brief is too thin to dispatch, or `None` when it is fine: under
+/// [`THIN_BRIEF_CHARS`] and naming no file or symbol. The message tells the model what a
+/// usable brief carries, and that the alternative is to do the small thing itself.
+pub(crate) fn thin_brief(brief: &str) -> Option<String> {
+    let n = brief.trim().chars().count();
+    if n >= THIN_BRIEF_CHARS || names_a_target(brief) {
+        return None;
+    }
+    Some(format!(
+        "brief too thin ({n} chars, no file or symbol named): a sub-agent starts with an empty \
+         context, so say WHICH files or symbols to look at, WHAT to return (expected_output), \
+         and what is already established (context) — or do this small thing yourself"
+    ))
+}
+
+/// Does a writer's stop reason earn the one retry? Only the two that leave a half-done tree
+/// behind for reasons a tighter brief can fix: it ran out of TIME, or its own check never
+/// passed. A step-budget stop is a scope problem, divergence a reasoning one — neither gets
+/// better by asking again.
+pub(crate) fn needs_retry(stop: &crate::agent::StopReason) -> bool {
+    matches!(
+        stop,
+        crate::agent::StopReason::Deadline | crate::agent::StopReason::VerificationFailed
+    )
+}
+
+fn stop_phrase(stop: &crate::agent::StopReason) -> &'static str {
+    match stop {
+        crate::agent::StopReason::Deadline => "ran out of time",
+        crate::agent::StopReason::VerificationFailed => "failed verification",
+        _ => "stopped",
+    }
+}
+
+/// Most of the partial report a retried child sees: enough to resume, not a second transcript.
+const RETRY_REPORT_CHARS: usize = 4_000;
+
+/// The retry brief: the original request, then what the first attempt reached and the one
+/// instruction that turns a timeout or a failed check into a finishable job — the SMALLEST
+/// change that passes, no restart, no wider scope.
+pub(crate) fn tightened_brief(
+    original: &str,
+    stop: &crate::agent::StopReason,
+    partial: &str,
+) -> String {
+    let mut report: String = partial.trim().chars().take(RETRY_REPORT_CHARS).collect();
+    if report.len() < partial.trim().len() {
+        report.push_str("\n…[clipped]");
+    }
+    format!(
+        "{original}\n\n<retry>\nYour previous attempt {}. Its partial report:\n{report}\nFinish the \
+         SMALLEST change that passes the project's check. Do not start over, do not widen the \
+         scope, and verify before you finish.\n</retry>",
+        stop_phrase(stop)
+    )
 }
 
 /// Deterministic fallback when a child stops without a final answer. Uses only bounded, redacted
@@ -1452,6 +1662,67 @@ mod tests {
             depth,
             0,
         )
+    }
+
+    #[test]
+    fn thin_briefs_are_refused_unless_they_name_a_target() {
+        assert!(thin_brief("fix it").is_some());
+        assert!(thin_brief("review the change").is_some());
+        assert!(
+            thin_brief("fix the bug in src/parser.rs").is_none(),
+            "a path"
+        );
+        assert!(
+            thin_brief("find every caller of parse_kv").is_none(),
+            "a symbol"
+        );
+        assert!(thin_brief("read main.py and report").is_none(), "a file");
+        assert!(
+            thin_brief("where is Foo::bar used").is_none(),
+            "a scoped symbol"
+        );
+        assert!(thin_brief("does run() retry?").is_none(), "a call");
+        assert!(
+            thin_brief("look at `Config`").is_none(),
+            "a backticked token"
+        );
+        let long = "summarize what this repository does, who it is for, and how a new \
+                    contributor would build and test it";
+        assert!(long.chars().count() >= THIN_BRIEF_CHARS);
+        assert!(
+            thin_brief(long).is_none(),
+            "a full brief passes without a path"
+        );
+        let why = thin_brief("fix it").unwrap();
+        assert!(why.contains("expected_output") && why.contains("do this small thing yourself"));
+        // The tool refuses before spending a slot or a token.
+        let err = tool(0)
+            .execute(&serde_json::json!({"prompt": "fix it"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("brief too thin"), "{err}");
+    }
+
+    #[test]
+    fn only_time_and_verification_failures_earn_the_retry() {
+        use crate::agent::StopReason;
+        assert!(needs_retry(&StopReason::Deadline));
+        assert!(needs_retry(&StopReason::VerificationFailed));
+        assert!(!needs_retry(&StopReason::Done));
+        assert!(!needs_retry(&StopReason::MaxIters));
+        assert!(!needs_retry(&StopReason::Divergence));
+        assert!(!needs_retry(&StopReason::Cancelled));
+        let brief = tightened_brief("fix the parser", &StopReason::Deadline, &"p".repeat(5_000));
+        assert!(
+            brief.starts_with("fix the parser\n\n<retry>\nYour previous attempt ran out of time")
+        );
+        assert!(
+            brief.contains("…[clipped]") && brief.contains("SMALLEST change"),
+            "{brief}"
+        );
+        assert!(brief.ends_with("</retry>"));
+        let v = tightened_brief("x", &StopReason::VerificationFailed, "partial");
+        assert!(v.contains("failed verification") && v.contains("partial"));
     }
 
     #[test]
@@ -2308,6 +2579,103 @@ mod tests {
             d3.registry.get("shell_run").is_some() && d3.registry.get("file_edit").is_none(),
             "tester scope"
         );
+
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn resolve_dispatch_budgets_follow_the_role_profile() {
+        let t = tool(0);
+        let budget = |args: serde_json::Value| t.resolve_dispatch(&args).max_steps;
+        // Absent `max_steps`, the profile answers — and the profiles differ (audit O4).
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "argus"})),
+            15
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "daedalus"})),
+            45
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "coder"})),
+            45,
+            "alias"
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x"})),
+            15,
+            "default role is argus"
+        );
+        // An explicit budget still wins, clamped to the shared cap.
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "argus", "max_steps": 40})),
+            40
+        );
+        assert_eq!(
+            budget(serde_json::json!({"prompt": "x", "role": "daedalus", "max_steps": 999})),
+            MAX_STEP_BUDGET
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_pins_a_role_to_its_pantheon_model() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = std::env::temp_dir().join(format!("aizen-disp-pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+        ]);
+        let mut pantheon = std::collections::BTreeMap::new();
+        pantheon.insert(
+            "nemesis".to_string(),
+            crate::core::cli_config::RoleModelConfig {
+                model: Some("strong-model".into()),
+                ..Default::default()
+            },
+        );
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            roles: Some(crate::core::cli_config::RolesConfig {
+                subagent_default: Some(crate::core::cli_config::RoleModelConfig {
+                    model: Some("cheap-model".into()),
+                    ..Default::default()
+                }),
+                pantheon: Some(pantheon),
+                ..Default::default()
+            }),
+            model_endpoints: Some(vec![crate::core::cli_config::ModelEndpoint {
+                model: "strong-model".into(),
+                base_url: Some("https://strong/v1".into()),
+                api_key_ref: Some("literal-strong-key".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let t = tool(0); // parent endpoint: http://localhost / "k" / model "m"
+                         // The pinned role runs on its model, and that model carries its own gateway.
+        let rev = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "nemesis"}));
+        assert_eq!(rev.model, "strong-model");
+        assert_eq!(rev.base_url, "https://strong/v1");
+        assert_eq!(rev.api_key, "literal-strong-key");
+        // An unpinned role still takes the shared sub-agent default — so in one fan-out the
+        // reviewer and the searcher run on different models.
+        let arg = t.resolve_dispatch(&serde_json::json!({"prompt": "x", "role": "argus"}));
+        assert_eq!(arg.model, "cheap-model");
+        assert_eq!(
+            arg.base_url, "http://localhost",
+            "same gateway as the parent"
+        );
+        // An explicit `model` arg beats the pin.
+        let over = t.resolve_dispatch(
+            &serde_json::json!({"prompt": "x", "role": "nemesis", "model": "other"}),
+        );
+        assert_eq!(over.model, "other");
 
         drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);

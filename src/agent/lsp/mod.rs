@@ -184,7 +184,35 @@ pub struct LspManager {
     /// lines), refreshed on every fetch. Post-edit feedback reports `now − baseline` only, so a
     /// pre-existing warning wall never spams every edit result.
     diag_baseline: Mutex<HashMap<PathBuf, std::collections::HashSet<String>>>,
+    /// Post-edit diagnostics jobs still running when their edit result went out. The loop drains
+    /// them into the next tool result or the done gate — see [`take_ready_feedback`].
+    pending_folds: Mutex<Vec<PendingFold>>,
 }
+
+/// One post-edit diagnostics job that outran the inline wait.
+struct PendingFold {
+    file: PathBuf,
+    /// The server whose workspace snapshot the caller scan reads; `None` in tests.
+    server: Option<Arc<LspServer>>,
+    rx: std::sync::mpsc::Receiver<Option<Vec<DiagItem>>>,
+    started: std::time::Instant,
+}
+
+/// A fold that finished after its edit result had gone out.
+pub struct ReadyFold {
+    pub text: String,
+    /// At least one NEW error (the done gate turns such a fold into a demand).
+    pub has_error: bool,
+}
+
+/// How long an edit waits for its diagnostics before handing the job to the loop. Long enough for
+/// a warm TypeScript/Go server to answer in the same result, short enough that rust-analyzer's
+/// multi-second re-check never holds an edit hostage (it used to block up to 3.5 s per edit).
+const EDIT_FEEDBACK_INLINE_MS: u64 = 300;
+/// A parked job older than this is dropped unread — its file has moved on.
+const PENDING_FOLD_MAX_AGE_SECS: u64 = 60;
+/// Caller files reported per fold, three diagnostics each.
+const CALLER_FILES_MAX: usize = 3;
 
 impl LspManager {
     fn new() -> Self {
@@ -196,6 +224,7 @@ impl LspManager {
             servers: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
             diag_baseline: Mutex::new(HashMap::new()),
+            pending_folds: Mutex::new(Vec::new()),
         }
     }
 
@@ -478,12 +507,15 @@ impl LspManager {
         }
         let handle = self.handle().ok()?;
         let f = file.clone();
+        let srv = Arc::clone(&server);
         let (tx, rx) = std::sync::mpsc::channel();
         handle.spawn(async move {
-            // Hard 3s wall-clock cap around re-open + re-analysis + (bounded) settle.
+            // The job runs on regardless of whether the edit waits for it: a generous wall-clock
+            // cap around re-open + re-analysis + (bounded) settle, since only the inline wait below
+            // is on the edit's critical path.
             let out = tokio::time::timeout(
-                Duration::from_secs(3),
-                server.diagnostics_bounded(&f, Duration::from_millis(1500)),
+                Duration::from_secs(20),
+                srv.diagnostics_bounded(&f, Duration::from_millis(4_000)),
             )
             .await;
             let _ = tx.send(match out {
@@ -491,31 +523,157 @@ impl LspManager {
                 _ => None,
             });
         });
-        let items = rx
-            .recv_timeout(Duration::from_millis(3_500))
-            .ok()
-            .flatten()?;
+        match rx.recv_timeout(Duration::from_millis(EDIT_FEEDBACK_INLINE_MS)) {
+            Ok(Some(items)) => Some(self.fold_items(&file, &items).0),
+            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Still analysing: park it. The loop folds the result into the next tool result,
+                // or the done gate — whichever comes first. The edit returns now.
+                self.pending_folds
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(PendingFold {
+                        file,
+                        server: Some(server),
+                        rx,
+                        started: std::time::Instant::now(),
+                    });
+                None
+            }
+        }
+    }
 
+    /// `now − baseline` for one file, baseline refreshed: the fold text and whether it carries a
+    /// NEW error. The first fold of a file has no baseline and reports only its errors, labelled
+    /// `current` — a pre-existing warning wall must not spam every edit.
+    fn fold_items(&self, file: &Path, items: &[DiagItem]) -> (String, bool) {
         let fingerprints: std::collections::HashSet<String> =
             items.iter().map(diag_fingerprint).collect();
-        let had_baseline;
-        let new_items: Vec<&DiagItem> = {
-            let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = base.get(&file);
-            had_baseline = prev.is_some();
-            let fresh: Vec<&DiagItem> = match prev {
+        let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = base.get(file);
+        let had_baseline = prev.is_some();
+        let fresh: Vec<&DiagItem> = match prev {
+            Some(prev) => items
+                .iter()
+                .filter(|d| !prev.contains(&diag_fingerprint(d)))
+                .collect(),
+            None => items.iter().filter(|d| d.severity == "error").collect(),
+        };
+        let has_error = fresh.iter().any(|d| d.severity == "error");
+        let text = format_edit_feedback(&fresh, had_baseline);
+        base.insert(file.to_path_buf(), fingerprints);
+        (text, has_error)
+    }
+
+    /// Drain the post-edit jobs that have finished since the last call. Each becomes one fold
+    /// naming its file, plus up to [`CALLER_FILES_MAX`] other files whose NEW errors the server
+    /// published after the edit (a caller the edit broke). Jobs still running stay parked unless
+    /// older than [`PENDING_FOLD_MAX_AGE_SECS`]; a job whose task died is dropped.
+    pub fn take_ready_feedback(&self) -> Vec<ReadyFold> {
+        let pending: Vec<PendingFold> =
+            std::mem::take(&mut *self.pending_folds.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ready = Vec::new();
+        let mut keep = Vec::new();
+        for p in pending {
+            match p.rx.try_recv() {
+                Ok(Some(items)) => {
+                    let (text, mut has_error) = self.fold_items(&p.file, &items);
+                    let name = p
+                        .file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.file.display().to_string());
+                    let mut text = text.replacen("[lsp] ", &format!("[lsp] {name}: "), 1);
+                    if let Some(server) = &p.server {
+                        for (line, err) in self.caller_folds(server, &p.file) {
+                            text.push('\n');
+                            text.push_str(&line);
+                            has_error |= err;
+                        }
+                    }
+                    ready.push(ReadyFold { text, has_error });
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if p.started.elapsed().as_secs() < PENDING_FOLD_MAX_AGE_SECS {
+                        keep.push(p);
+                    }
+                }
+            }
+        }
+        let mut slot = self.pending_folds.lock().unwrap_or_else(|e| e.into_inner());
+        keep.append(&mut slot);
+        *slot = keep;
+        ready
+    }
+
+    /// NEW errors in files OTHER than the edited one, against their own baselines — the callers.
+    /// A file with no baseline yet only gets one recorded (its wall is pre-existing until a later
+    /// fold proves otherwise), so the scan can never dump a project's existing errors on the model.
+    fn caller_folds(&self, server: &LspServer, edited: &Path) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut base = self.diag_baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let mut files = 0usize;
+        for (uri_str, items) in server.all_diagnostics() {
+            let Ok(path) = uri::uri_to_path(&uri_str) else {
+                continue;
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            if path == edited {
+                continue;
+            }
+            let fps: std::collections::HashSet<String> =
+                items.iter().map(diag_fingerprint).collect();
+            let fresh: Vec<&DiagItem> = match base.get(&path) {
                 Some(prev) => items
                     .iter()
-                    .filter(|d| !prev.contains(&diag_fingerprint(d)))
+                    .filter(|d| d.severity == "error" && !prev.contains(&diag_fingerprint(d)))
                     .collect(),
-                // First edit with no baseline: report only ERRORS (a pre-existing warning wall
-                // must not spam), labeled `current` not `new`.
-                None => items.iter().filter(|d| d.severity == "error").collect(),
+                None => Vec::new(),
             };
-            base.insert(file.clone(), fingerprints);
-            fresh
-        };
-        Some(format_edit_feedback(&new_items, had_baseline))
+            base.insert(path.clone(), fps);
+            if fresh.is_empty() || files >= CALLER_FILES_MAX {
+                continue;
+            }
+            files += 1;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            for d in fresh.iter().take(3) {
+                let first: String = d
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(140)
+                    .collect();
+                out.push((
+                    format!("  caller {name}:{}:{}  {first}", d.line, d.col),
+                    true,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Test seam: park a job whose sender the test controls.
+    #[cfg(test)]
+    pub(crate) fn park_fold_for_test(
+        &self,
+        file: PathBuf,
+        rx: std::sync::mpsc::Receiver<Option<Vec<DiagItem>>>,
+    ) {
+        self.pending_folds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(PendingFold {
+                file,
+                server: None,
+                rx,
+                started: std::time::Instant::now(),
+            });
     }
 
     /// Refresh the per-file fingerprint baseline (every fetch is the new truth).
@@ -1008,6 +1166,48 @@ mod tests {
             "no baseline → honest 'current' label: {s2}"
         );
         assert_eq!(format_edit_feedback(&[], true), "[lsp] no new diagnostics");
+    }
+
+    #[test]
+    fn take_ready_feedback_folds_finished_jobs_and_keeps_pending() {
+        let file = PathBuf::from("/tmp/aizen-fold-test/x.rs");
+        let mine = |folds: &[ReadyFold]| folds.iter().any(|f| f.text.contains("x.rs:"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        LSP.park_fold_for_test(file.clone(), rx);
+        // Still running → nothing ready, and it stays parked.
+        assert!(!mine(&LSP.take_ready_feedback()));
+        tx.send(Some(vec![DiagItem {
+            line: 3,
+            col: 1,
+            severity: "error",
+            message: "mismatched types".into(),
+            code: Some("E0308".into()),
+        }]))
+        .unwrap();
+        let ready = LSP.take_ready_feedback();
+        let fold = ready
+            .iter()
+            .find(|f| f.text.contains("x.rs:"))
+            .expect("the finished job is folded");
+        assert!(fold.has_error);
+        assert!(
+            fold.text
+                .starts_with("[lsp] x.rs: 1 current diagnostic(s) after edit:"),
+            "{}",
+            fold.text
+        );
+        assert!(
+            fold.text.contains("error 3:1  mismatched types [E0308]"),
+            "{}",
+            fold.text
+        );
+        // Drained: a second call does not report it again.
+        assert!(!mine(&LSP.take_ready_feedback()));
+        // A job whose task died (sender dropped) is discarded, not kept forever.
+        let (tx2, rx2) = std::sync::mpsc::channel::<Option<Vec<DiagItem>>>();
+        LSP.park_fold_for_test(file, rx2);
+        drop(tx2);
+        assert!(!mine(&LSP.take_ready_feedback()));
     }
 
     #[test]

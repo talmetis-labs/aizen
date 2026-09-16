@@ -24,6 +24,34 @@
 pub mod migrate_stems;
 pub mod reflect;
 pub mod self_mem;
+
+/// The persona gate (E4.7, quality plan M11): the costume, the character's self-memory and the
+/// agent identity cost up to ~1,900 tokens per turn and do nothing for a coding task. The REPL's
+/// per-turn lane refresh raises this while it builds the lanes for a tool-bound turn, and
+/// [`crate::agent::build_system_prompt_bundle`] leaves the three blocks out while it is up.
+/// Nothing else sets it — a hostbot lane, whose persona IS the product, never sees it.
+static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Raise or lower the gate. Returns a guard that restores the previous state on drop, so a
+/// panic inside the lane build cannot leave the persona switched off for the session.
+#[must_use = "the gate stays raised only while the guard is held"]
+pub fn suppress_for_turn(on: bool) -> SuppressGuard {
+    let prior = SUPPRESSED.swap(on, std::sync::atomic::Ordering::SeqCst);
+    SuppressGuard(prior)
+}
+
+/// Is the persona gate raised for the lane being built right now?
+pub fn suppressed() -> bool {
+    SUPPRESSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub struct SuppressGuard(bool);
+
+impl Drop for SuppressGuard {
+    fn drop(&mut self) {
+        SUPPRESSED.store(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 pub mod soul;
 
 use crate::core::config::aizen_home;
@@ -401,7 +429,34 @@ pub fn prompt_block() -> Option<String> {
 /// the character has no self-memory yet.
 pub fn self_block() -> Option<String> {
     let slug = active_slug()?;
-    self_mem::self_block(&slug, SELF_BLOCK_MAX_TOKENS)
+    let key = (aizen_home(), slug.clone());
+    if let Ok(adopted) = ADOPTED_SELF.lock() {
+        if let Some((k, block)) = adopted.as_ref() {
+            if *k == key {
+                return block.clone();
+            }
+        }
+    }
+    let block = self_mem::self_block(&slug, SELF_BLOCK_MAX_TOKENS);
+    if let Ok(mut adopted) = ADOPTED_SELF.lock() {
+        *adopted = Some((key, block.clone()));
+    }
+    block
+}
+
+/// The `<self>` block adopted for the current conversation, keyed by (home, persona slug). The
+/// self-store is rewritten by the post-turn reflection pass, and the block sits in the dynamic
+/// system lane ahead of the whole transcript — so re-reading it every turn would bust the prefix
+/// cache each time the character learned something. Like the frozen core, it is adopted at a
+/// conversation boundary and reused byte-for-byte until the next one.
+static ADOPTED_SELF: Mutex<Option<((PathBuf, String), Option<String>)>> = Mutex::new(None);
+
+/// Drop the adopted `<self>` block so the next build re-reads the store. Called at conversation
+/// boundaries by `refreshed_system_prompt_bundle`.
+pub fn forget_adopted_self() {
+    if let Ok(mut adopted) = ADOPTED_SELF.lock() {
+        *adopted = None;
+    }
 }
 
 #[cfg(test)]
@@ -741,6 +796,13 @@ mod tests {
                 8,
             )
             .unwrap();
+            // Within a conversation the block is the adopted copy (byte-stable for the prefix
+            // cache), so new experience shows up at the next conversation boundary, not mid-way.
+            assert!(
+                self_block().is_none(),
+                "adopted copy is reused until a boundary"
+            );
+            forget_adopted_self();
             let block = self_block().expect("self block renders once there is experience");
             assert!(block.contains("force-push"));
         });

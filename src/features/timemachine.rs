@@ -445,6 +445,10 @@ struct Journal {
     ref_name: Option<String>,
     #[serde(default)]
     new_oid: Option<String>,
+    /// Paths a restore removes because the target tree never had them (E5.1) — written before
+    /// the update touches the tree, so a crash mid-restore leaves the list for `time doctor`.
+    #[serde(default)]
+    removed: Vec<String>,
 }
 
 impl Journal {
@@ -465,6 +469,7 @@ impl Journal {
             preimage_id: None,
             ref_name: None,
             new_oid: None,
+            removed: Vec::new(),
         }
     }
 }
@@ -1129,6 +1134,138 @@ impl RepoContext {
         oids
     }
 
+    /// Objects in the store's OWN packs, read from each `.idx` with `show-index` — like
+    /// [`RepoContext::loose_object_ids`], an enumeration with no walk and no alternates in it.
+    fn packed_object_ids(&self) -> Vec<String> {
+        let pack_dir = self.store_git_dir.join("objects").join("pack");
+        let mut oids = Vec::new();
+        let Ok(rd) = fs::read_dir(&pack_dir) else {
+            return oids;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "idx") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&p) else {
+                continue;
+            };
+            let Ok(out) = self.git_output_stdin(["show-index"], &bytes, "private-store show-index")
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(oid) = line.split_whitespace().nth(1) {
+                    oids.push(oid.to_string());
+                }
+            }
+        }
+        oids
+    }
+
+    /// Objects reachable from the store's refs. `--missing=allow-any` keeps the walk alive across
+    /// a parent that lives only in the source repository — the case that kills `git gc` here.
+    fn reachable_object_ids(&self) -> Result<HashSet<String>> {
+        let out = self.git(
+            None,
+            ["rev-list", "--objects", "--missing=allow-any", "--all"],
+        )?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Drop every object the store owns that no ref reaches (E5.4, quality plan S8: retention
+    /// deleted refs, never bytes, so a store only ever grew). Selection is by OID, never by the
+    /// history walk the alternates cannot complete: the reachable set comes from a walk that
+    /// tolerates a missing parent, the owned set from the filesystem, and what is kept is
+    /// re-packed from that list before anything is deleted.
+    fn prune_unreachable(&self) -> Result<PruneReport> {
+        let objects = self.store_git_dir.join("objects");
+        let before_bytes = dir_size_bytes(&objects);
+        let owned: HashSet<String> = self
+            .loose_object_ids()
+            .into_iter()
+            .chain(self.packed_object_ids())
+            .collect();
+        let reachable = self.reachable_object_ids()?;
+        let drop: Vec<&String> = owned.iter().filter(|o| !reachable.contains(*o)).collect();
+        if drop.is_empty() {
+            return Ok(PruneReport {
+                owned: owned.len(),
+                pruned: 0,
+                before_bytes,
+                after_bytes: before_bytes,
+            });
+        }
+        let keep: Vec<&String> = owned.iter().filter(|o| reachable.contains(*o)).collect();
+        let pack_dir = objects.join("pack");
+        fs::create_dir_all(&pack_dir)
+            .with_context(|| format!("creating pack dir {}", pack_dir.display()))?;
+        let old_packs: Vec<PathBuf> = fs::read_dir(&pack_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "pack" || x == "idx"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The kept objects go into one fresh pack, named by git after their checksum. When the
+        // kept set equals an old pack's exactly, the names collide and the new pack IS the old
+        // one — it must survive the sweep below, so its name is read back and excluded.
+        let mut fresh_name: Option<String> = None;
+        if !keep.is_empty() {
+            let mut stdin = String::with_capacity(keep.len() * 41);
+            for oid in &keep {
+                stdin.push_str(oid);
+                stdin.push('\n');
+            }
+            let pack_base = strip_windows_verbatim(&pack_dir.join("pack"))
+                .to_string_lossy()
+                .replace('\\', "/");
+            let out = self.git_output_stdin(
+                ["pack-objects", "--non-empty", "-q", &pack_base],
+                stdin.as_bytes(),
+                "private-store pack-objects (prune)",
+            )?;
+            if !out.status.success() {
+                bail!(
+                    "re-packing the reachable objects failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !hash.is_empty() {
+                fresh_name = Some(format!("pack-{hash}"));
+            }
+        }
+        // Only now: the packs listed BEFORE the fresh one, and the unreachable loose copies.
+        for p in old_packs {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if fresh_name.as_deref() == Some(stem) {
+                continue;
+            }
+            let _ = fs::remove_file(p);
+        }
+        for oid in &drop {
+            if oid.len() > 2 {
+                let _ = fs::remove_file(objects.join(&oid[..2]).join(&oid[2..]));
+            }
+        }
+        let _ = self.git_output(None, ["prune-packed", "-q"]);
+        Ok(PruneReport {
+            owned: owned.len(),
+            pruned: drop.len(),
+            before_bytes,
+            after_bytes: dir_size_bytes(&objects),
+        })
+    }
+
     /// Compact the store's loose objects into a pack.
     ///
     /// `git gc` and `git repack` cannot do this job here, and that is not a tuning problem — it is
@@ -1493,7 +1630,17 @@ fn run_git_bounded(cmd: &mut Command, what: &str) -> Result<Output> {
 ///
 /// The caller configures stdio: `stdin` MUST be piped; stdout/stderr may be piped or null.
 fn run_git_piped_bounded(cmd: &mut Command, stdin_bytes: &[u8], what: &str) -> Result<Output> {
-    let timeout = git_op_timeout();
+    run_git_piped_bounded_within(cmd, stdin_bytes, what, git_op_timeout())
+}
+
+/// `run_git_piped_bounded` with the deadline passed in, so a test can shorten it for one child
+/// without setting `AIZEN_GIT_OP_TIMEOUT_SECS` for every git call in the process.
+fn run_git_piped_bounded_within(
+    cmd: &mut Command,
+    stdin_bytes: &[u8],
+    what: &str,
+    timeout: Duration,
+) -> Result<Output> {
     crate::core::proctree::prepare(cmd);
     let mut child = cmd
         .spawn()
@@ -2557,11 +2704,51 @@ pub fn clear() -> Result<usize> {
     Ok(n)
 }
 
-fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<()> {
+/// Bring the worktree to `commit`. Returns the paths that were in the worktree (tracked, or
+/// untracked and not ignored — a checkpoint's own coverage) and are absent from `commit`,
+/// which the update removed.
+///
+/// The temporary index is seeded from the source `.git/index` and then staged with `add -A`,
+/// exactly as a checkpoint is captured. Before E5.1 it was only seeded: a file created since
+/// the checkpoint was never in the source index, `read-tree -u` removes only what the index it
+/// starts from knows about, so the file survived and the verification in `restore_in` rolled
+/// the whole restore back — `/undo` failed on the file the agent had just created (quality plan
+/// S2). [`restore_in_reported`] stages and journals the list itself before applying; this is
+/// the one-shot form the rollback paths use.
+fn apply_tree(ctx: &RepoContext, commit: &str) -> Result<Vec<String>> {
+    let staged = stage_for_apply(ctx)?;
+    let removed = paths_absent_from(ctx, &staged.0, commit)?;
+    apply_staged(ctx, &staged, commit)?;
+    Ok(removed)
+}
+
+/// The preflight and the staged temporary index a restore applies from.
+fn stage_for_apply(ctx: &RepoContext) -> Result<TempIndex> {
     ctx.ensure_safe_filters()?;
     reparse_preflight(ctx)?;
     let idx = seed_index(ctx)?;
-    ctx.git(Some(&idx.0), ["read-tree", "--reset", "-u", commit])?;
+    ctx.git(Some(&idx.0), ["add", "-A", "--", "."])?;
+    Ok(idx)
+}
+
+/// Paths in `index` that `commit`'s tree does not have, sorted — what the update will remove.
+fn paths_absent_from(ctx: &RepoContext, index: &Path, commit: &str) -> Result<Vec<String>> {
+    let present = ctx.git(Some(index), ["ls-files", "-z"])?;
+    let target = ctx.git(None, ["ls-tree", "-r", "-z", "--name-only", commit])?;
+    let target: HashSet<&str> = target.split('\0').filter(|s| !s.is_empty()).collect();
+    let mut removed: Vec<String> = present
+        .split('\0')
+        .filter(|p| !p.is_empty() && !target.contains(p))
+        .map(str::to_string)
+        .collect();
+    removed.sort();
+    Ok(removed)
+}
+
+/// The update itself: entries in the staged index that `commit` lacks are removed from the
+/// worktree along with every other change.
+fn apply_staged(ctx: &RepoContext, staged: &TempIndex, commit: &str) -> Result<()> {
+    ctx.git(Some(&staged.0), ["read-tree", "--reset", "-u", commit])?;
     Ok(())
 }
 
@@ -2661,6 +2848,11 @@ fn capture_checkpoint_locked(
 }
 
 pub fn restore(id: u32) -> Result<Snapshot> {
+    restore_with_report(id).map(|(snap, _)| snap)
+}
+
+/// [`restore`], also naming the files it removed because the checkpoint never had them.
+pub fn restore_with_report(id: u32) -> Result<(Snapshot, Vec<String>)> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         &ctx.root,
@@ -2668,7 +2860,7 @@ pub fn restore(id: u32) -> Result<Snapshot> {
         None,
         "time restore",
     )?;
-    restore_in(&ctx, id)
+    restore_in_reported(&ctx, id)
 }
 
 /// Restore-by-id for callers that ALREADY hold the workspace writer lease (the agent loop takes it
@@ -2682,6 +2874,12 @@ pub fn restore_under_lease(id: u32) -> Result<Snapshot> {
 }
 
 fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
+    restore_in_reported(ctx, id).map(|(snap, _)| snap)
+}
+
+/// As [`restore_in`], also returning the paths the restore removed because the target never
+/// had them (E5.1) — every one of them is in the preimage checkpoint saved first.
+fn restore_in_reported(ctx: &RepoContext, id: u32) -> Result<(Snapshot, Vec<String>)> {
     let _store = ctx.store_shared()?;
     let _lock = ctx.lock()?;
     let mut ledger = ctx.load_ledger()?;
@@ -2723,10 +2921,15 @@ fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
     let mut journal = Journal::new(JournalKind::Restore, ledger.generation);
     journal.target_id = Some(id);
     journal.preimage_id = preimage_id;
+    // E5.1: stage the worktree the way a checkpoint sees it and journal what the restore will
+    // remove BEFORE it removes anything.
+    let staged = stage_for_apply(ctx)?;
+    let removed = paths_absent_from(ctx, &staged.0, &target.commit)?;
+    journal.removed = removed.clone();
     journal.phase = JournalPhase::Applying;
     ctx.save_journal(&journal)?;
 
-    if let Err(apply_error) = apply_tree(ctx, &target.commit) {
+    if let Err(apply_error) = apply_staged(ctx, &staged, &target.commit) {
         if let Some(pid) = preimage_id {
             if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
                 let _ = apply_tree(ctx, &preimage.commit);
@@ -2757,7 +2960,7 @@ fn restore_in(ctx: &RepoContext, id: u32) -> Result<Snapshot> {
     journal.phase = JournalPhase::LedgerCommitted;
     ctx.save_journal(&journal)?;
     ctx.clear_journal()?;
-    Ok(target)
+    Ok((target, removed))
 }
 
 fn save_preimage_locked(
@@ -2779,7 +2982,41 @@ fn save_preimage_locked(
     .id)
 }
 
+/// The checkpoints an `undo` would move between — `(current, target)` — without moving. The
+/// REPL shows the change this implies (a diff stat from the working tree to `target`) and asks
+/// before applying when the tree holds work no checkpoint has.
+pub fn undo_target() -> Result<(u32, u32)> {
+    let ctx = RepoContext::current()?;
+    let ledger = ctx.load_ledger()?;
+    let current = ledger
+        .cursor_id
+        .or_else(|| ledger.snapshots.last().map(|s| s.id))
+        .context("no checkpoints yet — save one with `aizen time save`")?;
+    let parent = ledger
+        .snapshots
+        .iter()
+        .find(|s| s.id == current)
+        .and_then(|s| s.parent)
+        .context("already at the oldest checkpoint")?;
+    Ok((current, parent))
+}
+
+/// Does the working tree differ from checkpoint `id`? `true` means a rewind would discard work
+/// that no checkpoint holds.
+pub fn working_tree_differs_from(id: u32) -> Result<bool> {
+    Ok(
+        !diff(&DiffSide::Checkpoint(id), &DiffSide::Working, &[], None)?
+            .files
+            .is_empty(),
+    )
+}
+
 pub fn undo() -> Result<Snapshot> {
+    undo_with_report().map(|(snap, _)| snap)
+}
+
+/// [`undo`], also naming the files it removed because the checkpoint never had them.
+pub fn undo_with_report() -> Result<(Snapshot, Vec<String>)> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         &ctx.root,
@@ -2798,10 +3035,15 @@ pub fn undo() -> Result<Snapshot> {
         .find(|s| s.id == current)
         .and_then(|s| s.parent)
         .context("already at the oldest checkpoint")?;
-    restore_in(&ctx, parent)
+    restore_in_reported(&ctx, parent)
 }
 
 pub fn redo() -> Result<Snapshot> {
+    redo_with_report().map(|(snap, _)| snap)
+}
+
+/// [`redo`], also naming the files it removed because the checkpoint never had them.
+pub fn redo_with_report() -> Result<(Snapshot, Vec<String>)> {
     let ctx = RepoContext::current()?;
     let _workspace = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
         &ctx.root,
@@ -2821,7 +3063,7 @@ pub fn redo() -> Result<Snapshot> {
         .max_by_key(|s| s.id)
         .map(|s| s.id)
         .context("already at the newest checkpoint on this branch")?;
-    restore_in(&ctx, child)
+    restore_in_reported(&ctx, child)
 }
 
 pub fn timeline() -> Result<(Vec<Snapshot>, Option<usize>)> {
@@ -3314,7 +3556,7 @@ pub fn doctor_repair() -> Result<DoctorReport> {
 /// Returns the health report plus what compaction reclaimed, so the CLI can report bytes rather than
 /// only "cleaned". The compaction half is `None` when packing could not run — a store that will not
 /// compact is still a store worth reporting on.
-pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>)> {
+pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>, Option<PruneReport>)> {
     let ctx = RepoContext::current()?;
     // Whole-store sweep: block every sibling worktree's ref creation/deletion for the scan+reap so a
     // concurrent `save` can't slip a ref past `for-each-ref`. Store-exclusive ordered before the
@@ -3403,9 +3645,12 @@ pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>)> {
     // and an explicit `gc` is exactly when the user is asking for space back — so compact
     // unconditionally here rather than waiting for `LOOSE_COMPACT_THRESHOLD`. Best-effort: a store
     // that cannot be packed is still a healthy store, and `doctor()` below reports what it finds.
+    // E5.4: drop what no ref reaches first (re-packing the rest by OID), then pack whatever
+    // loose objects remain. Both best-effort: a store that cannot be pruned is still healthy.
+    let pruned = ctx.prune_unreachable().ok();
     let compacted = ctx.compact_objects().ok();
     drop(_lock);
-    Ok((doctor()?, compacted))
+    Ok((doctor()?, compacted, pruned))
 }
 
 /// One private store found while sweeping `~/.aizen/timemachine/`. Two ways a store is an ORPHAN:
@@ -3430,6 +3675,17 @@ pub struct StoreEntry {
     pub superseded_by: Option<String>,
     pub bytes: u64,
     pub checkpoints: usize,
+}
+
+/// What one [`RepoContext::prune_unreachable`] pass reclaimed.
+#[derive(Debug, Clone, Serialize)]
+pub struct PruneReport {
+    /// Objects the store owned before the prune (loose + in its own packs).
+    pub owned: usize,
+    /// Of those, the ones no live ref reached — removed.
+    pub pruned: usize,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 /// What one [`RepoContext::compact_objects`] pass moved into a pack.
@@ -4194,11 +4450,17 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        std::env::set_var("AIZEN_GIT_OP_TIMEOUT_SECS", "2");
+        // The deadline is passed in, not set through `AIZEN_GIT_OP_TIMEOUT_SECS`: that variable
+        // is process-wide, and a two-second cap would also cut short any git call another test
+        // is running at the same moment.
         let start = std::time::Instant::now();
-        let res = run_git_piped_bounded(&mut cmd, &payload, "stdin-hostile child");
+        let res = run_git_piped_bounded_within(
+            &mut cmd,
+            &payload,
+            "stdin-hostile child",
+            Duration::from_secs(2),
+        );
         let elapsed = start.elapsed();
-        std::env::remove_var("AIZEN_GIT_OP_TIMEOUT_SECS");
 
         assert!(
             res.is_err(),
@@ -4290,6 +4552,57 @@ mod tests {
             reparse_checked: std::cell::Cell::new(true),
             skip_dirs: std::cell::RefCell::new(None),
         }
+    }
+
+    /// E5.1 (quality plan S2): a file created after a checkpoint is untracked until someone
+    /// commits it; restoring that checkpoint must remove it, name it, and the checkpoint taken
+    /// before the restore must bring it back.
+    #[test]
+    fn restore_removes_a_file_the_target_checkpoint_never_had_and_reports_it() {
+        if !git_available() {
+            return;
+        }
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = scratch("restore-home");
+        std::env::set_var("AIZEN_HOME", &home);
+        let root = scratch("restore-repo");
+        let init = git_cmd()
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .output()
+            .expect("git init");
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fs::write(root.join("f1.txt"), "one").unwrap();
+        let ctx = RepoContext::discover(&root).expect("context");
+        let first = save_in(&ctx, "first", false, None).expect("first checkpoint");
+        fs::write(root.join("f2.txt"), "two").unwrap(); // never `git add`ed
+        let second = save_in(&ctx, "second", false, None).expect("second checkpoint");
+        let (snap, removed) = restore_in_reported(&ctx, first.id).expect("restore to first");
+        assert_eq!(snap.id, first.id);
+        assert_eq!(
+            removed,
+            vec!["f2.txt".to_string()],
+            "the file the target never had is named"
+        );
+        assert!(!root.join("f2.txt").exists(), "…and gone");
+        assert_eq!(fs::read_to_string(root.join("f1.txt")).unwrap(), "one");
+        let (back, removed2) = restore_in_reported(&ctx, second.id).expect("forward again");
+        assert_eq!(back.id, second.id);
+        assert!(removed2.is_empty(), "{removed2:?}");
+        assert_eq!(
+            fs::read_to_string(root.join("f2.txt")).unwrap(),
+            "two",
+            "the preimage checkpoint brought it back"
+        );
+        std::env::remove_var("AIZEN_HOME");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// Only genuine loose objects count. `pack/`, `info/`, and git's `tmp_obj_*` scratch files share
@@ -4429,6 +4742,97 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "checkpoint tree became unreadable");
+        // E5.4: the prune's reachability walk must survive the same dangling parent, and it
+        // must keep everything the checkpoint reaches.
+        let prune = ctx
+            .prune_unreachable()
+            .expect("prune must survive a parent that lives only in the (gone) source");
+        assert_eq!(prune.pruned, 0, "everything here is reachable from the ref");
+        let out = git_cmd()
+            .env("GIT_DIR", &store)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .args(["cat-file", "-e", &format!("{commit}^{{tree}}")])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "prune must not touch reachable objects"
+        );
+    }
+
+    /// E5.4 (quality plan S8): an object no ref reaches is removed — loose or packed — and the
+    /// reachable ones come out the other side readable, in one fresh pack.
+    #[test]
+    fn prune_drops_unreachable_objects_and_keeps_reachable_ones() {
+        if !git_available() {
+            return;
+        }
+        let tmp = scratch("prune");
+        let store = tmp.join("store.git");
+        git_in(&tmp, &["init", "-q", "--bare", &store.to_string_lossy()]);
+        let kept_file = tmp.join("kept.txt");
+        fs::write(&kept_file, b"kept\n").unwrap();
+        let blob = git_in(
+            &store,
+            &["hash-object", "-w", "--", &kept_file.to_string_lossy()],
+        );
+        let index = tmp.join("prune.idx");
+        git_in_index(
+            &store,
+            Some(&index),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},kept.txt"),
+            ],
+        );
+        let tree = git_in_index(&store, Some(&index), &["write-tree"]);
+        let commit = git_in(&store, &["commit-tree", &tree, "-m", "checkpoint"]);
+        git_in(&store, &["update-ref", "refs/ng/tm/wt-test/1", &commit]);
+        // A blob nothing references: the shape retention leaves behind when it deletes a ref.
+        let orphan_file = tmp.join("orphan.txt");
+        fs::write(&orphan_file, b"nobody points at me\n").unwrap();
+        let orphan = git_in(
+            &store,
+            &["hash-object", "-w", "--", &orphan_file.to_string_lossy()],
+        );
+        let ctx = ctx_for_store(&tmp, &store);
+        // Pack everything first so the orphan sits INSIDE a pack, the harder case.
+        ctx.compact_objects().expect("compaction");
+        assert_eq!(ctx.loose_object_ids().len(), 0);
+        let report = ctx.prune_unreachable().expect("prune");
+        assert_eq!(report.owned, 4, "blob, tree, commit and the orphan");
+        assert_eq!(report.pruned, 1, "only the orphan goes");
+        let exists = |oid: &str| {
+            git_cmd()
+                .env("GIT_DIR", &store)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_device())
+                .args(["cat-file", "-e", oid])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(!exists(&orphan), "the orphan is gone");
+        assert!(
+            exists(&blob) && exists(&tree) && exists(&commit),
+            "the checkpoint is intact"
+        );
+        let packs: Vec<_> = fs::read_dir(store.join("objects").join("pack"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .collect();
+        assert_eq!(
+            packs.len(),
+            1,
+            "one fresh pack, the old one swept: {packs:?}"
+        );
+        // A second prune finds nothing and changes nothing.
+        let again = ctx.prune_unreachable().expect("prune again");
+        assert_eq!(again.pruned, 0);
     }
 
     /// An empty store is a no-op, not an error: `pack-objects` with no input would fail, and a save

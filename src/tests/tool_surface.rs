@@ -468,7 +468,7 @@ fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferre
     )));
 
     let top = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
-    assert!(top.contains("# Deferred integrations"), "note present");
+    assert!(top.contains("# Deferred tools"), "note present");
     assert!(top.contains("gh (2)"), "per-server count rendered");
     assert!(top.contains("`tool_search`"), "the note names the door");
     assert!(
@@ -479,7 +479,7 @@ fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferre
     // No deferred surface ⇒ the note vanishes entirely (zero bytes for the common case).
     builtin::swap_deferred_tools_for_test(None);
     let bare = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-26", "m", None);
-    assert!(!bare.contains("# Deferred integrations"));
+    assert!(!bare.contains("# Deferred tools"));
 
     builtin::swap_deferred_tools_for_test(prior_deferred);
     builtin::swap_active_tools_for_test(prior);
@@ -590,6 +590,71 @@ async fn invalid_arguments_produce_a_controlled_error_not_a_panic() {
     // Syntactically broken arguments are caught before dispatch.
     let msgs = run_scripted(&registry, vec![tool_call("file_read", "{not json")]).await;
     assert!(last_tool_result(&msgs).starts_with("error: invalid JSON arguments"));
+}
+
+fn scratch_file(name: &str, body: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("aizen-lenient-{}-{name}", std::process::id()));
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
+    // Hermes/Qwen-style `<tool_call>` block with an EMPTY native array: the loop must lift it into
+    // a real call and run the tool — not echo the block back as the final answer.
+    let registry = coder_registry();
+    let path = scratch_file(
+        "hermes.txt",
+        "recovered-marker-7f3a
+",
+    );
+    let block = serde_json::json!({
+        "name": "file_read",
+        "arguments": {"path": path.to_string_lossy()}
+    });
+    let text_turn = ChatTurn {
+        content: Some(format!(
+            "Let me read it.
+<tool_call>
+{block}
+</tool_call>"
+        )),
+        tool_calls: Vec::new(),
+        finish_reason: Some("stop".into()),
+        usage: None,
+        eager: Vec::new(),
+    };
+    let msgs = run_scripted(&registry, vec![text_turn]).await;
+    let result = last_tool_result(&msgs);
+    assert!(
+        result.contains("recovered-marker-7f3a"),
+        "the tool ran on the recovered call: {result}"
+    );
+    let call = msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        .expect("the assistant turn carries the recovered call");
+    assert!(call.tool_calls[0].id.starts_with("recovered-"));
+    assert_eq!(call.tool_calls[0].function.name, "file_read");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn almost_json_arguments_are_repaired_before_dispatch() {
+    // A trailing comma is the single most common local-model slip; it must not cost a round trip.
+    let registry = coder_registry();
+    let path = scratch_file(
+        "comma.txt",
+        "repaired-marker-9c1d
+",
+    );
+    let quoted = serde_json::to_string(&path.to_string_lossy()).unwrap();
+    let args = format!("{{\"path\": {quoted},}}");
+    let msgs = run_scripted(&registry, vec![tool_call("file_read", &args)]).await;
+    let result = last_tool_result(&msgs);
+    assert!(result.contains("repaired-marker-9c1d"), "{result}");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -706,7 +771,11 @@ fn prompt_construction_never_embeds_credentials() {
     assert!(!map.contains(SECRET));
     assert!(!map.contains("api_key"));
 
-    // The whole assembled prompt, with a credential live in the environment.
+    // The whole assembled prompt, with a credential live in the environment. Under the shared
+    // env lock: any test resolving an endpoint meanwhile would pick this key up.
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let prior = std::env::var("AIZEN_API_KEY").ok();
     std::env::set_var("AIZEN_API_KEY", SECRET);
     let prompt = crate::agent::build_system_prompt("/w", "linux", "2026-08-17", "m", None);
@@ -723,6 +792,11 @@ fn tool_definitions_never_carry_credential_values() {
     // Descriptions and schemas are model-facing text baked at registration; a tool that interpolated
     // a resolved secret into either would ship it on every request.
     const SECRET: &str = "tvly-test-SHOULDNOTLEAK";
+    // Under the shared env lock: a test that resolves the search key while the fake one is set
+    // would read this value as a configured key.
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let prior = std::env::var("TAVILY_API_KEY").ok();
     std::env::set_var("TAVILY_API_KEY", SECRET);
     let json = serde_json::to_string(&coder_registry().defs()).unwrap();
@@ -731,4 +805,31 @@ fn tool_definitions_never_carry_credential_values() {
         None => std::env::remove_var("TAVILY_API_KEY"),
     }
     assert!(!json.contains(SECRET), "a tool definition leaked a key");
+}
+
+// ── 8. the five search tools end on the same routing sentence ─────────────────────────────
+
+#[test]
+fn the_search_tools_share_one_routing_sentence() {
+    // Each used to name a different subset of its siblings; the model now reads one rule on
+    // whichever tool it is looking at. The LSP pair is checked when the registry carries it.
+    let registry = coder_registry();
+    for name in ["file_glob", "search_files", "codebase_search"] {
+        let t = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        assert!(
+            t.description().ends_with(crate::search_routing!()),
+            "{name}: {}",
+            t.description()
+        );
+    }
+    for name in ["lsp_workspace_symbol", "read_symbol"] {
+        if let Some(t) = registry.get(name) {
+            assert!(
+                t.description().ends_with(crate::search_routing!()),
+                "{name}"
+            );
+        }
+    }
 }

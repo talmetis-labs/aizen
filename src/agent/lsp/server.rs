@@ -910,6 +910,17 @@ impl LspServer {
         }
     }
 
+    /// Every document's latest push snapshot as `(uri, items)` — the whole-workspace view the
+    /// post-edit fold reads to catch a CALLER the edit broke, not only the edited file.
+    pub fn all_diagnostics(&self) -> Vec<(String, Vec<DiagItem>)> {
+        self.diags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, p)| (k.clone(), p.items.iter().map(to_diag_item).collect()))
+            .collect()
+    }
+
     fn push_seq(&self, key: &str) -> Option<u64> {
         self.diags
             .lock()

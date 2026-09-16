@@ -27,6 +27,13 @@ const PROFILE_CASES: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/bench-fixtures/profile.jsonl"
 ));
+/// Tier hints: sentences the write-path classifier must file as `project` (they name the work)
+/// or leave as `user`. Guards the profile from absorbing another project's notes as the
+/// person's preferences (quality plan M3).
+const TIER_HINT_CASES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench-fixtures/tier-hints.jsonl"
+));
 const DIALECTIC_MEMORIES: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/bench-fixtures/dialectic-memories.jsonl"
@@ -65,6 +72,17 @@ struct ProfileCase {
     excludes: Vec<String>,
     #[serde(default)]
     min_confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TierHintCase {
+    id: String,
+    text: String,
+    /// Lineage places, narrowest first (the project directory is what names the work).
+    #[serde(default)]
+    places: Vec<String>,
+    /// `project` or `user`.
+    expect: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,7 +273,33 @@ fn eval_profile_case(case: &ProfileCase) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Entry point for `aizen bench profile`.
+/// One tier-hint case through the real classifier, with a lineage built from the case.
+fn eval_tier_hint(case: &TierHintCase) -> std::result::Result<(), String> {
+    use crate::memory::learning::tiering;
+    use crate::memory::path_scope::Lineage;
+    let cwd = case
+        .places
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "c:/users/admin/work/proj".to_string());
+    let lin = Lineage {
+        cwd,
+        places: case.places.clone(),
+        device: "dev-bench".to_string(),
+        home: Some("c:/users/admin".to_string()),
+    };
+    let got = if tiering::mentions_project(&case.text, &lin) {
+        "project"
+    } else {
+        "user"
+    };
+    if got != case.expect {
+        return Err(format!("classified as {got}, expected {}", case.expect));
+    }
+    Ok(())
+}
+
+/// Entry point for `aizen bench profile`: the profile golden set, then the tier hints.
 pub fn run_profile() -> Result<()> {
     let cases: Vec<ProfileCase> = parse_jsonl(PROFILE_CASES, "profile.jsonl")?;
     lint_profile(&cases)?;
@@ -270,11 +314,34 @@ pub fn run_profile() -> Result<()> {
             }
         }
     }
+    let hints: Vec<TierHintCase> = parse_jsonl(TIER_HINT_CASES, "tier-hints.jsonl")?;
+    {
+        let mut seen = HashSet::new();
+        for h in &hints {
+            if !seen.insert(h.id.as_str()) {
+                bail!("duplicate tier-hint case id '{}'", h.id);
+            }
+            if !matches!(h.expect.as_str(), "project" | "user") {
+                bail!("tier-hint {}: expect must be project|user", h.id);
+            }
+        }
+    }
+    println!("tier hints: {} golden case(s)", hints.len());
+    for h in &hints {
+        match eval_tier_hint(h) {
+            Ok(()) => println!("  ✓ {}", h.id),
+            Err(e) => {
+                eprintln!("  ✗ {} — {e}", h.id);
+                failed += 1;
+            }
+        }
+    }
+    let total = cases.len() + hints.len();
     if failed == 0 {
-        println!("PROFILE GATE: PASS ({n}/{n} golden cases)", n = cases.len());
+        println!("PROFILE GATE: PASS ({total}/{total} golden cases)");
         Ok(())
     } else {
-        eprintln!("PROFILE GATE: FAIL ({failed}/{} cases)", cases.len());
+        eprintln!("PROFILE GATE: FAIL ({failed}/{total} cases)");
         std::process::exit(1);
     }
 }
