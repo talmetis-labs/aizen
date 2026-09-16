@@ -11,6 +11,17 @@ Phase 0 of the 2026-09-14 quality plan (`docs/execution-plan-2026-09-14.md`): th
 handing the model false inputs, and starts measuring what it sends.
 
 ### Added
+- **`aizen agent --output-format json`** — the run as one JSON object per line on stdout:
+  `start`, `text` deltas, `tool_call` / `tool_result`, `plan`, `diff`, `verify`, `warning`,
+  `trace`, `hook`, `session`, `done` (stop reason, answer, this run's tokens) and `error`; a
+  destructive call asks with an `approval_request` and reads the answer from stdin. The contract
+  a front-end or a CI script builds on instead of parsing the transcript's glyphs, which every
+  cosmetic change used to break in silence.
+- **Hooks.** `hooks` in `cli-config.json` runs your own commands around the loop: `pre_tool`
+  (after the safety floor, before the prompt — exit `2` denies, `{"decision":"allow"}`
+  pre-approves), `post_tool` (what it prints joins the tool result the model reads) and `stop`.
+  One JSON object on stdin, the same sandbox runner as every child, and a hook that merely fails
+  never blocks the run. `aizen hooks` lists them; `AIZEN_NO_HOOKS=1` turns them off.
 - **Per-request usage ledger in every session file.** Each model call's input, output, cached
   and cache-write tokens are appended to `meta.usage` on autosave (rows capped, totals exact,
   turn-numbered, safe across `/resume` and across processes). `/cost` shows the session's cached

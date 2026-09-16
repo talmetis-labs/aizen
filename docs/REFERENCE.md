@@ -609,8 +609,42 @@ aizen agent --max-iters 40 "..."                            # raise the step cap
 aizen agent --save-session "..."                            # keep the transcript for /sessions
 aizen agent --effort high "..."                             # this run only; the config is untouched
 aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat --image for more
+aizen agent --output-format json "..."                      # one JSON event per line on stdout (front-ends, CI)
 ```
 Behavior worth knowing:
+- **Machine-readable output.** `--output-format json` turns the run into one JSON object per line
+  on stdout, and nothing else on stdout — the contract a front-end, an editor extension or a CI
+  script builds on instead of parsing the human transcript by its leading glyphs. Every line has
+  a `type`; fields are only ever added, so ignore what you do not know:
+
+  | `type` | fields |
+  |---|---|
+  | `start` | `version`, `model`, `cwd`, `effort`, `images`, `pid` |
+  | `text` | `delta` — a fragment of the answer, in order; concatenate them for the raw markdown |
+  | `reasoning` | `delta` — the model's reasoning channel, when the provider exposes one |
+  | `tool_call` | `seq`, `name`, `args`, `target` |
+  | `tool_result` | `seq`, `name`, `target`, `ok`, `digest`, `elapsed_ms`, `output` (cut at 64 KB, then `truncated: true`) |
+  | `plan` | `items[{status: pending \| in_progress \| done, text}]` — the todo panel as last written |
+  | `diff` | `path`, `added`, `removed` — the size of an edit (its text is in the `tool_result`) |
+  | `verify` | `command`, `detail` — a verify-gate line |
+  | `warning` | `kind` (`blocked`, `caution`, `network`), `text` — the safety floor spoke |
+  | `trace` | `text` — any other progress line the transcript would have shown, styling stripped |
+  | `hook` | `event`, `run`, `decision`, `reason`, `context`, `exit`, `timed_out`, `error`, `elapsed_ms` |
+  | `approval_request` | `id`, `tool`, `args`, `who` (a sub-agent's label), `preview{title, lines, diff}` |
+  | `approval` | `id`, `decision` — what stdin answered (`deny` with `reason: "stdin closed"` on EOF) |
+  | `session` | `slug`, `path` (with `--save-session`), or `error` |
+  | `done` | `stop`, `steps`, `final_text`, `question` (with `awaiting_input`), `session`, `usage{calls, input, output, cached, cache_write}` |
+  | `error` | `message` — the run died; the exit code is non-zero |
+
+  `stop` is one of `done`, `divergence`, `max_iters`, `verification_failed`, `awaiting_input`,
+  `cancelled`, `deadline`. **Approvals are answered on stdin**: when a destructive call needs a
+  decision the run writes `approval_request` and blocks until a line
+  `{"type":"approval","id":<id>,"decision":"allow"}` arrives — `deny`, `allow_tool` (this tool for
+  the rest of the run) and `allow_all` (every later call, as `--yes` from here on) are the other
+  answers, and a closed stdin is a deny, exactly as a non-TTY run has always been. Lines that are
+  not a reply to the pending request are ignored. Nothing else changes: `--yes`, `--save-session`,
+  `--effort` and `--image` mean what they mean in text mode, and the exit code is `0` for every
+  `done` (read `stop`) and `1` for `error`.
 - **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
   it writes no session file by default — a file per invocation would bury the pool `/sessions` reads.
   Saved conversations are bounded: `sessions_keep` (default 200) and `sessions_max_bytes`
@@ -800,6 +834,43 @@ Behavior worth knowing:
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
   seed URL (see `aizen crawl` below). Read-only; available to every role except `argus`, whose
   whole job is inside the repository.
+
+### Hooks — your own commands around the loop
+Three points of every run take a command of yours, configured under `hooks` in
+`~/.aizen/cli-config.json` — your file, never the repository's, so a cloned checkout cannot plant
+one:
+
+```json
+"hooks": {
+  "pre_tool":  [{ "match": "shell_run",            "run": "python ~/hooks/guard.py" }],
+  "post_tool": [{ "match": "file_edit|file_write", "run": "cargo fmt --quiet", "timeout_secs": 60 }],
+  "stop":      [{ "run": "notify-send aizen 'run finished'" }]
+}
+```
+
+- **`pre_tool`** runs before a tool call — after the hard safety floor, which no hook can
+  override, and before the approval prompt, which a hook can answer. Exit `2` (stderr becomes the
+  reason) or print `{"decision":"deny","reason":"…"}` to refuse the call: the model is told
+  `blocked by hook …` and moves on. Print `{"decision":"allow"}` to run it without asking the
+  user. Say nothing (exit `0`, no JSON) and the call proceeds as it would have.
+- **`post_tool`** runs after the call, with its result. Whatever it prints — or the `context` field
+  of a JSON line — is appended to the tool result the model reads, under a `[hook …]` heading, so a
+  formatter's or a checker's verdict reaches the model on the same step, with no extra round-trip.
+- **`stop`** runs when a top-level run ends: a one-shot, a REPL turn, a bot message. Its output is
+  only traced.
+
+`match` is a tool name, a glob with `*` (`file_*`), or `|`-separated alternatives; absent means
+every tool (`stop` hooks have no tool). Each hook reads one JSON object on stdin — `event`, `cwd`,
+`session`, `dispatch` (the sub-agent label when a delegated child made the call), `pid`, `time`,
+and for tool events `tool` and `args`, plus `result` (cut at 32 KB) and `ok` after the call; a
+`stop` hook gets `stop` (the reason word), `steps` and `final_text` — and sees `AIZEN_HOOK_EVENT`
+and `AIZEN_HOOK_TOOL` in its environment. It runs in the run's working directory through the same
+sandbox runner as every other child, with the network allowed and Aizen's own secrets scrubbed
+from its environment, under a wall clock (`timeout_secs`, default 30). A hook that fails — cannot
+start, exits non-zero other than `2`, or times out — is reported and never stops the run; only a
+deliberate deny blocks. `aizen hooks` lists what is configured; `AIZEN_NO_HOOKS=1` turns every
+hook off. On the JSON stream each run is a `hook` event; in the transcript it is one `→ hook …`
+line.
 
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
@@ -1194,7 +1265,8 @@ background chores race the turn and land on the tape in arrival order.
 
 ## Exit codes
 `0` success · `1` error (bad args, network/HTTP failure, a bench gate FAIL). The agent loop
-returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr.
+returns `0` even if it stops on the step limit or divergence — it prints the reason to stderr
+(with `--output-format json`, the `stop` field of the `done` event; an `error` event is a `1`).
 
 ## Safety model
 Three layers, bottom to top. (1) A **hard safety floor** — a deterministic blocklist (`rm -rf /`
