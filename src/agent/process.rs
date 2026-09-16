@@ -446,9 +446,9 @@ impl Tool for Process {
             "additionalProperties": false,
             "properties": {
                 "action": {"type": "string", "enum": ["start", "list", "log", "status", "wait", "kill", "write"]},
-                "command": {"type": "string", "description": "the command (action=start)"},
-                "cwd": {"type": "string", "description": "working dir (action=start)"},
-                "network": {"type": "boolean", "description": "network access, even to bind a port (action=start; default false; approval-gated)"},
+                "command": {"type": "string", "description": "the command (start)"},
+                "cwd": {"type": "string", "description": "working dir (start)"},
+                "network": {"type": "boolean", "description": "network access, even to bind a port (start; approval-gated)"},
                 "id": {"type": "string", "description": "proc_<n> handle (all but start/list)"},
                 "cursor": {"type": "integer", "description": "a previous next_cursor: only newer output (log/wait)"},
                 "format": crate::agent::result_format::schema_property(),

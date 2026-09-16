@@ -559,6 +559,18 @@ const DEFERRED_ALWAYS: &[&str] = &[
     "skill_install",
     "team_status",
     "notify",
+    // The language-server query and symbolic-edit surface, concept search and session recall:
+    // 4 of ~2,800 tool calls across 79 saved sessions (2026-09-16) for 7.4 KB of schema on every
+    // coding turn. `read_symbol`, `lsp_document_symbols` and `lsp_diagnostics` stay — they are
+    // the ones that get called.
+    "lsp_references",
+    "lsp_definition",
+    "lsp_hover",
+    "lsp_workspace_symbol",
+    "symbol_replace",
+    "symbol_insert",
+    "codebase_search",
+    "session_recall",
 ];
 
 /// Deferred on top of [`DEFERRED_ALWAYS`] when the conversation is a pure question: nothing is
@@ -1445,10 +1457,10 @@ impl Tool for MemorySearch {
         "memory_search"
     }
     fn description(&self) -> &str {
-        "Find a stored fact about the user or project by lexical/semantic match. Use to recall a \
-         specific past fact — project knowledge lives HERE (not in the always-on <user_memory> \
-         block, which only holds STYLE + global prefs). Not for the user's overall preferences → \
-         use memory_profile. Searches the current workspace + global facts by default. Read-only."
+        "Find a stored fact about the user or project by lexical/semantic match — project \
+         knowledge lives HERE, not in the always-on <user_memory> block (STYLE + global prefs \
+         only). Not for the user's overall preferences → memory_profile. Searches the current \
+         workspace + global facts by default. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1457,7 +1469,7 @@ impl Tool for MemorySearch {
                 "query": {"type": "string", "description": "what to recall"},
                 "limit": {"type": "integer", "description": "max hits (default 5)"},
                 "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "zones to search: current project + global (default), all zones, or global-only"},
-                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "restrict to one KIND of project knowledge (optional) — e.g. only past bugs, or only what previously FAILED so you don't retry a dead end"}
+                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "restrict to one KIND of project knowledge — e.g. only past bugs, or only what previously FAILED"}
             },
             "required": ["query"],
             "additionalProperties": false
@@ -1654,10 +1666,10 @@ impl Tool for MemoryList {
         "memory_list"
     }
     fn description(&self) -> &str {
-        "Inventory the stored facts (id · type · zone · category · one-line summary) with NO query \
-         — use to answer 'what do you remember?', to audit what's saved before editing/forgetting, \
-         or to find the exact id `memory_update`/`memory_forget` needs. Not for finding one fact by \
-         topic → use memory_search. Read-only."
+        "Inventory the stored facts (id · type · zone · category · summary) with NO query — for \
+         'what do you remember?', an audit before editing/forgetting, or the exact id \
+         memory_update / memory_forget needs. Not for one fact by topic → memory_search. \
+         Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2062,12 +2074,12 @@ impl Tool for FileRead {
         "file_read"
     }
     fn description(&self) -> &str {
-        "Read a file (optionally a 1-based start/end line range), or SEVERAL files in ONE call via \
-         files:[{path,start,end},…] — batch independent reads instead of one per turn. Use before \
-         editing. Set number:true to prefix each line with its 1-based number (`N|line`) — leave it \
-         off (the default) when you'll feed the text back into file_edit's old_string. A relative \
-         path resolves under the working directory; absolute or `../` paths read elsewhere too. For \
-         ONE named item prefer lsp_document_symbols + read_symbol over dumping the file. Read-only."
+        "Read a file, a 1-based start/end line range, or SEVERAL files in ONE call via \
+         files:[{path,start,end},…] — batch independent reads instead of one per turn. Use \
+         before editing. number:true prefixes each line with `N|`; leave it off when the text \
+         feeds file_edit's old_string. A relative path resolves under the working directory; \
+         absolute or `../` paths read elsewhere. For ONE named item prefer lsp_document_symbols \
+         + read_symbol over the whole file. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2278,12 +2290,15 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        concat!("Find files AND directories by name or glob (*, **, ?) — use this, not a shell command, to \
-         locate a file/folder. A bare name (`Cargo.toml`) runs a ranked, typo-tolerant search across \
-         the working dir, its parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a \
-         `../`/absolute path targets a specific place. Case-insensitive unless the pattern has an \
-         uppercase letter. Sees everything (dotfiles, target/, node_modules/) unless ignore:true; a \
-         bare-name search always skips heavy dirs. Read-only.", crate::search_routing!())
+        concat!(
+            "Find files AND directories by name or glob (*, **, ?) — use this, not a shell command. \
+             A bare name (`Cargo.toml`) is a ranked, typo-tolerant search over the working dir, its \
+             parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a `../`/absolute path \
+             targets one place. Case-insensitive unless the pattern has an uppercase letter. Sees \
+             dotfiles, target/, node_modules/ unless ignore:true; a bare-name search always skips \
+             heavy dirs. Read-only.",
+            crate::search_routing!()
+        )
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2670,13 +2685,12 @@ impl Tool for FileEdit {
         })
     }
     fn description(&self) -> &str {
-        "Edit a file by exact string replacement. ONE edit → old_string + new_string. SEVERAL edits \
-         to the SAME file → pass `edits` instead, in one atomic call (all succeed or nothing is \
-         written) — always prefer that over repeat calls. old_string must be unique unless \
-         replace_all (which applies on every matching rung, not only the exact one); \
-         indentation-tolerant retry if the exact text misses. dry_run:true shows the diff and \
-         writes nothing. To create or fully rewrite a whole file, use file_write. Read the file \
-         first. An absolute or `../` path may write outside the working directory."
+        "Edit a file by exact string replacement. ONE edit → old_string + new_string; SEVERAL \
+         edits to the same file → `edits`, one atomic call (all or nothing) — always prefer \
+         that over repeat calls. old_string must be unique unless replace_all; an \
+         indentation-tolerant retry runs when the exact text misses. dry_run shows the diff and \
+         writes nothing. To create or fully rewrite a file use file_write. Read the file first. \
+         Absolute or `../` paths may write outside the working directory."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2789,12 +2803,11 @@ impl Tool for FileWrite {
         })
     }
     fn description(&self) -> &str {
-        "Create a file, or COMPLETELY overwrite an existing one, with the given content — the whole \
-         file in one call. Use this to write a new file, or to rewrite a file from scratch. NEVER \
-         blank or build files with shell (`type NUL > f`, `> f`, `echo >`, heredocs) — use this \
-         tool. For a small change to an existing file, prefer file_edit. The parent directory must \
-         already exist. A relative path resolves under the working directory; an absolute path or \
-         a leading `../` may write ANYWHERE on disk."
+        "Create a file, or COMPLETELY overwrite an existing one, with the whole content in one \
+         call. NEVER blank or build files with shell (`> f`, `echo >`, heredocs) — use this \
+         tool. For a small change to an existing file prefer file_edit. The parent directory \
+         must exist. A relative path resolves under the working directory; absolute or `../` \
+         paths may write ANYWHERE on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2913,12 +2926,11 @@ impl Tool for FileMove {
         })
     }
     fn description(&self) -> &str {
-        "Rename or move a file or directory (from → to) in a single call. Use this instead of \
-         shelling out to mv / move / Rename-Item. An existing destination is a hard error unless \
-         `overwrite` is true (so you never clobber a file by accident). Set `create_dirs` true to \
-         create missing parent directories of the destination. Preserves file metadata (it is an \
-         OS-level rename on the same drive). Relative paths resolve under the working directory; an \
-         absolute path or a leading `../` may move ANYWHERE on disk."
+        "Rename or move a file or directory (from → to) — use this, not mv / move / \
+         Rename-Item. An existing destination is an error unless `overwrite`; `create_dirs` \
+         creates missing parents. An OS-level rename on the same drive, metadata kept. Relative \
+         paths resolve under the working directory; absolute or `../` paths may move ANYWHERE \
+         on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -3771,20 +3783,20 @@ impl Tool for ShellRun {
         })
     }
     fn description(&self) -> &str {
-        "Run a shell command in the working directory and return its stdout/stderr + exit code. \
-         Use to build, test, run tools, or manage files. For content search use search_files (not \
-         grep here). Wall-clock cap: 120s by default (AIZEN_SHELL_TIMEOUT_SECS overrides it, \
-         10..3600) — on timeout the whole process tree is killed. For anything that should keep \
-         running (dev servers, watchers, very long builds) use the process tool instead, which has \
-         no cap. Destructive — the user is asked to confirm."
+        "Run a shell command in the working directory; returns stdout/stderr + exit code. \
+         Build, test, run tools, manage files. For content search use search_files, not grep \
+         here. Cap 120s by default (AIZEN_SHELL_TIMEOUT_SECS, 10..3600); on timeout the whole \
+         process tree is killed. For anything that should keep running (dev servers, watchers, \
+         long builds) use the process tool, which has no cap. Destructive — the user is asked \
+         to confirm."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "cwd": {"type": "string", "description": "optional working dir for the command (a subdir, or a ../ or absolute path elsewhere)"},
-                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where the platform can enforce it). Approval-gated escalation."},
+                "cwd": {"type": "string", "description": "optional working dir (a subdir, or a ../ or absolute path)"},
+                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where it can). Approval-gated."},
                 "format": crate::agent::result_format::schema_property()
             },
             "required": ["command"],

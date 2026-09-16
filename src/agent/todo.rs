@@ -334,12 +334,12 @@ impl Tool for TodoWrite {
         "todo_write"
     }
     fn description(&self) -> &str {
-        "Track a multi-step task as a visible checklist. Send the COMPLETE current list every call \
-         (it REPLACES the previous one). Use it to plan multi-file / hard-to-undo work and to mark \
-         progress: set ONE item to in_progress at a time, flip it to done before starting the next. \
-         Not for trivial one-step tasks. Optional confidence (0–100) at assign/done and \
-         hill_climbable (0–100) for quantifiable goals. The list is shown to the user and resets on \
-         /clear. Leaving items incomplete will block Done (harness poke)."
+        "Track a multi-step task as a visible checklist. Send the COMPLETE list every call (it \
+         REPLACES the previous one). Use it for multi-file or hard-to-undo work: ONE item \
+         in_progress at a time, flip it to done before starting the next. Not for trivial \
+         one-step tasks. Optional confidence (0–100) at assign/done and hill_climbable (0–100) \
+         for quantifiable goals. Shown to the user; resets on /clear. Incomplete items block \
+         Done (harness poke)."
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()

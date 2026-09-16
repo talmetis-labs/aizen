@@ -109,13 +109,13 @@ impl Tool for SearchFiles {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "pattern": {"type": "string", "description": "a regular expression to match against each line"},
+                "pattern": {"type": "string", "description": "regular expression matched against each line"},
                 "path": {"type": "string", "description": "directory to search (subdir, ../ or absolute)"},
                 "glob": {"type": "string", "description": "file glob, e.g. *.rs or src/**/*.ts"},
                 "ignore_case": {"type": "boolean", "description": "case-insensitive match (default false)"},
                 "hidden": {"type": "boolean", "description": "also hidden and .gitignored paths (default false)"},
-                "max_results": {"type": "integer", "description": "cap on matches returned (default 200)"},
-                "context": {"type": "integer", "description": "context lines around each match, grep -C (default 0, max 10)"},
+                "max_results": {"type": "integer", "description": "cap (default 200)"},
+                "context": {"type": "integer", "description": "±N lines around each match (default 0, max 10)"},
                 "format": crate::agent::result_format::schema_property()
             },
             "required": ["pattern"]

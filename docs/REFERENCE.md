@@ -1101,9 +1101,13 @@ servers exceeds it, the **largest servers defer first** until the advertised rem
 **Built-in tools defer too, where it is safe.** On first-party APIs (`api.anthropic.com`,
 `api.openai.com`) the rarely-used built-ins — `workflow`, `persona_create`, `checkpoint` /
 `checkpoint_view`, the memory and skill write surface (`memory_save`/`update`/`forget`/`ask`/
-`profile`, `skill_save`/`refine`/`forget`/`search`/`install`), `team_status`, `notify`, and
-`web_crawl` outside research turns — ride behind `tool_search` instead of on every request
-(about 14.5 KB of the 42 KB schema block); a conversation that is a pure question also defers
+`profile`, `skill_save`/`refine`/`forget`/`search`/`install`), `team_status`, `notify`, the
+language-server query and symbolic-edit tools (`lsp_references`/`definition`/`hover`/
+`workspace_symbol`, `symbol_replace`/`insert` — `read_symbol`, `lsp_document_symbols` and
+`lsp_diagnostics` stay), `codebase_search`, `session_recall`, and `web_crawl` outside research
+turns — ride behind `tool_search` instead of on every request (about 22 KB of the 40 KB
+schema block; the cut was measured on 79 saved sessions: those tools took 4 of ~2,800 calls);
+a conversation that is a pure question also defers
 `process`, `file_move` and `task`. The set is decided by the conversation's shape (question ·
 small edit · multi-file · research, classified from the prompt in English or Vietnamese) and only
 ever widens, so the advertised tool list stays byte-stable. Elsewhere it is off for the reason

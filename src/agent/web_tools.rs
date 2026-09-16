@@ -56,13 +56,12 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &str {
-        "Fetch an absolute http(s) URL and return its content in the most useful form for that \
-         site: YouTube → title + transcript; a tweet/X status → text + stats; GitHub repo/file/\
-         tree/issue/PR → API-backed content; Hacker News item → story + top comments; Wikipedia → \
-         summary + article; RSS/Atom feeds (incl. the arXiv API) → parsed items; anything else → \
-         readable text, automatically falling back to the Jina reader when a page is blocked or \
-         JS-only (reddit/linkedin/x profiles go straight there). Backends fall over automatically \
-         — see /reach. Not a search engine — to FIND a URL first use web_search. Read-only."
+        "Fetch an absolute http(s) URL in the most useful form for that site: YouTube → title + \
+         transcript; an X status → text + stats; GitHub repo/file/tree/issue/PR → API-backed \
+         content; Hacker News → story + top comments; Wikipedia → summary + article; RSS/Atom \
+         (incl. the arXiv API) → parsed items; anything else → readable text, falling back to \
+         the Jina reader when a page is blocked or JS-only. Backends fail over automatically \
+         (see /reach). Not a search engine — web_search FINDS the URL. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -134,12 +133,11 @@ impl Tool for WebSearch {
         "web_search"
     }
     fn description(&self) -> &str {
-        "Search the web (Tavily → Jina; an API key is required — set AIZEN_TAVILY_API_KEY) and \
-         return the top results as title + URL + snippet, deduped and spread across domains. Use to FIND pages \
-         relevant to a query, then web_fetch a result URL to read it. Pass 'queries' (a list of \
-         2–3 DIFFERENT-angle phrasings) to fan out in one call — the union is merged and deduped, \
-         giving broader coverage than a single query. Optional 'site' searches one platform's own \
-         index instead: github (repositories), hackernews, stackoverflow, wikipedia. Read-only."
+        "Search the web (Tavily → Jina; needs AIZEN_TAVILY_API_KEY) and return title + URL + \
+         snippet per hit, deduped across domains. Use to FIND pages, then web_fetch a result. \
+         Pass `queries` (2–3 different-angle phrasings) to fan out in one call — broader than a \
+         single query. Optional `site` searches one platform's index: github, hackernews, \
+         stackoverflow, wikipedia. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -150,7 +148,7 @@ impl Tool for WebSearch {
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "2–3 different-angle queries to fan out and merge (use instead of 'query' for research breadth)"
+                    "description": "2–3 different-angle queries, merged and deduped (prefer over 'query' for breadth)"
                 },
                 "limit": {"type": "integer", "description": "max results (default 5, max 10)"},
                 "site": {

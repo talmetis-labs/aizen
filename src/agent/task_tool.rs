@@ -616,29 +616,26 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Dispatch exactly ONE bounded sub-agent (fresh context) and return its result. Use for a \
-         focused investigation or contained implementation with one clear scope; for independent \
-         angles or file groups use `workflow` (read-only children fan out; writers stay serial — \
-         never give two children the same files). The child cannot dispatch further sub-agents. \
-         Prefer a named specialist via `agent`; otherwise pick the role: daedalus implements (the \
-         only editor), themis runs tests/builds, argus finds code, metis plans, nemesis reviews, \
-         clio researches docs/deps, mnemosyne recalls prior decisions/history — all but \
-         daedalus/themis are read-only and fan out."
+        "Dispatch ONE bounded sub-agent (fresh context) and return its result. Use for a \
+         focused investigation or a contained implementation with one clear scope; for \
+         independent angles or file groups use `workflow` (read-only children fan out; writers \
+         stay serial — never give two children the same files). The child cannot dispatch \
+         further sub-agents. Prefer a named specialist via `agent`; otherwise pick a `role`."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "the complete, self-contained task for the sub-agent"},
-                "agent": {"type": "string", "description": "optional specialist slug from <agents> (e.g. \"code-reviewer\"); when set and it resolves, it supersedes role and decides the tool scope"},
+                "agent": {"type": "string", "description": "optional specialist slug from <agents>; when it resolves it supersedes role and decides the tool scope"},
                 "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "role when no agent is given: argus=find code · metis=plan · daedalus=implement (the only editor) · nemesis=review · themis=test (shell, no edit) · clio=web research · mnemosyne=prior decisions/history. Default argus (read-only); legacy role names accepted"},
                 "model": {"type": "string", "description": "optional model override for the sub-agent"},
-                "label": {"type": "string", "description": "short tag echoed in the result header — attribution when dispatching several tasks"},
+                "label": {"type": "string", "description": "short tag echoed in the result header when dispatching several tasks"},
                 "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
                 "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
                 "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
-                "max_steps": {"type": "integer", "description": "TOTAL model-step budget for this child (default set by the role, 15-45; cap 80); use workflow instead of raising this for independent work"},
-                "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the sub-agent replies with ONLY a JSON object and the harness validates it (result header shows json:ok|invalid)"}
+                "max_steps": {"type": "integer", "description": "TOTAL model-step budget (default per role, 15-45; cap 80); prefer workflow over raising this for independent work"},
+                "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the child replies with ONLY that JSON and the harness validates it (header shows json:ok|invalid)"}
             },
             "required": ["prompt"],
             "additionalProperties": false

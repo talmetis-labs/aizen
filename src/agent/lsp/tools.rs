@@ -45,12 +45,11 @@ impl Tool for LspReferences {
     }
 
     fn description(&self) -> &str {
-        "Find every reference / call-site of a symbol across the project, BY NAME, using the \
-         language server. Type-aware and exact: unlike text search it skips comments, strings, and \
-         unrelated same-named symbols, and spans all files. Use it for impact analysis before \
-         changing a function/type, or to find all call sites to update. Returns `path:line:col  \
-         [in <kind> <symbol>]  snippet` per hit — the enclosing function/impl is shown so you can \
-         assess each call site without re-opening its file. Read-only."
+        "Find every reference / call site of a symbol across the project, BY NAME, via the \
+         language server — type-aware and exact (skips comments, strings and unrelated \
+         same-named symbols). For impact analysis before changing a function/type, or to find \
+         the call sites to update. Rows: `path:line:col [in <kind> <symbol>] snippet`, the \
+         enclosing item shown so each site reads without opening its file. Read-only."
     }
 
     fn parameters(&self) -> Value {
@@ -60,11 +59,11 @@ impl Tool for LspReferences {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "the symbol name to find references to (function / type / method / variable name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                    "description": "symbol name; a method on one type as `Container/method` (e.g. `Config/load`)"
                 },
                 "file": {
                     "type": "string",
-                    "description": "optional: a file in the relevant project — helps pick the language and disambiguate same-named symbols; defaults to the working directory"
+                    "description": "optional file in the project: picks the language, disambiguates same names"
                 },
                 "include_declaration": {
                     "type": "boolean",
@@ -109,11 +108,10 @@ impl Tool for LspDefinition {
     }
 
     fn description(&self) -> &str {
-        "Go to the definition of a symbol BY NAME via the language server and return the \
-         definition's source code inline (file:line plus the item's text), so you see the signature \
-         and body without a separate file read. Works for named items (functions, types, methods, \
-         constants) — not local variables. Capped at 120 lines; for a longer body use read_symbol. \
-         Read-only."
+        "Go to the definition of a symbol BY NAME via the language server and return its source \
+         inline (file:line + the item's text) — signature and body without a separate read. \
+         Named items only (functions, types, methods, constants), not locals. Capped at 120 \
+         lines; longer bodies → read_symbol. Read-only."
     }
 
     fn parameters(&self) -> Value {
@@ -123,11 +121,11 @@ impl Tool for LspDefinition {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "the symbol name to resolve (function / type / method / constant name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                    "description": "symbol name; a method on one type as `Container/method` (e.g. `Config/load`)"
                 },
                 "file": {
                     "type": "string",
-                    "description": "optional: a file in the relevant project — helps pick the language and disambiguate same-named symbols; defaults to the working directory"
+                    "description": "optional file in the project: picks the language, disambiguates same names"
                 }
             },
             "required": ["symbol"]
@@ -164,11 +162,13 @@ impl Tool for LspSymbolBody {
     }
 
     fn description(&self) -> &str {
-        concat!("Read the FULL source of ONE named symbol (function / type / method / const / …) via the \
-         language server — its complete body plus file:line range, with no whole-file dump and no \
-         line-count cap. Prefer this over file_read when you need a single item, and over \
-         lsp_definition when the body may exceed its 120-line cap. Optional `file` disambiguates \
-         same-named symbols. Read-only.", crate::search_routing!())
+        concat!(
+            "Read the FULL source of ONE named symbol (function / type / method / const / …) via \
+             the language server — complete body plus file:line range, no whole-file dump, no line \
+             cap. Prefer over file_read for a single item and over lsp_definition past its 120-line \
+             cap. Optional `file` disambiguates same-named symbols. Read-only.",
+            crate::search_routing!()
+        )
     }
 
     fn parameters(&self) -> Value {
@@ -178,11 +178,11 @@ impl Tool for LspSymbolBody {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "the symbol name to read (function / type / method / constant name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                    "description": "symbol name; a method on one type as `Container/method` (e.g. `Config/load`)"
                 },
                 "file": {
                     "type": "string",
-                    "description": "optional: a file in the relevant project — helps pick the language and disambiguate same-named symbols; defaults to the working directory"
+                    "description": "optional file in the project: picks the language, disambiguates same names"
                 }
             },
             "required": ["symbol"]
@@ -219,10 +219,10 @@ impl Tool for LspHover {
     }
 
     fn description(&self) -> &str {
-        "Get the language server's hover for a symbol BY NAME — its resolved type, signature, and \
-         doc-comment (a few lines), without reading the definition or the file. Use for \"what type \
-         is X\", \"what's this function's signature\", or a quick doc lookup; it is far cheaper than \
-         lsp_definition or read_symbol. Optional `file` disambiguates same-named symbols. Read-only."
+        "The language server's hover for a symbol BY NAME — resolved type, signature and \
+         doc-comment (a few lines) without reading the definition. For 'what type is X', a \
+         signature, a quick doc lookup; far cheaper than lsp_definition or read_symbol. \
+         Optional `file` disambiguates. Read-only."
     }
 
     fn parameters(&self) -> Value {
@@ -232,11 +232,11 @@ impl Tool for LspHover {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "the symbol name to hover (function / type / method / constant name). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                    "description": "symbol name; a method on one type as `Container/method` (e.g. `Config/load`)"
                 },
                 "file": {
                     "type": "string",
-                    "description": "optional: a file in the relevant project — helps pick the language and disambiguate same-named symbols; defaults to the working directory"
+                    "description": "optional file in the project: picks the language, disambiguates same names"
                 }
             },
             "required": ["symbol"]
@@ -334,7 +334,7 @@ impl Tool for LspWorkspaceSymbol {
                 },
                 "file": {
                     "type": "string",
-                    "description": "optional: a file in the relevant project — picks the language in a mixed repo; defaults to the working directory"
+                    "description": "optional file in the project: picks the language in a mixed repo"
                 },
                 "max": {
                     "type": "integer",
@@ -423,11 +423,11 @@ impl Tool for SymbolReplace {
     }
 
     fn description(&self) -> &str {
-        "Replace the FULL body of a named symbol (function / type / method / const / …) using the \
-         language server's outline range — no old_string, no whole-file rewrite. Prefer this over \
-         file_edit when changing an entire item. Pass the complete new body (signature + body). \
-         Optional `file` disambiguates same-named symbols. Destructive; returns a before→after \
-         preview plus any new LSP diagnostics."
+        "Replace the FULL body of a named symbol (function / type / method / const / …) using \
+         the language server's outline range — no old_string, no whole-file rewrite. Prefer \
+         over file_edit when changing an entire item. Pass the complete new body (signature + \
+         body). Optional `file` disambiguates. Destructive; returns a before→after preview plus \
+         any new LSP diagnostics."
     }
 
     fn parameters(&self) -> Value {
@@ -437,7 +437,7 @@ impl Tool for SymbolReplace {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "exact symbol name whose full body to replace. Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                    "description": "exact symbol name whose full body to replace; a method on one type as `Container/method`"
                 },
                 "new_body": {
                     "type": "string",
@@ -522,10 +522,10 @@ impl Tool for SymbolInsert {
     }
 
     fn description(&self) -> &str {
-        "Insert source text immediately before or after a named symbol (function / type / method …) \
-         using the language-server outline range. Use for adding a helper next to an existing item, \
-         a method after another method, or a use/import near a type — without reading the whole file \
-         or hunting line numbers. `where` is `before` or `after` (default `after`). Destructive."
+        "Insert source text immediately before or after a named symbol (function / type / \
+         method …) using the language-server outline range — a helper next to an existing item, \
+         a method after another, a use/import near a type — without reading the whole file or \
+         hunting line numbers. `where` is `before` or `after` (default `after`). Destructive."
     }
 
     fn parameters(&self) -> Value {
@@ -535,7 +535,7 @@ impl Tool for SymbolInsert {
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "anchor symbol name (insert relative to its full body range). Disambiguate a method on a specific type with `Container/method` (e.g. `Config/load`)."
+                    "description": "anchor symbol name (the insert is relative to its full body range); a method on one type as `Container/method`"
                 },
                 "text": {
                     "type": "string",
