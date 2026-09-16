@@ -1495,6 +1495,17 @@ pub(crate) fn active_subagents() -> usize {
 /// RAII slot in the sub-agent gate — releases both the process-local count and cross-process OS slot.
 pub(crate) struct SubagentSlot {
     _global: crate::core::repo_lock::RepoTxnLock,
+    /// The counter this slot was charged to; released on drop.
+    active: &'static std::sync::atomic::AtomicUsize,
+}
+
+/// The gate as a value: the counter it charges, the width it enforces, and the directory whose
+/// slot files make a slot exclusive machine-wide. Production uses the process-wide instance
+/// (`global`); a test builds its own, so no other test's dispatch is counted against it.
+pub(crate) struct SubagentGate {
+    active: &'static std::sync::atomic::AtomicUsize,
+    cap: usize,
+    root: std::path::PathBuf,
 }
 
 /// Why the gate refused a slot. The two causes need OPPOSITE caller behavior, and the old
@@ -1509,13 +1520,26 @@ pub(crate) enum SlotDenied {
     Io(String),
 }
 
-impl SubagentSlot {
-    pub(crate) fn try_acquire() -> Result<Self, SlotDenied> {
+impl SubagentGate {
+    /// The process-wide gate: the shared counter, the configured width, the slot files under
+    /// `aizen_home()`.
+    fn global() -> Self {
+        Self {
+            active: &ACTIVE_SUBAGENTS,
+            cap: max_parallel_subagents(),
+            root: crate::core::config::aizen_home()
+                .join("locks")
+                .join("v1")
+                .join("slots")
+                .join("subagents"),
+        }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Result<SubagentSlot, SlotDenied> {
         use std::sync::atomic::Ordering;
-        let cap = max_parallel_subagents();
-        let prev = ACTIVE_SUBAGENTS.fetch_add(1, Ordering::SeqCst);
-        if prev >= cap {
-            ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.active.fetch_add(1, Ordering::SeqCst);
+        if prev >= self.cap {
+            self.active.fetch_sub(1, Ordering::SeqCst);
             return Err(SlotDenied::Full);
         }
         // Probe the whole GLOBAL band, not `0..cap`. The slot files are shared by every aizen
@@ -1525,21 +1549,21 @@ impl SubagentSlot {
         // the atomic above; the files exist to make a slot exclusive machine-wide, not to
         // re-derive a cross-process cap from whichever process happens to probe.
         let start = (std::process::id() as usize + prev) % HARD_CEILING;
-        let root = crate::core::config::aizen_home()
-            .join("locks")
-            .join("v1")
-            .join("slots")
-            .join("subagents");
         let mut saw_busy = false;
         let mut io_err: Option<String> = None;
         for step in 0..HARD_CEILING {
             let idx = (start + step) % HARD_CEILING;
-            let path = root.join(format!("slot-{idx}.lock"));
+            let path = self.root.join(format!("slot-{idx}.lock"));
             match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
                 &path,
                 std::time::Duration::ZERO,
             ) {
-                Ok(global) => return Ok(Self { _global: global }),
+                Ok(global) => {
+                    return Ok(SubagentSlot {
+                        _global: global,
+                        active: self.active,
+                    })
+                }
                 Err(e)
                     if e.downcast_ref::<crate::core::repo_lock::LockBusy>()
                         .is_some() =>
@@ -1553,7 +1577,7 @@ impl SubagentSlot {
                 }
             }
         }
-        ACTIVE_SUBAGENTS.fetch_sub(1, Ordering::SeqCst);
+        self.active.fetch_sub(1, Ordering::SeqCst);
         match (saw_busy, io_err) {
             // Not one slot was even contested and every attempt failed on I/O: the gate itself
             // is broken, not full.
@@ -1567,14 +1591,25 @@ impl SubagentSlot {
     /// honest, instead of a whole fan-out spending a single slot). Returns however many the gate
     /// had free (0..=want); an empty Vec means the caller should degrade to a soft "gate full"
     /// error. Each slot releases on drop, so the whole batch frees when the returned Vec drops.
+    pub(crate) fn acquire_up_to(&self, want: usize) -> Vec<SubagentSlot> {
+        (0..want).map_while(|_| self.try_acquire().ok()).collect()
+    }
+}
+
+impl SubagentSlot {
+    pub(crate) fn try_acquire() -> Result<Self, SlotDenied> {
+        SubagentGate::global().try_acquire()
+    }
+
     pub(crate) fn acquire_up_to(want: usize) -> Vec<Self> {
-        (0..want).map_while(|_| Self::try_acquire().ok()).collect()
+        SubagentGate::global().acquire_up_to(want)
     }
 }
 
 impl Drop for SubagentSlot {
     fn drop(&mut self) {
-        ACTIVE_SUBAGENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1973,38 +2008,30 @@ mod tests {
 
     #[test]
     fn subagent_gate_caps_reserves_and_releases() {
-        // Process-global counter — serialize against any other test that might touch ACTIVE_SUBAGENTS.
-        // (Default cargo --test-threads>1 races two gate tests on the same atomic.)
-        static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // ALSO the home lock: the gate's slots are OS file locks under `aizen_home()`, and the
-        // sandbox tests in this module repoint `AIZEN_HOME`/`AIZEN_HOME` at a temp dir and then
-        // `remove_dir_all` it. Interleaved, this test's lock files land in a directory being deleted,
-        // every `acquire_exclusive` fails, and `try_acquire` returns None for a slot that is free —
-        // a flaky "slot 3" panic. Lock order is GATE→HOME here and nothing takes GATE but this test,
-        // so there is no inversion with the sandbox tests (which take HOME alone).
-        let _home = crate::core::config::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // A gate of this test's own: its own counter, a pinned width of 3, and slot files in a
+        // directory nobody else uses. The process-wide gate is charged by every test that
+        // dispatches a child, so asserting exact counts against it raced those tests (a "slot 3:
+        // Full" panic on Windows CI) — and pinning its width through `AIZEN_MAX_SUBAGENTS` changed
+        // what those tests saw as well.
+        static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "aizen-gate-test-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        let gate = SubagentGate {
+            active: &ACTIVE,
+            cap: 3,
+            root: root.clone(),
+        };
 
-        // PIN THE CAP. The production default is now machine-derived (`available_parallelism`), so
-        // the assertions below would drift with the CI box's core count. The env knob wins over both
-        // config and the machine default (that precedence is exactly why it exists), so force cap=3
-        // here to keep this a deterministic gate test. Removed at the end (still under both locks).
-        std::env::set_var(MAX_SUBAGENTS_ENV, "3");
-
-        // Drain any leftover slots from a panicked sibling test so this assertion is hermetic.
-        while ACTIVE_SUBAGENTS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            ACTIVE_SUBAGENTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // try_acquire: pinned cap is 3 — three slots acquire, the fourth refuses, a drop frees one.
-        let a = SubagentSlot::try_acquire().expect("slot 1");
-        let b = SubagentSlot::try_acquire().expect("slot 2");
-        let c = SubagentSlot::try_acquire().expect("slot 3");
-        assert!(SubagentSlot::try_acquire().is_err(), "cap of 3 enforced");
+        // try_acquire: three slots acquire, the fourth refuses, a drop frees one.
+        let a = gate.try_acquire().expect("slot 1");
+        let b = gate.try_acquire().expect("slot 2");
+        let c = gate.try_acquire().expect("slot 3");
+        assert!(gate.try_acquire().is_err(), "cap of 3 enforced");
         drop(b);
-        let d = SubagentSlot::try_acquire().expect("released slot reusable");
+        let d = gate.try_acquire().expect("released slot reusable");
         drop(a);
         drop(c);
         drop(d);
@@ -2012,24 +2039,29 @@ mod tests {
         // acquire_up_to: reserves ONE slot per child, capped by the gate — asking for 5 on a cap of
         // 3 yields exactly 3 (the workflow fan-out's honest accounting: N children cost N slots, not
         // one slot for the whole call), the gate is then full, and dropping frees them all.
-        let batch = SubagentSlot::acquire_up_to(5);
-        assert_eq!(batch.len(), 3, "capped at the default cap of 3");
+        let batch = gate.acquire_up_to(5);
+        assert_eq!(batch.len(), 3, "capped at the cap of 3");
         assert!(
-            SubagentSlot::try_acquire().is_err(),
+            gate.try_acquire().is_err(),
             "gate is full after a maxed reservation"
         );
         drop(batch);
-        let again = SubagentSlot::acquire_up_to(2);
+        let again = gate.acquire_up_to(2);
         assert_eq!(again.len(), 2, "all freed → a fresh reservation succeeds");
         drop(again);
-        let one = SubagentSlot::acquire_up_to(1);
+        let one = gate.acquire_up_to(1);
         assert_eq!(
             one.len(),
             1,
             "asking for fewer than the cap yields exactly that many"
         );
         drop(one);
-        std::env::remove_var(MAX_SUBAGENTS_ENV);
+        assert_eq!(
+            ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "every slot released its charge"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

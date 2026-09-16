@@ -7,6 +7,11 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Fixed
+- **The splash header no longer runs through the frame.** `Aizen vX · model · endpoint` is
+  elided to the panel's width — the endpoint first, then the model — instead of pushing the right
+  border out when a gateway URL or a model id is long.
+
 ## [0.6.8] — 2026-09-16
 
 The 2026-09 quality upgrade (`docs/execution-plan-2026-09-14.md`, phases 0 to 6). The harness now
