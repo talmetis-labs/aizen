@@ -460,6 +460,18 @@ async fn run_serve_turn(
     crate::agent::todo::end_turn(true);
     let outcome =
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
+    // The user's `stop` hooks see every finished bot turn too (see `agent::hooks`).
+    {
+        let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
+        crate::agent::hooks::run_blocking(|| {
+            crate::agent::hooks::stop(
+                outcome.stop.label(),
+                outcome.iters,
+                outcome.final_text.as_deref(),
+                &hook_ctx,
+            )
+        });
+    }
     crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
 
     // The passive learner writes ONE global memory store, so lanes take turns rather than racing to

@@ -829,7 +829,7 @@ fn send_retry_note(status: u16, attempt: u32, max: u32, delay_ms: u64) {
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&crate::ui::theme::faint(format!("⟳ {text}")).to_string());
     } else {
-        eprintln!("⟳ {text}");
+        crate::ui::tui::note_line(&format!("⟳ {text}"));
     }
 }
 
@@ -840,7 +840,7 @@ pub(crate) fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: 
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
     } else {
-        eprintln!("{line}");
+        crate::ui::tui::note_line(&line);
     }
 }
 
@@ -1283,7 +1283,7 @@ async fn send_chat(
         if crate::ui::tui::active() {
             crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
         } else {
-            eprintln!("{}", crate::ui::theme::faint(note));
+            crate::ui::tui::note_line(&crate::ui::theme::faint(note).to_string());
         }
     }
 }
@@ -2106,6 +2106,7 @@ async fn stream_chat_with_tools_eager_live(
                                 spin.take();
                             }
                             reasoning.push_str(raw);
+                            crate::ui::events::reasoning(raw); // a no-op off the JSON stream
                         }
                         if let Some(content) = &choice.delta.content {
                             spin.take(); // stop+clear the spinner before the first token prints
@@ -2114,7 +2115,9 @@ async fn stream_chat_with_tools_eager_live(
                             if !shown.is_empty() {
                                 full.push_str(&shown); // history keeps the RAW markdown
                                 crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
-                                if retained_display {
+                                if crate::ui::events::on() {
+                                    crate::ui::events::text(&shown); // one `text` event per delta
+                                } else if retained_display {
                                     crate::ui::tui::assistant_stream_delta(&shown);
                                 } else {
                                     let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
@@ -2161,7 +2164,7 @@ async fn stream_chat_with_tools_eager_live(
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
                         } else {
-                            eprintln!("\n{warn}");
+                            crate::ui::tui::note_line(&format!("\n{warn}"));
                         }
                     }
                 }
@@ -2184,13 +2187,15 @@ async fn stream_chat_with_tools_eager_live(
             if crate::ui::tui::active() {
                 crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
             } else {
-                eprintln!("\n{line}");
+                crate::ui::tui::note_line(&format!("\n{line}"));
             }
         }
         let tail = think.finish();
         if !tail.is_empty() {
             full.push_str(&tail);
-            if retained_display {
+            if crate::ui::events::on() {
+                crate::ui::events::text(&tail);
+            } else if retained_display {
                 crate::ui::tui::assistant_stream_delta(&tail);
             } else {
                 let rendered = md.push(&tail);
@@ -2199,7 +2204,9 @@ async fn stream_chat_with_tools_eager_live(
                 }
             }
         }
-        if retained_display {
+        if crate::ui::events::on() {
+            // Every delta already went out as an event; there is no display line to close.
+        } else if retained_display {
             crate::ui::tui::assistant_stream_finish(stream_err.is_some());
         } else {
             let closing = md.finish(); // flush the final partial line + close any dangling code fence
@@ -2262,7 +2269,7 @@ async fn stream_chat_with_tools_eager_live(
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
                     } else {
-                        eprintln!("{note}");
+                        crate::ui::tui::note_line(note);
                     }
                 }
                 for h in eager_by_slot.into_values() {
@@ -2277,7 +2284,7 @@ async fn stream_chat_with_tools_eager_live(
             if crate::ui::tui::active() {
                 crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
             } else {
-                eprintln!("{note}");
+                crate::ui::tui::note_line(&note);
             }
             if finish_reason.is_none() {
                 finish_reason = Some("tool_calls".to_string());

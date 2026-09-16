@@ -22,6 +22,7 @@ pub mod codebase;
 pub mod compact;
 pub mod context_pack;
 pub mod goal;
+pub mod hooks;
 pub mod lenient;
 pub mod lsp;
 pub mod mcp;
@@ -888,6 +889,22 @@ pub enum StopReason {
     Deadline,
 }
 
+impl StopReason {
+    /// The stop reason as one word — the `stop` field of the JSON `done` event and of the `stop`
+    /// hook's input. Stable: front-ends match on these.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Divergence => "divergence",
+            Self::MaxIters => "max_iters",
+            Self::VerificationFailed => "verification_failed",
+            Self::AwaitingInput(_) => "awaiting_input",
+            Self::Cancelled => "cancelled",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AgentOutcome {
     /// The model's final answer (already streamed to stdout by `aizen agent`; consumed by the
@@ -1232,7 +1249,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(&line);
                     }
                 }
                 messages.push(Message::user(format!(
@@ -1394,7 +1411,7 @@ where
                             if crate::ui::tui::active() {
                                 crate::ui::tui::emit_line(&line);
                             } else {
-                                eprintln!("{line}");
+                                emit_trace(&line);
                             }
                         }
                     }
@@ -1450,7 +1467,7 @@ where
                                     if crate::ui::tui::active() {
                                         crate::ui::tui::emit_line(&line);
                                     } else {
-                                        eprintln!("{line}");
+                                        emit_trace(&line);
                                     }
                                 }
                                 true
@@ -1471,7 +1488,7 @@ where
                                             &crate::ui::theme::faint(line).to_string(),
                                         );
                                     } else {
-                                        eprintln!("{line}");
+                                        emit_trace(&line);
                                     }
                                 }
                                 compact_failures >= COMPACT_FAILURES_BEFORE_LATCH
@@ -1957,7 +1974,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(&line);
                     }
                 }
             }
@@ -2047,7 +2064,7 @@ where
                             if crate::ui::tui::active() {
                                 crate::ui::tui::emit_line(&line);
                             } else {
-                                eprintln!("{line}");
+                                emit_trace(&line);
                             }
                         }
                     }
@@ -2192,7 +2209,7 @@ where
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(&line);
                         } else {
-                            eprintln!("{line}");
+                            emit_trace(&line);
                         }
                     }
                     demands.push(format!(
@@ -2214,7 +2231,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(line);
                     }
                 }
                 demands.push(format!(
@@ -2270,7 +2287,7 @@ where
                         if crate::ui::tui::active() {
                             crate::ui::tui::emit_line(line);
                         } else {
-                            eprintln!("{line}");
+                            emit_trace(line);
                         }
                     }
                     // Record the premature stop (content or "") so history stays coherent, then poke.
@@ -2827,7 +2844,7 @@ where
                     if crate::ui::tui::active() {
                         crate::ui::tui::emit_line(&line);
                     } else {
-                        eprintln!("{line}");
+                        emit_trace(&line);
                     }
                 }
                 let open_block = if cfg.enable_todo_poke {
@@ -3224,12 +3241,18 @@ async fn execute_calls(
             i = j;
         } else {
             // BARRIER: gate + approve on this future, body un-raced in spawn_blocking.
+            let name = calls[i].function.name.as_str();
             let out = match &parsed[i] {
-                Err(e) => e.clone(),
-                Ok(args) => match registry.get_arc(&calls[i].function.name) {
-                    None => format!("error: unknown tool '{}'", calls[i].function.name),
+                Err(e) => note_unrun_call(name, &serde_json::Value::Null, e.clone(), cfg.quiet),
+                Ok(args) => match registry.get_arc(name) {
+                    None => note_unrun_call(
+                        name,
+                        args,
+                        format!("error: unknown tool '{name}'"),
+                        cfg.quiet,
+                    ),
                     Some(tool) => match gate_and_approve(tool.as_ref(), args, cfg) {
-                        Some(denied) => denied,
+                        Some(denied) => note_unrun_call(name, args, denied, cfg.quiet),
                         None => {
                             let effect = tool.workspace_effect(args);
                             // WHERE the write lands (a directory), when the tool names a path. The
@@ -3350,7 +3373,7 @@ async fn execute_calls(
                                 None
                             };
                             if let Some(error) = checkpoint_error {
-                                error
+                                note_unrun_call(name, args, error, cfg.quiet)
                             } else {
                                 let args = args.clone();
                                 let quiet = cfg.quiet;
@@ -3623,11 +3646,12 @@ fn gate_and_approve(
             style("⚠ network").color256(crate::ui::theme::WARN).bold(),
             style("this command requests network access (sandbox default is deny)").dim()
         );
-        if crate::ui::tui::active() {
-            crate::ui::tui::emit_line(&line);
-        } else if !cfg.quiet {
-            eprintln!("{line}");
-        }
+        emit_warning(
+            "network",
+            "network: this command requests network access (sandbox default is deny)",
+            &line,
+            cfg.quiet,
+        );
     }
     if let Some(command) = guarded_command.as_deref() {
         match cmd_guard::classify(command) {
@@ -3640,11 +3664,12 @@ fn gate_and_approve(
                     ))
                     .dim()
                 );
-                if crate::ui::tui::active() {
-                    crate::ui::tui::emit_line(&line);
-                } else if !cfg.quiet {
-                    eprintln!("{line}");
-                }
+                emit_warning(
+                    "blocked",
+                    &format!("blocked: {reason} — refused (hard safety floor, not overridable)"),
+                    &line,
+                    cfg.quiet,
+                );
                 return Some(format!(
                     "error: blocked by the hard safety floor: {reason}. This command is refused \
                      unconditionally (even under /yolo). Choose a narrower, safer command."
@@ -3660,11 +3685,7 @@ fn gate_and_approve(
                     style("⚠ caution").color256(crate::ui::theme::WARN).bold(),
                     style(&reason).dim()
                 );
-                if crate::ui::tui::active() {
-                    crate::ui::tui::emit_line(&line);
-                } else if !cfg.quiet {
-                    eprintln!("{line}");
-                }
+                emit_warning("caution", &format!("caution: {reason}"), &line, cfg.quiet);
             }
             cmd_guard::Verdict::Ask => {}
         }
@@ -3675,7 +3696,22 @@ fn gate_and_approve(
     if network_requested {
         smart_allow = false;
     }
-    if tool.is_destructive() && !cfg.approval_mode.approves_all() && !smart_allow {
+    // The user's `pre_tool` hooks run AFTER the hard floor — a hook narrows what runs, it never
+    // widens past the blocklist — and BEFORE the approval prompt, which a hook may answer. Only
+    // the barrier path comes through here; the read-only parallel path runs its hooks in
+    // `run_tool_body`, so every call sees them exactly once.
+    let mut hook_allow = false;
+    {
+        let hook_ctx = hooks::Context::from_cfg(cfg);
+        match hooks::run_blocking(|| hooks::pre_tool(tool.name(), args, &hook_ctx)) {
+            hooks::PreToolVerdict::Deny { run, reason } => {
+                return Some(format!("error: blocked by hook `{run}`: {reason}"));
+            }
+            hooks::PreToolVerdict::Allow { .. } => hook_allow = true,
+            hooks::PreToolVerdict::Pass => {}
+        }
+    }
+    if tool.is_destructive() && !cfg.approval_mode.approves_all() && !smart_allow && !hook_allow {
         // A standing grant (the menu's `always for <tool> [under <dir>]`, or the project's
         // `.aizen/approvals.json`) answers without asking — narrower than allow-all, and named
         // in the transcript so an auto-approval is never silent.
@@ -3689,7 +3725,7 @@ fn gate_and_approve(
             if crate::ui::tui::active() {
                 crate::ui::tui::emit_line(&line);
             } else if !cfg.quiet {
-                eprintln!("{line}");
+                emit_trace(&line);
             }
         } else {
             // Pre-flight: what the call WILL do, computed before it does anything — a patch
@@ -3759,7 +3795,22 @@ fn run_tool_body(
     // name the key without saying what the tool actually accepts or what it just sent. Checked here,
     // at the one point every tool's execution passes through, so the improvement is uniform.
     let missing = tools::missing_required_strings(&tool.parameters(), args);
-    let out = if !missing.is_empty() {
+    // The user's `pre_tool` hooks, for the calls that never pass `gate_and_approve` (the read-only
+    // parallel and eager paths); barrier calls ran theirs in the gate, ahead of the approval.
+    let hook_ctx = hooks::Context::here(quiet);
+    let hook_denied = if !tool.is_destructive() && tool.is_concurrency_safe_for(args) {
+        match hooks::pre_tool(tool.name(), args, &hook_ctx) {
+            hooks::PreToolVerdict::Deny { run, reason } => {
+                Some(format!("error: blocked by hook `{run}`: {reason}"))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let out = if let Some(denied) = hook_denied.clone() {
+        denied
+    } else if !missing.is_empty() {
         tools::missing_args_error(tool.name(), &tool.parameters(), args, &missing)
     } else {
         match tool.execute(args) {
@@ -3768,6 +3819,18 @@ fn run_tool_body(
         }
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    // `post_tool` hooks read the raw result; what they say rides the result the model reads.
+    let hook_note = if hook_denied.is_none() {
+        hooks::post_tool(
+            tool.name(),
+            args,
+            &out,
+            !out.trim_start().starts_with("error:"),
+            &hook_ctx,
+        )
+    } else {
+        None
+    };
     if !quiet {
         emit_tool_result(seq, tool.name(), args, &out, Some(elapsed_ms));
     }
@@ -3794,7 +3857,11 @@ fn run_tool_body(
     };
     let raw_chars = out.chars().count();
     let cut = cut_result(tool.name(), args, &out, budgets);
-    observe::attach_spill_note(cut, raw_chars, spill_note)
+    let result = observe::attach_spill_note(cut, raw_chars, spill_note);
+    match hook_note {
+        Some(note) => format!("{result}\n\n{note}"),
+        None => result,
+    }
 }
 
 /// The per-kind budget cut for one raw result — see the comments on each arm.
@@ -4099,6 +4166,11 @@ pub fn replay_transcript(msgs: &[crate::core::types::Message]) {
 
 /// Emit a trace line into the scroll region (sticky TUI) or stderr (plain / one-shot path).
 fn emit_trace(line: &str) {
+    // The JSON stream owns stdout: the line becomes a `trace` event, styling stripped.
+    if crate::ui::events::on() {
+        crate::ui::events::trace(line);
+        return;
+    }
     // `retained_running()` (not just `active()`) so replay during a SUSPENDED dialoguer menu — e.g.
     // restoring via `/sessions` — still routes into the render thread's buffer, which `resume`
     // redraws from. Otherwise the trace would `eprintln!` onto the menu screen and be wiped.
@@ -4107,6 +4179,33 @@ fn emit_trace(line: &str) {
     } else {
         eprintln!("{line}");
     }
+}
+
+/// A safety notice about a call (`⛔ blocked`, `⚠ caution`, `⚠ network`): a `warning` event on
+/// the JSON stream, else the styled line on the transcript or stderr (unless `quiet`).
+fn emit_warning(kind: &str, plain: &str, styled: &str, quiet: bool) {
+    if crate::ui::events::on() {
+        crate::ui::events::warning(kind, plain);
+        return;
+    }
+    if crate::ui::tui::active() {
+        crate::ui::tui::emit_line(styled);
+    } else if !quiet {
+        eprintln!("{styled}");
+    }
+}
+
+/// A call that produced a result WITHOUT running its body — arguments that did not parse, an
+/// unknown tool, a gate refusal, a failed pre-edit checkpoint — still owes the JSON stream its
+/// `tool_call` / `tool_result` pair, or a front-end would show a model that asked for a tool and
+/// heard nothing back. The transcript needs nothing extra: the gate already said why. Returns
+/// `out` unchanged so it can wrap the expression that produced it.
+fn note_unrun_call(name: &str, args: &serde_json::Value, out: String, quiet: bool) -> String {
+    if crate::ui::events::on() && !quiet {
+        let seq = emit_tool_call(name, args);
+        emit_tool_result(seq, name, args, &out, None);
+    }
+    out
 }
 
 /// [`emit_trace`] for tool bodies outside this module.
@@ -4334,6 +4433,12 @@ fn workflow_target(args: &serde_json::Value) -> String {
 /// Open a tool-call line (mockup shape `⚙ <name>   <target>`), returning the `seq` so the result can
 /// update the same line in place under retained. Shared by the serial + eager-adoption paths.
 fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
+    if crate::ui::events::on() {
+        let target = tool_target(name, args);
+        let seq = crate::ui::tui::tool_call_begin(tool_icon(), name, &target);
+        crate::ui::events::tool_call(seq, name, args, &target);
+        return seq;
+    }
     // Point the working caption (the typewriter line at the transcript bottom) at this tool's human
     // action ("Reading retained.rs", "Run cargo test") — the hybrid caption's "concrete" half. When a
     // tool has no English mapping, leave the caption on whatever whimsical verb is showing rather than
@@ -4361,6 +4466,18 @@ fn emit_tool_result(
     elapsed_ms: Option<u64>,
 ) {
     let (ok, summary) = summarize_result(name, out);
+    if crate::ui::events::on() {
+        crate::ui::events::tool_result(
+            seq,
+            name,
+            &tool_target(name, args),
+            ok,
+            &summary,
+            elapsed_ms,
+            out,
+        );
+        return;
+    }
     // Point the idle screensaver's context card at the feature this tool illustrates (a sub-agent
     // spawn → "Delegate", a web_search → "Researches the web", …). Only on success — a failed call
     // didn't really exercise the feature. A no-op for tools with no card.
@@ -4444,6 +4561,11 @@ fn parse_hunk_header(l: &str) -> Option<(usize, usize)> {
 fn emit_edit_diff(path: &str, out: &str) {
     const MAX_CHANGED: usize = 12; // changed (±) rows shown across all hunks; context rides free
     let (adds, dels) = count_diff(out);
+    if crate::ui::events::on() {
+        // The `tool_result` event already carries the diff text; this is its size.
+        crate::ui::events::diff(path, adds, dels);
+        return;
+    }
     let mut hunks: Vec<crate::ui::tui::DiffHunk> = Vec::new();
     let mut cur: Option<crate::ui::tui::DiffHunk> = None;
     let mut changed = 0usize;
@@ -5779,7 +5901,7 @@ fn retry_line(lane: &str, reason: &str, delay_ms: u64) {
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&line);
     } else {
-        eprintln!("{line}");
+        emit_trace(&line);
     }
 }
 
@@ -6111,7 +6233,7 @@ fn show_preview(p: &crate::agent::tools::ApprovalPreview) {
         if crate::ui::tui::active() {
             crate::ui::tui::emit_line(&row);
         } else {
-            eprintln!("{row}");
+            emit_trace(&row);
         }
     }
 }
@@ -6162,6 +6284,17 @@ fn approve(
             style(plain_who.trim_end()).color256(crate::ui::theme::WARN)
         )
     };
+    // JSON stream: the question goes out as data and the answer comes back on stdin.
+    if crate::ui::events::on() {
+        let preview = preview
+            .map(|p| serde_json::json!({ "title": p.title, "lines": p.lines, "diff": p.diff }));
+        return crate::ui::events::ask_approval(
+            tool,
+            args,
+            cfg.exec_ctx.dispatch_label().as_deref(),
+            preview,
+        );
+    }
     // Under the sticky TUI the background input thread owns stdin, so we can't run a blocking y/N
     // read inline. Instead, route a per-action prompt THROUGH that thread: `ask_approval` blocks
     // until it presses [y]es / [n]o / [a]llow-all-session. (Destructive tools force the serial path,

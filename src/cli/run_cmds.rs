@@ -440,6 +440,42 @@ pub(crate) async fn run_chat(args: ChatArgs) -> Result<()> {
 }
 
 pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
+    if args.output_format == "json" {
+        crate::ui::events::enable();
+    }
+    let result = run_agent_inner(args).await;
+    if let Err(e) = &result {
+        // The stream's last word: a caller reading stdout must not have to parse stderr to learn
+        // that the run died. `main` still prints the error and exits non-zero. No-op in text mode.
+        crate::ui::events::error(&format!("{e:#}"));
+    }
+    result
+}
+
+/// A status line of the one-shot's trace: stderr in text mode (stdout is the answer), a `trace`
+/// event on the JSON stream (stdout is the stream).
+fn status(line: &str) {
+    if crate::ui::events::on() {
+        crate::ui::events::trace(line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// The provider-reported tokens of one run: the cost meter's rows since `cursor`, summed.
+fn usage_since(cursor: (u64, u64)) -> serde_json::Value {
+    let rows = client::cost_meter().rows_since(cursor.0, cursor.1);
+    let sum = |f: fn(&types::UsageRow) -> u64| rows.iter().map(f).sum::<u64>();
+    serde_json::json!({
+        "calls": rows.len(),
+        "input": sum(|r| r.input),
+        "output": sum(|r| r.output),
+        "cached": sum(|r| r.cached),
+        "cache_write": sum(|r| r.cache_write),
+    })
+}
+
+async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     if args.task.trim().is_empty() {
         anyhow::bail!("empty task (pass the task as the first argument)");
     }
@@ -463,10 +499,10 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             "auto" => crate::ui::effort_ui::resolve_turn_effort(args.task.trim()),
             other => Some(other.to_string()),
         };
-        eprintln!(
-            "{}",
-            crate::ui::effort_ui::effort_turn_line(tier.as_deref(), None)
-        );
+        status(&crate::ui::effort_ui::effort_turn_line(
+            tier.as_deref(),
+            None,
+        ));
         cli_config::set_effort_override(tier);
     }
 
@@ -477,6 +513,15 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // The first event of a JSON run: what is about to happen, before any request goes out.
+    crate::ui::events::start(
+        &model,
+        &cwd,
+        cli_config::effort_override().flatten().as_deref(),
+        images.len(),
+    );
+    // Where the cost meter stands now, so the `done` event can sum only this run's calls.
+    let usage_cursor = client::cost_meter().cursor();
 
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
@@ -541,7 +586,7 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
                 model: model.clone(),
             };
             let planner = crate::agent::architect::planner_model(&cli_config::load(), &model);
-            eprintln!("architect: metis planning on {planner}…");
+            status(&format!("architect: metis planning on {planner}…"));
             if let Some(plan) = crate::agent::architect::plan(
                 &http,
                 &ep,
@@ -554,10 +599,11 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             .await
             {
                 let editor = crate::agent::architect::editor_model(&cli_config::load(), &model);
-                eprintln!(
-                    "{}",
-                    crate::agent::architect::status_line(&planner, &editor, plan.chars().count())
-                );
+                status(&crate::agent::architect::status_line(
+                    &planner,
+                    &editor,
+                    plan.chars().count(),
+                ));
                 model = editor;
                 cli_config::set_effort_override(Some("low".to_string()));
                 architect_plan = Some(plan);
@@ -600,9 +646,10 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     let asked = if images.is_empty() {
         Message::user(args.task.trim())
     } else {
-        eprintln!(
-            "{}",
-            style(format!("📎 {} image(s) attached", images.len())).dim()
+        status(
+            &style(format!("📎 {} image(s) attached", images.len()))
+                .dim()
+                .to_string(),
         );
         Message::user_with_images(args.task.trim(), images)
     };
@@ -626,10 +673,41 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await;
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
-    if args.save_session {
-        save_finished_session(&history, &model);
-    }
+    let saved = if args.save_session {
+        save_finished_session(&history, &model)
+    } else {
+        None
+    };
     let outcome = result?;
+    // The user's `stop` hooks see every finished run, however it ended (see `agent::hooks`).
+    {
+        let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
+        crate::agent::hooks::run_blocking(|| {
+            crate::agent::hooks::stop(
+                outcome.stop.label(),
+                outcome.iters,
+                outcome.final_text.as_deref(),
+                &hook_ctx,
+            )
+        });
+    }
+    if crate::ui::events::on() {
+        // One closing line carries what the text mode spreads over stdout and stderr: the stop
+        // reason, the answer, the question when the model asked one, and this run's tokens.
+        let question = match &outcome.stop {
+            StopReason::AwaitingInput(q) => Some(q.as_str()),
+            _ => None,
+        };
+        crate::ui::events::done(
+            outcome.stop.label(),
+            outcome.iters,
+            outcome.final_text.as_deref(),
+            question,
+            saved.as_deref(),
+            usage_since(usage_cursor),
+        );
+        return Ok(());
+    }
     match outcome.stop {
         // The final answer was already streamed to stdout during the call.
         StopReason::Done => {}
@@ -667,25 +745,98 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
 }
 
 /// Put a finished one-shot conversation into core's own session pool, and say where it went.
+/// Returns the slug on success.
 ///
 /// The stamp is `save_session`'s: project key, root and slug come from `config`, which resolves the
 /// repository this ran in — so a saved one-shot is filed exactly where the same conversation held
 /// in the REPL would have been, and `/sessions` reopens it with no idea which surface produced it.
 ///
 /// The line goes to stderr because stdout is the agent's answer: a caller piping it wants the
-/// answer and nothing else.
-fn save_finished_session(history: &[Message], model: &str) {
+/// answer and nothing else. On the JSON stream it is a `session` event.
+fn save_finished_session(history: &[Message], model: &str) -> Option<String> {
     // A run that never got a user turn onto the wire is not a conversation.
     if !history.iter().any(|m| m.role == "user") {
-        return;
+        return None;
     }
     let slug = session_store::allocate_session_slug(history);
     match session_store::save_session(history, &slug, Some(model)) {
-        Ok(path) => eprintln!("\n[saved as “{slug}” — {path}]"),
+        Ok(path) => {
+            if crate::ui::events::on() {
+                crate::ui::events::session_saved(&slug, &path);
+            } else {
+                eprintln!("\n[saved as “{slug}” — {path}]");
+            }
+            Some(slug)
+        }
         // Not fatal: the work is done and the answer is already printed. Saying so is the whole
         // duty here — silence would leave the caller believing there is something to reopen.
-        Err(e) => eprintln!("\n[this session was NOT saved: {e:#}]"),
+        Err(e) => {
+            let why = format!("{e:#}");
+            if crate::ui::events::on() {
+                crate::ui::events::session_not_saved(&why);
+            } else {
+                eprintln!("\n[this session was NOT saved: {why}]");
+            }
+            None
+        }
     }
+}
+
+/// `aizen hooks`: the configured lifecycle hooks, as the loop will read them.
+pub(crate) fn run_hooks_cmd(json: bool) -> Result<()> {
+    let path = cli_config::config_path();
+    let hooks = cli_config::load().hooks.unwrap_or_default();
+    let disabled = cli_config::branded_flag("NO_HOOKS");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "enabled": !disabled,
+                "config_path": path.display().to_string(),
+                "default_timeout_secs": crate::agent::hooks::DEFAULT_TIMEOUT_SECS,
+                "hooks": hooks,
+            }))?
+        );
+        return Ok(());
+    }
+    if disabled {
+        println!("hooks are OFF: AIZEN_NO_HOOKS is set");
+    }
+    if hooks.is_empty() {
+        println!(
+            "no hooks configured — add a `hooks` object to {}:\n\n  \"hooks\": {{\n    \"pre_tool\":  [{{ \"match\": \"shell_run\", \"run\": \"python ~/hooks/guard.py\" }}],\n    \"post_tool\": [{{ \"match\": \"file_edit|file_write\", \"run\": \"cargo fmt --quiet\" }}],\n    \"stop\":      [{{ \"run\": \"notify-send aizen 'run finished'\" }}]\n  }}\n\nsee docs/REFERENCE.md, \"Hooks\".",
+            path.display()
+        );
+        return Ok(());
+    }
+    println!(
+        "hooks from {} ({}):",
+        path.display(),
+        if disabled { "disabled" } else { "enabled" }
+    );
+    for (event, list) in [
+        ("pre_tool", &hooks.pre_tool),
+        ("post_tool", &hooks.post_tool),
+        ("stop", &hooks.stop),
+    ] {
+        for h in list {
+            let scope = if event == "stop" {
+                "-".to_string()
+            } else {
+                h.matches.clone().unwrap_or_else(|| "*".to_string())
+            };
+            println!(
+                "  {event:<9} {scope:<24} {:>3}s  {}",
+                h.timeout_secs
+                    .unwrap_or(crate::agent::hooks::DEFAULT_TIMEOUT_SECS),
+                h.run
+            );
+        }
+    }
+    println!(
+        "\ncolumns: event · match · timeout · command  (`AIZEN_NO_HOOKS=1` turns them all off)"
+    );
+    Ok(())
 }
 
 pub(crate) async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {

@@ -110,6 +110,12 @@ pub(crate) enum Commands {
     },
     /// List the models the provider advertises (GET {base}/models).
     Models(ModelsArgs),
+    /// Show the lifecycle hooks configured under `hooks` in ~/.aizen/cli-config.json — your own
+    /// commands run before/after tool calls and when a run ends — and whether they are enabled.
+    Hooks {
+        #[arg(long)]
+        json: bool,
+    },
     /// Crawl a website (katana-style): BFS over HTTP, extract links from HTML + endpoints from JS.
     Crawl(CrawlArgs),
     /// Reach doctor: live-probe every web-access backend and show which serves each platform.
@@ -1500,6 +1506,12 @@ pub(crate) struct AgentArgs {
     /// attach produce. A path that is not a readable image fails the run rather than being dropped.
     #[arg(long = "image", value_name = "PATH")]
     pub(crate) image: Vec<String>,
+    /// Output format. `text`: the human transcript (answer on stdout, trace on stderr). `json`:
+    /// one JSON object per line on stdout — `start`, `text`, `tool_call`, `tool_result`, `plan`,
+    /// `approval_request`, `hook`, `done`, … — for a front-end or script driving this run;
+    /// approvals are answered on stdin. The contract is in REFERENCE.md.
+    #[arg(long, value_name = "FORMAT", value_parser = ["text", "json"], default_value = "text")]
+    pub(crate) output_format: String,
 }
 
 #[derive(Parser, Debug)]

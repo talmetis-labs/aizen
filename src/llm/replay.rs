@@ -544,7 +544,7 @@ fn emit_note(note: &str) {
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
     } else {
-        eprintln!("{note}");
+        crate::ui::tui::note_line(note);
     }
 }
 

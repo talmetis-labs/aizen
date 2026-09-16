@@ -323,6 +323,15 @@ pub(crate) async fn finish_turn(
     // paragraph. Silence here makes those read exactly like `Done`, and the passes below would then
     // file a red tree as a finished task.
     surface_abnormal_stop(outcome);
+    // The user's `stop` hooks see every finished top-level turn (see `agent::hooks`).
+    crate::agent::hooks::run_blocking(|| {
+        crate::agent::hooks::stop(
+            outcome.stop.label(),
+            outcome.iters,
+            outcome.final_text.as_deref(),
+            &crate::agent::hooks::Context::here(false),
+        )
+    });
     // A turn that did not reach `Done` leaves its plan for the next user turn (see `todo`).
     crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
     // Goal mode finishes only on a verify-passing `Done`. Clear it here so the next turn is an

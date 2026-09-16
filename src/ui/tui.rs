@@ -1528,6 +1528,11 @@ pub fn emit(s: &str) {
         }
         return;
     }
+    // The JSON stream owns stdout: whatever would have been printed here is a `trace` event.
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::trace(s);
+        return;
+    }
     if retained::is_running() {
         // Route to the render thread even while SUSPENDED for a dialoguer menu: it folds this into
         // its block buffer (no paint yet), and `resume` redraws from that buffer. Printing straight
@@ -1572,6 +1577,10 @@ pub fn emit_line(s: &str) {
 /// wiped. Outside the REPL (one-shot `aizen agent`, pipes, CI) it degrades to `eprintln!`, keeping
 /// stdout clean for the model's answer.
 pub fn note_line(s: &str) {
+    if crate::ui::events::on() && !(active() || retained_running()) {
+        crate::ui::events::trace(s);
+        return;
+    }
     if active() || retained_running() {
         emit_line(s);
     } else {
@@ -1722,6 +1731,10 @@ pub fn tool_call_end(
 /// Replace the in-place plan checklist. `items` = `(status, text)` where status 0/1/2 = pending /
 /// in-progress / done. Empty removes the panel. Classic path re-prints the box each call.
 pub fn plan_update(items: &[(u8, String)]) {
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::plan(items);
+        return;
+    }
     let rows: Vec<retained::PlanRow> = items
         .iter()
         .map(|(s, t)| retained::PlanRow {
@@ -1752,6 +1765,10 @@ pub struct DiffHunk {
 /// Push a boxed diff preview — rendered side-by-side (old pane │ new pane) when the transcript is
 /// wide enough, unified otherwise.
 pub fn diff_box(path: &str, adds: usize, dels: usize, hunks: Vec<DiffHunk>) {
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::diff(path, adds, dels);
+        return;
+    }
     let d = retained::DiffPayload {
         path: path.to_string(),
         adds,
@@ -1769,6 +1786,10 @@ pub fn diff_box(path: &str, adds: usize, dels: usize, hunks: Vec<DiffHunk>) {
 
 /// Push a green verify-gate success line (`✓ <cmd> — <detail>`).
 pub fn verify_line(cmd: &str, detail: &str) {
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::verify(cmd, detail);
+        return;
+    }
     let v = retained::VerifyPayload {
         cmd: cmd.to_string(),
         detail: detail.to_string(),

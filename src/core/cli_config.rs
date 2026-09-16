@@ -128,6 +128,12 @@ pub struct CliConfig {
     /// heuristic caps at `high`, unchanged default). Force via `AIZEN_ADAPTIVE_EFFORT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_effort: Option<bool>,
+    /// Lifecycle hooks — the user's own commands run before and after tool calls and when a run
+    /// ends (`pre_tool` / `post_tool` / `stop`, each a list of `{ "run", "match", "timeout_secs" }`).
+    /// Read from THIS file only, never from a checkout. See `agent::hooks`. `AIZEN_NO_HOOKS=1`
+    /// disables them all without an edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksConfig>,
     /// Fold NEW LSP diagnostics into edit-tool results (only meaningful while LSP is on).
     /// `None` ⇒ ON. Toggle live with `/lsp edits on|off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -692,6 +698,41 @@ pub fn branded_env(suffix: &str) -> Option<String> {
 /// Presence check for a brand-prefixed boolean toggle env var: `AIZEN_<suffix>` set (to anything) ⇒ true.
 pub fn branded_flag(suffix: &str) -> bool {
     std::env::var_os(format!("AIZEN_{suffix}")).is_some()
+}
+
+/// One user hook: a shell line run at a lifecycle point. The contract — what it reads on stdin,
+/// what its exit code and output mean — is documented on `agent::hooks`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Hook {
+    /// The shell line to run (platform shell, from the run's working directory).
+    pub run: String,
+    /// Which tools this hook applies to (tool events only): a tool name, `file_*`-style globs,
+    /// `|`-separated alternatives. Absent ⇒ every tool.
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub matches: Option<String>,
+    /// Wall-clock cap in seconds (default `agent::hooks::DEFAULT_TIMEOUT_SECS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// The `hooks` object of the config: one list per event, run in order.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HooksConfig {
+    /// Before a tool call — after the hard safety floor, before the approval prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_tool: Vec<Hook>,
+    /// After a tool call, with its result; what the hook prints joins the result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_tool: Vec<Hook>,
+    /// When a top-level run ends (one-shot, REPL turn, bot message).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<Hook>,
+}
+
+impl HooksConfig {
+    pub fn is_empty(&self) -> bool {
+        self.pre_tool.is_empty() && self.post_tool.is_empty() && self.stop.is_empty()
+    }
 }
 
 impl ProviderProfile {

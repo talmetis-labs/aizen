@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
         Commands::Custom { cmd } => cli::custom_cmd::run(cmd).await,
         Commands::Key { cmd } => cli::key_cmd::run(cmd).await,
         Commands::Models(args) => run_models(args).await,
+        Commands::Hooks { json } => run_hooks_cmd(json),
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Reach { cmd } => run_reach(cmd).await,
         Commands::Serve {
