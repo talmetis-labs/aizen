@@ -1,0 +1,8 @@
+{
+  "id": "no-edit-control",
+  "prompt": "Run this crate's test suite and report how many tests passed. Do not modify any file.",
+  "allowed_files": [],
+  "expect": "no-edit",
+  "verify": ["cargo", "test", "--quiet"],
+  "max_steps": 12
+}

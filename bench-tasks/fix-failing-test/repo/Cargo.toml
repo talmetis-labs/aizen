@@ -1,0 +1,8 @@
+[package]
+name = "fixture_fix_failing_test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]

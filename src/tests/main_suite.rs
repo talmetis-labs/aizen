@@ -349,7 +349,7 @@ async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_n
     );
 }
 
-/// A background chore call (secretary, persona reflection, compaction, reconcile, handoff,
+/// A background chore call (secretary, persona reflection, compaction, reconcile,
 /// persona-distill) must be TIME-BOUNDED, not merely byte-bounded.
 ///
 /// Every one of those routes the NON-streaming `chat_with_tools`, whose only native guard is
@@ -1160,7 +1160,8 @@ fn restoring_the_legacy_last_pointer_rehomes_it_to_a_named_file() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The `/handoff` seed is conversation content, not prompt prefix: a lane rewrite (what
+/// A handoff seed (the retired `/handoff` wrote one; saved sessions may still carry it) is
+/// conversation content, not prompt prefix: a lane rewrite (what
 /// `/config` and `/model` do via `refresh_prompt_lanes_in_place`) must splice AROUND it.
 /// Before the marker, the splice consumed it and the fresh thread silently lost its context.
 #[test]
@@ -1318,19 +1319,22 @@ fn classify_health_probe_rules() {
 fn effort_turn_line_names_the_tier_or_default() {
     // The per-turn status line must contain the tier name (or "default" when the field is
     // omitted), regardless of colour stripping under the test harness.
-    assert!(effort_turn_line(Some("high")).contains("high"));
-    assert!(effort_turn_line(Some("low")).contains("low"));
+    assert!(effort_turn_line(Some("high"), None).contains("high"));
+    assert!(effort_turn_line(Some("low"), None).contains("low"));
     assert!(
-        effort_turn_line(Some("xhigh")).contains("xhigh"),
+        effort_turn_line(Some("xhigh"), None).contains("xhigh"),
         "xhigh rung named"
     );
     assert!(
-        effort_turn_line(Some("max")).contains("max"),
+        effort_turn_line(Some("max"), None).contains("max"),
         "max rung named"
     );
-    assert!(effort_turn_line(None).contains("default"), "None ⇒ default");
     assert!(
-        effort_turn_line(Some("high")).contains("effort:"),
+        effort_turn_line(None, None).contains("default"),
+        "None ⇒ default"
+    );
+    assert!(
+        effort_turn_line(Some("high"), None).contains("effort:"),
         "always prefixed"
     );
 }

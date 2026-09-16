@@ -163,7 +163,7 @@ fn warn_once(msg: &str) {
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&line);
     } else {
-        eprintln!("{line}");
+        crate::ui::tui::note_line(&line);
     }
 }
 
@@ -328,10 +328,16 @@ fn resolve_argv(spec: &CommandSpec) -> (PathBuf, Vec<String>) {
         CommandSpec::Shell { line } => {
             if cfg!(windows) {
                 // `chcp 65001>nul` first so legacy builtins emit UTF-8 — the exact wrapper
-                // `shell_run` has always used (see its comment).
+                // `shell_run` has always used (see its comment). The line is handed to `cmd` as
+                // RAW text (see the `raw_shell` branch below): `/S` makes cmd strip exactly the
+                // outer quotes added here and nothing else, whatever quotes the line contains.
                 (
                     PathBuf::from("cmd"),
-                    vec!["/C".into(), format!("chcp 65001>nul & {line}")],
+                    vec![
+                        "/S".into(),
+                        "/C".into(),
+                        format!("\"chcp 65001>nul & {line}\""),
+                    ],
                 )
             } else {
                 (PathBuf::from("sh"), vec!["-c".into(), line.clone()])
@@ -390,7 +396,26 @@ macro_rules! build_prepared {
             }
 
             let mut command: $cmd_ty = $new(&program);
-            command.args(&args);
+            // Windows: the shell line goes to `cmd` VERBATIM. `Command::arg` wraps an argument
+            // that contains spaces in quotes and escapes every `"` inside it as `\"`, which cmd
+            // does not unescape — so `echo "a b"` reached the shell as `echo \"a b\"` and printed
+            // the backslashes, and a `python -c "…"` got a quoted string instead of code.
+            #[cfg(windows)]
+            let raw_shell = matches!(req.spec, CommandSpec::Shell { .. });
+            #[cfg(not(windows))]
+            let raw_shell = false;
+            if raw_shell {
+                #[cfg(windows)]
+                {
+                    #[allow(unused_imports)] // tokio's `Command` has `raw_arg` inherently
+                    use std::os::windows::process::CommandExt as _;
+                    for a in &args {
+                        command.raw_arg(a);
+                    }
+                }
+            } else {
+                command.args(&args);
+            }
             command.current_dir(&req.cwd);
 
             let mut env_scrubbed = 0usize;
@@ -508,6 +533,42 @@ mod tests {
     fn req(origin: CommandOrigin) -> SandboxRequest {
         let cwd = std::env::current_dir().unwrap();
         SandboxRequest::shell(origin, "echo sandboxed", cwd.clone(), cwd)
+    }
+
+    /// The shell line must reach `cmd` as written. `Command::arg` used to escape its quotes as
+    /// `\"` (cmd does not unescape), so a hook or a model command with a quoted argument ran
+    /// with the backslashes in it.
+    #[cfg(windows)]
+    #[test]
+    fn a_shell_line_with_quotes_reaches_cmd_verbatim() {
+        let _g = lock();
+        crate::sandbox::set_mode(SandboxMode::Auto);
+        let cwd = std::env::temp_dir();
+        let mut sbx = prepare_std(SandboxRequest::shell(
+            CommandOrigin::UserEscape,
+            r#"echo "a b" {"k":"v"}"#,
+            cwd.clone(),
+            cwd,
+        ))
+        .expect("prepare");
+        let out = crate::core::proctree::output_bounded(
+            &mut sbx.command,
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("run");
+        sbx.finish(Outcome::Exit(out.code));
+        assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+        assert!(
+            out.stdout.contains(r#""a b" {"k":"v"}"#),
+            "quotes must survive: {:?}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains('\\'),
+            "no escaping may leak into the shell: {:?}",
+            out.stdout
+        );
     }
 
     #[test]

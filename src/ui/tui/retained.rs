@@ -70,6 +70,27 @@ const BLOCK_LIMIT: usize = 2048;
 const RESIZE_SETTLE: Duration = Duration::from_millis(400);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Milliseconds since process start at which transcript output last landed (a block pushed,
+/// assistant text appended, a tool row updated). The idle screensaver reads it: a user READING
+/// a long answer is idle on the keyboard but the screen is not stale.
+static LAST_OUTPUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn process_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Record that transcript output just landed.
+fn note_output() {
+    let ms = process_epoch().elapsed().as_millis() as u64;
+    LAST_OUTPUT_MS.store(ms, Ordering::Relaxed);
+}
+
+/// How long the transcript has been quiet — no block, no streamed text, no tool update.
+pub(super) fn output_quiet_for() -> Duration {
+    let now = process_epoch().elapsed().as_millis() as u64;
+    Duration::from_millis(now.saturating_sub(LAST_OUTPUT_MS.load(Ordering::Relaxed)))
+}
 static COLS: AtomicU16 = AtomicU16::new(80);
 static ROWS: AtomicU16 = AtomicU16::new(24);
 
@@ -137,6 +158,10 @@ pub(super) struct ToolEvent {
     /// Wall-clock run time of the tool call in milliseconds, appended to the result line (`· 1.2s`).
     /// `None` when unknown (restored transcripts, parallel eager-adoption) → no time is shown.
     pub elapsed_ms: Option<u64>,
+    /// The tail of the result text (see `tui::TOOL_BODY_KEEP_CHARS`) — what the row expands
+    /// into: its last lines are painted under a failed call, and `Ctrl-E` opens all of it.
+    /// Empty for a `Running` event.
+    pub body: String,
 }
 
 /// One checklist row for the plan panel. `status`: 0 = pending (○), 1 = in-progress (▸), 2 = done (✓).
@@ -186,6 +211,8 @@ impl Payload {
                 t.digest.hash(&mut h);
                 (t.state as u8).hash(&mut h);
                 t.elapsed_ms.hash(&mut h);
+                // The tail is painted under a failed row, so it is part of what the cache keys on.
+                t.body.hash(&mut h);
             }
             Payload::Plan(rows) => {
                 for r in rows {
@@ -237,49 +264,102 @@ struct CacheKey {
 
 #[derive(Default)]
 struct RenderCache {
-    rows: HashMap<CacheKey, Vec<String>>,
+    /// Rendered rows per key with the tick of their last use — an LRU bounded by `CACHE_LIMIT`.
+    /// It used to be cleared outright when full, which past 512 blocks re-rendered the whole
+    /// transcript on every frame (110 ms at 3,000 blocks).
+    rows: HashMap<CacheKey, (Vec<String>, u64)>,
+    /// Row COUNT per key for every block rendered at that width: the prefix sums that place the
+    /// viewport without rendering anything. Follows the session's blocks (`forget_before`), not
+    /// `CACHE_LIMIT`.
+    heights: HashMap<CacheKey, usize>,
+    tick: u64,
     hits: u64,
     misses: u64,
 }
 
 impl RenderCache {
-    fn get_or_render(&mut self, block: &UiBlock, width: u16) -> Vec<String> {
-        let key = CacheKey {
+    fn key(block: &UiBlock, width: u16) -> CacheKey {
+        CacheKey {
             id: block.id,
             width,
             hash: block.payload.content_hash(),
             complete: block.complete,
             theme_gen: crate::ui::theme::theme_generation(),
-        };
-        if let Some(rows) = self.rows.get(&key) {
+        }
+    }
+
+    fn get_or_render(&mut self, block: &UiBlock, width: u16) -> Vec<String> {
+        let key = Self::key(block, width);
+        self.tick += 1;
+        if let Some((rows, last)) = self.rows.get_mut(&key) {
+            *last = self.tick;
             self.hits += 1;
             return rows.clone();
         }
         self.misses += 1;
-        let w = width as usize;
-        let rows = match &block.payload {
-            Payload::Text(s) => match block.kind {
-                BlockKind::Assistant => render_assistant_rows(s, w),
-                // Intro/Generic (boot notes, warnings, the `❯` echo): wrap to the pane instead of
-                // letting the paint clip a long single-line note at the right edge.
-                _ => sanitize_keep_sgr(s)
-                    .split('\n')
-                    .flat_map(|l| wrap_keep_sgr(l, w))
-                    .collect(),
-            },
-            Payload::Tool(t) => render_tool_row(t, w)
-                .split('\n')
-                .map(str::to_string)
-                .collect(),
-            Payload::Plan(rows) => render_plan_box(rows, w),
-            Payload::Diff(d) => render_diff_box(d, w),
-            Payload::Verify(v) => vec![render_verify_line(v, w)],
-        };
+        let rows = render_block_rows(block, width);
+        self.heights.insert(key, rows.len());
         if self.rows.len() >= CACHE_LIMIT {
-            self.rows.clear();
+            self.evict_cold();
         }
-        self.rows.insert(key, rows.clone());
+        self.rows.insert(key, (rows.clone(), self.tick));
         rows
+    }
+
+    /// The block's row count at `width`: from the height table, else from cached rows, else one
+    /// render (which fills both). Every frame asks this for every block; only a block's first
+    /// frame, a resize or a theme switch pays a render.
+    fn height(&mut self, block: &UiBlock, width: u16) -> usize {
+        let key = Self::key(block, width);
+        if let Some(h) = self.heights.get(&key) {
+            return *h;
+        }
+        if let Some((rows, _)) = self.rows.get(&key) {
+            let h = rows.len();
+            self.heights.insert(key, h);
+            return h;
+        }
+        self.get_or_render(block, width).len()
+    }
+
+    /// Drop the coldest quarter of the row cache — one sort per `CACHE_LIMIT / 4` misses.
+    fn evict_cold(&mut self) {
+        let mut ticks: Vec<(u64, CacheKey)> =
+            self.rows.iter().map(|(k, (_, t))| (*t, *k)).collect();
+        ticks.sort_unstable_by_key(|(t, _)| *t);
+        for (_, k) in ticks.into_iter().take((CACHE_LIMIT / 4).max(1)) {
+            self.rows.remove(&k);
+        }
+    }
+
+    /// Forget every entry for blocks older than `min_id` — called when the transcript drains its
+    /// oldest blocks, so the height table follows the session, not the process.
+    fn forget_before(&mut self, min_id: u64) {
+        self.heights.retain(|k, _| k.id >= min_id);
+        self.rows.retain(|k, _| k.id >= min_id);
+    }
+}
+
+/// Render one block's wrapped rows at `width` — the one place a payload becomes text rows.
+fn render_block_rows(block: &UiBlock, width: u16) -> Vec<String> {
+    let w = width as usize;
+    match &block.payload {
+        Payload::Text(s) => match block.kind {
+            BlockKind::Assistant => render_assistant_rows(s, w),
+            // Intro/Generic (boot notes, warnings, the `❯` echo): wrap to the pane instead of
+            // letting the paint clip a long single-line note at the right edge.
+            _ => sanitize_keep_sgr(s)
+                .split('\n')
+                .flat_map(|l| wrap_keep_sgr(l, w))
+                .collect(),
+        },
+        Payload::Tool(t) => render_tool_row(t, w)
+            .split('\n')
+            .map(str::to_string)
+            .collect(),
+        Payload::Plan(rows) => render_plan_box(rows, w),
+        Payload::Diff(d) => render_diff_box(d, w),
+        Payload::Verify(v) => vec![render_verify_line(v, w)],
     }
 }
 
@@ -426,6 +506,7 @@ impl AppState {
     }
 
     fn push_block(&mut self, kind: BlockKind, payload: Payload, complete: bool) -> u64 {
+        note_output();
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.blocks.push(UiBlock {
@@ -438,6 +519,9 @@ impl AppState {
             let excess = self.blocks.len() - BLOCK_LIMIT;
             self.blocks.drain(0..excess);
         }
+        if let Some(first) = self.blocks.first() {
+            self.cache.forget_before(first.id);
+        }
         // No scroll reset here: when the user is at the bottom (`scroll_from_tail == 0`) the tail is
         // followed automatically; when they've scrolled up to read, `draw_transcript` anchors on the
         // same content so newly-appended blocks don't yank the viewport down mid-read.
@@ -446,6 +530,7 @@ impl AppState {
 
     /// A plain-text block (generic emit / intro). Convenience over [`push_block`] + [`Payload::Text`].
     fn push_text(&mut self, kind: BlockKind, content: String, complete: bool) -> u64 {
+        note_output();
         self.push_block(kind, Payload::Text(content), complete)
     }
 
@@ -489,6 +574,7 @@ impl AppState {
     /// the same line instead of appending a second row). A result for an unknown seq (e.g. after
     /// pruning) just pushes a fresh completed row.
     fn apply_tool_event(&mut self, ev: ToolEvent) {
+        note_output();
         if let Some(block) = self.blocks.iter_mut().find(|b| {
             b.kind == BlockKind::Tool && matches!(&b.payload, Payload::Tool(t) if t.seq == ev.seq)
         }) {
@@ -903,6 +989,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                             area: g.area,
                             occluders,
                             caret,
+                            rows_offset: g.rows_offset,
                         };
                         let out = s.terminal.backend_mut();
                         crate::ui::links::inject_hyperlinks(out, &g.sgr_rows, &g.plain_rows, &ctx);

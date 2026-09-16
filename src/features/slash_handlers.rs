@@ -157,6 +157,7 @@ pub(crate) async fn slash_menu(
     let theme = ui_theme();
     match Select::with_theme(&theme)
         .with_prompt("slash command")
+        .report(false) // the command runs right after; the palette is not a transcript line
         .items(&items)
         .default(0)
         .interact_opt()
@@ -338,6 +339,18 @@ async fn slash_init(arg: &str) {
             );
             if !summary.trim().is_empty() {
                 tui::emit_line(&style(summary).dim().to_string());
+            }
+            // The verify ladder's knowledge: which commands this project has and how long the
+            // fast rung takes, kept in HOME beside the index (never in the checkout).
+            let root = crate::core::config::project_root();
+            tui::emit_line(&style("  measuring verify commands…").dim().to_string());
+            for line in crate::agent::verify_gate::init_verify(
+                &root,
+                crate::agent::verify_gate::DEFAULT_TIMEOUT_SECS,
+            )
+            .await
+            {
+                tui::emit_line(&style(format!("  {line}")).dim().to_string());
             }
         }
         Ok(Err(e)) => {
@@ -1176,50 +1189,6 @@ pub(crate) async fn handle_slash(
                 None => tui::emit_line(&theme::muted("⏹ compact stopped — context unchanged.").to_string()),
             }
         }
-        SlashId::Handoff => {
-            if arg.trim().is_empty() {
-                tui::emit_line(&style("usage: /handoff <new goal> — start a fresh thread carrying only what matters for it").dim().to_string());
-            } else {
-                tui::emit_line(&style("handing off…").dim().to_string());
-                // Same cancellable wrapper as /compact: this is a blocking model call inside the
-                // REPL loop, so without an armed token Esc can't reach it.
-                match cancellable_slash(handoff_now(history, arg.trim())).await {
-                    Some(Ok(summary)) => {
-                        // Fresh thread: new system prompt, the goal-relevant extraction seeded as
-                        // context, todos cleared, destructive-op session grants re-armed (like /clear).
-                        rebuild_system(history, model_label);
-                        // The marker prefix keeps the seed alive through lane rewrites (/config,
-                        // /model, resume) — `leading_system_count` stops at it, so lane splices go
-                        // around the seed instead of overwriting it.
-                        history.push(Message::system(format!(
-                            "{}\n{summary}",
-                            agent::compact::HANDOFF_MARKER_PREFIX
-                        )));
-                        reset_per_session_state();
-                        // The finished conversation keeps its file; the handoff starts a NEW one.
-                        // Without re-slugging, the very next autosave overwrote the previous
-                        // thread's saved transcript with this freshly seeded stub.
-                        let previous = current_session_slug();
-                        set_session_slug(None);
-                        update_live_history(history);
-                        tui::emit_line(&style("handoff — fresh thread seeded with the relevant context").color256(splash::ACCENT).to_string());
-                        // Name the thread being left behind, so the full transcript is findable.
-                        if let Some(prev) = previous {
-                            tui::emit_line(
-                                &style(format!("  (the previous thread stays saved as “{prev}” — /sessions to reopen it)"))
-                                    .dim()
-                                    .to_string(),
-                            );
-                        }
-                        return SlashOutcome::Submit(arg.trim().to_string());
-                    }
-                    Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("handoff:").red())),
-                    // Cancelled before the extraction landed. Nothing was rebuilt, so the current
-                    // thread continues untouched.
-                    None => tui::emit_line(&theme::muted("⏹ handoff stopped — thread unchanged.").to_string()),
-                }
-            }
-        }
         SlashId::Goal => {
             // Goal mode: run cap-free with smart retry until the model declares completion
             // (`goal_complete`) AND the verify gate passes. `/goal off` (or bare `/goal`) turns it off.
@@ -1318,18 +1287,51 @@ pub(crate) async fn handle_slash(
             }
         }
         SlashId::Approval => {
-            let requested = arg.split_whitespace().next().unwrap_or("status");
+            let mut words = arg.split_whitespace();
+            let requested = words.next().unwrap_or("status");
+            let persist = words.any(|w| matches!(w, "--persist" | "persist" | "--save"));
             let mut cfg = cli_config::load();
             if requested.is_empty() || matches!(requested, "status" | "st") {
-                tui::emit_line(&style(format!("approval: {} · ask=prompt · smart=read-only auto · yolo=pre-authorized", approval_mode())).dim().to_string());
+                let saved = cfg.persisted_approval_mode();
+                let scope = match cli_config::session_approval() {
+                    Some(s) if s != saved => format!(" (this window; saved default: {saved})"),
+                    _ => String::new(),
+                };
+                let session = crate::core::approval::session_grants();
+                let project = crate::core::approval::project_grants();
+                tui::emit_line(&style(format!("approval: {}{scope} · ask=prompt · smart=read-only auto · yolo=pre-authorized · add --persist to change the saved default · grants: {} session, {} project (`/approval grants`)", approval_mode(), session.len(), project.len())).dim().to_string());
+            } else if matches!(requested, "grants" | "grant") {
+                // What runs without asking right now: the menu's `always` picks (this window) and
+                // the project's `.aizen/approvals.json`.
+                let session = crate::core::approval::session_grants();
+                let project = crate::core::approval::project_grants();
+                if session.is_empty() && project.is_empty() {
+                    tui::emit_line(&style(format!("no grants: pick `always for <tool>` on an approval, or add {{\"allow\": [{{\"tool\": \"shell_run\", \"under\": \"scripts\"}}]}} to .aizen/{}", crate::core::approval::PROJECT_ALLOWLIST)).dim().to_string());
+                }
+                for g in &session {
+                    tui::emit_line(&style(format!("  session · {}", g.describe())).dim().to_string());
+                }
+                for g in &project {
+                    tui::emit_line(&style(format!("  project · {}", g.describe())).dim().to_string());
+                }
             } else if let Ok(mode) = requested.parse::<ApprovalMode>() {
-                cfg.set_approval_mode(mode);
-                match cli_config::save(&cfg) {
-                    Ok(_) => tui::emit_line(&style(format!("approval → {mode}")).color256(splash::ACCENT).to_string()),
-                    Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                if persist {
+                    // The explicit way to change the machine's default: the saved file is what
+                    // every new window, `aizen serve` lane and cron job starts from.
+                    cfg.set_approval_mode(mode);
+                    cli_config::set_session_approval(None);
+                    match cli_config::save(&cfg) {
+                        Ok(_) => tui::emit_line(&style(format!("approval → {mode} (saved as the default)")).color256(splash::ACCENT).to_string()),
+                        Err(e) => tui::emit_line(&format!("{} {e}", style("approval:").red())),
+                    }
+                } else {
+                    // This window only: a one-off "just do it" must not arm every other window and
+                    // every cron job on the machine, which is what writing it to disk did.
+                    cli_config::set_session_approval(Some(mode));
+                    tui::emit_line(&style(format!("approval → {mode} (this window only — `/approval {mode} --persist` to make it the default)")).color256(splash::ACCENT).to_string());
                 }
             } else {
-                tui::emit_line(&style("usage: /approval ask|smart|yolo").dim().to_string());
+                tui::emit_line(&style("usage: /approval ask|smart|yolo [--persist]").dim().to_string());
             }
         }
         SlashId::Sandbox => {
@@ -1371,11 +1373,11 @@ pub(crate) async fn handle_slash(
             }
         }
 SlashId::Yolo => {
-            let mut cfg = cli_config::load();
-            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
-            cfg.set_approval_mode(mode);
-            let _ = cli_config::save(&cfg);
-            tui::emit_line(&style(format!("approval → {mode} (legacy /yolo alias)")).color256(splash::ACCENT).to_string());
+            // Session-scoped toggle (see `cli_config::session_approval`): flips THIS window
+            // between yolo and ask, and never touches the saved default.
+            let mode = if approval_mode() == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
+            cli_config::set_session_approval(Some(mode));
+            tui::emit_line(&style(format!("approval → {mode} (this window only; `/approval {mode} --persist` to save)")).color256(splash::ACCENT).to_string());
         }
         SlashId::AutoCopy => {
             // Copy shortcut wording is OS-specific so the status line teaches the right chord.
@@ -1467,11 +1469,10 @@ SlashId::Yolo => {
             }
         }
         SlashId::Smart => {
-            let mut cfg = cli_config::load();
-            let mode = if cfg.persisted_approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
-            cfg.set_approval_mode(mode);
-            let _ = cli_config::save(&cfg);
-            tui::emit_line(&style(format!("approval → {mode} (legacy /smart alias)")).color256(splash::ACCENT).to_string());
+            // Session-scoped like `/yolo`; `/approval smart --persist` changes the saved default.
+            let mode = if approval_mode() == ApprovalMode::Smart { ApprovalMode::Ask } else { ApprovalMode::Smart };
+            cli_config::set_session_approval(Some(mode));
+            tui::emit_line(&style(format!("approval → {mode} (this window only; `/approval {mode} --persist` to save)")).color256(splash::ACCENT).to_string());
         }
         SlashId::Ultimate => {
             let mut cfg = cli_config::load();
@@ -1768,7 +1769,28 @@ SlashId::Yolo => {
             }
         }
         SlashId::Persona => {
-            if let Err(e) = personas_menu(history, model_label).await {
+            // `/persona coding on|off|status`: keep the character in the prompt on coding turns
+            // (E4.7). Everything else opens the menu as before.
+            if let Some(rest) = arg.strip_prefix("coding") {
+                let want = rest.trim();
+                let mut cfg = cli_config::load();
+                match want {
+                    "on" | "off" => {
+                        cfg.persona_for_coding = Some(want == "on");
+                        if let Err(e) = cli_config::save(&cfg) {
+                            tui::note_line(&format!("{} {e}", style("persona:").red()));
+                        } else {
+                            tui::emit_line(&format!(
+                                "persona on coding turns: {want} (from your next message)"
+                            ));
+                        }
+                    }
+                    _ => tui::emit_line(&format!(
+                        "persona on coding turns: {} — `/persona coding on|off`",
+                        if cfg.persona_for_coding.unwrap_or(false) { "on" } else { "off" }
+                    )),
+                }
+            } else if let Err(e) = personas_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("persona:").red()));
             }
         }
@@ -1856,18 +1878,66 @@ SlashId::Yolo => {
             match build_time_diff(from, to, paths, patch) {
                 // Must go through `emit_line`: raw `println!` from inside the REPL is wiped by the
                 // retained render thread's next repaint.
-                Ok(report) => {
-                    for line in diff_lines(&report, "-- <path>") {
+                Ok(mut report) => {
+                    // On the retained TUI a patch goes through the diff boxes an edit result
+                    // gets (colour, side-by-side, gutter numbers) instead of monochrome lines.
+                    let boxed = if tui::retained_running() { report.patch.take() } else { None };
+                    let mut lines = diff_lines(&report, "-- <path>");
+                    if boxed.is_some() && lines.last().is_some_and(|l| l.contains("--patch for the full text")) {
+                        lines.pop();
+                    }
+                    for line in lines {
                         tui::emit_line(&line);
+                    }
+                    if let Some(text) = boxed {
+                        crate::agent::emit_patch_boxes(&text);
+                        if report.patch_truncated {
+                            tui::emit_line(&style("… patch truncated — narrow it with `-- <path>`").dim().to_string());
+                        }
                     }
                 }
                 Err(e) => tui::emit_line(&style(format!("diff: {e}")).color256(crate::ui::theme::WARN).to_string()),
             }
         }
-        SlashId::Undo => match timemachine::undo() {
-            Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏪ rewound to").color256(splash::ACCENT), s.id)),
-            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
-        },
+        // `/undo` (alias `/rewind`): show what the rewind WILL change first, refuse to discard
+        // work no checkpoint holds unless told `--yes`, and name the files it touched after.
+        SlashId::Undo => {
+            let yes = arg.split_whitespace().any(|w| matches!(w, "--yes" | "-y" | "yes"));
+            match timemachine::undo_target() {
+                Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
+                Ok((current, target)) => {
+                    let stat = build_time_diff(Some("working".into()), Some(format!("#{target}")), Vec::new(), false).ok();
+                    let files: Vec<String> = stat.as_ref().map(|r| r.files.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
+                    if let Some(r) = &stat {
+                        tui::emit_line(&style(format!("⏪ rewind to checkpoint #{target}: {} file(s), +{} −{}", r.files.len(), r.total_added(), r.total_deleted())).color256(splash::ACCENT).to_string());
+                        for line in diff_lines(r, "-- <path>").into_iter().skip(1) {
+                            if line.contains("--patch for the full text") { continue; }
+                            tui::emit_line(&line);
+                        }
+                    }
+                    let dirty = timemachine::working_tree_differs_from(current).unwrap_or(false);
+                    if dirty && !yes {
+                        tui::emit_line(&style(format!("the working tree has changes since checkpoint #{current} that no checkpoint holds — `/diff` shows them; `/undo --yes` (or `/rewind --yes`) rewinds anyway")).color256(crate::ui::theme::WARN).to_string());
+                    } else {
+                        match timemachine::undo_with_report() {
+                            Ok((s, removed)) => {
+                                let named = if files.is_empty() { String::new() } else {
+                                    let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
+                                    let more = files.len().saturating_sub(shown.len());
+                                    format!(" — {}{}", shown.join(", "), if more > 0 { format!(" (+{more} more)") } else { String::new() })
+                                };
+                                tui::emit_line(&format!("{} checkpoint #{}{named}", style("⏪ rewound to").color256(splash::ACCENT), s.id));
+                                if !removed.is_empty() {
+                                    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
+                                    tui::emit_line(&style(format!("  removed {} file(s) that checkpoint never had: {} — `/redo` brings them back", removed.len(), shown.join(", "))).dim().to_string());
+                                }
+                            }
+                            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
+                        }
+                    }
+                }
+            }
+        }
         SlashId::Redo => match timemachine::redo() {
             Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
             Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),

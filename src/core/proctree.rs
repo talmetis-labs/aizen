@@ -256,13 +256,53 @@ pub fn output_bounded_bytes(
     timeout: Duration,
     drain_grace: Duration,
 ) -> std::io::Result<BoundedBytes> {
+    output_bounded_bytes_fed(cmd, None, timeout, drain_grace)
+}
+
+/// [`output_bounded`] with `input` written to the child's stdin, which is then closed. The writer
+/// runs on its own thread and its errors are ignored: a child that exits without reading, or is
+/// killed at the deadline, breaks the pipe, and that is not a failure of the call.
+pub fn output_bounded_with_input(
+    cmd: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    drain_grace: Duration,
+) -> std::io::Result<BoundedOutput> {
+    let raw = output_bounded_bytes_fed(cmd, Some(input.to_vec()), timeout, drain_grace)?;
+    Ok(BoundedOutput {
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+        code: raw.code,
+        timed_out: raw.timed_out,
+        output_truncated: raw.output_truncated,
+    })
+}
+
+fn output_bounded_bytes_fed(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    drain_grace: Duration,
+) -> std::io::Result<BoundedBytes> {
     use std::process::Stdio;
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     prepare(cmd);
     let mut child = cmd.spawn()?;
     let containment = contain(&child);
+    if let Some(bytes) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(&bytes);
+            });
+        }
+    }
 
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();

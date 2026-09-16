@@ -63,6 +63,10 @@ struct Entry {
     /// whole point. Cancelling this stops one sub-agent; the turn, its parent workflow, and its
     /// siblings keep running. `None` for rows nobody offered a stop handle for.
     cancel: Option<crate::core::cancel::TurnCancel>,
+    /// Model tokens this run's own calls spent (input, output), summed from each call's usage
+    /// by the child runner — the per-child cost the session total used to hide.
+    tokens_in: u64,
+    tokens_out: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +459,8 @@ fn start(
         finished_unix: None,
         parent,
         cancel: None,
+        tokens_in: 0,
+        tokens_out: 0,
     };
     persist_manifest(&e);
     store()
@@ -464,6 +470,44 @@ fn start(
     Track {
         id,
         finished: false,
+    }
+}
+
+/// Live progress for a delegated child: `step 7 · file_edit` replaces the row's detail while it
+/// runs, so `/workflows` shows WHERE a child is, not only that it is running.
+pub fn note_step(id: u64, step: usize, tool: &str) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.live.iter_mut().find(|e| e.id == id) {
+        if e.phase == Phase::Running {
+            e.detail = format!("step {step} · {tool}");
+        }
+    }
+}
+
+/// Add a run's model tokens (input, output) to its row — live or already finished, since the
+/// runner sums them after the child's loop returns.
+pub fn add_usage(id: u64, tokens_in: u64, tokens_out: u64) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    // One deref of the guard, then disjoint field borrows: two `g.field` derefs would borrow the
+    // guard mutably twice.
+    let st = &mut *g;
+    if let Some(e) = st
+        .live
+        .iter_mut()
+        .chain(st.history.iter_mut())
+        .find(|e| e.id == id)
+    {
+        e.tokens_in += tokens_in;
+        e.tokens_out += tokens_out;
+    }
+}
+
+/// `12.3k` for the row's token counts; exact under ten thousand.
+pub fn fmt_tokens(n: u64) -> String {
+    if n < 10_000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1_000.0)
     }
 }
 
@@ -709,6 +753,15 @@ fn format_row(e: &Entry) -> String {
     } else {
         format!(" — {}", e.detail)
     };
+    let tokens = if e.tokens_in > 0 || e.tokens_out > 0 {
+        format!(
+            " · {}→{} tok",
+            fmt_tokens(e.tokens_in),
+            fmt_tokens(e.tokens_out)
+        )
+    } else {
+        String::new()
+    };
     let parent = e
         .parent
         .map(|p| format!(" ←{}", short_handle(p)))
@@ -722,7 +775,7 @@ fn format_row(e: &Entry) -> String {
         _ => "",
     };
     format!(
-        "  {mark} {handle}{stoppable} [{tag}] {}{label}  · {elapsed}{detail}{parent}\n",
+        "  {mark} {handle}{stoppable} [{tag}] {}{label}  · {elapsed}{detail}{tokens}{parent}\n",
         e.name
     )
 }
@@ -790,6 +843,29 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("slots"), "{s}");
+    }
+
+    #[test]
+    fn step_notes_and_usage_reach_the_row() {
+        let t = start_task("daedalus · fix parser");
+        let id = t.id();
+        note_step(id, 7, "file_edit+shell_run");
+        add_usage(id, 12_345, 1_200);
+        let live = format_status();
+        assert!(live.contains("step 7 · file_edit+shell_run"), "{live}");
+        // Exact under ten thousand, `12.3k` above it.
+        assert!(live.contains("12.3k→1200 tok"), "{live}");
+        t.finish_ok("done");
+        // A finished row keeps its tokens and still takes a late add (the runner sums after the
+        // child's loop returns); a late step note no longer overwrites its final detail.
+        // 12,495 sits clear of a `.x5` rounding edge in `{:.1}`; 12,350 rendered as 12.3k.
+        add_usage(id, 150, 5);
+        note_step(id, 9, "file_read");
+        let recent = format_status();
+        assert!(recent.contains("12.5k→1205 tok"), "{recent}");
+        assert!(!recent.contains("step 9 · file_read"), "{recent}");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(12_345), "12.3k");
     }
 
     #[test]

@@ -51,8 +51,10 @@ pub struct RoleProfile {
     /// Include `<project_context>` (build/test conventions) — the roles whose job is building
     /// and testing pay for it; investigation roles don't.
     pub project_context: bool,
-    /// Default total step budget for a dispatch that doesn't pass `max_steps`. One value today,
-    /// but it lives here so the profile — not a scattered constant — answers the question.
+    /// Default total step budget for a dispatch that doesn't pass `max_steps`. Sized to the
+    /// work: a locate job (argus) is done in a dozen steps or it is lost, while an implement
+    /// job (daedalus) reads, edits, builds and re-edits. The profile — not a scattered
+    /// constant — answers the question; the `task` tool and workflow children both read it.
     pub default_max_steps: usize,
     /// The role's working-method prompt (embedded at compile time from `roles/<name>.md`),
     /// rendered inside `<role>` after the brief. A sub-agent prompt is paid uncached per
@@ -85,7 +87,7 @@ pub const ROLES: &[RoleProfile] = &[
         edit: true,
         history: false,
         project_context: true,
-        default_max_steps: 25,
+        default_max_steps: 45,
         prompt: include_str!("roles/daedalus.md"),
     },
     RoleProfile {
@@ -100,7 +102,7 @@ pub const ROLES: &[RoleProfile] = &[
         edit: false,
         history: false,
         project_context: false,
-        default_max_steps: 25,
+        default_max_steps: 15,
         prompt: include_str!("roles/argus.md"),
     },
     RoleProfile {
@@ -143,7 +145,7 @@ pub const ROLES: &[RoleProfile] = &[
         edit: false,
         history: false,
         project_context: true,
-        default_max_steps: 25,
+        default_max_steps: 30,
         prompt: include_str!("roles/themis.md"),
     },
     RoleProfile {
@@ -157,13 +159,16 @@ pub const ROLES: &[RoleProfile] = &[
         edit: false,
         history: false,
         project_context: false,
-        default_max_steps: 25,
+        default_max_steps: 20,
         prompt: include_str!("roles/clio.md"),
     },
     RoleProfile {
         name: "mnemosyne",
         aliases: &["historian"],
-        brief: "mnemosyne (historian) — recover prior decisions and project/session history: what                 was decided, when, and whether it was later revised. Tools: memory search/list +                 session_recall (recent same-project conversations) + read/glob files; READ-ONLY:                 no web, no edits, no shell, no memory writes.",
+        brief: "mnemosyne (historian) — recover prior decisions and project/session history: what \
+                was decided, when, and whether it was later revised. Tools: memory search/list + \
+                session_recall (recent same-project conversations) + read/glob files; READ-ONLY: \
+                no web, no edits, no shell, no memory writes.",
         web: false,
         shell: false,
         edit: false,
@@ -286,6 +291,42 @@ mod tests {
         // History (session_recall) is the historian's instrument alone.
         for p in ROLES {
             assert_eq!(p.history, p.name == "mnemosyne", "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn budgets_are_sized_to_the_work() {
+        let budget = |n: &str| canonical(n).unwrap().default_max_steps;
+        // Locate < research < plan/review/recall < test < implement. A searcher that has not
+        // found its symbol in fifteen steps is lost; an implementer that has to build and
+        // re-edit needs three times that. Seven identical 25s was the audit's O4.
+        assert_eq!(budget("argus"), 15);
+        assert_eq!(budget("clio"), 20);
+        assert_eq!(budget("metis"), 25);
+        assert_eq!(budget("nemesis"), 25);
+        assert_eq!(budget("mnemosyne"), 25);
+        assert_eq!(budget("themis"), 30);
+        assert_eq!(budget("daedalus"), 45);
+        for p in ROLES {
+            assert!(
+                (1..=crate::agent::task_tool::MAX_STEP_BUDGET).contains(&p.default_max_steps),
+                "{}: default must fit under the shared cap",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn briefs_carry_no_runs_of_spaces() {
+        // A missing `\` continuation in a string literal ships its indentation to every
+        // dispatch (mnemosyne once carried three runs of seventeen spaces).
+        for p in ROLES {
+            assert!(
+                !p.brief.contains("  "),
+                "{}: run of spaces in brief: {:?}",
+                p.name,
+                p.brief
+            );
         }
     }
 }

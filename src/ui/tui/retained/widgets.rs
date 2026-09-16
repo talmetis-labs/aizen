@@ -132,7 +132,6 @@ pub(crate) fn fmt_elapsed(ms: Option<u64>) -> String {
 /// (empty digest) is just the call line; the result line is added when the digest lands.
 pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
     use crate::ui::theme;
-    let _ = width; // stacked layout no longer needs the frame width to right-align
     let icon = if t.icon.is_empty() {
         String::new()
     } else {
@@ -164,11 +163,41 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
     } else {
         theme::faint(&time).to_string()
     };
-    format!(
+    let mut out = format!(
         "{call_line}\n{} {digest_styled}{time_styled}",
         theme::faint("└")
-    )
+    );
+    // A failed call auto-expands: its last lines ride under the digest, so `exit 101` is never
+    // the whole story on screen. `Ctrl-E` opens the full tail; the hint says so only when
+    // there is more than what is shown.
+    if t.state == ToolState::Err && !t.body.is_empty() {
+        let lines: Vec<&str> = t.body.lines().filter(|l| !l.trim().is_empty()).collect();
+        let shown = lines.len().min(AUTO_EXPAND_LINES);
+        let max_w = width.saturating_sub(4).max(16);
+        for l in &lines[lines.len() - shown..] {
+            let clipped: String = l.chars().take(max_w).collect();
+            out.push_str(&format!(
+                "\n  {} {}",
+                theme::faint("│"),
+                theme::faint(&clipped)
+            ));
+        }
+        if lines.len() > shown {
+            out.push_str(&format!(
+                "\n  {} {}",
+                theme::faint("│"),
+                theme::faint(&format!(
+                    "… {} more line(s) — Ctrl-E expands",
+                    lines.len() - shown
+                ))
+            ));
+        }
+    }
+    out
 }
+
+/// Lines of a failed tool's tail painted under its row.
+pub(crate) const AUTO_EXPAND_LINES: usize = 6;
 
 /// Render the in-place plan panel as a boxed checklist: a `☑ done/total · plan` header row, then one
 /// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses — but in

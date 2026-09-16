@@ -29,7 +29,10 @@ impl Spinner {
     /// only the animation; the operation they were narrating still runs and still prints its verdict.
     pub fn start(label: &str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        if !std::io::stdout().is_terminal() || crate::ui::tui::retained_running() {
+        if !std::io::stdout().is_terminal()
+            || crate::ui::tui::retained_running()
+            || crate::ui::events::on()
+        {
             return Self { stop, handle: None };
         }
         let label = label.to_string();

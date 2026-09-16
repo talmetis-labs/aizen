@@ -134,6 +134,10 @@ fn normalize_paste_text(text: &str) -> String {
 /// Idle seconds before the screensaver card is raised (retained backend only). Reset by any key or
 /// mouse event; gated on !working and no open menu/overlay so it never fires mid-task or over a menu.
 const IDLE_SCREENSAVER_SECS: u64 = 15;
+/// The screensaver also needs the TRANSCRIPT quiet this long: a user reading a long diff is
+/// idle on the keyboard for more than 15 s, and covering what they are reading is the audit's
+/// U10.
+const OUTPUT_QUIET_SECS: u64 = 60;
 
 /// Shared list + selection while the overlay is open (owned by the menu input thread).
 static MODEL_MENU: OnceLock<Mutex<ModelMenuState>> = OnceLock::new();
@@ -755,6 +759,9 @@ struct Render {
     /// other overlay: it only exists while the agent loop is BLOCKED waiting on the answer.
     approval_menu_active: bool,
     approval_menu_sel: usize,
+    /// The rows painted for the CURRENT approval (built per call — they name the tool and its
+    /// directory). Index ↔ decision is pinned by `approval_menu_decision`.
+    approval_menu_rows: Vec<String>,
     /// `clarify` answer menu: the question's suggested options plus a trailing "type my own" row.
     question_menu_active: bool,
     question_menu_sel: usize,
@@ -788,6 +795,7 @@ fn render() -> &'static Mutex<Render> {
             text_overlay_lines: Vec::new(),
             approval_menu_active: false,
             approval_menu_sel: 0,
+            approval_menu_rows: Vec::new(),
             question_menu_active: false,
             question_menu_sel: 0,
             question_menu_question: String::new(),
@@ -986,14 +994,26 @@ pub fn reset_session_allow() {
     SESSION_ALLOW.store(false, Ordering::Relaxed);
 }
 
-/// The approval menu's rows, in the order painted. Index ↔ decision is pinned by
-/// [`approval_menu_decision`]; keep the two in lock-step.
-const APPROVAL_MENU_ROWS: [&str; 4] = [
-    "Yes — run this action",
-    "Yes — allow all destructive actions this session",
-    "No — skip this action (the agent continues)",
-    "No — stop the turn and tell it what to do",
-];
+/// The approval menu's rows for one call, in the order painted. Index ↔ decision is pinned by
+/// [`approval_menu_decision`]; keep the two in lock-step. The two `always` rows are the grant
+/// scopes (`core::approval::Grant`): the tool everywhere, or the tool under the directory this
+/// call writes to — the escape from prompt fatigue that is narrower than allow-all.
+fn approval_menu_rows(tool: &str, dir: Option<&str>) -> Vec<String> {
+    vec![
+        "Yes — run this action".to_string(),
+        format!("Yes — always for {tool} this session"),
+        match dir {
+            Some(d) => format!("Yes — always for {tool} under {d} this session"),
+            None => format!("Yes — always for {tool} this session (no directory to scope)"),
+        },
+        "Yes — allow all destructive actions this session".to_string(),
+        "No — skip this action (the agent continues)".to_string(),
+        "No — stop the turn and tell it what to do".to_string(),
+    ]
+}
+
+/// Rows per approval menu (see [`approval_menu_rows`]).
+const APPROVAL_MENU_LEN: usize = 6;
 
 /// Map an approval-menu row to `(answer_char, also_cancel_turn)`. The char is what the blocked
 /// [`ask_approval`] gate receives on its channel ('y' / 'a' / 'n'); `true` in the second slot means
@@ -1002,8 +1022,10 @@ const APPROVAL_MENU_ROWS: [&str; 4] = [
 fn approval_menu_decision(sel: usize) -> (char, bool) {
     match sel {
         0 => ('y', false),
-        1 => ('a', false),
-        2 => ('n', false),
+        1 => ('t', false),
+        2 => ('d', false),
+        3 => ('a', false),
+        4 => ('n', false),
         _ => ('n', true),
     }
 }
@@ -1021,7 +1043,10 @@ fn approval_menu_showing() -> bool {
 /// Under the retained backend this also raises the approval MENU overlay (arrow keys / Enter /
 /// mouse click pick a row); the y/n/a accelerator keys keep working either way, so the menu is a
 /// presentation layer over the same one-char channel, not a second decision path.
-pub fn ask_approval(prompt_line: &str) -> bool {
+/// `tool` and `dir` name what the menu's `always` rows grant; picking one records a session
+/// grant (`core::approval::grant_session`) before answering yes. `y`/`n`/`a` behave as before;
+/// `t` = always for the tool, `d` = always under the dir.
+pub fn ask_approval_for(prompt_line: &str, tool: &str, dir: Option<&std::path::Path>) -> bool {
     if session_allow_all() {
         return true;
     }
@@ -1036,11 +1061,13 @@ pub fn ask_approval(prompt_line: &str) -> bool {
     *approval_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     APPROVAL_PENDING.store(true, Ordering::Relaxed);
     let menu = retained_running();
+    let dir_label = dir.map(|d| d.display().to_string());
     if menu {
         {
             let mut r = render().lock().unwrap();
             r.approval_menu_active = true;
             r.approval_menu_sel = 0;
+            r.approval_menu_rows = approval_menu_rows(tool, dir_label.as_deref());
         }
         repaint_force();
     }
@@ -1057,6 +1084,15 @@ pub fn ask_approval(prompt_line: &str) -> bool {
     match ans {
         'a' => {
             SESSION_ALLOW.store(true, Ordering::Relaxed);
+            true
+        }
+        't' => {
+            crate::core::approval::grant_session(tool, None);
+            true
+        }
+        'd' => {
+            // No directory to scope to → the tool-wide grant, which is what the row said.
+            crate::core::approval::grant_session(tool, dir.map(std::path::Path::to_path_buf));
             true
         }
         'y' => true,
@@ -1214,7 +1250,7 @@ fn overlay_menu_click(
     cancel_tx: &UnboundedSender<()>,
 ) -> bool {
     if APPROVAL_PENDING.load(Ordering::Relaxed) && approval_menu_showing() {
-        if idx >= APPROVAL_MENU_ROWS.len() {
+        if idx >= APPROVAL_MENU_LEN {
             return true; // dead zone inside the panel — swallow, never start a selection under it
         }
         {
@@ -1492,6 +1528,11 @@ pub fn emit(s: &str) {
         }
         return;
     }
+    // The JSON stream owns stdout: whatever would have been printed here is a `trace` event.
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::trace(s);
+        return;
+    }
     if retained::is_running() {
         // Route to the render thread even while SUSPENDED for a dialoguer menu: it folds this into
         // its block buffer (no paint yet), and `resume` redraws from that buffer. Printing straight
@@ -1536,6 +1577,10 @@ pub fn emit_line(s: &str) {
 /// wiped. Outside the REPL (one-shot `aizen agent`, pipes, CI) it degrades to `eprintln!`, keeping
 /// stdout clean for the model's answer.
 pub fn note_line(s: &str) {
+    if crate::ui::events::on() && !(active() || retained_running()) {
+        crate::ui::events::trace(s);
+        return;
+    }
     if active() || retained_running() {
         emit_line(s);
     } else {
@@ -1577,6 +1622,7 @@ pub fn tool_call_begin(icon: &str, name: &str, target: &str) -> u64 {
     let seq = next_tool_seq();
     if retained::is_running() {
         retained::tool_event(retained::ToolEvent {
+            body: String::new(),
             seq,
             icon: icon.to_string(),
             name: name.to_string(),
@@ -1593,6 +1639,63 @@ pub fn tool_call_begin(icon: &str, name: &str, target: &str) -> u64 {
 /// opened by [`tool_call_begin`] in place; on the classic path it renders the whole call line plus
 /// the indented `└ <digest> · <time>` result line once, so both surfaces read the same. `elapsed_ms`
 /// is the wall-clock run time (`None` → no time shown, e.g. restored transcripts).
+/// How much of a tool result's tail a row keeps for expansion — the decisive part of a build log
+/// lives at its end.
+pub const TOOL_BODY_KEEP_CHARS: usize = 12_000;
+/// Tool bodies kept for `Ctrl-E`, newest last.
+const TOOL_BODIES_KEEP: usize = 64;
+
+fn tool_bodies() -> &'static Mutex<std::collections::VecDeque<(u64, String, String)>> {
+    static S: OnceLock<Mutex<std::collections::VecDeque<(u64, String, String)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// The tail of `body` a row keeps (see [`TOOL_BODY_KEEP_CHARS`]).
+pub fn tool_body_tail(body: &str) -> String {
+    let n = body.chars().count();
+    if n <= TOOL_BODY_KEEP_CHARS {
+        return body.to_string();
+    }
+    let skip = n - TOOL_BODY_KEEP_CHARS;
+    format!(
+        "…[{skip} chars cut]\n{}",
+        body.chars().skip(skip).collect::<String>()
+    )
+}
+
+/// Remember a finished tool's result for `Ctrl-E` (bounded; a repeat `seq` replaces its entry).
+pub(crate) fn note_tool_body(seq: u64, title: String, body: String) {
+    if body.trim().is_empty() {
+        return;
+    }
+    let mut v = tool_bodies().lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(s, _, _)| *s != seq);
+    v.push_back((seq, title, body));
+    while v.len() > TOOL_BODIES_KEEP {
+        v.pop_front();
+    }
+}
+
+/// `(title, body)` of the tool result with `seq`, if still kept.
+pub fn tool_body(seq: u64) -> Option<(String, String)> {
+    tool_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(s, _, _)| *s == seq)
+        .map(|(_, t, b)| (t.clone(), b.clone()))
+}
+
+/// The most recent kept tool result: `(seq, title, body)`.
+pub fn last_tool_body() -> Option<(u64, String, String)> {
+    tool_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .back()
+        .cloned()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn tool_call_end(
     seq: u64,
     icon: &str,
@@ -1601,7 +1704,10 @@ pub fn tool_call_end(
     digest: &str,
     outcome: ToolOutcome,
     elapsed_ms: Option<u64>,
+    body: &str,
 ) {
+    let tail = tool_body_tail(body);
+    note_tool_body(seq, format!("{name}  {target}  — {digest}"), tail.clone());
     let ev = retained::ToolEvent {
         seq,
         icon: icon.to_string(),
@@ -1610,6 +1716,7 @@ pub fn tool_call_end(
         digest: digest.to_string(),
         state: tool_state(outcome),
         elapsed_ms,
+        body: tail,
     };
     if retained::is_running() {
         retained::tool_event(ev);
@@ -1624,6 +1731,10 @@ pub fn tool_call_end(
 /// Replace the in-place plan checklist. `items` = `(status, text)` where status 0/1/2 = pending /
 /// in-progress / done. Empty removes the panel. Classic path re-prints the box each call.
 pub fn plan_update(items: &[(u8, String)]) {
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::plan(items);
+        return;
+    }
     let rows: Vec<retained::PlanRow> = items
         .iter()
         .map(|(s, t)| retained::PlanRow {
@@ -1654,6 +1765,10 @@ pub struct DiffHunk {
 /// Push a boxed diff preview — rendered side-by-side (old pane │ new pane) when the transcript is
 /// wide enough, unified otherwise.
 pub fn diff_box(path: &str, adds: usize, dels: usize, hunks: Vec<DiffHunk>) {
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::diff(path, adds, dels);
+        return;
+    }
     let d = retained::DiffPayload {
         path: path.to_string(),
         adds,
@@ -1671,6 +1786,10 @@ pub fn diff_box(path: &str, adds: usize, dels: usize, hunks: Vec<DiffHunk>) {
 
 /// Push a green verify-gate success line (`✓ <cmd> — <detail>`).
 pub fn verify_line(cmd: &str, detail: &str) {
+    if crate::ui::events::on() && !retained::is_running() {
+        crate::ui::events::verify(cmd, detail);
+        return;
+    }
     let v = retained::VerifyPayload {
         cmd: cmd.to_string(),
         detail: detail.to_string(),
@@ -1840,8 +1959,12 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
         // already in the transcript right above — the panel only has to carry the choices.
         Some(retained::OverlaySnapshot {
             title: "approve?".to_string(),
-            lines: APPROVAL_MENU_ROWS.iter().map(|s| s.to_string()).collect(),
-            selected: Some(r.approval_menu_sel.min(APPROVAL_MENU_ROWS.len() - 1)),
+            lines: if r.approval_menu_rows.is_empty() {
+                approval_menu_rows("this tool", None)
+            } else {
+                r.approval_menu_rows.clone()
+            },
+            selected: Some(r.approval_menu_sel.min(APPROVAL_MENU_LEN - 1)),
             hint: "↑↓/click pick · Enter confirm · y/a/n direct · Esc stop".to_string(),
         })
     } else if r.question_menu_active {
@@ -2647,6 +2770,7 @@ fn input_loop(
                     && !text_overlay_active()
                     && !RETAINED_INFO_OVERLAY.load(Ordering::Relaxed)
                     && last_activity.elapsed() >= Duration::from_secs(IDLE_SCREENSAVER_SECS)
+                    && retained::output_quiet_for() >= Duration::from_secs(OUTPUT_QUIET_SECS)
                 {
                     if let Some(idx) = crate::ui::cards::screensaver_card() {
                         retained::screensaver(Some(idx));
@@ -2900,7 +3024,7 @@ fn input_loop(
                 match key {
                     Key::ArrowUp | Key::ArrowDown => {
                         let mut r = render().lock().unwrap();
-                        let last = APPROVAL_MENU_ROWS.len() - 1;
+                        let last = APPROVAL_MENU_LEN - 1;
                         r.approval_menu_sel = match key {
                             Key::ArrowUp => r.approval_menu_sel.saturating_sub(1),
                             _ => (r.approval_menu_sel + 1).min(last),
@@ -2931,6 +3055,8 @@ fn input_loop(
             }
             let decided = match key {
                 Key::Char('y') | Key::Char('Y') => Some('y'),
+                Key::Char('t') | Key::Char('T') => Some('t'),
+                Key::Char('d') | Key::Char('D') => Some('d'),
                 Key::Char('a') | Key::Char('A') => Some('a'),
                 Key::Char('n') | Key::Char('N') => Some('n'),
                 _ => None,
@@ -3272,6 +3398,20 @@ fn input_loop(
                     last_arrival = None;
                     last_arrival_prev = None;
                     pending_paste_repaint = false;
+                    repaint();
+                }
+            }
+            Key::Char('\u{5}') => {
+                // Ctrl-E: expand a tool result into the text overlay — the tool under the
+                // selection anchor when a selection sits on a tool row, else the most recent.
+                // (Ctrl-O stays the screenshot key.)
+                let picked = retained::live_selection()
+                    .and_then(|s| retained::tool_seq_at_row(s.anchor_line))
+                    .and_then(tool_body)
+                    .or_else(|| last_tool_body().map(|(_, t, b)| (t, b)));
+                if let Some((title, body)) = picked {
+                    let lines: Vec<String> = body.lines().map(str::to_string).collect();
+                    let _ = text_overlay_open(title, lines);
                     repaint();
                 }
             }
@@ -4563,13 +4703,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_bodies_are_kept_bounded_and_found_by_seq() {
+        let base = 900_000 + (std::process::id() as u64 % 1000) * 100;
+        for i in 0..70u64 {
+            note_tool_body(base + i, format!("t{i}"), format!("body {i}"));
+        }
+        assert!(
+            tool_body(base).is_none(),
+            "the oldest fell off the bounded store"
+        );
+        assert_eq!(
+            tool_body(base + 69).map(|(t, _)| t),
+            Some("t69".to_string())
+        );
+        note_tool_body(base + 69, "t69b".into(), "replaced".into());
+        assert_eq!(
+            tool_body(base + 69).map(|(_, b)| b),
+            Some("replaced".to_string())
+        );
+        note_tool_body(base + 1000, "empty".into(), "   ".into());
+        assert!(
+            tool_body(base + 1000).is_none(),
+            "an empty body is not kept"
+        );
+        let tail = tool_body_tail(&"x".repeat(TOOL_BODY_KEEP_CHARS + 5));
+        assert!(tail.starts_with("…[5 chars cut]\n"), "{}", &tail[..24]);
+        assert_eq!(tool_body_tail("short"), "short");
+    }
+
+    #[test]
     fn session_allow_short_circuits_approval() {
         reset_session_allow();
         assert!(!session_allow_all(), "starts off");
         // When session-allow is set, ask_approval returns true immediately (no input thread needed).
         SESSION_ALLOW.store(true, Ordering::Relaxed);
         assert!(
-            ask_approval("⚙ file_edit x — approve?"),
+            ask_approval_for("⚙ file_edit x — approve?", "file_edit", None),
             "allow-all short-circuits to true"
         );
         reset_session_allow();
@@ -4584,20 +4753,36 @@ mod tests {
     #[test]
     fn approval_menu_rows_and_decisions_stay_in_lockstep() {
         // Every painted row must map to a decision; the mapping is what a click/Enter fires.
-        assert_eq!(APPROVAL_MENU_ROWS.len(), 4);
+        let rows = approval_menu_rows("shell_run", Some("/proj/scripts"));
+        assert_eq!(rows.len(), APPROVAL_MENU_LEN);
         assert_eq!(approval_menu_decision(0), ('y', false), "run once");
-        assert_eq!(approval_menu_decision(1), ('a', false), "session allow");
-        assert_eq!(approval_menu_decision(2), ('n', false), "deny, keep going");
         assert_eq!(
-            approval_menu_decision(3),
+            approval_menu_decision(1),
+            ('t', false),
+            "always for the tool"
+        );
+        assert_eq!(
+            approval_menu_decision(2),
+            ('d', false),
+            "always under the dir"
+        );
+        assert_eq!(approval_menu_decision(3), ('a', false), "session allow");
+        assert_eq!(approval_menu_decision(4), ('n', false), "deny, keep going");
+        assert_eq!(
+            approval_menu_decision(5),
             ('n', true),
             "deny AND stop the turn — the Esc semantic as a row"
         );
-        // Labels and decisions must agree on which half is which: the two allow rows lead.
+        // Labels and decisions must agree on which half is which: the four allow rows lead,
+        // and the grant rows name what they grant.
+        assert!(rows[..4].iter().all(|r| r.starts_with("Yes")), "{rows:?}");
+        assert!(rows[4..].iter().all(|r| r.starts_with("No")), "{rows:?}");
         assert!(
-            APPROVAL_MENU_ROWS[0].starts_with("Yes") && APPROVAL_MENU_ROWS[1].starts_with("Yes")
+            rows[1].contains("shell_run") && rows[2].contains("/proj/scripts"),
+            "{rows:?}"
         );
-        assert!(APPROVAL_MENU_ROWS[2].starts_with("No") && APPROVAL_MENU_ROWS[3].starts_with("No"));
+        let bare = approval_menu_rows("file_edit", None);
+        assert!(bare[2].contains("no directory to scope"), "{bare:?}");
     }
 
     #[test]
@@ -4658,7 +4843,7 @@ mod tests {
         let snap = retained_input_snapshot();
         let overlay = snap.overlay.expect("approval menu must paint an overlay");
         assert_eq!(overlay.title, "approve?");
-        assert_eq!(overlay.lines.len(), APPROVAL_MENU_ROWS.len());
+        assert_eq!(overlay.lines.len(), APPROVAL_MENU_LEN);
         assert_eq!(overlay.selected, Some(2));
         {
             let mut r = render().lock().unwrap();

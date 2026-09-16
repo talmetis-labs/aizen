@@ -1,0 +1,8 @@
+{
+  "id": "multi-file-wire",
+  "prompt": "Wire a `--verbose` flag through the crate: `Config::from_args` in src/config.rs must set a new public `verbose: bool` field when the args contain \"--verbose\" (the positional name is still the first argument that does not start with `--`), and `run` in src/app.rs must append \" (verbose)\" to its greeting when the flag is set. tests/wire.rs already describes the behaviour; make `cargo test` pass without editing tests/ or src/lib.rs.",
+  "allowed_files": ["src/config.rs", "src/app.rs"],
+  "expect": "done",
+  "verify": ["cargo", "test", "--quiet"],
+  "max_steps": 30
+}

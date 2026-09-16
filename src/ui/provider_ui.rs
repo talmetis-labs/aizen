@@ -46,6 +46,7 @@ pub(crate) async fn provider_menu() -> Result<Option<cli_config::ProviderProfile
         .min(items.len().saturating_sub(1));
     let pick = Select::with_theme(&ui_theme())
         .with_prompt("Provider — choose to switch (Esc keeps current)")
+        .report(false) // the `model →` / provider line that follows is the record
         .items(&items)
         .default(default)
         .interact_opt()?;
@@ -90,6 +91,7 @@ pub(crate) async fn slash_model(model_label: &mut String) -> Result<()> {
     );
     let pick = match Select::with_theme(&theme)
         .with_prompt(prompt)
+        .report(false) // `model → …` below is the record
         .items(&items)
         .default(idx)
         .interact_opt()?

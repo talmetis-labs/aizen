@@ -8,11 +8,16 @@
 pub mod brain;
 pub mod loop_eval;
 pub mod metrics;
+pub mod sessions_stats;
+pub mod task_eval;
 
 use crate::memory::embed::{self, Embedder};
 use crate::memory::store::{MemoryEntry, MemoryType};
 use crate::memory::tokenize::tokenize;
-use crate::memory::{search_hybrid_gated_in, search_hybrid_in, search_in, search_in_fuzzy};
+use crate::memory::{
+    gate_coverage, search_hybrid_gated_in, search_hybrid_in, search_in, search_in_fuzzy,
+    GATE_TOP_HITS, RECALL_GATE_COVERAGE,
+};
 use anyhow::{Context, Result};
 use metrics::{aggregate, regressions, BenchMetrics};
 use serde::Deserialize;
@@ -202,6 +207,49 @@ fn print_metrics(label: &str, m: &BenchMetrics) {
     );
 }
 
+/// The recall gate over a split, at the shipped threshold and along a sweep: how many queries
+/// it admits, how many of those show an acceptable fact in the top hits, and how many it
+/// rejects although the top hits were right. This is the evidence `RECALL_GATE_COVERAGE` is
+/// tuned on (E4.3) — `bench memory` measures ranking; this measures the gate in front of it.
+fn gate_report(label: &str, corpus: &[MemoryEntry], queries: &[FixQuery]) {
+    let idx = Bm25Index::build(corpus.iter().map(|e| e.tokens.as_slice()));
+    let rows: Vec<(f64, bool)> = queries
+        .iter()
+        .map(|q| {
+            let hits = search_in(&q.query, 10, corpus.to_vec());
+            let acc: HashSet<&str> = q.acceptable.iter().map(String::as_str).collect();
+            let shown_ok = hits
+                .iter()
+                .take(GATE_TOP_HITS)
+                .any(|h| acc.contains(h.entry.id.as_str()));
+            (gate_coverage(&tokenize(&q.query), &hits, &idx), shown_ok)
+        })
+        .collect();
+    let at = |t: f64| {
+        let admitted = rows.iter().filter(|(c, _)| *c >= t).count();
+        let admitted_ok = rows.iter().filter(|(c, ok)| *c >= t && *ok).count();
+        let rejected_ok = rows.iter().filter(|(c, ok)| *c < t && *ok).count();
+        (admitted, admitted_ok, rejected_ok)
+    };
+    let (a, ok, rj) = at(RECALL_GATE_COVERAGE);
+    println!(
+        "{label:<22} n={:<3} gate {:.2}: admitted={a} (correct in top {GATE_TOP_HITS}: {ok}) rejected-but-correct={rj}",
+        queries.len(),
+        RECALL_GATE_COVERAGE
+    );
+    let sweep: Vec<String> = [0.20, 0.30, 0.40, 0.50, 0.60]
+        .iter()
+        .map(|t| {
+            let (a, ok, rj) = at(*t);
+            format!("{t:.2}→{a}/{ok}/{rj}")
+        })
+        .collect();
+    println!(
+        "  sweep (threshold→admitted/correct/rejected-but-correct): {}",
+        sweep.join("  ")
+    );
+}
+
 /// Entry point for `aizen bench memory`.
 pub fn run(split: &str, update_baseline: bool, hybrid: bool, fuzzy: bool) -> Result<()> {
     let corpus = corpus()?;
@@ -324,6 +372,8 @@ pub fn run(split: &str, update_baseline: bool, hybrid: bool, fuzzy: bool) -> Res
         // measurement-only and never rewrite the baseline.
         let current = eval(&corpus, &gate, None, Rank::Exact, DenseMode::AlwaysOn);
         print_metrics("gate", &current);
+        gate_report("gate (recall gate)", &corpus, &gate);
+        gate_report("tune (recall gate)", &corpus, &tune);
         if hybrid {
             let gc = crate::core::config::MemorySettings::default().dense_gate_coverage;
             print_metrics(

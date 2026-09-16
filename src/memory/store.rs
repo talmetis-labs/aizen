@@ -374,13 +374,54 @@ pub fn load_all() -> Result<Vec<MemoryEntry>> {
     load_from(&config::entries_dir())
 }
 
+/// A file's identity for the entry cache: modification time and size. The store's own writes go
+/// through `write_atomic` (a rename of a fresh file), so any write it makes changes both.
+type Fingerprint = (Option<std::time::SystemTime>, u64);
+
+/// The parsed rows of one directory, plus how many files were parsed to get there.
+#[derive(Default)]
+struct DirCache {
+    rows: std::collections::HashMap<PathBuf, (Fingerprint, MemoryEntry)>,
+    parses: usize,
+}
+
+/// Per-directory cache of parsed entries (E4.5, quality plan M7): a recall, the secretary and
+/// reconcile each re-read and re-parsed every fact file, several times per turn. Keyed by the
+/// directory, so a test home, the review queue and the archive each get their own map.
+fn entry_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, DirCache>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, DirCache>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How many files `load_from` has parsed for `dir` since process start — a test's way to see
+/// the cache work.
+#[cfg(test)]
+pub(crate) fn parses_for(dir: &Path) -> usize {
+    entry_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+        .map(|c| c.parses)
+        .unwrap_or(0)
+}
+
 /// Load every `*.md` entry under `dir` (entries dir, review queue, archive). Missing → empty.
+///
+/// Incremental: the directory is stat-walked on every call, but a file whose `(mtime, len)`
+/// matches its cached row is reused as parsed, a new or changed file is parsed once, and a file
+/// that is gone drops out.
 pub fn load_from(dir: &Path) -> Result<Vec<MemoryEntry>> {
-    let mut out = Vec::new();
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return Ok(out), // not created yet
+        Err(_) => return Ok(Vec::new()), // not created yet
     };
+    let mut cache = entry_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let known = cache.entry(dir.to_path_buf()).or_default();
+    let mut fresh: std::collections::HashMap<PathBuf, (Fingerprint, MemoryEntry)> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
     for ent in rd.flatten() {
         let path = ent.path();
         let is_md = path
@@ -391,8 +432,24 @@ pub fn load_from(dir: &Path) -> Result<Vec<MemoryEntry>> {
         if !is_md {
             continue;
         }
+        let fp: Option<Fingerprint> = ent.metadata().ok().map(|m| (m.modified().ok(), m.len()));
+        if let Some(fp) = fp {
+            if let Some((seen, e)) = known.rows.get(&path) {
+                if *seen == fp {
+                    out.push(e.clone());
+                    fresh.insert(path, (fp, e.clone()));
+                    continue;
+                }
+            }
+        }
+        known.parses += 1;
         match MemoryEntry::from_file(&path) {
-            Ok(e) => out.push(e),
+            Ok(e) => {
+                if let Some(fp) = fp {
+                    fresh.insert(path.clone(), (fp, e.clone()));
+                }
+                out.push(e);
+            }
             // Through the TUI funnel, never `eprintln!`: retrieval calls this on EVERY turn, so a raw
             // print writes into the terminal behind the retained renderer's back and corrupts the
             // frame (see `ui::tui::note_line`). One unreadable file would otherwise garble the UI
@@ -403,6 +460,7 @@ pub fn load_from(dir: &Path) -> Result<Vec<MemoryEntry>> {
             )),
         }
     }
+    known.rows = fresh;
     Ok(out)
 }
 
@@ -1748,6 +1806,53 @@ mod tests {
         assert_eq!(e2.body, "a fact to be reused");
 
         std::env::remove_var("AIZEN_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn entry_file(dir: &Path, id: &str, body: &str) {
+        let content = format!("---\nname: {id}\ntype: reference\n---\n\n{body}\n");
+        fs::write(dir.join(format!("{id}.md")), content).unwrap();
+    }
+
+    #[test]
+    fn load_from_parses_only_what_changed() {
+        let dir = std::env::temp_dir().join(format!("aizen-store-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        entry_file(&dir, "alpha", "alpha body");
+        entry_file(&dir, "beta", "beta body");
+        let first = load_from(&dir).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(parses_for(&dir), 2, "both parsed once");
+        let again = load_from(&dir).unwrap();
+        assert_eq!(again.len(), 2);
+        assert_eq!(parses_for(&dir), 2, "an unchanged directory parses nothing");
+        // A changed file (same length, new content) is parsed again and its body is the new one;
+        // a deleted file drops out; a new file is parsed.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        entry_file(&dir, "alpha", "ALPHA body");
+        fs::remove_file(dir.join("beta.md")).unwrap();
+        entry_file(&dir, "gamma", "gamma body");
+        let third = load_from(&dir).unwrap();
+        let mut ids: Vec<&str> = third.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["alpha", "gamma"]);
+        assert!(
+            third
+                .iter()
+                .any(|e| e.id == "alpha" && e.body.contains("ALPHA")),
+            "{third:?}"
+        );
+        assert_eq!(
+            parses_for(&dir),
+            4,
+            "alpha and gamma parsed, beta dropped, nothing else"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

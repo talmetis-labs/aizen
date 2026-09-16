@@ -1,14 +1,17 @@
 //! `workflow` — the model-callable fan-out primitive (deterministic orchestration IN conversation).
 //!
 //! `aizen workflow` (workflow.rs) is CLI-only: the model can't invoke it, so multi-agent patterns had
-//! to be narrated serially through `task`. This tool exposes the same bounded fan-out with two
+//! to be narrated serially through `task`. This tool exposes the same bounded fan-out with three
 //! modes, keeping control flow in CODE and content in the model (the workflows-over-agents rule):
 //!
 //! - `fanout`: run tasks concurrently (you decide how many), then one synthesis pass
-//!   (mixture-of-agents). At most ONE `coder` task per call — parallel writers in one repo race
-//!   edits and build locks; the fan-out is for READS (investigate/review/test in parallel), the
-//!   write stays singular. The gate limits how many run AT ONCE (machine-derived, see
-//!   `task_tool::max_parallel_subagents_pub`); extra tasks queue and run in the next chunk.
+//!   (mixture-of-agents). A task with `after` waits for those tasks and receives their reports,
+//!   so a chain (implement → verify → review) is ONE call. At most ONE writer per wave — parallel
+//!   writers in one repo race edits and build locks; the fan-out is for READS, and two writers
+//!   are legal only when `after` orders them (see `workflow::schedule`). The gate limits how many
+//!   run AT ONCE (machine-derived, see `task_tool::max_parallel_subagents_pub`).
+//! - `implement`: that chain prebuilt from one `prompt` — daedalus, then themis with a
+//!   `VERDICT: PASS|FAIL` contract and one fix loop back to daedalus, then nemesis.
 //! - `verify`: the adversarial-refuter preset — each finding gets a read-only reviewer explicitly
 //!   prompted to REFUTE it (industrially measured at ~0.93 accuracy filtering false positives).
 //!   No synthesis: the per-finding verdicts return raw.
@@ -71,6 +74,63 @@ fn refuter_prompt(finding: &str) -> String {
     )
 }
 
+/// The `implement` preset: daedalus makes the change, themis verifies it (report opening with
+/// `VERDICT: PASS|FAIL`; a FAIL re-dispatches daedalus once with the failure), nemesis reviews
+/// the result. One call instead of three hand-chained turns, each re-briefed through the
+/// parent. The same spec as a file: `bench-fixtures/workflows/implement.json`.
+pub(crate) fn implement_spec(prompt: &str) -> WorkflowSpec {
+    let task =
+        |id: &str, role: &str, after: &[&str], retry: Option<&str>, brief: String| WorkflowTask {
+            id: id.to_string(),
+            role: role.to_string(),
+            prompt: brief,
+            after: after.iter().map(|s| s.to_string()).collect(),
+            retry_on_fail: retry.map(str::to_string),
+            ..Default::default()
+        };
+    let mut implement = task("implement", "daedalus", &[], None, prompt.to_string());
+    implement.expected_output =
+        Some("What changed, with file:line, and the build or test command you ran.".into());
+    let mut verify = task(
+        "verify",
+        "themis",
+        &["implement"],
+        Some("implement"),
+        format!(
+            "Verify the change reported above, made for this request: {prompt}\n\nRun the \
+             project's fast check and the narrowest tests that cover it (git_inspect diff shows \
+             what changed). Your FIRST line must be exactly `VERDICT: PASS` or `VERDICT: FAIL` \
+             (`VERDICT: INCONCLUSIVE` only if nothing could run), then the exact commands, exit \
+             codes and the decisive failing output with file:line."
+        ),
+    );
+    verify.boundaries = Some("Do not edit files.".into());
+    let review = task(
+        "review",
+        "nemesis",
+        &["verify"],
+        None,
+        format!(
+            "Review the change made for this request: {prompt}\n\nUse git_inspect diff for the \
+             actual change and the verify report above for its test status. Findings with \
+             severity and file:line, then one line: safe to merge, or not, and why."
+        ),
+    );
+    WorkflowSpec {
+        name: "implement".into(),
+        tasks: vec![implement, verify, review],
+        synthesis: Some(Synthesis {
+            model: None,
+            prompt: Some(
+                "Report in order: what was implemented (implement), the test verdict with its \
+                 evidence (verify — if it failed after the retry, say so first), and the review \
+                 findings (review)."
+                    .into(),
+            ),
+        }),
+    }
+}
+
 /// Build the spec for one call. Pure for role-only tasks; a task naming an `agent` resolves that
 /// specialist from disk to classify its write-capability (see [`task_is_writer`]).
 pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
@@ -118,12 +178,20 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         .unwrap_or_else(|| format!("t{}", i + 1)),
                     role,
                     agent: t.get("agent").and_then(|v| v.as_str()).map(str::to_string),
-                    prompt: t
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("task #{} is missing 'prompt'", i + 1))?
-                        .to_string(),
+                    prompt: {
+                        let p = t
+                            .get("prompt")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("task #{} is missing 'prompt'", i + 1)
+                            })?;
+                        // Same bar as a `task` dispatch: a child cannot work from a line.
+                        if let Some(why) = crate::agent::task_tool::thin_brief(p) {
+                            bail!("task #{}: {why}", i + 1);
+                        }
+                        p.to_string()
+                    },
                     model: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
                     boundaries: opt_str("boundaries"),
                     expected_output: opt_str("expected_output"),
@@ -132,6 +200,25 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         .and_then(|v| v.as_u64())
                         .map(|n| n as usize),
                     expects: t.get("expects").filter(|v| v.is_object()).cloned(),
+                    context: {
+                        let c = crate::agent::context_pack::findings_from_args(t);
+                        (!c.is_empty()).then_some(c)
+                    },
+                    after: match t.get("after") {
+                        Some(Value::Array(a)) => a
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                        Some(Value::String(s)) => s
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                        _ => Vec::new(),
+                    },
+                    retry_on_fail: opt_str("retry_on_fail"),
                 });
             }
             // Singular-writer invariant — shared with CLI `run_workflow` via
@@ -151,6 +238,18 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
             };
             enforce_singular_writer(&spec)?;
             Ok((spec, true))
+        }
+        "implement" => {
+            let prompt = args
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("implement mode requires a non-empty 'prompt'"))?;
+            if let Some(why) = crate::agent::task_tool::thin_brief(prompt) {
+                bail!("implement: {why}");
+            }
+            Ok((implement_spec(prompt), true))
         }
         "verify" => {
             let findings = args
@@ -192,7 +291,7 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 false,
             ))
         }
-        other => bail!("unknown workflow mode '{other}' (use fanout or verify)"),
+        other => bail!("unknown workflow mode '{other}' (use fanout, implement or verify)"),
     }
 }
 
@@ -201,31 +300,34 @@ impl Tool for WorkflowTool {
         "workflow"
     }
     fn description(&self) -> &str {
-        "Run several sub-agents CONCURRENTLY (deterministic fan-out). Request as many tasks as the \
-         work needs — the harness limits how many run AT ONCE based on the machine. mode=fanout: \
-         independent tasks in parallel + one synthesized answer — for multi-angle \
-         investigation/review (at most ONE coder task; writes stay singular). mode=verify: \
-         adversarially re-check findings — each finding gets a read-only refuter, verdicts return \
-         per finding. For a single sub-task use `task` instead."
+        "Run several sub-agents (the harness bounds how many run at once). fanout: tasks in \
+         parallel + one synthesized answer; `after` chains tasks (each gets its dependencies' \
+         reports; one writer per wave). implement: daedalus → themis → nemesis prebuilt from \
+         `prompt`, one fix loop on a themis FAIL. verify: a read-only refuter per finding. For \
+         one sub-task use `task`."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["fanout", "verify"], "description": "fanout: run tasks in parallel and synthesize · verify: refute findings adversarially"},
-                "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks to run concurrently (request what the work needs; the harness bounds concurrent width by machine)", "items": {"type": "object", "properties": {
+                "mode": {"type": "string", "enum": ["fanout", "implement", "verify"], "description": "fanout · implement (prompt → daedalus, themis, nemesis) · verify (refute findings)"},
+                "prompt": {"type": "string", "description": "implement mode: the change to make"},
+                "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks", "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string", "description": "complete, self-contained task"},
-                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "default nemesis (read-only review); daedalus/themis are the writers — at most one writer per workflow. argus=find · metis=plan · clio=web research · mnemosyne=history. Legacy coder/planner/reviewer/tester names are also accepted"},
+                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "default nemesis (read-only); daedalus/themis write — one writer per wave; legacy names accepted"},
                     "agent": {"type": "string", "description": "optional specialist slug from <agents>"},
                     "model": {"type": "string"},
                     "boundaries": {"type": "string", "description": "what this child must NOT do or touch"},
                     "expected_output": {"type": "string", "description": "the shape/content of the answer wanted back"},
-                    "max_steps": {"type": "integer", "description": "TOTAL step budget for this child (cap 80)"},
-                    "expects": {"type": "object", "description": "JSON Schema the child's final answer must satisfy (validated; status carries json:ok|json:invalid)"}
+                    "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
+                    "max_steps": {"type": "integer", "description": "total step budget (cap 80)"},
+                    "expects": {"type": "object", "description": "JSON Schema the child's answer must satisfy"},
+                    "after": {"type": "array", "items": {"type": "string"}, "description": "ids this task waits for; it receives their reports"},
+                    "retry_on_fail": {"type": "string", "description": "an `after` id to re-run once (then this task) when this report opens with VERDICT: FAIL"}
                 }, "required": ["prompt"], "additionalProperties": false}},
                 "synthesis": {"type": "string", "description": "fanout mode: optional merge instruction"},
-                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description": "verify mode: claims to refute, each self-contained with file:line evidence"}
+                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description": "verify mode: claims to refute, with file:line evidence"}
             },
             "required": ["mode"],
             "additionalProperties": false
@@ -323,7 +425,7 @@ mod tests {
             "tasks": [{
                 "id": "review-auth",
                 "role": "nemesis",
-                "prompt": "review the auth changes",
+                "prompt": "review the auth changes in src/auth.rs",
                 "boundaries": "Do not edit files",
                 "expected_output": "Findings with severity and file:line",
                 "max_steps": 12,
@@ -355,8 +457,8 @@ mod tests {
         let err = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "edit a", "role": "coder"},
-                {"prompt": "edit b", "role": "coder"}
+                {"prompt": "edit src/a.rs", "role": "coder"},
+                {"prompt": "edit src/b.rs", "role": "coder"}
             ]
         }))
         .unwrap_err()
@@ -366,8 +468,8 @@ mod tests {
         let (spec, synth) = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "edit a", "role": "coder"},
-                {"prompt": "review b", "role": "reviewer"}
+                {"prompt": "edit src/a.rs", "role": "coder"},
+                {"prompt": "review src/b.rs", "role": "reviewer"}
             ]
         }))
         .unwrap();
@@ -393,7 +495,7 @@ mod tests {
         // The per-call cap is now 32 (the model requests what the work needs; concurrent WIDTH is
         // bounded separately by the machine-derived gate). A batch under the cap is accepted…
         let six: Vec<_> = (0..6)
-            .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
+            .map(|i| serde_json::json!({"prompt": format!("review src/t{i}.rs"), "role": "reviewer"}))
             .collect();
         assert!(
             build_spec(&serde_json::json!({"mode": "fanout", "tasks": six})).is_ok(),
@@ -401,7 +503,7 @@ mod tests {
         );
         // …and only an absurd batch past the disaster-stop cap is rejected.
         let too_many: Vec<_> = (0..33)
-            .map(|i| serde_json::json!({"prompt": format!("t{i}"), "role": "reviewer"}))
+            .map(|i| serde_json::json!({"prompt": format!("review src/t{i}.rs"), "role": "reviewer"}))
             .collect();
         assert!(
             build_spec(&serde_json::json!({"mode": "fanout", "tasks": too_many})).is_err(),
@@ -421,13 +523,101 @@ mod tests {
     }
 
     #[test]
+    fn implement_mode_builds_the_chain_with_one_fix_loop() {
+        let (spec, synth) = build_spec(&serde_json::json!({
+            "mode": "implement",
+            "prompt": "add parse_pairs to src/lib.rs"
+        }))
+        .unwrap();
+        assert!(synth);
+        let ids: Vec<&str> = spec.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["implement", "verify", "review"]);
+        let roles: Vec<&str> = spec.tasks.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(roles, ["daedalus", "themis", "nemesis"]);
+        assert_eq!(spec.tasks[1].after, ["implement"]);
+        assert_eq!(spec.tasks[1].retry_on_fail.as_deref(), Some("implement"));
+        assert_eq!(spec.tasks[2].after, ["verify"]);
+        assert!(
+            spec.tasks[1].prompt.contains("VERDICT: PASS"),
+            "verdict contract"
+        );
+        assert!(spec.tasks[0].prompt.contains("add parse_pairs"));
+        // Two writers (daedalus, themis) — legal because `after` puts them in different waves.
+        enforce_singular_writer(&spec).unwrap();
+        assert!(
+            build_spec(&serde_json::json!({"mode": "implement"})).is_err(),
+            "a prompt is required"
+        );
+    }
+
+    #[test]
+    fn fanout_parses_after_as_array_or_string_and_refuses_bad_chains() {
+        let (spec, _) = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [
+                {"id": "a", "prompt": "scan src/x.rs", "role": "argus"},
+                {"id": "b", "prompt": "scan src/x.rs", "role": "clio"},
+                {"id": "c", "prompt": "scan src/x.rs", "after": ["a", " b "]},
+                {"id": "d", "prompt": "scan src/x.rs", "after": "a, c"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(spec.tasks[2].after, ["a", "b"]);
+        assert_eq!(spec.tasks[3].after, ["a", "c"]);
+        let err = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{"id": "a", "prompt": "scan src/x.rs", "after": ["nope"]}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown task 'nope'"), "{err}");
+    }
+
+    #[test]
+    fn thin_task_briefs_are_refused_in_fanout_and_implement() {
+        let err = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{"id": "a", "prompt": "review it", "role": "nemesis"}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("task #1: brief too thin"), "{err}");
+        let err = build_spec(&serde_json::json!({"mode": "implement", "prompt": "fix it"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("implement: brief too thin"), "{err}");
+        assert!(build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [{"id": "a", "prompt": "review src/parser.rs for off-by-one errors"}]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn fanout_tasks_carry_context_findings() {
+        let (spec, _) = build_spec(&serde_json::json!({
+            "mode": "fanout",
+            "tasks": [
+                {"prompt": "review src/a.rs", "context": ["- parser is in a.rs", "  ", "b"]},
+                {"prompt": "plan src/b.rs"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.tasks[0].context.as_deref(),
+            Some(&["parser is in a.rs".to_string(), "b".to_string()][..])
+        );
+        assert!(spec.tasks[1].context.is_none(), "absent stays absent");
+    }
+
+    #[test]
     fn fanout_allows_two_readers() {
         // Two read-only tasks are NOT writers → they fan out freely (the invariant is one WRITER).
         let (spec, _) = build_spec(&serde_json::json!({
             "mode": "fanout",
             "tasks": [
-                {"prompt": "review a", "role": "reviewer"},
-                {"prompt": "plan b", "role": "planner"}
+                {"prompt": "review src/a.rs", "role": "reviewer"},
+                {"prompt": "plan src/b.rs", "role": "planner"}
             ]
         }))
         .unwrap();

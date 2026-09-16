@@ -89,7 +89,11 @@ pub(crate) const NOOP_WRITE_PREFIX: &str = "no change (identical content)";
 /// marker (so the model knows it has a partial view). A range/numbered read is NEVER bounded. Small
 /// files (the common case) stay byte-exact so `old_string` round-trips. `0` disables a cap.
 const FILE_READ_MAX_LINES: usize = 2000;
-const FILE_READ_MAX_BYTES: usize = 200_000;
+/// The ONE read budget. `file_read` is the only authority on how much of a file the model sees:
+/// the loop no longer re-cuts its output (see `agent::is_self_budgeted`), so this number is what
+/// actually reaches the model — roughly the 12 k-char window the loop used to keep, with a little
+/// headroom, and every cut it makes is contiguous and marked with the lines it left out.
+const FILE_READ_MAX_BYTES: usize = 16_000;
 /// Soft threshold (well below the hard `FILE_READ_MAX_LINES` budget): a WHOLE-file read of a
 /// SOURCE file longer than this earns a one-line hint to prefer `lsp_document_symbols` + `read_symbol`
 /// — the single biggest token sink in a real task is reading whole files the model only needs one
@@ -141,7 +145,7 @@ static DEFERRED_TOOL_SURFACE: Lazy<Mutex<Option<crate::agent::tools::DeferredSur
 /// The deferred half is published only while `tool_search` survived the toolset filter: deferred
 /// tools without their discovery tool are unreachable, and advertising unreachable tools in the
 /// prompt is exactly the drift the routing map exists to prevent.
-fn publish_active_tools(r: &ToolRegistry) {
+pub(crate) fn publish_active_tools(r: &ToolRegistry) {
     *ACTIVE_TOOL_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.advertised_names());
     let deferred = if r.get("tool_search").is_some() {
         r.deferred_summary()
@@ -190,21 +194,49 @@ pub fn deferred_tools_note() -> Option<String> {
     let guard = DEFERRED_TOOL_SURFACE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let (names, by_server) = guard.as_ref()?;
-    let servers = by_server
+    guard.as_ref().map(deferred_tools_note_for)
+}
+
+/// The note text for one deferred surface. Built-in deferred tools are NAMED (there are a dozen
+/// and the model must know `checkpoint` exists to ask for it); MCP tools are counted per server
+/// (there can be hundreds). Byte-stable for a stable surface.
+pub(crate) fn deferred_tools_note_for(surface: &crate::agent::tools::DeferredSurface) -> String {
+    let (names, by_origin) = surface;
+    let builtin: Vec<&str> = names
         .iter()
+        .map(String::as_str)
+        .filter(|n| {
+            DEFERRED_ALWAYS.contains(n) || DEFERRED_FOR_QUESTIONS.contains(n) || *n == "web_crawl"
+        })
+        .collect();
+    let mcp: Vec<String> = by_origin
+        .iter()
+        .filter(|(o, _)| o != "builtin")
         .map(|(s, n)| format!("{s} ({n})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "# Deferred integrations (via tool_search)\n\
-         Beyond the surface above, {} more MCP tool(s) are connected but not pre-loaded: {}. \
-         When the task needs one of these integrations, find it with `tool_search` (query by \
-         capability) — a match returns the full argument schema, and that tool is then callable \
-         directly by its exact name.\n",
-        names.len(),
-        servers,
-    ))
+        .collect();
+    let mut s = String::from("# Deferred tools (via tool_search)\nBeyond the surface above, ");
+    if !builtin.is_empty() {
+        s.push_str(&format!(
+            "these built-in tools are registered but not pre-loaded: {}",
+            builtin.join(", ")
+        ));
+    }
+    if !mcp.is_empty() {
+        if !builtin.is_empty() {
+            s.push_str("; and ");
+        }
+        s.push_str(&format!(
+            "{} MCP tool(s) are connected but not pre-loaded: {}",
+            names.len() - builtin.len(),
+            mcp.join(", ")
+        ));
+    }
+    s.push_str(
+        ". When the task needs one, find it with `tool_search` (by name or capability) — a match \
+         returns the full argument schema, and that tool is then callable directly by its exact \
+         name.\n",
+    );
+    s
 }
 
 /// Swap the published surface, returning the previous value — TESTS ONLY.
@@ -241,8 +273,9 @@ fn resolve_root() -> Result<PathBuf> {
 }
 
 /// The built-in tools rooted at `root`. Shared by the top-level registry and the `coder`
-/// sub-agent role.
-fn default_registry_in(root: &Path) -> ToolRegistry {
+/// sub-agent role, and by the task suite (`bench tasks`), which wants the real surface minus the
+/// `task`/`workflow` dispatchers.
+pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     // Registry construction happens exactly once per fresh top-level user turn. Apply any deferred
     // MCP `tools/list_changed` notification here — never from inside an agent run — so the model's
@@ -361,24 +394,14 @@ fn default_registry_in(root: &Path) -> ToolRegistry {
     // estimate over `deferAutoTokens`) registers its tools DEFERRED: dispatchable by name, absent
     // from `defs()`. `tool_search` is their discovery door and registers only when at least one
     // tool is deferred — a session with a small surface pays neither the tool nor its schema.
-    let mut deferred_entries: Vec<crate::agent::tool_search::DeferredEntry> = Vec::new();
     for d in crate::agent::mcp::discovered_tools() {
         if d.deferred {
-            let arc: std::sync::Arc<dyn Tool> = std::sync::Arc::from(d.tool);
-            r.register_deferred(arc.clone(), d.server.clone());
-            deferred_entries.push(crate::agent::tool_search::DeferredEntry {
-                tool: arc,
-                server: d.server,
-            });
+            r.register_deferred(std::sync::Arc::from(d.tool), d.server);
         } else {
             r.register(d.tool);
         }
     }
-    if !deferred_entries.is_empty() {
-        r.register(Box::new(crate::agent::tool_search::ToolSearch::new(
-            deferred_entries,
-        )));
-    }
+    install_tool_search(&mut r);
     // CDP browser tools (OPT-IN: `--features browser`, default OFF). Top-level only; they connect
     // lazily to a local Chrome/Edge/Brave and return an actionable error if none is running.
     #[cfg(feature = "browser")]
@@ -471,6 +494,8 @@ pub fn default_registry_with_task(
         Some(r) => r.canonicalize().unwrap_or(r),
         None => resolve_root()?,
     };
+    // Decided before `base_url` moves into the delegation tools below.
+    let lean = crate::core::cli_config::lean_tools_enabled(&base_url);
     let mut r = default_registry_in(&root);
     r.register(Box::new(PersonaCreate));
     r.register(Box::new(crate::agent::task_tool::TaskTool::new(
@@ -500,9 +525,115 @@ pub fn default_registry_with_task(
         )));
     }
     crate::agent::toolsets::apply_toolset_filter(&mut r);
+    // The rarely-used built-ins ride behind `tool_search` instead of on every request; which ones
+    // depends on the conversation's shape (widest turn so far), so the list stays byte-stable.
+    // Only where a non-advertised tool can still be called (`lean_tools`): a grammar-locking
+    // gateway would leave a deferred tool uncallable, silently.
+    if lean {
+        defer_builtins_for_shape(&mut r, crate::core::turn_shape::conversation_shape());
+    }
     // Publish the live surface so the `<skills>` index can hide skills that `require:` an absent tool.
     publish_active_tools(&r);
     Ok(r)
+}
+
+/// Built-in tools a coding turn rarely calls, kept OFF the request and reachable through
+/// `tool_search`: the orchestration and character surfaces, the memory and skill WRITE surfaces,
+/// the time machine, the crawler. Measured at ~14.5 KB of the 42 KB schema block (2026-09-15).
+/// Every one of them stays dispatchable — a model that needs `checkpoint` asks `tool_search` for
+/// it, gets the schema back, and calls it by name.
+const DEFERRED_ALWAYS: &[&str] = &[
+    "workflow",
+    "persona_create",
+    "checkpoint",
+    "checkpoint_view",
+    "memory_save",
+    "memory_update",
+    "memory_forget",
+    "memory_ask",
+    "memory_profile",
+    "skill_save",
+    "skill_refine",
+    "skill_forget",
+    "skill_search",
+    "skill_install",
+    "team_status",
+    "notify",
+    // The language-server query and symbolic-edit surface, concept search and session recall:
+    // 4 of ~2,800 tool calls across 79 saved sessions (2026-09-16) for 7.4 KB of schema on every
+    // coding turn. `read_symbol`, `lsp_document_symbols` and `lsp_diagnostics` stay — they are
+    // the ones that get called.
+    "lsp_references",
+    "lsp_definition",
+    "lsp_hover",
+    "lsp_workspace_symbol",
+    "symbol_replace",
+    "symbol_insert",
+    "codebase_search",
+    "session_recall",
+];
+
+/// Deferred on top of [`DEFERRED_ALWAYS`] when the conversation is a pure question: nothing is
+/// going to be moved, run in the background, or delegated.
+const DEFERRED_FOR_QUESTIONS: &[&str] = &["file_move", "process", "task"];
+
+/// The built-in names to defer for a conversation shape. `None` (no turn classified yet —
+/// `serve` lanes, `prompt-size`) takes the coding set. Research keeps the crawler; everything
+/// else defers it.
+pub(crate) fn deferred_builtins(
+    shape: Option<crate::core::turn_shape::TurnShape>,
+) -> Vec<&'static str> {
+    use crate::core::turn_shape::TurnShape;
+    let mut out: Vec<&'static str> = DEFERRED_ALWAYS.to_vec();
+    match shape {
+        Some(TurnShape::Research) => {}
+        Some(TurnShape::Question) => {
+            out.push("web_crawl");
+            out.extend_from_slice(DEFERRED_FOR_QUESTIONS);
+        }
+        _ => out.push("web_crawl"),
+    }
+    out
+}
+
+/// Defer the built-ins for `shape` and (re)install `tool_search` over everything deferred.
+pub(crate) fn defer_builtins_for_shape(
+    r: &mut ToolRegistry,
+    shape: Option<crate::core::turn_shape::TurnShape>,
+) {
+    for name in deferred_builtins(shape) {
+        r.defer(name, "builtin");
+    }
+    install_tool_search(r);
+}
+
+/// The schema bytes `tool_search` itself costs once anything is deferred (for `prompt-size`).
+pub(crate) fn tool_search_schema_bytes() -> usize {
+    let t = crate::agent::tool_search::ToolSearch::new(Vec::new());
+    serde_json::to_string(&crate::core::types::ToolDef::function(
+        t.name(),
+        t.description(),
+        t.parameters(),
+    ))
+    .map(|s| s.len())
+    .unwrap_or(0)
+}
+
+/// Register `tool_search` over the registry's deferred tools (built-in and MCP), replacing any
+/// earlier instance. No deferred tools ⇒ no `tool_search` — a small surface pays neither the
+/// tool nor its schema.
+pub(crate) fn install_tool_search(r: &mut ToolRegistry) {
+    r.retain(|n| n != "tool_search");
+    let entries: Vec<crate::agent::tool_search::DeferredEntry> = r
+        .deferred_entries()
+        .into_iter()
+        .map(|(tool, server)| crate::agent::tool_search::DeferredEntry { tool, server })
+        .collect();
+    if !entries.is_empty() {
+        r.register(Box::new(crate::agent::tool_search::ToolSearch::new(
+            entries,
+        )));
+    }
 }
 
 /// Register the `workflow` tool unless the user explicitly opts out. The ~350-token schema is a
@@ -1020,6 +1151,7 @@ static BROAD_PRUNE: &[&str] = &[
 fn bounded_walk<F>(
     roots: &[(PathBuf, usize)],
     prune: bool,
+    git_aware: bool,
     match_cap: usize,
     budget: &WalkBudget,
     keep: F,
@@ -1034,14 +1166,18 @@ where
             break;
         }
         let mut wb = WalkBuilder::new(root);
+        // Default: SEE hidden files/dirs (dotfiles, .env) and ignored paths — the user asked for
+        // everything. `git_aware` (file_glob `ignore:true`) flips to search_files' semantics:
+        // `.gitignore`/`.ignore` honoured, hidden entries skipped, heavy dirs pruned below.
         wb.follow_links(false) // never chase junctions/symlinks → no reparse-point loops
             .same_file_system(true) // don't cross into other drives/mounts mid-walk
-            .hidden(false) // SEE hidden files/dirs (dotfiles, .env) — the user asked for everything
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .ignore(false)
-            .parents(false)
+            .hidden(git_aware)
+            .git_ignore(git_aware)
+            .git_global(git_aware)
+            .git_exclude(git_aware)
+            .ignore(git_aware)
+            .parents(git_aware)
+            .require_git(false)
             .max_depth(Some(*depth));
         let tx = tx.clone();
         let keep = &keep;
@@ -1061,7 +1197,7 @@ where
                 let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 // Prune heavy/system subtrees on a broad walk (depth>0 so we don't prune a root the
                 // caller explicitly pointed at). This is the single highest-leverage speed-up.
-                if prune && is_dir && dent.depth() > 0 {
+                if (prune || git_aware) && is_dir && dent.depth() > 0 {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if BROAD_PRUNE.iter().any(|b| b.eq_ignore_ascii_case(name)) {
                             return WalkState::Skip;
@@ -1321,10 +1457,10 @@ impl Tool for MemorySearch {
         "memory_search"
     }
     fn description(&self) -> &str {
-        "Find a stored fact about the user or project by lexical/semantic match. Use to recall a \
-         specific past fact — project knowledge lives HERE (not in the always-on <user_memory> \
-         block, which only holds STYLE + global prefs). Not for the user's overall preferences → \
-         use memory_profile. Searches the current workspace + global facts by default. Read-only."
+        "Find a stored fact about the user or project by lexical/semantic match — project \
+         knowledge lives HERE, not in the always-on <user_memory> block (STYLE + global prefs \
+         only). Not for the user's overall preferences → memory_profile. Searches the current \
+         workspace + global facts by default. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1333,7 +1469,7 @@ impl Tool for MemorySearch {
                 "query": {"type": "string", "description": "what to recall"},
                 "limit": {"type": "integer", "description": "max hits (default 5)"},
                 "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "zones to search: current project + global (default), all zones, or global-only"},
-                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "restrict to one KIND of project knowledge (optional) — e.g. only past bugs, or only what previously FAILED so you don't retry a dead end"}
+                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "restrict to one KIND of project knowledge — e.g. only past bugs, or only what previously FAILED"}
             },
             "required": ["query"],
             "additionalProperties": false
@@ -1530,10 +1666,10 @@ impl Tool for MemoryList {
         "memory_list"
     }
     fn description(&self) -> &str {
-        "Inventory the stored facts (id · type · zone · category · one-line summary) with NO query \
-         — use to answer 'what do you remember?', to audit what's saved before editing/forgetting, \
-         or to find the exact id `memory_update`/`memory_forget` needs. Not for finding one fact by \
-         topic → use memory_search. Read-only."
+        "Inventory the stored facts (id · type · zone · category · summary) with NO query — for \
+         'what do you remember?', an audit before editing/forgetting, or the exact id \
+         memory_update / memory_forget needs. Not for one fact by topic → memory_search. \
+         Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1884,17 +2020,7 @@ impl FileRead {
         if s > e {
             return Ok(String::new());
         }
-        if number {
-            let body = lines[s - 1..e]
-                .iter()
-                .enumerate()
-                .map(|(i, l)| format!("{}|{l}", s + i))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(body)
-        } else {
-            Ok(lines[s - 1..e].join("\n"))
-        }
+        Ok(range_view(&lines, s, e, number, path, max_lines, max_bytes))
     }
 
     /// The `files:[…]` batch form: N files/slices in ONE call — one round-trip instead of a
@@ -1911,7 +2037,7 @@ impl FileRead {
             .unwrap_or(false);
         let shown = &list[..list.len().min(MULTI_READ_MAX_FILES)];
         let per_lines = (FILE_READ_MAX_LINES / shown.len()).max(200);
-        let per_bytes = (FILE_READ_MAX_BYTES / shown.len()).max(20_000);
+        let per_bytes = (FILE_READ_MAX_BYTES / shown.len()).max(4_000);
         let mut out: Vec<String> = Vec::with_capacity(shown.len() + 1);
         for entry in shown {
             let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
@@ -1948,12 +2074,12 @@ impl Tool for FileRead {
         "file_read"
     }
     fn description(&self) -> &str {
-        "Read a file (optionally a 1-based start/end line range), or SEVERAL files in ONE call via \
-         files:[{path,start,end},…] — batch independent reads instead of one per turn. Use before \
-         editing. Set number:true to prefix each line with its 1-based number (`N|line`) — leave it \
-         off (the default) when you'll feed the text back into file_edit's old_string. A relative \
-         path resolves under the working directory; absolute or `../` paths read elsewhere too. For \
-         ONE named item prefer lsp_document_symbols + read_symbol over dumping the file. Read-only."
+        "Read a file, a 1-based start/end line range, or SEVERAL files in ONE call via \
+         files:[{path,start,end},…] — batch independent reads instead of one per turn. Use \
+         before editing. number:true prefixes each line with `N|`; leave it off when the text \
+         feeds file_edit's old_string. A relative path resolves under the working directory; \
+         absolute or `../` paths read elsewhere. For ONE named item prefer lsp_document_symbols \
+         + read_symbol over the whole file. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2047,6 +2173,60 @@ fn take_bytes_suffix(s: &str, max: usize) -> &str {
 /// spliced text back as an exact `old_string` — a slice is either fully inside head/tail, which
 /// round-trips, or spans the omitted sentinel, which is a clean exact-miss). Slices are byte-exact
 /// (real line endings preserved — NOT the lossy `lines()` path). `max_*`=0 disables that cap.
+/// A `start`/`end` (or `number:true`) read under the same budget as a whole-file read: the
+/// CONTIGUOUS head of the requested range up to the line/byte cap, then a marker naming what was
+/// left out and the exact `start` to continue from. Contiguous on purpose — a ranged read exists
+/// so the model can copy an `old_string` out of it, and a head+tail or keyword splice would hand
+/// it text that does not occur in the file in that order. Zero for either cap disables it.
+fn range_view(
+    lines: &[&str],
+    s: usize,
+    e: usize,
+    number: bool,
+    path: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (i, line) in lines[s - 1..e].iter().enumerate() {
+        let rendered = if number {
+            format!("{}|{line}", s + i)
+        } else {
+            (*line).to_string()
+        };
+        if max_lines > 0 && shown >= max_lines {
+            break;
+        }
+        if max_bytes > 0 && out.len() + rendered.len() + 1 > max_bytes {
+            if shown == 0 {
+                // One line alone exceeds the budget (minified source): show its head, char-safe.
+                out.push_str(take_bytes_prefix(&rendered, max_bytes));
+                shown = 1;
+            }
+            break;
+        }
+        if shown > 0 {
+            out.push('\n');
+        }
+        out.push_str(&rendered);
+        shown += 1;
+    }
+    let requested = e - s + 1;
+    if shown < requested || (shown == 1 && requested == 1 && out.len() < lines[s - 1].len()) {
+        let last = s + shown.max(1) - 1;
+        let kb = lines[s - 1..e].iter().map(|l| l.len() + 1).sum::<usize>() / 1024;
+        out.push_str(&format!(
+            "\n…[file_read: lines {s}-{e} of {path} are {requested} lines ({kb} KB) — over the read \
+             budget ({max_lines} lines / {} KB). Showing {s}-{last}; continue with start:{}, \
+             end:{e}.]",
+            max_bytes / 1024,
+            last + 1,
+        ));
+    }
+    out
+}
+
 fn budget_view(content: &str, path: &str, max_lines: usize, max_bytes: usize) -> String {
     let total_bytes = content.len();
     let spans = line_byte_spans(content);
@@ -2110,23 +2290,33 @@ impl Tool for FileGlob {
         "file_glob"
     }
     fn description(&self) -> &str {
-        "Find files AND directories by name or glob (*, **, ?) — use this, not a shell command, to \
-         locate a file/folder. A bare name (`Cargo.toml`) runs a ranked, typo-tolerant search across \
-         the working dir, its parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a \
-         `../`/absolute path targets a specific place. Case-insensitive unless the pattern has an \
-         uppercase letter; hidden files included, heavy dirs (node_modules, target, .git) skipped on \
-         a broad search. Not for file CONTENT → use search_files. Read-only."
+        concat!(
+            "Find files AND directories by name or glob (*, **, ?) — use this, not a shell command. \
+             A bare name (`Cargo.toml`) is a ranked, typo-tolerant search over the working dir, its \
+             parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a `../`/absolute path \
+             targets one place. Case-insensitive unless the pattern has an uppercase letter. Sees \
+             dotfiles, target/, node_modules/ unless ignore:true; a bare-name search always skips \
+             heavy dirs. Read-only.",
+            crate::search_routing!()
+        )
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": {"pattern": {"type": "string", "description": "e.g. src/**/*.rs, ../sibling/**/*.py, or a bare name like 'confg.toml' for a fuzzy lookup"}},
+            "properties": {
+                "pattern": {"type": "string", "description": "e.g. src/**/*.rs, ../sibling/**/*.py, or a bare name like 'confg.toml' for a fuzzy lookup"},
+                "ignore": {"type": "boolean", "description": "honour .gitignore and skip node_modules/target/.git like search_files (default false)"}
+            },
             "required": ["pattern"],
             "additionalProperties": false
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let pattern = str_arg(args, "pattern")?;
+        let git_aware = args
+            .get("ignore")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let now = std::time::SystemTime::now();
         // Split into a literal directory anchor + the glob remainder, so `../x/**/*.rs` and
         // `C:/abs/**/*.rs` reach a SPECIFIC place. A bare-name / bare-`**/name` pattern (no explicit
@@ -2168,7 +2358,7 @@ impl Tool for FileGlob {
             Duration::from_millis(if narrow { 4000 } else { 2500 }),
         );
         let re_ref = &re;
-        let outcome = bounded_walk(&roots, !narrow, 2000, &budget, |p, rel| {
+        let outcome = bounded_walk(&roots, !narrow, git_aware, 2000, &budget, |p, rel| {
             if re_ref.is_match(rel) {
                 return true;
             }
@@ -2241,8 +2431,13 @@ impl Tool for FileGlob {
             if narrow { 400_000 } else { 250_000 },
             Duration::from_millis(if narrow { 4000 } else { 2500 }),
         );
-        let pool = bounded_walk(&roots, !narrow, 6000, &fuzzy_budget, |p, _rel| {
-            match p.file_name().and_then(|n| n.to_str()) {
+        let pool = bounded_walk(
+            &roots,
+            !narrow,
+            git_aware,
+            6000,
+            &fuzzy_budget,
+            |p, _rel| match p.file_name().and_then(|n| n.to_str()) {
                 Some(name) => {
                     let name = name.to_ascii_lowercase();
                     name.contains(needle_ref)
@@ -2250,8 +2445,8 @@ impl Tool for FileGlob {
                         || strsim::jaro_winkler(needle_ref, &name) >= 0.82
                 }
                 None => false,
-            }
-        });
+            },
+        );
         let mut scored: Vec<(f64, PathBuf)> = pool
             .paths
             .into_iter()
@@ -2304,12 +2499,19 @@ impl FileEdit {
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let dry_run = dry_run_arg(args);
 
         if old.is_empty() {
             // create-new path
             let target = confine(&self.root, path, false)?;
             if target.exists() {
                 bail!("{path} exists; provide old_string to edit it, or use file_write to overwrite the whole file");
+            }
+            if dry_run {
+                return Ok(format!(
+                    "{DRY_RUN_PREFIX}: would create {path} ({} bytes); nothing written",
+                    new.len()
+                ));
             }
             crate::core::persist::create_if_absent(&target, new.as_bytes())
                 .with_context(|| format!("creating {}", target.display()))?;
@@ -2326,6 +2528,13 @@ impl FileEdit {
         if applied.content == content {
             return Ok(format!(
                 "{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"
+            ));
+        }
+        if dry_run {
+            return Ok(format!(
+                "{DRY_RUN_PREFIX}: would edit {path} ({}); nothing written\n{}",
+                applied.summary(),
+                diff_preview(&applied.before, &applied.after, applied.start_line)
             ));
         }
         crate::core::persist::compare_and_atomic_write(
@@ -2357,7 +2566,7 @@ impl FileEdit {
     /// Apply an ORDERED list of edits to ONE file in a single atomic write. Collapses what would be N
     /// single `file_edit` round-trips (each invalidating the model's byte offsets) into one call /
     /// one turn — this is the batch form the `edits` argument selects.
-    fn apply_edits(&self, path: &str, edits: &[Value]) -> Result<String> {
+    fn apply_edits(&self, path: &str, edits: &[Value], dry_run: bool) -> Result<String> {
         if edits.is_empty() {
             bail!("file_edit `edits` must be a non-empty array (or omit it and pass new_string for a single edit)");
         }
@@ -2392,11 +2601,12 @@ impl FileEdit {
                 .unwrap_or(false);
             let applied =
                 apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
-            let detail = match applied.rung {
-                "indent" => "1 replacement, indentation-tolerant".to_string(),
-                "exact" if replace_all => format!("{} replacement(s), replace_all", applied.count),
-                "exact" => format!("{} replacement(s)", applied.count),
-                other => format!("1 replacement, {other} match"),
+            let detail = match (applied.rung, applied.count) {
+                ("exact", n) if replace_all => format!("{n} replacement(s), replace_all"),
+                ("exact", n) => format!("{n} replacement(s)"),
+                ("indent", 1) => "1 replacement, indentation-tolerant".to_string(),
+                (other, 1) => format!("1 replacement, {other} match"),
+                (other, n) => format!("{n} replacements, {other} match, replace_all"),
             };
             summaries.push(format!("  #{n}: {detail}"));
             diffs.push(diff_preview(
@@ -2414,6 +2624,14 @@ impl FileEdit {
             return Ok(format!(
                 "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
                 edits.len()
+            ));
+        }
+        if dry_run {
+            return Ok(format!(
+                "{DRY_RUN_PREFIX}: would edit {path} ({} edits); nothing written\n{}\n{}",
+                edits.len(),
+                summaries.join("\n"),
+                diffs.join("\n")
             ));
         }
         crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
@@ -2441,13 +2659,38 @@ impl Tool for FileEdit {
     fn name(&self) -> &str {
         "file_edit"
     }
+    /// The patch, from the same dry-run the model can ask for — computed in memory, nothing
+    /// written. An edit that would fail (no match, bad path) has no preview: the failure is
+    /// what the approval would have run into anyway, and refusing to show one lets the
+    /// question fall through to the plain header.
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let mut dry = args.clone();
+        dry.as_object_mut()?
+            .insert("dry_run".to_string(), Value::Bool(true));
+        let out = self.execute(&dry).ok()?;
+        if !out.starts_with(DRY_RUN_PREFIX) {
+            return None;
+        }
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let (first, rest) = out.split_once('\n').unwrap_or((out.as_str(), ""));
+        let summary = first
+            .strip_prefix(DRY_RUN_PREFIX)
+            .map(|s| s.trim_start_matches(':').trim())
+            .unwrap_or(first)
+            .to_string();
+        Some(crate::agent::tools::ApprovalPreview {
+            title: path.to_string(),
+            diff: (!rest.trim().is_empty()).then(|| rest.to_string()),
+            lines: vec![summary],
+        })
+    }
     fn description(&self) -> &str {
-        "Edit a file by exact string replacement. ONE edit → old_string + new_string. SEVERAL edits \
-         to the SAME file → pass `edits` instead, in one atomic call (all succeed or nothing is \
-         written) — always prefer that over repeat calls. old_string must be unique unless \
-         replace_all; indentation-tolerant retry if the exact text misses. To create or fully \
-         rewrite a whole file, use file_write. Read the file first. An absolute or `../` path may \
-         write outside the working directory."
+        "Edit a file by exact string replacement. ONE edit → old_string + new_string; SEVERAL \
+         edits to the same file → `edits`, one atomic call (all or nothing) — always prefer \
+         that over repeat calls. old_string must be unique unless replace_all; an \
+         indentation-tolerant retry runs when the exact text misses. dry_run shows the diff and \
+         writes nothing. To create or fully rewrite a file use file_write. Read the file first. \
+         Absolute or `../` paths may write outside the working directory."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2457,6 +2700,7 @@ impl Tool for FileEdit {
                 "old_string": {"type": "string", "description": "exact text to replace; empty = create new file"},
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean"},
+                "dry_run": {"type": "boolean", "description": "preview the diff, write nothing"},
                 "edits": {
                     "type": "array",
                     "minItems": 1,
@@ -2494,7 +2738,7 @@ impl Tool for FileEdit {
         // An `edits` array selects the batch form; otherwise it's a single old_string/new_string
         // replacement. Batch wins if both are somehow present (a caller that filled `edits` meant it).
         match args.get("edits").and_then(|v| v.as_array()) {
-            Some(edits) => self.apply_edits(&path, edits),
+            Some(edits) => self.apply_edits(&path, edits, dry_run_arg(args)),
             // Name BOTH forms when neither is present. `str_arg` alone would say only "missing
             // new_string", which reads as "this tool cannot batch" — the one wrong lesson to teach a
             // model that merely reached for the batch form and mis-spelled the key.
@@ -2526,13 +2770,44 @@ impl Tool for FileWrite {
     fn name(&self) -> &str {
         "file_write"
     }
+    /// Create vs overwrite, with the patch against the current content when overwriting.
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let path = args.get("path")?.as_str()?;
+        let content = args.get("content")?.as_str()?;
+        let target = confine(&self.root, path, false).ok()?;
+        let title = path.to_string();
+        Some(match std::fs::read_to_string(&target) {
+            Ok(before) if before != content => crate::agent::tools::ApprovalPreview {
+                title,
+                diff: Some(diff_preview(&before, content, 1)),
+                lines: vec![format!(
+                    "overwrite {path}: {} → {} bytes",
+                    before.len(),
+                    content.len()
+                )],
+            },
+            Ok(_) => crate::agent::tools::ApprovalPreview {
+                title,
+                diff: None,
+                lines: vec![format!("{path} unchanged (identical content)")],
+            },
+            Err(_) => crate::agent::tools::ApprovalPreview {
+                title,
+                diff: None,
+                lines: vec![format!(
+                    "create {path} ({} bytes, {} line(s))",
+                    content.len(),
+                    content.lines().count()
+                )],
+            },
+        })
+    }
     fn description(&self) -> &str {
-        "Create a file, or COMPLETELY overwrite an existing one, with the given content — the whole \
-         file in one call. Use this to write a new file, or to rewrite a file from scratch. NEVER \
-         blank or build files with shell (`type NUL > f`, `> f`, `echo >`, heredocs) — use this \
-         tool. For a small change to an existing file, prefer file_edit. The parent directory must \
-         already exist. A relative path resolves under the working directory; an absolute path or \
-         a leading `../` may write ANYWHERE on disk."
+        "Create a file, or COMPLETELY overwrite an existing one, with the whole content in one \
+         call. NEVER blank or build files with shell (`> f`, `echo >`, heredocs) — use this \
+         tool. For a small change to an existing file prefer file_edit. The parent directory \
+         must exist. A relative path resolves under the working directory; absolute or `../` \
+         paths may write ANYWHERE on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2634,13 +2909,28 @@ impl Tool for FileMove {
     fn name(&self) -> &str {
         "file_move"
     }
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let from = args.get("from")?.as_str()?;
+        let to = args.get("to")?.as_str()?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Some(crate::agent::tools::ApprovalPreview {
+            title: from.to_string(),
+            diff: None,
+            lines: vec![format!(
+                "move {from} → {to}{}",
+                if overwrite { " (overwrite)" } else { "" }
+            )],
+        })
+    }
     fn description(&self) -> &str {
-        "Rename or move a file or directory (from → to) in a single call. Use this instead of \
-         shelling out to mv / move / Rename-Item. An existing destination is a hard error unless \
-         `overwrite` is true (so you never clobber a file by accident). Set `create_dirs` true to \
-         create missing parent directories of the destination. Preserves file metadata (it is an \
-         OS-level rename on the same drive). Relative paths resolve under the working directory; an \
-         absolute path or a leading `../` may move ANYWHERE on disk."
+        "Rename or move a file or directory (from → to) — use this, not mv / move / \
+         Rename-Item. An existing destination is an error unless `overwrite`; `create_dirs` \
+         creates missing parents. An OS-level rename on the same drive, metadata kept. Relative \
+         paths resolve under the working directory; absolute or `../` paths may move ANYWHERE \
+         on disk."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -2846,6 +3136,16 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Prefix of a `file_edit` result that previewed without writing (`dry_run: true`). The loop
+/// keeps the full diff for such a result — the preview IS the answer.
+pub(crate) const DRY_RUN_PREFIX: &str = "dry-run";
+
+fn dry_run_arg(args: &Value) -> bool {
+    args.get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// The outcome of ONE replacement (pure; computed in memory). `before`/`after` feed the diff
 /// preview; `count`/`rung` feed the human summary (which rung matched is surfaced so a
 /// looser-than-exact match is always visible in the result).
@@ -2872,13 +3172,18 @@ impl EditApplied {
     /// Human summary. The "exact" and "indent" wordings are byte-identical to the original
     /// `file_edit` strings (regression-gated by the existing tests).
     fn summary(&self) -> String {
-        match self.rung {
-            "indent" => "1 replacement, indentation-tolerant match".to_string(),
-            "ws-norm" => "1 replacement, whitespace-normalized match".to_string(),
-            "anchor-trim" => "1 replacement, shared-context-trimmed match".to_string(),
-            "unescape" => "1 replacement, escape-normalized match".to_string(),
-            "blank-norm" => "1 replacement, blank-line-insensitive match".to_string(),
-            _ => format!("{} replacement(s)", self.count),
+        let kind = match self.rung {
+            "indent" => "indentation-tolerant match",
+            "ws-norm" => "whitespace-normalized match",
+            "anchor-trim" => "shared-context-trimmed match",
+            "unescape" => "escape-normalized match",
+            "blank-norm" => "blank-line-insensitive match",
+            _ => return format!("{} replacement(s)", self.count),
+        };
+        if self.count > 1 {
+            format!("{} replacements, {kind}, replace_all", self.count)
+        } else {
+            format!("1 replacement, {kind}")
         }
     }
 }
@@ -2941,25 +3246,33 @@ fn apply_one_edit(
         });
     }
     // R2 indent-tolerant (kept uncapped + byte-stable messages — the original fallback).
-    if let Some(a) = block_rung(content, old, new, trim_norm, "indent", label)? {
+    if let Some(a) = block_rung(content, old, new, trim_norm, "indent", label, replace_all)? {
         return Ok(a);
     }
     let within_caps = old.lines().count() <= LADDER_MAX_LINES && old.len() <= LADDER_MAX_BYTES;
     if within_caps {
         // R3 whitespace-run-normalized.
-        if let Some(a) = block_rung(content, old, new, ws_collapse, "ws-norm", label)? {
+        if let Some(a) = block_rung(
+            content,
+            old,
+            new,
+            ws_collapse,
+            "ws-norm",
+            label,
+            replace_all,
+        )? {
             return Ok(a);
         }
         // R4 anchor-trim: drop a SHARED (old==new) first/last context line from both sides.
         for (o2, n2) in anchor_trim_variants(old, new) {
-            if let Some(a) = try_pair(content, &o2, &n2, "anchor-trim", label)? {
+            if let Some(a) = try_pair(content, &o2, &n2, "anchor-trim", label, replace_all)? {
                 return Ok(a);
             }
         }
         // R5 escape-normalized (only when unescaping actually changes old).
         if let Some(o2) = json_unescape(old) {
             let n2 = json_unescape(new).unwrap_or_else(|| new.to_string());
-            if let Some(a) = try_pair(content, &o2, &n2, "unescape", label)? {
+            if let Some(a) = try_pair(content, &o2, &n2, "unescape", label, replace_all)? {
                 return Ok(a);
             }
         }
@@ -2985,9 +3298,14 @@ fn apply_one_edit(
                         start_line: line_at(content, bs),
                     });
                 }
-                n => bail!(
-                    "old_string (ignoring blank lines) matches {n} blocks in {label}; add more surrounding context to disambiguate"
-                ),
+                n => {
+                    if replace_all {
+                        return Ok(splice_all(content, &ranges, new, "blank-norm"));
+                    }
+                    bail!(
+                        "old_string (ignoring blank lines) matches {n} blocks in {label}; add more surrounding context to disambiguate"
+                    )
+                }
             }
         }
     }
@@ -3013,19 +3331,24 @@ fn try_pair(
     new: &str,
     rung: &'static str,
     label: &str,
+    replace_all: bool,
 ) -> Result<Option<EditApplied>> {
     if old.trim().is_empty() {
         return Ok(None); // a variant that trimmed away all signal proves nothing
     }
     let count = content.matches(old).count();
-    if count == 1 {
-        let updated = content.replacen(old, new, 1);
+    if count == 1 || (count > 1 && replace_all) {
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
         let start_line = content.find(old).map(|p| line_at(content, p)).unwrap_or(0);
         return Ok(Some(EditApplied {
             content: updated,
             before: old.to_string(),
             after: new.to_string(),
-            count: 1,
+            count,
             rung,
             start_line,
         }));
@@ -3033,10 +3356,10 @@ fn try_pair(
     if count > 1 {
         bail!("old_string ({rung} form) matches {count} places in {label}; add more surrounding context to disambiguate");
     }
-    if let Some(a) = block_rung(content, old, new, trim_norm, rung, label)? {
+    if let Some(a) = block_rung(content, old, new, trim_norm, rung, label, replace_all)? {
         return Ok(Some(a));
     }
-    block_rung(content, old, new, ws_collapse, rung, label)
+    block_rung(content, old, new, ws_collapse, rung, label, replace_all)
 }
 
 /// One block-matching rung over normalized lines: exactly 1 block ⇒ apply, >1 ⇒ hard ambiguous
@@ -3048,6 +3371,7 @@ fn block_rung(
     norm: fn(&str) -> String,
     rung: &'static str,
     label: &str,
+    replace_all: bool,
 ) -> Result<Option<EditApplied>> {
     let ranges = normalized_blocks(content, old, norm);
     match ranges.len() {
@@ -3067,11 +3391,47 @@ fn block_rung(
             }))
         }
         n => {
+            if replace_all {
+                return Ok(Some(splice_all(content, &ranges, new, rung)));
+            }
             if rung == "indent" {
                 bail!("old_string (ignoring indentation) matches {n} blocks in {label}; add more surrounding context to disambiguate");
             }
             bail!("old_string ({rung} form) matches {n} blocks in {label}; add more surrounding context to disambiguate");
         }
+    }
+}
+
+/// `replace_all` on a tolerant rung: splice `new` into EVERY matched block (ascending byte ranges;
+/// a block that overlaps the previous splice is skipped). `before`/`start_line` describe the first
+/// block — the diff preview shows one representative hunk, the summary carries the count.
+fn splice_all(
+    content: &str,
+    ranges: &[(usize, usize)],
+    new: &str,
+    rung: &'static str,
+) -> EditApplied {
+    let mut updated = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    for &(bs, be) in ranges {
+        if bs < cursor {
+            continue;
+        }
+        updated.push_str(&content[cursor..bs]);
+        updated.push_str(&preserve_eol(new, &content[bs..be], &content[be..]));
+        cursor = be;
+        count += 1;
+    }
+    updated.push_str(&content[cursor..]);
+    let (fs, fe) = ranges[0];
+    EditApplied {
+        content: updated,
+        before: content[fs..fe].to_string(),
+        after: new.to_string(),
+        count,
+        rung,
+        start_line: line_at(content, fs),
     }
 }
 
@@ -3397,21 +3757,47 @@ impl Tool for ShellRun {
     fn name(&self) -> &str {
         "shell_run"
     }
+    /// The full command line and the directory it runs in — the header clips a command to
+    /// its first word, and `python deploy.py --prod --force-delete` approved as `deploy.py`
+    /// is the audit's first finding.
+    fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        let command = args.get("command")?.as_str()?;
+        let dir = match args.get("cwd").and_then(|v| v.as_str()) {
+            Some(c) => confine(&self.root, c, true)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| c.to_string()),
+            None => self.root.display().to_string(),
+        };
+        let mut lines = vec![format!("cwd: {dir}"), format!("$ {command}")];
+        if args
+            .get("network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            lines.push("network: requested".to_string());
+        }
+        Some(crate::agent::tools::ApprovalPreview {
+            title: "shell_run".to_string(),
+            diff: None,
+            lines,
+        })
+    }
     fn description(&self) -> &str {
-        "Run a shell command in the working directory and return its stdout/stderr + exit code. \
-         Use to build, test, run tools, or manage files. For content search use search_files (not \
-         grep here). Wall-clock cap: 120s by default (AIZEN_SHELL_TIMEOUT_SECS overrides it, \
-         10..3600) — on timeout the whole process tree is killed. For anything that should keep \
-         running (dev servers, watchers, very long builds) use the process tool instead, which has \
-         no cap. Destructive — the user is asked to confirm."
+        "Run a shell command in the working directory; returns stdout/stderr + exit code. \
+         Build, test, run tools, manage files. For content search use search_files, not grep \
+         here. Cap 120s by default (AIZEN_SHELL_TIMEOUT_SECS, 10..3600); on timeout the whole \
+         process tree is killed. For anything that should keep running (dev servers, watchers, \
+         long builds) use the process tool, which has no cap. Destructive — the user is asked \
+         to confirm."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "cwd": {"type": "string", "description": "optional working dir for the command (a subdir, or a ../ or absolute path elsewhere)"},
-                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where the platform can enforce it). Approval-gated escalation."}
+                "cwd": {"type": "string", "description": "optional working dir (a subdir, or a ../ or absolute path)"},
+                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where it can). Approval-gated."},
+                "format": crate::agent::result_format::schema_property()
             },
             "required": ["command"],
             "additionalProperties": false
@@ -3566,7 +3952,11 @@ impl Tool for ShellRun {
                     s.push_str("\n[stderr]\n");
                     s.push_str(&stderr);
                 }
-                Ok(s.trim_end().to_string())
+                Ok(crate::agent::result_format::finish_log(
+                    "shell_run",
+                    args,
+                    s.trim_end().to_string(),
+                ))
             }
             Some(st) => {
                 let mut s = format!("exit {}\n", st.code().unwrap_or(-1));
@@ -3575,7 +3965,11 @@ impl Tool for ShellRun {
                     s.push_str("\n[stderr]\n");
                     s.push_str(&stderr);
                 }
-                Ok(s.trim_end().to_string())
+                Ok(crate::agent::result_format::finish_log(
+                    "shell_run",
+                    args,
+                    s.trim_end().to_string(),
+                ))
             }
         }
     }
@@ -4570,6 +4964,37 @@ mod tests {
     }
 
     #[test]
+    fn file_glob_ignore_true_honours_gitignore_and_prunes_build_dirs() {
+        // The default stays "see everything" (the maintainer asked for it); `ignore:true` opts into
+        // search_files' semantics for the structured walk.
+        let root = temp_root("glob-ignore");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        std::fs::write(root.join("target/debug/app.rs"), "").unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        std::fs::write(root.join("gen/out.rs"), "").unwrap();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        let t = FileGlob::new(root);
+        let all = t
+            .execute(&serde_json::json!({"pattern": "**/*.rs"}))
+            .unwrap();
+        assert!(
+            all.contains("target/debug/app.rs") && all.contains("gen/out.rs"),
+            "default sees everything: {all}"
+        );
+        let lean = t
+            .execute(&serde_json::json!({"pattern": "**/*.rs", "ignore": true}))
+            .unwrap();
+        assert!(lean.contains("src/a.rs"), "{lean}");
+        assert!(
+            !lean.contains("target/debug/app.rs"),
+            "build dir pruned: {lean}"
+        );
+        assert!(!lean.contains("gen/out.rs"), ".gitignore honoured: {lean}");
+    }
+
+    #[test]
     fn file_glob_reaches_outside_the_root() {
         // A `../sibling/...` pattern must escape the working dir (confinement removed, #67). Anchor
         // the tool at a subdir and glob back up into a sibling.
@@ -4720,6 +5145,55 @@ mod tests {
         // default (no number) stays byte-exact so old_string round-trips into file_edit cleanly
         let plain = t.execute(&serde_json::json!({"path":"f.txt"})).unwrap();
         assert_eq!(plain, "alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn file_read_range_over_budget_is_contiguous_and_says_how_to_continue() {
+        let root = temp_root("read-range-budget");
+        let body: String = (1..=50).map(|i| format!("row {i}\n")).collect();
+        std::fs::write(root.join("f.txt"), &body).unwrap();
+        let t = FileRead::new(root);
+        // Line cap of 10 on a 50-line range: the first ten rows, in order, then the marker.
+        let out = t
+            .read_one("f.txt", Some(1), Some(50), false, 10, 0, false)
+            .unwrap();
+        let (shown, marker) = out.split_once("\n…[file_read:").expect("marker present");
+        assert_eq!(
+            shown,
+            (1..=10)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "a contiguous head of the range, nothing spliced"
+        );
+        assert!(marker.contains("Showing 1-10"), "{marker}");
+        assert!(
+            marker.contains("continue with start:11, end:50"),
+            "{marker}"
+        );
+        // `number:true` on the whole file goes through the same budget (it used to bypass it).
+        let numbered = t.read_one("f.txt", None, None, true, 5, 0, false).unwrap();
+        assert!(
+            numbered.starts_with("1|row 1\n2|row 2\n3|row 3\n4|row 4\n5|row 5\n…[file_read:"),
+            "{numbered}"
+        );
+        assert!(
+            numbered.contains("continue with start:6, end:50"),
+            "{numbered}"
+        );
+        // Under budget: byte-exact, no marker (the old_string round-trip invariant).
+        let small = t
+            .read_one("f.txt", Some(3), Some(4), false, 10, 0, false)
+            .unwrap();
+        assert_eq!(small, "row 3\nrow 4");
+        // A byte cap on a range is honoured too.
+        let bytes = t
+            .read_one("f.txt", Some(1), Some(50), false, 0, 20, false)
+            .unwrap();
+        assert!(
+            bytes.starts_with("row 1\nrow 2\nrow 3\n…[file_read:"),
+            "{bytes}"
+        );
     }
 
     #[test]
@@ -5005,6 +5479,142 @@ mod tests {
         // LF file → untouched (byte-identical).
         assert_eq!(preserve_eol("X", "b", "\nc"), "X");
         assert_eq!(preserve_eol("X\nY", "b", "\nc"), "X\nY");
+    }
+
+    #[test]
+    fn file_edit_replace_all_reaches_the_tolerant_rungs() {
+        // Two identically-drifted blocks (4-space file, 2-space old_string): replace_all used to
+        // live on the exact rung only, so the indent rung saw 2 blocks and refused.
+        let root = temp_root("edit-replace-all-indent");
+        let drifted = "fn a() {\n    foo();\n    baz();\n}\nfn b() {\n    foo();\n    baz();\n}\n";
+        std::fs::write(root.join("f.rs"), drifted).unwrap();
+        let t = FileEdit::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.rs",
+                "old_string": "  foo();\n  baz();",
+                "new_string": "    bar();\n    baz();",
+                "replace_all": true
+            }))
+            .unwrap();
+        assert!(
+            r.contains("2 replacements, indentation-tolerant match, replace_all"),
+            "got: {r}"
+        );
+        let after = std::fs::read_to_string(root.join("f.rs")).unwrap();
+        assert_eq!(
+            after,
+            "fn a() {\n    bar();\n    baz();\n}\nfn b() {\n    bar();\n    baz();\n}\n"
+        );
+        // Without replace_all the same call still refuses: the 1-match invariant holds.
+        std::fs::write(root.join("g.rs"), drifted).unwrap();
+        let e = t.execute(&serde_json::json!({
+            "path": "g.rs",
+            "old_string": "  foo();\n  baz();",
+            "new_string": "    bar();\n    baz();"
+        }));
+        assert!(e.is_err(), "ambiguous without replace_all");
+    }
+
+    #[test]
+    fn previews_show_the_patch_the_command_and_the_destination_before_anything_runs() {
+        use crate::agent::tools::Tool as _;
+        let root =
+            std::env::temp_dir().join(format!("aizen-preview-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let edit = FileEdit::new(root.clone());
+        let p = edit
+            .preview(&serde_json::json!({"path": "a.txt", "old_string": "two", "new_string": "2"}))
+            .expect("an edit previews");
+        assert_eq!(p.title, "a.txt");
+        let diff = p.diff.expect("the patch");
+        assert!(diff.contains("-two") && diff.contains("+2"), "{diff}");
+        assert!(p.lines[0].starts_with("would edit a.txt"), "{:?}", p.lines);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n",
+            "nothing written"
+        );
+        assert!(
+            edit.preview(
+                &serde_json::json!({"path": "a.txt", "old_string": "zzz", "new_string": "2"})
+            )
+            .is_none(),
+            "a failing edit has no preview"
+        );
+        let write = FileWrite::new(root.clone());
+        let p = write
+            .preview(&serde_json::json!({"path": "a.txt", "content": "one\n2\nthree\n"}))
+            .unwrap();
+        assert!(
+            p.diff.is_some() && p.lines[0].starts_with("overwrite a.txt"),
+            "{:?}",
+            p.lines
+        );
+        let p = write
+            .preview(&serde_json::json!({"path": "new.txt", "content": "x\ny\n"}))
+            .unwrap();
+        assert!(
+            p.diff.is_none() && p.lines[0].starts_with("create new.txt"),
+            "{:?}",
+            p.lines
+        );
+        let shell = ShellRun::new(root.clone());
+        let p = shell
+            .preview(&serde_json::json!({"command": "python deploy.py --prod --force-delete", "network": true}))
+            .unwrap();
+        assert!(p.lines[0].starts_with("cwd: "), "{:?}", p.lines);
+        assert_eq!(p.lines[1], "$ python deploy.py --prod --force-delete");
+        assert_eq!(p.lines[2], "network: requested");
+        let mv = FileMove::new(root.clone());
+        let p = mv
+            .preview(&serde_json::json!({"from": "a.txt", "to": "b.txt", "overwrite": true}))
+            .unwrap();
+        assert_eq!(p.lines[0], "move a.txt → b.txt (overwrite)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_edit_dry_run_previews_without_writing() {
+        let root = temp_root("edit-dry-run");
+        let original = "a\nb\nc\n";
+        std::fs::write(root.join("f.txt"), original).unwrap();
+        let t = FileEdit::new(root.clone());
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.txt", "old_string": "b", "new_string": "B", "dry_run": true
+            }))
+            .unwrap();
+        assert!(r.starts_with("dry-run: would edit f.txt"), "{r}");
+        assert!(r.contains("-b") && r.contains("+B"), "diff shown: {r}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original,
+            "nothing written"
+        );
+        // The batch form and the create-new form honour it too.
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "f.txt", "dry_run": true,
+                "edits": [
+                    {"old_string": "a", "new_string": "A"},
+                    {"old_string": "c", "new_string": "C"}
+                ]
+            }))
+            .unwrap();
+        assert!(r.starts_with("dry-run: would edit f.txt (2 edits)"), "{r}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original
+        );
+        let r = t
+            .execute(&serde_json::json!({
+                "path": "new.txt", "old_string": "", "new_string": "hello", "dry_run": true
+            }))
+            .unwrap();
+        assert!(r.starts_with("dry-run: would create new.txt"), "{r}");
+        assert!(!root.join("new.txt").exists());
     }
 
     #[test]
@@ -6107,6 +6717,12 @@ mod tests {
             .output()
             .is_err()
         {
+            // A developer box without git may skip; CI may not — a skipped end-to-end proof
+            // there is a green check that proved nothing (E6.2, quality plan Q4).
+            assert!(
+                std::env::var("CI").is_err(),
+                "CI must have git on PATH for the git_inspect end-to-end test"
+            );
             eprintln!("git not on PATH — skipping");
             return;
         }
@@ -6201,5 +6817,133 @@ mod tests {
         for rev in ["-n1", "--help", "a b", "x\ny"] {
             assert!(!super::valid_git_rev(rev), "{rev} should be refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod deferral_tests {
+    use super::*;
+    use crate::core::turn_shape::TurnShape;
+
+    fn root(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aizen-defer-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn adv(r: &ToolRegistry, name: &str) -> bool {
+        r.advertised_names().iter().any(|n| n == name)
+    }
+
+    #[test]
+    fn coding_shape_defers_the_rare_builtins_behind_tool_search() {
+        let mut r = default_registry_in(&root("coding"));
+        r.register(Box::new(PersonaCreate));
+        let before = r.advertised_names().len();
+        defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
+        for n in [
+            "checkpoint",
+            "memory_save",
+            "skill_save",
+            "persona_create",
+            "web_crawl",
+        ] {
+            assert!(!adv(&r, n), "{n} must not ride the request");
+            assert!(r.get(n).is_some(), "{n} stays dispatchable");
+        }
+        for n in [
+            "file_read",
+            "file_edit",
+            "shell_run",
+            "process",
+            "file_move",
+            "memory_search",
+        ] {
+            assert!(adv(&r, n), "{n} stays advertised on a coding turn");
+        }
+        assert!(adv(&r, "tool_search"), "the door is advertised");
+        assert!(r.advertised_names().len() < before);
+        assert!(r.deferred_entries().iter().all(|(_, o)| o == "builtin"));
+        // Idempotent: a second pass (the registry is rebuilt every turn) changes nothing.
+        let names = r.advertised_names();
+        defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
+        assert_eq!(r.advertised_names(), names);
+    }
+
+    #[test]
+    fn question_shape_defers_more_and_research_keeps_the_crawler() {
+        let mut q = default_registry_in(&root("question"));
+        defer_builtins_for_shape(&mut q, Some(TurnShape::Question));
+        assert!(!adv(&q, "process") && !adv(&q, "file_move"));
+        assert!(adv(&q, "file_read") && adv(&q, "search_files"));
+        let mut rs = default_registry_in(&root("research"));
+        defer_builtins_for_shape(&mut rs, Some(TurnShape::Research));
+        assert!(adv(&rs, "web_crawl"));
+        assert!(!adv(&rs, "checkpoint"));
+    }
+
+    #[test]
+    fn deferred_note_names_builtins_and_counts_mcp_servers() {
+        let surface: crate::agent::tools::DeferredSurface = (
+            vec![
+                "checkpoint".into(),
+                "memory_save".into(),
+                "mcp_github_issue".into(),
+            ],
+            vec![("builtin".into(), 2), ("github".into(), 1)],
+        );
+        let note = deferred_tools_note_for(&surface);
+        assert!(note.contains("checkpoint, memory_save"), "{note}");
+        assert!(
+            note.contains("1 MCP tool(s)") && note.contains("github (1)"),
+            "{note}"
+        );
+        assert!(note.contains("tool_search"));
+        let only_builtin: crate::agent::tools::DeferredSurface =
+            (vec!["workflow".into()], vec![("builtin".into(), 1)]);
+        let note = deferred_tools_note_for(&only_builtin);
+        assert!(!note.contains("MCP"), "{note}");
+    }
+
+    #[test]
+    fn coding_turn_advertised_schema_fits_the_lean_budget() {
+        // The top-level surface with delegation, persona and LSP registered — the maximal shape —
+        // after the coding-turn deferral. Measured 28.2 KB on 2026-09-15 (42.2 KB before).
+        const CEILING: usize = 32_000;
+        let root = root("lean");
+        let mut r = default_registry_in(&root);
+        r.register(Box::new(PersonaCreate));
+        r.register(Box::new(crate::agent::task_tool::TaskTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            root.clone(),
+            0,
+            200_000,
+        )));
+        r.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
+            reqwest::Client::new(),
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            0,
+            root.clone(),
+            200_000,
+        )));
+        register_subagent_lsp_read(&mut r, &root);
+        register_subagent_lsp_write(&mut r, &root);
+        defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
+        let bytes: usize = r
+            .defs()
+            .iter()
+            .map(|d| serde_json::to_string(d).unwrap().len())
+            .sum();
+        assert!(
+            bytes <= CEILING,
+            "advertised schema on a coding turn is {bytes} B > {CEILING} B"
+        );
     }
 }

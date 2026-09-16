@@ -1,0 +1,14 @@
+{"id":"path-in-src","text":"I keep the config in src/core/config.rs","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"this-repo","text":"prefer rustls in this repo, never openssl","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"drive-path","text":"my notes live under C:\\work\\notes","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"project-name","text":"the aizen binary must stay a single static file","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"manifest","text":"Cargo.toml uses license = Apache-2.0, not license-file","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"vi-readme","text":"tôi muốn giữ README.md dưới 110 dòng","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"vi-repo-nay","text":"repo này dùng GitFlow, cắt nhánh từ dev","places":["c:/users/admin/work/aizen"],"expect":"project"}
+{"id":"other-project-name","text":"omniroute must not be built on the small vps","places":["c:/users/admin/work/omniroute"],"expect":"project"}
+{"id":"terse","text":"prefers terse answers","places":["c:/users/admin/work/aizen"],"expect":"user"}
+{"id":"node-js-is-a-product","text":"I like node.js and next.js for small tools","places":["c:/users/admin/work/aizen"],"expect":"user"}
+{"id":"and-or","text":"reply in Vietnamese and/or English","places":["c:/users/admin/work/aizen"],"expect":"user"}
+{"id":"fraction","text":"available 24/7 on weekdays","places":["c:/users/admin/work/aizen"],"expect":"user"}
+{"id":"pnpm","text":"prefer pnpm over npm","places":["c:/users/admin/work/aizen"],"expect":"user"}
+{"id":"vi-language","text":"người dùng giao tiếp bằng tiếng Việt, xưng hô anh","places":["c:/users/admin/work/aizen"],"expect":"user"}

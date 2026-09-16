@@ -7,6 +7,7 @@ pub mod channel_markdown;
 pub mod config_ui;
 pub mod context_report;
 pub mod effort_ui;
+pub mod events;
 pub mod gateway_ui;
 pub mod icons;
 pub mod image_input;

@@ -15,7 +15,7 @@ use crate::core::{cli_config, session_store, types};
 use crate::features::crawl;
 use crate::llm::client;
 use crate::memory;
-use crate::ui::context_report::resolve_ctx_window;
+use crate::ui::context_report::{resolve_ctx_window, system_block_chars, volatile_markers};
 use crate::{arm_lsp_session, eager_enabled};
 use anyhow::{Context, Result};
 use console::style;
@@ -27,6 +27,7 @@ use types::Message;
 pub(crate) fn run_prompt_size(
     model: Option<String>,
     show_tools: bool,
+    live: bool,
     as_json: bool,
 ) -> Result<()> {
     let model = model
@@ -58,6 +59,20 @@ pub(crate) fn run_prompt_size(
     let total = prompt + tools_bytes;
     // Rough: 4 bytes/token. The real count is tokenizer-specific — this is a budget, not a bill.
     let tok = |b: usize| b / 4;
+    // The LEAN surface: what a coding turn advertises when built-in deferral is on (first-party
+    // APIs by default, `lean_tools: true` elsewhere) — the rare tools move behind `tool_search`.
+    let deferred = agent::builtin::deferred_builtins(None);
+    let lean_tools_bytes: usize = defs
+        .iter()
+        .filter(|d| !deferred.contains(&d.function.name.as_str()))
+        .map(|d| serde_json::to_string(d).map(|s| s.len()).unwrap_or(0))
+        .sum::<usize>()
+        + agent::builtin::tool_search_schema_bytes();
+    let lean_deferred = defs
+        .iter()
+        .filter(|d| deferred.contains(&d.function.name.as_str()))
+        .count();
+    let lean_total = prompt + lean_tools_bytes;
 
     let mut per_tool: Vec<(usize, String)> = defs
         .iter()
@@ -68,17 +83,65 @@ pub(crate) fn run_prompt_size(
         .collect();
     per_tool.sort_by(|a, b| b.0.cmp(&a.0));
 
+    // `--live`: the lanes as a prompt cache sees them. A second build of the same lanes must be
+    // byte-identical (else something in the build is nondeterministic), and neither lane may carry
+    // content that reads differently next turn — that is the prefix bust the HUD's `⛁ N% cached`
+    // chip later reports as a drop to the tool-schema floor.
+    let audit = live.then(|| {
+        let again = active_system_prompt_bundle(&model);
+        let stable_rows = system_block_chars(&bundle.stable);
+        let dynamic_rows = system_block_chars(&bundle.dynamic);
+        let volatile = volatile_markers(&bundle.stable)
+            .into_iter()
+            .map(|(tag, snip)| ("stable", tag, snip))
+            .chain(
+                volatile_markers(&bundle.dynamic)
+                    .into_iter()
+                    .map(|(tag, snip)| ("dynamic", tag, snip)),
+            )
+            .collect::<Vec<_>>();
+        (
+            again.stable == bundle.stable,
+            again.dynamic == bundle.dynamic,
+            stable_rows,
+            dynamic_rows,
+            volatile,
+        )
+    });
+
     if as_json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "model": model,
             "system_prompt": { "bytes": prompt, "stable_bytes": stable, "dynamic_bytes": dynamic },
             "tools": { "count": defs.len(), "json_bytes": tools_bytes },
             "fixed_total": { "bytes": total, "approx_tokens": tok(total) },
+            "lean": {
+                "tools_json_bytes": lean_tools_bytes,
+                "deferred_count": lean_deferred,
+                "fixed_total_bytes": lean_total,
+                "approx_tokens": tok(lean_total),
+            },
             "per_tool": per_tool
                 .iter()
                 .map(|(n, name)| serde_json::json!({ "name": name, "bytes": n }))
                 .collect::<Vec<_>>(),
         });
+        if let Some((stable_same, dynamic_same, stable_rows, dynamic_rows, volatile)) = &audit {
+            let rows = |rows: &[(&str, usize)]| {
+                rows.iter()
+                    .map(|(label, chars)| serde_json::json!({ "block": label, "chars": chars }))
+                    .collect::<Vec<_>>()
+            };
+            out["live"] = serde_json::json!({
+                "rebuild_identical": { "stable": stable_same, "dynamic": dynamic_same },
+                "blocks": { "stable": rows(stable_rows), "dynamic": rows(dynamic_rows) },
+                "volatile": volatile
+                    .iter()
+                    .map(|(lane, tag, snip)| serde_json::json!({ "lane": lane, "block": tag, "text": snip }))
+                    .collect::<Vec<_>>(),
+                "prefix_stable": *stable_same && *dynamic_same && volatile.is_empty(),
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -106,13 +169,65 @@ pub(crate) fn run_prompt_size(
         kb(total),
         tok(total) / 1000
     );
+    println!(
+        "  Lean (coding turn)   : {lean_total:>8} B  ({}, ~{}k tokens; {lean_deferred} tools deferred behind tool_search — on for first-party APIs, `lean_tools` elsewhere)",
+        kb(lean_total),
+        tok(lean_total) / 1000
+    );
     if show_tools {
         println!("\n  Per tool, largest first:");
         for (n, name) in &per_tool {
             println!("    {n:>6} B  {name}");
         }
-    } else {
-        println!("\n  (--tools for per-tool sizes, --json for machine output)");
+    }
+    if let Some((stable_same, dynamic_same, stable_rows, dynamic_rows, volatile)) = &audit {
+        println!("\n  Lanes by block (chars, ~tokens):");
+        for (lane, rows) in [("stable", stable_rows), ("dynamic", dynamic_rows)] {
+            for (label, chars) in rows {
+                if *chars == 0 {
+                    continue;
+                }
+                // The dynamic lane's untagged remainder is the generated tool-routing map (plus
+                // the deferred-tools note); the stable lane's is the base prompt itself.
+                let label = match (lane, *label) {
+                    ("dynamic", "base instructions") => "tool routing map",
+                    _ => label,
+                };
+                println!("    {lane:<8} {label:<18} {chars:>7}  ~{}", chars / 4);
+            }
+        }
+        let verdict = |same: bool| if same { "identical" } else { "CHANGED" };
+        println!(
+            "\n  Rebuild check        : stable {} · dynamic {}",
+            verdict(*stable_same),
+            verdict(*dynamic_same)
+        );
+        if volatile.is_empty() {
+            println!("  Volatile content     : none");
+        } else {
+            println!(
+                "  Volatile content     : {} marker(s) that will differ next turn",
+                volatile.len()
+            );
+            for (lane, tag, snip) in volatile.iter().take(12) {
+                println!("    {lane:<8} <{tag}>  \"{snip}\"");
+            }
+            if volatile.len() > 12 {
+                println!("    … {} more", volatile.len() - 12);
+            }
+        }
+        let prefix_ok = *stable_same && *dynamic_same && volatile.is_empty();
+        println!(
+            "  Verdict              : prefix {}",
+            if prefix_ok {
+                "STABLE — a warm cache should hit on every turn".to_string()
+            } else {
+                "VOLATILE — the cached prefix will miss on the next turn".to_string()
+            }
+        );
+    }
+    if !show_tools && audit.is_none() {
+        println!("\n  (--tools for per-tool sizes, --live for the cache audit, --json for machine output)");
     }
     Ok(())
 }
@@ -325,6 +440,44 @@ pub(crate) async fn run_chat(args: ChatArgs) -> Result<()> {
 }
 
 pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
+    match args.output_format.as_str() {
+        "stream-json" => crate::ui::events::enable(true),
+        "json" => crate::ui::events::enable(false),
+        _ => {}
+    }
+    let result = run_agent_inner(args).await;
+    if let Err(e) = &result {
+        // The stream's last word: a caller reading stdout must not have to parse stderr to learn
+        // that the run died. `main` still prints the error and exits non-zero. No-op in text mode.
+        crate::ui::events::error(&format!("{e:#}"));
+    }
+    result
+}
+
+/// A status line of the one-shot's trace: stderr in text mode (stdout is the answer), a `trace`
+/// event on the JSON stream (stdout is the stream).
+fn status(line: &str) {
+    if crate::ui::events::on() {
+        crate::ui::events::trace(line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// The provider-reported tokens of one run: the cost meter's rows since `cursor`, summed.
+fn usage_since(cursor: (u64, u64)) -> serde_json::Value {
+    let rows = client::cost_meter().rows_since(cursor.0, cursor.1);
+    let sum = |f: fn(&types::UsageRow) -> u64| rows.iter().map(f).sum::<u64>();
+    serde_json::json!({
+        "calls": rows.len(),
+        "input": sum(|r| r.input),
+        "output": sum(|r| r.output),
+        "cached": sum(|r| r.cached),
+        "cache_write": sum(|r| r.cache_write),
+    })
+}
+
+async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     if args.task.trim().is_empty() {
         anyhow::bail!("empty task (pass the task as the first argument)");
     }
@@ -348,10 +501,10 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
             "auto" => crate::ui::effort_ui::resolve_turn_effort(args.task.trim()),
             other => Some(other.to_string()),
         };
-        eprintln!(
-            "{}",
-            crate::ui::effort_ui::effort_turn_line(tier.as_deref())
-        );
+        status(&crate::ui::effort_ui::effort_turn_line(
+            tier.as_deref(),
+            None,
+        ));
         cli_config::set_effort_override(tier);
     }
 
@@ -362,6 +515,8 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // Where the cost meter stands now, so the `done` event can sum only this run's calls.
+    let usage_cursor = client::cost_meter().cursor();
 
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
@@ -371,6 +526,8 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         ApprovalMode::Ask
     };
     arm_lsp_session();
+    // The task's shape picks the deferred tool set the registry is built with.
+    crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(args.task.trim()));
     // Built BEFORE the prompt: it publishes the live tool surface the routing map is generated from.
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
@@ -381,6 +538,16 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         resolve_ctx_window(&model).0,
         None, // cwd IS the project on the CLI path
     )?;
+    // The first record of a machine-readable run — `system` / `init`: what is about to happen and
+    // with what, before any request goes out. The tool list is the one the first request carries.
+    crate::ui::events::start(
+        &model,
+        &cwd,
+        cli_config::effort_override().flatten().as_deref(),
+        images.len(),
+        &registry.advertised_names(),
+        cli_approval.as_str(),
+    );
     let system = agent::build_top_level_system_prompt(
         &cwd,
         std::env::consts::OS,
@@ -389,14 +556,66 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         Some(&frozen),
     );
     let max = args.max_iters.unwrap_or(25).max(1);
-    let cfg = AgentConfig {
+    let mut cfg = AgentConfig {
         max_iters: max,
         auto_extend_to: max.saturating_mul(2),
         approval_mode: cli_approval,
         context_window: resolve_ctx_window(&model).0,
+        compact_at_pct: crate::compact_threshold_pct(),
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
+        nudge_role: agent::NudgeRole::for_base_url(&base_url),
         ..Default::default()
     };
+    // The tier gives the harness its budgets too, unless the caller pinned the step cap.
+    if args.max_iters.is_none() {
+        if let Some(t) = cli_config::effort_override().flatten() {
+            cfg.apply_effort(&t);
+        }
+    }
+
+    // Architect mode (see agent::architect): under max effort a multi-file task is planned first
+    // by metis on the strong model; the loop then applies the plan on the fast model at low
+    // wire effort. Decided before the chat closure borrows `model`.
+    let mut model = model;
+    let mut architect_plan: Option<String> = None;
+    {
+        let tier = cli_config::effort_override().flatten();
+        let shape = crate::core::turn_shape::classify(args.task.trim());
+        if crate::agent::architect::applies(
+            tier.as_deref(),
+            shape,
+            cli_config::architect_mode_enabled(),
+        ) {
+            let ep = cli_config::ResolvedEndpoint {
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+            };
+            let planner = crate::agent::architect::planner_model(&cli_config::load(), &model);
+            status(&format!("architect: metis planning on {planner}…"));
+            if let Some(plan) = crate::agent::architect::plan(
+                &http,
+                &ep,
+                cli_approval,
+                std::path::Path::new(&cwd),
+                args.task.trim(),
+                cfg.cancel.clone(),
+                cfg.context_window,
+            )
+            .await
+            {
+                let editor = crate::agent::architect::editor_model(&cli_config::load(), &model);
+                status(&crate::agent::architect::status_line(
+                    &planner,
+                    &editor,
+                    plan.chars().count(),
+                ));
+                model = editor;
+                cli_config::set_effort_override(Some("low".to_string()));
+                architect_plan = Some(plan);
+            }
+        }
+    }
 
     // The model call, injected into the loop. http_ref/base/key/model are all Copy
     // (&Client / &str), so the closure stays `Fn` across the loop's repeated calls.
@@ -433,20 +652,68 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     let asked = if images.is_empty() {
         Message::user(args.task.trim())
     } else {
-        eprintln!(
-            "{}",
-            style(format!("📎 {} image(s) attached", images.len())).dim()
+        status(
+            &style(format!("📎 {} image(s) attached", images.len()))
+                .dim()
+                .to_string(),
         );
         Message::user_with_images(args.task.trim(), images)
     };
     let mut history = vec![Message::system(&system), asked];
-    let result = agent::run_agent_loop(chat, &cfg, &registry, &mut history).await;
+    if let Some(plan) = &architect_plan {
+        crate::agent::architect::attach_plan(&mut history, plan);
+    }
+    // A one-shot run is the canonical single-turn shape (one prompt, many tool steps): give it the
+    // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
+    // of relying on tool-result clearing alone.
+    let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
+    let summarize = move |msgs: Vec<Message>| {
+        let ep = sum_ep.clone();
+        async move {
+            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
+                .await
+                .map(|t| t.content.unwrap_or_default())
+        }
+    };
+    let result =
+        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await;
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
-    if args.save_session {
-        save_finished_session(&history, &model);
-    }
+    let saved = if args.save_session {
+        save_finished_session(&history, &model)
+    } else {
+        None
+    };
     let outcome = result?;
+    // The user's `stop` hooks see every finished run, however it ended (see `agent::hooks`).
+    {
+        let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
+        crate::agent::hooks::run_blocking(|| {
+            crate::agent::hooks::stop(
+                outcome.stop.label(),
+                outcome.iters,
+                outcome.final_text.as_deref(),
+                &hook_ctx,
+            )
+        });
+    }
+    if crate::ui::events::on() {
+        // One closing line carries what the text mode spreads over stdout and stderr: the stop
+        // reason, the answer, the question when the model asked one, and this run's tokens.
+        let question = match &outcome.stop {
+            StopReason::AwaitingInput(q) => Some(q.as_str()),
+            _ => None,
+        };
+        crate::ui::events::done(
+            outcome.stop.label(),
+            outcome.iters,
+            outcome.final_text.as_deref(),
+            question,
+            saved.as_deref(),
+            usage_since(usage_cursor),
+        );
+        return Ok(());
+    }
     match outcome.stop {
         // The final answer was already streamed to stdout during the call.
         StopReason::Done => {}
@@ -484,25 +751,98 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
 }
 
 /// Put a finished one-shot conversation into core's own session pool, and say where it went.
+/// Returns the slug on success.
 ///
 /// The stamp is `save_session`'s: project key, root and slug come from `config`, which resolves the
 /// repository this ran in — so a saved one-shot is filed exactly where the same conversation held
 /// in the REPL would have been, and `/sessions` reopens it with no idea which surface produced it.
 ///
 /// The line goes to stderr because stdout is the agent's answer: a caller piping it wants the
-/// answer and nothing else.
-fn save_finished_session(history: &[Message], model: &str) {
+/// answer and nothing else. On the JSON stream it is a `session` event.
+fn save_finished_session(history: &[Message], model: &str) -> Option<String> {
     // A run that never got a user turn onto the wire is not a conversation.
     if !history.iter().any(|m| m.role == "user") {
-        return;
+        return None;
     }
     let slug = session_store::allocate_session_slug(history);
     match session_store::save_session(history, &slug, Some(model)) {
-        Ok(path) => eprintln!("\n[saved as “{slug}” — {path}]"),
+        Ok(path) => {
+            if crate::ui::events::on() {
+                crate::ui::events::session_saved(&slug, &path);
+            } else {
+                eprintln!("\n[saved as “{slug}” — {path}]");
+            }
+            Some(slug)
+        }
         // Not fatal: the work is done and the answer is already printed. Saying so is the whole
         // duty here — silence would leave the caller believing there is something to reopen.
-        Err(e) => eprintln!("\n[this session was NOT saved: {e:#}]"),
+        Err(e) => {
+            let why = format!("{e:#}");
+            if crate::ui::events::on() {
+                crate::ui::events::session_not_saved(&why);
+            } else {
+                eprintln!("\n[this session was NOT saved: {why}]");
+            }
+            None
+        }
     }
+}
+
+/// `aizen hooks`: the configured lifecycle hooks, as the loop will read them.
+pub(crate) fn run_hooks_cmd(json: bool) -> Result<()> {
+    let path = cli_config::config_path();
+    let hooks = cli_config::load().hooks.unwrap_or_default();
+    let disabled = cli_config::branded_flag("NO_HOOKS");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "enabled": !disabled,
+                "config_path": path.display().to_string(),
+                "default_timeout_secs": crate::agent::hooks::DEFAULT_TIMEOUT_SECS,
+                "hooks": hooks,
+            }))?
+        );
+        return Ok(());
+    }
+    if disabled {
+        println!("hooks are OFF: AIZEN_NO_HOOKS is set");
+    }
+    if hooks.is_empty() {
+        println!(
+            "no hooks configured — add a `hooks` object to {}:\n\n  \"hooks\": {{\n    \"pre_tool\":  [{{ \"match\": \"shell_run\", \"run\": \"python ~/hooks/guard.py\" }}],\n    \"post_tool\": [{{ \"match\": \"file_edit|file_write\", \"run\": \"cargo fmt --quiet\" }}],\n    \"stop\":      [{{ \"run\": \"notify-send aizen 'run finished'\" }}]\n  }}\n\nsee docs/REFERENCE.md, \"Hooks\".",
+            path.display()
+        );
+        return Ok(());
+    }
+    println!(
+        "hooks from {} ({}):",
+        path.display(),
+        if disabled { "disabled" } else { "enabled" }
+    );
+    for (event, list) in [
+        ("pre_tool", &hooks.pre_tool),
+        ("post_tool", &hooks.post_tool),
+        ("stop", &hooks.stop),
+    ] {
+        for h in list {
+            let scope = if event == "stop" {
+                "-".to_string()
+            } else {
+                h.matches.clone().unwrap_or_else(|| "*".to_string())
+            };
+            println!(
+                "  {event:<9} {scope:<24} {:>3}s  {}",
+                h.timeout_secs
+                    .unwrap_or(crate::agent::hooks::DEFAULT_TIMEOUT_SECS),
+                h.run
+            );
+        }
+    }
+    println!(
+        "\ncolumns: event · match · timeout · command  (`AIZEN_NO_HOOKS=1` turns them all off)"
+    );
+    Ok(())
 }
 
 pub(crate) async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {

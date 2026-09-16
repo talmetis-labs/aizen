@@ -1,0 +1,8 @@
+[package]
+name = "fixture_fix_build_error"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]

@@ -17,6 +17,10 @@ const DEFAULT_REPO: &str = "talmetis-labs/aizen";
 const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_BINARY_BYTES: u64 = 300 * 1024 * 1024;
 const HTTP_TIMEOUT_SECS: u64 = 120;
+/// A previous build (`aizen*.old-*`) is kept this long before the startup sweep removes it,
+/// so a bad update can be rolled back by hand for a week rather than until the next launch
+/// (quality plan S6).
+const BACKUP_PIN_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Version {
@@ -54,6 +58,10 @@ struct ReleaseInfo {
     asset_url: String,
     asset_name: String,
     asset_size: u64,
+    /// The `<asset>.sha256` published beside the binary (release workflow, E5.2). `None` for a
+    /// release from before checksums were published: installable, but said to be unverified.
+    #[serde(default)]
+    checksum_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +173,17 @@ fn parse_releases(json: &str, suffix: &str) -> Vec<ReleaseInfo> {
         else {
             continue;
         };
+        let checksum_name = format!("{asset_name}.sha256");
+        let checksum_url = assets
+            .iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|n| n == checksum_name)
+            })
+            .and_then(|a| a.get("browser_download_url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         out.push(ReleaseInfo {
             tag: tag.to_string(),
             name: item
@@ -187,6 +206,7 @@ fn parse_releases(json: &str, suffix: &str) -> Vec<ReleaseInfo> {
                 .get("size")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            checksum_url,
         });
     }
     out.sort_by(|a, b| parse_version(&b.tag).cmp(&parse_version(&a.tag)));
@@ -239,7 +259,44 @@ async fn list_releases(limit: usize) -> Result<Vec<ReleaseInfo>> {
     Ok(parse_releases(&body, suffix))
 }
 
-async fn download_to(url: &str, part: &Path, expected_size: u64) -> Result<u64> {
+/// Lower-case hex of a digest.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Check a downloaded asset's SHA-256 against the published checksum text. Accepts the
+/// `sha256sum` / `shasum -a 256` line shapes (`<hex>  <name>`, `<hex> *<name>`) and a bare hex
+/// digest; when a line names a file, it must name THIS asset. A mismatch is a refusal, not a
+/// warning: a tampered or corrupt binary must never be renamed over the live one (S4).
+fn verify_checksum(published: &str, asset_name: &str, digest_hex: &str) -> Result<()> {
+    for line in published.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let Some(hex) = it.next() else {
+            continue;
+        };
+        let named = it.next().map(|n| n.trim_start_matches('*'));
+        if named.is_some_and(|n| n != asset_name) {
+            continue; // another asset's line in a combined SHA256SUMS
+        }
+        if hex.eq_ignore_ascii_case(digest_hex) {
+            return Ok(());
+        }
+        bail!(
+            "refusing to install {asset_name}: SHA-256 mismatch (published {hex}, downloaded {digest_hex}) — the asset is corrupt or tampered"
+        );
+    }
+    // Every line naming this asset returned above; reaching here means none did.
+    bail!("refusing to install {asset_name}: the published checksum file names no digest for it")
+}
+
+/// Stream the asset to `part`, returning its size and SHA-256 (hex). The file is `sync_all`ed
+/// before it is handed to the swap: a rename over the live executable of bytes still in the
+/// page cache is how a power cut leaves a zero-length `aizen` (S5).
+async fn download_to(url: &str, part: &Path, expected_size: u64) -> Result<(u64, String)> {
     let client = http_client()?;
     let response = client
         .get(url)
@@ -260,8 +317,10 @@ async fn download_to(url: &str, part: &Path, expected_size: u64) -> Result<u64> 
         .with_context(|| format!("creating {}", part.display()))?;
     let mut stream = response.bytes_stream();
     let mut total = 0u64;
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading release asset")?;
+        digest.update(&chunk);
         total = total.saturating_add(chunk.len() as u64);
         if total > MAX_BINARY_BYTES {
             let _ = tokio::fs::remove_file(part).await;
@@ -275,12 +334,36 @@ async fn download_to(url: &str, part: &Path, expected_size: u64) -> Result<u64> 
             .context("writing release asset")?;
     }
     file.flush().await.context("flushing release asset")?;
+    file.sync_all()
+        .await
+        .context("syncing release asset to disk")?;
     drop(file);
     if expected_size > 0 && expected_size != total {
         let _ = tokio::fs::remove_file(part).await;
         bail!("release asset size mismatch (expected {expected_size}, downloaded {total})");
     }
-    Ok(total)
+    Ok((total, hex_lower(digest.finish().as_ref())))
+}
+
+/// Fetch the small published checksum text for a release asset.
+async fn fetch_checksum(url: &str) -> Result<String> {
+    let client = http_client()?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("downloading checksum {url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "checksum download returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let text = response.text().await.context("reading checksum")?;
+    if text.len() > 64 * 1024 {
+        bail!("checksum file is implausibly large");
+    }
+    Ok(text)
 }
 
 fn backup_path(target: &Path) -> PathBuf {
@@ -328,8 +411,18 @@ pub fn cleanup_stale_backups(dir: &Path, live_exe: &Path) {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
+        // A previous build is the rollback: it stays a week (`BACKUP_PIN_SECS`), not until the
+        // next launch — a bad update noticed the day after used to find its predecessor gone.
         if name != live_name && name.starts_with("aizen") && name.contains(".old-") {
-            let _ = fs::remove_file(path);
+            let pinned = entry
+                .metadata()
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_none_or(|age| age.as_secs() <= BACKUP_PIN_SECS);
+            if !pinned {
+                let _ = fs::remove_file(path);
+            }
             continue;
         }
         // A download killed mid-stream leaves `.aizen-update-{pid}.part` with nothing to collect
@@ -517,7 +610,26 @@ async fn install(release: &ReleaseInfo, target: &Path) -> Result<()> {
         fmt_size(release.asset_size)
     ));
     let part = target.with_file_name(format!(".aizen-update-{}.part", std::process::id()));
-    let size = download_to(&release.asset_url, &part, release.asset_size).await?;
+    let (size, digest) = download_to(&release.asset_url, &part, release.asset_size).await?;
+    match &release.checksum_url {
+        Some(url) => {
+            let published = match fetch_checksum(url).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = fs::remove_file(&part);
+                    return Err(e.context("the release publishes a checksum but it could not be fetched — not installing"));
+                }
+            };
+            if let Err(e) = verify_checksum(&published, &release.asset_name, &digest) {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+            emit(&format!("verified SHA-256 {}…", &digest[..16]));
+        }
+        None => emit(
+            "no checksum is published for this release — installing unverified (size-checked only)",
+        ),
+    }
     let backup = match swap_in_place(&part, target) {
         Ok(path) => path,
         Err(error) => {
@@ -564,6 +676,45 @@ mod tests {
         assert_eq!(asset_suffix_for("linux", "x86_64"), Some("linux-x86_64"));
         assert_eq!(asset_suffix_for("macos", "aarch64"), Some("macos-aarch64"));
         assert_eq!(asset_suffix_for("macos", "x86_64"), None);
+    }
+
+    #[test]
+    fn release_parser_picks_up_the_checksum_asset_when_published() {
+        let json = r#"[
+          {"tag_name":"v0.6.8","draft":false,"assets":[
+            {"name":"aizen-v0.6.8-windows-x86_64.exe","browser_download_url":"https://x/a","size":12},
+            {"name":"aizen-v0.6.8-windows-x86_64.exe.sha256","browser_download_url":"https://x/a.sha256","size":100}]},
+          {"tag_name":"v0.6.7","draft":false,"assets":[
+            {"name":"aizen-v0.6.7-windows-x86_64.exe","browser_download_url":"https://x/b","size":12}]}
+        ]"#;
+        let out = parse_releases(json, "windows-x86_64.exe");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].checksum_url.as_deref(), Some("https://x/a.sha256"));
+        assert_eq!(out[1].checksum_url, None, "older releases have none");
+    }
+
+    #[test]
+    fn a_checksum_mismatch_is_a_refusal_and_other_assets_lines_are_skipped() {
+        let good = "ab".repeat(32);
+        let name = "aizen-v0.6.8-linux-x86_64";
+        // sha256sum shape, shasum shape (`*name`), a bare digest, and a combined file.
+        assert!(verify_checksum(&format!("{good}  {name}\n"), name, &good).is_ok());
+        assert!(verify_checksum(&format!("{good} *{name}\n"), name, &good).is_ok());
+        assert!(verify_checksum(&good, name, &good.to_uppercase()).is_ok());
+        let combined = format!("{}  other-asset\n{good}  {name}\n", "cd".repeat(32));
+        assert!(verify_checksum(&combined, name, &good).is_ok());
+        let bad = verify_checksum(&format!("{}  {name}\n", "cd".repeat(32)), name, &good)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            bad.contains("refusing to install") && bad.contains("mismatch"),
+            "{bad}"
+        );
+        let none = verify_checksum(&format!("{good}  other-asset\n"), name, &good)
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("names no digest"), "{none}");
+        assert_eq!(hex_lower(&[0x00, 0xab, 0xff]), "00abff");
     }
 
     #[test]
@@ -638,9 +789,21 @@ mod tests {
         let root = scratch("sweep");
         let live = root.join("aizen.exe");
         let stale = root.join("aizen.exe.old-0.4.7-123");
+        let fresh = root.join("aizen.exe.old-0.6.7-456");
         let unrelated = root.join("notes.txt");
         fs::write(&live, b"live").unwrap();
         fs::write(&stale, b"stale").unwrap();
+        // Older than the pin: a backup from eight days ago is past its rollback window.
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(BACKUP_PIN_SECS + 86_400),
+            )
+            .unwrap();
+        fs::write(&fresh, b"yesterday").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
 
         // A download `.part` too fresh to be an orphan: it may be another window's LIVE download,
@@ -652,7 +815,11 @@ mod tests {
         cleanup_stale_backups(&root, &live);
 
         assert!(live.exists(), "the running binary must survive the sweep");
-        assert!(!stale.exists(), "a previous update's backup must be swept");
+        assert!(!stale.exists(), "a backup past the pin must be swept");
+        assert!(
+            fresh.exists(),
+            "a backup inside the pin is the rollback — kept"
+        );
         assert!(unrelated.exists(), "unrelated files must be left alone");
         assert!(
             part.exists(),

@@ -50,7 +50,16 @@ jobs:
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           asset="aizen-${tag}-${{ matrix.plat }}${{ matrix.ext }}"
           cp "target/release/aizen${{ matrix.ext }}" "$asset"
-          ls -lh "$asset"
+          # E5.2: a SHA-256 beside every binary, in `sha256sum` line shape, so `aizen update`
+          # can refuse a corrupt or tampered download. One file per asset (not one SHA256SUMS)
+          # because the matrix jobs upload concurrently and would clobber a shared file.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          ls -lh "$asset" "$asset.sha256"
+          cat "$asset.sha256"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
       - name: Publish binary to this repo's release
@@ -67,4 +76,4 @@ jobs:
           # so swallow "already exists".
           gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" \
             --notes "Automated build for $tag." 2>/dev/null || true
-          gh release upload "$tag" "$ASSET" --clobber --repo "${{ github.repository }}"
+          gh release upload "$tag" "$ASSET" "$ASSET.sha256" --clobber --repo "${{ github.repository }}"

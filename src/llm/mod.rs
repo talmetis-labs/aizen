@@ -6,4 +6,5 @@ pub mod client;
 pub mod codex_models;
 pub mod gateway;
 pub mod oauth_codex;
+pub mod replay;
 pub mod responses_codex;

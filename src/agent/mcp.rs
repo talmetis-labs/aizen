@@ -1947,7 +1947,7 @@ fn server_defs_estimate(srv: &ServerHandle) -> usize {
                 t.input_schema.clone(),
             );
             serde_json::to_string(&def)
-                .map(|s| s.len() / 4)
+                .map(|s| crate::core::tokens::estimate_str(&s))
                 .unwrap_or(0)
         })
         .sum()

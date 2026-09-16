@@ -142,24 +142,53 @@ impl WorkspaceIdentity {
     }
 }
 
-/// Worktree ids whose workspace lease THIS process already holds, with a nesting count.
-///
-/// An OS advisory lock is owned by the process, but both `LockFileEx` on a second handle and `flock`
-/// on a second descriptor still conflict — a nested acquire inside one process blocks against itself
-/// and then fails on timeout. That is not a theoretical case: the agent loop takes the lease on the
-/// first writing tool of a turn and holds it to the end of the turn, so a delegated sub-agent that
-/// writes (`task` with a write-capable role runs on the serialized path while the parent's lease is
-/// live) would deadlock against its own parent and report "workspace writer lease was not acquired"
-/// for an edit nothing was actually contending.
-///
-/// Reentrancy is safe precisely because the lease's purpose is mutual exclusion BETWEEN sessions:
-/// two nested holders in one process are one writer as far as any other process can tell, and the
-/// parent is suspended on the barrier path while the child runs.
-static HELD: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+// Worktree ids whose workspace lease THIS process already holds, keyed by the scope that took it.
+//
+// An OS advisory lock is owned by the process, but both `LockFileEx` on a second handle and `flock`
+// on a second descriptor still conflict — a nested acquire inside one process blocks against itself
+// and then fails on timeout. That is not a theoretical case: the agent loop takes the lease on the
+// first writing tool of a turn and holds it to the end of the turn, so a delegated sub-agent that
+// writes (`task` with a write-capable role runs on the serialized path while the parent's lease is
+// live) would deadlock against its own parent and report "workspace writer lease was not acquired"
+// for an edit nothing was actually contending.
+//
+// Reentrancy is granted to the holder's scope and its descendants only (see `reentry_allowed`):
+// a child inside its parent's blocking dispatch is one writer with it, while a sibling scope in
+// the same process — another `serve` lane, a parallel dispatch — is a second writer and waits.
 
-fn held_map<T>(f: impl FnOnce(&mut HashMap<String, u32>) -> T) -> T {
+/// One in-process holder: the resource scope that took the OS locks, what for, and how many
+/// nested handles it and its descendants currently hold.
+struct Held {
+    scope: String,
+    operation: String,
+    count: u32,
+}
+
+static HELD: Mutex<Option<HashMap<String, Held>>> = Mutex::new(None);
+
+fn held_map<T>(f: impl FnOnce(&mut HashMap<String, Held>) -> T) -> T {
     let mut guard = HELD.lock().unwrap_or_else(|e| e.into_inner());
     f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// May `requester` reenter a lease `holder` took? Only the holder's own scope and its
+/// descendants (`conv/task/3` under `conv`): a delegated child runs INSIDE its parent's blocking
+/// dispatch, so the two are one writer. A sibling scope — the next lane of `serve`, a parallel
+/// dispatch — is a second writer and must wait for the OS lock like a second process would.
+/// Reentrancy used to be process-wide, which let two `serve` lanes on one worktree share a
+/// lease that was supposed to keep them apart.
+pub(crate) fn reentry_allowed(holder: &str, requester: &str) -> bool {
+    requester == holder
+        || requester
+            .strip_prefix(holder)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The resource scope of the context this thread is running under, or `default`.
+fn current_scope() -> String {
+    crate::core::exec_ctx::current()
+        .map(|c| c.resource_scope())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 pub struct WorkspaceWriterLease {
@@ -169,6 +198,8 @@ pub struct WorkspaceWriterLease {
 }
 
 impl WorkspaceWriterLease {
+    /// Take the lease under the CURRENT execution context's resource scope (see
+    /// [`reentry_allowed`]); `default` outside any context.
     pub fn acquire(
         root: &Path,
         timeout: Duration,
@@ -179,19 +210,45 @@ impl WorkspaceWriterLease {
         Self::acquire_identity(identity, timeout, cancel, operation)
     }
 
+    /// [`Self::acquire`] under an explicit resource scope — the agent loop passes its own
+    /// `exec_ctx`'s, which is the one its delegated children derive theirs from.
+    pub fn acquire_scoped(
+        root: &Path,
+        timeout: Duration,
+        cancel: Option<&crate::core::cancel::TurnCancel>,
+        operation: &str,
+        scope: &str,
+    ) -> Result<Self> {
+        let identity = WorkspaceIdentity::discover_cached(root)?;
+        Self::acquire_identity_scoped(identity, timeout, cancel, operation, scope)
+    }
+
     pub fn acquire_identity(
         identity: WorkspaceIdentity,
         timeout: Duration,
         cancel: Option<&crate::core::cancel::TurnCancel>,
         operation: &str,
     ) -> Result<Self> {
-        // Already ours? Take a nested reference instead of deadlocking against our own handle.
-        let reentrant = held_map(|m| match m.get_mut(&identity.worktree_id) {
-            Some(n) => {
-                *n += 1;
-                true
+        Self::acquire_identity_scoped(identity, timeout, cancel, operation, &current_scope())
+    }
+
+    pub fn acquire_identity_scoped(
+        identity: WorkspaceIdentity,
+        timeout: Duration,
+        cancel: Option<&crate::core::cancel::TurnCancel>,
+        operation: &str,
+        scope: &str,
+    ) -> Result<Self> {
+        // Already ours — the same scope, or a child running inside our dispatch? Take a nested
+        // reference instead of deadlocking against our own handle. Any other scope in this
+        // process is a second writer and goes through the OS lock below like another process.
+        let (reentrant, other_holder) = held_map(|m| match m.get_mut(&identity.worktree_id) {
+            Some(h) if reentry_allowed(&h.scope, scope) => {
+                h.count += 1;
+                (true, None)
             }
-            None => false,
+            Some(h) => (false, Some(format!("{} ({})", h.scope, h.operation))),
+            None => (false, None),
         });
         if reentrant {
             return Ok(Self {
@@ -201,7 +258,7 @@ impl WorkspaceWriterLease {
         }
 
         let owner = LockOwner::new(format!("{}-{}", std::process::id(), now_unix()), operation);
-        let locks = LockSet::acquire(
+        let locks = match LockSet::acquire(
             vec![
                 LockRequest::new(
                     LockClass::RepositoryStore,
@@ -219,10 +276,28 @@ impl WorkspaceWriterLease {
             timeout,
             cancel,
             &owner,
-        )?;
+        ) {
+            Ok(l) => l,
+            // Name the in-process holder when there is one: "timed out" alone reads like
+            // another aizen window, and the fix — wait for that dispatch, or order it with
+            // `after` — is different.
+            Err(e) => match other_holder {
+                Some(h) => return Err(e.context(format!("held in this process by scope {h}"))),
+                None => return Err(e),
+            },
+        };
         // Registered only AFTER the OS locks are in hand, so a failed acquire never leaves a phantom
         // entry that would let a later nested acquire believe it is covered.
-        held_map(|m| m.insert(identity.worktree_id.clone(), 1));
+        held_map(|m| {
+            m.insert(
+                identity.worktree_id.clone(),
+                Held {
+                    scope: scope.to_string(),
+                    operation: operation.to_string(),
+                    count: 1,
+                },
+            )
+        });
         Ok(Self {
             identity,
             _locks: Some(locks),
@@ -263,9 +338,9 @@ impl Drop for WorkspaceWriterLease {
         held_map(|m| {
             if self._locks.is_some() {
                 m.remove(&self.identity.worktree_id);
-            } else if let Some(n) = m.get_mut(&self.identity.worktree_id) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
+            } else if let Some(h) = m.get_mut(&self.identity.worktree_id) {
+                h.count = h.count.saturating_sub(1);
+                if h.count == 0 {
                     m.remove(&self.identity.worktree_id);
                 }
             }
@@ -536,6 +611,11 @@ mod tests {
     /// nothing else was contending.
     #[test]
     fn a_nested_lease_in_one_process_is_granted_and_outlives_the_inner_handle() {
+        // The lock root lives under `aizen_home()`: hold the home lock so a test that points
+        // `AIZEN_HOME` at a temp dir and removes it cannot vanish the root mid-acquire.
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!(
             "aizen-lease-reentry-{}-{}",
             std::process::id(),
@@ -578,6 +658,73 @@ mod tests {
         // Proof the OS lock really came back: a fresh acquire succeeds immediately.
         WorkspaceWriterLease::acquire_identity(identity, Duration::from_millis(200), None, "after")
             .expect("lease must be re-acquirable once every handle is gone");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reentry_is_for_the_holder_and_its_descendants_only() {
+        assert!(reentry_allowed("conv-A", "conv-A"));
+        assert!(reentry_allowed("conv-A", "conv-A/task/3"));
+        assert!(reentry_allowed("conv-A", "conv-A/workflow/7/implement"));
+        assert!(!reentry_allowed("conv-A", "conv-B"));
+        assert!(
+            !reentry_allowed("conv-A", "conv-AB"),
+            "a prefix is not an ancestor"
+        );
+        assert!(
+            !reentry_allowed("conv-A/task/3", "conv-A"),
+            "an ancestor does not reenter a child's lease"
+        );
+    }
+
+    /// A child (descendant scope) reenters its parent's lease; a sibling scope in the same
+    /// process does NOT — it waits for the OS lock and fails at the timeout, naming the holder.
+    /// This is the exclusion two `serve` lanes on one worktree never had.
+    #[test]
+    fn a_sibling_scope_waits_for_the_os_lock_while_a_descendant_reenters() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!(
+            "aizen-lease-scope-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let identity = WorkspaceIdentity::discover(&base).unwrap();
+        let short = Duration::from_millis(200);
+        let outer = WorkspaceWriterLease::acquire_identity_scoped(
+            identity.clone(),
+            short,
+            None,
+            "file_edit",
+            "conv-A",
+        )
+        .expect("first acquire holds the OS locks");
+        let child = WorkspaceWriterLease::acquire_identity_scoped(
+            identity.clone(),
+            short,
+            None,
+            "child edit",
+            "conv-A/task/1",
+        )
+        .expect("a descendant scope reenters its parent's lease");
+        let err = match WorkspaceWriterLease::acquire_identity_scoped(
+            identity.clone(),
+            short,
+            None,
+            "sibling edit",
+            "conv-B",
+        ) {
+            Ok(_) => panic!("a sibling scope must not reenter"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("conv-A") && err.contains("file_edit"), "{err}");
+        drop(child);
+        assert!(WorkspaceWriterLease::held_by_this_process(&identity));
+        drop(outer);
+        WorkspaceWriterLease::acquire_identity_scoped(identity, short, None, "later", "conv-B")
+            .expect("free once every handle is gone");
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -15,16 +15,14 @@ use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
 use crate::repl::postturn::{
-    chore_chat, maybe_auto_compact, maybe_evolve_persona, maybe_run_secretary,
+    chore_chat, last_turn_slice, maybe_evolve_persona, maybe_run_secretary,
 };
 use crate::ui::context_report::{
     ctx_permille, resolve_ctx_window, usage_ctx_tokens, usage_input_tokens,
 };
 use crate::ui::image_input;
 use crate::ui::{splash, theme, tui};
-use crate::{
-    approval_mode, cancellable_slash, cancellable_slash_labeled, eager_enabled, summarizer_endpoint,
-};
+use crate::{approval_mode, cancellable_slash, eager_enabled, summarizer_endpoint};
 use anyhow::Result;
 use console::style;
 use types::Message;
@@ -75,6 +73,9 @@ pub(crate) fn turn_agent_config(
         approval_mode: approval_mode(),
         cancel,
         context_window: resolve_ctx_window(model).0,
+        // The auto-compact threshold from `/config` (`compact_threshold_pct`, default 80, `0` off)
+        // arms the loop's own compaction — the one compaction trigger the REPL has.
+        compact_at_pct: crate::compact_threshold_pct(),
         enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
         // Reflect the live manager state (honours `/lsp off` for this turn).
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
@@ -92,8 +93,71 @@ pub(crate) fn turn_agent_config(
         // stops at 2. `/goal` does not take this branch (goal mode retries transient errors
         // indefinitely, see agent/mod.rs), so raising this never shortens a goal run.
         max_transient_retries: 10,
+        // Where the loop's mid-run nudges go: a `system` message on Anthropic-style gateways, the
+        // user turn everywhere else (the Codex path hoists every system message into its
+        // instructions blob, and many local chat templates reject a mid-history system role).
+        nudge_role: nudge_role_for_endpoint(),
         ..AgentConfig::default()
     }
+}
+
+/// Architect mode for one turn (see `agent::architect`). When it applies — `max` effort, a
+/// multi-file request, the mode on — a `metis` child on the planner model writes the plan, and
+/// the turn continues on the editor model at low wire effort: the returned endpoint is the one
+/// to build the registry with, the plan is folded into the user message once it is seated
+/// (`architect::attach_plan`). `None` means the turn runs exactly as it would have.
+pub(crate) async fn architect_phase(
+    http: &reqwest::Client,
+    ep: &cli_config::ResolvedEndpoint,
+    eff: Option<&str>,
+    shape: crate::core::turn_shape::TurnShape,
+    line: &str,
+    cancel: crate::core::cancel::TurnCancel,
+) -> Option<(cli_config::ResolvedEndpoint, String)> {
+    use crate::agent::architect;
+    if !architect::applies(eff, shape, cli_config::architect_mode_enabled()) {
+        return None;
+    }
+    let root = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let planner = architect::planner_model(&cli_config::load(), &ep.model);
+    tui::emit_line(&theme::faint(&format!("architect: metis planning on {planner}…")).to_string());
+    let plan = architect::plan(
+        http,
+        ep,
+        approval_mode(),
+        &root,
+        line,
+        cancel,
+        resolve_ctx_window(&ep.model).0,
+    )
+    .await?;
+    let editor = architect::editor_model(&cli_config::load(), &ep.model);
+    tui::emit_line(
+        &theme::faint(&architect::status_line(
+            &planner,
+            &editor,
+            plan.chars().count(),
+        ))
+        .to_string(),
+    );
+    let mut out = ep.clone();
+    out.model = editor;
+    // The editor types at low wire effort; the harness budgets the `max` tier already applied
+    // to `AgentConfig` stay — a multi-file change on `low`'s twelve steps would be cut off.
+    cli_config::set_effort_override(Some("low".to_string()));
+    Some((out, plan))
+}
+
+/// The nudge role for the endpoint this REPL talks to (saved config or the `AIZEN_BASE_URL`
+/// override — the same two sources `resolve_endpoint` reads first).
+fn nudge_role_for_endpoint() -> crate::agent::NudgeRole {
+    let base = cli_config::branded_env("BASE_URL")
+        .or_else(|| cli_config::load().base_url.clone())
+        .unwrap_or_default();
+    crate::agent::NudgeRole::for_base_url(&base)
 }
 
 /// Fold this turn's retrieved context into the outgoing message and seat it in history.
@@ -109,6 +173,14 @@ pub(crate) fn seat_user_message(
     history: &mut Vec<Message>,
     model: &str,
 ) {
+    // Every model call from here until the next seated user message — the loop, its sub-agents,
+    // the post-turn chores — is billed to this turn in the usage ledger.
+    client::cost_meter().begin_turn();
+    // The todo list is scoped to the turn: cleared here unless the previous turn ended abnormally
+    // (its open items are then the continuation plan). Assume THIS turn ends abnormally until
+    // `finish_turn` says otherwise, so a turn that errors out keeps its plan for the retry.
+    crate::agent::todo::begin_user_turn();
+    crate::agent::todo::end_turn(true);
     let sent = fold_context_into_query(line);
     refresh_dynamic_prompt_lane(history, model);
     if images.is_empty() {
@@ -227,13 +299,6 @@ pub(crate) async fn run_agent_turn(
     agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await
 }
 
-/// How long the post-turn learning passes may take in total before the REPL gives up on them.
-///
-/// Each call already has its own 300s ceiling (`chore_chat` → `subagent_call_timeout`), but three of
-/// them in a row can strand an idle-looking REPL for fifteen minutes. On timeout the user sees a
-/// skip line instead of a spinner that never stops.
-const POST_TURN_OVERALL_TIMEOUT_SECS: u64 = 600;
-
 /// Everything a turn that reached the model must do afterwards, on either surface.
 ///
 /// Ordering is load-bearing and was the thing that drifted: the learning passes read the FULL detail
@@ -253,6 +318,17 @@ pub(crate) async fn finish_turn(
     // paragraph. Silence here makes those read exactly like `Done`, and the passes below would then
     // file a red tree as a finished task.
     surface_abnormal_stop(outcome);
+    // The user's `stop` hooks see every finished top-level turn (see `agent::hooks`).
+    crate::agent::hooks::run_blocking(|| {
+        crate::agent::hooks::stop(
+            outcome.stop.label(),
+            outcome.iters,
+            outcome.final_text.as_deref(),
+            &crate::agent::hooks::Context::here(false),
+        )
+    });
+    // A turn that did not reach `Done` leaves its plan for the next user turn (see `todo`).
+    crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
     // Goal mode finishes only on a verify-passing `Done`. Clear it here so the next turn is an
     // ordinary capped turn again; Esc leaves the goal armed on purpose, so the user can retry.
     if crate::agent::goal::current_goal().is_some() && matches!(outcome.stop, StopReason::Done) {
@@ -299,30 +375,22 @@ pub(crate) async fn finish_turn(
     // re-arming, Esc would take the idle branch while the REPL sat awaiting them: to the user the
     // turn had visibly ended and the app was wedged anyway. Cancelling here skips the remaining
     // learning, which is always optional work.
-    let learning = cancellable_slash_labeled("learning from this turn…", async {
-        maybe_run_secretary(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
-        maybe_evolve_persona(http, &ep.base_url, &ep.api_key, &ep.model).await;
-        maybe_auto_compact(history, http, &ep.base_url, &ep.api_key, &ep.model).await;
-    });
-    let learned = match tokio::time::timeout(
-        std::time::Duration::from_secs(POST_TURN_OVERALL_TIMEOUT_SECS),
-        learning,
-    )
-    .await
+    // E4.4: the secretary and the persona reflection read the turn and write the store; nothing
+    // in the next prompt waits on them except recall, which the next turn's `learning_queue`
+    // drain gives `DRAIN_JOIN` to satisfy. So they run in the background on a copy of the turn.
+    // Auto-compaction is not a post-turn pass any more: the loop compacts between its own steps
+    // (`compact_at_pct`), so a long turn shrinks mid-flight instead of after it ends.
     {
-        Ok(result) => result,
-        Err(_) => {
-            tui::emit_line(
-                &theme::muted("⏱ post-turn learning exceeded timeout — skipped.").to_string(),
-            );
-            None
-        }
-    };
-    if learned.is_none() {
-        tui::emit_line(&theme::muted("⏹ skipped the post-turn learning passes.").to_string());
+        let turn = last_turn_slice(history).to_vec();
+        let http = http.clone();
+        let ep = ep.clone();
+        crate::repl::learning_queue::LEARNING.spawn(async move {
+            maybe_run_secretary(&turn, &http, &ep.base_url, &ep.api_key, &ep.model).await;
+            maybe_evolve_persona(&http, &ep.base_url, &ep.api_key, &ep.model).await;
+        });
     }
-    // Persistence is NOT optional, so it sits outside that block: a cancelled learning pass must
-    // still leave the conversation on disk. `autosave_session` names the session with a model call,
+    // Persistence is NOT optional: a cancelled learning pass must still leave the conversation on
+    // disk. `autosave_session` names the session with a model call,
     // so it is cancellable too — the local-only writer keeps the transcript either way.
     if cancellable_slash(autosave_session(
         history,
@@ -430,5 +498,69 @@ pub(crate) fn show_clarify(display: &str) {
             println!("{o}");
         }
         println!("{hint}");
+    }
+}
+
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+
+    /// E6.2 (quality plan Q4): `src/repl/` had no tests at all. One user turn goes through the same
+    /// `run_agent_turn` both REPL surfaces call, with the model's answer replayed from a tape, the
+    /// real registry and the real loop — no network, no key. It pins the wiring (config → registry
+    /// → loop → outcome) that only a person at a terminal used to exercise.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the home + tape locks must span the taped turn
+    async fn one_turn_runs_through_the_repl_wiring_on_a_tape() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-repl-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("AIZEN_HOME", &home);
+        let _tape_lock = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tape = home.join("smoke.jsonl");
+        // Fingerprints are deliberately bogus: replay warns and carries on (the documented contract
+        // for a harness that changed underneath a recording).
+        let line = serde_json::json!({
+            "ordinal": 0, "model": "synthetic", "system_fp": "x", "turns_fp": "x",
+            "turn": {"content": "The answer is 4.", "finish_reason": "stop",
+                "usage": {"prompt": 500, "completion": 8, "cached": 0, "cache_write": 0}}
+        });
+        std::fs::write(&tape, line.to_string() + "\n").unwrap();
+        crate::llm::replay::configure(crate::llm::replay::Mode::Replay, &tape, None).unwrap();
+
+        let http = reqwest::Client::new();
+        let ep = cli_config::ResolvedEndpoint {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            api_key: "unused".to_string(),
+            model: "synthetic".to_string(),
+        };
+        let registry = build_turn_registry(&http, &ep).expect("registry");
+        let cfg = turn_agent_config(crate::core::cancel::TurnCancel::new(), "synthetic", false);
+        let mut history = vec![
+            Message::system("You are a test."),
+            Message::user("What is 2 + 2?"),
+        ];
+        let outcome = run_agent_turn(&http, &ep, &cfg, &registry, &mut history)
+            .await
+            .expect("a taped turn completes");
+        crate::llm::replay::disable();
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(outcome.final_text.as_deref(), Some("The answer is 4."));
+        assert!(
+            matches!(outcome.stop, StopReason::Done),
+            "{:?}",
+            outcome.stop
+        );
+        assert!(
+            history.iter().any(|m| m.role == "assistant"),
+            "the assistant turn was appended to the history"
+        );
     }
 }

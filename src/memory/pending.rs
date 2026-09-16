@@ -109,7 +109,7 @@ pub fn current() -> Vec<Pending> {
         .unwrap_or_default()
 }
 
-/// Forget everything. Called on thread switch (`/clear`, `/resume`, `/handoff`, `/recover`): the
+/// Forget everything. Called on thread switch (`/clear`, `/resume`, `/recover`): the
 /// new transcript never contained the old block, so its handles now point at nothing the model
 /// can see.
 pub fn clear() {

@@ -8,6 +8,7 @@
 
 pub mod background;
 pub mod input_pre;
+pub mod learning_queue;
 pub mod postturn;
 pub mod startup;
 pub mod turn;

@@ -1,0 +1,8 @@
+{
+  "id": "fix-failing-test",
+  "prompt": "`cargo test` fails in this crate. Find the bug in the implementation and fix it so every test passes. Do not change the tests.",
+  "allowed_files": ["src/lib.rs"],
+  "expect": "done",
+  "verify": ["cargo", "test", "--quiet"],
+  "max_steps": 30
+}

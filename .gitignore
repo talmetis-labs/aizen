@@ -44,3 +44,7 @@ main_diff*.txt
 /mutable-cuddling-narwhal.md
 /release-notes-v0.5.9.md
 /release-notes-v0.6.0.md
+
+# task-suite fixtures build in a temp copy, but a hand run inside bench-tasks/<id>/repo would not
+bench-tasks/*/repo/target/
+bench-tasks/*/repo/Cargo.lock

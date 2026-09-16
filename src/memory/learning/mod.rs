@@ -187,6 +187,15 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
             &lineage,
             &tiering::fs_exists,
         );
+        // The stored type follows the placement: a `user`-typed sentence the rule re-filed as
+        // `place` is a project fact for display and filtering too (`mtype_for`).
+        let mtype = if choice.tier != Tier::User
+            && matches!(c.mtype, MemoryType::User | MemoryType::Feedback)
+        {
+            secretary::mtype_for(choice.tier)
+        } else {
+            c.mtype
+        };
         let is_inferred = provenance == ProvenanceKind::Inferred;
         let r = route::route(&c, &s);
 
@@ -213,7 +222,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
                     let w = LearnedWrite {
                         name: &c.name,
                         description: "",
-                        mtype: c.mtype,
+                        mtype,
                         body: &clean,
                         source: provenance,
                         confidence: c.confidence * choice.confidence_mult,
@@ -235,7 +244,7 @@ pub fn ingest(user_text: &str, opts: &LearnOptions) -> Result<LearnReport> {
             Route::Store => {
                 apply_store(
                     &clean,
-                    &c.mtype,
+                    &mtype,
                     provenance,
                     c.confidence * choice.confidence_mult,
                     false,
@@ -390,7 +399,18 @@ fn apply_store(
         }
     }
 
-    let mem_op = consolidate::decide(&toks, &same_zone, s.learn_dedup_threshold);
+    // Two-stage dedup, same partition first (the merge target must be the row this placement
+    // would reinforce), then the OTHER tiers: a sentence already held in another tier is a
+    // classification artefact, not a second truth. The same tier at another anchor or device
+    // is not in the pool — see `apply_store_never_merges_across_places`.
+    let cross_tier = existing.iter().filter(|e| e.tier != choice.tier);
+    let hit = consolidate::find_duplicate(clean, &toks, same_zone.iter(), s.learn_dedup_threshold)
+        .or_else(|| consolidate::find_duplicate(clean, &toks, cross_tier, s.learn_dedup_threshold));
+    let stage = hit.as_ref().map(|(_, _, st)| st.label());
+    let mem_op = match hit {
+        Some((id, _, _)) => MemOp::Reinforce { id },
+        None => MemOp::Add,
+    };
     let op_is_add = matches!(&mem_op, MemOp::Add);
     match mem_op {
         MemOp::Reinforce { id } => {
@@ -408,6 +428,7 @@ fn apply_store(
                         new_id: None,
                         body_preview: None,
                         signal: Some(signal_kind_label(signal_kind)),
+                        verdict: stage,
                         ..Default::default()
                     });
                 }
@@ -958,6 +979,49 @@ mod tests {
                 vec![existing_id],
                 "it reinforces the SAME-anchor row"
             );
+        });
+    }
+
+    #[test]
+    fn a_restatement_already_held_in_another_tier_reinforces_instead_of_twinning() {
+        with_temp_home("cross-tier", || {
+            let s = crate::core::config::MemorySettings::default();
+            // The sentence is already a USER fact (mis-tiered, as quality plan M3 measured).
+            let user_id = store::add_learned(&store::LearnedWrite {
+                name: "deploy note",
+                mtype: MemoryType::Project,
+                body: "the deploy pipeline uses fly",
+                tier: Tier::User,
+                ..Default::default()
+            })
+            .unwrap();
+            let mut existing = store::load_all().unwrap();
+            let mut report = LearnReport::default();
+            apply_store(
+                "the deploy pipeline uses fly",
+                &MemoryType::Project,
+                ProvenanceKind::Inferred,
+                0.9,
+                false,
+                &tiering::TierChoice {
+                    tier: Tier::Place,
+                    anchor: Some("c:/work/proja".to_string()),
+                    device: None,
+                    confidence_mult: 1.0,
+                },
+                SignalKind::Passive,
+                &opts(),
+                &mut existing,
+                &s,
+                &mut report,
+            )
+            .unwrap();
+            assert_eq!(
+                report.reinforced,
+                vec![user_id],
+                "the other tier's row is reinforced, not twinned: {report:?}"
+            );
+            assert!(report.added.is_empty(), "{report:?}");
         });
     }
 

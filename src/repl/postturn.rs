@@ -1,74 +1,57 @@
-//! Everything that happens AFTER a turn's last token: auto-compaction, the secretary pass, passive
-//! memory learning, persona evolution, and the `/compact` · `/handoff` entry points.
+//! Everything that happens AFTER a turn's last token: the secretary pass, passive memory
+//! learning, persona evolution, and the `/compact` entry point. Auto-compaction is not here: it
+//! runs inside the turn, between the agent's steps (`compact_at_pct` — one trigger, armed by the
+//! `/config` threshold, for the REPL and the one-shot alike).
 //!
 //! All of it is best-effort and bounded — a failed or slow learning pass must leave the conversation
 //! exactly as the turn left it, which is why the whole block runs under one overall timeout.
 
 use crate::agent;
-use crate::agent::prompt_lanes::strip_recall_blocks;
 use crate::core::endpoint::{http_client, resolve_endpoint};
 use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
 use crate::skills as skill;
-use crate::ui::context_report::{fmt_k, resolve_ctx_window, session_tokens};
 use crate::ui::{icons, splash, tui};
 use crate::{
-    auto_skill_learn_enabled, compact_threshold_pct, extract_json_object, persona_evolve_enabled,
-    summarizer_endpoint, COMPACT_KEEP_TURNS,
+    auto_skill_learn_enabled, extract_json_object, persona_evolve_enabled, summarizer_endpoint,
+    COMPACT_KEEP_TURNS,
 };
 use crate::{memory, persona};
 use anyhow::Result;
 use console::style;
 use types::Message;
 
-/// After a completed turn: if auto-compact is enabled and context usage crossed the threshold,
-/// summarize older turns in place. Best-effort — a failed summary leaves the conversation intact.
-pub(crate) async fn maybe_auto_compact(
-    history: &mut Vec<Message>,
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
-    model: &str,
-) {
-    let threshold = compact_threshold_pct();
-    if threshold == 0 {
-        return; // disabled
-    }
-    let (window, _) = resolve_ctx_window(model);
-    let pct = session_tokens(history) as f64 / window as f64 * 100.0;
-    if pct < threshold as f64 {
-        return;
-    }
-    // The prefix cache is about to be invalidated anyway, so this is the one free moment to drop
-    // the stale recall blocks accumulated on older user turns (see `strip_recall_blocks`).
-    strip_recall_blocks(history);
-    // tui::emit_line routes through the sticky footer when active, else prints a plain line.
-    tui::emit_line(
-        &style(format!(
-            "↯ context {pct:.0}% ≥ {threshold}% — auto-compacting…"
-        ))
-        .dim()
-        .to_string(),
-    );
-    match compact_history(history, http, base, key, model).await {
-        Ok((b, a)) => tui::emit_line(
-            &style(format!(
-                "↯ auto-compacted: ~{} → ~{} tok",
-                fmt_k(b),
-                fmt_k(a)
-            ))
-            .color256(splash::ACCENT)
-            .to_string(),
-        ),
-        Err(e) => tui::emit_line(&format!("{} {e}", style("auto-compact skipped:").dim())),
+/// A chore — a compaction summary, the secretary's reading of a turn, a persona reflection, a
+/// reconcile judgement — is one short answer, so it gets a shorter per-call cap than a sub-agent:
+/// a chore still running after a minute is a chore that has hung (quality plan M6 measured them
+/// at 300 s each, three in a row, before the next prompt). `AIZEN_CHORE_CALL_SECS` overrides;
+/// the sub-agent ceiling still bounds it.
+const CHORE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) fn chore_call_timeout() -> std::time::Duration {
+    std::env::var("AIZEN_CHORE_CALL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(CHORE_CALL_TIMEOUT)
+        .min(crate::agent::task_tool::subagent_call_timeout())
+}
+
+/// The messages of the most recent user turn: from the last `user` message to the end, empty
+/// when there is none. The background learning passes take a copy of exactly this.
+pub(crate) fn last_turn_slice(history: &[Message]) -> &[Message] {
+    match history.iter().rposition(|m| m.role == "user") {
+        Some(i) => &history[i..],
+        None => &[],
     }
 }
 
-/// Wrap a background / chore model call in the SAME per-call wall-clock deadline a sub-agent gets
-/// ([`crate::agent::task_tool::subagent_call_timeout`], default 300s, `AIZEN_SUBAGENT_CALL_SECS`).
+/// Wrap a background / chore model call in a per-call wall-clock deadline
+/// ([`chore_call_timeout`], default 60s, `AIZEN_CHORE_CALL_SECS`).
 ///
-/// Every one of these is a NON-streaming `chat_with_tools` call — compaction / handoff summaries, the
+/// Every one of these is a NON-streaming `chat_with_tools` call — compaction summaries, the
 /// end-of-turn secretary, persona reflection, memory reconcile, the oracle reviewer, persona distill.
 /// None is streamed, so the streaming path's inter-event stall watchdog never applies; the shared
 /// client carries no total-request ceiling (removed so a long *streamed* turn isn't cut — see
@@ -84,7 +67,7 @@ pub(crate) async fn chore_chat(
     msgs: &[Message],
     tools: &[ToolDef],
 ) -> Result<client::ChatTurn> {
-    let deadline = crate::agent::task_tool::subagent_call_timeout();
+    let deadline = chore_call_timeout();
     match tokio::time::timeout(
         deadline,
         client::chat_with_tools(http, base, key, model, msgs, tools),
@@ -93,7 +76,7 @@ pub(crate) async fn chore_chat(
     {
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!(
-            "chore model call exceeded {}s with no response (raise AIZEN_SUBAGENT_CALL_SECS)",
+            "chore model call exceeded {}s with no response (raise AIZEN_CHORE_CALL_SECS)",
             deadline.as_secs()
         )),
     }
@@ -557,22 +540,28 @@ pub(crate) async fn compact_now(history: &mut Vec<Message>) -> Result<(usize, us
     compact_history(history, &http, &base, &key, &model).await
 }
 
-/// `/handoff` — one goal-conditioned extraction call over the current history (routed through the
-/// summarizer role, like compaction). Returns the extraction; the caller rebuilds the thread.
-pub(crate) async fn handoff_now(history: &[Message], goal: &str) -> Result<String> {
-    let (base, key, model) = resolve_endpoint(None, None, None)?;
-    let http = http_client()?;
-    if history.len() < 2 {
-        anyhow::bail!("nothing to hand off yet — the conversation is empty");
+#[cfg(test)]
+mod learning_tests {
+    use super::*;
+
+    #[test]
+    fn the_last_turn_slice_starts_at_the_last_user_message() {
+        let h = vec![
+            Message::user("one".to_string()),
+            Message::assistant("a".to_string()),
+            Message::user("two".to_string()),
+            Message::assistant("b".to_string()),
+        ];
+        let t = last_turn_slice(&h);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].content.as_deref(), Some("two"));
+        assert!(last_turn_slice(&[]).is_empty());
+        assert!(last_turn_slice(&[Message::assistant("x".to_string())]).is_empty());
     }
-    let ep = summarizer_endpoint(&base, &key, &model);
-    let prompt = agent::compact::handoff_prompt(history, goal);
-    let summary = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
-        .await?
-        .content
-        .unwrap_or_default();
-    if summary.trim().is_empty() {
-        anyhow::bail!("the model returned an empty handoff summary");
+
+    #[test]
+    fn the_chore_cap_never_exceeds_the_subagent_ceiling() {
+        assert!(chore_call_timeout() <= crate::agent::task_tool::subagent_call_timeout());
+        assert!(chore_call_timeout() <= CHORE_CALL_TIMEOUT);
     }
-    Ok(summary.trim().to_string())
 }

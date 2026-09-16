@@ -48,16 +48,23 @@ pub(crate) fn system_prompt_bundle_in(
         model,
         Some(frozen),
     );
-    // L2 session working memory (temporary, budget-capped). Empty → no tag (zero cost).
-    let sess_budget = memory::settings().session_mem_max_tokens;
-    if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
-        bundle.dynamic.push('\n');
-        bundle.dynamic.push_str(&block);
-        bundle.dynamic.push('\n');
+    // L2 session working memory (temporary, budget-capped). It grows as the agent works — the
+    // post-turn learning pass files candidates into it — so on the REPL it rides the USER turn
+    // (`fold_context_into_query`), where the bytes are new anyway, and never the dynamic lane,
+    // which must stay byte-stable for the prefix cache. A hostbot lane has no fold step and no
+    // cached prefix to protect the same way, so it keeps the block here.
+    if root.is_some() {
+        let sess_budget = memory::settings().session_mem_max_tokens;
+        if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
+            bundle.dynamic.push('\n');
+            bundle.dynamic.push_str(&block);
+            bundle.dynamic.push('\n');
+        }
     }
     // Recent saved conversations, so "continue the most recent session" is visible to the MODEL —
     // the startup resume hint only ever reached the terminal. REPL surfaces only (`root` is None):
     // a hostbot lane carries its own per-chat history and terminal sessions would be noise there.
+    // Adopted once per conversation (see `session_store::recent_sessions_block`).
     if root.is_none() {
         if let Some(block) = crate::core::session_store::recent_sessions_block() {
             bundle.dynamic.push('\n');
@@ -68,9 +75,14 @@ pub(crate) fn system_prompt_bundle_in(
 }
 
 /// A TRUE conversation boundary: promote pending memory, rebuild from the current store, and adopt
-/// the result before constructing a fresh prompt prefix. Startup, `/clear`, `/handoff`, session load,
+/// the result before constructing a fresh prompt prefix. Startup, `/clear`, session load,
 /// and one-shot/captured runs are the only callers that should use this path.
 pub(crate) fn refreshed_system_prompt_bundle(model: &str) -> agent::PromptBundle {
+    // Everything the dynamic lane adopts for a conversation is re-read here and nowhere else: the
+    // frozen core, the persona's self-memory, and the `<sessions>` rows. Between boundaries the
+    // lane is rebuilt from these adopted copies byte-for-byte.
+    crate::core::session_store::clear_sessions_block_cache();
+    persona::forget_adopted_self();
     let frozen = memory::refresh_frozen_core();
     system_prompt_bundle_with_core(model, &frozen)
 }
@@ -132,7 +144,29 @@ pub(crate) const CODEBASE_RETRIEVAL_BUDGET_TOKENS: usize = 1500;
 /// Fresh user-turn boundary: refresh only the dynamic lane, preserving stable index 0 byte-for-byte.
 pub(crate) fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &str) {
     migrate_legacy_prompt_lanes(history, model);
-    let dynamic = active_system_prompt_bundle(model).dynamic;
+    // E4.6: a convention file added, edited or removed mid-conversation is live on the next
+    // message. The conventions sit in the STABLE lane, so both lanes are rebuilt — the one
+    // per-turn path that may bust the prefix cache, and only when a stat says a file changed.
+    if let Ok(cwd) = std::env::current_dir() {
+        if agent::project_context::conventions_changed(&cwd) {
+            splice_prompt_lanes(history, active_system_prompt_bundle(model));
+            return;
+        }
+    }
+    // E4.7: a tool-bound turn — this turn's shape is an edit, or the previous turn worked with
+    // file/shell tools — gets the lanes without the persona blocks unless the user asked to keep
+    // them for coding. The gate is raised only around this build and only on this path.
+    let coding = persona_gate_applies(
+        crate::core::turn_shape::current_turn_shape(),
+        previous_turn_used_tools(history),
+        crate::core::cli_config::load()
+            .persona_for_coding
+            .unwrap_or(false),
+    );
+    let dynamic = {
+        let _gate = persona::suppress_for_turn(coding);
+        active_system_prompt_bundle(model).dynamic
+    };
     let lead = agent::compact::leading_system_count(history);
     if dynamic.trim().is_empty() {
         if lead > 1 {
@@ -143,6 +177,42 @@ pub(crate) fn refresh_dynamic_prompt_lane(history: &mut Vec<Message>, model: &st
     } else {
         history.insert(1, Message::system(dynamic));
     }
+}
+
+/// PURE. Should the persona blocks stay out of this turn's lanes? Yes for an edit-shaped turn or
+/// one that follows tool work, unless the user keeps the persona on for coding. A question or a
+/// research turn after a conversational one keeps its character.
+pub(crate) fn persona_gate_applies(
+    shape: Option<crate::core::turn_shape::TurnShape>,
+    previous_turn_used_tools: bool,
+    keep_for_coding: bool,
+) -> bool {
+    use crate::core::turn_shape::TurnShape;
+    if keep_for_coding {
+        return false;
+    }
+    matches!(shape, Some(TurnShape::SmallEdit | TurnShape::MultiFile)) || previous_turn_used_tools
+}
+
+/// Did the most recent turn in `history` call a file, shell or process tool? Read at the next
+/// user-turn boundary, before the new message is seated, so "the last user message" is the
+/// previous turn's.
+pub(crate) fn previous_turn_used_tools(history: &[Message]) -> bool {
+    use crate::agent::tool_routing::{lane_for, Lane};
+    let start = history
+        .iter()
+        .rposition(|m| m.role == "user")
+        .unwrap_or(history.len());
+    history[start..]
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .flat_map(|m| m.tool_calls.iter())
+        .any(|c| {
+            matches!(
+                lane_for(&c.function.name),
+                Some(Lane::FileRead | Lane::FileWrite | Lane::Shell | Lane::Process)
+            )
+        })
 }
 
 /// Rewrite BOTH system lanes in place, preserving every non-system message.
@@ -228,17 +298,34 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     // denominator ("live facts per turn") has to mean turns the user drove.
     memory::stats::note_turn();
     let mut out = fold_retrieval_into_query(query);
+    // A pure question — nothing to change — skips the gated-skills and memory-recall blocks: the
+    // standing facts already ride the frozen core, and a how-to procedure is for doing, not for
+    // answering. The turn then costs one request against the cached prefix. Session working
+    // memory and codebase retrieval stay: a question about THIS repo needs both.
+    let question =
+        crate::core::turn_shape::classify(query) == crate::core::turn_shape::TurnShape::Question;
     // Skills that actually fit THIS question, gated on the same coverage threshold as recall. The
     // always-on `<skills>` index names every applicable procedure regardless of the request; this
     // block is what makes the fitting ones salient without spending the system lane's byte-stable
     // budget on the ones that don't. Folded ABOVE the code but BELOW the facts, matching the
     // "standing truth → how-to → source" reading order.
-    if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
+    if !question {
+        if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
+            out = format!("{block}\n\n{out}");
+        }
+    }
+    // L2 session working memory: the notes the learning pass filed during THIS conversation. It
+    // changes between turns, which is exactly why it rides here and not in the dynamic lane.
+    if let Some(block) =
+        memory::session_mem::process_prompt_block(memory::settings().session_mem_max_tokens)
+    {
         out = format!("{block}\n\n{out}");
     }
-    if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
-        memory::pending::open_turn(pairs);
-        out = format!("{block}\n\n{out}");
+    if !question {
+        if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
+            memory::pending::open_turn(pairs);
+            out = format!("{block}\n\n{out}");
+        }
     }
     out
 }
@@ -268,7 +355,8 @@ pub(crate) fn strip_recall_blocks(history: &mut [Message]) {
         };
         let mut cur = content;
         loop {
-            let next = strip_skill_prefix(memory::strip_recall_prefix(cur));
+            let next =
+                strip_skill_prefix(strip_session_mem_prefix(memory::strip_recall_prefix(cur)));
             if next.len() == cur.len() {
                 break;
             }
@@ -291,8 +379,98 @@ pub(crate) fn strip_skill_prefix(content: &str) -> &str {
     }
 }
 
+/// Peel one leading `<session_memory>` block (folded by [`fold_context_into_query`]). The tag has
+/// to open at position 0, which only our own folding produces; the block carries no blank line
+/// inside, so the first one after its closing tag is the boundary.
+pub(crate) fn strip_session_mem_prefix(content: &str) -> &str {
+    if !content.starts_with("<session_memory>\n") {
+        return content;
+    }
+    match content.split_once("</session_memory>\n\n") {
+        Some((_, rest)) => rest,
+        None => content,
+    }
+}
+
+#[cfg(test)]
+mod lane_stability_tests {
+    use super::{
+        active_system_prompt_bundle, fold_context_into_query, refreshed_system_prompt_bundle,
+        strip_recall_blocks,
+    };
+    use crate::core::session_store::{autosave_last, set_session_slug};
+    use crate::core::types::Message;
+    use crate::memory::session_mem::{
+        clear_process_session_mem, process_session_mem, SessionNoteKind,
+    };
+
+    /// The invariant every turn relies on: between two conversation boundaries the dynamic lane
+    /// is byte-identical, whatever happened in between — this conversation's own autosave (which
+    /// used to bump the `<sessions>` row for it every turn) and a note filed by the learning pass
+    /// (which used to re-render `<session_memory>` in the lane). Both now land where the bytes
+    /// are new anyway: the file is skipped, the note rides the user turn.
+    #[test]
+    fn dynamic_lane_is_byte_identical_across_an_autosave_and_a_session_note() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-lane-stable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        clear_process_session_mem();
+
+        let model = "m";
+        let boundary = refreshed_system_prompt_bundle(model);
+
+        // Turn 1 happens: the conversation autosaves under a fresh slug, and learning files a note.
+        let history = vec![
+            Message::system("lane".to_string()),
+            Message::user("please fix the parser".to_string()),
+            Message::assistant("done".to_string()),
+        ];
+        autosave_last(&history, Some(model));
+        process_session_mem().note(
+            "the parser lives in src/parse.rs",
+            SessionNoteKind::Candidate,
+            None,
+            8,
+        );
+
+        // Turn 2 rebuilds the lane from the adopted copies.
+        let next = active_system_prompt_bundle(model);
+        assert_eq!(boundary.stable, next.stable, "stable lane");
+        assert_eq!(
+            boundary.dynamic, next.dynamic,
+            "dynamic lane must not change within a conversation"
+        );
+        assert!(
+            !next.dynamic.contains("<session_memory>"),
+            "session notes ride the user turn, not the lane"
+        );
+
+        // …and the note reaches the model on the user turn, then leaves with the other per-turn
+        // blocks at compaction time.
+        let typed = "now add a test for it";
+        let sent = fold_context_into_query(typed);
+        assert!(
+            sent.contains("<session_memory>") && sent.contains("src/parse.rs"),
+            "{sent}"
+        );
+        assert!(sent.ends_with(&format!("\n\n{typed}")), "{sent}");
+        let mut turn = vec![Message::user(sent)];
+        strip_recall_blocks(&mut turn);
+        assert_eq!(turn[0].content.as_deref(), Some(typed));
+
+        clear_process_session_mem();
+        set_session_slug(None);
+        std::env::remove_var("AIZEN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 /// Everything a THREAD SWITCH must reset besides history itself: session scratch memory, todos,
-/// the cost tally, destructive-op session grants, and browser page @refs. `/clear`, `/handoff`,
+/// the cost tally, destructive-op session grants, and browser page @refs. `/clear`,
 /// `/resume`, `/sessions` restore and `/recover` all route here so a fresh or restored thread
 /// never inherits the previous one's state (the classic leak: a restored conversation still
 /// "allowed" the old thread's destructive ops and showed its cost).
@@ -303,11 +481,14 @@ pub(crate) fn reset_per_session_state() {
     // thread as a "duplicate" of one that is no longer in context.
     memory::pending::clear();
     crate::agent::todo::clear();
+    // The next turn decides the conversation's shape (and so its deferred tool set) afresh.
+    crate::core::turn_shape::reset_conversation();
     client::cost_meter().reset();
     // The provider-reported context size describes the OLD thread's last request — the new one
     // starts from the chars/4 estimate until its own first call reports usage.
     tui::clear_ctx_real_tokens();
     tui::reset_session_allow();
+    crate::core::approval::reset_session_grants();
     #[cfg(feature = "browser")]
     crate::agent::browser::release_active();
 }
@@ -324,4 +505,82 @@ pub(crate) fn rebuild_system(history: &mut Vec<Message>, model: &str) {
 /// persona mid-chat so the new character applies but the history is preserved.
 pub(crate) fn update_system_prompt(history: &mut Vec<Message>, model: &str) {
     refresh_dynamic_prompt_lane(history, model);
+}
+
+#[cfg(test)]
+mod persona_gate_tests {
+    use super::*;
+    use crate::core::turn_shape::TurnShape;
+
+    #[test]
+    fn the_gate_closes_on_questions_and_opens_on_coding_unless_kept() {
+        assert!(!persona_gate_applies(
+            Some(TurnShape::Question),
+            false,
+            false
+        ));
+        assert!(!persona_gate_applies(
+            Some(TurnShape::Research),
+            false,
+            false
+        ));
+        assert!(
+            !persona_gate_applies(None, false, false),
+            "the first turn keeps its character"
+        );
+        assert!(persona_gate_applies(
+            Some(TurnShape::SmallEdit),
+            false,
+            false
+        ));
+        assert!(persona_gate_applies(
+            Some(TurnShape::MultiFile),
+            false,
+            false
+        ));
+        assert!(
+            persona_gate_applies(Some(TurnShape::Question), true, false),
+            "a question after tool work is still a coding session"
+        );
+        assert!(
+            !persona_gate_applies(Some(TurnShape::MultiFile), true, true),
+            "`persona coding on` keeps the blocks everywhere"
+        );
+    }
+
+    #[test]
+    fn the_previous_turn_is_read_from_its_last_user_message() {
+        let call = |name: &str| crate::core::types::ToolCall {
+            id: "c".to_string(),
+            kind: "function".to_string(),
+            function: crate::core::types::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut h = vec![
+            Message::user("edit it".to_string()),
+            Message::assistant_tool_calls(vec![call("file_edit")]),
+            Message::user("thanks, and what is a monad?".to_string()),
+            Message::assistant("a monoid in the category of endofunctors".to_string()),
+        ];
+        assert!(
+            !previous_turn_used_tools(&h),
+            "the last turn was conversational"
+        );
+        h.push(Message::user("now rename the module".to_string()));
+        h.push(Message::assistant_tool_calls(vec![call("shell_run")]));
+        assert!(previous_turn_used_tools(&h));
+        assert!(!previous_turn_used_tools(&[]));
+    }
+
+    #[test]
+    fn the_flag_is_restored_when_the_guard_drops() {
+        assert!(!persona::suppressed());
+        {
+            let _g = persona::suppress_for_turn(true);
+            assert!(persona::suppressed());
+        }
+        assert!(!persona::suppressed());
+    }
 }

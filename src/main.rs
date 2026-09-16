@@ -180,6 +180,25 @@ async fn main() -> Result<()> {
             BenchCmd::Dialectic => bench::brain::run_dialectic(),
             BenchCmd::Health => bench::brain::run_health(),
             BenchCmd::Loop => bench::loop_eval::run().await,
+            BenchCmd::Sessions { json } => bench::sessions_stats::run(json),
+            BenchCmd::Tasks {
+                task,
+                record,
+                live,
+                tape,
+                update_baseline,
+                json,
+            } => {
+                bench::task_eval::run(bench::task_eval::Options {
+                    task,
+                    record,
+                    live,
+                    tape,
+                    update_baseline,
+                    json,
+                })
+                .await
+            }
         },
         Commands::Config { cmd } => config_ui::run_config(cmd).await,
         Commands::Auth { cmd } => config_ui::run_auth(cmd).await,
@@ -191,6 +210,7 @@ async fn main() -> Result<()> {
         Commands::Custom { cmd } => cli::custom_cmd::run(cmd).await,
         Commands::Key { cmd } => cli::key_cmd::run(cmd).await,
         Commands::Models(args) => run_models(args).await,
+        Commands::Hooks { json } => run_hooks_cmd(json),
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Reach { cmd } => run_reach(cmd).await,
         Commands::Serve {
@@ -284,7 +304,12 @@ async fn main() -> Result<()> {
         Commands::Apps { cmd } => run_apps(cmd).await,
         Commands::Agents { cmd } => run_agents(cmd).await,
         Commands::Update => features::update::run().await,
-        Commands::PromptSize { model, tools, json } => run_prompt_size(model, tools, json),
+        Commands::PromptSize {
+            model,
+            tools,
+            live,
+            json,
+        } => run_prompt_size(model, tools, live, json),
         Commands::Art => {
             crate::ui::moonscape::run();
             Ok(())
@@ -436,17 +461,23 @@ fn status_text(history: &[Message], model: &str) -> String {
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
-/// calls (compaction/handoff summaries) are the classic cheap-model candidates — one config field
+/// calls (compaction summaries) are the classic cheap-model candidates — one config field
 /// and every summary routes there.
+/// The endpoint every chore call goes to. The `summarizer` role when one is configured; otherwise
+/// the cheapest model the user configured for this endpoint (`models_by_effort.low`), and only
+/// then the main model — quality plan M6 measured the chores landing on the main coding model at
+/// full effort because nothing else was named.
 fn summarizer_endpoint(base: &str, key: &str, model: &str) -> cli_config::ResolvedEndpoint {
-    cli_config::resolve_role(
-        "summarizer",
-        &cli_config::ResolvedEndpoint {
-            base_url: base.to_string(),
-            api_key: key.to_string(),
-            model: model.to_string(),
-        },
-    )
+    let main = cli_config::ResolvedEndpoint {
+        base_url: base.to_string(),
+        api_key: key.to_string(),
+        model: model.to_string(),
+    };
+    let ep = cli_config::resolve_role("summarizer", &main);
+    if ep.model == main.model && ep.base_url == main.base_url {
+        return cli_config::route_endpoint_for_effort(&ep, Some("low"));
+    }
+    ep
 }
 
 /// Eager tool execution during streaming: ON unless disabled by config (`eager_tools: false`) or
@@ -463,11 +494,9 @@ fn eager_enabled() -> bool {
 /// reports usage and any tokens actually came from cache. The at-a-glance KV-cache health signal —
 /// a sudden drop to 0% mid-session means something is rewriting the prefix.
 fn cache_hit_label() -> Option<String> {
-    let (prompt, cached, _) = client::cost_meter().last_call()?;
-    if prompt == 0 || cached == 0 {
-        return None;
-    }
-    Some(format!("⛁ {}% cached", cached * 100 / prompt))
+    let meter = client::cost_meter();
+    let (input, cached, _) = meter.last_call()?;
+    crate::ui::context_report::cache_label(input, cached, meter.cache_read())
 }
 
 /// Disarms the interactive cancel token AND resets working state however a turn ends — normal
@@ -519,7 +548,7 @@ impl Drop for SteerMailboxGuard {
 
 /// Run a slash command's network call as INTERRUPTIBLE work. `None` means the user pressed Esc.
 ///
-/// Slash handlers that call the model (`/compact`, `/handoff`) used to `await` straight inside the
+/// Slash handlers that call the model (`/compact`) used to `await` straight inside the
 /// REPL loop with no token armed and `WORKING` still false. Two consequences, both bad: the HTTP
 /// client's 300s read timeout became the real ceiling, and `tui::turn_in_flight()` reported false —
 /// so Esc took the idle branch and merely cleared the draft while the REPL sat blocked in the await,
@@ -558,6 +587,34 @@ async fn cancellable_slash_labeled<T>(
     let out = crate::core::cancel::race(&token, fut).await;
     tui::set_working(false);
     out
+}
+
+/// E4.4: give the previous turn's background learning up to `DRAIN_JOIN` to land, so this turn's
+/// recall can see what the last one taught; a slow pass keeps running and lands later.
+async fn drain_learning_before_turn() {
+    use crate::repl::learning_queue::{DRAIN_JOIN, LEARNING};
+    if LEARNING.in_flight() == 0 {
+        return;
+    }
+    if !LEARNING.drain(DRAIN_JOIN).await {
+        tui::emit_line(
+            &theme::muted("… last turn's learning is still running; going ahead without it.")
+                .to_string(),
+        );
+    }
+}
+
+/// On the way out, let the last turn's learning finish rather than lose it (Esc skips).
+async fn drain_learning_before_exit() {
+    use crate::repl::learning_queue::LEARNING;
+    if LEARNING.in_flight() == 0 {
+        return;
+    }
+    let _ = cancellable_slash_labeled(
+        "finishing learning from the last turn… (Esc skips)",
+        LEARNING.drain(std::time::Duration::from_secs(60)),
+    )
+    .await;
 }
 
 /// Compact "N ago" for a Unix-seconds timestamp (for `/init --status`).
@@ -607,6 +664,7 @@ async fn run_menu_sticky() -> Result<()> {
     }
     tui::set_ultimate(cli_config::ultimate_enabled()); // open the input box in the right colour (gold if ultimate)
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
+    warm_up_after_first_frame();
     {
         let (main, notes) = identity_banner();
         tui::emit_line(&style(main).dim().to_string());
@@ -668,11 +726,17 @@ async fn run_menu_sticky() -> Result<()> {
     loop {
         let sub = match input.submissions.recv().await {
             Some(s) => s,
-            None => break,
+            None => {
+                drain_learning_before_exit().await;
+                break;
+            }
         };
         tui::note_submission_dequeued();
         match sub {
-            tui::Submission::Quit => break,
+            tui::Submission::Quit => {
+                drain_learning_before_exit().await;
+                break;
+            }
             tui::Submission::Slash(cmd) => {
                 if cmd.trim().is_empty() || slash_is_interactive(&cmd) {
                     // Dialoguer menus / long-running daemons drive the terminal directly → suspend
@@ -820,7 +884,35 @@ async fn run_menu_sticky() -> Result<()> {
                 };
                 let eff = resolve_turn_effort(effort_src);
                 cli_config::set_effort_override(eff.clone());
-                tui::emit_line(&effort_turn_line(eff.as_deref()));
+                // The turn's shape widens the conversation's, which picks the deferred tool set
+                // the registry below is built with (see `core::turn_shape`).
+                let shape = crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(
+                    effort_src,
+                ));
+                // `models_by_effort` may send this tier to another model on the same endpoint.
+                let ep = cli_config::route_endpoint_for_effort(&ep, eff.as_deref());
+                let routed = (ep.model != model).then_some(ep.model.as_str());
+                tui::emit_line(&format!(
+                    "{} {}",
+                    effort_turn_line(eff.as_deref(), routed),
+                    theme::faint(&format!("· {}", shape.as_str()))
+                ));
+                // Architect mode: a strong model plans, the turn applies on the fast one. Runs
+                // BEFORE the registry is built so the registry and every child see the editor
+                // model; the plan is folded in once the user message is seated below.
+                let architect = crate::repl::turn::architect_phase(
+                    &http,
+                    &ep,
+                    eff.as_deref(),
+                    shape,
+                    &line,
+                    turn_cancel.clone(),
+                )
+                .await;
+                let ep = architect
+                    .as_ref()
+                    .map(|(editor, _)| editor.clone())
+                    .unwrap_or(ep);
                 if let Err(e) = crate::core::recovery::checkpoint_history(
                     &history,
                     Some(&line),
@@ -832,6 +924,7 @@ async fn run_menu_sticky() -> Result<()> {
                             .to_string(),
                     );
                 }
+                drain_learning_before_turn().await;
                 let persona_before = cli_config::load().persona;
                 // Arm LSP BEFORE building the registry — tools only register while enabled.
                 arm_lsp_session();
@@ -853,7 +946,15 @@ async fn run_menu_sticky() -> Result<()> {
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
                 seat_user_message(&line, images, &mut history, &model);
-                let cfg = turn_agent_config(turn_cancel.clone(), &model, true);
+                if let Some((_, plan)) = &architect {
+                    crate::agent::architect::attach_plan(&mut history, plan);
+                }
+                let mut cfg = turn_agent_config(turn_cancel.clone(), &model, true);
+                // The tier shapes the harness budgets too (steps, continuations, verify rounds,
+                // self-review, log budget) — see `AgentConfig::apply_effort`.
+                if let Some(t) = eff.as_deref() {
+                    cfg.apply_effort(t);
+                }
 
                 // Esc pressed DURING prep already cancelled this token — honour it instead of firing
                 // the request anyway. Without this, cancelling in the prep window (the very thing the
@@ -1056,7 +1157,10 @@ async fn run_menu_plain() -> Result<()> {
         print_status_line(&history, &model_label);
         let (line, mut images) = match read_input_box(&input_history)? {
             Some(l) => l,
-            None => break,
+            None => {
+                drain_learning_before_exit().await;
+                break;
+            }
         };
         let mut line = line.trim().to_string();
         // Drag-drop / typed / pasted image-file paths on the line → vision attachments (the other
@@ -1081,7 +1185,10 @@ async fn run_menu_plain() -> Result<()> {
             // a lone slash as ordinary text (a message may legitimately begin with one).
             if line.trim() == "/" {
                 match slash_menu(&mut history, &mut model_label).await {
-                    SlashOutcome::Quit => break,
+                    SlashOutcome::Quit => {
+                        drain_learning_before_exit().await;
+                        break;
+                    }
                     SlashOutcome::Submit(prompt) => line = prompt,
                     SlashOutcome::Continue => continue,
                 }
@@ -1096,7 +1203,10 @@ async fn run_menu_plain() -> Result<()> {
                             format!("{name} {arg}")
                         };
                         match handle_slash(&rest, &mut history, &mut model_label).await {
-                            SlashOutcome::Quit => break,
+                            SlashOutcome::Quit => {
+                                drain_learning_before_exit().await;
+                                break;
+                            }
                             // A custom command expanded to a prompt → run it as a chat turn (not
                             // re-preprocessed).
                             SlashOutcome::Submit(prompt) => line = prompt,
@@ -1154,9 +1264,34 @@ async fn run_menu_plain() -> Result<()> {
         };
         let eff = resolve_turn_effort(effort_src);
         cli_config::set_effort_override(eff.clone());
-        println!("{}", effort_turn_line(eff.as_deref()));
+        let shape =
+            crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(effort_src));
+        let ep = cli_config::route_endpoint_for_effort(&ep, eff.as_deref());
+        let routed = (ep.model != model).then_some(ep.model.as_str());
+        println!(
+            "{} {}",
+            effort_turn_line(eff.as_deref(), routed),
+            theme::faint(&format!("· {}", shape.as_str()))
+        );
+        // Architect mode — same hook as the retained REPL; the cancel token is created here
+        // (rather than at the agent config below) so the planner child can observe it too.
+        let turn_cancel = crate::core::cancel::TurnCancel::new();
+        let architect = crate::repl::turn::architect_phase(
+            &http,
+            &ep,
+            eff.as_deref(),
+            shape,
+            &line,
+            turn_cancel.clone(),
+        )
+        .await;
+        let ep = architect
+            .as_ref()
+            .map(|(editor, _)| editor.clone())
+            .unwrap_or(ep);
         // Snapshot the active persona so we can detect an in-turn switch (the `persona_create` tool)
         // and resync the system prompt at the turn boundary — prefix-cache safe, takes effect next msg.
+        drain_learning_before_turn().await;
         let persona_before = cli_config::load().persona;
         arm_lsp_session();
         // Registry BEFORE the user message is seated — it publishes the live tool surface that
@@ -1173,9 +1308,14 @@ async fn run_menu_plain() -> Result<()> {
         // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
         // history / display.
         seat_user_message(&line, images, &mut history, &model);
+        if let Some((_, plan)) = &architect {
+            crate::agent::architect::attach_plan(&mut history, plan);
+        }
         // Unified ask/smart/yolo approval, with AIZEN_YES forcing yolo.
-        let turn_cancel = crate::core::cancel::TurnCancel::new();
-        let cfg = turn_agent_config(turn_cancel, &model, false);
+        let mut cfg = turn_agent_config(turn_cancel, &model, false);
+        if let Some(t) = eff.as_deref() {
+            cfg.apply_effort(t);
+        }
         match run_agent_turn(&http, &ep, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
@@ -1236,6 +1376,31 @@ fn arm_lsp_session() {
     if !ARMED.swap(true, Ordering::Relaxed) {
         let _ = crate::agent::lsp::LSP.enable();
     }
+}
+
+/// Warm the two lazy subsystems a first edit or search otherwise pays for inline, AFTER the
+/// first frame is up (nothing here runs before the REPL is usable, so startup is unchanged):
+/// the LSP runtime plus one server per language the project uses (a `documentSymbol` probe on
+/// one file of that language starts the server and its cold index), and an incremental refresh
+/// of an EXISTING `/init` index — never a first build, which scans and redacts the whole repo
+/// and is the user's call. Best-effort and silent: a missing server binary, `/lsp off`, or a
+/// locked index are all skips. `AIZEN_NO_WARMUP=1` turns it off (benchmarks, small machines).
+fn warm_up_after_first_frame() {
+    if std::env::var_os("AIZEN_NO_WARMUP").is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("aizen-warmup".into())
+        .spawn(|| {
+            arm_lsp_session();
+            let root = crate::core::config::project_root();
+            for file in crate::agent::lsp::discovery::probe_files(&root) {
+                let _ = crate::agent::lsp::LSP.document_symbols(&file);
+            }
+            if crate::agent::codebase::load().is_some() {
+                let _ = crate::agent::codebase::build_index(true, None, &|_| {});
+            }
+        });
 }
 
 /// Whether an active persona evolves (records episodes + reflects). `None` ⇒ default ON.

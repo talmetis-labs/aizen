@@ -511,6 +511,9 @@ pub struct InjectCtx {
     /// LAST step of `draw`, so moving the cursor here without putting it back strands the caret in
     /// the transcript.
     pub caret: Option<(u16, u16)>,
+    /// Absolute transcript row of `plain_rows[0]` / `sgr_rows[0]`: the painter hands over only
+    /// the rendered window, not the whole session.
+    pub rows_offset: usize,
 }
 
 /// After `terminal.draw()`, walk the visible transcript rows and overprint each detected link span
@@ -537,15 +540,18 @@ pub fn inject_hyperlinks<W: std::io::Write>(
         area,
         occluders,
         caret,
+        rows_offset,
     } = ctx;
-    let (start, visible, area) = (*start, *visible, *area);
+    let (start, visible, area, base) = (*start, *visible, *area, *rows_offset);
 
     // Scan a window that reaches past both edges of the viewport so a URL wrapped across the top or
     // bottom boundary is still joined into one link (`scan_window_with` needs the off-screen half).
-    let lo = start.saturating_sub(REJOIN_WINDOW);
+    // Window-relative: the rows handed over start at absolute row `base`.
+    let lo = start.saturating_sub(REJOIN_WINDOW).saturating_sub(base);
     let hi = start
         .saturating_add(visible)
         .saturating_add(REJOIN_WINDOW)
+        .saturating_sub(base)
         .min(plain_rows.len());
     // Mirror `draw_transcript`'s content budget: it reserves 2 cells for the scrollbar gutter.
     let content_width = area.width.saturating_sub(2).max(8) as usize;
@@ -554,7 +560,7 @@ pub fn inject_hyperlinks<W: std::io::Write>(
     let mut wrote = false;
     for link in &links {
         // Rows outside the viewport were only scanned for context — they have no screen position.
-        let Some(screen_row) = link.row.checked_sub(start) else {
+        let Some(screen_row) = (link.row + base).checked_sub(start) else {
             continue;
         };
         if screen_row >= visible {
@@ -926,6 +932,7 @@ mod tests {
                 area,
                 occluders: vec![Rect::new(0, 0, 80, 10)],
                 caret: None,
+                rows_offset: 0,
             },
         );
         assert!(
@@ -951,6 +958,7 @@ mod tests {
                 area,
                 occluders: Vec::new(),
                 caret: Some((7, 21)),
+                rows_offset: 0,
             },
         );
         let s = String::from_utf8_lossy(&out);
@@ -977,6 +985,7 @@ mod tests {
                 area,
                 occluders: Vec::new(),
                 caret: Some((7, 21)),
+                rows_offset: 0,
             },
         );
         assert!(out.is_empty(), "must not touch the cursor for nothing");

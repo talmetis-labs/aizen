@@ -1135,6 +1135,12 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
         "apply",
         role_row_value(roles.and_then(|r| r.apply.as_ref())),
     );
+    // Only the pinned Pantheon roles print — seven "not set" rows would bury the four above.
+    if let Some(map) = roles.and_then(|r| r.pantheon.as_ref()) {
+        for (name, rc) in map {
+            row(name.as_str(), role_row_value(Some(rc)));
+        }
+    }
     match cfg.agent_routes.as_deref().filter(|l| !l.is_empty()) {
         Some(routes) => row(
             "specialists",
@@ -1390,6 +1396,11 @@ fn line_bad(msg: &str) {
     tui::emit_line(&format!("  {} {}", style("✗").red(), style(msg).red()));
 }
 
+/// `  <msg>` dimmed — guidance for the prompt that follows, kept off the prompt line itself.
+pub(crate) fn line_dim(msg: &str) {
+    tui::emit_line(&format!("  {}", style(msg).dim()));
+}
+
 /// `  ! <msg>` in the warn colour — something to know, but not a stop.
 fn line_warn(msg: &str) {
     tui::emit_line(&format!(
@@ -1421,25 +1432,40 @@ async fn prompt_validated_base_url(
     allow_skip: bool,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
     let mut suggestion: Option<String> = current.map(str::to_string);
+    // The guidance rides on its own dim line, not in the prompt: a long prompt plus a long
+    // URL wraps the live input line, and dialoguer redraws a wrapped line badly (fragments
+    // of the old text survive beside the new one). The prompt itself stays two words, and a
+    // kept value is announced on its own line for the same reason (Enter still keeps it).
+    line_dim("base URL must include the version path, e.g. https://api.openai.com/v1");
     loop {
         let mut input = Input::<String>::with_theme(theme)
-            .with_prompt("Base URL (must include the version path, e.g. https://api.openai.com/v1)")
+            .with_prompt("Base URL")
             .allow_empty(allow_skip);
         if let Some(s) = suggestion.clone() {
-            input = input.default(s);
+            line_dim(&format!("Enter keeps {s}"));
+            input = input.default(s).show_default(false);
         }
         let raw = input.interact_text()?;
-        let base = raw.trim().trim_end_matches('/').to_string();
-        if base.is_empty() {
+        let typed = raw.trim().trim_end_matches('/').to_string();
+        if typed.is_empty() {
             if allow_skip {
                 return Ok(None);
             }
             line_bad("a base URL is required");
             continue;
         }
-        if !(base.starts_with("http://") || base.starts_with("https://")) {
-            line_bad("must start with http:// or https://");
-            suggestion = Some(format!("https://{base}"));
+        // `htps://`, a missing scheme, `https://https://` from a paste over a prefilled
+        // field: read what was meant instead of bouncing the question back.
+        let base = normalize_scheme(&typed);
+        if base != typed {
+            line_warn(&format!("read as {base}"));
+        }
+        if base
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.is_empty())
+        {
+            line_bad("must name a host, e.g. https://api.openai.com/v1");
+            suggestion = None;
             continue;
         }
 
@@ -1487,6 +1513,32 @@ async fn prompt_validated_base_url(
             return Ok(None);
         }
     }
+}
+
+/// Read the scheme the way it was meant: a mistyped one (`htps://`, `http:/`) becomes
+/// `https://` (or `http://` when that is what was typed), a missing one is added, and a doubled
+/// one — a URL pasted over a prefilled `https://` — collapses to the last. Everything after the
+/// last scheme-looking prefix is kept verbatim; `localhost:8080/v1` has no scheme (a port is
+/// not a scheme) and gets `https://` in front.
+pub(crate) fn normalize_scheme(typed: &str) -> String {
+    let mut rest = typed.trim();
+    let mut scheme = "https";
+    while let Some((word, after)) = rest.split_once(':') {
+        let scheme_word = word.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if !scheme_word || !after.starts_with('/') {
+            break;
+        }
+        scheme = if word.eq_ignore_ascii_case("http") {
+            "http"
+        } else {
+            "https"
+        };
+        rest = after.trim_start_matches('/');
+    }
+    format!("{scheme}://{}", rest.trim_end_matches('/'))
 }
 
 /// `Some(base + "/v1")` when `base` has no version-looking final segment, else `None`.
@@ -1560,6 +1612,7 @@ async fn prompt_validated_api_key(
         let entered = Input::<String>::with_theme(theme)
             .with_prompt(prompt)
             .allow_empty(true)
+            .report(false) // the key is visible while typed, never echoed into the scrollback
             .interact_text()?;
         let entered = entered.trim().to_string();
         let candidate = if entered.is_empty() {
@@ -1754,6 +1807,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         ];
         let pick = match Select::with_theme(&theme)
             .with_prompt("Config — pick a section (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2260,6 +2314,7 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Providers (Esc when done)")
+            .report(false)
             .items(&items)
             .default(items.len().saturating_sub(2))
             .interact_opt()?
@@ -2312,6 +2367,7 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
         let existing = &list[pick];
         let action = Select::with_theme(&theme)
             .with_prompt(format!("{} (Esc cancels)", existing.name))
+            .report(false)
             .items(&["use now", "edit endpoint + key + model", "rename", "remove"])
             .default(0)
             .interact_opt()?;
@@ -2551,6 +2607,7 @@ fn subagent_hint(cfg: &cli_config::CliConfig) -> String {
         usize::from(r.summarizer.is_some())
             + usize::from(r.oracle.is_some())
             + usize::from(r.apply.is_some())
+            + r.pantheon.as_ref().map_or(0, |m| m.len())
     });
     let mut s = model;
     if mapped > 0 {
@@ -2572,7 +2629,7 @@ const ROLE_ROWS: [(&str, &str, &str); 4] = [
     (
         "summarizer",
         "Summarizer",
-        "compaction + handoff summaries (a cheap-fast model fits)",
+        "compaction summaries (a cheap-fast model fits)",
     ),
     (
         "oracle",
@@ -2586,15 +2643,19 @@ const ROLE_ROWS: [(&str, &str, &str); 4] = [
     ),
 ];
 
-fn role_slot<'a>(
-    roles: &'a mut cli_config::RolesConfig,
+/// Store one role row. The four routable slots are fields; any other name is a Pantheon role
+/// and goes into the map under its canonical name (`None` unpins it).
+fn role_set(
+    roles: &mut cli_config::RolesConfig,
     role: &str,
-) -> &'a mut Option<cli_config::RoleModelConfig> {
+    value: Option<cli_config::RoleModelConfig>,
+) {
     match role {
-        "summarizer" => &mut roles.summarizer,
-        "oracle" => &mut roles.oracle,
-        "apply" => &mut roles.apply,
-        _ => &mut roles.subagent_default,
+        "summarizer" => roles.summarizer = value,
+        "oracle" => roles.oracle = value,
+        "apply" => roles.apply = value,
+        "subagent_default" => roles.subagent_default = value,
+        other => roles.set_pantheon(other, value),
     }
 }
 
@@ -2607,7 +2668,71 @@ fn role_get<'a>(
         "summarizer" => r.summarizer.as_ref(),
         "oracle" => r.oracle.as_ref(),
         "apply" => r.apply.as_ref(),
-        _ => r.subagent_default.as_ref(),
+        "subagent_default" => r.subagent_default.as_ref(),
+        other => r.pantheon_entry(other),
+    }
+}
+
+/// One menu row's value for a role: what is pinned, or what it inherits.
+fn role_row_summary(rc: Option<&cli_config::RoleModelConfig>, inherits: &str) -> String {
+    let Some(rc) = rc else {
+        return inherits.to_string();
+    };
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(p) = rc.provider.as_deref() {
+        bits.push(format!("provider {p}"));
+    }
+    if let Some(m) = rc.model.as_deref() {
+        bits.push(m.to_string());
+    }
+    if rc.base_url.is_some() {
+        bits.push("own url".into());
+    }
+    if rc.api_key_ref.is_some() {
+        bits.push("own key".into());
+    }
+    if bits.is_empty() {
+        "not set".into()
+    } else {
+        bits.join(" · ")
+    }
+}
+
+/// The seven built-in sub-agent roles, each pinnable to its own provider/model above the
+/// shared sub-agent default: a reviewer on a strong model, a searcher on a cheap one.
+async fn config_edit_pantheon(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    let roles = crate::agent::roles::ROLES;
+    let label = |p: &crate::agent::roles::RoleProfile| {
+        format!("{} ({})", p.name, p.aliases.first().copied().unwrap_or(""))
+    };
+    loop {
+        let mut items: Vec<String> = roles
+            .iter()
+            .map(|p| {
+                format!(
+                    "{:<22}· {}",
+                    label(p),
+                    role_row_summary(role_get(cfg, p.name), "sub-agent default")
+                )
+            })
+            .collect();
+        items.push("Back".to_string());
+        let pick = match Select::with_theme(&theme)
+            .with_prompt("Pantheon roles — each above the sub-agent default (Esc when done)")
+            .report(false)
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(i) if i < roles.len() => i,
+            _ => return Ok(()),
+        };
+        let p = &roles[pick];
+        // The brief's first clause says what the role does; the rest is its tool scope.
+        let what = p.brief.split(". ").next().unwrap_or(p.brief);
+        tui::emit_line(&format!("  {}", style(what).dim()));
+        config_edit_one_role(cfg, p.name, &label(p)).await?;
     }
 }
 
@@ -2623,31 +2748,20 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
         let mut items: Vec<String> = ROLE_ROWS
             .iter()
             .map(|(key, label, _)| {
-                let cur = role_get(cfg, key)
-                    .map(|rc| {
-                        let mut bits: Vec<String> = Vec::new();
-                        if let Some(p) = rc.provider.as_deref() {
-                            bits.push(format!("provider {p}"));
-                        }
-                        if let Some(m) = rc.model.as_deref() {
-                            bits.push(m.to_string());
-                        }
-                        if rc.base_url.is_some() {
-                            bits.push("own url".into());
-                        }
-                        if rc.api_key_ref.is_some() {
-                            bits.push("own key".into());
-                        }
-                        if bits.is_empty() {
-                            "not set".into()
-                        } else {
-                            bits.join(" · ")
-                        }
-                    })
-                    .unwrap_or_else(|| "main endpoint".to_string());
+                let cur = role_row_summary(role_get(cfg, key), "main endpoint");
                 format!("{label:<22}· {cur}")
             })
             .collect();
+        let pinned = cfg
+            .roles
+            .as_ref()
+            .and_then(|r| r.pantheon.as_ref())
+            .map_or(0, |m| m.len());
+        items.push(format!(
+            "{:<22}· {pinned} of {} pinned",
+            "Pantheon roles",
+            crate::agent::roles::ROLES.len()
+        ));
         items.push(format!(
             "{:<22}· {} advanced entr(ies)",
             "Advanced overrides",
@@ -2662,6 +2776,7 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
 
         let pick = match Select::with_theme(&theme)
             .with_prompt("Sub-agents & roles (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -2675,11 +2790,12 @@ async fn config_edit_subagents(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 tui::emit_line(&format!("  {}", style(what).dim()));
                 config_edit_one_role(cfg, key, label).await?;
             }
-            i if i == ROLE_ROWS.len() => {
+            i if i == ROLE_ROWS.len() => config_edit_pantheon(cfg).await?,
+            i if i == ROLE_ROWS.len() + 1 => {
                 line_warn("advanced model→endpoint overrides can supersede provider-based routing");
                 config_edit_model_registry(cfg).await?
             }
-            i if i == ROLE_ROWS.len() + 1 => config_edit_agent_pins(cfg).await?,
+            i if i == ROLE_ROWS.len() + 2 => config_edit_agent_pins(cfg).await?,
             _ => return Ok(()),
         }
     }
@@ -2701,18 +2817,24 @@ async fn prompt_probed_base_url(
     current: Option<&str>,
     inherit_label: &str,
 ) -> Result<Option<(String, Vec<client::ModelInfo>)>> {
+    line_dim(&format!("empty = {inherit_label} · `-` clears"));
     let mut input = Input::<String>::with_theme(theme)
-        .with_prompt(format!("Base URL (empty = {inherit_label}, `-` clears)"))
+        .with_prompt("Base URL")
         .allow_empty(true);
     if let Some(c) = current {
-        input = input.default(c.to_string());
+        line_dim(&format!("Enter keeps {c}"));
+        input = input.default(c.to_string()).show_default(false);
     }
     let raw = input.interact_text()?;
     let raw = raw.trim();
     if raw.is_empty() || raw == "-" {
         return Ok(None);
     }
-    let url = raw.trim_end_matches('/').to_string();
+    let typed = raw.trim_end_matches('/').to_string();
+    let url = normalize_scheme(&typed);
+    if url != typed {
+        line_warn(&format!("read as {url}"));
+    }
     let check = spin_while(
         &format!("checking {url}"),
         client::check_endpoint(http, &url, None),
@@ -2801,6 +2923,7 @@ fn prompt_api_key_ref(theme: &ColorfulTheme, current: Option<&str>) -> Result<Op
             let key: String = Input::with_theme(theme)
                 .with_prompt("API key")
                 .allow_empty(true)
+                .report(false)
                 .interact_text()?;
             let key = key.trim();
             Ok((!key.is_empty()).then(|| key.to_string()))
@@ -2905,12 +3028,15 @@ async fn config_edit_one_role(
         None
     };
     let mut roles = cfg.roles.take().unwrap_or_default();
-    let slot = role_slot(&mut roles, role);
-    *slot = (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
-        provider,
-        model,
-        ..Default::default()
-    });
+    role_set(
+        &mut roles,
+        role,
+        (provider.is_some() || model.is_some()).then_some(cli_config::RoleModelConfig {
+            provider,
+            model,
+            ..Default::default()
+        }),
+    );
     cfg.roles = roles.has_any().then_some(roles);
     Ok(())
 }
@@ -2944,6 +3070,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
         items.push("Back".to_string());
         let pick = match Select::with_theme(&theme)
             .with_prompt("Model → endpoint (Esc when done)")
+            .report(false)
             .items(&items)
             .default(items.len().saturating_sub(2))
             .interact_opt()?
@@ -2958,6 +3085,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
             let existing = &list[pick];
             let action = match Select::with_theme(&theme)
                 .with_prompt(format!("{} (Esc cancels)", existing.model))
+                .report(false)
                 .items(&["edit", "remove"])
                 .default(0)
                 .interact_opt()?
@@ -3045,6 +3173,7 @@ async fn config_edit_agent_pins(cfg: &mut cli_config::CliConfig) -> Result<()> {
             .collect();
         let Some(pick) = Select::with_theme(&theme)
             .with_prompt("Specialist agent (Esc when done)")
+            .report(false)
             .items(&items)
             .default(0)
             .interact_opt()?
@@ -3274,6 +3403,7 @@ where
         let entered = Input::<String>::with_theme(theme)
             .with_prompt(prompt)
             .allow_empty(true)
+            .report(false) // the key is visible while typed, never echoed into the scrollback
             .interact_text()?;
         let entered = entered.trim().to_string();
         if entered.is_empty() {
