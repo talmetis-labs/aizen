@@ -771,7 +771,11 @@ fn prompt_construction_never_embeds_credentials() {
     assert!(!map.contains(SECRET));
     assert!(!map.contains("api_key"));
 
-    // The whole assembled prompt, with a credential live in the environment.
+    // The whole assembled prompt, with a credential live in the environment. Under the shared
+    // env lock: any test resolving an endpoint meanwhile would pick this key up.
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let prior = std::env::var("AIZEN_API_KEY").ok();
     std::env::set_var("AIZEN_API_KEY", SECRET);
     let prompt = crate::agent::build_system_prompt("/w", "linux", "2026-08-17", "m", None);
@@ -788,6 +792,11 @@ fn tool_definitions_never_carry_credential_values() {
     // Descriptions and schemas are model-facing text baked at registration; a tool that interpolated
     // a resolved secret into either would ship it on every request.
     const SECRET: &str = "tvly-test-SHOULDNOTLEAK";
+    // Under the shared env lock: a test that resolves the search key while the fake one is set
+    // would read this value as a configured key.
+    let _g = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let prior = std::env::var("TAVILY_API_KEY").ok();
     std::env::set_var("TAVILY_API_KEY", SECRET);
     let json = serde_json::to_string(&coder_registry().defs()).unwrap();

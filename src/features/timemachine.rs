@@ -1630,7 +1630,17 @@ fn run_git_bounded(cmd: &mut Command, what: &str) -> Result<Output> {
 ///
 /// The caller configures stdio: `stdin` MUST be piped; stdout/stderr may be piped or null.
 fn run_git_piped_bounded(cmd: &mut Command, stdin_bytes: &[u8], what: &str) -> Result<Output> {
-    let timeout = git_op_timeout();
+    run_git_piped_bounded_within(cmd, stdin_bytes, what, git_op_timeout())
+}
+
+/// `run_git_piped_bounded` with the deadline passed in, so a test can shorten it for one child
+/// without setting `AIZEN_GIT_OP_TIMEOUT_SECS` for every git call in the process.
+fn run_git_piped_bounded_within(
+    cmd: &mut Command,
+    stdin_bytes: &[u8],
+    what: &str,
+    timeout: Duration,
+) -> Result<Output> {
     crate::core::proctree::prepare(cmd);
     let mut child = cmd
         .spawn()
@@ -4440,11 +4450,17 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        std::env::set_var("AIZEN_GIT_OP_TIMEOUT_SECS", "2");
+        // The deadline is passed in, not set through `AIZEN_GIT_OP_TIMEOUT_SECS`: that variable
+        // is process-wide, and a two-second cap would also cut short any git call another test
+        // is running at the same moment.
         let start = std::time::Instant::now();
-        let res = run_git_piped_bounded(&mut cmd, &payload, "stdin-hostile child");
+        let res = run_git_piped_bounded_within(
+            &mut cmd,
+            &payload,
+            "stdin-hostile child",
+            Duration::from_secs(2),
+        );
         let elapsed = start.elapsed();
-        std::env::remove_var("AIZEN_GIT_OP_TIMEOUT_SECS");
 
         assert!(
             res.is_err(),
