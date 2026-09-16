@@ -3162,11 +3162,15 @@ async fn execute_calls(
                         // (its body ran quiet — emit the standard trace here so the UX is uniform).
                         if let Some(h) = eager.remove(&k) {
                             adopted.insert(k);
-                            if !cfg.quiet {
+                            if !cfg.quiet || crate::ui::events::on() {
                                 if let (Some(tool), Ok(args)) =
                                     (registry.get(&calls[k].function.name), &parsed[k])
                                 {
-                                    adopted_seq.insert(k, emit_tool_call(tool.name(), args));
+                                    let dispatch = cfg.exec_ctx.dispatch_label();
+                                    adopted_seq.insert(
+                                        k,
+                                        emit_tool_call_as(tool.name(), args, dispatch.as_deref()),
+                                    );
                                 }
                             }
                             return (k, h);
@@ -3175,7 +3179,8 @@ async fn execute_calls(
                             .get_arc(&calls[k].function.name)
                             .expect("safe ⇒ known");
                         let args = parsed[k].clone().expect("safe ⇒ parsed");
-                        let quiet = cfg.quiet;
+                        // Quiet on the transcript, never on the JSON stream (see the serial arm).
+                        let quiet = cfg.quiet && !crate::ui::events::on();
                         let budgets = cfg.result_budgets();
                         let cancel = cfg.cancel.clone();
                         let exec_ctx = cfg.exec_ctx.clone();
@@ -3212,12 +3217,20 @@ async fn execute_calls(
                             )
                         }
                     };
-                    if adopted.contains(&k) && !cfg.quiet {
+                    if adopted.contains(&k) && (!cfg.quiet || crate::ui::events::on()) {
                         // Eager body ran quiet; close the line opened at adoption (matched by seq).
                         let seq = adopted_seq.get(&k).copied().unwrap_or(0);
                         if let Ok(args) = &parsed[k] {
                             // Eager-adopted parallel body: no per-call wall-clock to attribute here.
-                            emit_tool_result(seq, &calls[k].function.name, args, &out, None);
+                            let dispatch = cfg.exec_ctx.dispatch_label();
+                            emit_tool_result_as(
+                                seq,
+                                &calls[k].function.name,
+                                args,
+                                &out,
+                                None,
+                                dispatch.as_deref(),
+                            );
                         }
                     }
                     land(k, out, &mut results, sink);
@@ -3243,16 +3256,13 @@ async fn execute_calls(
             // BARRIER: gate + approve on this future, body un-raced in spawn_blocking.
             let name = calls[i].function.name.as_str();
             let out = match &parsed[i] {
-                Err(e) => note_unrun_call(name, &serde_json::Value::Null, e.clone(), cfg.quiet),
+                Err(e) => note_unrun_call(name, &serde_json::Value::Null, e.clone(), cfg),
                 Ok(args) => match registry.get_arc(name) {
-                    None => note_unrun_call(
-                        name,
-                        args,
-                        format!("error: unknown tool '{name}'"),
-                        cfg.quiet,
-                    ),
+                    None => {
+                        note_unrun_call(name, args, format!("error: unknown tool '{name}'"), cfg)
+                    }
                     Some(tool) => match gate_and_approve(tool.as_ref(), args, cfg) {
-                        Some(denied) => note_unrun_call(name, args, denied, cfg.quiet),
+                        Some(denied) => note_unrun_call(name, args, denied, cfg),
                         None => {
                             let effect = tool.workspace_effect(args);
                             // WHERE the write lands (a directory), when the tool names a path. The
@@ -3373,10 +3383,12 @@ async fn execute_calls(
                                 None
                             };
                             if let Some(error) = checkpoint_error {
-                                note_unrun_call(name, args, error, cfg.quiet)
+                                note_unrun_call(name, args, error, cfg)
                             } else {
                                 let args = args.clone();
-                                let quiet = cfg.quiet;
+                                // A child's body is quiet on the transcript and loud on the JSON
+                                // stream, where its calls are wanted and wear its label.
+                                let quiet = cfg.quiet && !crate::ui::events::on();
                                 let budgets = cfg.result_budgets();
                                 let cancel = cfg.cancel.clone();
                                 let exec_ctx = cfg.exec_ctx.clone();
@@ -4200,10 +4212,12 @@ fn emit_warning(kind: &str, plain: &str, styled: &str, quiet: bool) {
 /// `tool_call` / `tool_result` pair, or a front-end would show a model that asked for a tool and
 /// heard nothing back. The transcript needs nothing extra: the gate already said why. Returns
 /// `out` unchanged so it can wrap the expression that produced it.
-fn note_unrun_call(name: &str, args: &serde_json::Value, out: String, quiet: bool) -> String {
-    if crate::ui::events::on() && !quiet {
-        let seq = emit_tool_call(name, args);
-        emit_tool_result(seq, name, args, &out, None);
+fn note_unrun_call(name: &str, args: &serde_json::Value, out: String, cfg: &AgentConfig) -> String {
+    if crate::ui::events::on() {
+        // On the loop's thread, so the label is the config's, not the thread's.
+        let dispatch = cfg.exec_ctx.dispatch_label();
+        let seq = emit_tool_call_as(name, args, dispatch.as_deref());
+        emit_tool_result_as(seq, name, args, &out, None, dispatch.as_deref());
     }
     out
 }
@@ -4433,10 +4447,24 @@ fn workflow_target(args: &serde_json::Value) -> String {
 /// Open a tool-call line (mockup shape `⚙ <name>   <target>`), returning the `seq` so the result can
 /// update the same line in place under retained. Shared by the serial + eager-adoption paths.
 fn emit_tool_call(name: &str, args: &serde_json::Value) -> u64 {
+    emit_tool_call_as(name, args, dispatch_here().as_deref())
+}
+
+/// The delegated sub-agent whose call this thread is running — from the execution context the
+/// tool body was entered with (`exec_ctx::with_current`). `None` on the loop's own thread, which
+/// is why the sites that emit from there (an eager start adopted, a call that never ran) pass the
+/// label from their `cfg` instead of asking here.
+fn dispatch_here() -> Option<String> {
+    crate::core::exec_ctx::current().and_then(|c| c.dispatch_label())
+}
+
+/// [`emit_tool_call`] with the dispatch label given. Only the JSON stream carries it: the
+/// transcript never showed a child's calls, and still does not.
+fn emit_tool_call_as(name: &str, args: &serde_json::Value, dispatch: Option<&str>) -> u64 {
     if crate::ui::events::on() {
         let target = tool_target(name, args);
         let seq = crate::ui::tui::tool_call_begin(tool_icon(), name, &target);
-        crate::ui::events::tool_call(seq, name, args, &target);
+        crate::ui::events::tool_call(seq, name, args, &target, dispatch);
         return seq;
     }
     // Point the working caption (the typewriter line at the transcript bottom) at this tool's human
@@ -4465,6 +4493,18 @@ fn emit_tool_result(
     out: &str,
     elapsed_ms: Option<u64>,
 ) {
+    emit_tool_result_as(seq, name, args, out, elapsed_ms, dispatch_here().as_deref());
+}
+
+/// [`emit_tool_result`] with the dispatch label given (see [`emit_tool_call_as`]).
+fn emit_tool_result_as(
+    seq: u64,
+    name: &str,
+    args: &serde_json::Value,
+    out: &str,
+    elapsed_ms: Option<u64>,
+    dispatch: Option<&str>,
+) {
     let (ok, summary) = summarize_result(name, out);
     if crate::ui::events::on() {
         crate::ui::events::tool_result(
@@ -4475,6 +4515,7 @@ fn emit_tool_result(
             &summary,
             elapsed_ms,
             out,
+            dispatch,
         );
         return;
     }

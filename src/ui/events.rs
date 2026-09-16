@@ -139,12 +139,24 @@ pub fn warning(kind: &str, text: &str) {
     emit("warning", json!({ "kind": kind, "text": plain(text) }));
 }
 
-/// A tool call is starting. `seq` ties the later `tool_result` to this call.
-pub fn tool_call(seq: u64, name: &str, args: &Value, target: &str) {
+/// A tool call is starting. `seq` ties the later `tool_result` to this call; `dispatch` names
+/// the delegated sub-agent whose call it is, `null` for the loop's own. A child's calls share the
+/// stream with its parent's and with its siblings', interleaved — pair them by `seq`.
+pub fn tool_call(seq: u64, name: &str, args: &Value, target: &str, dispatch: Option<&str>) {
     emit(
         "tool_call",
-        json!({ "seq": seq, "name": name, "args": args, "target": target }),
+        tool_call_fields(seq, name, args, target, dispatch),
     );
+}
+
+pub(crate) fn tool_call_fields(
+    seq: u64,
+    name: &str,
+    args: &Value,
+    target: &str,
+    dispatch: Option<&str>,
+) -> Value {
+    json!({ "seq": seq, "name": name, "args": args, "target": target, "dispatch": dispatch })
 }
 
 /// A tool call finished. `digest` is the one-line summary the transcript shows; `output` is the
@@ -158,6 +170,7 @@ pub fn tool_result(
     digest: &str,
     elapsed_ms: Option<u64>,
     output: &str,
+    dispatch: Option<&str>,
 ) {
     let (out, truncated) = clip(output, OUTPUT_CAP);
     emit(
@@ -171,6 +184,7 @@ pub fn tool_result(
             "elapsed_ms": elapsed_ms,
             "output": out,
             "truncated": truncated,
+            "dispatch": dispatch,
         }),
     );
 }
@@ -375,6 +389,17 @@ mod tests {
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "text");
         assert_eq!(v["delta"], "a\nb");
+    }
+
+    /// A child's call says whose it is; the loop's own says so too, as an explicit `null`, so a
+    /// reader can tell "no label" from "a core too old to send one".
+    #[test]
+    fn a_tool_call_carries_its_dispatch_label_or_an_explicit_null() {
+        let own = tool_call_fields(1, "file_read", &json!({"path": "a"}), "a", None);
+        assert!(own.get("dispatch").is_some_and(Value::is_null));
+        let child = tool_call_fields(2, "file_read", &json!({}), "", Some("reviewer-1"));
+        assert_eq!(child["dispatch"], "reviewer-1");
+        assert_eq!(child["seq"], 2);
     }
 
     #[test]
