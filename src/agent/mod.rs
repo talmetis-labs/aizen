@@ -11143,10 +11143,11 @@ mod tests {
         // self-review (nudge mode) + incomplete todos both fire on the SAME "done" claim: the old
         // cascade spent one LLM round-trip PER gate; the merged flush carries both demands in ONE
         // combined user message, with each gate's budget/latch consumed exactly as before.
-        let _t = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Home before todo: the order every other test in the suite uses (home, tape, todo).
         let _h = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _t = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         todo::set(vec![todo::Todo::new("open-item", todo::Status::Pending)]);
         let r = registry();
         let c = AgentConfig {

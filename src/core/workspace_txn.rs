@@ -611,6 +611,11 @@ mod tests {
     /// nothing else was contending.
     #[test]
     fn a_nested_lease_in_one_process_is_granted_and_outlives_the_inner_handle() {
+        // The lock root lives under `aizen_home()`: hold the home lock so a test that points
+        // `AIZEN_HOME` at a temp dir and removes it cannot vanish the root mid-acquire.
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!(
             "aizen-lease-reentry-{}-{}",
             std::process::id(),
@@ -677,6 +682,9 @@ mod tests {
     /// This is the exclusion two `serve` lanes on one worktree never had.
     #[test]
     fn a_sibling_scope_waits_for_the_os_lock_while_a_descendant_reenters() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!(
             "aizen-lease-scope-{}-{}",
             std::process::id(),

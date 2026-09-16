@@ -856,6 +856,14 @@ mod tests {
             eprintln!("skipping: cargo not runnable from this test process");
             return;
         }
+        // The loop's first edit takes the workspace writer lease, whose lock root lives under
+        // `aizen_home()`; without the home lock a concurrent test that swaps `AIZEN_HOME` to a
+        // temp dir and removes it makes the edit fail, the fixture stays broken and the verify
+        // command exits 101 (seen on Windows CI). Lock order across the suite: home, tape, then
+        // the todo lock `run_task` takes itself.
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _tape_lock = crate::llm::replay::TAPE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
