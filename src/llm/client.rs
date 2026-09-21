@@ -869,6 +869,48 @@ fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
 /// statuses (429/5xx), honoring `Retry-After`; a permanent non-2xx (or exhausted retries) reads the
 /// body and returns the SAME `upstream returned HTTP {status}: {detail}` error the call sites used
 /// before this layer existed. A 2xx `Response` is returned untouched for the caller to parse/stream.
+/// Shape the gateway returns for /v1/* errors: {"error":{"message","type","code","correlation_id"}}.
+/// Prefer its message verbatim (pilot already differentiates expired/revoked/unpinned/malformed)
+/// and surface correlation_id so the operator can grep pilot+nginx logs with one id.
+fn format_gateway_error(status: u16, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            let code = err
+                .get("code")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            let cid = err
+                .get("correlation_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            if !msg.is_empty() {
+                if !cid.is_empty() && !code.is_empty() {
+                    return format!(
+                        "{msg} (code={code} correlation_id={cid} HTTP {status}) — raw: {body}"
+                    );
+                }
+                if !cid.is_empty() {
+                    return format!("{msg} (correlation_id={cid} HTTP {status}) — raw: {body}");
+                }
+                return format!("{msg} (HTTP {status}) — raw: {body}");
+            }
+        }
+    }
+    let t = body.trim();
+    if t.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {t}")
+    }
+}
+
 async fn send_with_retry<F>(build: F) -> Result<reqwest::Response>
 where
     F: Fn() -> reqwest::RequestBuilder,
@@ -925,7 +967,8 @@ where
                 let url = resp.url().clone();
                 let verdict = (status.as_u16() == 401)
                     .then(|| crate::llm::gateway::on_unauthorized(url.as_str()));
-                let detail = resp.text().await.unwrap_or_default();
+                let raw = resp.text().await.unwrap_or_default();
+                let detail = format_gateway_error(status.as_u16(), &raw);
                 match verdict {
                     // Ending the session here means the NEXT run stops at `resolve_endpoint` with
                     // the sentence that names the fix, instead of failing at the provider with a
@@ -944,6 +987,10 @@ where
                     // in and this call carried the session token. Tokens last 30 days, there is no
                     // refresh route, and a password change anywhere kills every one minted before
                     // it — so the fix is always the same command, and never a retry.
+                    //
+                    // Since pilot 401-p1 the gateway stamps a per-request correlation_id (x-request-id)
+                    // and returns a reasoned message (expired/revoked/unpinned/malformed). Show it
+                    // verbatim — it already says which aizen command fixes it.
                     Some(Unauthorized::SignInAgain) => bail!(
                         "the Aizen gateway rejected the account session (HTTP 401). A 401 here \
                          means the session is over — not a hiccup to retry. \
