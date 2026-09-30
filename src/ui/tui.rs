@@ -3241,6 +3241,22 @@ fn input_loop(
                     }
                     line = rest.trim().to_string();
                 }
+                // Plain Enter while a turn runs = STEER (the Kimi/Claude-Code behaviour): the
+                // message folds into the turn IN FLIGHT instead of waiting behind it. Queuing was the
+                // old default, but a user typing mid-turn almost always means "about what you're
+                // doing right now" — and when they do mean "next", the queued-behind turn still runs
+                // right after, so nothing is lost. A refused steer (mailbox full / oversized / the
+                // turn ended between keypress and push) falls through to the ordinary queue below, so
+                // the message is delivered either way, never swallowed. Slash commands and image
+                // messages keep their old path: a `/` is a command, and an image belongs to a fresh
+                // turn's vision context, not a mid-flight injection.
+                else if turn_in_flight()
+                    && images == 0
+                    && !trimmed.starts_with('/')
+                    && crate::core::steer::push(&trimmed)
+                {
+                    continue;
+                }
                 // A leading `/` is not enough to make a line a command — an XPath, a POSIX path, or
                 // prose that merely starts with a slash (`/help... abcd`) used to be swallowed here
                 // and answered with "unknown command" instead of reaching the model. `slash::classify`

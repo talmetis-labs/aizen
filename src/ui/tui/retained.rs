@@ -68,6 +68,11 @@ const BLOCK_LIMIT: usize = 2048;
 /// repaint fires (see `resize_settle` in the render loop). Long enough to sit out a ConPTY resize
 /// storm, short enough that the user never catches the screen dirty.
 const RESIZE_SETTLE: Duration = Duration::from_millis(400);
+/// Smallest gap between two stream-driven repaints. 33 fps is past the flicker-fusion threshold for
+/// text and matches what a terminal can absorb; slower looks steppy, faster just re-parses the same
+/// markdown for deltas nobody can read. Only stream/tool commands are capped — keystrokes, scroll,
+/// and menus draw on arrival (see `interactive_dirty`).
+const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(30);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Milliseconds since process start at which transcript output last landed (a block pushed,
@@ -788,6 +793,16 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     // leaks back through as ↑/↓ and the transcript stops scrolling. Re-emitting the mode setters is
     // idempotent and cheap; doing it on the true→false edge restores scroll without a per-frame cost.
     let mut was_working = false;
+    // P0 stream coalescing: the last moment a frame was actually drawn. Streaming deltas arrive per
+    // token (5–10/s, bursty), and each one re-parses the whole assistant block's markdown — drawing
+    // per command is the visible jitter. Capping stream-driven repaints at FRAME_MIN_INTERVAL makes
+    // the token flow paint at a steady ~33fps instead of following the burst. Interactive commands
+    // (typing, scroll, menus, overlays) bypass the cap via `interactive_dirty`: keystroke latency is
+    // a responsiveness contract and must never wait on a stream budget.
+    let mut last_draw = Instant::now() - Duration::from_millis(1000);
+    // True when this iteration applied at least one stream/tool command (capped) vs only interactive
+    // ones (drawn immediately).
+    let mut interactive_dirty = false;
     // Set by `Command::Redraw`: clear the terminal before the next draw so ratatui's cell diff starts
     // from a blank slate instead of its stale belief about the screen.
     let mut force_clear = false;
@@ -799,11 +814,17 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     // shredded the frame" report). One late full repaint reconciles screen and model.
     let mut resize_settle: Option<Instant> = None;
     loop {
-        let wait = if state.working && state.focused {
+        let mut wait = if state.working && state.focused {
             Duration::from_millis(110)
         } else {
             Duration::from_millis(250)
         };
+        // A capped stream frame is owed a paint the moment the budget reopens — wait exactly that
+        // long rather than a full tick, so coalesced output lands at ~33fps instead of being held
+        // to the 110ms animation tick. Anything arriving sooner interrupts the wait as usual.
+        if dirty && !interactive_dirty && !force_clear {
+            wait = wait.min(FRAME_MIN_INTERVAL.saturating_sub(last_draw.elapsed()));
+        }
         match rx.recv_timeout(wait) {
             Ok(Command::Shutdown(ack)) => {
                 shutdown_ack = Some(ack);
@@ -840,6 +861,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 dirty = true;
             }
             Ok(cmd) => {
+                if !is_stream_command(&cmd) {
+                    interactive_dirty = true;
+                }
                 apply_command(&mut state, cmd);
                 dirty = true;
             }
@@ -852,7 +876,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     if state.work_reveal < len {
                         state.work_reveal += 1;
                     }
-                    dirty = true;
+                    dirty = true; // animation tick — stream-capped, the spinner can wait 30ms
                 }
                 // Idle resize: the render below only runs when `dirty`, so a terminal resized while
                 // nothing is happening (no command) would otherwise never be repainted until the next
@@ -897,8 +921,12 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 Command::Redraw => {
                     force_clear = true;
                     dirty = true;
+                    interactive_dirty = true; // Ctrl-L is a user keystroke — never wait on the cap
                 }
                 other => {
+                    if !is_stream_command(&other) {
+                        interactive_dirty = true;
+                    }
                     apply_command(&mut state, other);
                     dirty = true;
                 }
@@ -928,7 +956,17 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
             force_clear = true;
             dirty = true;
         }
+        // P0: stream-driven work repaints at most once per FRAME_MIN_INTERVAL so a token burst paints
+        // at a steady cadence instead of per-command (each delta re-parses the streaming block's
+        // markdown — per-command drawing is the visible jitter). Interactive state (typing, scroll,
+        // menus, selection, Ctrl-L) always draws on arrival; `force_clear` implies an interactive
+        // recovery or a resize settle, both of which bypass the cap too. Skipped stream state is not
+        // lost: `dirty` stays set and the next tick (≤110ms) or the cap expiring paints it.
+        if dirty && !interactive_dirty && !force_clear && last_draw.elapsed() < FRAME_MIN_INTERVAL {
+            continue;
+        }
         if dirty {
+            last_draw = Instant::now();
             if let Some(s) = session.as_mut() {
                 let _ = s.terminal.autoresize();
                 let after = s.terminal.size().ok();
@@ -975,7 +1013,20 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     // Inject OSC 8 hyperlinks AFTER terminal.draw() — post-draw so ratatui's cell
                     // diff never sees the escape sequences and can't overwrite them next frame.
                     // Pattern is identical to the screensaver sixel blitter (`blit_screensaver`).
-                    {
+                    // Cheap presence gate first: most streamed frames carry no link at all, and the
+                    // scan ends in a filesystem probe per path candidate — running it per frame
+                    // during a burst is pure cost. `://` (URLs) or a path separator (file links)
+                    // are the only two shapes `scan_row_shapes` can match, so a row without either
+                    // contributes nothing and the whole pass is skipped.
+                    let link_hint = {
+                        let g = transcript_geom_slot()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        g.plain_rows
+                            .iter()
+                            .any(|r| r.contains("://") || r.contains('/') || r.contains('\\'))
+                    };
+                    if link_hint {
                         // Snapshot occluders + caret BEFORE taking the geometry lock, so all four
                         // pieces describe the frame that was just drawn.
                         let occluders = last_occluders();
@@ -1005,6 +1056,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 }
             }
             dirty = false;
+            interactive_dirty = false; // frame painted — the next iteration classifies fresh
         }
     }
     session.take();
@@ -1164,4 +1216,24 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         // Listed explicitly rather than via `_` so a new command can't silently become a no-op here.
         Command::Suspend(_) | Command::Resume { .. } | Command::Shutdown(_) | Command::Redraw => {}
     }
+}
+
+/// Is this command part of the model/tool output stream (safe to repaint at the capped rate) or an
+/// interactive edge that must paint on arrival (typing, scrolling, menus, selection, overlays)?
+/// The split is the responsiveness contract of the frame cap: a user action never waits behind the
+/// stream budget, and a token burst never out-draws the terminal.
+fn is_stream_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::AssistantDelta(_)
+            | Command::AssistantFinish { .. }
+            | Command::Tool(_)
+            | Command::Plan(_)
+            | Command::Diff(_)
+            | Command::Verify(_)
+            | Command::Emit(_)
+            | Command::WorkCaption(..)
+            | Command::SentTokens(_)
+            | Command::Tick
+    )
 }
