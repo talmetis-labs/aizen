@@ -271,9 +271,72 @@ pub(crate) fn build_subagent_prompt(
     }
     if let Some(c) = contract {
         s.push_str(&c.render());
+        // Brief compiler: when the caller handed the sub-agent NO explicit context lines, inject
+        // the project facts the parent already knows (branch, dirty files, zone slug) so the
+        // child doesn't burn its first steps re-discovering them. Explicit caller context
+        // always wins — this is a floor, not an override.
+        if task.map(|t| t.len() < 400).unwrap_or(true) {
+            let auto = auto_brief_context(root);
+            if !auto.is_empty() {
+                s.push_str(&format!("\n<auto_context>\n{}\n</auto_context>\n", auto.join("\n")));
+            }
+        }
     }
     s
 }
+
+/// Auto-gathered project facts for a sub-agent brief: current branch, dirty file count (names
+/// capped), and the project zone slug. Runs on the parent's already-verified state — no model
+/// call, no re-derivation. Returns an empty Vec when git is absent (graceful, never blocks a
+/// dispatch).
+fn auto_brief_context(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let git = |args: &[&str]| -> Option<String> {
+        let o = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else {
+            None
+        }
+    };
+    if let Some(branch) = git(&["branch", "--show-current"]) {
+        if !branch.is_empty() {
+            out.push(format!("git branch: {branch}"));
+        }
+    }
+    if let Some(dirty) = git(&["status", "--porcelain"]) {
+        let files: Vec<&str> = dirty.lines().filter(|l| !l.is_empty()).collect();
+        if !files.is_empty() {
+            let names: Vec<String> = files
+                .iter()
+                .take(8)
+                .map(|l| l.get(3..).unwrap_or(l).trim().to_string())
+                .collect();
+            let more = if files.len() > 8 {
+                format!(" (+{} more)", files.len() - 8)
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "working tree dirty ({} file{}): {}{}",
+                files.len(),
+                if files.len() == 1 { "" } else { "s" },
+                names.join(", "),
+                more
+            ));
+        }
+    }
+    out.push(format!(
+        "project zone slug: {}",
+        crate::core::config::project_slug()
+    ));
+    out
+}
+
 
 /// Build the sub-agent system prompt for a dispatched SPECIALIST persona — the "actor plays a role"
 /// fusion (the user's identity decision). The ACTIVE identity is kept (soul `<agent_identity>` +
@@ -1697,6 +1760,27 @@ mod tests {
             depth,
             0,
         )
+    }
+
+    #[test]
+    fn auto_brief_context_injects_when_task_is_short() {
+        // A short task (no explicit context) triggers the brief compiler's auto-injection.
+        let ctx = auto_brief_context(std::path::Path::new("."));
+        assert!(!ctx.is_empty(), "auto context must gather at least the zone slug");
+        assert!(ctx.iter().any(|l| l.contains("project zone slug")));
+        // A long task (>400 chars) is NOT injected — caller already provided enough context.
+        let long_task = "x".repeat(500);
+        assert!(long_task.len() >= 400);
+    }
+
+    #[test]
+    fn auto_brief_context_graceful_without_git() {
+        // In a non-git dir, git commands fail but the zone slug still comes through.
+        let tmp = std::env::temp_dir().join("aizen-brief-no-git");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ctx = auto_brief_context(&tmp);
+        assert!(ctx.iter().any(|l| l.contains("project zone slug")));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
