@@ -2655,6 +2655,41 @@ impl FileEdit {
         Ok(out)
     }
 }
+/// Nhóm 1.2: negative-memory trigger. When the agent is about to edit `path`, recall any
+/// `bug-history` or `failed-attempt` facts that mention this file (or its dir) so a known dead
+/// end is surfaced BEFORE the edit, not after the same mistake is re-made. Returns None when
+/// nothing relevant is stored or the query finds nothing — silent no-op, never blocks an edit.
+fn recall_negative_for_path(path: &str) -> Option<String> {
+    use crate::memory::category::Category;
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    let mut hits = Vec::new();
+    for cat in [Category::BugHistory, Category::FailedAttempt] {
+        if let Ok(mut h) = crate::memory::search_filtered_scoped_cat(
+            name,
+            3,
+            None,
+            Some(cat),
+            &crate::memory::ScopeSel::Current,
+        ) {
+            hits.append(&mut h);
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(3);
+    let mut s = String::from("\n<negative-memory>\n");
+    for h in hits {
+        s.push_str(&format!("- {}: {}\n", h.entry.name, h.entry.body.replace('\n', " ")));
+    }
+    s.push_str("</negative-memory>\n");
+    Some(s)
+}
+
 impl Tool for FileEdit {
     fn name(&self) -> &str {
         "file_edit"
@@ -2735,19 +2770,23 @@ impl Tool for FileEdit {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let path = str_arg(args, "path")?;
-        // An `edits` array selects the batch form; otherwise it's a single old_string/new_string
-        // replacement. Batch wins if both are somehow present (a caller that filled `edits` meant it).
-        match args.get("edits").and_then(|v| v.as_array()) {
+        // Nhóm 1.2: negative-memory trigger — before touching a file, surface any bug-history /
+        // failed-attempt facts that mention this path so the agent doesn't re-walk a dead end.
+        // Silent no-op when nothing matches or memory is off; one extra memory query per edit,
+        // cheap vs. the cost of a repeated mistake.
+        let neg = recall_negative_for_path(&path);
+        let mut result = match args.get("edits").and_then(|v| v.as_array()) {
             Some(edits) => self.apply_edits(&path, edits, dry_run_arg(args)),
-            // Name BOTH forms when neither is present. `str_arg` alone would say only "missing
-            // new_string", which reads as "this tool cannot batch" — the one wrong lesson to teach a
-            // model that merely reached for the batch form and mis-spelled the key.
             None if args.get("new_string").is_none() => bail!(
                 "file_edit needs either `new_string` (single edit, with `old_string`) or a non-empty \
                  `edits` array (batch of {{old_string, new_string}} applied atomically to {path})"
             ),
             None => self.apply_single(&path, args),
+        }?;
+        if let Some(block) = neg {
+            result.push_str(&block);
         }
+        Ok(result)
     }
 }
 

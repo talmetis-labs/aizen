@@ -442,15 +442,47 @@ pub fn strip_recall_prefix(content: &str) -> &str {
 /// monotone in the budget: `self_block` continues past an oversized line, which is right there (it
 /// is choosing what to say about a persona) but wrong here, because the handles are positional —
 /// skipping `[m2]` and still emitting `[m3]` would hand the model a numbering with a hole in it.
+/// Nhóm 1.1: intent-aware recall boost. Lightweight lexical mapping from query intent to the
+/// memory category that serves that phase. Returns an empty Vec when the intent is ambiguous —
+/// the default ranking then applies unchanged.
+fn boosted_categories_for(query: &str) -> Vec<crate::memory::category::Category> {
+    use crate::memory::category::Category;
+    let q = query.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| q.contains(w));
+    if has(&["fix", "bug", "error", "fail", "crash", "broken", "lỗi", "hỏng"]) {
+        vec![Category::BugHistory, Category::FailedAttempt]
+    } else if has(&["refactor", "redesign", "restructure", "clean up", "tái cấu trúc"]) {
+        vec![Category::ArchDecision, Category::Codebase]
+    } else if has(&["how does", "how to", "what is", "explain", "tại sao", "như thế nào"]) {
+        vec![Category::Codebase, Category::SuccessPattern]
+    } else if has(&["deploy", "ship", "release", "publish", "triển khai", "phát hành"]) {
+        vec![Category::DeployNote, Category::SecurityRule]
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn recall_block(query: &str, budget_tokens: usize) -> Option<(String, Vec<pending::Pending>)> {
     if query.trim().is_empty() {
         return None;
     }
-    // The working view: only facts true HERE (see `ScopeSel::admits`). Read-only — this is not the
-    // agent's `memory_search` tool, so it must NOT record reuse: the fact was offered, not used.
-    // Phase 3's `used` report is what earns a confirmation.
+    // Nhóm 1.1: intent-aware recall — when the query smells like a bug-fix or a refactor, boost the
+    // category that matters for that phase. "fix the crash in parser.rs" wants bug-history; "how
+    // does auth flow work" wants architecture. This is a lightweight lexical hint, not a full phase
+    // tracker — the query itself is the cheapest signal we have.
+    let boosted = boosted_categories_for(query);
     let (hits, idx) =
         search_scoped_with_index(query, RECALL_CANDIDATES, &ScopeSel::default_view()).ok()?;
+    let hits = if boosted.is_empty() {
+        hits
+    } else {
+        // Re-rank: boosted categories float to the top, keeping relative score order within each.
+        let (mut yes, mut no): (Vec<_>, Vec<_>) = hits
+            .into_iter()
+            .partition(|h| boosted.contains(&h.entry.category));
+        yes.extend(no);
+        yes
+    };
     if hits.is_empty() {
         return None;
     }

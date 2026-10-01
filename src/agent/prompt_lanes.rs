@@ -297,7 +297,11 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     // once per user message. Counting inside the agent loop would count iterations, and metric 1's
     // denominator ("live facts per turn") has to mean turns the user drove.
     memory::stats::note_turn();
-    let mut out = fold_retrieval_into_query(query);
+    // Nhóm 1.3: augment the query with file-type signals from any paths the user mentioned, so a
+    // skill whose trigger says "rust" fires when the user says "fix parser.rs". The query itself
+    // is NOT modified for the transcript — only the string we hand to the skill/memory ranker.
+    let augmented = augment_query_with_file_types(query);
+    let mut out = fold_retrieval_into_query(&augmented);
     // A pure question — nothing to change — skips the gated-skills and memory-recall blocks: the
     // standing facts already ride the frozen core, and a how-to procedure is for doing, not for
     // answering. The turn then costs one request against the cached prefix. Session working
@@ -310,7 +314,7 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     // budget on the ones that don't. Folded ABOVE the code but BELOW the facts, matching the
     // "standing truth → how-to → source" reading order.
     if !question {
-        if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
+        if let Some(block) = skills::turn_block(&augmented, skills::SKILL_TURN_BUDGET_TOKENS) {
             out = format!("{block}\n\n{out}");
         }
     }
@@ -322,9 +326,47 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
         out = format!("{block}\n\n{out}");
     }
     if !question {
-        if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
+        if let Some((block, pairs)) = memory::recall_block(&augmented, MEMORY_RECALL_BUDGET_TOKENS) {
             memory::pending::open_turn(pairs);
             out = format!("{block}\n\n{out}");
+        }
+    }
+    out
+}
+
+/// Nhóm 1.3: file-type augmentation. When the user mentions a path (e.g. "fix parser.rs"), append
+/// the language name ("rust") so skill triggers that name a language match. The transcript keeps
+/// the user's real words; only the ranking query sees the augmentation.
+fn augment_query_with_file_types(query: &str) -> String {
+    let mut out = query.to_string();
+    // Map file extensions to the language name a skill trigger would use.
+    const MAP: &[(&str, &str)] = &[
+        (".rs", "rust"),
+        (".py", "python"),
+        (".js", "javascript"),
+        (".ts", "typescript"),
+        (".go", "golang"),
+        (".java", "java"),
+        (".cpp", "cpp"),
+        (".c", "c"),
+        (".toml", "toml"),
+        (".md", "markdown"),
+        (".yaml", "yaml"),
+        (".yml", "yaml"),
+        (".json", "json"),
+        (".html", "html"),
+        (".css", "css"),
+        (".sql", "sql"),
+        (".sh", "bash"),
+        (".ps1", "powershell"),
+        (".docx", "docx"),
+        (".xlsx", "excel"),
+        (".pdf", "pdf"),
+    ];
+    let q_lower = query.to_lowercase();
+    for (ext, lang) in MAP {
+        if q_lower.contains(ext) {
+            out.push_str(&format!(" {lang}"));
         }
     }
     out
