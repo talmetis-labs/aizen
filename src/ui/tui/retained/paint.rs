@@ -532,10 +532,12 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
             );
             let thumb_text = Text::from(
                 (0..thumb_height_u16)
-                    .map(|_| Line::from(Span::styled(
-                        "█",
-                        Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)),
-                    )))
+                    .map(|_| {
+                        Line::from(Span::styled(
+                            "█",
+                            Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)),
+                        ))
+                    })
                     .collect::<Vec<_>>(),
             );
             frame.render_widget(Paragraph::new(thumb_text), scrollbar_area);

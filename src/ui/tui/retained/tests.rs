@@ -1454,11 +1454,10 @@ fn generic_blocks_render_folded_rows_through_the_cache() {
         "the Generic path folds long rows: {:?}",
         rows.sgr
     );
-    assert!(
-        rows.sgr
-            .iter()
-            .all(|r| console::measure_text_width(r) <= 32)
-    );
+    assert!(rows
+        .sgr
+        .iter()
+        .all(|r| console::measure_text_width(r) <= 32));
 }
 
 fn sample_diff() -> DiffPayload {

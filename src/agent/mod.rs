@@ -4471,7 +4471,6 @@ fn count_diff(out: &str) -> (usize, usize) {
     (add, del)
 }
 
-
 /// Parse a `@@ -N[,c] +M[,c] @@` unified hunk header into `(N, M)`.
 fn parse_hunk_header(l: &str) -> Option<(usize, usize)> {
     let rest = l.strip_prefix("@@ -")?;
@@ -6956,7 +6955,6 @@ mod tests {
             "two '+' lines, one '-'; '…' and ' ' ignored"
         );
     }
-
 
     // ── test tools ──────────────────────────────────────────────────────────
     struct EchoTool;

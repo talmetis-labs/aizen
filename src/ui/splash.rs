@@ -911,7 +911,10 @@ mod tests {
             .iter()
             .position(|l| l.contains("▄▀▀▄"))
             .expect("wordmark row");
-        assert!(top < word && word < bottom, "wordmark must sit inside the frame");
+        assert!(
+            top < word && word < bottom,
+            "wordmark must sit inside the frame"
+        );
         let sun_last = sun.iter().map(|&(i, _)| i).max().unwrap();
         assert!(sun_last < word, "wordmark sits below the sun");
         let wind = plain[word].chars().position(|c| c == '▄').unwrap();
@@ -921,7 +924,10 @@ mod tests {
             .iter()
             .position(|l| l.contains("ARTIFICIAL INTELLIGENCE AGENT"))
             .expect("tagline row");
-        assert!(top < tag && tag < bottom, "tagline must sit inside the frame");
+        assert!(
+            top < tag && tag < bottom,
+            "tagline must sit inside the frame"
+        );
         let tind = plain[tag].chars().position(|c| c == 'A').unwrap();
         assert!(tind > INNER, "tagline must sit on the right flank: {tind}");
     }
