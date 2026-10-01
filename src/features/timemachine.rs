@@ -566,7 +566,17 @@ impl RepoContext {
     }
 
     fn current() -> Result<Self> {
-        Self::discover(&std::env::current_dir().context("resolving cwd")?)
+        // Prefer the session's workspace root (where the edit will land) over the harness's cwd,
+        // which may be the user's home directory. Without this, a pre-edit checkpoint spawned from
+        // `C:\Users\admin` probes git there, gets "not a git repository", and blocks the edit.
+        //
+        // The harness sets `AIZEN_WORKSPACE_ROOT` when it knows the target project. Fall back to
+        // cwd, then to walking up from cwd looking for `.git` (handles nested non-repo dirs).
+        if let Ok(root) = std::env::var("AIZEN_WORKSPACE_ROOT") {
+            return Self::discover(Path::new(&root));
+        }
+        let cwd = std::env::current_dir().context("resolving cwd")?;
+        Self::discover(&cwd)
     }
 
     fn ledger_path(&self) -> PathBuf {
@@ -4497,6 +4507,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("creating scratch dir");
         dir
+    }
+
+    /// When the harness sets `AIZEN_WORKSPACE_ROOT`, `RepoContext::current()` must use it instead
+    /// of the process cwd — the fix for pre-edit checkpoints failing when the harness runs from
+    /// the user's home directory instead of the project root.
+    #[test]
+    fn repo_context_current_prefers_aizen_workspace_root_env() {
+        if !git_available() {
+            eprintln!("skipping: no usable git on this machine");
+            return;
+        }
+        let tmp = scratch("repo-context-env");
+        let repo = tmp.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_cmd()
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .arg("--initial-branch=main")
+            .output()
+            .expect("git init failed");
+        git_cmd()
+            .arg("-C")
+            .arg(&repo)
+            .arg("commit")
+            .arg("--allow-empty")
+            .arg("-m")
+            .arg("init")
+            .output()
+            .expect("git commit failed");
+
+        // Set the env var and verify current() picks it up.
+        std::env::set_var("AIZEN_WORKSPACE_ROOT", &repo);
+        let ctx = RepoContext::current().unwrap();
+        std::env::remove_var("AIZEN_WORKSPACE_ROOT");
+        assert_eq!(ctx.root, repo.canonicalize().unwrap());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// Run git against `git_dir`, returning trimmed stdout. Panics with git's own stderr so a broken
