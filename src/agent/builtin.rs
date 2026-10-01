@@ -2570,6 +2570,20 @@ impl FileEdit {
         if edits.is_empty() {
             bail!("file_edit `edits` must be a non-empty array (or omit it and pass new_string for a single edit)");
         }
+        // Nhóm 3.1: pre-mortem nudge. A batch of ≥3 edits to one file is where most partial-failure
+        // risk lives (one edit's old_string can be consumed by an earlier edit's new_string). Surface
+        // the risk BEFORE writing, not after a confusing mid-batch failure.
+        if edits.len() >= 3 {
+            let preview: Vec<String> = edits.iter().enumerate().map(|(i, e)| {
+                let old = e.get("old_string").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("  #{} old: {:.60}{}", i + 1, old, if old.len() > 60 { "…" } else { "" })
+            }).collect();
+            crate::agent::emit_trace(&format!(
+                "⚠ batch edit ({} hunks) — risk: one hunk's replacement may consume another's anchor.\n  If this fails mid-batch, consider splitting into smaller groups or using file_write.\n{}",
+                edits.len(),
+                preview.join("\n")
+            ));
+        }
         let target = confine(&self.root, path, true)?;
         let (original_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
         let original = String::from_utf8(original_bytes.context("file disappeared while reading")?)

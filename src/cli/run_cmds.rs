@@ -772,6 +772,11 @@ fn save_finished_session(history: &[Message], model: &str) -> Option<String> {
             } else {
                 eprintln!("\n[saved as “{slug}” — {path}]");
             }
+            // Nhóm 5: session-end distill nudge. The per-turn secretary already extracts facts;
+            // this is a session-level reminder to review what was learned. The actual LLM call
+            // belongs in postturn (which has the async context + chore timeout) — here we just
+            // surface the reminder so it isn't silently skipped.
+            eprintln!("\n[session ended — run `aizen memory reconcile` to review what this session learned]");
             Some(slug)
         }
         // Not fatal: the work is done and the answer is already printed. Saying so is the whole

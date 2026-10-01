@@ -1125,6 +1125,7 @@ where
     let mut writer_lease: Option<crate::core::workspace_txn::WorkspaceWriterLease> = None;
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
     let mut self_review_done = false;
+    let mut oracle_called = false; // once per episode: stuck-trigger oracle fires at most once
     let mut context_warned = false;
     // P-ctx1: the last budget band we surfaced to the model (see `budget_band`). Injected only on a
     // band change so the running budget `system` nudge stays cache-stable within a band. Reset when
@@ -2799,12 +2800,41 @@ where
             stall.mark_nudged();
             push_nudge_as(
                 messages,
-                 cfg.nudge_role,
+                cfg.nudge_role,
                 NUDGE_STUCK,
                 "Recent turns added no new evidence (no new result, failure class, completed todo, \
                  or successful edit). STOP retrying variations. Re-read the exact state, take a \
                  genuinely different approach, or explain what is blocking you.",
             );
+            // Nhóm 2: stuck-trigger oracle — after the stall nudge fires, ask the oracle (the
+            // stronger model wired into self-review) for a second opinion. The oracle sees the
+            // last few turns and suggests a genuinely different angle. Runs once per episode
+            // (oracle_called latch), never blocks the loop, degrades to nothing when no oracle
+            // endpoint is configured.
+            if let Some(o) = &oracle {
+                if !oracle_called {
+                    oracle_called = true;
+                    let recent: Vec<String> = messages.iter().rev().take(6)
+                        .filter_map(|m| m.content.clone())
+                        .collect();
+                    let oracle_msgs = vec![
+                        Message::system("You are the oracle. The main agent is stuck. Read the recent turns and suggest ONE genuinely different approach — name the file, the command, or the search query. Be concrete."),
+                        Message::user(format!(
+                            "Stuck for {} flat turns. Recent context:\n{}",
+                            stall.flat,
+                            recent.join("\n---\n")
+                        )),
+                    ];
+                    if let Ok(answer) = o(oracle_msgs).await {
+                        push_nudge_as(
+                            messages,
+                            cfg.nudge_role,
+                            "[oracle]",
+                            &format!("Second opinion from the oracle:\n{answer}"),
+                        );
+                    }
+                }
+            }
         }
 
         // P0.2 / P0.3: after tools run, sample process-global todos for confidence spikes and
