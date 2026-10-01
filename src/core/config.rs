@@ -347,6 +347,17 @@ pub(crate) fn slug_for_key(name: &str, key: &str) -> String {
     format!("{}-{:08x}", slug_fragment(name), fnv1a64(key) as u32)
 }
 
+/// The project slug for an ARBITRARY root — the same `dirname-hex8` formula `identity()` uses,
+/// but computed for a path that is not necessarily the current project. Used by zone rebind to
+/// know which slug a new root WOULD produce without having to `set_current_dir` there.
+pub fn project_slug_for_root(root: &Path) -> String {
+    let name = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    slug_for_key(name, &workspace_key(root))
+}
+
 /// Hash key for a workspace root: its canonicalized path in ONE normalized spelling — verbatim
 /// `\\?\` prefix stripped, `\` → `/`, drive letter lowercased, no trailing slash — mirroring
 /// `workspace_txn::normalized_path` so the two identity systems agree on "same directory".

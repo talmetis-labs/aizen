@@ -260,6 +260,7 @@ async fn main() -> Result<()> {
         Commands::Sandbox { cmd } => crate::cli::sandbox_cmd::run_sandbox(cmd),
         Commands::Import { path } => run_import(path).await,
         Commands::Zone { cmd } => run_zone(cmd),
+        Commands::State { cmd } => run_state(cmd),
         Commands::Cron { cmd } => cron::handle(cmd).await,
         Commands::Mcp { cmd } => match cmd {
             McpCmd::List => {
@@ -650,12 +651,10 @@ async fn run_menu_sticky() -> Result<()> {
 
     // Text-only splash: the retained alt-screen renderer sanitizes CSI and would pass a raw sixel DCS
     // image through as garbage, so the intro is a Braille sun → pure printable text.
-    let intro = format!(
-        "{}\n{}",
-        splash::render_text_only(),
-        style("Type to talk — messages queue while it works · Esc cancels a running turn · /help · /quit")
-            .dim()
-    );
+    // The intro is JUST the splash — no status line, no identity banner, no recovery hints.
+    // Those used to ride the intro and cluttered the landing screen. They are now deferred to
+    // after the first user message (or suppressed entirely if the user starts typing immediately).
+    let intro = splash::render_text_only();
     // The retained backend is the only interactive surface. If it can't take the terminal (alt-screen
     // refused), there is no second renderer to degrade into — hand off to the plain line-REPL rather
     // than run this loop headless, which would queue keystrokes against a UI that never painted.
@@ -665,14 +664,8 @@ async fn run_menu_sticky() -> Result<()> {
     tui::set_ultimate(cli_config::ultimate_enabled()); // open the input box in the right colour (gold if ultimate)
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
     warm_up_after_first_frame();
-    {
-        let (main, notes) = identity_banner();
-        tui::emit_line(&style(main).dim().to_string());
-        for n in notes {
-            tui::emit_line(&style(n).color256(theme::WARN).to_string());
-        }
-        startup_update_probe();
-    }
+    // Defer the identity banner, coop peers, and recovery hints to after the first user message.
+    // The splash alone is the landing screen; extra lines clutter it.
     crate::core::recovery::begin(repo_scope.clone(), current_session_slug());
     // Housekeeping for everything the previous runs could not clean up after themselves: lease
     // directories from abrupt shutdowns (the clean-exit path never ran) and staging files from a
@@ -689,28 +682,34 @@ async fn run_menu_sticky() -> Result<()> {
     // one that eventually reviews and commits) can see it exists, what it is doing, and which files
     // it has changed. Best-effort: a registry failure never blocks the REPL.
     coop::begin(current_session_slug());
+    // Deferred startup info: shown only after the first user message, not on the landing screen.
+    let mut deferred_startup_info: Vec<String> = Vec::new();
+    {
+        let (main, notes) = identity_banner();
+        deferred_startup_info.push(style(main).dim().to_string());
+        for n in notes {
+            deferred_startup_info.push(style(n).color256(theme::WARN).to_string());
+        }
+    }
     if let Some(line) = coop::peers_banner() {
-        tui::emit_line(&style(line).dim().to_string());
+        deferred_startup_info.push(style(line).dim().to_string());
     }
     if let Some(offer) = crate::core::recovery::scan_stale(&repo_scope)
         .into_iter()
         .next()
     {
-        tui::emit_line(
-            &style(format!("⟳ {}", crate::core::recovery::format_offer(&offer)))
+        deferred_startup_info.push(
+            style(format!("⟳ {}", crate::core::recovery::format_offer(&offer)))
                 .dim()
                 .to_string(),
         );
-        tui::emit_line(
-            &style("  /recover restore · /recover discard")
+        deferred_startup_info.push(
+            style("  /recover restore · /recover discard")
                 .dim()
                 .to_string(),
         );
     } else if let Some(hint) = resume_hint() {
-        // Suppressed when a crash-recovery offer is showing: two competing restore prompts in a
-        // row is worse than one, and `/recover` (which carries an unsent draft + checkpoint id)
-        // wins.
-        tui::emit_line(&style(hint).dim().to_string());
+        deferred_startup_info.push(style(hint).dim().to_string());
     }
     // Background model health poller: colours the idle `● ready` chip green/yellow/red from a real
     // GET /models probe every 60s (plus once immediately). Independent of the chat HTTP client so a
@@ -836,6 +835,13 @@ async fn run_menu_sticky() -> Result<()> {
                     style("❯").color256(splash::ACCENT).bold(),
                     style(&echo).color256(splash::ACCENT)
                 ));
+                // On the FIRST user message, emit the deferred startup info (identity banner, coop
+                // peers, recovery hints) so the landing screen stays clean. After that it's empty.
+                if !deferred_startup_info.is_empty() {
+                    for line in deferred_startup_info.drain(..) {
+                        tui::emit_line(&line);
+                    }
+                }
                 let (base_url, api_key, model) = match resolve_endpoint(None, None, None) {
                     Ok(t) => t,
                     Err(e) => {

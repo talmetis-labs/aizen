@@ -1368,6 +1368,21 @@ where
                                 } else {
                                     emit_trace(&line);
                                 }
+                                // Amp-style handoff nudge: after a compaction, the conversation
+                                // has already paid the summary cost — a fresh session seeded from
+                                // that summary starts with a cleaner attention span than this
+                                // increasingly-spliced one. Say so once per compaction; the user
+                                // decides (no auto-fork: sessions are user-visible state).
+                                let hand = "💡 context was just compacted — for a long task, \
+                                            `session_recall` + a fresh session keeps the summary \
+                                            without the accumulated splice history";
+                                if crate::ui::tui::active() {
+                                    crate::ui::tui::emit_line(
+                                        &crate::ui::theme::faint(hand).to_string(),
+                                    );
+                                } else {
+                                    emit_trace(hand);
+                                }
                             }
                             true
                         }

@@ -1523,9 +1523,17 @@ pub fn commit_staged(plan: &CommitPlan, message: &str, staged: &Staged) -> Resul
     if staged_names.trim().is_empty() {
         bail!("nothing is staged — run the plan again");
     }
+    // The commit carries an Aizen-Session trailer so `git log` leads from a change back to the
+    // conversation that produced it — the same traceability Amp gets from its Amp-Thread-ID
+    // trailer. The slug is the saved-session name; a CLI one-shot without a session simply gets
+    // no trailer.
+    let message_with_trailer = match crate::core::session_store::current_session_slug() {
+        Some(slug) => format!("{message}\n\nAizen-Session: {slug}"),
+        None => message.to_string(),
+    };
     let out = git_ok(
         &plan.root,
-        &["commit".into(), "-m".into(), message.to_string()],
+        &["commit".into(), "-m".into(), message_with_trailer],
     )?;
     if let Some(repo_id) = current_repo_id() {
         let sid = plan.session_id.clone();

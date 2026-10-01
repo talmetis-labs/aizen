@@ -118,6 +118,9 @@ tower-layer = "0.3"
 # has no C toolchain, and the single-static-binary posture must hold). flate2 + miniz_oxide are
 # ALREADY in the dependency tree (verified vs Cargo.lock 2026-07-05) → zero marginal binary cost.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust tar archive reader/writer for `aizen state export|import` (portable memory bundles).
+# No C deps, no compression of its own — pairs with flate2 when we want .tar.gz.
+tar = { version = "0.4", default-features = false }
 
 [features]
 # Enable the model2vec semantic embedder. Build: `cargo build --features dense`.

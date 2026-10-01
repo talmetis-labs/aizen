@@ -6,6 +6,7 @@
 
 use crate::features::cron;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 // No explicit `name` — clap uses the package name ("aizen") for `--version` and the actual argv[0]
@@ -199,6 +200,12 @@ pub(crate) enum Commands {
     Zone {
         #[command(subcommand)]
         cmd: ZoneCmd,
+    },
+    /// Portable state: export / import memory, personas and skills so Aizen follows its owner
+    /// across machines.
+    State {
+        #[command(subcommand)]
+        cmd: StateCmd,
     },
     /// Schedule agent tasks via the OS scheduler (no daemon): add / list / remove.
     Cron {
@@ -1775,5 +1782,47 @@ pub(crate) enum ZoneCmd {
         /// Execute the merge (without this flag: report only).
         #[arg(long)]
         apply: bool,
+    },
+    /// Retarget an ORPHANED zone (slug = hash of an absolute path that no longer exists, e.g.
+    /// after moving to a new machine or renaming the checkout) onto a NEW project root.
+    /// Dry-run by default; `--apply` rewrites every entry's `scope` (and attributable `anchor`)
+    /// to the new root's slug and renames the per-zone directories. Nothing is overwritten —
+    /// a directory clash is reported and both are kept.
+    Rebind {
+        /// The old zone slug to rebind (e.g. `aizen-5296147b`).
+        slug: String,
+        /// The new project root whose slug the zone should adopt.
+        #[arg(long)]
+        to: PathBuf,
+        /// Execute the rebind (without this flag: report only).
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum StateCmd {
+    /// Export portable state (memory, personas, skills) to a single archive file.
+    Export {
+        /// Output file path. Default: aizen-state-<date>.tar in the current dir.
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Include the skill archive (`.archive/`) too.
+        #[arg(long)]
+        with_archive: bool,
+    },
+    /// Import a portable-state archive, merging by id (existing entries are never overwritten;
+    /// conflicting imports are archived). Optionally rebind project zones to new paths.
+    Import {
+        /// Path to the archive file.
+        file: PathBuf,
+        /// Rebind a project zone: old-slug=new-root-path. Repeatable.
+        #[arg(long)]
+        rebind: Vec<String>,
+    },
+    /// List what's inside a portable-state archive without importing.
+    Inspect {
+        /// Path to the archive file.
+        file: PathBuf,
     },
 }

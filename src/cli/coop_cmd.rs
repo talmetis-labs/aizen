@@ -48,6 +48,53 @@ pub(crate) fn run_zone(cmd: ZoneCmd) -> Result<()> {
             }
             Ok(())
         }
+        ZoneCmd::Rebind { slug, to, apply } => {
+            let rep = if apply {
+                crate::features::rebind::apply(&slug, &to)?
+            } else {
+                crate::features::rebind::plan(&slug, &to)?
+            };
+            for line in rep.lines() {
+                println!("{line}");
+            }
+            if !apply {
+                println!("\ndry-run — nothing was changed. Re-run with `aizen zone rebind {slug} --to {} --apply` to execute.", to.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `aizen state …` — portable memory/persona/skill export, import and inspect.
+pub(crate) fn run_state(cmd: StateCmd) -> Result<()> {
+    match cmd {
+        StateCmd::Export { to, with_archive } => {
+            let out = crate::features::state::export(to.as_deref(), with_archive)?;
+            println!("exported: {}", out.display());
+            Ok(())
+        }
+        StateCmd::Import { file, rebind } => {
+            let rebinds: Vec<(String, std::path::PathBuf)> = rebind
+                .iter()
+                .map(|s| {
+                    let (old, new) = s.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("--rebind expects old-slug=new-root, got {s:?}")
+                    })?;
+                    Ok((old.trim().to_string(), std::path::PathBuf::from(new.trim())))
+                })
+                .collect::<Result<_, anyhow::Error>>()?;
+            let rep = crate::features::state::import(&file, &rebinds)?;
+            for line in rep.lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        StateCmd::Inspect { file } => {
+            for line in crate::features::state::inspect(&file)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
