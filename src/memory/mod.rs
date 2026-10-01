@@ -477,7 +477,7 @@ pub fn recall_block(query: &str, budget_tokens: usize) -> Option<(String, Vec<pe
         hits
     } else {
         // Re-rank: boosted categories float to the top, keeping relative score order within each.
-        let (mut yes, mut no): (Vec<_>, Vec<_>) = hits
+        let (mut yes, no): (Vec<_>, Vec<_>) = hits
             .into_iter()
             .partition(|h| boosted.contains(&h.entry.category));
         yes.extend(no);
