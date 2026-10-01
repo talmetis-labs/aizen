@@ -349,7 +349,9 @@ fn custom_verify_timeout(cwd: &Path) -> Option<u64> {
 }
 
 /// The verify budget the REPL and `/init` run under when no loop config names one.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 90;
+/// 180s covers cold compile of a large Rust workspace on Windows (linking dominates);
+/// warm runs finish in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
 /// How a timed-out command reports itself (the ladder reads it back to tell a slow suite from a
 /// broken one).

@@ -7,10 +7,35 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-10-01
+
+Quality-of-life fixes: the time machine survives a wrong cwd, the verify gate stops timing out
+on cold compiles, the diff box no longer repeats the file path, and the UI gets a steady-streaming
+rework with universal glyphs.
+
 ### Fixed
-- **The splash header no longer runs through the frame.** `Aizen vX · model · endpoint` is
-  elided to the panel's width — the endpoint first, then the model — instead of pushing the right
-  border out when a gateway URL or a model id is long.
+- **Time machine no longer dies when the harness cwd is not the repo.** `RepoContext::current()`
+  now prefers the `AIZEN_WORKSPACE_ROOT` env var over the process cwd before falling back to
+  `git rev-parse` discovery — the pre-edit checkpoint "os error 267" is gone when aizen is
+  spawned from a parent directory or a task runner.
+- **Verify gate timeout raised to 180 s.** Cold `cargo build --tests` on a large Tauri or Rust
+  workspace no longer gets killed at 90 s; the custom `.aizen/verify.json` warm-up command
+  (compile first, test second) keeps the gate green without burning CI time on cached runs.
+- **Diff-box header drops the redundant path.** The tool row immediately above already names
+  the file being edited — the header now reads `diff  +A −D` instead of `diff · <path>  +A −D`.
+- **Edit digest drops the absolute path.** `edited · +A −D` instead of `edited /abs/path · +A −D`
+  in the tool-use digest line.
+
+### Changed
+- **Steady streaming frames.** The retained TUI re-renders at a fixed cadence instead of
+  racing the token stream — no more flicker or scroll jumps when the model types faster than
+  the terminal draws.
+- **Universal geometric glyphs in the splash panel.** Tool-group icons switch from Nerd Font
+  PUA codepoints to glyphs any font renders (◉ ✦ ▤ ❯ ◎ ☰ ◐ ⇄), so the panel looks correct on
+  stock Windows Terminal, macOS Terminal.app, and Linux console fonts.
+- **`.cargo/config.toml` with rust-lld for the MSVC target.** Incremental test-compile link
+  time drops from ~53 s to ~2 s on Windows when the default toolchain is
+  `stable-x86_64-pc-windows-msvc`.
 
 ## [0.6.8] — 2026-09-16
 

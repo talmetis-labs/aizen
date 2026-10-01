@@ -24,8 +24,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     // The composer GROWS DOWNWARD with the draft instead of scrolling one row sideways, so the
     // footer's height is decided here — before the split — from the wrapped draft. `input_layout` is
     // pure over `AppState`, so the same call that sizes the box is the one handed to `draw_footer`
-    // to paint it: the two cannot disagree by a row.
-    let layout = input_layout(state, main.width as usize, max_input_rows(main.height));
+    // to paint it: the two cannot disagree by a row. During a streamed answer the composer usually
+    // sits unchanged for hundreds of frames, so the layout rides a one-slot cache keyed on a
+    // fingerprint of everything it reads (see `cached_input_layout`).
+    let mut layout_cache = state.input_layout_cache.take();
+    let layout = cached_input_layout(
+        &mut layout_cache,
+        state,
+        main.width as usize,
+        max_input_rows(main.height),
+    );
+    state.input_layout_cache = layout_cache;
     state.input_row_scroll = layout.scroll; // sticky across frames — see `AppState::input_row_scroll`
     let footer_rows = FOOTER_CHROME_ROWS.saturating_add(layout.rows.len() as u16);
     let chunks = Layout::default()
@@ -41,11 +50,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     // because only the draw pass knows what was actually painted — the post-draw hyperlink injector
     // writes at absolute coordinates and would otherwise print over them.
     let mut occluders: Vec<Rect> = Vec::new();
-    if let Some(overlay) = state.input.overlay.clone() {
+    if let Some(overlay) = state.input.overlay.as_ref() {
         // draw_overlay clamps the requested scroll against the overlay's own visible height and
         // returns the value actually used, so a stored offset past the end snaps back next frame.
         // It also publishes the menu hit-test geometry (selectable overlays only).
-        let (scroll, rect) = draw_overlay(frame, area, &overlay, state.overlay_scroll);
+        let (scroll, rect) = draw_overlay(frame, area, overlay, state.overlay_scroll);
         state.overlay_scroll = scroll;
         occluders.push(rect);
     } else {
@@ -404,9 +413,10 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Leave 1 cell on the right for the scrollbar track when content overflows — content already
-    // reserves `width-2` so the thumb never paints over text.
-    let content_width = area.width.saturating_sub(2).max(8);
+    // Content spans the full width; the scrollbar thumb (when shown) overlays the rightmost column
+    // rather than reserving a permanent gutter. This keeps the transcript edge-to-edge when there's
+    // nothing to scroll or when the user is at the tail, and the thumb only appears during scrollback.
+    let content_width = area.width.saturating_sub(1).max(8);
     // 1. Heights only: the prefix sums place the viewport without rendering a single row.
     let mut heights: Vec<usize> = Vec::with_capacity(state.blocks.len());
     let mut blocks_total = 0usize;
@@ -454,11 +464,14 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
                 Payload::Tool(t) => Some(t.seq),
                 _ => None,
             };
-            for row in state.cache.get_or_render(block, content_width) {
-                plain_rows.push(console::strip_ansi_codes(&row).into_owned());
-                sgr_rows.push(row.clone());
+            // A cache hit shares the block's rendered rows (Rc bump) — the per-row copies below are
+            // only for the rows actually on screen, not the whole block.
+            let rendered = state.cache.get_or_render(block, content_width);
+            for i in 0..rendered.plain.len() {
+                plain_rows.push(rendered.plain[i].clone());
+                sgr_rows.push(rendered.sgr[i].clone());
                 row_tool_seq.push(seq);
-                lines.push(styled_row(block.kind, row));
+                lines.push(rendered.lines[i].clone());
             }
         }
         cursor = end;
@@ -491,19 +504,44 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
         ));
     frame.render_widget(paragraph, area);
 
-    // Dim vertical scrollbar when content overflows the viewport. Style is quiet (FAINT track,
-    // MUTED thumb) so it doesn't compete with the transcript. Positioned on the right edge of
-    // `area` — content_width already left a 2-cell gutter so text is never covered.
-    if total > visible {
-        let mut sb_state = ScrollbarState::new(total.saturating_sub(visible)).position(start);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("│"))
-            .thumb_symbol("█")
-            .style(Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)))
-            .track_style(Style::default().fg(Color::Indexed(crate::ui::theme::FAINT)));
-        frame.render_stateful_widget(scrollbar, area, &mut sb_state);
+    // Minimal scrollbar: no full-height track, just a small thumb that appears when content overflows.
+    // The thumb is a short `█` bar, its height proportional to visible/total (min 1 cell), positioned
+    // to reflect the viewport's place in the transcript. Cleaner than a persistent track because the
+    // gutter stays empty when there's nothing to scroll, and the eye isn't drawn to a static line.
+    //
+    // Auto-hide: when at the live tail (`start == tail_start`) the thumb is suppressed entirely, so
+    // streaming output doesn't carry a scrollbar artifact on its right edge.
+    let tail_start = total.saturating_sub(visible);
+    if total > visible && start < tail_start {
+        let track_height = area.height as usize;
+        if track_height > 0 {
+            let thumb_height = ((visible * track_height) / total).max(1).min(track_height);
+            let max_offset = total.saturating_sub(visible);
+            let thumb_pos = if max_offset > 0 {
+                (start * (track_height - thumb_height)) / max_offset
+            } else {
+                0
+            };
+            let thumb_top = area.y + thumb_pos as u16;
+            let thumb_height_u16 = thumb_height as u16;
+            let scrollbar_area = Rect::new(
+                area.x + area.width.saturating_sub(1),
+                thumb_top,
+                1,
+                thumb_height_u16,
+            );
+            let thumb_text = Text::from(
+                (0..thumb_height_u16)
+                    .map(|_| {
+                        Line::from(Span::styled(
+                            "█",
+                            Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            frame.render_widget(Paragraph::new(thumb_text), scrollbar_area);
+        }
     }
 
     // Floating "jump to bottom" button — only while scrolled up off the tail (`start` below the
@@ -514,7 +552,7 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     let jump_button = if total > visible && start < tail_start {
         const LABEL: &str = " ↓ bottom ";
         let label_w = console::measure_text_width(LABEL) as u16;
-        // Keep the button inside the content gutter (1 cell reserved on the right for the scrollbar).
+        // Keep the button inside the content area (scrollbar overlays the right edge now).
         if area.width > label_w + 1 && area.height >= 1 {
             let bx = area.x + area.width - 1 - label_w;
             let by = area.y + area.height - 1;
@@ -619,21 +657,63 @@ fn reverse_line_cols(line: &mut Line<'static>, start_col: usize, end_col: usize)
     line.spans = new_spans;
 }
 
-fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
-    match kind {
-        // Intro is sanitised plain (no SGR) → one flat dim line, as before.
-        BlockKind::Intro => Line::styled(row, Style::default().fg(Color::DarkGray)),
-        // Assistant + Generic carry SGR now: parse it into coloured spans over a grey base. The
-        // moonlight `▌` gutter keeps its own colour because it rode through as SGR; uncoloured text
-        // collapses to one grey span (unchanged look). The structured kinds (Tool/Plan/Diff/Verify)
-        // also emit their palette as SGR from their render fns, so they take the same span path.
-        BlockKind::Assistant
-        | BlockKind::Generic
-        | BlockKind::Tool
-        | BlockKind::Plan
-        | BlockKind::Diff
-        | BlockKind::Verify => Line::from(ansi_spans(&row, Style::default().fg(Color::Gray))),
+/// One-slot cache for the composer's layout: the fingerprint of the inputs it was computed from,
+/// plus the layout itself (shared by `Rc` so a hit costs a refcount bump, not a re-wrap).
+///
+/// During a streamed answer the composer usually sits unchanged for hundreds of frames while frames
+/// paint at ~33fps, and `input_layout` re-wrapped the whole draft — a `measure_text_width` per
+/// non-ASCII char plus a String per row — on every one of them. `draw` takes this out of
+/// [`AppState`] for the duration of the call (so the state borrow stays shared), and the
+/// fingerprint covers everything `input_layout` reads; a collision would paint one stale frame,
+/// not corrupt state.
+pub(super) struct InputLayoutCache {
+    key: u64,
+    layout: std::rc::Rc<InputLayout>,
+}
+
+pub(super) fn cached_input_layout(
+    cache: &mut Option<InputLayoutCache>,
+    state: &AppState,
+    width: usize,
+    max_rows: usize,
+) -> std::rc::Rc<InputLayout> {
+    let key = layout_fingerprint(state, width, max_rows);
+    if let Some(c) = cache {
+        if c.key == key {
+            return c.layout.clone();
+        }
     }
+    let layout = std::rc::Rc::new(input_layout(state, width, max_rows));
+    *cache = Some(InputLayoutCache {
+        key,
+        layout: layout.clone(),
+    });
+    layout
+}
+
+/// FNV-1a over everything [`input_layout`] reads: the draft chars, caret, attachments, the
+/// placeholder's inputs (queued count, working flag, pending steers, overlay presence), the sticky
+/// window offset, and the box geometry. `input_row_scroll` is written back from the layout each
+/// draw, so a clamped offset costs exactly one recompute before the key settles.
+fn layout_fingerprint(state: &AppState, width: usize, max_rows: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for &c in &state.input.draft {
+        mix(c as u64);
+    }
+    mix(state.input.cursor as u64);
+    mix(state.input.images as u64);
+    mix(state.input.queued_count as u64);
+    mix(state.input.overlay.is_some() as u64);
+    mix(state.input_row_scroll as u64);
+    mix(state.working as u64);
+    mix(crate::core::steer::pending() as u64);
+    mix(width as u64);
+    mix(max_rows as u64);
+    h
 }
 
 /// The brand-bloom spinner: the ✦ mark opening out through stars of growing radius and closing back.

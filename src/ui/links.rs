@@ -553,8 +553,10 @@ pub fn inject_hyperlinks<W: std::io::Write>(
         .saturating_add(REJOIN_WINDOW)
         .saturating_sub(base)
         .min(plain_rows.len());
-    // Mirror `draw_transcript`'s content budget: it reserves 2 cells for the scrollbar gutter.
-    let content_width = area.width.saturating_sub(2).max(8) as usize;
+    // Mirror `draw_transcript`'s content budget exactly: the scrollbar overlays the rightmost
+    // column, so content gets `width - 1`. A wider assumption here would join/split wrapped URLs
+    // one cell off from how the painter wrapped them.
+    let content_width = area.width.saturating_sub(1).max(8) as usize;
     let links = scan_window_with(plain_rows, lo, hi, content_width, &resolve_path);
 
     let mut wrote = false;

@@ -93,13 +93,14 @@ pub(super) fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
     // ONE renderer for both surfaces. The live turn (streaming) and the replayed transcript
     // (`agent::replay_transcript` → `MarkdownStream`) must produce byte-identical output, or the same
     // message looks different when re-opened than when first shown. So feed the whole raw block through
-    // `MarkdownStream` here too — the block is cached by `content_hash`, so re-parsing the full body on
-    // each width/content change is the same trip `replay_transcript` makes, with none of the
-    // incremental-splice risk an in-place streaming parser would carry.
+    // `MarkdownStream` here too — the block is cached by revision (and throttled by the stream slot
+    // while it is still growing), so re-parsing the full body on each width/revision change is the
+    // same trip `replay_transcript` makes, with none of the incremental-splice risk an in-place
+    // streaming parser would carry.
     //
     // Keep SGR: the renderer emits the moonlight gutter, code-box borders, and syntax highlight as
     // colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves) and `ansi_spans`
-    // turns them into styled spans at draw time.
+    // turns them into styled spans once, when the block's rows are rendered into the cache.
     let mut md = crate::ui::markdown::MarkdownStream::new(true, width.max(24));
     let mut rendered = md.push(&format!("{raw}\n"));
     rendered.push_str(&md.finish());
@@ -340,7 +341,8 @@ fn diff_cell(cell: Option<&DiffCell>, numw: usize, w: usize) -> String {
 /// GitHub review look — old on the left, new on the right, real file line numbers in the gutters,
 /// removed rows on a deep-red tint and added rows on a deep-green one, context quiet between
 /// them. Narrow, the same rows stack as a single unified column. The header keeps the
-/// `diff · <path>  +A −D` shape with the counts in their semantic colours.
+/// `diff  +A −D` shape with the counts in their semantic colours; the path is intentionally
+/// omitted because the tool row immediately above already names it.
 pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     use crate::ui::theme;
     // The box takes the full width it is handed (the transcript pane): a wide terminal buys the
@@ -357,10 +359,7 @@ pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     // With the row budgeted at `inner + 2` like every other row, that leaves label+counts+fill =
     // inner − 6. This subtracted 5, painting every header one column wider than the box — the old
     // 100-column clamp kept the overhang inside the pane, so nobody saw it.
-    let label = clip_to(
-        &format!("diff · {}", d.path),
-        inner.saturating_sub(6 + counts_w).max(8),
-    );
+    let label = "diff".to_string();
     let fill = inner.saturating_sub(6 + console::measure_text_width(&label) + counts_w);
     out.push(format!(
         "{}{}  {} {}{}",
