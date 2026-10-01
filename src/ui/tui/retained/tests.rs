@@ -323,24 +323,187 @@ fn ansi_spans_reads_256_colour() {
 }
 
 #[test]
-fn assistant_cache_is_width_and_content_keyed() {
+fn assistant_cache_is_width_and_revision_keyed() {
     let mut cache = RenderCache::default();
     let mut block = UiBlock {
         id: 7,
         kind: BlockKind::Assistant,
         payload: Payload::Text("hello world".into()),
-        complete: false,
+        complete: true,
+        rev: 0,
     };
     let a = cache.get_or_render(&block, 40);
     let b = cache.get_or_render(&block, 40);
-    assert_eq!(a, b);
+    assert!(
+        std::rc::Rc::ptr_eq(&a, &b),
+        "a second read of the same revision is the cached rows"
+    );
     assert_eq!(cache.hits, 1);
+    // The cache keys on the block's revision, not a payload hash: a mutation must bump `rev` —
+    // every mutation site in `AppState` does — or it would paint stale rows.
     if let Payload::Text(s) = &mut block.payload {
         s.push('!');
     }
-    let _ = cache.get_or_render(&block, 40);
+    block.rev += 1;
+    let c = cache.get_or_render(&block, 40);
+    assert!(!std::rc::Rc::ptr_eq(&a, &c), "a bumped revision re-renders");
     let _ = cache.get_or_render(&block, 20);
     assert_eq!(cache.misses, 3);
+}
+
+#[test]
+fn a_streaming_block_reuses_its_last_render_inside_the_interval() {
+    let mut cache = RenderCache::default();
+    let mut block = UiBlock {
+        id: 7,
+        kind: BlockKind::Assistant,
+        payload: Payload::Text("hello".into()),
+        complete: false,
+        rev: 0,
+    };
+    let a = cache.get_or_render(&block, 40);
+    assert_eq!(cache.misses, 1);
+    // A delta bumps the revision (a new cache key), but inside the adaptive interval the stream
+    // slot's rows are reused instead of re-parsing the block's markdown.
+    if let Payload::Text(s) = &mut block.payload {
+        s.push_str(" world");
+    }
+    block.rev += 1;
+    let b = cache.get_or_render(&block, 40);
+    assert!(
+        std::rc::Rc::ptr_eq(&a, &b),
+        "throttled: the previous render is reused"
+    );
+    assert_eq!(cache.misses, 1, "no re-render inside the interval");
+    // The completion flip bypasses the slot: the final state always renders, immediately.
+    block.complete = true;
+    block.rev += 1;
+    let c = cache.get_or_render(&block, 40);
+    assert!(
+        !std::rc::Rc::ptr_eq(&a, &c),
+        "the final render is not throttled"
+    );
+    assert_eq!(cache.misses, 2);
+    assert!(
+        c.plain.iter().any(|r| r.contains("hello world")),
+        "the final render carries the whole text: {:?}",
+        c.plain
+    );
+}
+
+#[test]
+fn payload_mutations_bump_the_revision_so_the_cache_cannot_go_stale() {
+    let mut state = AppState::new("intro", "status");
+    apply_command(&mut state, Command::AssistantDelta("a".into()));
+    let id = state.active_assistant.expect("a delta opens the block");
+    let rev = |state: &AppState| state.blocks.iter().find(|b| b.id == id).unwrap().rev;
+    let r0 = rev(&state);
+    apply_command(&mut state, Command::AssistantDelta("b".into()));
+    assert!(rev(&state) > r0, "a streamed delta bumps the revision");
+
+    apply_command(
+        &mut state,
+        Command::Plan(vec![PlanRow {
+            status: 0,
+            text: "x".into(),
+        }]),
+    );
+    let p0 = state
+        .blocks
+        .iter()
+        .find(|b| b.kind == BlockKind::Plan)
+        .unwrap()
+        .rev;
+    apply_command(
+        &mut state,
+        Command::Plan(vec![PlanRow {
+            status: 1,
+            text: "x".into(),
+        }]),
+    );
+    let p1 = state
+        .blocks
+        .iter()
+        .find(|b| b.kind == BlockKind::Plan)
+        .unwrap()
+        .rev;
+    assert!(p1 > p0, "a plan refresh bumps the revision");
+
+    let ev = |state_flag: ToolState| ToolEvent {
+        seq: 3,
+        icon: "⚙".into(),
+        name: "file_read".into(),
+        target: "x.rs".into(),
+        digest: String::new(),
+        state: state_flag,
+        elapsed_ms: None,
+        body: String::new(),
+    };
+    apply_command(&mut state, Command::Tool(ev(ToolState::Running)));
+    let t0 = state
+        .blocks
+        .iter()
+        .find(|b| b.kind == BlockKind::Tool)
+        .unwrap()
+        .rev;
+    apply_command(&mut state, Command::Tool(ev(ToolState::Ok)));
+    let t1 = state
+        .blocks
+        .iter()
+        .find(|b| b.kind == BlockKind::Tool)
+        .unwrap()
+        .rev;
+    assert!(t1 > t0, "a tool result bumps the revision");
+}
+
+#[test]
+fn scroll_and_selection_ride_the_frame_cap_but_typing_does_not() {
+    // Coalesced: the output stream AND high-rate view changes — wheel scroll, scrollbar drags,
+    // mouse selection. Their intermediate states are superseded by the next event, so painting
+    // each one is pure jitter.
+    for cmd in [
+        Command::AssistantDelta("x".into()),
+        Command::Scroll(3),
+        Command::Scroll(-1),
+        Command::ScrollTo(0),
+        Command::ScrollEnd,
+        Command::ClearSelection,
+        Command::SetSelection(SelectionRange::default()),
+    ] {
+        assert!(is_coalesced_command(&cmd));
+    }
+    // Interactive edges still paint on arrival: keystroke latency is the responsiveness contract.
+    for cmd in [
+        Command::Input(InputSnapshot::default()),
+        Command::Focus(true),
+    ] {
+        assert!(!is_coalesced_command(&cmd));
+    }
+}
+
+#[test]
+fn the_composer_layout_is_cached_until_an_input_it_reads_moves() {
+    let mut state = input_state("hello", 5, 0);
+    let mut cache = None;
+    let a = cached_input_layout(&mut cache, &state, 40, 10);
+    let b = cached_input_layout(&mut cache, &state, 40, 10);
+    assert!(
+        std::rc::Rc::ptr_eq(&a, &b),
+        "unchanged input ⇒ the cached layout"
+    );
+    state.input.draft.push('!');
+    let c = cached_input_layout(&mut cache, &state, 40, 10);
+    assert!(!std::rc::Rc::ptr_eq(&a, &c), "a keystroke re-lays out");
+
+    // The sticky window offset is one of the layout's inputs: scrolling the draft re-lays out too.
+    let many = "x\n".repeat(10);
+    let mut state = input_state(&many, 13, 4); // caret on wrapped row 6, window at 4
+    let mut cache = None;
+    let d = cached_input_layout(&mut cache, &state, 40, 5);
+    assert_eq!(d.scroll, 4);
+    state.input_row_scroll = 2;
+    let e = cached_input_layout(&mut cache, &state, 40, 5);
+    assert_eq!(e.scroll, 2, "a draft-window scroll re-lays out");
 }
 
 #[test]
@@ -686,6 +849,7 @@ fn the_row_cache_is_an_lru_not_a_flush() {
         kind: BlockKind::Generic,
         payload: Payload::Text(format!("row {id}")),
         complete: true,
+        rev: 0,
     };
     let hot = block(0);
     for id in 1..(CACHE_LIMIT as u64 + 64) {
@@ -1282,10 +1446,19 @@ fn generic_blocks_render_folded_rows_through_the_cache() {
             "[dense] loaded model2vec-potion-multilingual-128M (dim 256) — auto-detected".into(),
         ),
         complete: true,
+        rev: 0,
     };
     let rows = cache.get_or_render(&block, 32);
-    assert!(rows.len() > 1, "the Generic path folds long rows: {rows:?}");
-    assert!(rows.iter().all(|r| console::measure_text_width(r) <= 32));
+    assert!(
+        rows.sgr.len() > 1,
+        "the Generic path folds long rows: {:?}",
+        rows.sgr
+    );
+    assert!(
+        rows.sgr
+            .iter()
+            .all(|r| console::measure_text_width(r) <= 32)
+    );
 }
 
 fn sample_diff() -> DiffPayload {
@@ -1313,8 +1486,8 @@ fn diff_box_narrow_stacks_unified_with_line_numbers() {
         .map(|s| plain(s))
         .collect();
     assert!(
-        out[0].contains("diff · src/auth.rs"),
-        "header names the path: {:?}",
+        !out[0].contains("src/auth.rs"),
+        "header drops the path (the tool row above already names it): {:?}",
         out[0]
     );
     assert!(

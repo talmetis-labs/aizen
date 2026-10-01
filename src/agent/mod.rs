@@ -817,7 +817,7 @@ impl Default for AgentConfig {
             workspace_root: None,
             quiet: false,
             enable_verify_gate: true,
-            verify_gate_timeout_secs: 90,
+            verify_gate_timeout_secs: 180,
             auto_checkpoint: true,
             checkpoint_each_edit: true,
             context_window: 0,
@@ -4471,15 +4471,6 @@ fn count_diff(out: &str) -> (usize, usize) {
     (add, del)
 }
 
-/// `edited src/foo.rs (2 replacement(s))` → `edited src/foo.rs`; `created src/foo.rs` → `created src/foo.rs`.
-fn edit_target(head: &str) -> String {
-    let mut it = head.split_whitespace();
-    match (it.next(), it.next()) {
-        (Some("created"), Some(path)) => format!("created {path}"),
-        (Some(_), Some(path)) => format!("edited {path}"),
-        _ => "edited".to_string(),
-    }
-}
 
 /// Parse a `@@ -N[,c] +M[,c] @@` unified hunk header into `(N, M)`.
 fn parse_hunk_header(l: &str) -> Option<(usize, usize)> {
@@ -4769,7 +4760,12 @@ fn summarize_result(name: &str, out: &str) -> (bool, String) {
                 (true, first.chars().take(80).collect())
             } else {
                 let (a, d) = count_diff(out);
-                (true, format!("{} · +{a} −{d}", edit_target(first)))
+                let verb = if first.starts_with("created") {
+                    "created"
+                } else {
+                    "edited"
+                };
+                (true, format!("{verb} · +{a} −{d}"))
             }
         }
         "file_write" | "write_file" => {
@@ -6820,13 +6816,11 @@ mod tests {
             summarize_result("file_glob", "(no files match 'x')"),
             (true, "0 files".to_string())
         );
-        // an edit result → target + counts derived from the embedded unified diff
+        // an edit result → verb + counts derived from the embedded unified diff
+        // (the path already shows in the tool-row target, so the digest omits it)
         let edit = "edited src/x.rs (1 replacement(s))\n a\n-old\n+new\n b";
         let (ok, s) = summarize_result("file_edit", edit);
-        assert!(
-            ok && s.starts_with("edited src/x.rs") && s.contains("+1"),
-            "{s:?}"
-        );
+        assert!(ok && s.starts_with("edited") && s.contains("+1"), "{s:?}");
         assert_eq!(
             summarize_result("file_edit", "created src/n.rs"),
             (true, "created src/n.rs".to_string())
@@ -6963,14 +6957,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edit_target_labels_create_vs_edit() {
-        assert_eq!(
-            edit_target("edited src/x.rs (1 replacement(s))"),
-            "edited src/x.rs"
-        );
-        assert_eq!(edit_target("created src/n.rs"), "created src/n.rs");
-    }
 
     // ── test tools ──────────────────────────────────────────────────────────
     struct EchoTool;

@@ -249,7 +249,10 @@ fn resolve(req: &SandboxRequest, settings: &SandboxSettings) -> Result<Resolutio
                 });
             }
             // No kernel sandbox on this host. Unattended origins fail closed unless the user
-            // opted into the software fallback; interactive sessions degrade with one warning.
+            // opted into the software fallback; interactive sessions degrade to guarded. The
+            // degradation is recorded in `degraded` (surfaced by `aizen sandbox status`) but not
+            // announced as a boot line: on Windows the kernel backend never exists, so the warning
+            // is permanent noise at every startup rather than a signal.
             if (req.origin.unattended() || super::process_unattended())
                 && !settings.allow_guarded_fallback.unwrap_or(false)
             {
@@ -262,10 +265,6 @@ fn resolve(req: &SandboxRequest, settings: &SandboxSettings) -> Result<Resolutio
                      unattended runs",
                 ));
             }
-            warn_once(
-                "no kernel sandbox backend on this platform — commands run with software guards \
-                 only (guarded). `aizen sandbox status` shows exactly what is and is not enforced",
-            );
             Ok(Resolution {
                 effective: "guarded",
                 backend: report.backend.as_str(),

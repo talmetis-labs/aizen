@@ -1,0 +1,8 @@
+# Faster cold builds on MSVC: swap link.exe for LLVM's rust-lld (2-4x faster link).
+# Applies only when building with the msvc toolchain:
+#   rustup toolchain install stable-x86_64-pc-windows-msvc
+#   cargo +stable-x86_64-pc-windows-msvc test --target x86_64-pc-windows-msvc
+# The default gnu toolchain ignores this block entirely — no behavior change there.
+# Remove this file to fall back to the stock linker.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
