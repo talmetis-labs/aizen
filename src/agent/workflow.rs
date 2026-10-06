@@ -438,7 +438,8 @@ where
     let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut finished: Vec<bool> = vec![false; n];
     // Ready queue, spec order preserved; writers go to the back while a writer is in flight.
-    let mut ready: std::collections::VecDeque<usize> = (0..n).filter(|&i| remaining[i] == 0).collect();
+    let mut ready: std::collections::VecDeque<usize> =
+        (0..n).filter(|&i| remaining[i] == 0).collect();
     let mut in_flight: FuturesUnordered<Fut> = FuturesUnordered::new();
     let mut in_flight_writer = false;
 
@@ -462,7 +463,9 @@ where
         if in_flight.is_empty() {
             break; // nothing runnable: either done or the graph left unreachable tasks
         }
-        let Some(outcome) = in_flight.next().await else { break };
+        let Some(outcome) = in_flight.next().await else {
+            break;
+        };
         let done_id = base_id(&outcome.id).to_string();
         let done_idx = index.get(done_id.as_str()).copied();
         let was_writer = done_idx.is_some_and(|i| is_writer[i]);
@@ -487,10 +490,7 @@ where
                     let mut retry = restarted;
                     retry.id = retry_id.clone();
                     let o2 = run(retry).await;
-                    let o2 = TaskOutcome {
-                        id: retry_id,
-                        ..o2
-                    };
+                    let o2 = TaskOutcome { id: retry_id, ..o2 };
                     let recovered = o2.status != "error" && o2.status != "deadline";
                     let restart_summary = o2.summary.clone();
                     record(&mut results, &mut latest, o2);
@@ -498,7 +498,8 @@ where
                         // The restart carried the work: the base task counts as done.
                         let orig_status = outcome.status.clone();
                         outcome.status = "done".to_string();
-                        outcome.summary = format!("(restarted after {orig_status}) {restart_summary}");
+                        outcome.summary =
+                            format!("(restarted after {orig_status}) {restart_summary}");
                     }
                 }
             }
@@ -686,10 +687,8 @@ async fn run_workflow_with_cancel(
         )
     });
     let resume_events = match resume_id {
-        Some(_) => {
-            crate::agent::runlog::read_events(&runs_dir.join(format!("{run_id}.jsonl")))
-                .with_context(|| format!("reading run log for '{run_id}'"))?
-        }
+        Some(_) => crate::agent::runlog::read_events(&runs_dir.join(format!("{run_id}.jsonl")))
+            .with_context(|| format!("reading run log for '{run_id}'"))?,
         None => Vec::new(),
     };
     let task_ids: Vec<&str> = spec.tasks.iter().map(|t| t.id.as_str()).collect();
@@ -722,13 +721,12 @@ async fn run_workflow_with_cancel(
             );
         }
     }
-    let mut runlog =
-        crate::agent::runlog::RunLogWriter::open(&runs_dir, &run_id).map(|w| Some(w)).unwrap_or_else(
-            |e| {
-                eprintln!("  (run log not available: {e})");
-                None
-            },
-        );
+    let mut runlog = crate::agent::runlog::RunLogWriter::open(&runs_dir, &run_id)
+        .map(|w| Some(w))
+        .unwrap_or_else(|e| {
+            eprintln!("  (run log not available: {e})");
+            None
+        });
     if let Some(w) = runlog.as_mut() {
         let spec_json = serde_json::json!({
             "name": spec.name,
@@ -827,7 +825,10 @@ async fn run_workflow_with_cancel(
     let permanent_failures: Vec<String> = results
         .iter()
         .filter(|r| {
-            r.status == "error" && results.iter().any(|r2| r2.id == format!("{}#restart", r.id))
+            r.status == "error"
+                && results
+                    .iter()
+                    .any(|r2| r2.id == format!("{}#restart", r.id))
         })
         .map(|r| r.id.clone())
         .collect();
@@ -2139,7 +2140,7 @@ mod tests {
         assert!(v.prompt.contains("…[clipped]"), "{}", v.prompt.len());
         assert!(v.prompt.chars().count() < UPSTREAM_TASK_CHARS + 400);
     }
-#[tokio::test]
+    #[tokio::test]
     async fn schedule_has_no_wave_barrier_a_fast_tasks_downstream_starts_early() {
         // The Phase-2a metric: A→B (fast) and A→C (slow). With a wave barrier, B's downstream
         // (D after B) would wait for C to finish before starting. With the ready queue, D starts
@@ -2157,7 +2158,10 @@ mod tests {
         let run = |task: WorkflowTask| {
             let started_at = started_at.clone();
             async move {
-                started_at.lock().unwrap().push((task.id.clone(), t0.elapsed()));
+                started_at
+                    .lock()
+                    .unwrap()
+                    .push((task.id.clone(), t0.elapsed()));
                 if task.id == "c" {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
@@ -2246,7 +2250,7 @@ mod tests {
             "two writers must never run concurrently"
         );
     }
-#[tokio::test]
+    #[tokio::test]
     async fn schedule_restarts_a_failed_child_once_then_reports_done() {
         // Phase 3 (supervision, one_for_one): a child whose first run returns `error` gets ONE
         // restart (`<id>#restart`). When the restart succeeds, the base task reports `done` and
@@ -2267,7 +2271,11 @@ mod tests {
                         id: task.id,
                         role: task.role,
                         model: "m".into(),
-                        status: if attempt == 1 { "error".into() } else { "done".into() },
+                        status: if attempt == 1 {
+                            "error".into()
+                        } else {
+                            "done".into()
+                        },
                         summary: format!("attempt {attempt}"),
                         iters: 1,
                         tokens_in: 0,
@@ -2280,7 +2288,9 @@ mod tests {
         let results = schedule(&tasks, 1, "m", &cancel, run).await;
         assert_eq!(*calls.lock().unwrap(), 2, "exactly one restart");
         assert!(
-            results.iter().any(|r| r.id == "flaky#restart" && r.status == "done"),
+            results
+                .iter()
+                .any(|r| r.id == "flaky#restart" && r.status == "done"),
             "the restart outcome is recorded: {results:?}"
         );
         // The restart's success is what the downstream sees via `latest`.

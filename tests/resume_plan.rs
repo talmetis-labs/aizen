@@ -29,7 +29,10 @@ fn resume_plan_skips_completed_tasks_and_reruns_the_rest() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "run-resume failed: {text}");
 
-    assert!(text.contains("skip  scout"), "scout must be skipped:\n{text}");
+    assert!(
+        text.contains("skip  scout"),
+        "scout must be skipped:\n{text}"
+    );
     assert!(text.contains("skip  impl"), "impl must be skipped:\n{text}");
     assert!(text.contains("run   verify"), "verify must re-run:\n{text}");
     assert!(text.contains("dry-run"), "no --spec => dry-run:\n{text}");

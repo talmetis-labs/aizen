@@ -1102,18 +1102,35 @@ async fn run_menu_sticky() -> Result<()> {
                                     // Re-seat the original request so the fresh thread continues
                                     // the SAME work, not a blank "what do you want?" prompt.
                                     seat_user_message(&line, Vec::new(), &mut history, &model);
-                                    let mut cfg2 = turn_agent_config(turn_cancel.clone(), &model, true);
+                                    let mut cfg2 =
+                                        turn_agent_config(turn_cancel.clone(), &model, true);
                                     if let Some(t) = eff.as_deref() {
                                         cfg2.apply_effort(t);
                                     }
-                                    let r2 = run_agent_turn(&http, &ep, &cfg2, &registry, &mut history).await;
+                                    let r2 =
+                                        run_agent_turn(&http, &ep, &cfg2, &registry, &mut history)
+                                            .await;
                                     match r2 {
                                         Ok(outcome2) => {
-                                            finish_turn(&outcome2, persona_before, &mut history, &http, &ep).await;
+                                            finish_turn(
+                                                &outcome2,
+                                                persona_before,
+                                                &mut history,
+                                                &http,
+                                                &ep,
+                                            )
+                                            .await;
                                         }
                                         Err(e) => {
-                                            tui::emit_line(&format!("{} {e}", theme::err("error:")));
-                                            if history.last().map(|m| m.role == "user").unwrap_or(false) {
+                                            tui::emit_line(&format!(
+                                                "{} {e}",
+                                                theme::err("error:")
+                                            ));
+                                            if history
+                                                .last()
+                                                .map(|m| m.role == "user")
+                                                .unwrap_or(false)
+                                            {
                                                 history.pop();
                                             }
                                             autosave_last(&history, Some(&model));

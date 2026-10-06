@@ -938,7 +938,9 @@ impl Tool for TaskTool {
         // track id — stable for the lifetime of this dispatch, and unique per spawn.
         {
             let runs_dir = crate::core::scratch::dir().join("runs");
-            if let Ok(mut log) = crate::agent::runlog::RunLogWriter::open(&runs_dir, &track.id().to_string()) {
+            if let Ok(mut log) =
+                crate::agent::runlog::RunLogWriter::open(&runs_dir, &track.id().to_string())
+            {
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
                 let mut h = DefaultHasher::new();
@@ -1548,7 +1550,8 @@ pub(crate) struct SubagentSlot {
 
 impl Drop for SubagentSlot {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(m) = &self.model_active {
             m.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1558,7 +1561,9 @@ impl Drop for SubagentSlot {
 /// Per-model live counts (Phase 3). Keyed by model name; a model with no `max_concurrent` entry
 /// never gets a counter, so the map stays small.
 static MODEL_ACTIVE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// The per-model budget for `model`, looked up from config. `None` ⇒ no per-model limit.

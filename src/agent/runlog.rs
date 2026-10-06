@@ -61,7 +61,11 @@ pub enum Event {
     /// A blackboard note or other free-form record the orchestrator chose to persist (phase
     /// boundary, stall-guard fire, verify-gate outcome). The `label` is the queryable handle;
     /// `body` is opaque to the log itself.
-    Note { seq: u64, label: String, body: String },
+    Note {
+        seq: u64,
+        label: String,
+        body: String,
+    },
     /// A workflow-level task outcome (one sub-agent child run to its end). Recorded by
     /// `workflow.rs` after each `run_one_task` so a resume can skip tasks that already
     /// reached a terminal state instead of re-spending their tokens. `task_id` matches the
@@ -79,7 +83,11 @@ pub enum Event {
     /// A signal delivered to a running child (Phase 2's nudge channel). Recorded so a resumed run
     /// re-delivers signals that arrived after the crash point, and does NOT re-deliver ones the
     /// child already consumed.
-    Signal { seq: u64, target_run_id: String, body: String },
+    Signal {
+        seq: u64,
+        target_run_id: String,
+        body: String,
+    },
 }
 
 impl Event {
@@ -138,7 +146,11 @@ impl RunLogWriter {
             .append(true)
             .open(&path)
             .with_context(|| format!("opening run log {}", path.display()))?;
-        Ok(Self { file, next_seq, path })
+        Ok(Self {
+            file,
+            next_seq,
+            path,
+        })
     }
 
     /// Append one event, assigning its sequence number. The caller passes the event with a
@@ -297,19 +309,38 @@ pub fn plan(events: &[Event], task_ids: &[&str]) -> Vec<Action> {
 /// One line per event, for `run-status` / `run-resume --dry-run` output.
 pub fn describe(e: &Event) -> String {
     match e {
-        Event::Llm { seq, request_hash, .. } => format!("#{seq:>4} llm hash={request_hash:#x}"),
-        Event::Tool { seq, name, error, .. } => match error {
+        Event::Llm {
+            seq, request_hash, ..
+        } => format!("#{seq:>4} llm hash={request_hash:#x}"),
+        Event::Tool {
+            seq, name, error, ..
+        } => match error {
             Some(err) => format!("#{seq:>4} tool {name} → ERROR {err}"),
             None => format!("#{seq:>4} tool {name} → ok"),
         },
-        Event::Spawn { seq, child_run_id, role, .. } => {
+        Event::Spawn {
+            seq,
+            child_run_id,
+            role,
+            ..
+        } => {
             format!("#{seq:>4} spawn {role} → {child_run_id}")
         }
         Event::Note { seq, label, .. } => format!("#{seq:>4} note {label}"),
-        Event::Task { seq, task_id, status, iters, tokens_in, tokens_out, .. } => format!(
+        Event::Task {
+            seq,
+            task_id,
+            status,
+            iters,
+            tokens_in,
+            tokens_out,
+            ..
+        } => format!(
             "#{seq:>4} task {task_id} → {status} [{iters} step(s), {tokens_in}+{tokens_out} tok]"
         ),
-        Event::Signal { seq, target_run_id, .. } => {
+        Event::Signal {
+            seq, target_run_id, ..
+        } => {
             format!("#{seq:>4} signal → {target_run_id}")
         }
     }
@@ -332,7 +363,11 @@ mod tests {
         let dir = temp_dir("dense");
         let mut w = RunLogWriter::open(&dir, "run-1").unwrap();
         let s0 = w
-            .record(Event::Note { seq: 0, label: "start".into(), body: "begin".into() })
+            .record(Event::Note {
+                seq: 0,
+                label: "start".into(),
+                body: "begin".into(),
+            })
             .unwrap();
         let s1 = w
             .record(Event::Tool {
@@ -355,13 +390,27 @@ mod tests {
         let dir = temp_dir("resume");
         {
             let mut w = RunLogWriter::open(&dir, "run-2").unwrap();
-            w.record(Event::Note { seq: 0, label: "a".into(), body: String::new() }).unwrap();
-            w.record(Event::Note { seq: 0, label: "b".into(), body: String::new() }).unwrap();
+            w.record(Event::Note {
+                seq: 0,
+                label: "a".into(),
+                body: String::new(),
+            })
+            .unwrap();
+            w.record(Event::Note {
+                seq: 0,
+                label: "b".into(),
+                body: String::new(),
+            })
+            .unwrap();
         }
         // Simulate a crash and reopen: the writer must pick up at seq 2, not 0.
         let mut w = RunLogWriter::open(&dir, "run-2").unwrap();
         let s = w
-            .record(Event::Note { seq: 0, label: "c".into(), body: String::new() })
+            .record(Event::Note {
+                seq: 0,
+                label: "c".into(),
+                body: String::new(),
+            })
             .unwrap();
         assert_eq!(s, 2);
         assert_eq!(read_events(w.path()).unwrap().len(), 3);
@@ -372,13 +421,24 @@ mod tests {
         let dir = temp_dir("torn");
         let path = {
             let mut w = RunLogWriter::open(&dir, "run-3").unwrap();
-            w.record(Event::Note { seq: 0, label: "a".into(), body: String::new() }).unwrap();
-            w.record(Event::Note { seq: 0, label: "b".into(), body: String::new() }).unwrap();
+            w.record(Event::Note {
+                seq: 0,
+                label: "a".into(),
+                body: String::new(),
+            })
+            .unwrap();
+            w.record(Event::Note {
+                seq: 0,
+                label: "b".into(),
+                body: String::new(),
+            })
+            .unwrap();
             w.path().to_path_buf()
         };
         // Simulate a crash mid-write: append a partial JSON line.
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"{\"kind\":\"note\",\"seq\":2,\"label\":\"cr").unwrap();
+        f.write_all(b"{\"kind\":\"note\",\"seq\":2,\"label\":\"cr")
+            .unwrap();
         drop(f);
         // The reader sees only the two complete events...
         let events = read_events(&path).unwrap();
@@ -386,7 +446,12 @@ mod tests {
         // ...and a resumed writer re-uses seq 2 for the event that was torn.
         let mut w = RunLogWriter::open(&dir, "run-3").unwrap();
         assert_eq!(
-            w.record(Event::Note { seq: 0, label: "c".into(), body: String::new() }).unwrap(),
+            w.record(Event::Note {
+                seq: 0,
+                label: "c".into(),
+                body: String::new()
+            })
+            .unwrap(),
             2
         );
     }
@@ -394,10 +459,32 @@ mod tests {
     #[test]
     fn unresolved_reports_failed_tool_calls_only() {
         let events = vec![
-            Event::Tool { seq: 0, name: "a".into(), args_hash: 0, result: Some("ok".into()), error: None },
-            Event::Tool { seq: 1, name: "b".into(), args_hash: 0, result: None, error: Some("boom".into()) },
-            Event::Note { seq: 2, label: "x".into(), body: String::new() },
-            Event::Tool { seq: 3, name: "c".into(), args_hash: 0, result: None, error: Some("bang".into()) },
+            Event::Tool {
+                seq: 0,
+                name: "a".into(),
+                args_hash: 0,
+                result: Some("ok".into()),
+                error: None,
+            },
+            Event::Tool {
+                seq: 1,
+                name: "b".into(),
+                args_hash: 0,
+                result: None,
+                error: Some("boom".into()),
+            },
+            Event::Note {
+                seq: 2,
+                label: "x".into(),
+                body: String::new(),
+            },
+            Event::Tool {
+                seq: 3,
+                name: "c".into(),
+                args_hash: 0,
+                result: None,
+                error: Some("bang".into()),
+            },
         ];
         assert_eq!(unresolved(&events), vec![1, 3]);
     }
@@ -446,7 +533,11 @@ mod tests {
                 tokens_in: 200,
                 tokens_out: 80,
             },
-            Event::Note { seq: 4, label: "workflow-spec".into(), body: String::new() },
+            Event::Note {
+                seq: 4,
+                label: "workflow-spec".into(),
+                body: String::new(),
+            },
         ];
         let actions = plan(&events, &["scout", "impl", "verify"]);
         assert_eq!(actions.len(), 3);

@@ -1201,12 +1201,10 @@ where
     // phase-checkpoint stamp below appends a `Note` event so a crash leaves a durable trace of
     // which phases completed. `None` (the default for one-shot `aizen agent` calls) disables
     // run-logging entirely.
-    let mut runlog: Option<crate::agent::runlog::RunLogWriter> = cfg.run_id.as_deref().and_then(
-        |id| {
-            crate::agent::runlog::RunLogWriter::open(&crate::agent::runlog::runs_dir(), id)
-                .ok()
-        },
-    );
+    let mut runlog: Option<crate::agent::runlog::RunLogWriter> =
+        cfg.run_id.as_deref().and_then(|id| {
+            crate::agent::runlog::RunLogWriter::open(&crate::agent::runlog::runs_dir(), id).ok()
+        });
     // Batch-coach streak (see NUDGE_BATCH): consecutive turns whose ONLY call was one read-only
     // retrieval. One-shot latch per run.
     let mut single_read_streak = 0usize;
@@ -1219,7 +1217,8 @@ where
     // Phase 2b (live blackboard): track how many sibling notes were on the board the last time we
     // told the model. A sibling's report landing mid-run bumps the count → the model gets a fresh
     // env_line as a collapsing system nudge (same cache-friendly shape as NUDGE_BUDGET).
-    let mut blackboard_seen: usize = crate::agent::blackboard::list(&cfg.exec_ctx.resource_scope()).len();
+    let mut blackboard_seen: usize =
+        crate::agent::blackboard::list(&cfg.exec_ctx.resource_scope()).len();
     // Phase 2c (coordinator signals): a `aizen signal <run-id> "instruction"` lands as a line in
     // `<run_id>.signals.jsonl`; the loop drains the UNREAD tail each iteration and injects it as a
     // nudge. Byte offset = high-water mark; a signal written mid-run is seen on the next turn.
@@ -1264,14 +1263,18 @@ where
                         for line in unread.lines() {
                             let instruction = serde_json::from_str::<serde_json::Value>(line)
                                 .ok()
-                                .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(str::to_string))
+                                .and_then(|v| {
+                                    v.get("body").and_then(|b| b.as_str()).map(str::to_string)
+                                })
                                 .unwrap_or_else(|| line.trim().to_string());
                             if !instruction.is_empty() {
                                 push_nudge_as(
                                     messages,
                                     cfg.nudge_role,
                                     NUDGE_SIGNAL,
-                                    &format!("{NUDGE_SIGNAL} coordinator instruction: {instruction}"),
+                                    &format!(
+                                        "{NUDGE_SIGNAL} coordinator instruction: {instruction}"
+                                    ),
                                 );
                             }
                         }
@@ -1314,7 +1317,10 @@ where
                     NUDGE_STEP_LIMIT,
                     "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
                 );
-            } else if healthy && !(last_turn_was_text_only && !todo::has_incomplete()) && continuations < cfg.max_continuations {
+            } else if healthy
+                && !(last_turn_was_text_only && !todo::has_incomplete())
+                && continuations < cfg.max_continuations
+            {
                 // CONTINUATION: the one-shot extension is spent, but this run is neither stalled nor
                 // looping — it is simply a big task still moving. Cutting it here is what made aizen
                 // hand back partial work and wait for the user to type "continue"; do that for it
@@ -1932,10 +1938,13 @@ where
                 seq: 0, // writer stamps the real seq
                 request_hash: h.finish(),
                 response: turn.content.clone().unwrap_or_default(),
-                usage: turn.usage.as_ref().map(|u| crate::agent::runlog::TokenUsage {
-                    prompt: u.prompt_tokens.unwrap_or(0),
-                    completion: u.completion_tokens.unwrap_or(0),
-                }),
+                usage: turn
+                    .usage
+                    .as_ref()
+                    .map(|u| crate::agent::runlog::TokenUsage {
+                        prompt: u.prompt_tokens.unwrap_or(0),
+                        completion: u.completion_tokens.unwrap_or(0),
+                    }),
             });
         }
 
@@ -2405,11 +2414,11 @@ where
                     messages.push(Message::assistant(t.clone()));
                 }
             }
-                    return Ok(AgentOutcome {
-                        final_text: turn.content,
-                        iters: iter + 1,
-                        stop: StopReason::Done,
-                    });
+            return Ok(AgentOutcome {
+                final_text: turn.content,
+                iters: iter + 1,
+                stop: StopReason::Done,
+            });
         }
 
         // Reaching the tool path means this turn HAS tool calls, i.e. work is genuinely continuing —

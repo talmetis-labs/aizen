@@ -94,10 +94,7 @@ pub fn carryover_prompt(history: &[Message]) -> Vec<Message> {
         prompt.push_str("\n\nContext ledger (from the full thread):\n");
         prompt.push_str(&ledger);
     }
-    vec![
-        Message::system(CARRYOVER_SYS),
-        Message::user(prompt),
-    ]
+    vec![Message::system(CARRYOVER_SYS), Message::user(prompt)]
 }
 
 /// Truncate to `max` chars with a `…[+N chars]` marker (char-safe, never splits a codepoint).

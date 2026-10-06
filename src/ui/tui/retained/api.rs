@@ -420,10 +420,10 @@ fn set_focus(focused: bool) {
 
 #[cfg(test)]
 mod capability_tests {
-    #[cfg(windows)]
-    use super::term_supported_here;
     #[cfg(not(windows))]
     use super::term_can_fullscreen;
+    #[cfg(windows)]
+    use super::term_supported_here;
 
     #[cfg(windows)]
     #[test]
