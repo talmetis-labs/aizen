@@ -44,6 +44,7 @@ You are a focused sub-agent dispatched to do ONE task and report back.
 - scope: do only the dispatched task; do not widen it. If you are genuinely blocked, state exactly what is done, what remains, and what blocks you.
 - capability: the tools listed under # Tool routing are ALL you have. A capability you lack is a boundary of this dispatch — report the gap; never work around it through another tool.
 - workspace: file/shell ops resolve relative paths against the working directory but may reach elsewhere on disk; you cannot dispatch further sub-agents.
+- effort_scaling: if your task names a model or effort tier, honour it exactly — a small lookup goes to the cheap model, a design critique goes to the strongest. Do not upgrade or downgrade the model yourself; the orchestrator set it.
 - contract: if a <contract> block follows, its boundaries, expected output, and step budget are BINDING.
 </subagent>";
 
@@ -696,25 +697,43 @@ impl Tool for TaskTool {
                 return Ok(unknown_role_error(role));
             }
         }
+        // Phase 3 (per-model budget): resolve the model BEFORE acquiring the slot so the gate can
+        // charge the right per-model counter. `resolve_dispatch` is pure (no network), so this
+        // second call costs a config parse, not a request.
+        let dispatch_preview = self.resolve_dispatch(args);
+        let model_for_budget = dispatch_preview.model.as_str();
         // Concurrency gate: each sub-agent is a whole model loop — cap how many run at once
         // (below the tool-level MAX_PARALLEL: N loops × N tool threads oversubscribes a CLI).
-        // Over-limit is a SOFT error the model recovers from by retrying serially; a BROKEN gate
-        // (unwritable home) is a hard one, and the wording must not invite a retry that cannot
-        // ever succeed.
-        let _slot = match SubagentSlot::try_acquire() {
-            Ok(s) => s,
-            Err(SlotDenied::Full) => {
+        // Phase 2d: over-limit no longer answers a soft error — the task PARKS here until a slot
+        // frees (the parent model cannot meaningfully "retry with fewer calls"; only the queue
+        // can). Bounded: polls every 200ms for up to 60s, then gives up so a deadlocked sibling
+        // cannot park a task forever. A broken gate (unwritable home) stays a hard error:
+        // waiting cannot fix it.
+        let mut _slot = None;
+        for _ in 0..300 {
+            // 300 × 200ms = 60s ceiling
+            match SubagentGate::global().try_acquire_for(Some(model_for_budget)) {
+                Ok(s) => {
+                    _slot = Some(s);
+                    break;
+                }
+                Err(SlotDenied::Full) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(SlotDenied::Io(e)) => {
+                    return Ok(format!(
+                        "error: the sub-agent gate is unavailable on this machine ({e}) — this is NOT \
+                         a concurrency limit and retrying will not help; tell the user their aizen \
+                         home directory appears unwritable or locked"
+                    ));
+                }
+            }
+        }
+        let _slot = match _slot {
+            Some(s) => s,
+            None => {
                 return Ok(
-                    "error: sub-agent concurrency limit reached — retry with fewer task calls in one turn"
+                    "error: waited 60s for a sub-agent slot and none freed — the gate is saturated"
                         .to_string(),
                 );
-            }
-            Err(SlotDenied::Io(e)) => {
-                return Ok(format!(
-                    "error: the sub-agent gate is unavailable on this machine ({e}) — this is NOT \
-                     a concurrency limit and retrying will not help; tell the user their aizen \
-                     home directory appears unwritable or locked"
-                ));
             }
         };
         let prompt = args
@@ -913,6 +932,28 @@ impl Tool for TaskTool {
         track.arm_stop(own_cancel);
         cfg.step_note = Some((track.id(), crate::agent::orchestration::note_step));
 
+        // Run-log: record this spawn so a crash mid-child leaves a durable trace of what was
+        // dispatched (and with what prompt hash), enabling a future `resume` to find the child's
+        // own run log rather than re-spawning from scratch. The child_run_id is the orchestration
+        // track id — stable for the lifetime of this dispatch, and unique per spawn.
+        {
+            let runs_dir = crate::core::scratch::dir().join("runs");
+            if let Ok(mut log) =
+                crate::agent::runlog::RunLogWriter::open(&runs_dir, &track.id().to_string())
+            {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                prompt.hash(&mut h);
+                let _ = log.record(crate::agent::runlog::Event::Spawn {
+                    seq: 0, // writer stamps the real seq
+                    child_run_id: track.id().to_string(),
+                    role: header_label.clone(),
+                    prompt_hash: h.finish(),
+                });
+            }
+        }
+
         // Bridge sync→async on the CURRENT runtime (same one the reqwest client was built on).
         // MUST run on a Tokio MULTI-THREAD worker thread — `block_in_place` panics on a
         // current-thread runtime / with no runtime. Both reach paths satisfy this: the async
@@ -1017,6 +1058,8 @@ impl Tool for TaskTool {
             crate::agent::StopReason::AwaitingInput(_) => "stopped to ask (no interactive user)",
             crate::agent::StopReason::Cancelled => "cancelled by user",
             crate::agent::StopReason::Deadline => "hit its time limit",
+            // A sub-agent has no thread to refresh; its final note IS the answer it hands back.
+            crate::agent::StopReason::Refresh => "done",
         };
         let body = outcome
             .final_text
@@ -1304,6 +1347,8 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
         crate::agent::StopReason::Deadline => Some(
             "[INCOMPLETE — the sub-agent ran out of TIME (its wall-clock limit), not steps, and nobody cancelled it. The work below is whatever it had reached; it was cut off mid-task.]",
         ),
+        // A sub-agent has no thread to refresh; its final note is its answer, same as Done.
+        crate::agent::StopReason::Refresh => None,
     }
 }
 
@@ -1493,10 +1538,42 @@ pub(crate) fn active_subagents() -> usize {
 }
 
 /// RAII slot in the sub-agent gate — releases both the process-local count and cross-process OS slot.
+/// `model_key` releases the per-model budget on drop (Phase 3).
 pub(crate) struct SubagentSlot {
     _global: crate::core::repo_lock::RepoTxnLock,
     /// The counter this slot was charged to; released on drop.
     active: &'static std::sync::atomic::AtomicUsize,
+    /// The per-model counter this slot was charged to (Phase 3). `None` when the model has no
+    /// `max_concurrent` configured — no budget to release.
+    model_active: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl Drop for SubagentSlot {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(m) = &self.model_active {
+            m.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Per-model live counts (Phase 3). Keyed by model name; a model with no `max_concurrent` entry
+/// never gets a counter, so the map stays small.
+static MODEL_ACTIVE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The per-model budget for `model`, looked up from config. `None` ⇒ no per-model limit.
+fn model_max_concurrent(model: &str) -> Option<usize> {
+    crate::core::cli_config::load()
+        .model_endpoints?
+        .iter()
+        .find(|e| e.model.trim() == model.trim())
+        .and_then(|e| e.max_concurrent)
+        .map(|n| n.clamp(1, HARD_CEILING))
 }
 
 /// The gate as a value: the counter it charges, the width it enforces, and the directory whose
@@ -1536,12 +1613,42 @@ impl SubagentGate {
     }
 
     pub(crate) fn try_acquire(&self) -> Result<SubagentSlot, SlotDenied> {
+        self.try_acquire_for(None)
+    }
+
+    /// Acquire a slot for a sub-agent that will run `model`. Checks the global cap first, then
+    /// the model's own `max_concurrent` budget (Phase 3) — a model with no configured budget
+    /// (`None`) is gated only globally.
+    pub(crate) fn try_acquire_for(&self, model: Option<&str>) -> Result<SubagentSlot, SlotDenied> {
         use std::sync::atomic::Ordering;
         let prev = self.active.fetch_add(1, Ordering::SeqCst);
         if prev >= self.cap {
             self.active.fetch_sub(1, Ordering::SeqCst);
             return Err(SlotDenied::Full);
         }
+        // Phase 3: per-model budget. Only models with a configured `max_concurrent` get a counter;
+        // an over-budget model refuses exactly like a full gate (the caller parks).
+        let model_counter = model.and_then(|m| {
+            let cap = model_max_concurrent(m)?;
+            let counter = {
+                let mut map = MODEL_ACTIVE.lock().unwrap();
+                map.entry(m.to_string())
+                    .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+                    .clone()
+            };
+            let prev = counter.fetch_add(1, Ordering::SeqCst);
+            if prev >= cap {
+                counter.fetch_sub(1, Ordering::SeqCst);
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return Some(Err(SlotDenied::Full));
+            }
+            Some(Ok(counter))
+        });
+        let model_counter = match model_counter {
+            Some(Err(e)) => return Err(e),
+            Some(Ok(c)) => Some(c),
+            None => None,
+        };
         // Probe the whole GLOBAL band, not `0..cap`. The slot files are shared by every aizen
         // process on this machine, while `cap` is this process's own width — with mismatched
         // caps, a cap-2 process probing only slots 0–1 starved behind a cap-16 process holding
@@ -1562,6 +1669,7 @@ impl SubagentGate {
                     return Ok(SubagentSlot {
                         _global: global,
                         active: self.active,
+                        model_active: model_counter.clone(),
                     })
                 }
                 Err(e)
@@ -1603,13 +1711,6 @@ impl SubagentSlot {
 
     pub(crate) fn acquire_up_to(want: usize) -> Vec<Self> {
         SubagentGate::global().acquire_up_to(want)
-    }
-}
-
-impl Drop for SubagentSlot {
-    fn drop(&mut self) {
-        self.active
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2684,6 +2785,7 @@ mod tests {
                 model: "strong-model".into(),
                 base_url: Some("https://strong/v1".into()),
                 api_key_ref: Some("literal-strong-key".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })
@@ -2735,6 +2837,7 @@ mod tests {
                 model: "other-model".into(),
                 base_url: Some("https://other/v1".into()),
                 api_key_ref: Some("literal-other-key".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })
@@ -2846,6 +2949,7 @@ mod tests {
                 model: "shared-model".into(),
                 base_url: Some("https://registry-gateway/v1".into()),
                 api_key_ref: Some("registry-key".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })

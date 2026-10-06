@@ -304,7 +304,8 @@ impl Tool for WorkflowTool {
          parallel + one synthesized answer; `after` chains tasks (each gets its dependencies' \
          reports; one writer per wave). implement: daedalus → themis → nemesis prebuilt from \
          `prompt`, one fix loop on a themis FAIL. verify: a read-only refuter per finding. For \
-         one sub-task use `task`."
+         one sub-task use `task`.\n\
+         Effort-scale: set `model` per task — cheap for lookup, strongest for design."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({

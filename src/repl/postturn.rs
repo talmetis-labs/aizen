@@ -540,6 +540,29 @@ pub(crate) async fn compact_now(history: &mut Vec<Message>) -> Result<(usize, us
     compact_history(history, &http, &base, &key, &model).await
 }
 
+/// `/clear` carry-over — distill the WHOLE current conversation into one dense seed note (routed
+/// through the summarizer role, like compaction) so a refresh starts a fresh thread that still
+/// REMEMBERS what the previous one was doing. Returns the distilled text; the caller rebuilds the
+/// thread and seeds it behind [`agent::compact::HANDOFF_MARKER_PREFIX`]. `Err` when there is nothing
+/// worth carrying or the model returns nothing — the caller then falls back to a plain wipe.
+pub(crate) async fn refresh_distill_now(history: &[Message]) -> Result<String> {
+    let (base, key, model) = resolve_endpoint(None, None, None)?;
+    let http = http_client()?;
+    if history.len() < 2 {
+        anyhow::bail!("nothing to carry forward — the conversation is empty");
+    }
+    let ep = summarizer_endpoint(&base, &key, &model);
+    let prompt = agent::compact::carryover_prompt(history);
+    let summary = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
+        .await?
+        .content
+        .unwrap_or_default();
+    if summary.trim().is_empty() {
+        anyhow::bail!("the model returned an empty carry-over summary");
+    }
+    Ok(summary.trim().to_string())
+}
+
 #[cfg(test)]
 mod learning_tests {
     use super::*;

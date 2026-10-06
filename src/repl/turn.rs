@@ -453,6 +453,14 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
              Say \"continue\" to carry on, or raise AIZEN_SUBAGENT_WALL_SECS.",
             outcome.iters
         ),
+        // The model asked for a fresh thread (its final text opened with `REFRESH:`). The REPL
+        // handles the actual distill + reseed; reaching here means the caller did not, so surface
+        // the request rather than swallow it.
+        StopReason::Refresh => format!(
+            "⚠ the model asked to refresh the thread after {} step(s) — run /clear to distill a \
+             carry-over seed and start fresh.",
+            outcome.iters
+        ),
     };
     let painted = theme::err(line).to_string();
     if tui::active() {

@@ -38,6 +38,7 @@ pub mod reach;
 pub mod repo_map;
 pub mod result_format;
 pub mod roles;
+pub mod runlog;
 pub mod search;
 pub mod task_tool;
 pub mod todo;
@@ -638,6 +639,12 @@ pub struct AgentConfig {
     /// summarized in place. `0` disables compaction (the loop falls back to the one-shot wrap-up
     /// nudge). Requires `context_window > 0`.
     pub compact_at_pct: u8,
+    /// The run id for this loop, if the caller wants a durable event log (durable-run Phase 1).
+    /// When set, the loop opens `scratch/runs/<run_id>.jsonl` and records `Note` events at every
+    /// phase checkpoint, so a crash leaves a trace of which phases completed. `None` disables
+    /// run-logging entirely (the default for one-shot `aizen agent` calls, where the transcript
+    /// is already the durable record).
+    pub run_id: Option<String>,
     /// The one-shot "wrap up now" context guard fires when running history crosses this percent of
     /// `context_window` (P-ctx4 — was a hardcoded 90). Kept above `compact_at_pct` so a summarizer-
     /// equipped caller compacts first; the guard is the last-ditch nudge for callers WITHOUT one.
@@ -771,12 +778,18 @@ impl AgentConfig {
     /// much of a build/test log reaches the model. Unknown tiers (provider-specific strings) leave
     /// the config untouched.
     pub fn apply_effort(&mut self, tier: &str) {
+        // `continuations` is the knob that decides how long a STILL-PROGRESSING run keeps going past
+        // the step cap before it is handed back as `MaxIters` (see the loop's continuation branch).
+        // It was tuned so tight (3 on medium) that an ordinary long edit on the interactive surface
+        // hit the wall mid-task and made the user type "continue" — the exact annoyance this widens.
+        // A healthy run is still bounded: the stall ledger stops it the moment two turns in a row add
+        // no evidence, so more continuations only ever buy room for genuine progress, never a wander.
         let (iters, extend, continuations, verify, review, log) = match tier {
-            "low" => (12, 18, 1, 1, false, 8_000),
-            "medium" => (25, 50, 3, 2, false, 16_000),
-            "high" => (40, 80, 3, 3, false, 16_000),
-            "xhigh" => (60, 120, 4, 4, true, 24_000),
-            "max" => (90, 180, 5, 5, true, 24_000),
+            "low" => (12, 24, 2, 1, false, 8_000),
+            "medium" => (25, 80, 8, 2, false, 16_000),
+            "high" => (40, 120, 12, 3, false, 16_000),
+            "xhigh" => (60, 180, 16, 4, true, 24_000),
+            "max" => (90, 300, 24, 5, true, 24_000),
             _ => return,
         };
         self.max_iters = iters;
@@ -805,7 +818,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iters: 25,
-            auto_extend_to: 50,
+            auto_extend_to: 80,
             max_tool_result_chars: 4096,
             max_fetch_result_chars: 12_000,
             max_log_result_chars: 16_000,
@@ -817,7 +830,7 @@ impl Default for AgentConfig {
             workspace_root: None,
             quiet: false,
             enable_verify_gate: true,
-            verify_gate_timeout_secs: 180,
+            verify_gate_timeout_secs: 300,
             auto_checkpoint: true,
             checkpoint_each_edit: true,
             context_window: 0,
@@ -832,6 +845,7 @@ impl Default for AgentConfig {
             harness_check_after_edits: 3,
             todo_reminder_every: 8,
             compact_at_pct: 80,
+            run_id: None,
             context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,
@@ -846,7 +860,13 @@ impl Default for AgentConfig {
             hill_climb_gate: 90,
             hill_climb_reminder_every: 6,
             max_transient_retries: 2, // survive a gateway blip mid-task instead of losing the work
-            max_continuations: 3,
+            // A still-progressing run gets this many fresh step budgets before it is cut off with
+            // `MaxIters` (see the loop's continuation branch). Kept generous on the interactive
+            // surface — where the user is present and can Esc — so a long but healthy task finishes
+            // on its own instead of stopping mid-work and asking the user to type "continue". The
+            // stall ledger still ends a run the moment it stops making progress, so this is room for
+            // real work, not a licence to wander.
+            max_continuations: 8,
             max_stall_recoveries: 1,
             goal: None,
             enable_steering: false,
@@ -880,6 +900,13 @@ pub enum StopReason {
     /// "cancelled by user" would send the user looking for a keypress that never happened) and from
     /// `MaxIters` (a step-budget stop). Never automatically resumed.
     Deadline,
+    /// The model asked for a fresh thread: its final text opened with `REFRESH: <note>` — it judged
+    /// the conversation too long/drifted to keep steering and requested a context refresh. The REPL
+    /// distills a carry-over seed (smart: recent tail + touchpoints ledger, not the whole transcript)
+    /// and starts a new thread seeded with it, so the next turn continues the same work with a clean
+    /// context. Distinct from `Done` (the model did NOT finish the task — it asked to keep working
+    /// with a fresh context) and from `MaxIters` (a budget stop, not a model-initiated refresh).
+    Refresh,
 }
 
 impl StopReason {
@@ -894,6 +921,7 @@ impl StopReason {
             Self::AwaitingInput(_) => "awaiting_input",
             Self::Cancelled => "cancelled",
             Self::Deadline => "deadline",
+            Self::Refresh => "refresh",
         }
     }
 }
@@ -1148,6 +1176,10 @@ where
     let mut last_todo_reminder = 0usize;
     // P0.1: incomplete-todo pokes this run (cap = max_todo_poke_attempts).
     let mut todo_poke_attempts = 0usize;
+    // True when the PREVIOUS turn was the model's final answer (text, no tool call). A continuation
+    // that fires right after that is dragging the run onward AFTER the model already said it was
+    // done — block it (see the step-cap branch), unless the todo list still says work is open.
+    let mut last_turn_was_text_only = false;
     // P0.2: last confidence per todo content key; spike at Done arms a one-shot gate.
     let mut conf_last: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut confidence_gate_armed = false;
@@ -1164,6 +1196,15 @@ where
     // Eviction blanks bodies IN PLACE, which the byte-level intact-check catches per entry, so no
     // clear is needed there.
     let read_cache_scope = cfg.exec_ctx.resource_scope();
+    // Run-log (durable-run Phase 1): open the append-only event log for this run, if the caller
+    // gave us a run_id. The writer is opened once here and lives for the whole loop; every
+    // phase-checkpoint stamp below appends a `Note` event so a crash leaves a durable trace of
+    // which phases completed. `None` (the default for one-shot `aizen agent` calls) disables
+    // run-logging entirely.
+    let mut runlog: Option<crate::agent::runlog::RunLogWriter> =
+        cfg.run_id.as_deref().and_then(|id| {
+            crate::agent::runlog::RunLogWriter::open(&crate::agent::runlog::runs_dir(), id).ok()
+        });
     // Batch-coach streak (see NUDGE_BATCH): consecutive turns whose ONLY call was one read-only
     // retrieval. One-shot latch per run.
     let mut single_read_streak = 0usize;
@@ -1172,6 +1213,16 @@ where
     // genuinely finished, so the only exits are Esc (→ Cancelled, via `cancel::race`) or a verified
     // completion (→ Done, via the goal gate + verify gate). Ordinary turns keep `iter < cap`.
     let goal_mode = cfg.goal.is_some();
+
+    // Phase 2b (live blackboard): track how many sibling notes were on the board the last time we
+    // told the model. A sibling's report landing mid-run bumps the count → the model gets a fresh
+    // env_line as a collapsing system nudge (same cache-friendly shape as NUDGE_BUDGET).
+    let mut blackboard_seen: usize =
+        crate::agent::blackboard::list(&cfg.exec_ctx.resource_scope()).len();
+    // Phase 2c (coordinator signals): a `aizen signal <run-id> "instruction"` lands as a line in
+    // `<run_id>.signals.jsonl`; the loop drains the UNREAD tail each iteration and injects it as a
+    // nudge. Byte offset = high-water mark; a signal written mid-run is seen on the next turn.
+    let mut signal_offset: u64 = 0;
 
     loop {
         // COOPERATIVE CANCEL wins before any cap bookkeeping. Goal mode bypasses the cap exactly as
@@ -1183,6 +1234,53 @@ where
                 iters: iter,
                 stop: StopReason::Cancelled,
             });
+        }
+
+        // 2b: a sibling posted a new blackboard note since we last looked → refresh the pointer.
+        // Collapsing nudge (push_nudge replaces the same-kind one), so it costs one system message
+        // total, not one per turn.
+        let bb_now = crate::agent::blackboard::list(&cfg.exec_ctx.resource_scope()).len();
+        if bb_now > blackboard_seen {
+            blackboard_seen = bb_now;
+            let line = crate::agent::blackboard::env_line(&cfg.exec_ctx.resource_scope());
+            push_nudge_as(
+                messages,
+                cfg.nudge_role,
+                NUDGE_BLACKBOARD,
+                &format!("{NUDGE_BLACKBOARD} a sibling posted a new report. {line}"),
+            );
+        }
+
+        // 2c: drain unread coordinator signals for this run. Each line is one instruction;
+        // malformed lines are skipped, never fatal (the log is advice, not control flow).
+        if let Some(id) = cfg.run_id.as_deref() {
+            let sig_path = crate::agent::runlog::runs_dir().join(format!("{id}.signals.jsonl"));
+            if let Ok(meta) = std::fs::metadata(&sig_path) {
+                if meta.len() > signal_offset {
+                    if let Ok(text) = std::fs::read_to_string(&sig_path) {
+                        let unread = &text[signal_offset as usize..];
+                        signal_offset = meta.len();
+                        for line in unread.lines() {
+                            let instruction = serde_json::from_str::<serde_json::Value>(line)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("body").and_then(|b| b.as_str()).map(str::to_string)
+                                })
+                                .unwrap_or_else(|| line.trim().to_string());
+                            if !instruction.is_empty() {
+                                push_nudge_as(
+                                    messages,
+                                    cfg.nudge_role,
+                                    NUDGE_SIGNAL,
+                                    &format!(
+                                        "{NUDGE_SIGNAL} coordinator instruction: {instruction}"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         // WALL-CLOCK CEILING (`cfg.deadline`), checked beside the cancel flag because it is the same
         // kind of exit: the step that just finished is recorded, and no new work starts. NOT gated on
@@ -1219,13 +1317,23 @@ where
                     NUDGE_STEP_LIMIT,
                     "You are nearing the step limit. Finish the task now, or stop and state what is blocking you.",
                 );
-            } else if healthy && continuations < cfg.max_continuations {
+            } else if healthy
+                && !(last_turn_was_text_only && !todo::has_incomplete())
+                && continuations < cfg.max_continuations
+            {
                 // CONTINUATION: the one-shot extension is spent, but this run is neither stalled nor
                 // looping — it is simply a big task still moving. Cutting it here is what made aizen
                 // hand back partial work and wait for the user to type "continue"; do that for it
                 // instead. A `user`-role message (not a soft system nudge) so the model cannot treat
                 // it as ambient noise, and the whole conversation is preserved, so this is a
                 // CONTINUATION of the work, not a restart of it.
+                //
+                // `last_turn_was_text_only && !todo::has_incomplete()`: a turn that just returned TEXT
+                // (its final answer) with NO open todos has already said "done" — dragging it onward
+                // is exactly the "it keeps running after it finished" behaviour, so block the
+                // continuation and let the run end. If the model SAID done but the todo list still
+                // shows open items, that claim is suspect: fall through (allow continuation), and the
+                // incomplete-todo gate will own the "you still have work" poke instead.
                 continuations += 1;
                 cap = cap.saturating_add(cfg.max_iters.max(1));
                 if !cfg.quiet {
@@ -1816,6 +1924,30 @@ where
             }
         };
 
+        // Run-log: record the completed LLM turn (durable-run Phase 1). `request_hash` is a stable
+        // hash of the message count + tool-call count — enough for a resume to detect "the context
+        // changed since the crash" without storing the full prompt (which would double the log's
+        // size for no replay benefit, since the loop re-derives messages from history anyway).
+        if let Some(log) = runlog.as_mut() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            messages.len().hash(&mut h);
+            turn.tool_calls.len().hash(&mut h);
+            let _ = log.record(crate::agent::runlog::Event::Llm {
+                seq: 0, // writer stamps the real seq
+                request_hash: h.finish(),
+                response: turn.content.clone().unwrap_or_default(),
+                usage: turn
+                    .usage
+                    .as_ref()
+                    .map(|u| crate::agent::runlog::TokenUsage {
+                        prompt: u.prompt_tokens.unwrap_or(0),
+                        completion: u.completion_tokens.unwrap_or(0),
+                    }),
+            });
+        }
+
         // LENIENT TOOL-CALL RECOVERY: a provider that put the call in the TEXT — `<tool_call>` tags,
         // a ```json fence, or a bare `{"name": …}` object — and sent an empty `tool_calls` array
         // used to read as a final answer (the model's "call" echoed to the user) or, with nothing
@@ -2024,10 +2156,17 @@ where
                         // tree so it's free when the last todo boundary already captured this tree.
                         if cfg.checkpoint_each_edit && made_edits_in_phase {
                             phase_counter += 1;
-                            stamp_phase_checkpoint(
-                                cfg.quiet,
-                                &format!("phase {phase_counter} verified"),
-                            );
+                            let label = format!("phase {phase_counter} verified");
+                            stamp_phase_checkpoint(cfg.quiet, &label);
+                            // Run-log: record the phase boundary so a crash leaves a durable trace
+                            // of which phases completed (durable-run Phase 1).
+                            if let Some(log) = runlog.as_mut() {
+                                let _ = log.record(crate::agent::runlog::Event::Note {
+                                    seq: 0, // writer stamps the real seq
+                                    label: label.clone(),
+                                    body: String::new(),
+                                });
+                            }
                             made_edits_in_phase = false;
                             phase_todos_before = crate::agent::todo::snapshot();
                         }
@@ -2088,6 +2227,24 @@ where
                     }
                     // NUDGE MODE (no oracle): the model re-reads its own diff. One demand, always.
                     None => demands.push(SELF_REVIEW_NUDGE.to_string()),
+                }
+            }
+
+            // REFRESH: — the model's final text opens with `REFRESH: <note>` when it judges the
+            // conversation too long/drifted to keep steering and asks for a fresh thread. Parse it
+            // here (before any gate can drag the run onward) and stop with a dedicated reason; the
+            // REPL distills a carry-over seed (smart: recent tail + touchpoints ledger) and reseeds.
+            if let Some(text) = turn.content.as_deref() {
+                let trimmed = text.trim_start();
+                if trimmed.starts_with("REFRESH:") {
+                    if !cfg.quiet {
+                        emit_trace("→ model requested a thread refresh (REFRESH:)");
+                    }
+                    return Ok(AgentOutcome {
+                        final_text: turn.content,
+                        iters: iter + 1,
+                        stop: StopReason::Refresh,
+                    });
                 }
             }
 
@@ -2166,6 +2323,10 @@ where
                     )
                 };
                 messages.push(Message::user(combined));
+                // This turn returned TEXT (a "done" claim) and a gate is dragging the run onward —
+                // latch that, so the step-cap branch can tell "hit the cap mid-work" apart from
+                // "hit the cap right after saying done". Reset at the tool path (work continues).
+                last_turn_was_text_only = true;
                 iter += 1;
                 continue;
             }
@@ -2260,6 +2421,10 @@ where
             });
         }
 
+        // Reaching the tool path means this turn HAS tool calls, i.e. work is genuinely continuing —
+        // reset the "said done" latch so a later text-only turn can re-arm it. (A tool turn may still
+        // carry content, so we cannot key the reset off `turn.content` being empty.)
+        last_turn_was_text_only = false;
         // DIVERGENCE (W1): a turn whose canonical signature exactly repeats the previous turn
         // (A,A) or completes a 2-cycle (A,B,A,B) is a SUSPECTED loop. On the FIRST flagged
         // occurrence we nudge but still EXECUTE the call, so its result novelty is judged by the
@@ -2432,6 +2597,32 @@ where
         .await;
         crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
 
+        // Run-log: record each tool call's outcome (durable-run Phase 1). `results` is a
+        // position-aligned `Vec<(body, error)>` — a non-empty error string means the call failed,
+        // which is what `unresolved()` keys on for resume. The body is capped at 200 chars — the
+        // full result lives in the transcript, the log only needs enough to identify what ran.
+        if let Some(log) = runlog.as_mut() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            for (tc, (body, err)) in calls.iter().zip(results.iter()) {
+                let mut h = DefaultHasher::new();
+                tc.function.arguments.hash(&mut h);
+                let capped: String = body.chars().take(200).collect();
+                let (result, error) = if err.is_empty() {
+                    (Some(capped), None)
+                } else {
+                    (None, Some(err.clone()))
+                };
+                let _ = log.record(crate::agent::runlog::Event::Tool {
+                    seq: 0, // writer stamps the real seq
+                    name: tc.function.name.clone(),
+                    args_hash: h.finish(),
+                    result,
+                    error,
+                });
+            }
+        }
+
         // Arm the verify gate only if a destructive tool actually SUCCEEDED this turn — a
         // denied/errored edit changed nothing, so it must not make the gate blame the tree.
         let edited_this_turn = turn_made_edits(registry, &calls, &results);
@@ -2562,6 +2753,15 @@ where
                     &phase_todos_after,
                 ) {
                     stamp_phase_checkpoint(cfg.quiet, &format!("phase: {label}"));
+                    // Run-log: record the phase boundary so a crash leaves a durable trace
+                    // of which phases completed (durable-run Phase 1).
+                    if let Some(log) = runlog.as_mut() {
+                        let _ = log.record(crate::agent::runlog::Event::Note {
+                            seq: 0, // writer stamps the real seq
+                            label: format!("phase: {label}"),
+                            body: String::new(),
+                        });
+                    }
                     made_edits_in_phase = false;
                 }
             }
@@ -5809,6 +6009,12 @@ const GOAL_POKE_PREFIX: &str = "[goal]";
 /// shape as the todo-poke and goal pokes rather than a soft system nudge). Shared by both paths so
 /// the transcript reads with one consistent marker for "the harness granted more room".
 const CONTINUE_PREFIX: &str = "[continue]";
+/// A sibling posted a new blackboard note mid-run (Phase 2b): the loop refreshes the pointer as
+/// a collapsing system nudge, so the child sees fresh findings without a new spawn.
+const NUDGE_BLACKBOARD: &str = "[blackboard]";
+/// A coordinator instruction arrived via `<run_id>.signals.jsonl` (Phase 2c): drained at the top
+/// of each loop iteration and injected as a collapsing system nudge.
+const NUDGE_SIGNAL: &str = "[signal]";
 /// Running context-budget signal (P-ctx1). Like Claude's server-side `<budget>`/`<system_warning>`
 /// pair, but client-side and CACHE-AWARE: refreshed only when usage crosses a new band (see
 /// `budget_band`), never every turn — every mid-history system-message rewrite busts the provider
@@ -5926,6 +6132,8 @@ const NUDGE_KINDS: &[&str] = &[
     NUDGE_HILL_CLIMB,
     NUDGE_BATCH,
     NUDGE_BUDGET,
+    NUDGE_BLACKBOARD,
+    NUDGE_SIGNAL,
 ];
 
 /// Is `m` a nudge of `kind_prefix`, in either delivery role?
@@ -7293,6 +7501,7 @@ mod tests {
             harness_check_after_edits: 3,
             todo_reminder_every: 0, // recitation OFF in unit tests (todo state is process-global)
             compact_at_pct: 80,
+            run_id: None,
             context_guard_pct: 90,
             max_verify_attempts: 2,
             enable_self_review: false,

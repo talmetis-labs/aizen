@@ -65,6 +65,7 @@ fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<(
             model,
             base_url,
             api_key_ref,
+            max_concurrent: None,
         });
     }
     cfg.model_endpoints = (!list.is_empty()).then_some(list);
@@ -3129,6 +3130,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
                 model: model.clone(),
                 base_url,
                 api_key_ref,
+                max_concurrent: None,
             });
             line_ok(&format!("mapped {model}"));
         } else {

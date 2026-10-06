@@ -1050,12 +1050,35 @@ pub(crate) async fn handle_slash(
         SlashId::Help => tui::emit_line(&style(slash::help_page()).dim().to_string()),
         SlashId::Quit => return SlashOutcome::Quit,
         SlashId::Clear => {
-            rebuild_system(history, model_label);
-            reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
-            set_session_slug(None); // the next turn names + autosaves a brand-new session file
-            update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
-                                          // immediate window-close after /clear doesn't re-save it
-            tui::emit_line(&style("(new conversation)").dim().to_string());
+            // `new`/`reset` are aliases of `/clear` (same identity) — they refresh too. To wipe
+            // without carrying a memory of this thread, spell it `/clear hard` (see the help).
+            let hard = matches!(arg.trim().to_ascii_lowercase().as_str(), "hard" | "fresh" | "wipe" | "blank");
+            if hard {
+                rebuild_system(history, model_label);
+                reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
+                set_session_slug(None); // the next turn names + autosaves a brand-new session file
+                update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                              // immediate window-close after /clear doesn't re-save it
+                tui::emit_line(&style("(new conversation — nothing carried over)").dim().to_string());
+            } else {
+                match crate::repl::postturn::refresh_distill_now(history).await {
+                    Ok(seed) => {
+                        rebuild_system(history, model_label);
+                        history.push(Message::system(format!(
+                            "{}{seed}",
+                            crate::agent::compact::HANDOFF_MARKER_PREFIX
+                        )));
+                        reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
+                        set_session_slug(None); // the next turn names + autosaves a brand-new session file
+                        update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                                      // immediate window-close after /clear doesn't re-save it
+                        tui::emit_line(&style("(new conversation — carried over a memory of this one)").dim().to_string());
+                    }
+                    Err(e) => {
+                        tui::emit_line(&style(format!("carry-over failed ({e}) — conversation left as-is; retry or /clear hard to wipe")).dim().to_string());
+                    }
+                }
+            }
         }
         SlashId::Where => {
             tui::emit_line(&where_report());

@@ -158,6 +158,10 @@ async fn main() -> Result<()> {
         Commands::Chat(args) => run_chat(args).await,
         Commands::Agent(args) => run_agent_cmd(args).await,
         Commands::Workflow(args) => run_workflow_cmd(args).await,
+        Commands::Status { run_id } => crate::cli::run_cmds::run_run_status(&run_id),
+        Commands::Resume { run_id, spec, yes } => {
+            crate::cli::run_cmds::run_run_resume(&run_id, spec.as_deref(), yes).await
+        }
         Commands::Memory { cmd } => run_memory(cmd).await,
         Commands::Skill { cmd } => run_skill(cmd).await,
         Commands::Persona { cmd } => run_persona(cmd),
@@ -1076,16 +1080,85 @@ async fn run_menu_sticky() -> Result<()> {
                         autosave_last(&history, Some(&model));
                     }
                     Some(Ok(outcome)) => {
-                        // ABNORMAL STOP, SAID OUT LOUD. The loop can end for reasons that are NOT
-                        // success — the repair budget ran out with the tree still broken, the step cap
-                        // was hit mid-task, the model started repeating itself — and in every one of
-                        // them the model has usually already streamed a confident closing paragraph.
-                        // Without this the three read EXACTLY like `Done`: the post-turn passes below
-                        // file the run as a normal episode and store it as a normal session, so a red
-                        // tree is remembered as a finished task. The one-shot `aizen agent` path has
-                        // reported these since it was written (see the `match outcome.stop` in
-                        // `run_agent_cmd`); the REPL — where the user actually lives — never did.
-                        finish_turn(&outcome, persona_before, &mut history, &http, &ep).await;
+                        // MODEL-REQUESTED REFRESH. The model's final text opened with `REFRESH:` — it
+                        // judged the thread too long/drifted to keep steering and asked for a fresh
+                        // one. Distill a carry-over seed (smart: recent tail + touchpoints ledger,
+                        // not the whole transcript), rebuild the thread seeded with it, then re-seat
+                        // the user's ORIGINAL request so the work continues with a clean context.
+                        // One shot per user turn: the refreshed thread starts with the same request
+                        // and no memory of having asked for a refresh before, so a second REFRESH:
+                        // would be a fresh decision, not a loop.
+                        if matches!(outcome.stop, StopReason::Refresh) {
+                            match crate::repl::postturn::refresh_distill_now(&history).await {
+                                Ok(seed) => {
+                                    rebuild_system(&mut history, &model_label);
+                                    history.push(Message::system(format!(
+                                        "{}{seed}",
+                                        crate::agent::compact::HANDOFF_MARKER_PREFIX
+                                    )));
+                                    reset_per_session_state();
+                                    set_session_slug(None);
+                                    update_live_history(&history);
+                                    // Re-seat the original request so the fresh thread continues
+                                    // the SAME work, not a blank "what do you want?" prompt.
+                                    seat_user_message(&line, Vec::new(), &mut history, &model);
+                                    let mut cfg2 =
+                                        turn_agent_config(turn_cancel.clone(), &model, true);
+                                    if let Some(t) = eff.as_deref() {
+                                        cfg2.apply_effort(t);
+                                    }
+                                    let r2 =
+                                        run_agent_turn(&http, &ep, &cfg2, &registry, &mut history)
+                                            .await;
+                                    match r2 {
+                                        Ok(outcome2) => {
+                                            finish_turn(
+                                                &outcome2,
+                                                persona_before,
+                                                &mut history,
+                                                &http,
+                                                &ep,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            tui::emit_line(&format!(
+                                                "{} {e}",
+                                                theme::err("error:")
+                                            ));
+                                            if history
+                                                .last()
+                                                .map(|m| m.role == "user")
+                                                .unwrap_or(false)
+                                            {
+                                                history.pop();
+                                            }
+                                            autosave_last(&history, Some(&model));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Distill failed — fall back to the old surface (tell the user
+                                    // the model asked, let them decide).
+                                    tui::emit_line(&style(format!(
+                                        "⚠ the model asked to refresh the thread after {} step(s), but carry-over failed ({e}) — run /clear to force it.",
+                                        outcome.iters
+                                    )).dim().to_string());
+                                    autosave_last(&history, Some(&model));
+                                }
+                            }
+                        } else {
+                            // ABNORMAL STOP, SAID OUT LOUD. The loop can end for reasons that are NOT
+                            // success — the repair budget ran out with the tree still broken, the step cap
+                            // was hit mid-task, the model started repeating itself — and in every one of
+                            // them the model has usually already streamed a confident closing paragraph.
+                            // Without this the three read EXACTLY like `Done`: the post-turn passes below
+                            // file the run as a normal episode and store it as a normal session, so a red
+                            // tree is remembered as a finished task. The one-shot `aizen agent` path has
+                            // reported these since it was written (see the `match outcome.stop` in
+                            // `run_agent_cmd`); the REPL — where the user actually lives — never did.
+                            finish_turn(&outcome, persona_before, &mut history, &http, &ep).await;
+                        }
                     }
                     Some(Err(e)) => {
                         tui::emit_line(&format!("{} {e}", theme::err("error:")));

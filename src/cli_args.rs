@@ -33,6 +33,30 @@ pub(crate) enum Commands {
     /// Run a workflow: fan out a set of role-scoped sub-agents (from a JSON spec), then
     /// synthesize their results into one answer (mixture-of-agents).
     Workflow(WorkflowArgs),
+    /// Read a run's event log (JSONL) and report its state: which events completed, which are
+    /// unresolved (failed tool calls), and the next sequence number a resume would start from.
+    /// Read-only — never writes. Alias of `run-status` (the name the Phase-1 design doc uses).
+    #[command(alias = "run-status")]
+    Status {
+        /// The run id (as passed to `aizen status <id>`). Matches the JSONL filename under
+        /// the run's scratch dir, without the `.jsonl` extension.
+        run_id: String,
+    },
+    /// Resume an interrupted workflow run: read the run's event log, skip the tasks already
+    /// recorded as done, and re-run only the rest (zero LLM tokens re-spent on finished work).
+    /// Without `--spec` this is a dry-run. Alias of `run-resume`.
+    #[command(alias = "run-resume")]
+    Resume {
+        /// The run id (as passed to `aizen resume <id>`; also printed by `workflow` at start).
+        run_id: String,
+        /// Path to the workflow spec (JSON or YAML). Required for a real resume: the log holds
+        /// outcomes, not prompts, so re-running the surviving tasks needs the original spec.
+        #[arg(long, value_name = "path")]
+        spec: Option<String>,
+        /// Skip the confirmation prompt before a real resume.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Manage the CLI's memory brain.
     Memory {
         #[command(subcommand)]
@@ -1536,6 +1560,10 @@ pub(crate) struct WorkflowArgs {
     /// Write a JSON audit trace of the fan-out (per-task model + outcome + synthesis model) here.
     #[arg(long)]
     pub(crate) trace: Option<String>,
+    /// Resume an interrupted workflow run: reuse its run id so tasks already logged as done
+    /// are skipped instead of re-run. Pass the same id shown in `run-list`.
+    #[arg(long, value_name = "run_id")]
+    pub(crate) resume: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]

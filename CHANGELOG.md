@@ -7,6 +7,81 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+### Changed
+- **`/clear` now refreshes instead of forgetting.** A fresh start used to wipe the thread to a blank
+  system prompt, so the model woke up with no memory of what it had just been doing — a mid-task "new
+  conversation" felt like handing the work to a stranger. `/clear` (and its `new`/`reset` aliases) now
+  distills the previous thread into one dense seed note — goals, decisions, files touched, commands
+  run, open tasks, and a reflection on what was tried and failed — and seeds the fresh thread with it
+  behind the handoff marker, so the new thread continues the same work without re-deriving it. The full
+  previous transcript still stays saved under its own name (`/sessions` reopens it). The distillation is
+  one cancellable model call (Esc leaves the thread untouched), and an empty or first-turn thread skips
+  it. `/clear hard` (also `fresh`/`wipe`/`blank`) keeps the old blank-slate behaviour. This revives the
+  retired `/handoff` idea — a fresh thread that remembers beats a summarized one — but wires it into the
+  refresh people actually reach for instead of a separate command nobody ran.
+- **A long but healthy turn no longer stops mid-task to ask you to type "continue".** The step cap
+  exists to bound a *wandering* loop, but the continuation budget was tuned so tight (3 fresh budgets
+  on `medium`) that an ordinary large edit on the interactive surface hit the wall while still making
+  progress, synthesized a "here's how far I got" summary, and handed back partial work. The budgets
+  that govern a *still-progressing* run are now far more generous: the interactive default extends
+  once to ~80 steps (was ~50) and then grants up to 8 continuations (was 3), and every `/effort` tier
+  scales up to match (`low` 12/24/2, `medium` 25/80/8, `high` 40/120/12, `xhigh` 60/180/16,
+  `max` 90/300/24 for iters/auto-extend/continuations). Nothing about the safety model changed — the
+  stall ledger still ends a run the moment two turns in a row add no evidence, so the extra room only
+  ever buys steps for genuine progress; a flat or looping run still stops exactly as before. Delegated
+  sub-agents and workflow children are untouched (they set their own budgets and run no continuation
+  loop).
+
+### Fixed
+- **No more escape-code garbage and broken scrolling on the bare Linux console.** Resuming a session
+  on a terminal that cannot host the full-screen UI — the Linux VT (`TERM=linux`), a `dumb`/empty/
+  unset `TERM`, or a BSD console — printed the alternate-screen / mouse / bracketed-paste mode-sets as
+  literal `^[[?1049h` / `[200~` text while the transcript scrolled out from under the frame. The replay
+  only made it loud: the TUI should never have taken those terminals at all. `retained::preferred()`
+  now checks `$TERM` as well as `is_terminal()`, so an incapable console falls back to the plain
+  line-REPL (which needs nothing but raw mode and a cursor) instead of a frame it can't paint. Capable
+  emulators and multiplexers (xterm, foot, alacritty, kitty, screen/tmux, …) are unaffected, and
+  `AIZEN_NO_STICKY=1` still forces the plain REPL anywhere.
+
+## [0.7.0] — 2026-10-06
+
+Multi-agent orchestration lands its first three phases: durable run logs with real resume, a
+barrier-free scheduler, and supervision with cost reporting.
+
+### Added
+- **Run log + real resume (Phase 1).** Every workflow run appends to an append-only JSONL event
+  log under `.aizen/runs/<run-id>.jsonl` (override with `AIZEN_RUNS_DIR`). New event kind `task`
+  records each workflow task's outcome; `runlog::plan()` derives a skip/run plan from the log as a
+  pure function. New CLI: `aizen resume <run-id> --spec <path>` (alias `run-resume`) replays the
+  log, injects recorded outcomes for finished tasks (zero LLM tokens re-spent — verified E2E with a
+  killed run), and re-runs only the rest; without `--spec` it dry-runs the plan. `aizen status
+  <run-id>` (alias `run-status`) reads a log without writing. `aizen workflow --resume <run-id>`
+  resumes inline.
+- **Ready-queue scheduler (Phase 2a).** `schedule()` no longer runs wave-by-wave: a task starts the
+  moment its `after` dependencies finish and a slot frees. Writers now serialize globally, not just
+  per-wave. The fix loop runs immediately after its task instead of at wave end.
+- **Live blackboard + coordinator signals (Phase 2b/2c).** A running child sees new sibling findings
+  on its next tool turn via a collapsing `[blackboard]` nudge, and drains coordinator instructions
+  from `<run-id>.signals.jsonl` as `[signal]` nudges each loop iteration.
+- **Slot queue (Phase 2d).** A task that hits the sub-agent concurrency limit parks and polls
+  (200ms × up to 60s) instead of returning a soft error the model had to retry around.
+- **Supervision + restart policy (Phase 3).** A child that fails with `error`/`deadline` gets one
+  same-task restart after a 500ms backoff (one_for_one, max 1); a permanent failure escalates to a
+  metis re-plan that writes a replacement task from what the failures taught. Retry prompts are
+  diff-feedback ("smallest patch on what you just wrote"). Per-model concurrency budgets via
+  `model_endpoints[].max_concurrent` in config, enforced beside the global gate. Every workflow now
+  prints a one-line cost report (`cost: X→Y tok across N task(s)`), and the `workflow` tool
+  description carries the effort-scaling table (cheap lookup / default implement / strongest design).
+- **Design doc:** `docs/design/multi-agent-orchestration.md` — the phased plan this release
+  implements (Phases 0–3).
+
+### Tests
+- New integration tests: `tests/resume_plan.rs` (E2E resume plan from a fabricated log) and
+  `tests/eval.rs` (20-task eval harness with keyword checks + LLM judge; `#[ignore]`d by default —
+  run with `--ignored --nocapture`, needs a live endpoint). Unit tests for the ready-queue
+  (no-wave-barrier timing, global writer serialization, restart-once, no-second-restart) and the
+  runlog `plan()` skip policy. Suite: 2069 passed, 0 failed.
+
 ## [0.6.9] — 2026-10-01
 
 Quality-of-life fixes: the time machine survives a wrong cwd, the verify gate stops timing out

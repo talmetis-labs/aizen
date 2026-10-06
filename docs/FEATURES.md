@@ -52,7 +52,7 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 **The agent loop — `aizen agent <task>`**
 - A lean 6-step state machine per turn: **call model (with tools) → classify (a non-empty `tool_calls[]` is the signal, *not* `finish_reason`) → execute each tool (validate → gate destructive ops → truncate result → feed errors back) → append results → check convergence → loop.**
-- **Iteration caps:** default 25 steps (`--max-iters`), with a **one-time auto-extend to ~50** when the model is near the cap and asked to wrap up. Hitting the wall ends with a clear `MaxIters` stop.
+- **Iteration caps:** default 25 steps (`--max-iters`), with a **one-time auto-extend to ~80** when the model is near the cap and asked to wrap up. Past that, a run that is *still making progress* (stall ledger not flat, no looping) keeps earning fresh step budgets — up to 8 continuations on the interactive surface — instead of stopping mid-task; only a wandering or looping run hits the wall and ends with a clear `MaxIters` stop.
 - **Divergence guard:** if the model repeats the exact same tool calls two turns running, it gets one recovery nudge, then stops (`Divergence`).
 - **Context guard:** near ~90% of the context window, a one-time "wrap up now" nudge is injected.
 - **Verify gate (post-edit typecheck):** after a successful destructive edit and before declaring "done," Aizen auto-runs the project's check (`cargo check`; for Node, `tsc --noEmit` / typecheck script; silent no-op for unknown projects, 90s timeout). On failure it injects the compiler errors and grants one fix turn. This is the "done but broken" catcher.
