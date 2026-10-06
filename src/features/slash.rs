@@ -546,9 +546,11 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[("new", "alias for /clear"), ("reset", "alias for /clear")],
         hidden_aliases: &[],
         hidden: false,
-        description: "start a fresh conversation",
-        argument_hint: "",
-        help: "start a fresh conversation",
+        description: "start a fresh conversation (distills a memory of this one)",
+        argument_hint: "[hard]",
+        help: "start a fresh conversation that REMEMBERS this one: the thread is distilled into one \
+               dense seed note (goals, decisions, files, open tasks) that the new thread starts with; \
+               /clear hard wipes with nothing carried over",
         stdin: Stdin::Never,
     },
     Builtin {

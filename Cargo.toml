@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.6.9"
+version = "0.7.0"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "Apache-2.0"
@@ -136,6 +136,21 @@ lto = "fat"          # aggressive cross-crate inlining dissolves function bounda
 codegen-units = 1    # one unit → more inlining, smaller output (slower link; CI absorbs it)
 strip = true         # drop the symbol table + debug info (no function names for a disassembler)
 debug = false
+
+# Dev profile tuned for the code→verify loop, not for debugging: no debuginfo (the verify harness
+# and `cargo check`/`cargo test` never read it, and writing + linking it is the single biggest cost
+# of a cold dev build of this crate), and incremental ON (the default, stated explicitly so a future
+# "turn it off for reproducibility" edit doesn't silently double every verify run). This is what
+# keeps `cargo test` under the verify gate's timeout after a source edit.
+[profile.dev]
+debug = false
+incremental = true
+
+# Test builds inherit the same posture: tests assert on behaviour, not on debug symbols, and the
+# 180s verify cap is hit in the LINK step of the test binary — exactly what `debug = false` removes.
+[profile.test]
+debug = false
+incremental = true
 
 # Image (vision) input — encode a pasted clipboard image into a data URL for OpenAI-compatible
 # vision models (paste a screenshot straight into the chat box with Ctrl-V). Clipboard access is

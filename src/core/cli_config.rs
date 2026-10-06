@@ -506,6 +506,12 @@ pub struct ModelEndpoint {
     /// `env:VAR` (preferred — the key never touches disk) or a literal key (masked in displays).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<String>,
+    /// Phase 3 (per-model concurrency budget): at most this many sub-agents run on this model at
+    /// once, machine-wide. Absent ⇒ only the global `SubagentGate` cap applies. Two gates, two
+    /// reasons: the global one protects the CLI from thread oversubscription; this one protects
+    /// a PROVIDER from rate-limit bursts when the same expensive model is fanned out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
 }
 
 /// Resolve the full endpoint a `model` should run on: if the model-endpoint registry has an entry
@@ -1806,6 +1812,7 @@ mod tests {
                 model: "gpt-4o".into(),
                 base_url: Some("https://openai/v1".into()),
                 api_key_ref: Some("env:AIZEN_TEST_OAI_KEY".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })
@@ -1866,6 +1873,7 @@ mod tests {
                 model: "cheap-fast".into(),
                 base_url: Some("https://cheap/v1".into()),
                 api_key_ref: Some("cheap-literal-key".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })

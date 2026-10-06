@@ -746,6 +746,8 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             "\n[stopped: wall-clock budget reached after {} step(s) — the task may be incomplete]",
             outcome.iters
         ),
+        // A one-shot run has no thread to refresh into; the model's note is its final answer.
+        StopReason::Refresh => {}
     }
     Ok(())
 }
@@ -860,7 +862,170 @@ pub(crate) async fn run_workflow_cmd(args: WorkflowArgs) -> Result<()> {
     } else {
         ApprovalMode::Ask
     };
-    agent::workflow::run_workflow(&http, &base_url, &api_key, &model, approval, &spec, trace).await
+    agent::workflow::run_workflow_resumable(
+        &http,
+        &base_url,
+        &api_key,
+        &model,
+        approval,
+        &spec,
+        trace,
+        args.resume.as_deref(),
+    )
+    .await
+}
+
+/// Where workflow run logs live — delegates to `runlog::runs_dir()` (`.aizen/runs/`,
+/// `AIZEN_RUNS_DIR` override). Kept here so the CLI and the orchestrator agree on one place.
+fn runs_dir() -> std::path::PathBuf {
+    crate::agent::runlog::runs_dir()
+}
+
+/// `aizen run-status <run-id>` — read the run's event log and print its state. Read-only.
+pub(crate) fn run_run_status(run_id: &str) -> Result<()> {
+    let runs_dir = runs_dir();
+    let path = runs_dir.join(format!("{run_id}.jsonl"));
+    let events = crate::agent::runlog::read_events(&path)
+        .with_context(|| format!("reading run log {}", path.display()))?;
+
+    println!("run:  {run_id}");
+    println!("log:  {}", path.display());
+    println!("events: {}", events.len());
+    if let Some(last) = events.last() {
+        println!("next seq: {}", last.seq() + 1);
+    } else {
+        println!("next seq: 0");
+    }
+
+    let unresolved = crate::agent::runlog::unresolved(&events);
+    if unresolved.is_empty() {
+        println!("unresolved: (none)");
+    } else {
+        println!("unresolved: {unresolved:?}");
+        for seq in &unresolved {
+            if let Some(crate::agent::runlog::Event::Tool { name, error, .. }) =
+                events.iter().find(|e| e.seq() == *seq)
+            {
+                println!("  seq {seq}: tool `{name}` failed: {error:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `aizen run-resume <run-id>` — resume an interrupted workflow run.
+///
+/// Without `--spec` this is a dry-run: it prints the replay plan (which tasks the log marks as
+/// done → skipped, which re-run) and exits. With `--spec` it re-executes the workflow under the
+/// SAME run id, injecting recorded outcomes for finished tasks so their tokens are not re-spent.
+pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: bool) -> Result<()> {
+    let runs_dir = runs_dir();
+    let path = runs_dir.join(format!("{run_id}.jsonl"));
+    let events = crate::agent::runlog::read_events(&path)
+        .with_context(|| format!("reading run log {}", path.display()))?;
+
+    // Recover the spec's task ids from the Note the workflow wrote at start. If the log has no
+    // such note (a non-workflow run), fall back to every task_id seen on the log.
+    let task_ids: Vec<String> = {
+        let from_note = events.iter().find_map(|e| {
+            if let crate::agent::runlog::Event::Note { label, body, .. } = e {
+                if label == "workflow-spec" {
+                    serde_json::from_str::<serde_json::Value>(body)
+                        .ok()?
+                        .get("tasks")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                        .into()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        from_note.unwrap_or_else(|| {
+            events
+                .iter()
+                .filter_map(|e| {
+                    if let crate::agent::runlog::Event::Task { task_id, .. } = e {
+                        Some(task_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+    };
+    let id_refs: Vec<&str> = task_ids.iter().map(String::as_str).collect();
+    let actions = crate::agent::runlog::plan(&events, &id_refs);
+
+    println!("run:  {run_id}");
+    println!("log:  {}", path.display());
+    println!("resume plan ({} task(s) known to the log):", task_ids.len());
+    let mut skips = 0usize;
+    for (id, action) in task_ids.iter().zip(actions.iter()) {
+        match action {
+            crate::agent::runlog::Action::Skip { status, .. } => {
+                skips += 1;
+                println!("  skip  {id}  (log: {status})");
+            }
+            crate::agent::runlog::Action::Run => println!("  run   {id}"),
+        }
+    }
+
+    let spec_path = match spec_path {
+        Some(p) => p,
+        None => {
+            println!();
+            println!("dry-run: pass --spec <workflow.json> to resume for real.");
+            return Ok(());
+        }
+    };
+    if task_ids.is_empty() {
+        anyhow::bail!(
+            "run '{run_id}' has no task events to resume from — was it started by `aizen workflow`?"
+        );
+    }
+    if skips == task_ids.len() {
+        println!("\nevery task is already done — nothing to resume.");
+        return Ok(());
+    }
+
+    let text = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("reading workflow spec {spec_path}"))?;
+    let spec: agent::workflow::WorkflowSpec =
+        serde_json::from_str(&text).context("parsing workflow spec JSON")?;
+
+    if !yes {
+        println!(
+            "\nabout to resume '{run_id}': {skips} skipped, {} re-run. Re-run spends LLM tokens.",
+            task_ids.len() - skips
+        );
+        let go = dialoguer::Confirm::new()
+            .with_prompt("proceed?")
+            .default(false)
+            .interact()?;
+        if !go {
+            println!("aborted.");
+            return Ok(());
+        }
+    }
+
+    let (base_url, api_key, model) = resolve_endpoint(None, None, None)?;
+    let http = http_client()?;
+    agent::workflow::run_workflow_resumable(
+        &http,
+        &base_url,
+        &api_key,
+        &model,
+        ApprovalMode::Ask,
+        &spec,
+        None,
+        Some(run_id),
+    )
+    .await
 }
 
 #[cfg(test)]

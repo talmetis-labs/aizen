@@ -59,7 +59,49 @@ pub(crate) fn preferred() -> bool {
     // Retained is the ONLY interactive UI, so this is simply "can we take the terminal at all". When
     // it says no (piped output, CI, dumb terminals, or an explicit `NO_STICKY`) the caller runs the
     // plain line-REPL — there is no second renderer to pick, and nothing in the config selects one.
-    io::stdout().is_terminal() && !crate::core::cli_config::branded_flag("NO_STICKY")
+    //
+    // `term_can_fullscreen` is the half that makes "dumb terminals" above actually true. A bare Linux
+    // VT console (`TERM=linux`), a `dumb`/empty/unset `TERM`, or a BSD console does NOT honour the
+    // alternate screen (`?1049`), mouse reporting (`?1000`) or bracketed paste (`?2004`) that
+    // `TerminalSession::enter` turns on — so on those the mode-set escapes are not consumed and leak
+    // onto the screen as literal `^[[?1049h` / `[200~` text while the transcript scrolls out from
+    // under the frame (the "reopening a session shows escape codes + broken scroll on Linux" bug).
+    // Those terminals must fall back to the plain line-REPL, which needs nothing but raw mode + cursor.
+    //
+    // The check is UNIX-ONLY. Windows consoles do not expose $TERM at all (it is never set), and
+    // crossterm negotiates raw mode / alt-screen through the Win32 console API — so a $TERM-based
+    // deny list would wrongly reject EVERY Windows terminal (conhost, Windows Terminal, Tabby...).
+    io::stdout().is_terminal()
+        && term_supported_here()
+        && !crate::core::cli_config::branded_flag("NO_STICKY")
+}
+
+/// Whether the current platform's terminal can host the full-screen retained TUI (alternate screen
+/// + mouse + bracketed paste). On Windows there is no $TERM to consult — any real console qualifies
+/// (`is_terminal` above already ruled out pipes/redirects). On Unix, defer to the $TERM deny list.
+#[cfg(windows)]
+fn term_supported_here() -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn term_supported_here() -> bool {
+    term_can_fullscreen(std::env::var("TERM").ok().as_deref())
+}
+
+/// Whether `$TERM` names a terminal that can host the full-screen retained TUI (alternate screen +
+/// mouse + bracketed paste). A DENY list, not an allow list — a terminal we have never heard of is
+/// assumed capable (it keeps working, and `AIZEN_NO_STICKY` forces the plain REPL when it is not).
+/// The one failure we must prevent is the opposite: entering the alt-screen on a console that cannot
+/// interpret the mode-sets, which dumps them as visible `^[[?1049h` / `[200~` and corrupts scrolling.
+#[cfg(not(windows))]
+fn term_can_fullscreen(term: Option<&str>) -> bool {
+    !matches!(
+        term.map(|t| t.trim()),
+        // unset / empty / the no-capabilities sentinel / the bare Linux (fbcon) and BSD consoles —
+        // none of which implement the alternate screen, mouse reporting or bracketed paste.
+        None | Some("") | Some("dumb") | Some("linux") | Some("cons25")
+    )
 }
 
 pub(crate) fn is_active() -> bool {
@@ -374,4 +416,59 @@ pub(crate) fn screensaver(card: Option<usize>) {
 #[allow(dead_code)]
 fn set_focus(focused: bool) {
     send(Command::Focus(focused));
+}
+
+#[cfg(test)]
+mod capability_tests {
+    #[cfg(windows)]
+    use super::term_supported_here;
+    #[cfg(not(windows))]
+    use super::term_can_fullscreen;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_consoles_are_always_capable() {
+        // There is no $TERM on Windows; any real console qualifies (is_terminal rules out pipes).
+        assert!(term_supported_here());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bare_and_dumb_terminals_fall_back_to_plain() {
+        // The Linux VT console, the no-capabilities sentinel, an empty value, a BSD console, and a
+        // missing $TERM all lack the alt-screen / mouse / bracketed-paste modes the retained TUI needs.
+        for t in ["linux", "dumb", "", "cons25"] {
+            assert!(
+                !term_can_fullscreen(Some(t)),
+                "{t:?} must not host the full-screen TUI"
+            );
+        }
+        assert!(
+            !term_can_fullscreen(None),
+            "an unset $TERM must not host the full-screen TUI"
+        );
+        // Surrounding whitespace must not sneak a dumb terminal past the check.
+        assert!(!term_can_fullscreen(Some("  dumb  ")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn capable_terminals_keep_the_retained_tui() {
+        // Real emulators and multiplexers that DO pass the mode-sets through stay on the rich UI.
+        for t in [
+            "xterm-256color",
+            "screen-256color",
+            "tmux-256color",
+            "foot",
+            "alacritty",
+            "wezterm",
+            "xterm",
+            "rxvt-unicode-256color",
+        ] {
+            assert!(
+                term_can_fullscreen(Some(t)),
+                "{t:?} must keep the full-screen TUI"
+            );
+        }
+    }
 }

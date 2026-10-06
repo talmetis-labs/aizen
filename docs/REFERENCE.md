@@ -79,7 +79,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback; the download is checked against the release's published SHA-256 and refused on a mismatch |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
 | `/theme [moonlight\|lanes]` | colour theme: `moonlight` (default) keeps the calm all-silver look; `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal. Bare `/theme` lists both with a live colour swatch; the choice persists |
-| `/clear` | fresh conversation · `/tokens` usage · `/quit` exit |
+| `/clear` | start a fresh conversation that REMEMBERS this one: the thread is distilled into a dense seed note the new conversation starts with · `/clear hard` wipes with nothing carried over · `/tokens` usage · `/quit` exit |
 
 **Input shortcuts** — on a normally typed message (not with an image):
 

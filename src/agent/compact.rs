@@ -46,6 +46,60 @@ const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to con
     WHY (errors hit, dead ends, things that did not work) — so the continuation does not repeat \
     them. Use terse bullet points. Do NOT invent anything not in the transcript.";
 
+/// The `/clear` carry-over instruction. Compaction keeps a verbatim tail; a REFRESH does not — it
+/// starts a BRAND-NEW thread, so the whole prior conversation is distilled into one seed note that
+/// becomes the fresh thread's only memory of it. This is the Amp lesson kept rather than dropped: a
+/// fresh thread that still REMEMBERS what the last one was doing beats one that wakes up blank.
+/// Goal-free (a plain refresh carries no new objective) and dense enough that the next turn can
+/// continue the SAME work without re-deriving it.
+const CARRYOVER_SYS: &str = "You write a HANDOFF NOTE for a coding assistant that is starting a \
+    fresh thread to CONTINUE the same work. Preserve densely: the user's goals and explicit \
+    requests, decisions made, files/paths touched, commands run and their outcomes, important \
+    code/config, the CURRENT state of the work, and any OPEN or UNFINISHED task with its obvious \
+    next step. Include a REFLECTION of approaches TRIED and FAILED and WHY, so the fresh thread \
+    does not repeat them. Terse bullet points. Do NOT invent anything not in the transcript.";
+
+/// Smart `/clear` carry-over: distill ONLY the recent tail (the last `keep_turns` user turns) plus a
+/// ledger of what the conversation touched — files read/edited, skills loaded, todos — so the fresh
+/// thread inherits the *signal* without re-reading the whole transcript. The ledger is built from
+/// [`context_touchpoints`] and the todo summary, both cheap in-memory scans, and is folded into the
+/// distillation prompt so the model can reference them without seeing the full history.
+pub fn carryover_prompt(history: &[Message]) -> Vec<Message> {
+    let lead = leading_system_count(history);
+    let tail = history.get(lead..).unwrap_or_default();
+    // Smart seed: only distill the recent tail (last 6 user turns) plus a ledger of what was
+    // touched — files, skills, todos — so the fresh thread inherits the signal without re-reading
+    // the whole transcript. The ledger is built from context_touchpoints and the todo summary,
+    // both cheap in-memory scans, and is folded into the distillation prompt so the model can
+    // reference them without seeing the full history.
+    let keep_turns = 6;
+    let tail_start = plan_compact_cut(tail, keep_turns).unwrap_or(0);
+    let recent = tail.get(tail_start..).unwrap_or_default();
+    let transcript = render_transcript(recent);
+    let tp = context_touchpoints(history);
+    let todos = crate::agent::todo::incomplete_summary(600);
+    let mut ledger = String::new();
+    if !tp.files.is_empty() {
+        ledger.push_str(&format!("Files touched: {}\n", tp.files.join(", ")));
+    }
+    if !tp.skills.is_empty() {
+        ledger.push_str(&format!("Skills loaded: {}\n", tp.skills.join(", ")));
+    }
+    if let Some(t) = todos {
+        ledger.push_str(&format!("Open todos:\n{t}\n"));
+    }
+    let mut prompt = String::from("Conversation tail to carry forward:\n\n");
+    prompt.push_str(&transcript);
+    if !ledger.is_empty() {
+        prompt.push_str("\n\nContext ledger (from the full thread):\n");
+        prompt.push_str(&ledger);
+    }
+    vec![
+        Message::system(CARRYOVER_SYS),
+        Message::user(prompt),
+    ]
+}
+
 /// Truncate to `max` chars with a `…[+N chars]` marker (char-safe, never splits a codepoint).
 pub fn truncate_chars(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();

@@ -308,9 +308,13 @@ fn with_fix_request(
     latest: &std::collections::HashMap<String, usize>,
 ) -> WorkflowTask {
     let mut t = with_upstream(target, results, latest, Some(attempt));
+    // Phase 3 (diff-feedback): the retry brief leads with the SMALLEST patch framing, so the
+    // re-dispatched writer edits the code it just wrote instead of re-attempting from scratch —
+    // the whole point of sending the verifier's findings back.
     t.prompt = format!(
-        "{}\n\n<fix_request>\nThe verifier reported FAIL on your change. Fix it in place — do not \
-         start over and do not widen the scope. Its report:\n{}\n</fix_request>",
+        "{}\n\n<fix_request>\nThe verifier reported FAIL on your change. Apply the SMALLEST patch \
+         that fixes what it found — a diff on top of the code you just wrote, not a rewrite. Do \
+         not widen the scope. Its report:\n{}\n</fix_request>",
         t.prompt,
         clip_chars(failure.trim(), FIX_REQUEST_CHARS)
     );
@@ -377,13 +381,13 @@ async fn fix_loop<F, Fut>(
     }
 }
 
-/// Run the tasks wave by wave (see [`waves`]). Within a wave the read-only tasks fan out `width`
-/// at a time and THEN the wave's writer (at most one — [`enforce_singular_writer`]) runs alone, so
-/// a reviewer never reads a tree the implementer is mutating; a spec that wants the review AFTER
-/// the change says so with `after`. A chained task receives its dependencies' latest reports; a
-/// task whose report opens with FAIL and names `retry_on_fail` triggers one fix loop
-/// ([`fix_loop`]). Retries are recorded as `<id>#2` outcomes so the trace keeps both attempts and
-/// downstream tasks see the latest. Tasks never started (cancel) are marked cancelled.
+/// Run the tasks as a ready-queue, NOT wave by wave (Phase 2a): a task starts the moment every
+/// `after` dependency has finished AND a slot is free — a slow wave-mate no longer stalls the
+/// rest of its wave. Readers fan out `width` at a time; writers serialize GLOBALLY (at most one
+/// writer running at any moment — stronger than the old per-wave rule, and required for the same
+/// reason: two writers race the working tree). A chained task receives its dependencies' latest
+/// reports; a FAIL verdict with `retry_on_fail` triggers one fix loop (`fix_loop`), recorded as
+/// `<id>#2`. Tasks never started (cancel) are marked cancelled.
 ///
 /// Generic over the runner so the ordering and the fix loop are testable without a model.
 pub(crate) async fn schedule<F, Fut>(
@@ -397,53 +401,137 @@ where
     F: Fn(WorkflowTask) -> Fut,
     Fut: std::future::Future<Output = TaskOutcome>,
 {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
     let width = width.max(1);
-    // Validated before we get here; an invalid graph runs flat rather than dropping tasks.
-    let waves = waves(tasks).unwrap_or_else(|_| vec![(0..tasks.len()).collect()]);
-    let mut results: Vec<TaskOutcome> = Vec::with_capacity(tasks.len());
-    let mut latest: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    'waves: for wave in &waves {
-        let (writers, readers): (Vec<usize>, Vec<usize>) = wave
-            .iter()
-            .copied()
-            .partition(|&i| task_is_writer(&tasks[i].role, tasks[i].agent.as_deref()));
-        for chunk in readers.chunks(width) {
-            if cancel.is_cancelled() {
-                break 'waves;
+    // Validate the graph first; an invalid graph runs flat rather than dropping tasks.
+    if let Err(e) = waves(tasks) {
+        eprintln!("workflow: invalid `after` graph, running flat: {e:#}");
+    }
+    let n = tasks.len();
+    let index: std::collections::HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str(), i))
+        .collect();
+    // deps[i] = indices i waits on; dependents[i] = indices waiting on i.
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, t) in tasks.iter().enumerate() {
+        for a in &t.after {
+            if let Some(&j) = index.get(a.trim()) {
+                if j != i && !deps[i].contains(&j) {
+                    deps[i].push(j);
+                    dependents[j].push(i);
+                }
             }
-            let futs: Vec<Fut> = chunk
-                .iter()
-                .map(|&i| {
-                    started.insert(i);
-                    run(with_upstream(&tasks[i], &results, &latest, None))
-                })
-                .collect();
-            for o in futures_util::future::join_all(futs).await {
-                record(&mut results, &mut latest, o);
-            }
-            for &i in chunk {
-                fix_loop(tasks, i, &mut results, &mut latest, cancel, &run).await;
-            }
-        }
-        for &i in &writers {
-            if cancel.is_cancelled() {
-                break 'waves;
-            }
-            started.insert(i);
-            let o = run(with_upstream(&tasks[i], &results, &latest, None)).await;
-            record(&mut results, &mut latest, o);
-            fix_loop(tasks, i, &mut results, &mut latest, cancel, &run).await;
         }
     }
+    let mut remaining: Vec<usize> = deps.iter().map(Vec::len).collect();
+    let is_writer: Vec<bool> = tasks
+        .iter()
+        .map(|t| task_is_writer(&t.role, t.agent.as_deref()))
+        .collect();
+
+    let mut results: Vec<TaskOutcome> = Vec::with_capacity(n);
+    let mut latest: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut finished: Vec<bool> = vec![false; n];
+    // Ready queue, spec order preserved; writers go to the back while a writer is in flight.
+    let mut ready: std::collections::VecDeque<usize> = (0..n).filter(|&i| remaining[i] == 0).collect();
+    let mut in_flight: FuturesUnordered<Fut> = FuturesUnordered::new();
+    let mut in_flight_writer = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Fill free slots from the ready queue.
+        while in_flight.len() < width {
+            let Some(&i) = ready.front() else { break };
+            if is_writer[i] && in_flight_writer {
+                break; // writers serialize globally; try again when the current writer lands
+            }
+            ready.pop_front();
+            started.insert(i);
+            if is_writer[i] {
+                in_flight_writer = true;
+            }
+            in_flight.push(run(with_upstream(&tasks[i], &results, &latest, None)));
+        }
+        if in_flight.is_empty() {
+            break; // nothing runnable: either done or the graph left unreachable tasks
+        }
+        let Some(outcome) = in_flight.next().await else { break };
+        let done_id = base_id(&outcome.id).to_string();
+        let done_idx = index.get(done_id.as_str()).copied();
+        let was_writer = done_idx.is_some_and(|i| is_writer[i]);
+        let mut outcome = outcome;
+        // Phase 3 (supervision, one_for_one): a transient child failure (`error`/`deadline`) gets
+        // ONE same-task restart before the failure is allowed to stand. A permanent failure (second
+        // crash) stops here — metis re-planning would need a model call inside the scheduler, which
+        // `schedule` deliberately does not own (it is generic over the runner); the synthesis
+        // reports `status: "error"` and the parent decides.
+        if matches!(outcome.status.as_str(), "error" | "deadline") {
+            if let Some(i) = done_idx {
+                if !cancel.is_cancelled() {
+                    // Phase 3 (backoff): wait before the restart so a rate-limited or
+                    // transiently-broken provider gets a chance to recover instead of being
+                    // hammered with an immediate retry.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let restarted = with_upstream(&tasks[i], &results, &latest, None);
+                    let retry_id = format!("{}#restart", tasks[i].id);
+                    let mut retry = restarted;
+                    retry.id = retry_id.clone();
+                    let o2 = run(retry).await;
+                    let o2 = TaskOutcome {
+                        id: retry_id,
+                        ..o2
+                    };
+                    let recovered = o2.status != "error" && o2.status != "deadline";
+                    let restart_summary = o2.summary.clone();
+                    record(&mut results, &mut latest, o2);
+                    if recovered {
+                        // The restart carried the work: the base task counts as done.
+                        let orig_status = outcome.status.clone();
+                        outcome.status = "done".to_string();
+                        outcome.summary = format!("(restarted after {orig_status}) {restart_summary}");
+                    }
+                }
+            }
+        }
+        record(&mut results, &mut latest, outcome);
+        if let Some(i) = done_idx {
+            finished[i] = true;
+            // Fix loop BEFORE releasing dependents: they must see the post-fix latest report.
+            fix_loop(tasks, i, &mut results, &mut latest, cancel, &run).await;
+            for &d in &dependents[i] {
+                remaining[d] = remaining[d].saturating_sub(1);
+                if remaining[d] == 0 && !started.contains(&d) {
+                    ready.push_back(d);
+                }
+            }
+        }
+        if was_writer {
+            in_flight_writer = false;
+        }
+    }
+
     for (i, t) in tasks.iter().enumerate() {
-        if !started.contains(&i) {
+        if !finished[i] {
             results.push(TaskOutcome {
                 id: t.id.clone(),
                 role: t.role.clone(),
                 model: model.to_string(),
                 status: "cancelled".into(),
-                summary: "cancelled by user before start".into(),
+                summary: if started.contains(&i) {
+                    "cancelled mid-flight".into()
+                } else {
+                    "cancelled by user before start".into()
+                },
                 iters: 0,
                 tokens_in: 0,
                 tokens_out: 0,
@@ -464,6 +552,7 @@ pub struct Synthesis {
 }
 
 /// The outcome of one fanned-out sub-task.
+#[derive(Clone, Debug)]
 pub struct TaskOutcome {
     pub id: String,
     pub role: String,
@@ -509,6 +598,34 @@ pub async fn run_workflow(
     spec: &WorkflowSpec,
     trace: Option<&Path>,
 ) -> Result<()> {
+    run_workflow_resumable(
+        http,
+        base_url,
+        api_key,
+        model,
+        approval_mode,
+        spec,
+        trace,
+        None,
+    )
+    .await
+}
+
+/// `run_workflow` + an optional run-id to resume from. When `resume_id` names an existing run
+/// log, the tasks `runlog::plan` decides are already done are injected as synthetic outcomes
+/// (no LLM call); the rest run for real, and every outcome lands in the SAME log so a second
+/// resume picks up exactly where this one stopped.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_workflow_resumable(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    approval_mode: crate::core::approval::ApprovalMode,
+    spec: &WorkflowSpec,
+    trace: Option<&Path>,
+    resume_id: Option<&str>,
+) -> Result<()> {
     let cancel = crate::core::cancel::TurnCancel::new();
     run_workflow_with_cancel(
         http,
@@ -519,6 +636,7 @@ pub async fn run_workflow(
         spec,
         trace,
         cancel,
+        resume_id,
     )
     .await
 }
@@ -533,6 +651,7 @@ async fn run_workflow_with_cancel(
     spec: &WorkflowSpec,
     trace: Option<&Path>,
     cancel: crate::core::cancel::TurnCancel,
+    resume_id: Option<&str>,
 ) -> Result<()> {
     validate_spec_ids(spec)?;
     // Same singular-writer gate as `workflow_tool::build_spec` — CLI specs used to skip it and could
@@ -553,11 +672,93 @@ async fn run_workflow_with_cancel(
         bail!("sub-agent concurrency limit reached — retry when running tasks finish");
     }
     let width = slots.len();
+
+    // ── Run log + resume plan ────────────────────────────────────────────────
+    // One workflow = one run id. A fresh run mints one; a resume reuses the id so the log
+    // continues where the killed run stopped (RunLogWriter picks up the next seq on reopen).
+    // Log lives under `.aizen/runs/` (per the design doc); `AIZEN_RUNS_DIR` overrides it for tests.
+    let runs_dir = crate::agent::runlog::runs_dir();
+    let run_id = resume_id.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "wf-{}-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            std::process::id()
+        )
+    });
+    let resume_events = match resume_id {
+        Some(_) => {
+            crate::agent::runlog::read_events(&runs_dir.join(format!("{run_id}.jsonl")))
+                .with_context(|| format!("reading run log for '{run_id}'"))?
+        }
+        None => Vec::new(),
+    };
+    let task_ids: Vec<&str> = spec.tasks.iter().map(|t| t.id.as_str()).collect();
+    let actions = crate::agent::runlog::plan(&resume_events, &task_ids);
+    let mut completed: std::collections::HashMap<String, TaskOutcome> =
+        std::collections::HashMap::new();
+    let mut skipped = 0usize;
+    for (task, action) in spec.tasks.iter().zip(actions.iter()) {
+        if let crate::agent::runlog::Action::Skip {
+            status,
+            summary,
+            iters,
+            tokens_in,
+            tokens_out,
+        } = action
+        {
+            skipped += 1;
+            completed.insert(
+                task.id.clone(),
+                TaskOutcome {
+                    id: task.id.clone(),
+                    role: task.role.clone(),
+                    model: model.to_string(),
+                    status: status.clone(),
+                    summary: summary.clone(),
+                    iters: *iters,
+                    tokens_in: *tokens_in,
+                    tokens_out: *tokens_out,
+                },
+            );
+        }
+    }
+    let mut runlog =
+        crate::agent::runlog::RunLogWriter::open(&runs_dir, &run_id).map(|w| Some(w)).unwrap_or_else(
+            |e| {
+                eprintln!("  (run log not available: {e})");
+                None
+            },
+        );
+    if let Some(w) = runlog.as_mut() {
+        let spec_json = serde_json::json!({
+            "name": spec.name,
+            "tasks": task_ids,
+        });
+        let _ = w.record(crate::agent::runlog::Event::Note {
+            seq: 0,
+            label: "workflow-spec".into(),
+            body: spec_json.to_string(),
+        });
+        if resume_id.is_some() {
+            let _ = w.record(crate::agent::runlog::Event::Note {
+                seq: 0,
+                label: "workflow-resume".into(),
+                body: format!("resuming: {skipped}/{} task(s) skipped", spec.tasks.len()),
+            });
+        }
+    }
+
     eprintln!(
-        "workflow '{}': {} task(s), up to {} in parallel (slots reserved)",
+        "workflow '{}': {} task(s), up to {} in parallel (slots reserved){} [run-id: {}]",
         spec.name,
         spec.tasks.len(),
-        width
+        width,
+        if skipped > 0 {
+            format!(", {skipped} skipped from run log")
+        } else {
+            String::new()
+        },
+        run_id
     );
 
     let wf_track = crate::agent::orchestration::start_workflow(&spec.name, spec.tasks.len());
@@ -575,9 +776,26 @@ async fn run_workflow_with_cancel(
         Some(parent_id),
         cancel.clone(),
         0,
+        &completed,
     )
     .await;
     drop(slots);
+
+    // Record every outcome (including the skipped ones — a resume must see them as done too)
+    // so a killed workflow resumes from exactly the tasks that never finished.
+    if let Some(w) = runlog.as_mut() {
+        for r in &results {
+            let _ = w.record(crate::agent::runlog::Event::Task {
+                seq: 0,
+                task_id: r.id.clone(),
+                status: r.status.clone(),
+                summary: r.summary.clone(),
+                iters: r.iters,
+                tokens_in: r.tokens_in,
+                tokens_out: r.tokens_out,
+            });
+        }
+    }
 
     for r in &results {
         eprintln!(
@@ -589,6 +807,74 @@ async fn run_workflow_with_cancel(
             r.iters,
             tok_suffix(r)
         );
+    }
+    // Phase 3 (cost report): one line, total spend across every task + restart + re-plan. This is
+    // the number the effort-scaling table is judged against.
+    let total_in: u64 = results.iter().map(|r| r.tokens_in).sum();
+    let total_out: u64 = results.iter().map(|r| r.tokens_out).sum();
+    eprintln!(
+        "  cost: {}→{} tok across {} task(s)",
+        crate::agent::orchestration::fmt_tokens(total_in),
+        crate::agent::orchestration::fmt_tokens(total_out),
+        results.len()
+    );
+
+    // Phase 3 (metis re-plan): a task that failed even AFTER its one restart is a permanent
+    // failure — the orchestrator asks metis (the planner role) to write a REPLACEMENT task from
+    // what was learned, runs it, and folds its outcome in before synthesis. One re-plan per
+    // failed task; a re-plan that also fails is left as-is (the synthesis reports the gap).
+    let mut results = results;
+    let permanent_failures: Vec<String> = results
+        .iter()
+        .filter(|r| {
+            r.status == "error" && results.iter().any(|r2| r2.id == format!("{}#restart", r.id))
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    for failed_id in &permanent_failures {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let failed = results.iter().find(|r| &r.id == failed_id).unwrap();
+        let replan_prompt = format!(
+            "A workflow task failed permanently (it was restarted once and failed again). Write a \
+             REPLACEMENT task that achieves the same goal by a different approach, using what the \
+             failures taught.\n\
+             Original task id: {}\nOriginal prompt: {}\nFailure report: {}\n\n\
+             Reply with ONLY the replacement task's prompt (no preamble, no id — the orchestrator \
+             assigns the id).",
+            failed.id,
+            spec.tasks
+                .iter()
+                .find(|t| t.id == *failed_id)
+                .map(|t| t.prompt.as_str())
+                .unwrap_or("(unknown)"),
+            clip_chars(&failed.summary, 600)
+        );
+        let replanned = run_one_task(
+            http,
+            base_url,
+            api_key,
+            model,
+            approval_mode,
+            &root,
+            &date,
+            &WorkflowTask {
+                id: format!("{failed_id}#replan"),
+                role: "metis".into(),
+                prompt: replan_prompt,
+                ..Default::default()
+            },
+            Some(parent_id),
+            cancel.clone(),
+            0,
+        )
+        .await;
+        eprintln!(
+            "  • {} ({}/{}) — {} [{} step(s)]  (metis re-plan)",
+            replanned.id, replanned.role, replanned.model, replanned.status, replanned.iters
+        );
+        results.push(replanned);
     }
 
     // Only the PARENT token ends the whole workflow. A cancelled CHILD (`/workflows stop #id`)
@@ -799,6 +1085,7 @@ pub(crate) async fn fan_out(
         None,
         crate::core::cancel::TurnCancel::new(),
         0,
+        &std::collections::HashMap::new(),
     )
     .await
 }
@@ -818,11 +1105,18 @@ async fn fan_out_tracked(
     parent: Option<u64>,
     cancel: crate::core::cancel::TurnCancel,
     context_window: usize,
+    completed: &std::collections::HashMap<String, TaskOutcome>,
 ) -> Vec<TaskOutcome> {
     let width = max_parallel.clamp(1, crate::agent::task_tool::max_parallel_subagents_pub());
     schedule(tasks, width, model, &cancel, |t: WorkflowTask| {
         let cancel = cancel.clone();
+        // Resume: a task with a recorded skippable outcome is answered from the log, not
+        // re-run — zero LLM tokens re-spent on work the previous run already paid for.
+        let prior = completed.get(&t.id).cloned();
         async move {
+            if let Some(o) = prior {
+                return o;
+            }
             run_one_task(
                 http,
                 base_url,
@@ -899,6 +1193,7 @@ pub(crate) async fn run_workflow_collect(
         Some(parent_id),
         cancel.clone(),
         context_window,
+        &std::collections::HashMap::new(),
     )
     .await;
     drop(slots); // explicit: hold the reservation across the whole fan-out, free it here
@@ -1357,6 +1652,9 @@ pub(crate) async fn run_one_task(
                 StopReason::AwaitingInput(_) => "awaiting-input",
                 StopReason::Cancelled => "cancelled",
                 StopReason::Deadline => "deadline",
+                // A sub-agent's refresh request maps to done: the workflow runtime has no thread to
+                // refresh, so the child's final note is its answer.
+                StopReason::Refresh => "done",
             };
             let ok = status == "done";
             let summary = o
@@ -1748,13 +2046,15 @@ mod tests {
             .iter()
             .map(|(id, _)| id.clone())
             .collect();
-        // Wave 0: the reader (scout) fans out first, then the writer (implement) alone. Wave 1:
-        // verify FAILs → implement#2 with the failure, verify#2 → PASS. Wave 2: review.
+        // Ready-queue (Phase 2a): wave-0 tasks start in SPEC order — implement (writer) then scout
+        // (reader) — no wave barrier reorders them. The DEPENDENCY order is what is preserved:
+        // verify starts only after implement lands; the FAIL verdict fires the fix loop
+        // (implement#2, verify#2) before review starts.
         assert_eq!(
             order,
             [
-                "scout",
                 "implement",
+                "scout",
                 "verify",
                 "implement#2",
                 "verify#2",
@@ -1838,6 +2138,191 @@ mod tests {
         let v = with_upstream(&tasks[1], &results, &latest, None);
         assert!(v.prompt.contains("…[clipped]"), "{}", v.prompt.len());
         assert!(v.prompt.chars().count() < UPSTREAM_TASK_CHARS + 400);
+    }
+#[tokio::test]
+    async fn schedule_has_no_wave_barrier_a_fast_tasks_downstream_starts_early() {
+        // The Phase-2a metric: A→B (fast) and A→C (slow). With a wave barrier, B's downstream
+        // (D after B) would wait for C to finish before starting. With the ready queue, D starts
+        // as soon as B lands, while C is still in flight.
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let tasks = vec![
+            chained("a", "argus", &[], None),
+            chained("b", "argus", &["a"], None),
+            chained("c", "argus", &["a"], None),
+            chained("d", "argus", &["b"], None),
+        ];
+        let started_at: Arc<Mutex<Vec<(String, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let run = |task: WorkflowTask| {
+            let started_at = started_at.clone();
+            async move {
+                started_at.lock().unwrap().push((task.id.clone(), t0.elapsed()));
+                if task.id == "c" {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                TaskOutcome {
+                    id: task.id,
+                    role: task.role,
+                    model: "m".into(),
+                    status: "done".into(),
+                    summary: String::new(),
+                    iters: 1,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                }
+            }
+        };
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let results = schedule(&tasks, 4, "m", &cancel, run).await;
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|r| r.status == "done"));
+        let at = |id: &str| {
+            started_at
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, t)| *t)
+                .unwrap()
+        };
+        // d starts when b lands (~0ms), not when c lands (~300ms). A wave barrier would put
+        // d's start at >= 300ms. `started_at` stores t0-relative Durations.
+        let d_start_after_t0 = at("d");
+        assert!(
+            d_start_after_t0 < Duration::from_millis(200),
+            "d started {d_start_after_t0:?} after t0 — a wave barrier would have stalled it behind slow c (~300ms)"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_serializes_writers_globally_not_just_per_wave() {
+        // Two writers in DIFFERENT waves must still not overlap: writer2 (after r1) starts only
+        // after writer1 lands, even though the ready-queue could otherwise interleave them.
+        use std::sync::{Arc, Mutex};
+        let tasks = vec![
+            chained("w1", "daedalus", &[], None),
+            chained("r1", "argus", &[], None),
+            chained("w2", "daedalus", &["r1"], None),
+        ];
+        let overlap = Arc::new(Mutex::new(0usize));
+        let max_overlap = Arc::new(Mutex::new(0usize));
+        let run = |task: WorkflowTask| {
+            let overlap = overlap.clone();
+            let max_overlap = max_overlap.clone();
+            let is_writer = task.role == "daedalus";
+            async move {
+                if is_writer {
+                    let mut n = overlap.lock().unwrap();
+                    *n += 1;
+                    let cur = *n;
+                    drop(n);
+                    let mut m = max_overlap.lock().unwrap();
+                    if cur > *m {
+                        *m = cur;
+                    }
+                    drop(m);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    *overlap.lock().unwrap() -= 1;
+                }
+                TaskOutcome {
+                    id: task.id,
+                    role: task.role,
+                    model: "m".into(),
+                    status: "done".into(),
+                    summary: String::new(),
+                    iters: 1,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                }
+            }
+        };
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let results = schedule(&tasks, 4, "m", &cancel, run).await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            *max_overlap.lock().unwrap(),
+            1,
+            "two writers must never run concurrently"
+        );
+    }
+#[tokio::test]
+    async fn schedule_restarts_a_failed_child_once_then_reports_done() {
+        // Phase 3 (supervision, one_for_one): a child whose first run returns `error` gets ONE
+        // restart (`<id>#restart`). When the restart succeeds, the base task reports `done` and
+        // the trace holds both attempts.
+        use std::sync::{Arc, Mutex};
+        let tasks = vec![chained("flaky", "argus", &[], None)];
+        let calls = Arc::new(Mutex::new(0usize));
+        let run = {
+            let calls = calls.clone();
+            move |task: WorkflowTask| {
+                let calls = calls.clone();
+                async move {
+                    let mut n = calls.lock().unwrap();
+                    *n += 1;
+                    let attempt = *n;
+                    drop(n);
+                    TaskOutcome {
+                        id: task.id,
+                        role: task.role,
+                        model: "m".into(),
+                        status: if attempt == 1 { "error".into() } else { "done".into() },
+                        summary: format!("attempt {attempt}"),
+                        iters: 1,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    }
+                }
+            }
+        };
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let results = schedule(&tasks, 1, "m", &cancel, run).await;
+        assert_eq!(*calls.lock().unwrap(), 2, "exactly one restart");
+        assert!(
+            results.iter().any(|r| r.id == "flaky#restart" && r.status == "done"),
+            "the restart outcome is recorded: {results:?}"
+        );
+        // The restart's success is what the downstream sees via `latest`.
+        assert!(
+            results.iter().any(|r| r.status == "done"),
+            "a recovered task reports done: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_does_not_restart_a_second_failure() {
+        // one_for_one with max_intensity=1: a child that fails TWICE stays failed — no infinite
+        // restart loop, no third call.
+        use std::sync::{Arc, Mutex};
+        let tasks = vec![chained("doomed", "argus", &[], None)];
+        let calls = Arc::new(Mutex::new(0usize));
+        let run = {
+            let calls = calls.clone();
+            move |task: WorkflowTask| {
+                let calls = calls.clone();
+                async move {
+                    *calls.lock().unwrap() += 1;
+                    TaskOutcome {
+                        id: task.id,
+                        role: task.role,
+                        model: "m".into(),
+                        status: "error".into(),
+                        summary: "always fails".into(),
+                        iters: 1,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    }
+                }
+            }
+        };
+        let cancel = crate::core::cancel::TurnCancel::new();
+        let results = schedule(&tasks, 1, "m", &cancel, run).await;
+        assert_eq!(*calls.lock().unwrap(), 2, "one restart, then stop");
+        assert!(
+            results.iter().any(|r| r.status == "error"),
+            "the failure stands after the restart also failed: {results:?}"
+        );
     }
 
     #[test]
