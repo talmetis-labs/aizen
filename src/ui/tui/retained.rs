@@ -903,6 +903,22 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 session.take();
                 let _ = ack.send(());
                 dirty = false;
+                // Drain any raw input bytes the terminal queued while the menu owned stdin.
+                // When the alternate screen is dropped, mouse capture ends and the terminal's
+                // alternateScroll turns wheel motion into ↑/↓ key presses — those bytes sit in
+                // the stdin buffer. If we don't drain them here, the resumed session reads them
+                // as phantom history-scroll keys.
+                #[cfg(unix)]
+                {
+                    use std::io::Read;
+                    let mut stdin = std::io::stdin();
+                    let mut buf = [0u8; 256];
+                    while let Ok(n) = stdin.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
             }
             Ok(Command::Resume { status, ack }) => {
                 state.input.status = status;
@@ -921,6 +937,12 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 // later frames — the "/config corrupted the layout" report.
                 force_clear = ok;
                 dirty = ok;
+                // Re-assert mouse capture explicitly: `TerminalSession::enter()` already enables it,
+                // but some terminals (especially on Linux after alternateScroll was active while the
+                // menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓ keys.
+                if ok {
+                    let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+                }
             }
             Ok(Command::Redraw) => {
                 force_clear = true;
@@ -970,6 +992,22 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     session.take();
                     let _ = ack.send(());
                     dirty = false;
+                    // Drain any raw input bytes the terminal queued while the menu owned stdin.
+                    // When the alternate screen is dropped, mouse capture ends and the terminal's
+                    // alternateScroll turns wheel motion into ↑/↓ key presses — those bytes sit in
+                    // the stdin buffer. If we don't drain them here, the resumed session reads them
+                    // as phantom history-scroll keys.
+                    #[cfg(unix)]
+                    {
+                        use std::io::Read;
+                        let mut stdin = std::io::stdin();
+                        let mut buf = [0u8; 256];
+                        while let Ok(n) = stdin.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    }
                 }
                 Command::Resume { status, ack } => {
                     state.input.status = status;
@@ -983,6 +1021,13 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     let _ = ack.send(ok);
                     force_clear = ok; // see the blocking-recv arm above
                     dirty = ok;
+                    // Re-assert mouse capture explicitly: `TerminalSession::enter()` already enables
+                    // it, but some terminals (especially on Linux after alternateScroll was active
+                    // while the menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓
+                    // keys.
+                    if ok {
+                        let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+                    }
                 }
                 Command::Redraw => {
                     force_clear = true;
