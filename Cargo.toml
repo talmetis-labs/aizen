@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "Apache-2.0"
@@ -171,7 +171,8 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 # prebuilt import libs and builds everywhere.
 [target.'cfg(windows)'.dependencies]
 # Features cover: Job Objects (LSP tree-kill), console mode restore (TUI), atomic MoveFileEx +
-# ACL owner-only writes (persist), exclusive file locks (repo_lock), reparse-point checks (TM).
+# ACL owner-only writes (persist), exclusive file locks (repo_lock), reparse-point checks (TM),
+# PID-liveness probes (orchestration manifest sweep — OpenProcess/GetExitCodeProcess).
 # PINNED to 0.59 — see comment above. Do NOT promote this to a target-agnostic dep.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -182,4 +183,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Registry",
+    "Win32_System_Threading",
 ] }

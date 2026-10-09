@@ -26,6 +26,12 @@ The chat box is a small line editor: type / Backspace / Del at the cursor, **←
 jump, **↑/↓** recall past prompts, Enter sends. A braille spinner (`⠹ thinking`) shows while the
 model is responding, clearing the moment the first token streams.
 
+**You never wait for a turn to finish before talking again.** A message typed *while the agent is
+working* is handed to the running turn at its next step — a course correction folded into the task
+in flight, not a queued next request (a working turn keeps doing what it already planned AND reads
+your new line immediately). Paste something long or attach an image and it queues as a separate turn
+instead; `/jobs` and `/workflows` typed mid-turn open their panels instantly rather than queueing.
+
 The **mouse works in the box too**: click to put the caret on the character you clicked instead of
 walking there with ←/→, and drag across the text to select it — the selection is copied to the
 clipboard on release, and **Ctrl-C** copies it too (with nothing selected, Ctrl-C copies the whole
@@ -78,6 +84,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree; on the retained TUI `/diff --patch` draws each file as a diff box. `/undo` (alias `/rewind`) shows the rewind's diff stat first, refuses to discard work no checkpoint holds unless you add `--yes`, and names the files it restored. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` prunes the objects no checkpoint reaches and compacts this repo's store (packs loose objects — a save does the packing automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
 | `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback; the download is checked against the release's published SHA-256 and refused on a mismatch |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
+| `/jobs` | background work at a glance: long-running `process` handles (dev servers, watchers) plus live monitor runs (sub-agents · workflows), self-refreshing. It is selectable and interactive — ↑↓ pick a row, Enter opens that process's live log, `x` stops it (a process is killed by handle; a monitor run gets a stop request), Esc closes (Esc again from a log returns to the list). Typed WHILE A TURN RUNS it opens immediately instead of queueing behind the turn (same inline path as `/workflows`). On the retained TUI a wide terminal shows the same summary in the sidebar, and a narrow one shows a clickable one-line strip under the composer that opens this panel |
 | `/theme [moonlight\|lanes]` | colour theme: `moonlight` (default) keeps the calm all-silver look; `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal. Bare `/theme` lists both with a live colour swatch; the choice persists |
 | `/clear` | start a fresh conversation that REMEMBERS this one: the thread is distilled into a dense seed note the new conversation starts with · `/clear hard` wipes with nothing carried over · `/tokens` usage · `/quit` exit |
 
@@ -608,6 +615,7 @@ aizen agent "add a --version flag and update the help text"
 aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
 aizen agent --max-iters 40 "..."                            # raise the step cap
 aizen agent --save-session "..."                            # keep the transcript for /sessions
+aizen agent --resume fix-delete-btn --save-session "..."    # continue a saved session under its slug
 aizen agent --effort high "..."                             # this run only; the config is untouched
 aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat --image for more
 aizen agent --output-format stream-json "..."               # one JSON record per line on stdout (front-ends, CI)
@@ -636,6 +644,7 @@ Behavior worth knowing:
   | `system` / `hook_response` | `hook_name`, `hook_event`, `output`, `exit_code`, `outcome`, plus `decision`, `reason`, `timed_out`, `elapsed_ms` |
   | `system` / `compact_boundary` | `compact_metadata{trigger, pre_tokens, post_tokens}` — older turns were summarized in place |
   | `system` / `session_saved`, `session_not_saved` | `slug`, `path` (with `--save-session`), or `error` |
+  | `system` / `steer_queued`, `steer_dropped` | `text`, plus `pending` when queued, `reason` when dropped — a stdin steer was taken into the mailbox or refused |
   | `result` | `subtype` (`success`, `error_max_turns`, `error_during_execution`), `is_error`, `duration_ms`, `num_turns`, `result` (the answer), `usage{input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}`, `permission_denials[]`, plus aizen's `stop`, `question` (with `awaiting_input`), `session`, `calls`; `errors[]` when `is_error` |
 
   A delegated child's records (`task`, `workflow`) are on the stream too: their
@@ -652,9 +661,16 @@ Behavior worth knowing:
   allows that tool for the rest of the run, `[{"type":"setMode","mode":"bypassPermissions","destination":"session"}]`
   allows every later call (as `--yes` from here on). A closed stdin is a deny, exactly as a
   non-TTY run has always been, and so is `--output-format json`, which has no channel to ask on.
-  Lines that are not a reply to the pending request are ignored. Not on the stream: a cost in
-  dollars (aizen has no price list) and the API's per-message `usage` (the run's total is in
-  `result`). Nothing else changes: `--yes`, `--save-session`, `--effort` and `--image` mean what
+  **Steering is answered on stdin too**: a `stream-json` run arms the steer mailbox, and a line
+  `{"type":"steer","text":"…"}` queues text for the loop to fold in at the next turn boundary —
+  the same mailbox the TUI drives with Alt+Enter, capped at 8 pending of 4000 chars each. The
+  run acknowledges with a `system` record `{"subtype":"steer_queued","text":…,"pending":n}`, or
+  `{"subtype":"steer_dropped","text":…,"reason":…}` when the mailbox is full, the text oversized,
+  or no live turn is accepting; a leftover when the run ends is also dropped, with
+  `reason: "turn ended"`. A front-end that sees `steer_dropped` may keep the text and retry it on
+  the next run. Lines that are neither a reply to the pending request nor a steer are ignored.
+  Not on the stream: a cost in dollars (aizen has no price list) and the API's per-message
+  `usage` (the run's total is in `result`). Nothing else changes: `--yes`, `--save-session`, `--effort` and `--image` mean what
   they mean in text mode, and the exit code is `0` for every `result` that ends a run (read
   `is_error` and `stop`) and `1` when the run died (a `result` with `errors`).
 - **Nothing is saved unless you ask.** This subcommand is also the scripting and CI entry point, so
@@ -667,6 +683,13 @@ Behavior worth knowing:
   provenance stamp the REPL writes (project key, root and slug), so `/sessions` reopens it without
   caring which surface produced it, and the path is printed to **stderr** — stdout stays the answer.
   A run that ends in an error is saved too: it still happened.
+  `--resume <slug>` continues a saved conversation instead of starting one: the stored transcript
+  becomes the run's history (its prompt lanes rebuilt for the current project and model — the same
+  contract as `/resume`, with the same loud warning when the session came from another project),
+  and the task is appended as the next user turn. Combined with `--save-session` the run writes
+  back into the **same** slug rather than allocating a fresh one, so a front-end can chain runs
+  into one continuous conversation: save, resume-and-save, resume-and-save. Resuming a missing or
+  unreadable slug fails the run before any request goes out.
 - **Effort is per run, not per config.** `/effort` in the REPL pins a tier by writing
   `reasoning_effort` into the config; `--effort` arms the same per-turn override the REPL arms and
   persists nothing, so a front-end can send one hard run and one cheap one without editing the
@@ -839,9 +862,11 @@ Behavior worth knowing:
   the background `process` pool with it). Runtime capability always comes from the resolved tool
   registry, never from the card's prose.
 - **Clarify, don't guess** — when a choice is genuinely ambiguous and a wrong guess would waste
-  real work, the agent calls `clarify` to ask ONE question; the turn pauses and your next message
-  is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention with the
-  input box). For low-stakes choices it assumes and states rather than stalling.
+  real work, the agent calls `clarify` to ask one or more focused questions; the turn pauses and your
+  next message is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention
+  with the input box). Under the REPL an ask with suggested answers opens a Claude-Code-style panel:
+  a tab per question, checkboxes for `multi_select`, arrow/Space to pick and Enter to submit all
+  answers at once. For low-stakes choices it assumes and states rather than stalling.
 - **Web research** — `web_search` (needs a free Tavily key — set `TAVILY_API_KEY`) finds pages; `web_fetch` GETs a URL and
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
   seed URL (see `aizen crawl` below). Read-only; available to every role except `argus`, whose
@@ -886,7 +911,11 @@ one `→ hook …` line.
 
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
-in-REPL dispatches), then merge their results into one answer (mixture-of-agents). See
+in-REPL dispatches), then merge their results into one answer (mixture-of-agents). In the REPL the
+individual `task`/`workflow` dispatch lines collapse into one **`sub-agents` block** — a header
+(`▸ sub-agents (3) · 1 running`) plus a one-line summary; **Ctrl-E** toggles it open to a row per
+agent (mark · label · current step · elapsed) and shut. Ctrl-E still expands a tool result into its
+overlay whenever no sub-agents block is on screen. See
 [examples/review.workflow.json](../examples/review.workflow.json):
 ```bash
 aizen workflow examples/review.workflow.json

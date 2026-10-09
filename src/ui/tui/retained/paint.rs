@@ -36,13 +36,38 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     );
     state.input_layout_cache = layout_cache;
     state.input_row_scroll = layout.scroll; // sticky across frames — see `AppState::input_row_scroll`
-    let footer_rows = FOOTER_CHROME_ROWS.saturating_add(layout.rows.len() as u16);
+                                            // The jobs strip: when the sidebar is NOT docked (a narrow terminal) there is nowhere else to
+                                            // show background work, so it rides one row UNDER the composer — a one-line clickable summary of
+                                            // running processes + monitor runs. Wide terminals get the full sidebar section instead and the
+                                            // strip stays off (duplication the sidebar already avoids elsewhere).
+    let show_jobs_strip = side.is_none() && !state.jobs.is_empty();
+    let strip_rows = u16::from(show_jobs_strip);
+    let footer_rows = FOOTER_CHROME_ROWS
+        .saturating_add(layout.rows.len() as u16)
+        .saturating_add(strip_rows);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(footer_rows)])
         .split(main);
     draw_transcript(frame, chunks[0], state);
-    draw_footer(frame, chunks[1], state, &layout);
+    // Split the footer band so the strip gets its own row beneath the composer, and hand the composer
+    // only the rows it asked for.
+    let (footer_area, strip_area) = if show_jobs_strip {
+        let f = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(chunks[1]);
+        (f[0], Some(f[1]))
+    } else {
+        (chunks[1], None)
+    };
+    draw_footer(frame, footer_area, state, &layout);
+    match strip_area {
+        Some(strip) => draw_jobs_strip(frame, strip, state),
+        // No strip this frame (a docked sidebar, or no jobs) → retire the click geometry, so a stale
+        // rect can never keep answering hit-tests for a row that is no longer on screen.
+        None => set_jobs_strip(None),
+    }
     if let Some(side) = side {
         draw_sidebar(frame, side, state);
     }
@@ -253,6 +278,65 @@ fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
         body.push(Line::default());
     }
 
+    // Live background work: long-running `process` handles and live monitor runs (sub-agent /
+    // workflow). Running processes first, each on one line (`▸ proc_3  7m03s  npm run dev`), with
+    // finished ones dimmed below — so a dev server the agent started is visible from the sidebar.
+    if !state.jobs.is_empty() {
+        let running = state.jobs.running_processes();
+        let live = state.jobs.live_monitor();
+        let head = match (running, live) {
+            (r, 0) => format!("{r} running"),
+            (0, m) => format!("monitor {m}"),
+            (r, m) => format!("{r} proc · {m} monitor"),
+        };
+        body.push(Line::from(vec![
+            Span::styled("Jobs ", bold),
+            Span::styled(head, muted),
+        ]));
+        let avail = (rect.height as usize)
+            .saturating_sub(body.len())
+            .saturating_sub(2);
+        let mut used = 0usize;
+        let mut shown = 0usize;
+        let mut all: Vec<&crate::ui::tui::JobRow> = state
+            .jobs
+            .processes
+            .iter()
+            .chain(state.jobs.monitor.iter())
+            .collect();
+        // Cap at a few rows so the section never crowds the plan/where-here blocks.
+        all.truncate(6);
+        for row in &all {
+            let (glyph, gstyle) = if row.running {
+                ("▸", accent)
+            } else {
+                ("·", faint)
+            };
+            let text = format!("{}  {}", row.elapsed, row.detail);
+            let wrapped = wrap_plain(&text, inner.saturating_sub(2), 2);
+            if used + wrapped.len() > avail {
+                break;
+            }
+            used += wrapped.len();
+            shown += 1;
+            for (i, l) in wrapped.into_iter().enumerate() {
+                let lead = if i == 0 {
+                    Span::styled(format!("{glyph} "), gstyle)
+                } else {
+                    Span::styled("  ".to_string(), faint)
+                };
+                body.push(Line::from(vec![lead, Span::styled(l, muted)]));
+            }
+        }
+        if shown < all.len() {
+            body.push(Line::styled(
+                format!("… +{} more — /jobs", all.len() - shown),
+                faint,
+            ));
+        }
+        body.push(Line::default());
+    }
+
     // Where this conversation lives and what else is plugged in.
     if !state.facts.session.is_empty() {
         body.push(Line::from(vec![
@@ -377,6 +461,64 @@ fn sidebar_cwd(width: usize) -> String {
         .rev()
         .collect();
     format!("…{cut}")
+}
+
+/// One row under the composer (narrow terminals only) summarising background work:
+/// `▸ 3 running · monitor 2   npm run dev · …   /jobs ↵`. Paints the row, and publishes its rect so a
+/// left-click on it opens the jobs panel. Kept to ONE row: it must never eat the composer's room.
+fn draw_jobs_strip(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
+    if rect.width < 6 || rect.height == 0 {
+        set_jobs_strip(None);
+        return;
+    }
+    let accent = Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT));
+    let muted = Style::default().fg(Color::Indexed(crate::ui::theme::MUTED));
+    let faint = Style::default().fg(Color::Indexed(crate::ui::theme::FAINT));
+    let running = state.jobs.running_processes();
+    let live = state.jobs.live_monitor();
+    // The single most-recent running command, so the strip says WHAT is running, not just how many.
+    let sample = state
+        .jobs
+        .processes
+        .iter()
+        .find(|r| r.running)
+        .map(|r| r.detail.clone())
+        .unwrap_or_default();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if running > 0 {
+        spans.push(Span::styled(format!("▸ {running} running"), accent));
+    }
+    if live > 0 {
+        if running > 0 {
+            spans.push(Span::styled("  ·  ", faint));
+        }
+        spans.push(Span::styled(format!("monitor {live}"), accent));
+    }
+    if !sample.is_empty() {
+        spans.push(Span::styled("   ", faint));
+        let used: usize = spans
+            .iter()
+            .map(|s| console::measure_text_width(s.content.as_ref()))
+            .sum();
+        // Leave room for the trailing hint; clip the sample so the hint always fits.
+        let budget = (rect.width as usize).saturating_sub(used + 12);
+        let clipped = console::truncate_str(&sample, budget, "…").into_owned();
+        spans.push(Span::styled(clipped, muted));
+    }
+    // Right-align the affordance.
+    let hint = "/jobs ↵";
+    let used: usize = spans
+        .iter()
+        .map(|s| console::measure_text_width(s.content.as_ref()))
+        .sum();
+    let hint_w = console::measure_text_width(hint);
+    let gap = (rect.width as usize).saturating_sub(used + hint_w);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.push(Span::styled(hint.to_string(), faint));
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    set_jobs_strip(Some(rect));
 }
 
 /// Resolve the transcript scroll for one frame. Pure so it can be unit-tested without a backend.

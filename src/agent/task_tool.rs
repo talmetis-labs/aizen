@@ -1339,7 +1339,7 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
             "[CANCELLED — the user stopped this sub-agent. Do not treat the work below as complete.]",
         ),
         crate::agent::StopReason::AwaitingInput(_) => Some(
-            "[INCOMPLETE — the sub-agent stopped to ask a question that no interactive user can answer here.]",
+            "[INCOMPLETE — the sub-agent stopped to ask a question that no interactive user can answer here. The question is shown above; answer it in a fresh top-level turn if the work must continue.]",
         ),
         // Says TIME rather than steps, and says nobody cancelled: a parent that reads "cancelled" or
         // "step limit" would draw the wrong next move (re-ask the user vs. raise max_steps) when the
@@ -2265,7 +2265,10 @@ mod tests {
             Divergence,
             MaxIters,
             Cancelled,
-            AwaitingInput("q?".into()),
+            AwaitingInput(
+                crate::agent::clarify::Ask::from_args(&serde_json::json!({"question": "q?"}))
+                    .unwrap(),
+            ),
             Deadline,
         ] {
             let w = stop_body_warning(&stop).unwrap_or_else(|| panic!("{stop:?} must warn"));

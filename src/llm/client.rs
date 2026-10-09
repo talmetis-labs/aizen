@@ -1348,6 +1348,11 @@ pub struct ChatTurn {
     /// Provider-reported usage for THIS call, when sent (the final chunk in streaming). The loop's
     /// context guards prefer this real number over the chars/4 estimate.
     pub usage: Option<Usage>,
+    /// One-line summary of what the wire ACTUALLY carried when the turn looks empty: unknown
+    /// message/choice keys, reasoning-channel length, usage. Populated only on the non-streaming
+    /// path when there is no text and no tool call — an empty turn then fails with a diagnosis that
+    /// NAMES the shape gap instead of "empty response".
+    pub empty_wire_note: Option<String>,
     /// EAGERLY-STARTED tool executions from the streaming path: `(position in tool_calls, handle)`.
     /// A read-only call whose arguments finished streaming may already be running before the
     /// response ends — the executor ADOPTS these instead of re-spawning. Discarding a `ChatTurn`
@@ -1702,26 +1707,124 @@ async fn chat_with_tools_effort_live(
 
     let resp = send_chat(client, &url, api_key, body).await?;
 
-    let parsed: ChatResponse = resp
-        .json()
+    // Bytes first, parse second: when the body does not fit `ChatResponse`, the parse error gets the
+    // first bytes attached — otherwise serde discards the evidence and the failure is a bare
+    // "missing field"/"invalid type" with no way to see what the gateway actually sent.
+    let raw = resp
+        .bytes()
         .await
-        .context("parsing chat-completions response")?;
+        .context("reading chat-completions response body")?;
+    let mut parsed: ChatResponse = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "parsing chat-completions response (first 400 B: {})",
+            summarize_bytes(&raw, 400)
+        )
+    })?;
     if let Some(u) = &parsed.usage {
         cost_meter().record(u);
     }
     let usage = parsed.usage;
     let choice = parsed
         .choices
-        .into_iter()
-        .next()
+        .first_mut()
         .ok_or_else(|| anyhow!("response had no choices"))?;
+    // A gateway answering non-streaming with `content: [{"type":"text",…}]` (the parts spelling)
+    // used to fail the whole message parse here — `content` was `Option<String>`, and a sequence
+    // did not fit it. `RespMessage`'s hand-rolled `Deserialize` now joins text parts at the
+    // boundary, so by this point `content` already carries the text regardless of spelling.
+    let content = resolve_content(&choice.message);
+    let empty_wire_note = if choice.message.tool_calls.is_empty()
+        && content.as_deref().is_none_or(|s| s.trim().is_empty())
+    {
+        Some(empty_wire_note(
+            &choice.message,
+            choice.finish_reason.as_deref(),
+            &choice.extra,
+            usage.as_ref(),
+        ))
+    } else {
+        None
+    };
+    if let Some(note) = &empty_wire_note {
+        // TUI-quiet, single line: the note is what turns a retry storm into a bug report.
+        crate::ui::tui::note_line(
+            &crate::ui::theme::faint(format!("empty response — {note}")).to_string(),
+        );
+    }
     Ok(ChatTurn {
-        content: resolve_content(&choice.message),
-        tool_calls: choice.message.tool_calls,
-        finish_reason: choice.finish_reason,
+        content,
+        tool_calls: std::mem::take(&mut choice.message.tool_calls),
+        finish_reason: choice.finish_reason.clone(),
         usage,
+        empty_wire_note,
         eager: Vec::new(),
     })
+}
+
+/// A printable prefix of a response body: ASCII as-is (escaped), non-ASCII as `len=N bytes`.
+/// Never more than `cap` bytes, and never raw control bytes into a transcript or error chain.
+fn summarize_bytes(raw: &[u8], cap: usize) -> String {
+    let head = &raw[..raw.len().min(cap)];
+    let mut out = String::with_capacity(head.len() + 32);
+    for &b in head {
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    if raw.len() > cap {
+        out.push_str(&format!("… ({} B total)", raw.len()));
+    }
+    out
+}
+
+/// One line naming everything an empty-looking turn DID carry, so the report distinguishes
+/// "the provider went silent" (`finish_reason=stop, usage=…, no unknown keys` — a real silence)
+/// from "the provider answered in a shape we do not read" (unknown keys listed by name).
+fn empty_wire_note(
+    m: &crate::core::types::RespMessage,
+    finish_reason: Option<&str>,
+    choice_extra: &BTreeMap<String, serde_json::Value>,
+    usage: Option<&Usage>,
+) -> String {
+    let mut bits: Vec<String> = Vec::new();
+    bits.push(format!(
+        "finish_reason={}",
+        finish_reason.unwrap_or("<absent>")
+    ));
+    if !m.extra.is_empty() {
+        bits.push(format!(
+            "message keys [{}]",
+            m.extra.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !choice_extra.is_empty() {
+        bits.push(format!(
+            "choice keys [{}]",
+            choice_extra.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if m.reasoning_content.is_some() || m.reasoning.is_some() {
+        // Blank-whitespace reasoning is not text (reasoning_text() already filtered it) but it IS
+        // evidence the model generated something — name it.
+        bits.push("reasoning channel present but whitespace-only".to_string());
+    }
+    match usage {
+        Some(u) => bits.push(format!(
+            "usage prompt={} completion={}",
+            u.prompt_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into()),
+            u.completion_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into())
+        )),
+        None => bits.push("no usage".to_string()),
+    }
+    bits.join(", ")
 }
 
 /// The message's text, falling back to its REASONING channel when `content` is empty.
@@ -2358,6 +2461,7 @@ async fn stream_chat_with_tools_eager_live(
             tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
             finish_reason,
             usage: final_usage,
+            empty_wire_note: None,
             eager,
         });
     } // end blank-stream replay loop

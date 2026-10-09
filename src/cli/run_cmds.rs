@@ -352,8 +352,8 @@ pub(crate) async fn run_agent_capture(
     // A `clarify` yield in a captured (non-REPL) run — e.g. `aizen serve` — has no input box to loop
     // back to, so surface the question as the reply itself. Over Telegram the owner just answers
     // with their next message; for a plain capture caller it reads as the agent's question.
-    if let StopReason::AwaitingInput(q) = &outcome.stop {
-        return Ok(format!("❓ {q}"));
+    if let StopReason::AwaitingInput(ask) = &outcome.stop {
+        return Ok(format!("❓ {}", ask.display()));
     }
     Ok(outcome
         .final_text
@@ -441,11 +441,27 @@ pub(crate) async fn run_chat(args: ChatArgs) -> Result<()> {
 
 pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     match args.output_format.as_str() {
-        "stream-json" => crate::ui::events::enable(true),
+        "stream-json" => {
+            crate::ui::events::enable(true);
+            // A pipe is the only stdin shape a control channel (approvals, steers) can arrive on;
+            // detected once here so the reader thread can decide to exist at all. The REPL's
+            // stdin-driven approval path never sets this — its stdin is a console.
+            crate::ui::events::note_stdin_piped(!std::io::IsTerminal::is_terminal(
+                &std::io::stdin(),
+            ));
+        }
         "json" => crate::ui::events::enable(false),
         _ => {}
     }
     let result = run_agent_inner(args).await;
+    // Whatever the turn never drained is a steer the user meant for it: surface the text as
+    // `steer_dropped` records so the driving app can resume-chain it into the next run, and log
+    // the same in text mode rather than dropping it silently.
+    if crate::ui::events::streaming() && crate::core::steer::is_armed() {
+        for s in crate::core::steer::disarm() {
+            crate::ui::events::steer_leftover(&s);
+        }
+    }
     if let Err(e) = &result {
         // The stream's last word: a caller reading stdout must not have to parse stderr to learn
         // that the run died. `main` still prints the error and exits non-zero. No-op in text mode.
@@ -564,8 +580,19 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         compact_at_pct: crate::compact_threshold_pct(),
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         nudge_role: agent::NudgeRole::for_base_url(&base_url),
+        // A machine-driven run (the desktop plugin, a script) can only correct course via a
+        // `steer` line on stdin, so under stream-json this loop drains the same mailbox the TUI
+        // feeds from its keyboard thread. Text mode keeps the flag off: no steer can arrive.
+        enable_steering: crate::ui::events::streaming(),
         ..Default::default()
     };
+    // Arm the mailbox + the stdin reader for the run's span. The reader thread owns stdin from
+    // here and dispatches control_responses (approvals) and steer lines; `run_agent_cmd`'s
+    // guard disarms and tells the driver about any leftovers.
+    if cfg.enable_steering {
+        crate::core::steer::arm();
+        crate::ui::events::start_stdin_reader();
+    }
     // The tier gives the harness its budgets too, unless the caller pinned the step cap.
     if args.max_iters.is_none() {
         if let Some(t) = cli_config::effort_override().flatten() {
@@ -659,7 +686,24 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         );
         Message::user_with_images(args.task.trim(), images)
     };
-    let mut history = vec![Message::system(&system), asked];
+    // `--resume SLUG` continues a saved conversation instead of starting one: the stored
+    // transcript is the history (its prompt lanes rebuilt for THIS project/model by
+    // `load_session`, the same contract as /resume), the new task is the next user turn, and the
+    // pinned slug makes --save-session write back into the same file — a front-end can chain
+    // runs into one continuous conversation. `load_session` is headless-safe: its cross-project
+    // warning is an `emit_line`, which is an emit-line record when the JSON stream is on and a
+    // terminal line otherwise.
+    let mut history = if let Some(slug) = args.resume.as_deref() {
+        let mut loaded = Vec::new();
+        let n = session_store::load_session(&mut loaded, slug, &model)?;
+        if !crate::ui::events::on() {
+            status(&format!("resumed '{slug}' ({n} messages)"));
+        }
+        loaded.push(asked);
+        loaded
+    } else {
+        vec![Message::system(&system), asked]
+    };
     if let Some(plan) = &architect_plan {
         crate::agent::architect::attach_plan(&mut history, plan);
     }
@@ -680,7 +724,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
     let saved = if args.save_session {
-        save_finished_session(&history, &model)
+        save_finished_session(&history, &model, args.resume.as_deref())
     } else {
         None
     };
@@ -701,14 +745,14 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         // One closing line carries what the text mode spreads over stdout and stderr: the stop
         // reason, the answer, the question when the model asked one, and this run's tokens.
         let question = match &outcome.stop {
-            StopReason::AwaitingInput(q) => Some(q.as_str()),
+            StopReason::AwaitingInput(ask) => Some(ask.display()),
             _ => None,
         };
         crate::ui::events::done(
             outcome.stop.label(),
             outcome.iters,
             outcome.final_text.as_deref(),
-            question,
+            question.as_deref(),
             saved.as_deref(),
             usage_since(usage_cursor),
         );
@@ -731,8 +775,9 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         ),
         // One-shot `aizen agent` is non-interactive: there is no next message to answer with, so
         // surface the question and exit rather than hang. Re-run in the REPL to answer it.
-        StopReason::AwaitingInput(q) => eprintln!(
-            "\n[the agent needs clarification — re-run interactively (`aizen`) to answer]\n❓ {q}"
+        StopReason::AwaitingInput(ask) => eprintln!(
+            "\n[the agent needs clarification — re-run interactively (`aizen`) to answer]\n❓ {}",
+            ask.display()
         ),
         StopReason::Cancelled => eprintln!(
             "\n[stopped: cancelled by user after {} step(s)]",
@@ -758,15 +803,19 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
 /// The stamp is `save_session`'s: project key, root and slug come from `config`, which resolves the
 /// repository this ran in — so a saved one-shot is filed exactly where the same conversation held
 /// in the REPL would have been, and `/sessions` reopens it with no idea which surface produced it.
+/// A run started with `--resume` keeps writing back into the resumed slug (which `load_session`
+/// already re-homed out of the legacy `last` pointer); anything else allocates a fresh one.
 ///
 /// The line goes to stderr because stdout is the agent's answer: a caller piping it wants the
 /// answer and nothing else. On the JSON stream it is a `session` event.
-fn save_finished_session(history: &[Message], model: &str) -> Option<String> {
+fn save_finished_session(history: &[Message], model: &str, resume: Option<&str>) -> Option<String> {
     // A run that never got a user turn onto the wire is not a conversation.
     if !history.iter().any(|m| m.role == "user") {
         return None;
     }
-    let slug = session_store::allocate_session_slug(history);
+    let slug = resume
+        .map(session_store::sanitize_name)
+        .unwrap_or_else(|| session_store::allocate_session_slug(history));
     match session_store::save_session(history, &slug, Some(model)) {
         Ok(path) => {
             if crate::ui::events::on() {
@@ -1052,7 +1101,7 @@ mod tests {
             Message::user("fix the delete button"),
             Message::assistant("done"),
         ];
-        save_finished_session(&history, "model-x");
+        save_finished_session(&history, "model-x", None);
 
         let files: Vec<_> = std::fs::read_dir(sessions_dir())
             .unwrap()
@@ -1094,9 +1143,48 @@ mod tests {
         set_session_slug(None);
         std::fs::create_dir_all(sessions_dir()).unwrap();
 
-        save_finished_session(&[Message::system("lane")], "model-x");
+        save_finished_session(&[Message::system("lane")], "model-x", None);
 
         assert_eq!(std::fs::read_dir(sessions_dir()).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `--resume` run saves back into the SAME slug it was handed — the chain contract: a
+    /// front-end that keeps `--resume s --save-session`-ing must produce one growing file, not a
+    /// new slug per link.
+    #[test]
+    fn a_resumed_run_saves_back_into_the_resumed_slug() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("aizen-oneshot-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        set_session_slug(None);
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+
+        let history = vec![
+            Message::system("lane"),
+            Message::user("first task"),
+            Message::assistant("first answer"),
+            Message::user("follow-up"),
+            Message::assistant("second answer"),
+        ];
+        let slug = save_finished_session(&history, "model-x", Some("My Chain/1"))
+            .expect("a conversation always saves");
+
+        assert_eq!(
+            slug, "My_Chain_1",
+            "the slug is the resumed name, sanitized"
+        );
+        assert!(sessions_dir().join(format!("{slug}.json")).is_file());
+        let (msgs, _) = parse_session_bytes(
+            &std::fs::read(sessions_dir().join(format!("{slug}.json"))).unwrap(),
+        )
+        .expect("a transcript we wrote ourselves must be readable");
+        assert_eq!(msgs.len(), 5, "the whole chain, not just the new turn");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }

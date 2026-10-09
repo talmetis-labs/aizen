@@ -72,6 +72,12 @@ pub struct Usage {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    /// Provider-specific usage extensions (per-model splits, cost fields, …): unknown keys land here
+    /// so a diagnostic dump can name them instead of the shape gap being invisible.
+    /// Deserialized from the wire; read on demand when a usage anomaly needs its extra keys named.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
     /// Anthropic-compatible gateways: cache WRITE tokens this call (the breakpoint-creation cost).
@@ -183,6 +189,31 @@ pub struct Message {
 enum ContentField {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl ContentField {
+    /// The joined text of the `text` parts (one `\n` between parts), `None` when there are none.
+    /// `Text` — the ordinary wire spelling — passes through unchanged.
+    fn into_plain_text(self) -> Option<String> {
+        match self {
+            ContentField::Text(s) => Some(s),
+            ContentField::Parts(parts) => {
+                let text = parts
+                    .into_iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+        }
+    }
 }
 
 /// One element of a multimodal `content` array. Unknown part types deserialize to `Other` and are
@@ -449,19 +480,20 @@ pub struct RespChoice {
     pub message: RespMessage,
     #[serde(default)]
     pub finish_reason: Option<String>,
+    /// Provider-specific choice-level keys (`logprobs`, `native_finish_reason`, …) — see
+    /// [`RespMessage::extra`].
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct RespMessage {
-    #[serde(default)]
     #[allow(dead_code)]
     pub role: Option<String>,
-    #[serde(default)]
     pub content: Option<String>,
     /// The signal that the model wants tools — trust THIS, not `finish_reason` (some
     /// gateways emit `stop`/`end_turn` alongside tool calls).
-    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     /// Dedicated reasoning channel some providers return INSTEAD of `content` (DeepSeek spells it
     /// `reasoning_content`) — the same channel the streaming [`Delta`] has always read.
@@ -475,14 +507,70 @@ pub struct RespMessage {
     ///
     /// Read it through [`RespMessage::reasoning_text`], never directly — the same channel arrives
     /// under two spellings and either one may be the populated one.
-    #[serde(default)]
     pub reasoning_content: Option<String>,
     /// The OpenRouter spelling of [`Self::reasoning_content`]. A SEPARATE field on purpose: as a
     /// `#[serde(alias)]` on the one above, a provider that sends BOTH keys in a single object
     /// (OpenRouter-shaped gateways mirror the text into both) is a serde `duplicate field` error
     /// that rejects the whole message. Two fields cannot collide.
-    #[serde(default)]
     pub reasoning: Option<String>,
+    /// Every other key the provider sent on the message (provider-specific reply channels,
+    /// annotations, …). Collected so an "empty response" diagnosis can NAME what was actually on
+    /// the wire — the gap is otherwise invisible because serde silently drops unknown fields.
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for RespMessage {
+    /// Hand-rolled because `content` must accept BOTH spellings: the OpenAI string AND the
+    /// Anthropic-style parts array (`[{"type":"text","text":…}]`) that a growing number of
+    /// gateways emit on NON-streaming replies. A derived `Option<String>` did not "fall back" on
+    /// the array — it FAILED THE WHOLE MESSAGE, which is strictly worse than the parts array it
+    /// was meant to survive. Text parts are joined into `content` here (one `\n` between them), so
+    /// the wire gap is closed AT THE BOUNDARY and no caller ever sees it.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let Some(obj) = value.as_object_mut() else {
+            return Err(serde::de::Error::custom(
+                "assistant message must be an object",
+            ));
+        };
+        let content = match obj.remove("content") {
+            Some(v) => serde_json::from_value::<ContentField>(v)
+                .ok()
+                .and_then(ContentField::into_plain_text),
+            None => None,
+        };
+        Ok(RespMessage {
+            role: take_string(obj, "role"),
+            content,
+            tool_calls: take_value(obj, "tool_calls")?,
+            reasoning_content: take_string(obj, "reasoning_content"),
+            reasoning: take_string(obj, "reasoning"),
+            extra: std::mem::take(obj)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        })
+    }
+}
+
+fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.remove(key).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+fn take_value<T, E>(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned + Default,
+    E: serde::de::Error,
+{
+    match obj.remove(key) {
+        Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom),
+        None => Ok(T::default()),
+    }
 }
 
 impl RespMessage {
@@ -605,6 +693,43 @@ mod tests {
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content.as_deref(), Some("all done"));
         assert!(resp.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parts_array_content_parses_into_plain_string() {
+        // The sub-agent killer: a gateway answers NON-streaming with Anthropic-style parts. The
+        // manual `Deserialize` for `RespMessage` joins text parts at the boundary, so the turn
+        // NEVER reads as empty-200 and the retry loop is never re-asked an answered question.
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]},"finish_reason":"stop"}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.choices[0].message;
+        assert_eq!(m.content.as_deref(), Some("hello\nworld"));
+        assert!(
+            !m.extra.contains_key("content"),
+            "content is consumed, not extra"
+        );
+    }
+
+    #[test]
+    fn parts_array_with_tool_calls_keeps_text() {
+        // A model that reasons out loud before calling a tool sends BOTH; the text is kept
+        // alongside the calls, not dropped and not treated as an empty turn.
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"thinking"}],"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.choices[0].message;
+        assert_eq!(m.content.as_deref(), Some("thinking"));
+        assert_eq!(m.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn non_text_parts_parse_to_no_content() {
+        // content parts we do not read (e.g. image_url) must NOT produce text and must NOT fail
+        // the message — the reply parses with `content: None` and the tool-less-empty retry
+        // classification takes over from there.
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:x"}}]},"finish_reason":"stop"}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.choices[0].message;
+        assert!(m.content.is_none());
     }
 
     #[test]

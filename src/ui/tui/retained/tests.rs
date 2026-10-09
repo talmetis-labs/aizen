@@ -1702,6 +1702,67 @@ fn a_wide_terminal_docks_the_sidebar_and_a_narrow_one_does_not() {
 }
 
 #[test]
+fn sidebar_shows_jobs_and_the_narrow_strip_replaces_it() {
+    use crate::ui::tui::{JobRow, JobsStatus};
+    let mut state = AppState::new("intro", "status");
+    state.jobs = JobsStatus {
+        processes: vec![
+            JobRow {
+                id: "proc_1".to_string(),
+                running: true,
+                elapsed: "7m03s".to_string(),
+                detail: "npm run dev".to_string(),
+            },
+            JobRow {
+                id: "proc_2".to_string(),
+                running: false,
+                elapsed: "3s".to_string(),
+                detail: "cargo build".to_string(),
+            },
+        ],
+        monitor: vec![JobRow {
+            id: "#4".to_string(),
+            running: true,
+            elapsed: "12s".to_string(),
+            detail: "reviewer · t1".to_string(),
+        }],
+    };
+
+    // Wide: the sidebar carries a Jobs section — running process named, monitor counted.
+    let rows = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24);
+    let joined = rows.join("\n");
+    assert!(joined.contains("Jobs "), "jobs header missing:\n{joined}");
+    assert!(
+        joined.contains("npm run dev"),
+        "running cmd missing:\n{joined}"
+    );
+    assert!(
+        joined.contains("monitor"),
+        "monitor count missing:\n{joined}"
+    );
+
+    // Narrow: no sidebar, so the one-row strip under the composer carries the summary instead.
+    let rows = painted_rows(&mut state, SIDEBAR_MIN_TERM_W - 1, 24);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("running") && joined.contains("/jobs"),
+        "narrow strip missing:\n{joined}"
+    );
+    // A click on the strip lands in the panel; its rect is published only while it is painted.
+    let strip = jobs_strip_rect().expect("the strip publishes its rect while painted");
+    assert!(strip.height == 1 && strip.width > 0);
+
+    // With no jobs, neither surface appears and the strip rect is cleared.
+    state.jobs = JobsStatus::default();
+    let rows = painted_rows(&mut state, SIDEBAR_MIN_TERM_W - 1, 24);
+    assert!(!rows.join("\n").contains("/jobs"));
+    assert!(
+        jobs_strip_rect().is_none(),
+        "stale strip rect must be cleared"
+    );
+}
+
+#[test]
 fn sidebar_wrap_breaks_words_and_marks_overflow() {
     assert_eq!(
         wrap_plain("hello world again", 11, 3),
@@ -1731,4 +1792,140 @@ fn content_width_subtracts_the_docked_sidebar() {
         100,
         "no sidebar → the full grid is the pane"
     );
+}
+
+fn subagents_payload(expanded: bool) -> SubAgentsPayload {
+    SubAgentsPayload {
+        rows: vec![
+            SubAgentRow {
+                mark: "⋯".into(),
+                label: "coder · fix parser".into(),
+                detail: "step 3 · file_edit".into(),
+                elapsed: "42s".into(),
+                running: true,
+            },
+            SubAgentRow {
+                mark: "✓".into(),
+                label: "reviewer · audit".into(),
+                detail: String::new(),
+                elapsed: "7m03s".into(),
+                running: false,
+            },
+        ],
+        summary: "coder · fix parser, reviewer · audit — 1 done · 1 running".into(),
+        expanded,
+    }
+}
+
+#[test]
+fn subagents_block_collapsed_shows_header_and_summary() {
+    let out: Vec<String> = render_subagents_block(&subagents_payload(false), 60)
+        .iter()
+        .map(|s| plain(s))
+        .collect();
+    assert!(
+        out[0].contains("▸ sub-agents (2) · 1 running"),
+        "collapsed header: {:?}",
+        out[0]
+    );
+    // Collapsed: border, one summary line, border — the per-row labels stay hidden.
+    assert_eq!(out.len(), 3, "collapsed frame: {out:?}");
+    assert!(out[1].contains("reviewer · audit"), "summary row: {out:?}");
+    assert!(
+        !out.join("\n").contains("step 3 · file_edit"),
+        "collapsed hides row detail: {out:?}"
+    );
+    let w0 = console::measure_text_width(&out[0]);
+    assert!(
+        out.iter().all(|l| console::measure_text_width(l) == w0),
+        "uniform width: {out:?}"
+    );
+}
+
+#[test]
+fn subagents_block_expanded_lists_one_row_per_agent() {
+    let out: Vec<String> = render_subagents_block(&subagents_payload(true), 60)
+        .iter()
+        .map(|s| plain(s))
+        .collect();
+    assert!(
+        out[0].contains("▾ sub-agents (2) · 1 running"),
+        "expanded header: {:?}",
+        out[0]
+    );
+    // Border, two agent rows, border — the summary is replaced, not kept.
+    assert_eq!(out.len(), 4, "expanded frame: {out:?}");
+    assert!(
+        out.iter()
+            .any(|l| l.contains("⋯ coder · fix parser — step 3 · file_edit · 42s")),
+        "running row: {out:?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("✓ reviewer · audit — 7m03s")),
+        "done row: {out:?}"
+    );
+    assert!(
+        !out.join("\n").contains("1 done · 1 running"),
+        "expanded drops the summary line: {out:?}"
+    );
+    let w0 = console::measure_text_width(&out[0]);
+    assert!(
+        out.iter().all(|l| console::measure_text_width(l) == w0),
+        "uniform width: {out:?}"
+    );
+}
+
+#[test]
+fn subagents_update_is_in_place_and_toggle_is_ui_owned() {
+    // The panel mirrors the plan pattern: one stable block, snapshots replace the payload in place,
+    // and a snapshot never closes what the user opened with Ctrl-E.
+    let mut state = AppState::new("intro", "status");
+    state.push_text(BlockKind::Generic, "before".into(), true);
+    apply_command(&mut state, Command::SubAgents(subagents_payload(false)));
+    state.push_text(BlockKind::Generic, "after".into(), true);
+    let panel_pos = state
+        .blocks
+        .iter()
+        .position(|b| b.kind == BlockKind::SubAgents)
+        .unwrap();
+
+    apply_command(&mut state, Command::ToggleSubAgents);
+    let expanded_flag = state
+        .blocks
+        .iter()
+        .find_map(|b| match &b.payload {
+            Payload::SubAgents(p) => Some(p.expanded),
+            _ => None,
+        })
+        .unwrap();
+    assert!(expanded_flag, "Ctrl-E opened the panel");
+
+    // A fresh registry snapshot lands in the SAME block — position kept, no stack, still open.
+    apply_command(&mut state, Command::SubAgents(subagents_payload(false)));
+    assert_eq!(
+        state
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::SubAgents)
+            .count(),
+        1,
+        "exactly one sub-agents block"
+    );
+    assert_eq!(
+        state
+            .blocks
+            .iter()
+            .position(|b| b.kind == BlockKind::SubAgents),
+        Some(panel_pos),
+        "the panel stays where it first appeared"
+    );
+    let still_open = state
+        .blocks
+        .iter()
+        .find_map(|b| match &b.payload {
+            Payload::SubAgents(p) => Some(p.expanded),
+            _ => None,
+        })
+        .unwrap();
+    assert!(still_open, "a snapshot never resets the user's toggle");
 }

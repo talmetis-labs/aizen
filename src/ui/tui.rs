@@ -7,8 +7,9 @@
 //!    horizontal borders only around the input row); all agent output scrolls in the region *above* it,
 //!    so the prompt never scrolls away and never stacks up.
 //! 2. **Continuous chat** — a background thread owns the keyboard and pushes each submitted line onto
-//!    an unbounded queue. You can keep typing (and queue messages) while the agent runs; the REPL
-//!    drains the queue and auto-fires the next one when the current turn finishes.
+//!    an unbounded queue. A message typed WHILE a turn runs steers that turn at its next iteration
+//!    boundary (see `core::steer`) instead of waiting in the queue; anything that cannot steer (an
+//!    oversized paste, a full mailbox, an image message) queues and auto-fires when the turn finishes.
 //! 3. **Cancel** — Esc / Ctrl-C while the agent is working sends a cancel signal; the REPL drops the
 //!    in-flight turn (aborting the streaming HTTP request) and returns you to the prompt.
 //!
@@ -508,6 +509,44 @@ pub fn next_work_verb() -> &'static str {
     VERBS[VERB_CURSOR.fetch_add(1, Ordering::Relaxed) % VERBS.len()]
 }
 
+/// One row of the jobs view — a background process or a live orchestration run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobRow {
+    /// Lead handle/id (`proc_3`, `#7`).
+    pub id: String,
+    /// Still running (drives the row glyph + colour).
+    pub running: bool,
+    /// Elapsed, preformatted (`7m03s`).
+    pub elapsed: String,
+    /// What it is — the command, or a run's name/label.
+    pub detail: String,
+}
+
+/// A whole-app snapshot of background work: long-running `process` handles, and live monitor entries
+/// (sub-agent / workflow runs). Published to the render thread by a background poller so the sidebar
+/// and the jobs strip stay live even while the turn is idle — a dev server started last turn is still
+/// worth a chip this turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobsStatus {
+    pub processes: Vec<JobRow>,
+    pub monitor: Vec<JobRow>,
+}
+
+impl JobsStatus {
+    /// Running processes (the number the HUD chip counts).
+    pub fn running_processes(&self) -> usize {
+        self.processes.iter().filter(|r| r.running).count()
+    }
+    /// Live monitor runs.
+    pub fn live_monitor(&self) -> usize {
+        self.monitor.len()
+    }
+    /// Whether anything is worth showing — a chip or a sidebar section.
+    pub fn is_empty(&self) -> bool {
+        self.processes.is_empty() && self.monitor.is_empty()
+    }
+}
+
 /// Provider reachability for the idle `●` chip. Green = answered fast; yellow = flaky/slow;
 /// red = permanent unavailability (bad key/endpoint or missing config).
 ///
@@ -701,6 +740,14 @@ fn handle_status_command_inline(name: &str, arg: &str) -> bool {
     if !turn_in_flight() || !crate::agent::orchestration::is_status_command(&name.to_lowercase()) {
         return false;
     }
+    // `/jobs` has no stop-verb text form (stopping is done inside its panel), so it always opens
+    // the panel — but it MUST open from here: a queued `/jobs` only surfaces after the turn ends,
+    // which is exactly when watching a background process has stopped being useful.
+    if name.eq_ignore_ascii_case("jobs") {
+        // A `false` return (no retained backend — a pipe/CI, or the box suspended for a menu) falls
+        // through to the queue, same as the `/workflows` path below.
+        return open_jobs_panel();
+    }
     if let Some(note) = crate::agent::orchestration::try_stop_command(arg) {
         note_line(&theme::muted(note).to_string());
         return true;
@@ -762,13 +809,56 @@ struct Render {
     /// The rows painted for the CURRENT approval (built per call — they name the tool and its
     /// directory). Index ↔ decision is pinned by `approval_menu_decision`.
     approval_menu_rows: Vec<String>,
-    /// `clarify` answer menu: the question's suggested options plus a trailing "type my own" row.
-    question_menu_active: bool,
-    question_menu_sel: usize,
-    question_menu_question: String,
-    question_menu_options: Vec<String>,
+    /// `clarify` answer panel (Claude-Code-style): a tab per question, checkbox rows for suggested
+    /// options, and a per-question free-text buffer. `None` when no ask is pending.
+    ask_panel: Option<AskPanel>,
+    /// `/jobs` panel: a SELECTABLE overlay over the transcript. Each selectable row is a live job, and
+    /// the input thread routes ↑↓/Enter/k/x to it — Enter or `x` stops the highlighted job. `None`
+    /// when the panel is closed. `rows` maps the painted row index back to a job handle.
+    jobs_menu: Option<JobsMenu>,
     /// Chat/slash submissions waiting while a turn runs (shown in the prompt placeholder).
     queued_count: usize,
+}
+
+/// One stop-able row of the `/jobs` panel. `handle` is what the stop action targets: a `proc_<n>`
+/// process handle, or a monitor run's short handle (`#3`). `kind` decides which kill path runs.
+#[derive(Clone)]
+struct JobsMenuRow {
+    handle: String,
+    kind: JobKind,
+    /// Preformatted display (`▸ proc_1  7m03s  npm run dev`) — the panel is append-only text driven
+    /// by the poller, so the label is stored, not re-derived at key time.
+    label: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Process,
+    Monitor,
+}
+
+/// Live state of the `/jobs` panel while it is open. Two views: the LIST (pick/stop) and, once a
+/// process row is opened, the LOG of that handle.
+#[derive(Clone, Default)]
+struct JobsMenu {
+    active: bool,
+    sel: usize,
+    rows: Vec<JobsMenuRow>,
+    /// `Some(handle)` while the panel is showing that process's log instead of the row list. `title`
+    /// is the row label captured at open time (the row may vanish from the list while the log is up).
+    log: Option<JobsLogView>,
+}
+
+/// The `/jobs` panel's log sub-view: which handle's output is shown, its captured title, and the
+/// `(status, body)` snapshot the render uses. The refresher re-reads `body` each second so a running
+/// process's log keeps updating while it is on screen. Scrolling rides the overlay's own
+/// `overlay_scroll` (via `retained::scroll`), so there is no second source of truth for the offset.
+#[derive(Clone)]
+struct JobsLogView {
+    handle: String,
+    title: String,
+    status: String,
+    body: String,
 }
 
 fn render() -> &'static Mutex<Render> {
@@ -796,10 +886,8 @@ fn render() -> &'static Mutex<Render> {
             approval_menu_active: false,
             approval_menu_sel: 0,
             approval_menu_rows: Vec::new(),
-            question_menu_active: false,
-            question_menu_sel: 0,
-            question_menu_question: String::new(),
-            question_menu_options: Vec::new(),
+            ask_panel: None,
+            jobs_menu: None,
             queued_count: 0,
         })
     })
@@ -1100,139 +1188,466 @@ pub fn ask_approval_for(prompt_line: &str, tool: &str, dir: Option<&std::path::P
     }
 }
 
-// ── clarify question menu ─────────────────────────────────────────────────────
-// When a `clarify` call pauses the turn WITH suggested options, the sticky REPL raises a picker over
-// the input box (Claude-style): ↑↓/click choose an option, Enter submits it as the next user
-// message through the SAME submission channel a typed answer would use. Esc — or just typing —
-// dismisses the menu and falls back to free-text, so the picker is a shortcut, never a cage.
+// ── clarify ask panel ─────────────────────────────────────────────────────────
+// When a `clarify` call pauses the turn, the sticky REPL raises an answer PANEL over the input box
+// (Claude-Code-style). It carries the tool's structured `Ask`: one or more questions, each with
+// optional suggested answers. ↑↓ move the highlight, ←→/Tab switch question, Space checks an option
+// (multi-select) or picks one (single-select), and ENTER submits — every question's answer is joined
+// and sent as the next user message through the SAME submission channel a typed answer would use, so
+// the model maps the labels back to the questions. Esc — or just typing — dismisses the panel and
+// falls back to free-text, so the picker is a shortcut, never a cage.
 
-/// The trailing non-option row: dismisses the menu and hands focus back to the draft.
-const QUESTION_MENU_FREEFORM_ROW: &str = "✎ type my own answer…";
+use crate::agent::clarify::{Ask, AskQuestion};
 
-/// Whether the clarify answer menu is up (input thread routes ↑↓/Enter/digits to it).
-pub fn question_menu_active() -> bool {
-    render().lock().unwrap().question_menu_active
+/// The trailing non-option row on a SINGLE-question ask: dismisses the panel and hands focus back to
+/// the draft for a free-text answer.
+const ASK_PANEL_FREEFORM_ROW: &str = "✎ type my own answer…";
+
+/// Live state of the clarify answer panel. `None` when no ask is pending.
+#[derive(Clone)]
+struct AskPanel {
+    questions: Vec<AskQuestion>,
+    /// Which question's tab is showing (0-based).
+    tab: usize,
+    /// Highlighted row PER QUESTION (index into that question's options, or its free-text row). Kept
+    /// per-question so switching tabs preserves each pick — a single shared index would silently move
+    /// every other question's highlight when the user tabs across.
+    sel: Vec<usize>,
+    /// Checked options per question, flat: `checked[q][i]` for question `q`, option `i`.
+    checked: Vec<Vec<bool>>,
+    /// Set while the user is answering the trailing free-text row: keystrokes then edit a per-question
+    /// buffer instead of dismissing the panel. Lets a free-text answer ride the panel for a question
+    /// whose options don't fit, without losing picks on the other questions.
+    typing: bool,
+    /// One free-text answer per question (used only when `typing` is set for that question).
+    free: Vec<String>,
 }
 
-/// Raise the clarify answer menu. No-ops outside the sticky TUI or with no options to offer — the
-/// free-text path (type your answer, press Enter) is always available and always correct.
-pub fn question_menu_open(question: &str, options: &[String]) {
-    if !active() || options.is_empty() {
-        return;
-    }
-    question_menu_set(question, options);
-    repaint_force();
-}
-
-/// State half of [`question_menu_open`], separated so tests can drive the menu without a live TUI.
-fn question_menu_set(question: &str, options: &[String]) {
-    let mut r = render().lock().unwrap();
-    r.question_menu_active = true;
-    r.question_menu_sel = 0;
-    r.question_menu_question = question.to_string();
-    r.question_menu_options = options.to_vec();
-}
-
-/// Dismiss the clarify answer menu (picked, Esc'd, or superseded by typing).
-fn question_menu_close() {
-    {
-        let mut r = render().lock().unwrap();
-        r.question_menu_active = false;
-        r.question_menu_sel = 0;
-        r.question_menu_question.clear();
-        r.question_menu_options.clear();
-    }
-    repaint_force();
-}
-
-/// Resolve a pick on the clarify menu: option rows submit the option text as the next user message
-/// (identical to typing it and pressing Enter); the trailing free-form row just dismisses.
-fn question_menu_pick(idx: usize, sub_tx: &UnboundedSender<Submission>) {
-    let text = {
-        let r = render().lock().unwrap();
-        r.question_menu_options.get(idx).cloned()
-    };
-    question_menu_close();
-    if let Some(text) = text {
-        if sub_tx.send(Submission::Chat(text, Vec::new())).is_ok() {
-            note_submission_enqueued();
+impl AskPanel {
+    fn from_ask(ask: &Ask) -> Self {
+        let questions = ask.questions.clone();
+        let checked = questions
+            .iter()
+            .map(|q| vec![false; q.options.len()])
+            .collect();
+        let free = vec![String::new(); questions.len()];
+        let n = questions.len();
+        Self {
+            questions,
+            tab: 0,
+            sel: vec![0; n],
+            checked,
+            typing: false,
+            free,
         }
     }
+
+    /// The current question's highlighted row.
+    fn cur_sel(&self) -> usize {
+        self.sel.get(self.tab).copied().unwrap_or(0)
+    }
+
+    fn cur(&self) -> &AskQuestion {
+        &self.questions[self.tab]
+    }
+
+    /// Rows on the current tab: one per option, plus a trailing free-text row when the question has
+    /// no multi-select (a multi-select is answered by checking; free text would be ambiguous). A
+    /// question with NO options always offers the free-text row.
+    fn rows(&self) -> usize {
+        let q = self.cur();
+        if q.options.is_empty() {
+            1 // the free-text row alone
+        } else {
+            q.options.len() + 1
+        }
+    }
+
+    fn free_row(&self) -> usize {
+        if self.cur().options.is_empty() {
+            0
+        } else {
+            self.cur().options.len()
+        }
+    }
+
+    /// The current question's answers: the free-text buffer if that row was used; else, for a
+    /// single-select question, its HIGHLIGHTED row (radio semantics — the highlight IS the pick, so
+    /// "arrow to it, press Enter" keeps working exactly as the old menu did); for a multi-select,
+    /// every CHECKED option. The highlight is stored per-question, so an off-screen tab keeps the pick
+    /// the user left on it.
+    fn answers_for(&self, q: usize) -> Vec<String> {
+        let question = &self.questions[q];
+        if !self.free[q].trim().is_empty() {
+            return vec![self.free[q].trim().to_string()];
+        }
+        if !question.multi_select {
+            let sel = self.sel.get(q).copied().unwrap_or(0);
+            if let Some(o) = question.options.get(sel) {
+                return vec![o.label.clone()];
+            }
+            return Vec::new();
+        }
+        question
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.checked[q].get(*i).copied().unwrap_or(false))
+            .map(|(_, o)| o.label.clone())
+            .collect()
+    }
+
+    /// The join of every question's answer, ready to submit.
+    fn all_answers(&self) -> Vec<Vec<String>> {
+        (0..self.questions.len())
+            .map(|q| self.answers_for(q))
+            .collect()
+    }
 }
 
-/// Handle one key while the clarify menu is open. Returns `true` if the key was consumed.
+/// Whether the clarify answer panel is up (the input thread routes ↑↓/Space/Enter to it).
+pub fn ask_panel_active() -> bool {
+    render().lock().unwrap().ask_panel.is_some()
+}
+
+/// Raise the clarify answer panel for `ask`. No-ops outside the sticky TUI; a bare question with no
+/// options is left to the free-text path (the transcript line already carries it). Accepts an `&Ask`
+/// so the caller (repl/turn.rs) never has to flatten the structure.
+pub fn ask_panel_open(ask: &Ask) {
+    if !active() || ask.questions.is_empty() {
+        return;
+    }
+    // Nothing to pick anywhere (a plain question) → the input box is the whole interface; raising a
+    // panel of one free-text row would just be an extra layer over it.
+    if ask.questions.iter().all(|q| q.options.is_empty()) {
+        return;
+    }
+    ask_panel_set(ask);
+    repaint_force();
+}
+
+/// State half of [`ask_panel_open`], separated so tests can drive the panel without a live TUI.
+fn ask_panel_set(ask: &Ask) {
+    render().lock().unwrap().ask_panel = Some(AskPanel::from_ask(ask));
+}
+
+/// Dismiss the clarify answer panel (submitted, Esc'd, or superseded by typing).
+fn ask_panel_close() {
+    {
+        let mut r = render().lock().unwrap();
+        r.ask_panel = None;
+    }
+    repaint_force();
+}
+
+/// Submit the panel's collected answers: joined and sent as the next user message through the same
+/// channel a typed answer uses. Empty answers (every question left blank) submit nothing, so an
+/// accidental Enter on a fresh panel doesn't fire a blank turn.
+fn ask_panel_submit(sub_tx: &UnboundedSender<Submission>) {
+    let (ask, answers) = {
+        let r = render().lock().unwrap();
+        let Some(panel) = r.ask_panel.as_ref() else {
+            return;
+        };
+        let ask = Ask {
+            questions: panel.questions.clone(),
+        };
+        (ask, panel.all_answers())
+    };
+    ask_panel_close();
+    let text = ask.format_answers(&answers);
+    if text.trim().is_empty() {
+        return;
+    }
+    if sub_tx.send(Submission::Chat(text, Vec::new())).is_ok() {
+        note_submission_enqueued();
+    }
+}
+
+/// Move the highlight within the current question, clamped to its rows.
+fn ask_panel_move(delta: isize) {
+    let mut r = render().lock().unwrap();
+    let Some(panel) = r.ask_panel.as_mut() else {
+        return;
+    };
+    let rows = panel.rows();
+    if rows == 0 {
+        return;
+    }
+    let tab = panel.tab;
+    let cur = panel.sel[tab] as isize + delta;
+    panel.sel[tab] = cur.clamp(0, rows as isize - 1) as usize;
+}
+
+/// Switch the visible question tab by `delta`, wrapping. A no-op for a single-question ask.
+fn ask_panel_switch_tab(delta: isize) {
+    let mut r = render().lock().unwrap();
+    let Some(panel) = r.ask_panel.as_mut() else {
+        return;
+    };
+    let n = panel.questions.len();
+    if n <= 1 {
+        return;
+    }
+    panel.tab = ((panel.tab as isize + delta).rem_euclid(n as isize)) as usize;
+    panel.typing = false;
+}
+
+/// Toggle/select the row the highlight is on. On a multi-select option this flips a checkbox; on a
+/// single-select option the highlight already IS the pick, so a Space/click just confirms it; on the
+/// free-text row it opens the per-question free-text buffer.
+fn ask_panel_activate_row() {
+    let mut r = render().lock().unwrap();
+    let Some(panel) = r.ask_panel.as_mut() else {
+        return;
+    };
+    let q = panel.tab;
+    let sel = panel.cur_sel();
+    if sel == panel.free_row() {
+        panel.typing = true;
+        return;
+    }
+    if panel.cur().multi_select && sel < panel.checked[q].len() {
+        panel.checked[q][sel] = !panel.checked[q][sel];
+    }
+    panel.typing = false;
+}
+
+/// Handle one key while the answer panel is open. Returns `true` if the key was consumed.
 ///
-/// Deliberately porous, unlike the other menus: printable chars and Backspace dismiss the menu and
-/// fall THROUGH to draft editing (`false`), because the menu offers suggestions — it must never
-/// stand between the user and typing their real answer. Enter with a non-empty draft also falls
-/// through, so an answer typed or pasted while the menu was up submits normally.
-fn question_menu_handle_key(key: &Key, sub_tx: &UnboundedSender<Submission>) -> bool {
-    if !question_menu_active() {
+/// Deliberately porous on the FIRST keypress of a free-text answer: typing a printable char while
+/// merely HIGHLIGHTING a row dismisses the panel and falls through to the shared draft (`false`),
+/// exactly as the old menu did — the panel must never stand between the user and typing their real
+/// answer. But once the free-text row was activated (`typing`), keystrokes edit that per-question
+/// buffer instead (Enter submits it), so a multi-question ask can mix picks and prose without losing
+/// the picks. Enter with a non-empty shared draft also falls through, so a pasted answer submits.
+fn ask_panel_handle_key(key: &Key, sub_tx: &UnboundedSender<Submission>) -> bool {
+    if !ask_panel_active() {
         return false;
     }
-    let (rows, sel) = {
-        let r = render().lock().unwrap();
-        (r.question_menu_options.len() + 1, r.question_menu_sel)
-    };
+    let typing = render()
+        .lock()
+        .unwrap()
+        .ask_panel
+        .as_ref()
+        .map(|p| p.typing)
+        .unwrap_or(false);
+    if typing {
+        return ask_panel_handle_typing_key(key, sub_tx);
+    }
     match key {
         Key::ArrowUp => {
-            if sel > 0 {
-                render().lock().unwrap().question_menu_sel = sel - 1;
-                repaint();
-            }
+            ask_panel_move(-1);
+            repaint();
             true
         }
         Key::ArrowDown => {
-            if sel + 1 < rows {
-                render().lock().unwrap().question_menu_sel = sel + 1;
-                repaint();
-            }
+            ask_panel_move(1);
+            repaint();
             true
         }
-        // Digits highlight (not submit): a stray key must not fire an answer at the agent.
+        Key::ArrowLeft => {
+            ask_panel_switch_tab(-1);
+            repaint();
+            true
+        }
+        Key::ArrowRight | Key::Tab => {
+            ask_panel_switch_tab(1);
+            repaint();
+            true
+        }
+        Key::Char(' ') => {
+            ask_panel_activate_row();
+            repaint();
+            true
+        }
+        // Digits jump to AND pick that option — the old menu highlighted only; picking is the useful
+        // thing here and the panel makes the result visible, so a stray digit is harmless.
         Key::Char(c @ '1'..='9') => {
             let idx = (*c as usize) - ('1' as usize);
-            if idx < rows.saturating_sub(1) {
-                render().lock().unwrap().question_menu_sel = idx;
+            let ok = {
+                let mut r = render().lock().unwrap();
+                let Some(panel) = r.ask_panel.as_mut() else {
+                    return false;
+                };
+                let q = panel.tab;
+                if idx < panel.cur().options.len() {
+                    panel.sel[q] = idx;
+                    // A multi-select digit also checks the row; a single-select digit only moves the
+                    // highlight (which IS the pick).
+                    if panel.cur().multi_select {
+                        panel.checked[q][idx] = !panel.checked[q][idx];
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if ok {
                 repaint();
                 true
             } else {
                 // Not an option number → the user is typing an answer that starts with a digit.
-                question_menu_close();
+                ask_panel_close();
                 false
             }
         }
         Key::Enter => {
             if !render().lock().unwrap().draft.is_empty() {
-                // A typed/pasted answer outranks the highlight — submit it via the normal path.
-                question_menu_close();
+                // A typed/pasted answer in the shared box outranks the panel — submit it normally.
+                ask_panel_close();
                 return false;
             }
-            if sel + 1 == rows {
-                question_menu_close(); // "type my own" → back to the draft
+            let on_free = {
+                let r = render().lock().unwrap();
+                r.ask_panel
+                    .as_ref()
+                    .map(|p| p.cur_sel() == p.free_row())
+                    .unwrap_or(false)
+            };
+            if on_free {
+                // Enter on "type my own" opens the per-question buffer (rather than dismissing, so a
+                // multi-question answer keeps its other picks).
+                ask_panel_activate_row();
+                repaint();
+                true
             } else {
-                question_menu_pick(sel, sub_tx);
+                ask_panel_submit(sub_tx);
+                true
             }
-            true
         }
         Key::Escape => {
-            question_menu_close();
-            true
+            ask_panel_close();
+            true // consumed: Esc must never fall through to the draft-clear/Quit arm
         }
-        // Ctrl-C keeps its global meaning (copy/quit); don't trap the user in the menu.
+        // Ctrl-C keeps its global meaning; don't trap the user in the panel.
         Key::CtrlC | Key::Char('\u{3}') | Key::Char('\u{4}') => {
-            question_menu_close();
+            ask_panel_close();
+            false
+        }
+        // A printable char while merely HIGHLIGHTING a row dismisses the panel and falls through to
+        // the shared draft (`false`) — the panel must never stand between the user and typing their
+        // real answer. To type a free-text answer that rides the panel, the user opens the free-text
+        // row first (Space/Enter on it), which flips `typing` and routes here instead.
+        Key::Char(c) if !c.is_control() => {
+            ask_panel_close();
             false
         }
         Key::Backspace | Key::Del => {
-            question_menu_close();
+            ask_panel_close();
             false
+        }
+        _ => true, // swallow the rest so navigation keys don't scroll/edit under the panel
+    }
+}
+
+/// Keystrokes while a per-question free-text buffer is focused: editing, Enter submits the whole
+/// panel, Esc/Backspace-on-empty returns to the option rows.
+fn ask_panel_handle_typing_key(key: &Key, sub_tx: &UnboundedSender<Submission>) -> bool {
+    match key {
+        Key::Enter => {
+            ask_panel_submit(sub_tx);
+            true
+        }
+        Key::Escape => {
+            let mut r = render().lock().unwrap();
+            if let Some(p) = r.ask_panel.as_mut() {
+                p.typing = false;
+            }
+            true
+        }
+        Key::Backspace => {
+            let mut r = render().lock().unwrap();
+            if let Some(p) = r.ask_panel.as_mut() {
+                let q = p.tab;
+                if p.free[q].pop().is_none() {
+                    p.typing = false; // backspace on an empty buffer steps back out
+                }
+            }
+            repaint();
+            true
         }
         Key::Char(c) if !c.is_control() => {
-            question_menu_close();
+            let mut r = render().lock().unwrap();
+            if let Some(p) = r.ask_panel.as_mut() {
+                let q = p.tab;
+                p.free[q].push(*c);
+                // A typed answer supersedes any checkbox picks on this question.
+                for ch in p.checked[q].iter_mut() {
+                    *ch = false;
+                }
+            }
+            repaint();
+            true
+        }
+        Key::Char('\u{3}') | Key::Char('\u{4}') | Key::CtrlC => {
+            ask_panel_close();
             false
         }
-        _ => true, // swallow the rest so navigation keys don't scroll/edit under the menu
+        _ => true,
+    }
+}
+
+/// Render the ask panel into a retained overlay: a tab strip across the top when more than one
+/// question, then the current question's option rows with a leading checkbox / radio glyph, then the
+/// free-text row. `selected` is the panel's highlight; the mouse row index maps 1:1 to these lines.
+fn ask_panel_overlay(panel: &AskPanel) -> retained::OverlaySnapshot {
+    let q = panel.tab;
+    let question = &panel.questions[q];
+    // Title: the question text, prefixed with its tab position when several are queued.
+    let title = if panel.questions.len() > 1 {
+        format!(
+            "❓ [{}/{}] {}",
+            q + 1,
+            panel.questions.len(),
+            question.question
+        )
+    } else {
+        format!("❓ {}", question.question)
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let sel = panel.cur_sel();
+    for (i, o) in question.options.iter().enumerate() {
+        let box_glyph = if question.multi_select {
+            if panel.checked[q].get(i).copied().unwrap_or(false) {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+        } else if i == sel {
+            // Single-select: the highlight IS the pick, so the radio follows it.
+            "(•)"
+        } else {
+            "( )"
+        };
+        let desc = if o.description.is_empty() {
+            String::new()
+        } else {
+            format!("  — {}", o.description)
+        };
+        lines.push(format!("{box_glyph} {}{desc}", o.label));
+    }
+    // The free-text row, with any buffer shown inline as it is typed.
+    let free_row = if panel.typing || !panel.free[q].trim().is_empty() {
+        format!("✎ {}", panel.free[q])
+    } else {
+        ASK_PANEL_FREEFORM_ROW.to_string()
+    };
+    lines.push(free_row);
+    let hint = if panel.typing {
+        "type your answer · Enter submit · Esc back".to_string()
+    } else if panel.questions.len() > 1 {
+        "←→/Tab question · ↑↓ row · Space check · Enter submit · Esc dismiss".to_string()
+    } else if question.multi_select {
+        "↑↓ row · Space check · Enter submit · Esc dismiss".to_string()
+    } else {
+        "↑↓ row · Space/click pick · Enter submit · Esc dismiss".to_string()
+    };
+    retained::OverlaySnapshot {
+        title,
+        lines,
+        selected: Some(panel.cur_sel()),
+        hint,
     }
 }
 
@@ -1246,7 +1661,7 @@ fn question_menu_handle_key(key: &Key, sub_tx: &UnboundedSender<Submission>) -> 
 /// and a click that ran a command the user was still reading would be worse than one more keypress.
 fn overlay_menu_click(
     idx: usize,
-    sub_tx: &UnboundedSender<Submission>,
+    _sub_tx: &UnboundedSender<Submission>,
     cancel_tx: &UnboundedSender<()>,
 ) -> bool {
     if APPROVAL_PENDING.load(Ordering::Relaxed) && approval_menu_showing() {
@@ -1272,13 +1687,23 @@ fn overlay_menu_click(
         }
         return true;
     }
-    if question_menu_active() {
-        let options = render().lock().unwrap().question_menu_options.len();
-        if idx < options {
-            question_menu_pick(idx, sub_tx);
-        } else {
-            question_menu_close(); // the "type my own" row (or a stale row) → back to the draft
+    if ask_panel_active() {
+        // A click on an option row moves the highlight there and activates it (check/pick); a click
+        // on the free-text row opens the per-question buffer. The panel is a two-axis surface (tabs ×
+        // rows), so the row index published by the overlay geometry is the ROW-ONLY index — the
+        // published rows already account for the free-text row being last.
+        {
+            let mut r = render().lock().unwrap();
+            if let Some(p) = r.ask_panel.as_mut() {
+                let rows = p.rows();
+                let tab = p.tab;
+                if idx < rows {
+                    p.sel[tab] = idx;
+                }
+            }
         }
+        ask_panel_activate_row();
+        repaint_force();
         return true;
     }
     if model_menu_active() {
@@ -1293,6 +1718,13 @@ fn overlay_menu_click(
         if pick.is_some() {
             model_menu_finish(pick);
         }
+        return true;
+    }
+    // The `/jobs` panel outranks the mere palettes but not the modal menus above: a click on a job
+    // row selects and STOPS it (a click is a full pick, like every other selectable overlay). Same
+    // priority order the snapshot paints, so a click never lands on the wrong surface.
+    if jobs_menu_active() {
+        jobs_menu_click(idx);
         return true;
     }
     if sessions_menu_active() {
@@ -1384,6 +1816,10 @@ pub fn activate(intro: &str, status: &str) -> bool {
         return false;
     }
     ACTIVE.store(true, Ordering::Relaxed);
+    // Publish an initial jobs snapshot and start the poller, so the sidebar's jobs section and the
+    // footer strip are populated from the first frame rather than a second in. Idempotent per process.
+    set_jobs(jobs_snapshot());
+    spawn_jobs_poller();
     true
 }
 
@@ -1606,6 +2042,13 @@ fn next_tool_seq() -> u64 {
     TOOL_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Allocate a tool-call seq WITHOUT opening a row — for calls (task/workflow under retained) whose
+/// begin/end feed the collapsible sub-agents block instead of the transcript, but still need a seq so
+/// `note_tool_body` keeps their result for `Ctrl-E`.
+pub fn tool_seq_alloc() -> u64 {
+    next_tool_seq()
+}
+
 fn tool_state(outcome: ToolOutcome) -> retained::ToolState {
     match outcome {
         None => retained::ToolState::Running,
@@ -1664,7 +2107,7 @@ pub fn tool_body_tail(body: &str) -> String {
 }
 
 /// Remember a finished tool's result for `Ctrl-E` (bounded; a repeat `seq` replaces its entry).
-pub(crate) fn note_tool_body(seq: u64, title: String, body: String) {
+pub fn note_tool_body(seq: u64, title: String, body: String) {
     if body.trim().is_empty() {
         return;
     }
@@ -1866,6 +2309,503 @@ pub fn set_facts(facts: SessionFacts) {
     }
 }
 
+/// Publish the live background-work snapshot (processes + monitor runs) for the sidebar section and
+/// the jobs strip. Retained-only; a no-op off the full-frame surface. Sent by [`spawn_jobs_poller`].
+pub fn set_jobs(jobs: JobsStatus) {
+    if retained::is_running() {
+        retained::set_jobs(jobs);
+    }
+}
+
+/// Pull a fresh orchestration-registry snapshot and push it into the collapsible sub-agents block.
+/// Called by `orchestration::publish_panel` on every run start/finish/step; the registry speaks in
+/// plain tuples because the panel's payload type is `pub(super)` inside `retained`. A no-op off the
+/// retained surface — classic keeps its per-call tool rows.
+pub fn publish_subagents_panel() {
+    if !retained::is_running() {
+        return;
+    }
+    let (rows, summary) = crate::agent::orchestration::panel_snapshot();
+    if rows.is_empty() && summary.is_empty() {
+        return;
+    }
+    let rows = rows
+        .into_iter()
+        .map(|r| retained::SubAgentRow {
+            mark: r.mark.to_string(),
+            label: r.label,
+            detail: r.detail,
+            elapsed: r.elapsed,
+            running: r.running,
+        })
+        .collect();
+    retained::subagents_update(retained::SubAgentsPayload {
+        rows,
+        summary,
+        expanded: false, // the UI-owned value wins inside `apply_subagents`
+    });
+}
+
+/// Build the current [`JobsStatus`]: long-running `process` handles plus live monitor runs. Pure
+/// reads of two lock-guarded registries, so it is cheap enough for a 1 s poll.
+pub fn jobs_snapshot() -> JobsStatus {
+    let procs = crate::agent::process::snapshot()
+        .into_iter()
+        .map(|j| JobRow {
+            id: j.id,
+            running: j.running,
+            elapsed: j.elapsed,
+            detail: j.command,
+        })
+        .collect();
+    let monitor = crate::agent::orchestration::live_rows()
+        .into_iter()
+        .map(|(id, label, elapsed)| JobRow {
+            id,
+            running: true,
+            elapsed,
+            detail: label,
+        })
+        .collect();
+    JobsStatus {
+        processes: procs,
+        monitor,
+    }
+}
+
+/// Guards the single jobs poller thread so it is spawned at most once per process.
+static JOBS_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Render the jobs snapshot as a plain-text panel body (the live overlay behind `/jobs` and a click
+/// on the strip). Two sections — long-running PROCESSES and live MONITOR runs — with a short legend
+/// so the reader knows what they are looking at. Used for the non-selectable fallback path (a pipe,
+/// or a suspended menu) where stop keys cannot be routed.
+pub fn format_jobs() -> String {
+    let jobs = jobs_snapshot();
+    let mut out = String::new();
+    let rp = jobs.running_processes();
+    out.push_str(&format!(
+        "Background jobs  ·  {} running process(es)  ·  {} live monitor run(s)\n",
+        rp,
+        jobs.live_monitor()
+    ));
+    out.push_str("\n● processes (process tool)\n");
+    if jobs.processes.is_empty() {
+        out.push_str("  (none — the agent starts these with `process action=start`)\n");
+    } else {
+        for r in &jobs.processes {
+            let mark = if r.running { "▸" } else { "·" };
+            out.push_str(&format!(
+                "  {mark} {:<10} {:>7}  {}\n",
+                r.id, r.elapsed, r.detail
+            ));
+        }
+    }
+    out.push_str("\n● monitor (sub-agents · workflows)\n");
+    if jobs.monitor.is_empty() {
+        out.push_str("  (none running)\n");
+    } else {
+        for r in &jobs.monitor {
+            out.push_str(&format!("  ✦ {:<6} {:>7}  {}\n", r.id, r.elapsed, r.detail));
+        }
+    }
+    out.push_str(
+        "\nStop one monitor run: `/workflows stop #<id>`  ·  a process: `process action=kill id=proc_n`\n\
+         Esc cancels the whole turn.",
+    );
+    out
+}
+
+/// Build the STOP-ABLE rows of the jobs panel: one per running process, then one per live monitor
+/// run. Finished processes are omitted — there is nothing to stop — so a row index always maps to an
+/// actionable handle. Returned newest-handle-last within each section.
+fn jobs_menu_rows() -> Vec<JobsMenuRow> {
+    let jobs = jobs_snapshot();
+    let mut rows: Vec<JobsMenuRow> = Vec::new();
+    for r in jobs.processes.iter().filter(|r| r.running) {
+        rows.push(JobsMenuRow {
+            handle: r.id.clone(),
+            kind: JobKind::Process,
+            label: format!("▸ {:<10} {:>7}  {}", r.id, r.elapsed, r.detail),
+        });
+    }
+    for r in &jobs.monitor {
+        rows.push(JobsMenuRow {
+            handle: r.id.clone(),
+            kind: JobKind::Monitor,
+            label: format!("✦ {:<6} {:>7}  {}", r.id, r.elapsed, r.detail),
+        });
+    }
+    rows
+}
+
+/// Open the live jobs panel. Under the retained UI it is a SELECTABLE overlay driven through the
+/// normal input-snapshot chain (like the ask panel): ↑↓ move the highlight, Enter (or `x`/`k`) stops
+/// the highlighted job, Esc closes. The body refreshes in place every second (see the refesher
+/// thread). Anywhere the overlay cannot be driven (a pipe, a suspended menu) it degrades to text.
+/// Returns whether the panel actually opened — the mid-turn caller routes on this.
+pub fn open_jobs_panel() -> bool {
+    if !active() {
+        note_line(&format_jobs());
+        return false;
+    }
+    // Retire any live informational overlay first (a `/workflows` panel re-publishes itself ~1/s
+    // through `Command::UpdateOverlay`, which would race this panel for `state.input.overlay`).
+    retained_overlay_close();
+    let rows = jobs_menu_rows();
+    {
+        let mut r = render().lock().unwrap();
+        r.jobs_menu = Some(JobsMenu {
+            active: true,
+            sel: 0,
+            rows,
+            log: None,
+        });
+        // A background panel and the draft palettes are mutually exclusive; clear the palette
+        // highlight so a stale one can't paint under the panel.
+        r.palette_sel = 0;
+    }
+    repaint_force();
+    spawn_jobs_menu_refresher();
+    true
+}
+
+/// The overlay snapshot for the jobs panel: either the process LOG (when one is open) or the
+/// stop-able row list. A SELECTABLE overlay (selected = Some) so the render thread publishes click
+/// geometry and paints one row per line.
+fn jobs_overlay_snapshot(menu: &JobsMenu) -> retained::OverlaySnapshot {
+    if let Some(log) = menu.log.as_ref() {
+        return jobs_log_snapshot(log);
+    }
+    let mut lines: Vec<String> = menu.rows.iter().map(|r| r.label.clone()).collect();
+    if lines.is_empty() {
+        lines.push("(nothing running — no background work to stop)".to_string());
+    }
+    let hint = if menu.rows.is_empty() {
+        "Esc close".to_string()
+    } else {
+        "↑↓ pick · Enter open log · x stop · Esc close".to_string()
+    };
+    retained::OverlaySnapshot {
+        title: "Jobs".to_string(),
+        lines,
+        selected: (!menu.rows.is_empty()).then_some(menu.sel),
+        hint,
+    }
+}
+
+/// The `(title, status, body)` of the log view, in the fields the overlay needs. `body`'s lines
+/// become the panel rows; `scroll` picks the visible window.
+fn jobs_log_snapshot(log: &JobsLogView) -> retained::OverlaySnapshot {
+    let mut lines: Vec<String> = log.body.lines().map(str::to_string).collect();
+    if lines.is_empty() {
+        lines.push("(no output yet)".to_string());
+    }
+    retained::OverlaySnapshot {
+        title: format!("{}  ·  {}  ·  {}", log.handle, log.title, log.status),
+        lines,
+        selected: None,
+        hint: "↑↓/PgUp/PgDn scroll · Esc back".to_string(),
+    }
+}
+
+/// Close the jobs panel.
+pub fn jobs_menu_close() {
+    {
+        let mut r = render().lock().unwrap();
+        r.jobs_menu = None;
+    }
+    repaint_force();
+}
+
+/// Whether the jobs panel is open (the input thread routes ↑↓/Enter/x/Esc to it).
+pub fn jobs_menu_active() -> bool {
+    render()
+        .lock()
+        .unwrap()
+        .jobs_menu
+        .as_ref()
+        .map(|j| j.active)
+        .unwrap_or(false)
+}
+
+/// Rebuild the jobs panel from a fresh snapshot: the row list (keeping the highlight on the same job
+/// when it still exists — a job that ended drops off and the highlight slides to a neighbour), and the
+/// open log view's body (so a running process's log keeps growing). Runs on the refresher thread and on
+/// every stop, so the panel never shows a job that has already gone.
+fn jobs_menu_refresh() {
+    {
+        let mut r = render().lock().unwrap();
+        let Some(menu) = r.jobs_menu.as_mut() else {
+            return;
+        };
+        let rows = jobs_menu_rows();
+        let old = menu.rows.get(menu.sel).map(|row| row.handle.clone());
+        menu.rows = rows;
+        menu.sel = match old {
+            Some(h) => menu
+                .rows
+                .iter()
+                .position(|row| row.handle == h)
+                .unwrap_or_else(|| menu.sel.min(menu.rows.len().saturating_sub(1))),
+            None => menu.sel.min(menu.rows.len().saturating_sub(1)),
+        };
+        // Re-read the open log, if any, so a live process's output tracks what it is doing now.
+        if let Some(log) = menu.log.as_ref() {
+            let handle = log.handle.clone();
+            let title = log.title.clone();
+            if let Some((status, body)) = crate::agent::process::log_by_id(&handle, LOG_VIEW_LINES)
+            {
+                if let Some(log) = menu.log.as_mut() {
+                    log.status = status;
+                    log.body = body;
+                    let _ = &title; // title is captured at open time; the row may be gone now
+                }
+            }
+        }
+    }
+    // Rebuilding the snapshot republishes the overlay with the current selection.
+    repaint_force();
+}
+
+/// How many tail lines of a process's output the `/jobs` log view shows. Enough for a build tail or
+/// a dev-server error burst, small enough to stay readable in a panel.
+const LOG_VIEW_LINES: usize = 200;
+
+/// Open the highlighted row's log in the panel (Enter on a process row). A monitor run has no process
+/// log — say so rather than showing an empty panel. No-op when the row is not a live process.
+fn jobs_menu_open_log() {
+    let row = {
+        let r = render().lock().unwrap();
+        r.jobs_menu
+            .as_ref()
+            .and_then(|j| j.rows.get(j.sel).cloned())
+    };
+    let Some(row) = row else { return };
+    match row.kind {
+        JobKind::Monitor => {
+            note_line(
+                "monitor runs have no process log — `/workflows` shows their step; x stops one",
+            );
+        }
+        JobKind::Process => match crate::agent::process::log_by_id(&row.handle, LOG_VIEW_LINES) {
+            Some((status, body)) => {
+                {
+                    let mut r = render().lock().unwrap();
+                    if let Some(menu) = r.jobs_menu.as_mut() {
+                        menu.log = Some(JobsLogView {
+                            handle: row.handle.clone(),
+                            title: row.label.clone(),
+                            status,
+                            body,
+                        });
+                    }
+                }
+                repaint_force();
+                // A log is read at its TAIL — open on the newest lines rather than the oldest. The
+                // overlay's scroll is "lines from the top", clamped at draw, so a huge negative delta
+                // lands at the bottom regardless of length.
+                retained::scroll(-9999);
+            }
+            None => note_line(&format!("{} has no log (already gone)", row.handle)),
+        },
+    }
+}
+
+/// Leave the log view and return to the job list. The panel's overlay scroll is pinned back to the
+/// top so the row list opens at its first row rather than wherever the log was scrolled.
+fn jobs_menu_close_log() {
+    {
+        let mut r = render().lock().unwrap();
+        if let Some(menu) = r.jobs_menu.as_mut() {
+            menu.log = None;
+        }
+    }
+    retained::scroll_end();
+    repaint_force();
+}
+
+/// Guards the single jobs-panel refresher thread.
+static JOBS_MENU_REFRESHER: AtomicBool = AtomicBool::new(false);
+
+/// Spawn the jobs-panel refresher: while the panel stays open it rebuilds the row list each second,
+/// so a process that exits (or a monitor run that finishes) leaves the panel without a reopen. Exits
+/// the moment the panel closes.
+fn spawn_jobs_menu_refresher() {
+    if JOBS_MENU_REFRESHER.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_millis(1000));
+            // Reset the flag on the way out so a later reopen can spawn a fresh refresher.
+            if !jobs_menu_active() || !retained::is_running() {
+                JOBS_MENU_REFRESHER.store(false, Ordering::SeqCst);
+                return;
+            }
+            jobs_menu_refresh();
+        }
+    });
+}
+
+/// Stop the highlighted job (Enter / `x` / `k` in the jobs panel). Returns a short note to display.
+fn jobs_menu_stop_selected() -> Option<String> {
+    let row = {
+        let r = render().lock().unwrap();
+        r.jobs_menu
+            .as_ref()
+            .and_then(|j| j.rows.get(j.sel).cloned())
+    };
+    let row = row?;
+    let note = match row.kind {
+        JobKind::Process => crate::agent::process::kill_by_id(&row.handle),
+        JobKind::Monitor => {
+            let report = crate::agent::orchestration::cancel_matching(&row.handle);
+            if report.cancelled > 0 {
+                format!("✓ stop requested for {}", row.handle)
+            } else if report.unstoppable > 0 {
+                format!(
+                    "{} has no stop handle — Esc cancels the whole turn",
+                    row.handle
+                )
+            } else {
+                format!("{} already finished", row.handle)
+            }
+        }
+    };
+    // Reflect the change at once rather than waiting for the next refresh tick.
+    jobs_menu_refresh();
+    Some(note)
+}
+
+/// Handle one key while the jobs panel is open. Returns `true` if consumed.
+///
+/// Two views share the panel: the LIST (↑↓ pick, Enter opens that process's log, `x`/`k` stops it,
+/// Esc closes) and the LOG (↑↓/PgUp/PgDn scroll, Esc/q returns to the list). The log view is checked
+/// first so its scroll keys never fall through to the list's selection.
+fn jobs_menu_handle_key(key: &Key) -> bool {
+    if !jobs_menu_active() {
+        return false;
+    }
+    // LOG view.
+    if render()
+        .lock()
+        .unwrap()
+        .jobs_menu
+        .as_ref()
+        .map(|j| j.log.is_some())
+        .unwrap_or(false)
+    {
+        match key {
+            Key::Escape | Key::Char('q') | Key::Char('Q') => jobs_menu_close_log(),
+            Key::ArrowUp => retained::scroll(-1),
+            Key::ArrowDown => retained::scroll(1),
+            Key::PageUp => retained::scroll(-12),
+            Key::PageDown => retained::scroll(12),
+            Key::Home => retained::scroll_end(),
+            _ => {}
+        }
+        return true;
+    }
+    let rows = render()
+        .lock()
+        .unwrap()
+        .jobs_menu
+        .as_ref()
+        .map(|j| j.rows.len())
+        .unwrap_or(0);
+    match key {
+        Key::ArrowUp => {
+            if let Some(m) = render().lock().unwrap().jobs_menu.as_mut() {
+                m.sel = m.sel.saturating_sub(1);
+            }
+            jobs_menu_repaint();
+            true
+        }
+        Key::ArrowDown => {
+            if let Some(m) = render().lock().unwrap().jobs_menu.as_mut() {
+                if m.sel + 1 < rows {
+                    m.sel += 1;
+                }
+            }
+            jobs_menu_repaint();
+            true
+        }
+        // Enter opens the highlighted process's log (a monitor row has none — said, not silently
+        // ignored). Enter on the empty placeholder closes the panel.
+        Key::Enter => {
+            if rows == 0 {
+                jobs_menu_close();
+            } else {
+                jobs_menu_open_log();
+            }
+            true
+        }
+        // `x`/`k` = STOP the highlighted job, without leaving the panel (stop several in a row).
+        // Deliberately not Enter: opening the log is the common intent, and a stop should be explicit.
+        Key::Char('x') | Key::Char('X') | Key::Char('k') | Key::Char('K') => {
+            if rows > 0 {
+                if let Some(note) = jobs_menu_stop_selected() {
+                    note_line(&note);
+                }
+            }
+            true
+        }
+        Key::Escape | Key::Char('q') | Key::Char('Q') => {
+            jobs_menu_close();
+            true
+        }
+        _ => true, // swallow the rest so typing doesn't edit the draft under the panel
+    }
+}
+
+/// Repaint the jobs panel from its current selection (arrow keys) — the snapshot builder reads
+/// `Render.jobs_menu`, so a plain input repaint is enough.
+fn jobs_menu_repaint() {
+    if render().lock().unwrap().jobs_menu.is_some() {
+        repaint_force();
+    }
+}
+
+/// Click a row of the jobs panel: move the highlight there and OPEN that job's log (a click is a full
+/// pick, matching every other selectable overlay — and matches Enter). Stopping stays on `x`/`k` so a
+/// stray click can never kill a job.
+fn jobs_menu_click(idx: usize) {
+    let ok = {
+        let mut r = render().lock().unwrap();
+        match r.jobs_menu.as_mut() {
+            Some(m) if idx < m.rows.len() => {
+                m.sel = idx;
+                true
+            }
+            _ => false,
+        }
+    };
+    if ok {
+        jobs_menu_open_log();
+    }
+}
+
+/// Spawn a background thread that publishes [`jobs_snapshot`] to the render thread about once a
+/// second, so the sidebar's jobs section and the footer strip track background work even while the
+/// turn is idle (a dev server from a previous turn keeps ticking; a finished one drops off). Idle
+/// cost is two registry locks — negligible — and it only runs while the retained backend is up.
+pub fn spawn_jobs_poller() {
+    if JOBS_POLLER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(1000));
+        if !retained::is_running() {
+            // The render thread is gone (shutdown). Keep the thread parked rather than exiting, so a
+            // later re-activation in the same process (the REPL re-entering after a suspend) still
+            // gets updates — `is_running()` covers the suspended case, where `is_active()` is false.
+            continue;
+        }
+        set_jobs(jobs_snapshot());
+    });
+}
+
 /// Recolour the retained input box for ultimate mode (gold ON, moonlight OFF). No-op on the classic
 /// path (it has no persistent box to recolour). Called once when `/ultimate` toggles and once at
 /// activation so the box opens in the right colour.
@@ -1967,15 +2907,8 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
             selected: Some(r.approval_menu_sel.min(APPROVAL_MENU_LEN - 1)),
             hint: "↑↓/click pick · Enter confirm · y/a/n direct · Esc stop".to_string(),
         })
-    } else if r.question_menu_active {
-        let mut lines: Vec<String> = r.question_menu_options.clone();
-        lines.push(QUESTION_MENU_FREEFORM_ROW.to_string());
-        Some(retained::OverlaySnapshot {
-            title: format!("❓ {}", r.question_menu_question),
-            lines,
-            selected: Some(r.question_menu_sel),
-            hint: "↑↓/click pick · Enter answer · Esc/type your own".to_string(),
-        })
+    } else if let Some(panel) = r.ask_panel.as_ref() {
+        Some(ask_panel_overlay(panel))
     } else if r.model_menu_active {
         Some(retained::OverlaySnapshot {
             title: "model".to_string(),
@@ -2017,6 +2950,9 @@ fn retained_input_snapshot() -> retained::InputSnapshot {
             selected: None,
             hint: "↑↓/PgUp/PgDn scroll · Esc/q close".to_string(),
         })
+    } else if let Some(menu) = r.jobs_menu.as_ref() {
+        // The `/jobs` panel: a selectable, stop-able overlay driven from `Render.jobs_menu`.
+        Some(jobs_overlay_snapshot(menu))
     } else {
         // `@` file picker — takes priority over slash palette (you can't type both at once).
         let at = at_matches(&r.draft);
@@ -2764,10 +3700,11 @@ fn input_loop(
                     && crate::ui::splash::logo_is_sixel()
                     && !WORKING.load(Ordering::Relaxed)
                     && !APPROVAL_PENDING.load(Ordering::Relaxed)
-                    && !question_menu_active()
+                    && !ask_panel_active()
                     && !model_menu_active()
                     && !sessions_menu_active()
                     && !text_overlay_active()
+                    && !jobs_menu_active()
                     && !RETAINED_INFO_OVERLAY.load(Ordering::Relaxed)
                     && last_activity.elapsed() >= Duration::from_secs(IDLE_SCREENSAVER_SECS)
                     && retained::output_quiet_for() >= Duration::from_secs(OUTPUT_QUIET_SECS)
@@ -2933,6 +3870,15 @@ fn input_loop(
                                 continue;
                             }
                         }
+                        // A click on the jobs strip (narrow terminals) opens the jobs panel — same
+                        // surface `/jobs` raises. Priority over transcript selection so the click on
+                        // the strip never starts a highlight under it.
+                        if let Some(r) = retained::jobs_strip_rect() {
+                            if hit(r, me.column, me.row) {
+                                open_jobs_panel();
+                                continue;
+                            }
+                        }
                     }
                     handle_retained_mouse(
                         me.kind,
@@ -3074,7 +4020,7 @@ fn input_loop(
             // y/n/a and the menu keys only — other keys still edit the draft / queue messages
             // (Claude-style).
         }
-        if question_menu_handle_key(&key, &sub_tx) {
+        if ask_panel_handle_key(&key, &sub_tx) {
             continue;
         }
         if model_menu_handle_key(&key) {
@@ -3084,6 +4030,11 @@ fn input_loop(
             continue;
         }
         if text_overlay_handle_key(&key) {
+            continue;
+        }
+        // The `/jobs` panel is selectable AND stop-able, so its keys must be routed before the generic
+        // informational-overlay block below — that block would swallow Enter/x and only offer scroll.
+        if jobs_menu_handle_key(&key) {
             continue;
         }
         if retained::is_active() && RETAINED_INFO_OVERLAY.load(Ordering::Relaxed) {
@@ -3273,6 +4224,21 @@ fn input_loop(
                         );
                     }
                     crate::features::slash::Verdict::Chat => {
+                        // A PLAIN message typed WHILE A TURN RUNS steers that turn instead of
+                        // queueing behind it. Queueing meant the turn finished whatever plan it had
+                        // committed to before the model ever saw the follow-up; steering hands the
+                        // text to the running turn at its next iteration boundary, where the loop
+                        // folds it in as a course correction (see `core::steer::format_injection`) —
+                        // same body, no prefix needed. The `>` prefix above is the same path typed
+                        // explicitly; both exist because a bare Enter on ordinary prose is the
+                        // instinctive one. A refused steer (oversized, or all MAX_PENDING slots
+                        // taken — steer::push is armed during prep too) falls through to the queue
+                        // unchanged, so the message is delivered either way, never lost.
+                        // Image attachments keep the queue: the mailbox carries text only, and a
+                        // vision message belongs in its own turn.
+                        if crate::core::steer::push(trimmed.as_str()) {
+                            continue;
+                        }
                         // Image data URLs aren't carried here (the box only tracks a count); the
                         // REPL resolves attachments — we forward the text and the clipboard images
                         // live in shared state drained by the caller.
@@ -3404,7 +4370,14 @@ fn input_loop(
             Key::Char('\u{5}') => {
                 // Ctrl-E: expand a tool result into the text overlay — the tool under the
                 // selection anchor when a selection sits on a tool row, else the most recent.
-                // (Ctrl-O stays the screenshot key.)
+                // (Ctrl-O stays the screenshot key.) When a collapsible sub-agents panel is on
+                // screen, Ctrl-E toggles THAT open/closed first — expanding a tool body stays
+                // available via the selection anchor on a real tool row.
+                if retained::is_running() && retained::has_subagents_panel() {
+                    retained::toggle_subagents();
+                    repaint();
+                    continue;
+                }
                 let picked = retained::live_selection()
                     .and_then(|s| retained::tool_seq_at_row(s.anchor_line))
                     .and_then(tool_body)
@@ -4547,6 +5520,59 @@ pub fn effort_slider(start: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// `/jobs` typed WHILE A TURN RUNS must open the panel on the input thread, not join the
+    /// submission queue — the queue only drains when the turn ends, which is exactly when watching a
+    /// background process stops being useful (the bug this pins: panel appeared only after the task
+    /// finished).
+    #[test]
+    fn jobs_is_serviced_inline_while_a_turn_runs() {
+        let token = crate::core::cancel::TurnCancel::new();
+        arm_cancel(token.clone());
+        ACTIVE.store(true, Ordering::Relaxed); // fake a live surface; the panel needs no render thread
+        assert!(
+            turn_in_flight(),
+            "an armed token is what the input thread routes on"
+        );
+        assert!(
+            handle_status_command_inline("jobs", ""),
+            "mid-turn /jobs must be handled here, never queued"
+        );
+        assert!(jobs_menu_active(), "the panel opened from the input thread");
+        jobs_menu_close();
+        ACTIVE.store(false, Ordering::Relaxed);
+        disarm_cancel(&token);
+        // Idle: the command falls through to the REPL's queue, where suspend/park semantics live.
+        assert!(
+            !turn_in_flight(),
+            "idle /jobs stays a queued submission (no turn → inline path never fires)"
+        );
+    }
+
+    /// A PLAIN message typed while a turn runs must steer that turn (`steer::push`), not join the
+    /// submission queue — the queue only drains when the turn ENDS, which is exactly when "wait,
+    /// also do X" has stopped being useful. The guard this relies on: `steer::push` refuses the
+    /// moment the mailbox is disarmed or full, so an idle or oversized message still queues —
+    /// delivery is never lost on either path. (The mailbox arm happens with the cancel token in the
+    /// REPL, so here we arm it directly to stand in for the running turn.)
+    #[test]
+    fn plain_chat_typed_mid_turn_steers_instead_of_queueing() {
+        let _lock = crate::core::steer::test_lock();
+        crate::core::steer::arm(); // stands in for the turn the input thread would steer
+        assert!(
+            crate::core::steer::push("wait, also update the README"),
+            "an armed mailbox accepts the mid-turn message — this is what the Verdict::Chat path tries FIRST"
+        );
+        let drained = crate::core::steer::drain();
+        assert_eq!(drained, vec!["wait, also update the README".to_string()]);
+        // A refused steer (mailbox disarmed = turn just ended) is what falls back to the queue.
+        let leftovers = crate::core::steer::disarm();
+        assert!(leftovers.is_empty(), "drained above");
+        assert!(
+            !crate::core::steer::push("arrived after the turn ended"),
+            "unarmed ⇒ the queue path must take it, never a silent drop"
+        );
+    }
+
     #[test]
     fn normalize_paste_text_collapses_windows_newlines() {
         assert_eq!(normalize_paste_text("a\r\nb\rc"), "a\nb\nc");
@@ -4786,14 +5812,16 @@ mod tests {
     }
 
     #[test]
-    fn question_menu_picks_submit_and_typing_falls_through() {
+    fn ask_panel_single_select_picks_and_typing_falls_through() {
         let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, mut rx) = mpsc::unbounded_channel::<Submission>();
-        question_menu_set(
+        let ask = ask_of(&[question_cfg(
             "Which file?",
-            &["src/a.rs".to_string(), "src/b.rs".to_string()],
-        );
-        assert!(question_menu_active());
+            &["src/a.rs", "src/b.rs"],
+            false,
+        )]);
+        ask_panel_set(&ask);
+        assert!(ask_panel_active());
         {
             // Enter must read an empty draft to mean "confirm the highlight".
             let mut r = render().lock().unwrap();
@@ -4801,9 +5829,9 @@ mod tests {
             r.cursor = 0;
         }
         // ↓ moves the highlight, Enter submits the highlighted option as a normal chat message.
-        assert!(question_menu_handle_key(&Key::ArrowDown, &tx));
-        assert!(question_menu_handle_key(&Key::Enter, &tx));
-        assert!(!question_menu_active(), "picking closes the menu");
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx));
+        assert!(ask_panel_handle_key(&Key::Enter, &tx));
+        assert!(!ask_panel_active(), "submitting closes the panel");
         match rx.try_recv() {
             Ok(Submission::Chat(text, imgs)) => {
                 assert_eq!(text, "src/b.rs");
@@ -4811,34 +5839,232 @@ mod tests {
             }
             other => panic!("expected the picked option as a Chat submission, got {other:?}"),
         }
-        // Typing dismisses the menu and the key falls through to the draft (`false`).
-        question_menu_set("Q?", &["A".to_string()]);
-        assert!(!question_menu_handle_key(&Key::Char('x'), &tx));
-        assert!(!question_menu_active(), "typing dismisses");
+        // Typing (not on the free-text row) dismisses and falls through to the draft (`false`).
+        ask_panel_set(&ask);
+        assert!(!ask_panel_handle_key(&Key::Char('x'), &tx));
+        assert!(!ask_panel_active(), "typing dismisses");
         assert!(rx.try_recv().is_err(), "dismissal submits nothing");
         // Esc dismisses too, but is consumed (it must never fall through to the Quit arm).
-        question_menu_set("Q?", &["A".to_string()]);
-        assert!(question_menu_handle_key(&Key::Escape, &tx));
-        assert!(!question_menu_active());
-        // The trailing free-form row dismisses without submitting.
-        question_menu_set("Q?", &["A".to_string()]);
-        assert!(question_menu_handle_key(&Key::ArrowDown, &tx)); // onto "type my own"
-        assert!(question_menu_handle_key(&Key::Enter, &tx));
-        assert!(!question_menu_active());
-        assert!(rx.try_recv().is_err(), "free-form row submits nothing");
+        ask_panel_set(&ask);
+        assert!(ask_panel_handle_key(&Key::Escape, &tx));
+        assert!(!ask_panel_active());
+    }
+
+    #[test]
+    fn jobs_panel_selects_stops_and_closes() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A panel with two fake monitor rows. Stopping a bogus monitor handle is a safe no-op (the
+        // orchestration registry simply has no match), so this drives the real key path.
+        {
+            let mut r = render().lock().unwrap();
+            r.jobs_menu = Some(JobsMenu {
+                active: true,
+                sel: 0,
+                rows: vec![
+                    JobsMenuRow {
+                        handle: "#1".to_string(),
+                        kind: JobKind::Monitor,
+                        label: "✦ #1   3s  reviewer".to_string(),
+                    },
+                    JobsMenuRow {
+                        handle: "#2".to_string(),
+                        kind: JobKind::Monitor,
+                        label: "✦ #2   9s  builder".to_string(),
+                    },
+                ],
+                log: None,
+            });
+            r.draft.clear();
+        }
+        assert!(jobs_menu_active());
+        // The snapshot paints a SELECTABLE overlay whose rows map 1:1 to jobs.
+        let snap = retained_input_snapshot();
+        let overlay = snap.overlay.expect("jobs panel paints an overlay");
+        assert_eq!(overlay.title, "Jobs");
+        assert_eq!(overlay.lines.len(), 2);
+        assert_eq!(overlay.selected, Some(0));
+        // ↓ moves the highlight; the hint names both the open and the stop keys.
+        assert!(jobs_menu_handle_key(&Key::ArrowDown));
+        assert_eq!(render().lock().unwrap().jobs_menu.as_ref().unwrap().sel, 1);
+        assert!(overlay.hint.contains("stop") && overlay.hint.contains("log"));
+        // `x` stops the highlighted row (a no-op for a bogus handle) but leaves the panel open.
+        assert!(jobs_menu_handle_key(&Key::Char('x')));
+        assert!(
+            jobs_menu_active(),
+            "stop keeps the panel open for stopping more"
+        );
+        // Esc closes.
+        assert!(jobs_menu_handle_key(&Key::Escape));
+        assert!(!jobs_menu_active());
+        assert!(retained_input_snapshot().overlay.is_none());
+        // With no jobs the panel is not selectable (a placeholder row) and closes on Enter.
+        let empty = jobs_overlay_snapshot(&JobsMenu::default());
+        assert_eq!(empty.selected, None);
+        assert!(empty.lines[0].contains("nothing running"));
+    }
+
+    #[test]
+    fn jobs_panel_log_view_scrolls_and_returns() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Drive the log sub-view directly (a real process in the registry is not needed to exercise
+        // the view's snapshot + key routing).
+        {
+            let mut r = render().lock().unwrap();
+            r.jobs_menu = Some(JobsMenu {
+                active: true,
+                sel: 0,
+                rows: Vec::new(),
+                log: Some(JobsLogView {
+                    handle: "proc_1".to_string(),
+                    title: "npm run dev".to_string(),
+                    status: "running".to_string(),
+                    body: "line one\nline two".to_string(),
+                }),
+            });
+        }
+        // The overlay shows the log: title names handle + status, rows are the body lines, and it is
+        // NOT selectable (no click geometry, wraps long lines).
+        let overlay = retained_input_snapshot()
+            .overlay
+            .expect("log paints an overlay");
+        assert!(overlay.title.contains("proc_1") && overlay.title.contains("running"));
+        assert_eq!(overlay.lines, vec!["line one", "line two"]);
+        assert_eq!(overlay.selected, None);
+        assert!(overlay.hint.contains("scroll"));
+        // Scroll keys are consumed by the log view (never reaching list selection), Esc returns.
+        assert!(jobs_menu_handle_key(&Key::ArrowUp));
+        assert!(jobs_menu_handle_key(&Key::PageDown));
+        assert!(jobs_menu_handle_key(&Key::Escape));
+        assert!(
+            render()
+                .lock()
+                .unwrap()
+                .jobs_menu
+                .as_ref()
+                .unwrap()
+                .log
+                .is_none(),
+            "Esc returns to the list, not out of the panel"
+        );
+        assert!(jobs_menu_active(), "the panel itself stays open");
+    }
+
+    #[test]
+    fn ask_panel_multi_select_checks_and_submits_all() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Submission>();
+        let ask = ask_of(&[question_cfg("Which tools?", &["fmt", "lint", "test"], true)]);
+        ask_panel_set(&ask);
+        {
+            let mut r = render().lock().unwrap();
+            r.draft.clear();
+        }
+        // Space on rows 0 and 2 checks them; Enter submits both labels joined.
+        assert!(ask_panel_handle_key(&Key::Char(' '), &tx));
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx));
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx));
+        assert!(ask_panel_handle_key(&Key::Char(' '), &tx));
+        assert!(ask_panel_handle_key(&Key::Enter, &tx));
+        match rx.try_recv() {
+            Ok(Submission::Chat(text, _)) => assert_eq!(text, "fmt, test"),
+            other => panic!("expected both checked labels, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_panel_multi_question_labels_answers() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Submission>();
+        let ask = ask_of(&[
+            question_cfg("Which DB?", &["pg", "sqlite"], false),
+            question_cfg("Which cache?", &["redis", "memory"], false),
+        ]);
+        ask_panel_set(&ask);
+        {
+            let mut r = render().lock().unwrap();
+            r.draft.clear();
+        }
+        // Pick "pg" on tab 0, then tab to question 2 and pick "redis".
+        assert!(ask_panel_handle_key(&Key::Char(' '), &tx));
+        assert!(ask_panel_handle_key(&Key::Tab, &tx));
+        assert!(ask_panel_handle_key(&Key::Char(' '), &tx));
+        assert!(ask_panel_handle_key(&Key::Enter, &tx));
+        match rx.try_recv() {
+            Ok(Submission::Chat(text, _)) => {
+                assert!(text.contains("Which DB? → pg"), "{text}");
+                assert!(text.contains("Which cache? → redis"), "{text}");
+            }
+            other => panic!("expected labelled multi answers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_panel_free_text_row_takes_prose() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Submission>();
+        let ask = ask_of(&[question_cfg("Which file?", &["src/a.rs"], false)]);
+        ask_panel_set(&ask);
+        {
+            let mut r = render().lock().unwrap();
+            r.draft.clear();
+        }
+        // Move onto the free-text row (last row) and press Enter to open its buffer, type, submit.
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx));
+        assert!(ask_panel_handle_key(&Key::Enter, &tx));
+        for c in "lib.rs".chars() {
+            assert!(ask_panel_handle_key(&Key::Char(c), &tx));
+        }
+        assert!(ask_panel_handle_key(&Key::Enter, &tx));
+        match rx.try_recv() {
+            Ok(Submission::Chat(text, _)) => assert_eq!(text, "lib.rs"),
+            other => panic!("expected the typed free text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_panel_keeps_each_questions_highlight_across_tabs() {
+        let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Submission>();
+        let ask = ask_of(&[
+            question_cfg("Q1?", &["a1", "b1", "c1"], false),
+            question_cfg("Q2?", &["a2", "b2"], false),
+        ]);
+        ask_panel_set(&ask);
+        {
+            let mut r = render().lock().unwrap();
+            r.draft.clear();
+        }
+        // On Q1 move down to the third option; tab to Q2, move to its second; tab back.
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx));
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx)); // Q1 highlight = c1
+        assert!(ask_panel_handle_key(&Key::Tab, &tx));
+        assert!(ask_panel_handle_key(&Key::ArrowDown, &tx)); // Q2 highlight = b2
+        assert!(ask_panel_handle_key(&Key::ArrowLeft, &tx)); // back to Q1
+                                                             // Submit: Q1 must still be on c1 (not reset by the tab), Q2 on b2.
+        assert!(ask_panel_handle_key(&Key::Enter, &tx));
+        match rx.try_recv() {
+            Ok(Submission::Chat(text, _)) => {
+                assert!(text.contains("Q1? → c1"), "Q1 highlight lost: {text}");
+                assert!(text.contains("Q2? → b2"), "Q2 highlight lost: {text}");
+            }
+            other => panic!("expected labelled answers, got {other:?}"),
+        }
     }
 
     #[test]
     fn menu_overlays_outrank_the_draft_palettes_in_the_snapshot() {
         let _g = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Approval outranks question outranks the rest — the agent is BLOCKED on approval, so
+        // Approval outranks the ask panel outranks the rest — the agent is BLOCKED on approval, so
         // nothing may paint over it.
         {
             let mut r = render().lock().unwrap();
             r.approval_menu_active = true;
             r.approval_menu_sel = 2;
-            r.question_menu_active = true;
-            r.question_menu_options = vec!["A".to_string()];
+            r.ask_panel = Some(AskPanel::from_ask(&ask_of(&[question_cfg(
+                "Q?",
+                &["A"],
+                false,
+            )])));
         }
         let snap = retained_input_snapshot();
         let overlay = snap.overlay.expect("approval menu must paint an overlay");
@@ -4853,15 +6079,47 @@ mod tests {
         let snap = retained_input_snapshot();
         let overlay = snap
             .overlay
-            .expect("question menu paints once approval is gone");
+            .expect("ask panel paints once approval is gone");
         assert!(overlay.title.contains('❓'));
-        assert_eq!(
-            overlay.lines.last().map(String::as_str),
-            Some(QUESTION_MENU_FREEFORM_ROW),
-            "the free-form escape hatch is always the last row"
+        assert!(
+            overlay
+                .lines
+                .last()
+                .map(|l| l.contains("type my own"))
+                .unwrap_or(false),
+            "the free-form escape hatch is the last row: {:?}",
+            overlay.lines
         );
-        question_menu_close();
-        assert!(retained_input_snapshot().overlay.is_none() || !question_menu_active());
+        ask_panel_close();
+        assert!(retained_input_snapshot().overlay.is_none() || !ask_panel_active());
+    }
+
+    /// Build an `Ask` from test-friendly `(question, options, multi)` tuples.
+    fn ask_of(items: &[(String, Vec<String>, bool)]) -> crate::agent::clarify::Ask {
+        let questions = items
+            .iter()
+            .map(|(q, opts, multi)| crate::agent::clarify::AskQuestion {
+                question: q.clone(),
+                header: String::new(),
+                options: opts
+                    .iter()
+                    .map(|o| crate::agent::clarify::AskOption {
+                        label: o.clone(),
+                        description: String::new(),
+                    })
+                    .collect(),
+                multi_select: *multi,
+            })
+            .collect();
+        crate::agent::clarify::Ask { questions }
+    }
+
+    fn question_cfg(q: &str, opts: &[&str], multi: bool) -> (String, Vec<String>, bool) {
+        (
+            q.to_string(),
+            opts.iter().map(|s| s.to_string()).collect(),
+            multi,
+        )
     }
 
     /// The Esc-responsiveness invariant, pinned end to end.

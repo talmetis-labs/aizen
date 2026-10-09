@@ -657,7 +657,7 @@ async fn run_menu_sticky() -> Result<()> {
     let intro = format!(
         "{}\n{}",
         splash::render_text_only(),
-        style("Type to talk — messages queue while it works · Esc cancels a running turn · /help · /quit")
+        style("Type to talk — messages steer a running turn · Esc cancels it · /help · /quit")
             .dim()
     );
     // The retained backend is the only interactive surface. If it can't take the terminal (alt-screen
@@ -1070,10 +1070,10 @@ async fn run_menu_sticky() -> Result<()> {
                     // loop back to the input box (the next message continues this conversation).
                     // Skip the post-turn learning/compaction passes: the turn isn't finished yet.
                     Some(Ok(AgentOutcome {
-                        stop: StopReason::AwaitingInput(q),
+                        stop: StopReason::AwaitingInput(ask),
                         ..
                     })) => {
-                        show_clarify(&q);
+                        show_clarify(&ask);
                         // Same reason as the Esc arm: this branch deliberately skips the post-turn
                         // passes because the turn isn't finished, but the question the agent asked is
                         // real conversation. Persist it so quitting at the prompt doesn't drop it.
@@ -1393,10 +1393,10 @@ async fn run_menu_plain() -> Result<()> {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
             Ok(AgentOutcome {
-                stop: StopReason::AwaitingInput(q),
+                stop: StopReason::AwaitingInput(ask),
                 ..
             }) => {
-                show_clarify(&q);
+                show_clarify(&ask);
                 autosave_last(&history, Some(&model)); // mirror of the sticky path: a paused turn is still a transcript
             }
             Ok(outcome) => {

@@ -127,12 +127,14 @@ impl TapedTurn {
             cache_read_input_tokens: (u.cached > 0).then_some(u.cached),
             cache_creation_input_tokens: (u.cache_write > 0).then_some(u.cache_write),
             prompt_tokens_details: None,
+            ..Default::default()
         });
         ChatTurn {
             content: self.content,
             tool_calls: self.tool_calls,
             finish_reason: self.finish_reason,
             usage,
+            empty_wire_note: None,
             eager: Vec::new(),
         }
     }
@@ -453,6 +455,7 @@ pub fn record_text(model: &str, messages: &[Message], text: &str) -> Result<()> 
         tool_calls: Vec::new(),
         finish_reason: Some("stop".into()),
         usage: None,
+        empty_wire_note: None,
         eager: Vec::new(),
     };
     record_turn(model, messages, &[], &turn)
@@ -583,7 +586,9 @@ mod tests {
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
                 prompt_tokens_details: None,
+                ..Default::default()
             }),
+            empty_wire_note: None,
             eager: Vec::new(),
         }
     }
@@ -677,6 +682,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
             eager: Vec::new(),
         };
         record_turn("m", &msgs2, &tools, &fin).unwrap();
