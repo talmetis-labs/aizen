@@ -1,18 +1,24 @@
 //! `clarify` — the ask-then-YIELD tool: when a task is genuinely ambiguous and a wrong guess
-//! would waste real work, the model poses ONE focused question and the turn PAUSES so the user
-//! answers in their next message.
+//! would waste real work, the model poses one or more focused questions and the turn PAUSES so the
+//! user answers before it goes on.
 //!
-//! Why a yield (not a blocking stdin read): under the sticky TUI a background thread owns stdin,
+//! Why a yield (not a blocking stdin read): under the retained TUI a background thread owns stdin,
 //! so a tool that `read_line`s would fight it (and deadlock / eat keystrokes); under `aizen serve`
-//! there is no terminal at all. So instead of READING input, the tool RECORDS the question in a
+//! there is no terminal at all. So instead of READING input, the tool RECORDS the questions in a
 //! process-global cell and the agent loop, on seeing it, stops with `StopReason::AwaitingInput`.
-//! Whatever input mechanism is already in play — the sticky input box, the plain REPL readline, or
-//! a Telegram message — then supplies the answer as the next user turn, re-entering the same
-//! conversation. One mechanism, every surface, zero stdin contention.
+//! Whatever input mechanism is already in play — the retained answer panel, the plain REPL
+//! readline, or a Telegram message — then supplies the answer as the next user turn, re-entering the
+//! same conversation. One mechanism, every surface, zero stdin contention.
 //!
 //! Distinct from its neighbours (the repo's anti-overlap discipline): `telegram_ask` is
 //! approve/deny over inline buttons for UNATTENDED runs; `memory_ask` recalls what the user
-//! ALREADY told us. `clarify` is interactive free-text disambiguation that blocks forward progress.
+//! ALREADY told us. `clarify` is interactive disambiguation that blocks forward progress.
+//!
+//! A question carries optional SUGGESTED answers (Claude-Code-style): each option has a short label
+//! and an optional one-line description, and a question may be `multi_select` (check more than one).
+//! The retained UI renders them as a picker with checkboxes; every other surface (plain REPL,
+//! Telegram, `aizen agent`) falls back to [`Ask::display`] — the question plus its numbered options —
+//! and the user simply types their answer.
 
 use crate::agent::tools::Tool;
 use anyhow::{Context, Result};
@@ -24,73 +30,246 @@ use std::sync::Mutex;
 /// pending cell this turn (so a turn that never called `clarify` can't drain a stale value).
 pub const NAME: &str = "clarify";
 
-/// The single outstanding question, set by `Clarify::execute` and drained by the agent loop
-/// (`take_pending`) the same turn. `None` whenever no clarification is in flight. A turn that
-/// contains `clarify` runs serially (it is not concurrency-safe), so there is never a race here.
-static PENDING: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+/// Upper bounds on what one ask may carry. Claude Code caps at 4 questions; we allow the same and
+/// cap options at 8 so the picker stays one screen. Excess is dropped, not an error (a model that
+/// over-asks still gets a usable panel).
+pub const MAX_QUESTIONS: usize = 4;
+pub const MAX_OPTIONS: usize = 8;
 
-/// Take (and clear) the pending clarification, if any. The agent loop calls this after executing a
-/// turn's tool calls; `Some` means "a clarify fired this turn → stop and yield to the user".
-pub fn take_pending() -> Option<String> {
+/// One suggested answer: a short `label` (what gets submitted) and an optional `description`
+/// (the "why", shown dim beside it in the picker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One question in an ask: the text, a short `header` (tab label when there are several questions),
+/// the suggested options, and whether more than one may be checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<AskOption>,
+    pub multi_select: bool,
+}
+
+/// The whole ask: one or more questions the turn is paused on. Carried in
+/// `StopReason::AwaitingInput` so every caller — the retained panel, the plain REPL, Telegram,
+/// `aizen agent` — reads the same structured payload, rendering it to text only where there is no
+/// picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ask {
+    pub questions: Vec<AskQuestion>,
+}
+
+impl Ask {
+    /// Parse an ask from the tool arguments. Two shapes are accepted, and both may coexist:
+    /// the single-question form (`question` + optional `options` / `multi_select` / `header`) and
+    /// the multi-question form (`questions: [{ question, header, options, multi_select }, …]`).
+    /// `options` may be plain strings or `{label, description}` objects. Questions and options are
+    /// capped, never rejected — an over-long ask is truncated to something answerable.
+    pub fn from_args(args: &Value) -> Result<Ask> {
+        let mut questions: Vec<AskQuestion> = Vec::new();
+
+        if let Some(arr) = args.get("questions").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(q) = parse_question(item) {
+                    questions.push(q);
+                }
+            }
+        }
+        // The single-question form is honoured too (and appended after any `questions` entries) so a
+        // model that mixes the two shapes loses nothing.
+        if let Some(q) = parse_question(args) {
+            questions.push(q);
+        }
+
+        if questions.is_empty() {
+            anyhow::bail!("clarify needs a non-empty `question` (or a `questions` array)");
+        }
+        if questions.len() > MAX_QUESTIONS {
+            questions.truncate(MAX_QUESTIONS);
+        }
+        Ok(Ask { questions })
+    }
+
+    /// The user-facing text rendering: each question with its numbered options. This is what the
+    /// plain REPL, Telegram and `aizen agent` show, and what the retained transcript keeps as a
+    /// durable record of what was asked (the picker itself is dismissible).
+    pub fn display(&self) -> String {
+        let multi = self.questions.len() > 1;
+        let mut out = String::new();
+        for (i, q) in self.questions.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let head = if multi && !q.header.is_empty() {
+                format!("[{}] {}", q.header, q.question)
+            } else {
+                q.question.clone()
+            };
+            out.push_str(&head);
+            for (j, o) in q.options.iter().enumerate() {
+                out.push_str(&format!("\n  {}. {}", j + 1, o.label));
+            }
+        }
+        out
+    }
+
+    /// The model-facing acknowledgement, handed back as the `clarify` tool result: it names what was
+    /// asked and instructs the model to STOP. Kept short — the display string already carries the
+    /// detail to the user.
+    pub fn ack(&self) -> String {
+        let n = self.questions.len();
+        let labels: Vec<String> = self
+            .questions
+            .iter()
+            .map(|q| format!("\"{}\"", q.question))
+            .collect();
+        let opts: Vec<String> = self
+            .questions
+            .iter()
+            .flat_map(|q| q.options.iter().map(|o| o.label.clone()))
+            .collect();
+        let opt_hint = if opts.is_empty() {
+            String::new()
+        } else {
+            format!(" Suggested answers: {}.", opts.join(" / "))
+        };
+        let noun = if n == 1 { "question" } else { "questions" };
+        format!(
+            "Posed {n} {noun} to the user: {}.{opt_hint} STOP now — do NOT call clarify again or \
+             answer on their behalf; their reply arrives as the next user message and you continue \
+             from there.",
+            labels.join("; ")
+        )
+    }
+
+    /// Format the user's answers as the message text the next turn receives. `answers[i]` is the
+    /// list of chosen labels (multi-select) or the single free-text answer for question `i`; an
+    /// empty inner vec means that question was left blank. A single-question ask collapses to just
+    /// the answer; a multi-question ask labels each answer with its question so the model can map
+    /// them back.
+    pub fn format_answers(&self, answers: &[Vec<String>]) -> String {
+        let clean: Vec<Vec<String>> = (0..self.questions.len())
+            .map(|i| {
+                answers
+                    .get(i)
+                    .map(|a| {
+                        a.iter()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        if self.questions.len() == 1 {
+            return clean.first().cloned().unwrap_or_default().join(", ");
+        }
+        let mut out = String::new();
+        for (i, q) in self.questions.iter().enumerate() {
+            let a = &clean[i];
+            if a.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{} → {}", q.question, a.join(", ")));
+        }
+        out
+    }
+}
+
+/// Parse ONE question object (`{ question, header, options, multi_select }`). Returns `None` when
+/// there is no non-empty question text, so a malformed entry is skipped rather than poisoning the
+/// whole ask. `options` accepts strings or `{label, description}` objects.
+fn parse_question(v: &Value) -> Option<AskQuestion> {
+    let question = v
+        .get("question")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let header = v
+        .get("header")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .chars()
+        .take(24)
+        .collect::<String>();
+    let mut options: Vec<AskOption> = v
+        .get("options")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(parse_option).collect())
+        .unwrap_or_default();
+    options.truncate(MAX_OPTIONS);
+    let multi_select = v
+        .get("multi_select")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        // A multi-select with no options is meaningless — treat it as free text.
+        && !options.is_empty();
+    Some(AskQuestion {
+        question,
+        header,
+        options,
+        multi_select,
+    })
+}
+
+/// Parse one option: a bare string becomes a label with no description; an object reads `label` +
+/// optional `description`. A blank label is dropped.
+fn parse_option(v: &Value) -> Option<AskOption> {
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| AskOption {
+                label: s.to_string(),
+                description: String::new(),
+            })
+        }
+        Value::Object(_) => {
+            let label = v
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let description = v
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            Some(AskOption { label, description })
+        }
+        _ => None,
+    }
+}
+
+/// The outstanding ask, set by `Clarify::execute` and drained by the agent loop (`take_pending`)
+/// the same turn. `None` whenever no clarification is in flight. A turn that contains `clarify`
+/// runs serially (it is not concurrency-safe), so there is never a race here.
+static PENDING: Lazy<Mutex<Option<Ask>>> = Lazy::new(|| Mutex::new(None));
+
+/// Take (and clear) the pending ask, if any. The agent loop calls this after executing a turn's tool
+/// calls; `Some` means "a clarify fired this turn → stop and yield to the user".
+pub fn take_pending() -> Option<Ask> {
     PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
-fn set_pending(display: String) {
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(display);
+fn set_pending(ask: Ask) {
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(ask);
 }
 
 /// Serializes every test (here AND in the agent-loop module) that touches the process-global
 /// `PENDING` — cargo runs tests in parallel, so without this a concurrent set/take would interleave.
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Render the user-facing display (the prominent question + any numbered options) and the
-/// model-facing acknowledgement (the "stop and wait" instruction). Pure — no global state — so the
-/// tests can exercise it without touching `PENDING`.
-fn build(question: &str, options: &[String]) -> (String, String) {
-    let q = question.trim();
-    let mut display = q.to_string();
-    for (i, o) in options.iter().enumerate() {
-        display.push_str(&format!("\n  {}. {}", i + 1, o));
-    }
-    let opt_hint = if options.is_empty() {
-        String::new()
-    } else {
-        format!(" Suggested answers: {}.", options.join(" / "))
-    };
-    let ack = format!(
-        "Question posed to the user: \"{q}\".{opt_hint} STOP now — do NOT call clarify again or \
-         answer on their behalf; their reply arrives as the next user message and you continue \
-         from there."
-    );
-    (display, ack)
-}
-
-/// Inverse of [`build`]'s display half: split a stored display back into the question and its
-/// numbered options, so the sticky REPL can raise a picker over the input box. Lives HERE, next to
-/// `build`, because the two must agree on the format — the round-trip test below pins them
-/// together. A display that doesn't match the shape `build` emits (a hand-written AwaitingInput
-/// string, a multi-line question) yields no options, which safely degrades to the free-text path.
-pub fn parse_display(display: &str) -> (&str, Vec<String>) {
-    let mut lines = display.lines();
-    let q = lines.next().unwrap_or("").trim();
-    let mut opts = Vec::new();
-    for l in lines {
-        let t = l.trim_start();
-        let numbered = t
-            .split_once(". ")
-            .filter(|(n, rest)| {
-                !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !rest.trim().is_empty()
-            })
-            .map(|(_, rest)| rest.trim().to_string());
-        match numbered {
-            Some(o) => opts.push(o),
-            // Any non-option line means this is NOT build()'s shape — don't guess.
-            None => return (q, Vec::new()),
-        }
-    }
-    (q, opts)
-}
 
 pub struct Clarify;
 
@@ -100,26 +279,45 @@ impl Tool for Clarify {
     }
 
     fn description(&self) -> &str {
-        "Ask the user ONE focused question when the task is genuinely ambiguous and you cannot \
-         proceed safely without their answer (which of two files, which framework, confirm a risky \
-         direction). The turn PAUSES and the user's next message is the answer — so ask only when a \
-         wrong guess would waste real work; otherwise make a reasonable assumption, state it, and \
-         continue. Not for approve/deny of a command when running unattended → use telegram_ask; \
-         not for recalling what the user already told you → use memory_search / memory_ask."
+        "Ask the user when the task is genuinely ambiguous and a wrong guess would waste real work \
+         (which file, which framework, confirm a risky direction). The turn PAUSES; the user's next \
+         message is the answer. Ask one question (`question` + optional `options`) or several at \
+         once (`questions`) — shown as one panel. `multi_select: true` checks several options. For \
+         unattended approve/deny use telegram_ask."
     }
 
     fn parameters(&self) -> Value {
+        // One option item, reused by both forms: a plain string, or `{label, description}`.
+        let option_item = json!({
+            "anyOf": [
+                {"type": "string"},
+                {"type": "object", "properties": {
+                    "label": {"type": "string"},
+                    "description": {"type": "string"}
+                }, "required": ["label"], "additionalProperties": false}
+            ]
+        });
         json!({
             "type": "object",
             "properties": {
-                "question": {"type": "string", "description": "the single, specific question to ask"},
-                "options": {
+                "question": {"type": "string", "description": "single question"},
+                "options": {"type": "array", "items": option_item},
+                "multi_select": {"type": "boolean", "description": "check several options"},
+                "questions": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "optional short suggested answers, shown to the user as a numbered list"
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string"},
+                            "header": {"type": "string", "description": "short tab label"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "multi_select": {"type": "boolean"}
+                        },
+                        "required": ["question"],
+                        "additionalProperties": false
+                    }
                 }
             },
-            "required": ["question"],
             "additionalProperties": false
         })
     }
@@ -136,25 +334,9 @@ impl Tool for Clarify {
     }
 
     fn execute(&self, args: &Value) -> Result<String> {
-        let question = args
-            .get("question")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .context("missing required non-empty string arg 'question'")?;
-        let options: Vec<String> = args
-            .get("options")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (display, ack) = build(question, &options);
-        set_pending(display);
+        let ask = Ask::from_args(args).context("invalid clarify arguments")?;
+        let ack = ask.ack();
+        set_pending(ask);
         Ok(ack)
     }
 }
@@ -164,51 +346,99 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_renders_question_and_numbered_options() {
-        let (display, ack) = build(
-            "Which file?",
-            &["src/a.rs".to_string(), "src/b.rs".to_string()],
-        );
-        assert_eq!(display, "Which file?\n  1. src/a.rs\n  2. src/b.rs");
-        assert!(ack.contains("Which file?"));
-        assert!(ack.contains("Suggested answers: src/a.rs / src/b.rs."));
-        assert!(
-            ack.contains("STOP now"),
-            "the model must be told to wait, not re-ask: {ack}"
-        );
+    fn single_question_with_options_parses_and_renders() {
+        let ask = Ask::from_args(&json!({
+            "question": "Which file?",
+            "options": ["src/a.rs", "src/b.rs"]
+        }))
+        .unwrap();
+        assert_eq!(ask.questions.len(), 1);
+        assert_eq!(ask.questions[0].options.len(), 2);
+        assert!(!ask.questions[0].multi_select);
+        assert_eq!(ask.display(), "Which file?\n  1. src/a.rs\n  2. src/b.rs");
+        assert!(ask.ack().contains("Which file?"));
+        assert!(ask.ack().contains("src/a.rs / src/b.rs"));
+        assert!(ask.ack().contains("STOP now"));
     }
 
     #[test]
-    fn parse_display_roundtrips_build() {
-        let opts = vec!["src/a.rs".to_string(), "option 2. with dots".to_string()];
-        let (display, _) = build("Which file?", &opts);
-        let (q, parsed) = parse_display(&display);
-        assert_eq!(q, "Which file?");
-        assert_eq!(parsed, opts, "options must survive the round-trip verbatim");
-        // No options → none parsed.
-        let (display, _) = build("Proceed?", &[]);
-        assert_eq!(parse_display(&display), ("Proceed?", Vec::new()));
+    fn options_accept_label_and_description_objects() {
+        let ask = Ask::from_args(&json!({
+            "question": "Pick one",
+            "options": [
+                {"label": "Fast", "description": "ship now"},
+                {"label": "Correct"}
+            ]
+        }))
+        .unwrap();
+        let o = &ask.questions[0].options;
+        assert_eq!(o[0].label, "Fast");
+        assert_eq!(o[0].description, "ship now");
+        assert_eq!(o[1].label, "Correct");
+        assert_eq!(o[1].description, "");
     }
 
     #[test]
-    fn parse_display_refuses_foreign_shapes() {
-        // A multi-line question that never came from build() must not be misread as options.
-        let (q, opts) = parse_display("What now?\nsome free-form second line");
-        assert_eq!(q, "What now?");
-        assert!(opts.is_empty(), "non-numbered line → no menu: {opts:?}");
-        // A numbered line followed by a stray line → also refuse (all-or-nothing).
-        let (_, opts) = parse_display("Q?\n  1. yes\ntrailing prose");
-        assert!(opts.is_empty());
+    fn multi_question_form_parses_all_and_numbers_by_tab_header() {
+        let ask = Ask::from_args(&json!({
+            "questions": [
+                {"question": "Which DB?", "header": "DB", "options": ["pg", "sqlite"]},
+                {"question": "Which cache?", "header": "Cache", "multi_select": true,
+                 "options": ["redis", "memory"]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(ask.questions.len(), 2);
+        assert!(ask.questions[1].multi_select);
+        let d = ask.display();
+        assert!(d.contains("[DB] Which DB?"), "{d}");
+        assert!(d.contains("[Cache] Which cache?"), "{d}");
+    }
+
+    #[test]
+    fn multi_select_without_options_degrades_to_free_text() {
+        let ask = Ask::from_args(&json!({"question": "Anything?", "multi_select": true})).unwrap();
+        assert!(!ask.questions[0].multi_select);
+    }
+
+    #[test]
+    fn questions_and_options_are_capped_not_rejected() {
+        let opts: Vec<String> = (0..20).map(|i| format!("o{i}")).collect();
+        let qs: Vec<Value> = (0..9)
+            .map(|i| json!({"question": format!("q{i}")}))
+            .collect();
+        let ask = Ask::from_args(&json!({"questions": qs, "options": opts})).unwrap();
+        assert_eq!(ask.questions.len(), MAX_QUESTIONS); // 9 from `questions` + 1 top-level form → capped
+                                                        // The single-question form's 20 options are capped.
+        let ask2 = Ask::from_args(&json!({"question": "x", "options": (0..20).map(|i| format!("o{i}")).collect::<Vec<_>>()})).unwrap();
+        assert_eq!(ask2.questions[0].options.len(), MAX_OPTIONS);
+    }
+
+    #[test]
+    fn blank_question_is_rejected() {
+        assert!(Ask::from_args(&json!({})).is_err());
+        assert!(Ask::from_args(&json!({"question": "   "})).is_err());
+    }
+
+    #[test]
+    fn format_answers_collapses_single_and_labels_multi() {
+        let single = Ask::from_args(&json!({"question": "Q?"})).unwrap();
+        assert_eq!(single.format_answers(&[vec!["hello".to_string()]]), "hello");
+        let multi = Ask::from_args(&json!({
+            "questions": [{"question": "Q1"}, {"question": "Q2"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            multi.format_answers(&[vec!["a".into(), "b".into()], vec![]]),
+            "Q1 → a, b"
+        );
     }
 
     #[test]
     fn build_without_options_is_just_the_question() {
-        let (display, ack) = build("  Proceed?  ", &[]);
-        assert_eq!(
-            display, "Proceed?",
-            "whitespace trimmed, no options appended"
-        );
-        assert!(!ack.contains("Suggested answers"));
+        let ask = Ask::from_args(&json!({"question": "  Proceed?  "})).unwrap();
+        assert_eq!(ask.display(), "Proceed?");
+        assert!(!ask.ack().contains("Suggested answers"));
     }
 
     #[test]
@@ -219,13 +449,10 @@ mod tests {
             .execute(&json!({"question": "A or B?", "options": ["A", "B"]}))
             .unwrap();
         assert!(ack.contains("A or B?"));
-        let pending = take_pending().expect("a question must be pending after execute");
-        assert!(pending.starts_with("A or B?"));
-        assert!(pending.contains("1. A") && pending.contains("2. B"));
-        assert!(
-            take_pending().is_none(),
-            "take must drain — a second take yields nothing"
-        );
+        let pending = take_pending().expect("an ask must be pending after execute");
+        assert_eq!(pending.questions[0].question, "A or B?");
+        assert_eq!(pending.questions[0].options.len(), 2);
+        assert!(take_pending().is_none(), "take must drain");
     }
 
     #[test]

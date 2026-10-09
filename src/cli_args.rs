@@ -1519,6 +1519,13 @@ pub(crate) struct AgentArgs {
     /// invocation would bury the pool the picker reads.
     #[arg(long)]
     pub(crate) save_session: bool,
+    /// Resume a saved session by slug: the stored transcript is loaded in place of a fresh
+    /// conversation (prompt lanes rebuilt for the current project/model, the same contract as
+    /// /resume in the REPL) and the task is appended as the next user turn. With --save-session
+    /// the run keeps saving back into that same slug, so a front-end can chain runs into one
+    /// continuous conversation.
+    #[arg(long, value_name = "SLUG")]
+    pub(crate) resume: Option<String>,
     /// Reasoning effort for this run: auto | low | medium | high | xhigh | max. `auto` classifies
     /// the task the way the REPL classifies a typed turn. Omitted ⇒ the configured
     /// `reasoning_effort` is used, exactly as before. This flag never writes the config.

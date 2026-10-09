@@ -1754,8 +1754,9 @@ pub(crate) async fn run_one_task(
 
 /// Emit the workflow header line (the fan-out banner) into the sticky-TUI transcript — a moonlight
 /// `✦` + label, matching the turn-start whimsy line's accent so it reads as a section opener.
+/// Under the retained UI the sub-agents panel IS the banner, so this only draws on classic.
 fn wf_header(line: &str) {
-    if crate::ui::tui::active() {
+    if crate::ui::tui::active() && !crate::ui::tui::retained_running() {
         let star = console::style("✦")
             .color256(crate::ui::splash::ACCENT)
             .bold();
@@ -1766,8 +1767,10 @@ fn wf_header(line: &str) {
 /// Emit one workflow progress line into the sticky-TUI transcript (a quiet `⎿`-prefixed trace,
 /// same shape as the agent loop's tool trace). A no-op when the TUI isn't active — the standalone
 /// CLI runner prints its own `eprintln!` status and isn't TUI-active, so this never double-prints.
+/// Under the retained UI it is ALSO a no-op: the collapsible sub-agents block already carries every
+/// trace fact (per-row step, per-row ✓/✗) without one transcript line per event.
 fn wf_trace(line: &str) {
-    if crate::ui::tui::active() {
+    if crate::ui::tui::active() && !crate::ui::tui::retained_running() {
         crate::ui::tui::emit_line(&format!(
             "  {} {}",
             crate::ui::theme::faint("└"),
@@ -1779,7 +1782,7 @@ fn wf_trace(line: &str) {
 /// Emit a workflow task's FINISH line — the corner + text turn salmon on failure so a diverged /
 /// errored task reads at a glance, matching the agent loop's `emit_tool_result` styling.
 fn wf_trace_done(ok: bool, line: &str) {
-    if !crate::ui::tui::active() {
+    if !crate::ui::tui::active() || crate::ui::tui::retained_running() {
         return;
     }
     let corner = if ok {

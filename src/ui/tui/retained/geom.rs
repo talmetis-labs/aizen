@@ -64,6 +64,24 @@ pub(crate) fn jump_button_rect() -> Option<Rect> {
     g.jump_button
 }
 
+/// Screen rect of the jobs strip painted under the composer (narrow terminals), present only while
+/// background work exists. A left-click inside it opens the jobs panel; cleared every frame the strip
+/// is not drawn so a stale rect can't swallow clicks.
+pub(super) fn jobs_strip_slot() -> &'static Mutex<Option<Rect>> {
+    static SLOT: OnceLock<Mutex<Option<Rect>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn set_jobs_strip(r: Option<Rect>) {
+    *jobs_strip_slot().lock().unwrap_or_else(|e| e.into_inner()) = r;
+}
+
+/// The jobs strip's rect at last draw, if it was painted. The input thread hit-tests a left-click
+/// against this before transcript selection so a click on the strip opens the panel.
+pub(crate) fn jobs_strip_rect() -> Option<Rect> {
+    *jobs_strip_slot().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Where the last frame put a SELECTABLE overlay's option rows, so the input thread can turn a
 /// left-click into a row index. Present only while a menu overlay (approval, question, model,
 /// sessions, palette) is painted — informational overlays wrap their text, so their screen rows do

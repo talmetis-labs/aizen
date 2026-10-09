@@ -887,11 +887,12 @@ pub enum StopReason {
     MaxIters,
     /// The verification gate ran and exhausted its repair budget without a passing result.
     VerificationFailed,
-    /// The model invoked `clarify` — the turn is PAUSED pending the user's answer (the carried
-    /// string is the user-facing question + options). The caller surfaces it and the next user
-    /// message re-enters the loop as the answer. History is left valid (the assistant tool-call
-    /// turn and its tool result are already appended).
-    AwaitingInput(String),
+    /// The model invoked `clarify` — the turn is PAUSED pending the user's answer. The carried
+    /// [`clarify::Ask`] holds one or more questions (with optional suggested options / multi-select).
+    /// The caller surfaces it (a picker under the retained UI, the rendered text everywhere else) and
+    /// the next user message re-enters the loop as the answer. History is left valid (the assistant
+    /// tool-call turn and its tool result are already appended).
+    AwaitingInput(crate::agent::clarify::Ask),
     /// The user cancelled mid-loop (Esc / cancel flag). Cooperative: no further model/tool work.
     /// Nested sub-agents (`task` / `workflow` children) observe the same process-global flag and
     /// stop at their next loop boundary instead of running to max_iters.
@@ -1827,9 +1828,19 @@ where
                         // Report that as the failure it is — never as a finished run.
                         if attempt as usize >= cfg.max_transient_retries {
                             rollback(messages, empty_nudges, nudge_pushed);
+                            // Name what the wire actually carried: `finish_reason=stop, usage
+                            // prompt=… completion=…, no unknown keys` means the provider really went
+                            // silent; `message keys [content]` means it answered in a shape we did
+                            // not read (the parts-array `content` recovery runs in the client, so a
+                            // `content` key still listed here is a NEW shape gap, not that one).
+                            let note = t
+                                .empty_wire_note
+                                .as_deref()
+                                .map(|n| format!(" — wire carried: {n}"))
+                                .unwrap_or_default();
                             return Err(anyhow::anyhow!(
                                 "provider returned {} empty response(s) in a row (HTTP 200 with no \
-                                 text and no tool call) — the model never answered this turn",
+                                 text and no tool call) — the model never answered this turn{note}",
                                 attempt + 1
                             ));
                         }
@@ -3051,11 +3062,11 @@ where
         // Gated on a clarify call actually firing this turn (not just "is the cell non-empty") so a
         // turn that never asked can't drain a stale value.
         if calls.iter().any(|c| c.function.name == clarify::NAME) {
-            if let Some(question) = clarify::take_pending() {
+            if let Some(ask) = clarify::take_pending() {
                 return Ok(AgentOutcome {
                     final_text: None,
                     iters: iter,
-                    stop: StopReason::AwaitingInput(question),
+                    stop: StopReason::AwaitingInput(ask),
                 });
             }
         }
@@ -4578,7 +4589,15 @@ fn emit_tool_call_as(name: &str, args: &serde_json::Value, dispatch: Option<&str
             None => crate::ui::tui::set_work_caption(&action),
         }
     }
-    crate::ui::tui::tool_call_begin(tool_icon(), name, &tool_target(name, args))
+    // A task/workflow dispatch under the retained UI feeds the collapsible sub-agents block instead
+    // of opening a tool row per spawn — the registry's `start()` already published the new row, so
+    // the seq must exist for the matching `emit_tool_result` but no row is drawn.
+    let target = tool_target(name, args);
+    let suppress_row = is_delegate_tool(name) && crate::ui::tui::retained_running();
+    if !suppress_row {
+        return crate::ui::tui::tool_call_begin(tool_icon(), name, &target);
+    }
+    crate::ui::tui::tool_seq_alloc()
 }
 
 /// Close a tool-call line: compute the result digest (via [`summarize_result`]) and update the line
@@ -4624,11 +4643,21 @@ fn emit_tool_result_as(
     if ok {
         crate::ui::cards::note_tool_activity(name);
     }
+    let target = tool_target(name, args);
+    if is_delegate_tool(name) && crate::ui::tui::retained_running() {
+        // Under retained a task/workflow never opened a tool row (see `emit_tool_call_as`): the
+        // collapsible sub-agents block carries it. Still keep the result tail for `Ctrl-E` and
+        // re-publish the panel so the finished row's ✓/✗ shows up.
+        crate::ui::tui::note_tool_body(seq, format!("{name} {target}"), out.to_string());
+        crate::agent::orchestration::publish_panel();
+        crate::ui::tui::set_work_caption("");
+        return;
+    }
     crate::ui::tui::tool_call_end(
         seq,
         tool_icon(),
         name,
-        &tool_target(name, args),
+        &target,
         &summary,
         Some(ok),
         elapsed_ms,
@@ -7413,6 +7442,7 @@ mod tests {
             }],
             finish_reason: Some("stop".into()), // deliberately NOT "tool_calls" — must still detect
             usage: None,
+            empty_wire_note: None,
             eager: Vec::new(),
         }
     }
@@ -7422,6 +7452,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
             eager: Vec::new(),
         }
     }
@@ -7443,6 +7474,7 @@ mod tests {
                 .collect(),
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
             eager: Vec::new(),
         }
     }
@@ -9901,6 +9933,7 @@ mod tests {
             ],
             finish_reason: Some("tool_calls".into()),
             usage: None,
+            empty_wire_note: None,
             eager: Vec::new(),
         };
         let out = run_agent(
@@ -10063,6 +10096,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
             usage: None,
+            empty_wire_note: None,
             eager: Vec::new(),
         }
     }
@@ -11992,11 +12026,15 @@ mod tests {
         .await
         .unwrap();
         match out.stop {
-            StopReason::AwaitingInput(q) => {
-                assert!(q.starts_with("A or B?"), "carries the question: {q}");
+            StopReason::AwaitingInput(ask) => {
+                let display = ask.display();
                 assert!(
-                    q.contains("1. A") && q.contains("2. B"),
-                    "carries the options: {q}"
+                    display.starts_with("A or B?"),
+                    "carries the question: {display}"
+                );
+                assert!(
+                    display.contains("1. A") && display.contains("2. B"),
+                    "carries the options: {display}"
                 );
             }
             other => panic!("expected AwaitingInput, got {other:?}"),

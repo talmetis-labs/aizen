@@ -5,7 +5,29 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
-## [Unreleased]
+## [0.7.1] — 2026-10-09
+
+### Added
+- **Clarify ask panel: several questions, multi-select, and answers that submit in one keystroke.**
+  The `clarify` tool grew a structured ask — one question (`question` + optional `options`) or several
+  at once (`questions`, each with a `header`, `options`, and `multi_select`), and options may carry a
+  `description`. Under the retained TUI an ask with suggested answers now opens a Claude-Code-style
+  panel over the composer: a tab per question (←→/Tab), checkbox rows for `multi_select` (Space), a
+  per-question free-text row, and **Enter submits every answer at once** as the next user message —
+  so answering no longer means retyping a choice into the box, and a bare Enter on a fresh panel is a
+  no-op rather than a re-render. Typing still dismisses the panel into the draft, so the free-text
+  path is unchanged. Every other surface (plain REPL, `aizen agent`, Telegram) prints the same
+  rendered questions and takes a typed answer.
+- **`/jobs` — background work at a glance, stop-able, and a live strip when there is no sidebar.**
+  Long-running `process` handles (dev servers, watchers) and live monitor runs (sub-agents ·
+  workflows) are now published to the UI by a background poller. A wide terminal shows them in the
+  sidebar under a `Jobs` section; a narrow one shows a clickable one-line summary (`▸ 3 running ·
+  monitor 2  npm run dev  /jobs ↵`) under the composer that opens the panel. `/jobs` opens the same
+  panel from the keyboard. The panel is selectable and interactive: ↑↓ pick a row, **Enter opens
+  that process's live log** (a tail that keeps updating while it is on screen; ↑↓/PgUp/PgDn scroll,
+  Esc returns to the list), **`x` stops the job** — a process is killed by handle, a monitor run gets
+  a stop request — and Esc closes. It refreshes in place every second, so a job that ends leaves the
+  list without a reopen.
 
 ### Changed
 - **`/clear` now refreshes instead of forgetting.** A fresh start used to wipe the thread to a blank
@@ -33,6 +55,15 @@ development log lives in that monorepo's history.
   loop).
 
 ### Fixed
+- **Skill marketplace errors now tell the whole story.** When the agentskill.sh search index is
+  down (it currently answers HTTP 500 to every query), `skill_search`/`skill_install` fall back to
+  browsing the public catalogue — but that catalogue only serves the registry's most recent
+  entries, so an older skill can exist yet be unreachable. The combined error now says both things
+  ("index down AND no match in the recent catalogue") instead of a bare HTTP 500 that read as
+  "marketplace down, give up", so retrying later vs. falling back to local skills is the user's
+  informed choice. The by-slug install route's docs are corrected to match what it actually does:
+  it reads the same index, so it rescues installs *while* the index is down, not installs *of*
+  skills the index no longer lists.
 - **No more escape-code garbage and broken scrolling on the bare Linux console.** Resuming a session
   on a terminal that cannot host the full-screen UI — the Linux VT (`TERM=linux`), a `dumb`/empty/
   unset `TERM`, or a BSD console — printed the alternate-screen / mouse / bracketed-paste mode-sets as

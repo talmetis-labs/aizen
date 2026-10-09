@@ -202,6 +202,17 @@ async fn slash_workflows(arg: &str) {
     }
 }
 
+/// `/jobs` — the background-work panel: long-running `process` handles plus live monitor runs, in one
+/// self-refreshing overlay (the same surface the footer strip and a click on it open). Falls back to
+/// printing the text when the retained overlay is unavailable (a suspended menu, a non-retained edge).
+/// `/jobs` — the background-work panel: long-running `process` handles plus live monitor runs. Under
+/// the retained UI this is a selectable, stop-able overlay (↑↓ pick, Enter/x stop, Esc close); the same
+/// surface the footer strip and a click on it open. Falls back to printing the text where that overlay
+/// cannot be driven (a pipe, a suspended menu).
+fn slash_jobs() {
+    tui::open_jobs_panel();
+}
+
 /// `/init` — build (or incrementally refresh) the per-repo codebase index that powers
 /// `codebase_search` + automatic per-turn retrieval. `--force`/`-f` rebuilds from scratch;
 /// `--status`/`-s` shows the current index without scanning. Esc cancels a running scan cleanly
@@ -1147,6 +1158,7 @@ pub(crate) async fn handle_slash(
             }
         }
         SlashId::Workflows => slash_workflows(arg).await,
+        SlashId::Jobs => slash_jobs(),
         // Multi-window cooperation: who else is in this repo, what they changed, and committing one
         // window's work. `/work` manages the isolated-worktree mode.
         SlashId::Team => slash_team(arg).await,

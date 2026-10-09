@@ -420,6 +420,95 @@ pub fn kill_all() {
     reg.clear();
 }
 
+/// One background process, as the jobs panel shows it: the handle, whether it is still running, how
+/// long it has run, and the command. A pure snapshot — copied out under the registry lock so the UI
+/// never holds it.
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub id: String,
+    pub running: bool,
+    /// Human elapsed, e.g. `7m03s` (or `3s`). For a finished process this is its total run time.
+    pub elapsed: String,
+    pub command: String,
+}
+
+/// A snapshot of every background process this process has started, newest handle last. Scope-blind
+/// on purpose: the jobs panel is a whole-app view, so a sub-agent's dev server is visible from the top
+/// level (its output stays scope-gated — the panel only names it). Running processes sort first so the
+/// interesting rows are on top; the caller decides how many rows to show.
+pub fn snapshot() -> Vec<JobInfo> {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rows: Vec<JobInfo> = reg
+        .iter()
+        .map(|(id, e)| JobInfo {
+            id: id.clone(),
+            running: !e.done.load(Ordering::Relaxed),
+            elapsed: elapsed_label(e.started.elapsed()),
+            command: e.command.clone(),
+        })
+        .collect();
+    // Running first, then by handle number (proc_2 before proc_10) so the order is stable.
+    rows.sort_by(|a, b| {
+        b.running
+            .cmp(&a.running)
+            .then_with(|| numeric_handle(&a.id).cmp(&numeric_handle(&b.id)))
+    });
+    rows
+}
+
+/// The numeric tail of a `proc_<n>` handle, for a stable sort. Unparseable → 0 (sorts first).
+fn numeric_handle(id: &str) -> u64 {
+    id.rsplit('_')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Kill one background process by handle from OUTSIDE the tool path — the jobs panel's stop key.
+/// SCOPE-BLIND on purpose (unlike the `process` tool's `kill`, which is scoped): the panel is a
+/// whole-app view, so it must be able to stop a dev server a sub-agent started, exactly as the panel
+/// shows it. Returns a short human note for the caller to display.
+pub fn kill_by_id(id: &str) -> String {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    match reg.get(id) {
+        Some(e) if !e.done.load(Ordering::Relaxed) => {
+            kill_tree(e);
+            format!("✓ stopped {id}")
+        }
+        Some(_) => format!("{id} already exited"),
+        None => format!("no such process '{id}'"),
+    }
+}
+
+/// The retained output of one background process by handle, from OUTSIDE the tool path — the jobs
+/// panel's log key. SCOPE-BLIND for the same reason as [`kill_by_id`] (the panel is a whole-app view).
+/// Returns a `(status, body)` pair the panel renders; an unknown handle yields a short note as the
+/// body. The body is the reverse-chronological tail capped at `limit` lines, so a chatty dev server's
+/// log stays readable rather than dumping the whole 200 KiB ring.
+pub fn log_by_id(id: &str, limit: usize) -> Option<(String, String)> {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let e = reg.get(id)?;
+    let status = e.status_label();
+    let body = {
+        let buf = e.out.lock().unwrap_or_else(|e| e.into_inner());
+        buf.text()
+    };
+    Some((status, tail_lines(&body, limit)))
+}
+
+/// The last `limit` non-empty lines of `body`, with a leading note when earlier lines were dropped.
+/// Kept here (not in the UI) so the cap and the marker are one fact the panel cannot drift from.
+fn tail_lines(body: &str, limit: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= limit {
+        return body.to_string();
+    }
+    let skip = lines.len() - limit;
+    let mut out = format!("… {skip} earlier line(s) hidden (full log via process action=log)\n");
+    out.push_str(&lines[skip..].join("\n"));
+    out
+}
+
 /// `process` — manage long-running background commands (start/list/log/status/wait/kill/write).
 pub struct Process {
     root: PathBuf,
@@ -746,6 +835,52 @@ mod tests {
             .is_err());
         assert!(t.execute(&serde_json::json!({"action":"status"})).is_err()); // missing id
         assert!(t.execute(&serde_json::json!({"action":"bogus"})).is_err());
+    }
+
+    #[test]
+    fn out_of_band_log_and_kill_by_handle() {
+        let _s = serial();
+        // `log_by_id` is the jobs-panel reader: it must see a scope's process without the caller
+        // pinning that scope (the panel is a whole-app view).
+        let id = scoped("panel-scope", || {
+            Process::new(root())
+                .execute(&serde_json::json!({"action":"start","command":"echo panel-log"}))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string()
+        });
+        // Poll for the output to land (the drain thread is async).
+        let mut got = None;
+        for _ in 0..50 {
+            if let Some((status, body)) = log_by_id(&id, 200) {
+                if body.contains("panel-log") {
+                    got = Some(status);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(got.is_some(), "log_by_id must read another scope's output");
+        // Unknown handle → None (the panel says "already gone" rather than panicking).
+        assert!(log_by_id("proc_does_not_exist", 20).is_none());
+        // kill_by_id on an unknown handle is a note, not a panic.
+        assert!(kill_by_id("proc_does_not_exist").contains("no such process"));
+        forget(&id);
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_end_and_marks_what_was_hidden() {
+        assert_eq!(
+            tail_lines("a\nb\nc", 5),
+            "a\nb\nc",
+            "short bodies pass through"
+        );
+        let t = tail_lines("l1\nl2\nl3\nl4\nl5", 2);
+        assert!(t.contains("3 earlier line(s) hidden"), "{t}");
+        assert!(t.ends_with("l4\nl5"), "{t}");
+        assert!(!t.contains("l1"), "the tail must drop the oldest lines");
     }
 
     #[test]

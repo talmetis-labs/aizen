@@ -471,3 +471,77 @@ pub(crate) fn render_verify_line(v: &VerifyPayload, width: usize) -> String {
     };
     theme::ok(clip_to(&text, width)).to_string()
 }
+
+/// Render the collapsible sub-agents panel. Collapsed (the default) it is ONE line —
+/// `▸ sub-agents (N) — <recent names> · X running` — so a fan-out never floods the transcript with
+/// one tool row per spawn; Ctrl-E flips it open. Expanded, the header's `▾` reads "open" and one
+/// phase-tinted row per run follows (`✓ coder · fix parser — 12 step(s) · 2m03s`). The frame rides
+/// the TALK lane's pink under `lanes` — delegation/asking is that lane — the dim silver under
+/// `moonlight`.
+pub(crate) fn render_subagents_block(p: &SubAgentsPayload, width: usize) -> Vec<String> {
+    use crate::ui::theme;
+    let frame_color = if theme::lanes_enabled() {
+        theme::LANE_TALK
+    } else {
+        theme::ACCENT_DIM
+    };
+    let frame = |s: String| console::style(s).color256(frame_color).to_string();
+    let inner = width.saturating_sub(2).min(72).max(12);
+    let bar = "─".repeat(inner);
+    let n = p.rows.len();
+    let running = p.rows.iter().filter(|r| r.running).count();
+    let chevron = if p.expanded { "▾" } else { "▸" };
+    let header = format!("{chevron} sub-agents ({n}) · {running} running");
+    let mut out = Vec::new();
+    out.push(frame(format!(
+        "╭─ {} ─╮",
+        pad_to(&header, inner.saturating_sub(4))
+    )));
+    if !p.expanded {
+        // Collapsed: the publisher's one-line summary (recent done names + counts), nothing more.
+        if !p.summary.is_empty() {
+            out.push(format!(
+                "{} {} {}",
+                frame("│".to_string()),
+                theme::faint(pad_to(
+                    &clip_to(&p.summary, inner.saturating_sub(2)),
+                    inner.saturating_sub(2)
+                )),
+                frame("│".to_string())
+            ));
+        }
+    } else {
+        for r in &p.rows {
+            let mark = r.mark.as_str();
+            let g = match mark {
+                "✓" => theme::ok(mark).to_string(),
+                "✗" => theme::err(mark).to_string(),
+                "✦" => theme::accent(mark).to_string(),
+                _ => theme::faint(mark).to_string(),
+            };
+            let body = if r.detail.is_empty() {
+                format!("{} — {}", r.label, r.elapsed)
+            } else {
+                format!("{} — {} · {}", r.label, r.detail, r.elapsed)
+            };
+            let text_budget = inner.saturating_sub(4);
+            let clipped = clip_to(&body, text_budget);
+            let pad = inner.saturating_sub(4 + console::measure_text_width(&clipped));
+            let styled = if r.running {
+                clipped
+            } else {
+                theme::muted(clipped).to_string()
+            };
+            out.push(format!(
+                "{} {} {}{} {}",
+                frame("│".to_string()),
+                g,
+                styled,
+                " ".repeat(pad),
+                frame("│".to_string())
+            ));
+        }
+    }
+    out.push(frame(format!("╰{bar}╯")));
+    out
+}

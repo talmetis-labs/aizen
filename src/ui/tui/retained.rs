@@ -28,7 +28,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::{HealthKind, SessionFacts};
+use super::{HealthKind, JobsStatus, SessionFacts};
 
 // The backend split by concern; `retained.rs` keeps the state, the command enum and the render
 // loop that ties them together. Re-exported at this level because callers outside (`ui::tui`) have
@@ -134,6 +134,10 @@ enum BlockKind {
     Diff,
     /// A green verify-gate success line (`✓ <cmd> — <detail>`).
     Verify,
+    /// The collapsible sub-agents panel (`▸ sub-agents (N) — … · X running`), replacing the per-call
+    /// `task(coder · fix parser)` tool rows with one block that refreshes in place as runs start and
+    /// finish. One stable block per session; `Ctrl-E` toggles it open.
+    SubAgents,
 }
 
 /// Outcome state for a [`ToolEvent`] — drives the digest colour (running = dim, ok = green,
@@ -191,6 +195,29 @@ pub(super) struct VerifyPayload {
     pub detail: String,
 }
 
+/// One row of the sub-agents panel: a phase mark, the `name · label` the orchestration registry
+/// shows, the live detail (`step 7 · file_edit`, `12 step(s)`), and the run's elapsed text.
+/// `running` splits ✓/✗ (history) from ⋯/✦ (live) so the renderer can tint without re-parsing
+/// the mark.
+#[derive(Clone)]
+pub(super) struct SubAgentRow {
+    pub mark: String,
+    pub label: String,
+    pub detail: String,
+    pub elapsed: String,
+    pub running: bool,
+}
+
+/// The collapsible sub-agents block. `rows` is the registry's live set (finished-at-snapshot rows
+/// may linger briefly, marked ✓/✗); `summary` carries the collapsed tail — recent done labels plus
+/// the `N running` counter. `expanded` is owned by the UI (Ctrl-E), never by the publisher.
+#[derive(Clone)]
+pub(super) struct SubAgentsPayload {
+    pub rows: Vec<SubAgentRow>,
+    pub summary: String,
+    pub expanded: bool,
+}
+
 /// The body of a transcript block. Text kinds (intro/generic/assistant) keep a raw string that is
 /// re-wrapped per width; the structured kinds carry typed data the renderer lays out by width.
 #[derive(Clone)]
@@ -200,6 +227,7 @@ enum Payload {
     Plan(Vec<PlanRow>),
     Diff(DiffPayload),
     Verify(VerifyPayload),
+    SubAgents(SubAgentsPayload),
 }
 
 #[derive(Clone)]
@@ -402,6 +430,7 @@ fn render_block_rows(block: &UiBlock, width: u16) -> BlockRows {
         Payload::Plan(rows) => render_plan_box(rows, w),
         Payload::Diff(d) => render_diff_box(d, w),
         Payload::Verify(v) => vec![render_verify_line(v, w)],
+        Payload::SubAgents(s) => render_subagents_block(s, w),
     };
     // Index-aligned with `sgr`: `plain[i]` is `sgr[i]` stripped (what mouse hit-tests read) and
     // `lines[i]` is it parsed into styled spans (what the frame paints). Intro rows are sanitised
@@ -442,6 +471,8 @@ struct AppState {
     health: HealthKind,
     /// Typed session facts for the sidebar (fed by `Command::Facts`).
     facts: SessionFacts,
+    /// Live background work for the sidebar section + jobs strip (fed by `Command::Jobs`).
+    jobs: JobsStatus,
     /// Transcript scroll offset measured in wrapped lines UP from the bottom. `0` means "follow the
     /// tail" — the newest output stays pinned to the bottom as it streams. Any positive value means
     /// the user scrolled up to read; while scrolled up, new content arriving at the bottom must NOT
@@ -460,6 +491,13 @@ struct AppState {
     /// that block's payload instead of appending a new one, so the checklist updates in place rather
     /// than stacking a fresh copy on every call. Cleared when the list is emptied.
     plan_id: Option<u64>,
+    /// Block id of the collapsible sub-agents panel, if one has been shown this session. The
+    /// orchestration registry publishes a fresh snapshot on every run start/finish/step; the panel
+    /// replaces THAT block's payload in place instead of one tool row per dispatch.
+    subagents_id: Option<u64>,
+    /// `Ctrl-E` on the sub-agents panel: collapsed (`▸ …` header + counts) or expanded (one row per
+    /// run). Owned by the UI — the registry's snapshots never touch it.
+    subagents_expanded: bool,
     /// Absolute (line, col) selection in the flat wrapped-line space. Drawn reversed; cleared on a
     /// plain click outside the range / Esc.
     selection: Option<SelectionRange>,
@@ -539,11 +577,14 @@ impl AppState {
             sent_tok: 0,
             health: HealthKind::Unknown,
             facts: SessionFacts::default(),
+            jobs: JobsStatus::default(),
             scroll_from_tail: 0,
             last_total: 0,
             overlay_scroll: 0,
             focused: true,
             plan_id: None,
+            subagents_id: None,
+            subagents_expanded: false,
             selection: None,
             cache: RenderCache::default(),
             screensaver: None,
@@ -678,6 +719,45 @@ impl AppState {
         }
         self.plan_id = Some(self.push_block(BlockKind::Plan, Payload::Plan(rows), true));
     }
+
+    /// Replace the single sub-agents panel with a fresh registry snapshot — the `apply_plan` pattern:
+    /// the first dispatch pushes the block, later snapshots replace THAT block's payload in place
+    /// (rev bumped so the render cache misses) instead of stacking one tool row per spawn. The
+    /// expand/collapse flag is UI-owned: a snapshot never resets what the user opened with Ctrl-E.
+    fn apply_subagents(&mut self, p: SubAgentsPayload) {
+        note_output();
+        SUBAGENTS_PANEL_SEEN.store(true, Ordering::Relaxed);
+        if let Some(id) = self.subagents_id {
+            if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
+                let expanded = self.subagents_expanded;
+                block.payload = Payload::SubAgents(SubAgentsPayload { expanded, ..p });
+                block.rev += 1;
+                return;
+            }
+            // The id was pruned out of the ring — fall through and push a fresh panel.
+        }
+        let expanded = self.subagents_expanded;
+        self.subagents_id = Some(self.push_block(
+            BlockKind::SubAgents,
+            Payload::SubAgents(SubAgentsPayload { expanded, ..p }),
+            true,
+        ));
+    }
+
+    /// Flip the sub-agents panel between the one-line collapsed form and the per-row expanded form
+    /// (Ctrl-E). A no-op when no panel exists.
+    fn toggle_subagents(&mut self) {
+        self.subagents_expanded = !self.subagents_expanded;
+        let expanded = self.subagents_expanded;
+        if let Some(id) = self.subagents_id {
+            if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
+                if let Payload::SubAgents(p) = &mut block.payload {
+                    p.expanded = expanded;
+                    block.rev += 1;
+                }
+            }
+        }
+    }
 }
 
 enum Command {
@@ -691,6 +771,10 @@ enum Command {
     Tool(ToolEvent),
     /// Replace the in-place plan checklist box with a fresh snapshot (`todo_write`).
     Plan(Vec<PlanRow>),
+    /// Replace the in-place sub-agents panel with a fresh registry snapshot.
+    SubAgents(SubAgentsPayload),
+    /// `Ctrl-E` toggled the sub-agents panel open/closed.
+    ToggleSubAgents,
     /// Push a boxed diff preview under the most recent edit.
     Diff(DiffPayload),
     /// Push a green verify-gate success line.
@@ -715,6 +799,9 @@ enum Command {
     /// Typed session facts for the sidebar (model, effort, persona, tokens, …) — published from
     /// the same call sites that set the HUD status string, so the two can never disagree.
     Facts(SessionFacts),
+    /// Live background work (processes + monitor runs) for the sidebar section and the jobs strip.
+    /// Published by a background poller so the view stays current while a turn is idle.
+    Jobs(JobsStatus),
     Tick,
     OpenOverlay(OverlaySnapshot),
     /// Replace the OPEN overlay's body while preserving the reader's scroll position. Distinct from
@@ -1185,6 +1272,8 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::AssistantFinish { interrupted } => state.finish_assistant(interrupted),
         Command::Tool(ev) => state.apply_tool_event(ev),
         Command::Plan(rows) => state.apply_plan(rows),
+        Command::SubAgents(p) => state.apply_subagents(p),
+        Command::ToggleSubAgents => state.toggle_subagents(),
         Command::Diff(d) => {
             state.push_block(BlockKind::Diff, Payload::Diff(d), true);
         }
@@ -1236,6 +1325,7 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::SentTokens(n) => state.sent_tok = n,
         Command::Health(h) => state.health = h,
         Command::Facts(f) => state.facts = f,
+        Command::Jobs(j) => state.jobs = j,
         Command::Tick => {
             state.frame = state.frame.wrapping_add(1);
             // Type one more character of the working caption per tick (the typewriter). Clamped to the

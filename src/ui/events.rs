@@ -30,8 +30,10 @@
 //! question — checks [`on`] first and hands the same information here as data.
 
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -85,6 +87,11 @@ struct Run {
     /// The answer text the loop's own `text` blocks carried so far, so a final answer that never
     /// streamed (a non-streaming provider) still goes out as a block before the result.
     spoken: String,
+    /// Open approval requests' reply channel, keyed by `request_id`. The stdin reader thread
+    /// (`start_stdin_reader`) parses every line; the one matching a registered id is delivered here
+    /// and `ask_approval` — which is usually running on a tool thread, never on stdin's owner —
+    /// waits on it. A sender that errors means the reader saw stdin close (a deny follows).
+    waiting: Option<HashMap<String, Sender<String>>>,
     seed: u64,
 }
 
@@ -100,8 +107,16 @@ impl Run {
             approved: Vec::new(),
             denials: Vec::new(),
             spoken: String::new(),
+            waiting: None,
             seed: 0,
         }
+    }
+}
+
+impl Run {
+    /// The `request_id` → reply-sender table, created on first use (the const constructor cannot).
+    fn waiting(&mut self) -> &mut HashMap<String, Sender<String>> {
+        self.waiting.get_or_insert_with(HashMap::new)
     }
 }
 
@@ -182,6 +197,152 @@ fn write_line(line: &str) {
     let _ = out.write_all(line.as_bytes());
     let _ = out.write_all(b"\n");
     let _ = out.flush();
+}
+
+// ── stdin control loop ───────────────────────────────────────────────────────
+
+/// Whether the stdin reader thread is alive. Plain `static`, written once at `aizen agent` entry
+/// and read on thread spawn: a one-shot run arms the reader exactly once, and a subprocess that
+/// inherited a closed pipe must not keep it alive (the desktop pipes stdin unconditionally).
+static STDIN_IS_PIPED: AtomicBool = AtomicBool::new(false);
+
+/// Called once from `run_agent_cmd` (before `run_agent_inner`): records whether stdin was handed
+/// to this process as a pipe — the only shape where a control channel (`control_response`,
+/// `steer` lines) can exist. Detected once, here, because `stdin.is_terminal()` reads the console
+/// mode and must not run per line.
+pub fn note_stdin_piped(piped: bool) {
+    STDIN_IS_PIPED.store(piped, Ordering::SeqCst);
+}
+
+fn stdin_is_piped() -> bool {
+    STDIN_IS_PIPED.load(Ordering::SeqCst)
+}
+
+/// What one stdin line is, for the reader thread.
+enum Inbound {
+    /// A `control_response` naming this `request_id` — handed to the `ask_approval` waiting on it.
+    Reply { request_id: String, line: String },
+    /// A `{"type":"steer","text":…}` line: a mid-run course correction from the driving process.
+    Steer(String),
+    /// Anything else (another record type, not JSON, a reply to no pending request): ignored, as
+    /// the old per-approval `read_line` loop ignored it.
+    Ignored,
+}
+
+/// Classify one stdin line without holding any lock.
+fn classify_inbound(line: &str) -> Inbound {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return Inbound::Ignored;
+    };
+    match v.get("type").and_then(Value::as_str) {
+        Some("control_response") => {
+            let request_id = v
+                .get("response")
+                .and_then(|r| r.get("request_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Inbound::Reply {
+                request_id,
+                line: line.trim().to_string(),
+            }
+        }
+        Some("steer") => {
+            let text = v.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.trim().is_empty() {
+                Inbound::Ignored
+            } else {
+                Inbound::Steer(text.to_string())
+            }
+        }
+        _ => Inbound::Ignored,
+    }
+}
+
+/// The single owner of `stdin` for the whole run. The old design had `ask_approval` read stdin
+/// itself, which drops every line that is not that request's reply — and blocks any second input
+/// channel from existing at all. With steering the line reader must be one thread that dispatches:
+/// a reply goes to the waiting approval, a steer goes into the mailbox, and anything else is
+/// skipped. EOF exits the thread; the waiters then see a closed channel and deny, the same safe
+/// default the old loop had on EOF.
+pub fn start_stdin_reader() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if !streaming() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("aizen-stdin".to_string())
+            .spawn(|| {
+                let stdin = std::io::stdin();
+                let mut handle = stdin.lock();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match handle.read_line(&mut line) {
+                        // EOF or a read error: no more control traffic. Waiting approvals deny via
+                        // the closed channel; nothing else to do.
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    match classify_inbound(&line) {
+                        Inbound::Reply { request_id, line } => {
+                            let sender = {
+                                let mut run = lock();
+                                run.waiting().get(&request_id).cloned()
+                            };
+                            if let Some(tx) = sender {
+                                let _ = tx.send(line);
+                            }
+                            // A reply to no pending request (stale id, late answer) is ignored.
+                        }
+                        Inbound::Steer(text) => {
+                            let accepted = crate::core::steer::push(&text);
+                            let mut run = lock();
+                            if accepted {
+                                emit_locked(
+                                    &mut run,
+                                    "system",
+                                    json!({
+                                        "subtype": "steer_queued",
+                                        "text": text,
+                                        "pending": crate::core::steer::pending(),
+                                    }),
+                                    false,
+                                );
+                            } else {
+                                // Refused: no armed turn (arrived between runs or before the loop
+                                // started), blank/oversized text, or a full backlog. The driver
+                                // must know — it should fall back to queueing for the next run.
+                                emit_locked(
+                                    &mut run,
+                                    "system",
+                                    json!({
+                                        "subtype": "steer_dropped",
+                                        "text": text,
+                                        "reason": if crate::core::steer::is_armed() {
+                                            "backlog full or oversized"
+                                        } else {
+                                            "no live turn accepting steers"
+                                        },
+                                    }),
+                                    false,
+                                );
+                            }
+                        }
+                        Inbound::Ignored => {}
+                    }
+                }
+            })
+            .ok(); // A thread that could not spawn falls back to per-approval reads (old behavior).
+    });
+}
+
+/// Whether the whole-run stdin reader is dispatching lines. When it is not (never started, or
+/// stdin is a console rather than a pipe), `ask_approval` falls back to reading stdin itself —
+/// the original behavior, unchanged for a `aizen agent` typed at a terminal.
+fn reader_active() -> bool {
+    streaming() && stdin_is_piped()
 }
 
 /// The record `kind` + `fields` serialize to, stamped with `uuid` and `session_id`: compact JSON,
@@ -680,6 +841,15 @@ pub fn session_not_saved(error: &str) {
     );
 }
 
+/// A steer the turn never drained before it ended — `system` / `steer_dropped` with
+/// `reason: "turn ended"`. The desktop resume-chains the text into the follow-up run.
+pub fn steer_leftover(text: &str) {
+    emit(
+        "system",
+        json!({ "subtype": "steer_dropped", "text": text, "reason": "turn ended" }),
+    );
+}
+
 /// The SDK `result` subtype and `is_error` for one of aizen's stop words (`done`, `divergence`,
 /// `max_iters`, `verification_failed`, `awaiting_input`, `cancelled`, `deadline`).
 pub(crate) fn result_kind(stop: &str) -> (&'static str, bool) {
@@ -889,6 +1059,49 @@ pub fn ask_approval(tool: &str, args: &Value, who: Option<&str>, preview: Option
             false,
         );
     }
+    // The reply reaches us one of two ways. With the whole-run reader thread active (the normal
+    // shape when a desktop or script drives us: stdin is a pipe), we register a channel keyed by
+    // this request and block on it — every other line (steers, stale replies) was already consumed
+    // by the reader, so this wait cannot swallow them. Without it (stdin is a console, or the
+    // thread could not spawn), we read stdin here exactly as before, and lines that are not this
+    // request's reply are ignored.
+    if reader_active() {
+        let (tx, rx) = channel::<String>();
+        lock().waiting().insert(request_id.clone(), tx);
+        let reply = rx.recv();
+        lock().waiting().remove(&request_id);
+        let line = match reply {
+            Ok(line) => line,
+            Err(_) => {
+                // The reader thread exited: stdin closed.
+                let mut run = lock();
+                record_denial(
+                    &mut run,
+                    tool,
+                    &tool_use_id,
+                    &request_id,
+                    args,
+                    "stdin closed",
+                );
+                return false;
+            }
+        };
+        if let Some((d, message)) = parse_reply(&line, &request_id, tool) {
+            return finish_decision(d, message, tool, &tool_use_id, &request_id, args);
+        }
+        // The reader delivered a line claiming our id that does not parse as a decision —
+        // an unrecognised answer must never run the call.
+        let mut run = lock();
+        record_denial(
+            &mut run,
+            tool,
+            &tool_use_id,
+            &request_id,
+            args,
+            "unrecognised control_response",
+        );
+        return false;
+    }
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -909,20 +1122,33 @@ pub fn ask_approval(tool: &str, args: &Value, who: Option<&str>, preview: Option
             Ok(_) => {}
         }
         if let Some((d, message)) = parse_reply(&line, &request_id, tool) {
-            match d {
-                Decision::AllowTool => crate::core::approval::grant_session(tool, None),
-                Decision::AllowAll => ALLOW_ALL.store(true, Ordering::Relaxed),
-                Decision::Allow | Decision::Deny => {}
-            }
-            if d == Decision::Deny {
-                let mut run = lock();
-                let why = message.unwrap_or_else(|| "the user declined this action".to_string());
-                record_denial(&mut run, tool, &tool_use_id, &request_id, args, &why);
-                return false;
-            }
-            return true;
+            return finish_decision(d, message, tool, &tool_use_id, &request_id, args);
         }
     }
+}
+
+/// Apply a parsed approval decision: widen the grants it carries, record a refusal, and return
+/// whether the call may run.
+fn finish_decision(
+    d: Decision,
+    message: Option<String>,
+    tool: &str,
+    tool_use_id: &str,
+    request_id: &str,
+    args: &Value,
+) -> bool {
+    match d {
+        Decision::AllowTool => crate::core::approval::grant_session(tool, None),
+        Decision::AllowAll => ALLOW_ALL.store(true, Ordering::Relaxed),
+        Decision::Allow | Decision::Deny => {}
+    }
+    if d == Decision::Deny {
+        let mut run = lock();
+        let why = message.unwrap_or_else(|| "the user declined this action".to_string());
+        record_denial(&mut run, tool, tool_use_id, request_id, args, &why);
+        return false;
+    }
+    true
 }
 
 /// Parse one stdin line as the `control_response` to `request_id`. `None` for anything that is
@@ -1123,6 +1349,41 @@ mod tests {
         assert_eq!(result_kind("max_iters"), ("error_max_turns", true));
         assert_eq!(result_kind("divergence"), ("error_during_execution", true));
         assert_eq!(result_kind("cancelled"), ("error_during_execution", true));
+    }
+
+    /// A steer line keeps its text, a reply keeps its id, and neither is confused for the other.
+    #[test]
+    fn stdin_lines_are_sorted_by_their_type_key() {
+        match classify_inbound(r#"{"type":"steer","text":"skip the tests"}"#) {
+            Inbound::Steer(text) => assert_eq!(text, "skip the tests"),
+            _ => panic!("a steer line is a steer"),
+        }
+        let reply = r#"{"type":"control_response","response":{"request_id":"req_9","response":{"behavior":"allow"}}}"#;
+        match classify_inbound(reply) {
+            Inbound::Reply { request_id, line } => {
+                assert_eq!(request_id, "req_9");
+                assert_eq!(line, reply, "the waiter re-parses the whole line");
+            }
+            _ => panic!("a control_response is a reply"),
+        }
+        assert!(
+            matches!(
+                classify_inbound(r#"{"type":"steer","text":"  "}"#),
+                Inbound::Ignored
+            ),
+            "a blank steer is ignored"
+        );
+        assert!(
+            matches!(classify_inbound("not json"), Inbound::Ignored),
+            "not JSON is ignored"
+        );
+        assert!(
+            matches!(
+                classify_inbound(r#"{"type":"user","message":{}}"#),
+                Inbound::Ignored
+            ),
+            "another record type is ignored"
+        );
     }
 
     /// Aizen counts cache reads and writes inside `input`; the API's `input_tokens` excludes them.

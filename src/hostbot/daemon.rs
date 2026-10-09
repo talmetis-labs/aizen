@@ -482,8 +482,8 @@ async fn run_serve_turn(
     }
     cap_session(history, SERVE_SESSION_MAX_MSGS);
 
-    if let StopReason::AwaitingInput(q) = &outcome.stop {
-        return Ok(format!("❓ {q}"));
+    if let StopReason::AwaitingInput(ask) = &outcome.stop {
+        return Ok(format!("❓ {}", ask.display()));
     }
     Ok(outcome
         .final_text

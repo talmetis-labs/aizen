@@ -445,7 +445,7 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
         // Both have dedicated arms in every caller (Esc / `clarify` pause), so reaching this is a
         // wiring slip rather than a real state — still say something instead of swallowing it.
         StopReason::Cancelled => format!("⚠ stopped: cancelled after {} step(s).", outcome.iters),
-        StopReason::AwaitingInput(q) => format!("❓ {q}"),
+        StopReason::AwaitingInput(ask) => format!("❓ {}", ask.display()),
         // Only reachable if a wall-clock budget was set on this run (no top-level default), so name
         // the knob — otherwise the user cannot tell a deadline from a step limit or a crash.
         StopReason::Deadline => format!(
@@ -470,39 +470,37 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
     }
 }
 
-/// Render a `clarify` question prominently and yield to the input box. `display` is the tool's
-/// stored text: the question on the first line, any numbered options on the following lines.
-/// Routes through `tui::emit_line` under the sticky TUI, else plain stdout — so the user just types
-/// their answer next (it becomes the agent's next user turn). The dim `↳` hint sits below.
-pub(crate) fn show_clarify(display: &str) {
+/// Render a `clarify` ask prominently and yield to the input box. Under the retained UI the whole
+/// structured ask is handed to the answer PANEL (`tui::ask_panel_open`) — a Claude-Code-style picker
+/// with a tab per question, checkboxes for multi-select questions, and a free-text row — and the
+/// rendered text of every question and option is ALSO emitted to the transcript, so dismissing the
+/// panel (Esc / typing) still leaves the free-text path completely usable. Every other surface (plain
+/// REPL, `aizen agent`, Telegram) prints the same rendered text and the user types the answer.
+pub(crate) fn show_clarify(ask: &crate::agent::clarify::Ask) {
+    let display = ask.display();
     let mut lines = display.lines();
-    let q = lines.next().unwrap_or("");
     let head = format!(
         "{} {}",
         style("❓").color256(splash::ACCENT).bold(),
-        style(q).bold()
+        style(lines.next().unwrap_or("")).bold()
     );
-    let opts: Vec<String> = lines
+    let rest: Vec<String> = lines
         .map(|l| style(l).color256(splash::ACCENT).to_string())
         .collect();
-    let hint = style("↳ type your answer below to continue")
-        .dim()
-        .to_string();
+    let hint = style("↳ answer below to continue").dim().to_string();
     if tui::active() {
         tui::emit_line(&head);
-        for o in &opts {
+        for o in &rest {
             tui::emit_line(o);
         }
         tui::emit_line(&hint);
-        // Suggested options → raise the picker over the input box (↑↓/click + Enter submits the
-        // choice as the next user message). The numbered list above STAYS in the transcript: the
-        // menu is dismissible (Esc / just start typing), and the options must survive its dismissal
-        // for the free-text path. No-ops when there are no options to offer.
-        let (q, options) = crate::agent::clarify::parse_display(display);
-        tui::question_menu_open(q, &options);
+        // Raise the answer panel. The numbered list above STAYS in the transcript: the panel is
+        // dismissible (Esc / just start typing), and the options must survive its dismissal for the
+        // free-text path. No-ops when there is nothing to pick (a bare question) — the box is enough.
+        tui::ask_panel_open(ask);
     } else {
         println!("{head}");
-        for o in &opts {
+        for o in &rest {
             println!("{o}");
         }
         println!("{hint}");

@@ -20,6 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Cap on finished entries retained for `/workflows` history.
 const HISTORY_CAP: usize = 16;
+/// How many of those the panel prints. Smaller than the retained cap on purpose: the store keeps
+/// the tail for forensics, the overlay is a glance surface and long histories bury the live rows.
+const RECENT_DISPLAY: usize = 6;
 /// Cap on concurrent live entries (workflow + children + tasks). Soft — over-cap still records.
 const LIVE_SOFT_CAP: usize = 32;
 
@@ -167,6 +170,29 @@ fn safe_text(value: &str, max: usize) -> String {
         .collect()
 }
 
+/// Detail strings are free text — a provider error sentence can run 200+ chars and make a panel
+/// row wrap until the job label scrolls off the side. Panel rows carry the detail only as a short
+/// elided tail; the full text stays in the manifest / transcript.
+const ROW_DETAIL_MAX: usize = 72;
+
+fn elide_detail(detail: &str, max: usize) -> String {
+    let flat = safe_text(detail, usize::MAX);
+    let mut chars = flat.chars();
+    let mut taken = String::with_capacity(max + 1);
+    for _ in 0..max {
+        match chars.next() {
+            Some(c) => taken.push(c),
+            None => return taken, // fits — no ellipsis
+        }
+    }
+    if chars.next().is_some() {
+        // Truncated mid-way: swap the last char for the ellipsis so the width stays at `max`.
+        taken.pop();
+        taken.push('…');
+    }
+    taken
+}
+
 fn persist_manifest(e: &Entry) {
     let path = manifest_path(e.id);
     let bytes = match serde_json::to_vec_pretty(&RunManifest {
@@ -214,6 +240,62 @@ fn remove_manifest(id: u64) {
 /// during a load. Generous so a long legitimate fan-out is never pruned out from under itself.
 const MANIFEST_STALE_SECS: u64 = 6 * 3600;
 
+/// Is the process that published a manifest still alive? A crashed aizen leaves its "running"
+/// manifests behind (only a live process deletes its own files on finish), so age alone used to be
+/// the only signal — and a fan-out killed mid-flight haunted the panel for the whole 6-hour stale
+/// window. A dead PID is conclusive NOW, so it sweeps regardless of age. Any probe doubt (access
+/// denied, unsupported platform) keeps the manifest — a false sweep is a lost live row, a false
+/// keep is only clutter the age window eventually clears.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: `pid` is a plain integer; the returned handle is checked for null, only queried
+        // for its exit code, and closed on every path.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                // Null is usually "no such process", but a higher-integrity peer denies the open
+                // too — and that peer is very much alive. Doubt means keep.
+                return true;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(unix)]
+    {
+        // No libc in the dependency tree (the pure-Rust posture), so probe via /proc instead of
+        // kill(pid, 0). A present directory means alive. An UNREADABLE /proc (hidepid mounts) makes
+        // every pid look dead, so the sweeper skips the probe entirely on doubt — never sweep on a
+        // maybe, only on a conclusive dead.
+        if fs::read_dir("/proc").is_err() {
+            return true;
+        }
+        fs::read_dir(format!("/proc/{pid}")).is_ok()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Sweep verdict for one manifest — separated from [`pid_is_alive`] so the age logic is testable
+/// without depending on a particular pid being absent on the CI host (a pid the probe cannot open
+/// reads as alive-by-doubt, by design, and there is no portable "definitely dead" pid constant).
+fn manifest_is_debris(m: &RunManifest, now: u64) -> bool {
+    !pid_is_alive(m.pid) || now.saturating_sub(m.updated_unix) > MANIFEST_STALE_SECS
+}
+
 fn load_remote_manifests() -> Vec<RunManifest> {
     let Ok(entries) = fs::read_dir(manifest_root()) else {
         return Vec::new();
@@ -235,8 +317,9 @@ fn load_remote_manifests() -> Vec<RunManifest> {
             continue;
         };
         // A crashed process leaves a "running" manifest forever; the owning process deletes its own
-        // file on finish. Sweep anything that hasn't been touched within the stale window.
-        if now.saturating_sub(m.updated_unix) > MANIFEST_STALE_SECS {
+        // file on finish. Sweep anything whose pid is conclusively dead — no waiting on the age
+        // window — then anything that hasn't been touched within the stale window.
+        if manifest_is_debris(&m, now) {
             let _ = crate::core::persist::remove_if_exists(&path);
             continue;
         }
@@ -265,7 +348,7 @@ fn remote_row(m: &RunManifest) -> String {
     let detail = if m.detail.is_empty() {
         String::new()
     } else {
-        format!(" — {}", m.detail)
+        format!(" — {}", elide_detail(&m.detail, ROW_DETAIL_MAX))
     };
     format!(
         "  {mark} [{}] {}{}  · {}{} · pid {}\n",
@@ -385,6 +468,7 @@ impl Track {
             remove_manifest(self.id);
         }
         self.finished = true;
+        publish_panel();
     }
 
     /// Mark failure / error.
@@ -398,6 +482,7 @@ impl Track {
             remove_manifest(self.id);
         }
         self.finished = true;
+        publish_panel();
     }
 
     /// Update phase without finishing (e.g. workflow → synthesizing).
@@ -409,6 +494,7 @@ impl Track {
         if let Some(e) = snapshot {
             persist_manifest(&e); // outside the lock — see `Store::set_phase`
         }
+        publish_panel();
     }
 
     /// Publish a stop handle for this run, so `/workflows stop <id>` can cancel it alone.
@@ -434,6 +520,7 @@ impl Drop for Track {
             if found {
                 remove_manifest(self.id);
             }
+            publish_panel();
         }
     }
 }
@@ -467,6 +554,7 @@ fn start(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_live(e);
+    publish_panel();
     Track {
         id,
         finished: false,
@@ -482,6 +570,8 @@ pub fn note_step(id: u64, step: usize, tool: &str) {
             e.detail = format!("step {step} · {tool}");
         }
     }
+    drop(g);
+    publish_panel();
 }
 
 /// Add a run's model tokens (input, output) to its row — live or already finished, since the
@@ -545,6 +635,28 @@ pub fn gate_cap() -> usize {
 /// Number of live (not-yet-finished) orchestration entries.
 pub fn live_count() -> usize {
     store().lock().unwrap_or_else(|e| e.into_inner()).live.len()
+}
+
+/// Compact `(handle, label, elapsed)` rows for every live run, for the sidebar's monitor section and
+/// the jobs panel. The handle is the typeable short form so `/workflows stop #3` works from what the
+/// panel shows. Ordered newest-last (the store's own order), which matches how runs start.
+pub fn live_rows() -> Vec<(String, String, String)> {
+    let g = store().lock().unwrap_or_else(|e| e.into_inner());
+    g.live
+        .iter()
+        .map(|e| {
+            let label = if e.label.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{} · {}", e.name, e.label)
+            };
+            (
+                short_handle(e.id),
+                label,
+                fmt_elapsed(e.started, e.finished),
+            )
+        })
+        .collect()
 }
 
 /// Format a run duration for a status row. Three tiers so the unit is always meaningful at a glance:
@@ -624,14 +736,22 @@ pub fn cancel_matching(needle: &str) -> CancelReport {
     }
 }
 
-/// Names that open the status panel. One source of truth: the REPL's slash dispatch matches on this,
-/// and the input thread uses it to recognise a mid-turn stop request before the command is queued.
+/// Names that open a live status panel while a turn is in flight. One source of truth: the REPL's
+/// slash dispatch matches on this, and the input thread uses it to recognise a mid-turn status request
+/// before the command is queued (a queued `/jobs` only surfaces after the turn ENDS — exactly when
+/// watching a background process has stopped being useful).
+///
+/// `jobs` lives here even though its data comes from `agent::process` + this registry: the panel reads
+/// both through `tui`'s snapshot path, so the routing decision is what needs one shared list.
 pub fn is_status_command(name: &str) -> bool {
-    matches!(name, "workflows" | "workflow" | "wf" | "agents-status")
+    matches!(
+        name,
+        "workflows" | "workflow" | "wf" | "agents-status" | "jobs"
+    )
 }
 
-/// Interpret a `/workflows` argument as a stop request and carry it out, returning the line to show.
-/// `None` means it wasn't a stop request and the caller should open the panel instead.
+/// Interpret a status command's argument as a stop request and carry it out, returning the line to
+/// show. `None` means it wasn't a stop request and the caller should open the panel instead.
 ///
 /// Parsing AND execution live here together so the two call sites — the REPL's slash handler (idle)
 /// and the input thread (mid-turn, where the submission queue is not being drained) — cannot drift
@@ -680,6 +800,77 @@ fn kind_tag(k: Kind) -> &'static str {
     }
 }
 
+/// One row of the retained sub-agents panel, as PLAIN data — the panel's payload type lives behind
+/// `pub(super)` in `tui::retained`, so this registry hands tuples across and a `tui`-side glue fn
+/// builds the payload.
+pub struct PanelRow {
+    pub mark: &'static str,
+    pub label: String,
+    pub detail: String,
+    pub elapsed: String,
+    pub running: bool,
+}
+
+/// Snapshot the collapsible sub-agents panel renders: one row per LIVE registry entry (newest-last,
+/// the store's own order) plus the collapsed tail — recent done labels and the done/running counts.
+/// Workflow parents are kept (their `N task(s)` label is the fan-out's own summary line).
+pub fn panel_snapshot() -> (Vec<PanelRow>, String) {
+    let (rows, done_names, done_count, running_count) = {
+        let g = store().lock().unwrap_or_else(|e| e.into_inner());
+        let rows = g
+            .live
+            .iter()
+            .map(|e| PanelRow {
+                mark: phase_mark(e.phase),
+                label: if e.label.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{} · {}", e.name, e.label)
+                },
+                // The sidebar cell is one line; an unelided provider error wrapped the row and
+                // shoved the label out of view.
+                detail: elide_detail(&e.detail, ROW_DETAIL_MAX),
+                elapsed: fmt_elapsed(e.started, e.finished),
+                running: matches!(e.phase, Phase::Running | Phase::Synthesizing),
+            })
+            .collect::<Vec<_>>();
+        let mut done_names = Vec::new();
+        for e in g.history.iter().rev() {
+            if done_names.len() >= 3 {
+                break;
+            }
+            let n = match e.kind {
+                Kind::Task => e.name.clone(),
+                Kind::Workflow => format!("workflow:{}", e.name),
+                Kind::WorkflowChild => format!("{} · {}", e.name, e.label),
+            };
+            done_names.push(n);
+        }
+        (
+            rows,
+            done_names,
+            g.history.len(),
+            g.live
+                .iter()
+                .filter(|e| matches!(e.phase, Phase::Running | Phase::Synthesizing))
+                .count(),
+        )
+    };
+    let mut summary = String::new();
+    if !done_names.is_empty() {
+        summary.push_str(&done_names.join(", "));
+        summary.push_str(" — ");
+    }
+    summary.push_str(&format!("{done_count} done · {running_count} running"));
+    (rows, summary)
+}
+
+/// Push a fresh panel snapshot to the retained UI, when one is live. Called by every registry
+/// mutation point — outside the store lock, like the manifest IO.
+pub fn publish_panel() {
+    crate::ui::tui::publish_subagents_panel();
+}
+
 /// Human-readable multi-agent status for `/workflows` (and pure-print overlays).
 pub fn format_status() -> String {
     let g = store().lock().unwrap_or_else(|e| e.into_inner());
@@ -725,8 +916,10 @@ pub fn format_status() -> String {
 
     if !g.history.is_empty() {
         out.push_str("\n· recent\n");
-        // Newest last in history vec → show newest first.
-        for e in g.history.iter().rev().take(HISTORY_CAP) {
+        // Newest last in history vec → show newest first. HISTORY_CAP bounds what we RETAIN, not
+        // what we show: the store keeps 16 for forensics (`/workflows` full dump), the panel shows
+        // a short tail or nothing fits on screen next to the running rows.
+        for e in g.history.iter().rev().take(RECENT_DISPLAY) {
             out.push_str(&format_row(e));
         }
     }
@@ -751,7 +944,7 @@ fn format_row(e: &Entry) -> String {
     let detail = if e.detail.is_empty() {
         String::new()
     } else {
-        format!(" — {}", e.detail)
+        format!(" — {}", elide_detail(&e.detail, ROW_DETAIL_MAX))
     };
     let tokens = if e.tokens_in > 0 || e.tokens_out > 0 {
         format!(
@@ -976,7 +1169,7 @@ mod tests {
     fn status_command_aliases_match_the_repl_dispatch() {
         // Both surfaces route on this one predicate; a drift here would make the mid-turn panel open
         // for `/workflows` but not for `/wf`.
-        for name in ["workflows", "workflow", "wf", "agents-status"] {
+        for name in ["workflows", "workflow", "wf", "agents-status", "jobs"] {
             assert!(is_status_command(name), "{name} must be recognised");
         }
         assert!(!is_status_command("work"), "/work is a different command");
@@ -989,5 +1182,90 @@ mod tests {
         let s = format_status();
         assert!(s.contains("Multi-agent"));
         assert!(s.contains("slots"));
+    }
+
+    #[test]
+    fn a_long_error_detail_is_elided_to_one_panel_line() {
+        // The screenshot bug: "provider returned 7 empty response(s) in a row (HTTP 200 with no
+        // text and no tool call)…" wrapped the row until the job label scrolled off the side.
+        let long = "error: provider returned 7 empty response(s) in a row (HTTP 200 with no text \
+                    and no tool call); the gateway answered but never said anything — check the \
+                    wire log for the raw bytes";
+        let elided = elide_detail(long, ROW_DETAIL_MAX);
+        assert_eq!(elided.chars().count(), ROW_DETAIL_MAX);
+        assert!(elided.ends_with('…'));
+        assert!(elided.starts_with("error: provider"));
+
+        let t = start_task("coder · elide check");
+        let id = t.id();
+        t.finish_err(long);
+        let s = format_status();
+        let row = s
+            .lines()
+            .find(|l| l.contains("elide check"))
+            .expect("row present");
+        assert!(!row.contains("wire log"), "the tail is cut: {row}");
+        assert!(row.contains('…'), "the cut is marked: {row}");
+        let _ = id;
+    }
+
+    #[test]
+    fn a_short_detail_is_shown_verbatim() {
+        assert_eq!(
+            elide_detail("done [3 step(s)]", ROW_DETAIL_MAX),
+            "done [3 step(s)]"
+        );
+        assert_eq!(elide_detail("", ROW_DETAIL_MAX), "");
+        // Newlines flatten to spaces — a multi-line provider error stays one panel line.
+        assert_eq!(
+            elide_detail("line one\nline two", ROW_DETAIL_MAX),
+            "line one line two"
+        );
+    }
+
+    #[test]
+    fn this_process_is_always_alive_to_itself() {
+        // The self-check guard: a sweep that took out the current process's own manifests would
+        // blank the remote view of every honest panel.
+        assert!(pid_is_alive(std::process::id()));
+    }
+
+    fn fake_manifest(pid: u32, updated_unix: u64) -> RunManifest {
+        RunManifest {
+            schema: RUN_SCHEMA,
+            run_id: "1".into(),
+            pid,
+            kind: "task".into(),
+            name: "n".into(),
+            label: String::new(),
+            phase: "running".into(),
+            detail: String::new(),
+            parent: None,
+            started_unix: updated_unix,
+            finished_unix: None,
+            updated_unix,
+            origin: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_manifest_from_a_live_process_is_kept() {
+        let now = unix_now();
+        assert!(!manifest_is_debris(
+            &fake_manifest(std::process::id(), now),
+            now
+        ));
+    }
+
+    #[test]
+    fn a_stale_manifest_is_swept_even_from_a_live_process() {
+        // The age window still applies when the pid probe cannot convict (e.g. an access-denied
+        // peer that reads as alive-by-doubt) — 6h of silence is its own evidence.
+        let now = unix_now();
+        let old = now - MANIFEST_STALE_SECS - 60;
+        assert!(manifest_is_debris(
+            &fake_manifest(std::process::id(), old),
+            now
+        ));
     }
 }

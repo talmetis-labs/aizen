@@ -144,11 +144,21 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
         Ok(hits) => return Ok(hits),
         Err(e) => e,
     };
-    // Nothing found by hand does not disprove the index — say what actually went wrong instead of
-    // reporting an empty catalogue.
+    // Nothing found by hand does not disprove the index — but the index being down is not the
+    // whole story either. The catalogue only serves its most recent entries (observed 2026-10-09:
+    // `total` is a single running count and `totalPages` shifts between pages, so old skills fall
+    // out of the window), and a skill that was there last month can be unfindable today. Saying
+    // just "HTTP 500" reads as "the marketplace is down, give up" when the truth is "the index is
+    // down AND the recent catalogue holds no match" — the difference decides whether retrying
+    // later or falling back to local skills is the right move.
     match browse_match(query, limit).await {
         Ok(hits) if !hits.is_empty() => Ok(hits),
-        _ => Err(indexed),
+        Ok(_) => bail!(
+            "{indexed:#}; the browse fallback found no match for '{query}' in the recent \
+             catalogue (it only serves the registry's most recent entries, so an older skill may \
+             exist but be unreachable until the search index recovers)"
+        ),
+        Err(_) => Err(indexed),
     }
 }
 
@@ -304,10 +314,10 @@ fn save_body(fallback: &str, body_md: &str) -> Result<crate::skills::Skill> {
 /// Install one skill by name. An exact `owner/name` is fetched by slug; anything else is a search
 /// followed by the best match.
 ///
-/// The by-slug route first because an install by exact name never needed the search index, and
-/// borrowing it meant borrowing its outages: when agentskill.sh's index began answering HTTP 500
-/// (2026-08-18) every `skill install` failed too, though every skill on it was still being served.
-/// A dependency that only ever costs you is one to drop.
+/// The by-slug route first because an install by exact name should not borrow the search index's
+/// outages. One caveat, observed 2026-10-09: the route reads the same index search does, so it
+/// answers 404 for a slug that has fallen out of the catalogue's recent-entries window — it
+/// rescues installs while the index is down, not installs OF skills the index no longer lists.
 pub async fn install(query: &str) -> Result<crate::skills::Skill> {
     let q = query.trim();
     if q.contains('/') {

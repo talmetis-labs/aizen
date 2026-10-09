@@ -133,6 +133,16 @@ pub(crate) fn is_running() -> bool {
         .is_some()
 }
 
+/// Whether the collapsible sub-agents panel exists this session — Ctrl-E reads this to decide
+/// between toggling the panel and expanding the last tool body.
+pub(crate) fn has_subagents_panel() -> bool {
+    SUBAGENTS_PANEL_SEEN.load(Ordering::Relaxed)
+}
+
+/// Set once the first sub-agents snapshot lands. Mirrors what the render thread's AppState knows,
+/// readable from the input thread without queueing a query command.
+pub(crate) static SUBAGENTS_PANEL_SEEN: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn size() -> (u16, u16) {
     (ROWS.load(Ordering::Relaxed), COLS.load(Ordering::Relaxed))
 }
@@ -340,6 +350,12 @@ pub(crate) fn set_facts(facts: SessionFacts) {
     send(Command::Facts(facts));
 }
 
+/// Publish a fresh background-work snapshot (processes + monitor runs) for the sidebar section and
+/// the jobs strip. Sent by the jobs poller; a no-op off the retained surface.
+pub(crate) fn set_jobs(jobs: JobsStatus) {
+    send(Command::Jobs(jobs));
+}
+
 pub(crate) fn set_selection(sel: SelectionRange) {
     // Mirror BEFORE queueing: the mirror is read by the input thread (right-click), and the command
     // queue is drained asynchronously by the render thread. Writing it here makes "what is selected"
@@ -370,6 +386,17 @@ pub(crate) fn tool_event(ev: ToolEvent) {
 /// Replace the in-place plan checklist box with a fresh snapshot (empty → removes the box).
 pub(crate) fn plan_update(rows: Vec<PlanRow>) {
     send(Command::Plan(rows));
+}
+
+/// Replace the in-place sub-agents panel with a fresh registry snapshot. Sent by the orchestration
+/// glue on every run start/finish/step; a no-op off the retained surface.
+pub(crate) fn subagents_update(p: SubAgentsPayload) {
+    send(Command::SubAgents(p));
+}
+
+/// `Ctrl-E` toggled the sub-agents panel open/closed.
+pub(crate) fn toggle_subagents() {
+    send(Command::ToggleSubAgents);
 }
 
 /// Push a boxed diff preview under the most recent edit.
