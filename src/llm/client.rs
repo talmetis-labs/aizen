@@ -1353,6 +1353,13 @@ pub struct ChatTurn {
     /// path when there is no text and no tool call — an empty turn then fails with a diagnosis that
     /// NAMES the shape gap instead of "empty response".
     pub empty_wire_note: Option<String>,
+    /// A bounded printable prefix of the RAW response body, populated on the same condition as
+    /// [`Self::empty_wire_note`]. The note names which keys were read; THIS is the evidence that
+    /// settles the two cases the note cannot tell apart — a billed-completion reply whose text
+    /// sits in a key the parser has never read (a NEW shape gap: fix the parser) vs a body that
+    /// genuinely carries no text (a silent provider). Printed ONLY when the budget dies, never
+    /// per retry — a mid-loop reply can carry user data, so it must not scroll by unwatched.
+    pub empty_wire_raw: Option<String>,
     /// EAGERLY-STARTED tool executions from the streaming path: `(position in tool_calls, handle)`.
     /// A read-only call whose arguments finished streaming may already be running before the
     /// response ends — the executor ADOPTS these instead of re-spawning. Discarding a `ChatTurn`
@@ -1745,18 +1752,18 @@ async fn chat_with_tools_effort_live(
     } else {
         None
     };
-    if let Some(note) = &empty_wire_note {
-        // TUI-quiet, single line: the note is what turns a retry storm into a bug report.
-        crate::ui::tui::note_line(
-            &crate::ui::theme::faint(format!("empty response — {note}")).to_string(),
-        );
-    }
+    // Captured on the same condition as the note, bounded + ASCII-escaped (never raw control
+    // bytes). NOT printed here: this function is called per retry, and a mid-loop reply can carry
+    // user data that must not scroll by in a transcript nobody is watching. The retry loop prints
+    // it exactly once — attached to the error when the budget dies.
+    let empty_wire_raw = empty_wire_note.as_ref().map(|_| summarize_bytes(&raw, 400));
     Ok(ChatTurn {
         content,
         tool_calls: std::mem::take(&mut choice.message.tool_calls),
         finish_reason: choice.finish_reason.clone(),
         usage,
         empty_wire_note,
+        empty_wire_raw,
         eager: Vec::new(),
     })
 }
@@ -2462,6 +2469,7 @@ async fn stream_chat_with_tools_eager_live(
             finish_reason,
             usage: final_usage,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager,
         });
     } // end blank-stream replay loop

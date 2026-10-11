@@ -1635,15 +1635,35 @@ where
                                 if nudge_pushed {
                                     messages.pop();
                                 }
+                                // The bounded raw body, for the same reason as the ordinary
+                                // branch: the note alone cannot tell "parser missed a key" from
+                                // "provider sent nothing" — the raw capture can, and it is printed
+                                // exactly once, here, never per retry.
+                                let raw_note = t
+                                    .empty_wire_raw
+                                    .as_deref()
+                                    .map(|r| format!("\n  raw body: {r}"))
+                                    .unwrap_or_default();
                                 return Err(anyhow::anyhow!(
                                     "provider returned {} empty response(s) in a row (HTTP 200 \
-                                     with no text and no tool call) — giving up this /goal turn",
+                                     with no text and no tool call) — giving up this /goal turn{raw_note}",
                                     attempt + 1
                                 ));
                             }
                             let delay = crate::llm::client::goal_backoff_ms(attempt);
                             attempt += 1;
-                            goal_retry_line(&format!("empty response; retry #{attempt}"), delay);
+                            // The wire note rides the retry line — a silent provider storm must be
+                            // diagnosable from the trace alone (the ordinary branch does the same).
+                            goal_retry_line(
+                                &format!(
+                                    "empty response; retry #{attempt}{}",
+                                    t.empty_wire_note
+                                        .as_deref()
+                                        .map(|n| format!(" — {n}"))
+                                        .unwrap_or_default()
+                                ),
+                                delay,
+                            );
                             if goal_sleep_or_cancel(&cfg.cancel, delay).await {
                                 if nudge_pushed {
                                     messages.pop();
@@ -1838,24 +1858,41 @@ where
                                 .as_deref()
                                 .map(|n| format!(" — wire carried: {n}"))
                                 .unwrap_or_default();
+                            // …and the bounded raw body, the one piece of evidence that settles
+                            // "billed completion but no text anywhere" — either the reply sits in a
+                            // key the parser has never read (visible right here → fix the parser)
+                            // or the provider truly sent nothing (→ provider-side). This is the
+                            // only place it is ever printed: once, when the turn is already lost.
+                            let raw_note = t
+                                .empty_wire_raw
+                                .as_deref()
+                                .map(|r| format!("\n  raw body: {r}"))
+                                .unwrap_or_default();
                             return Err(anyhow::anyhow!(
                                 "provider returned {} empty response(s) in a row (HTTP 200 with no \
-                                 text and no tool call) — the model never answered this turn{note}",
+                                 text and no tool call) — the model never answered this turn{note}{raw_note}",
                                 attempt + 1
                             ));
                         }
                         let delay = backoff(attempt);
                         attempt += 1;
-                        if !cfg.quiet {
-                            retry_line(
-                                "empty",
-                                &format!(
-                                    "empty response; retry {attempt}/{}",
-                                    cfg.max_transient_retries
-                                ),
-                                delay,
-                            );
-                        }
+                        // One status line per retry carries the wire note, quiet or not: the note
+                        // is the evidence that turns a retry storm into a bug report, and printing
+                        // it on its own line (ungated, in the client) used to flood the transcript
+                        // — a quiet workflow child's every retry surfaced as an unattributed
+                        // "empty response — …" with no retry number beside it.
+                        retry_line(
+                            "empty",
+                            &format!(
+                                "empty response; retry {attempt}/{}{}",
+                                cfg.max_transient_retries,
+                                t.empty_wire_note
+                                    .as_deref()
+                                    .map(|n| format!(" — {n}"))
+                                    .unwrap_or_default()
+                            ),
+                            delay,
+                        );
                         if goal_sleep_or_cancel(&cfg.cancel, delay).await {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
@@ -7443,6 +7480,7 @@ mod tests {
             finish_reason: Some("stop".into()), // deliberately NOT "tool_calls" — must still detect
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -7453,6 +7491,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -7475,6 +7514,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -9934,6 +9974,7 @@ mod tests {
             finish_reason: Some("tool_calls".into()),
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         };
         let out = run_agent(
@@ -10097,6 +10138,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -10267,6 +10309,60 @@ mod tests {
             messages.len(),
             2,
             "the empty-200 re-prompt must be rolled back on the error path, got: {messages:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_mode_empty_200_error_carries_wire_note_and_raw_body_once() {
+        // THE FLOOD this pins, and the evidence that replaces it. The screenshot case: a quiet
+        // workflow child billed `completion` tokens with text in no parsed key, and the transcript
+        // filled with unnumbered `empty response — finish_reason=<absent>, …` lines — one per
+        // retry per child, printed by the CLIENT with no quiet gate. Now the client never prints;
+        // the loop prints ONE numbered line per retry carrying the wire note, and the bounded raw
+        // body is captured per empty-200 (a fixture with `empty_wire_raw: Some(..)` models what
+        // the client captures) and surfaced exactly ONCE — attached to the exhausted-budget error,
+        // where it settles "parser missed a key" vs "provider sent nothing" from the trace alone.
+        let r = registry();
+        let c = AgentConfig {
+            quiet: true,
+            max_transient_retries: 1,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let mut wired = empty_turn();
+        wired.empty_wire_note = Some(
+            "finish_reason=<absent>, choice keys [index], usage prompt=99 completion=42".into(),
+        );
+        wired.empty_wire_raw = Some(
+            r#"{"choices":[{"index":0,"message":{"content":[]}}],"usage":{"completion_tokens":42}}"#
+                .into(),
+        );
+        // The wired turn is LAST: the exhausted-budget error reports the diagnostics of the
+        // attempt the budget dies on (each attempt captures fresh), so the first call returns the
+        // plain empty turn, the retry line carries nothing, and the second call — the one that
+        // spends the budget — is the one carrying the note + raw.
+        let chat = scripted(vec![empty_turn(), wired]);
+        let err = run_agent_loop(chat, &c, &r, &mut messages)
+            .await
+            .expect_err("a persistently silent provider must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("finish_reason=<absent>"),
+            "the exhausted-budget error must carry the wire note, got: {msg}"
+        );
+        assert_eq!(
+            msg.matches("raw body:").count(),
+            1,
+            "the raw body is printed exactly once — on the error, never per retry — got: {msg}"
+        );
+        assert!(
+            msg.contains("\"choices\""),
+            "the raw capture must show what the gateway actually sent, got: {msg}"
+        );
+        assert_eq!(
+            messages.len(),
+            2,
+            "the re-prompt is still rolled back on the error path, got: {messages:#?}"
         );
     }
 

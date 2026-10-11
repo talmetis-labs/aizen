@@ -505,6 +505,7 @@ async fn run_scripted(registry: &ToolRegistry, turns: Vec<ChatTurn>) -> Vec<Mess
                 finish_reason: Some("stop".into()),
                 usage: None,
                 empty_wire_note: None,
+                empty_wire_raw: None,
                 eager: Vec::new(),
             });
         std::future::ready(Ok(next))
@@ -540,6 +541,7 @@ fn tool_call(name: &str, args: &str) -> ChatTurn {
         finish_reason: Some("tool_calls".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -625,6 +627,7 @@ async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
         finish_reason: Some("stop".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     };
     let msgs = run_scripted(&registry, vec![text_turn]).await;

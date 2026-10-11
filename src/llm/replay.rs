@@ -91,7 +91,9 @@ pub struct TapedUsage {
     pub cache_write: u64,
 }
 
-/// The serializable half of a [`ChatTurn`] (no eager handles).
+/// The serializable half of a [`ChatTurn`] (no eager handles, no wire diagnostics: the raw-body
+/// capture is explicitly for the live error path and must never persist user/model text to a tape
+/// that travels).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TapedTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +137,7 @@ impl TapedTurn {
             finish_reason: self.finish_reason,
             usage,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -456,6 +459,7 @@ pub fn record_text(model: &str, messages: &[Message], text: &str) -> Result<()> 
         finish_reason: Some("stop".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     };
     record_turn(model, messages, &[], &turn)
@@ -589,6 +593,7 @@ mod tests {
                 ..Default::default()
             }),
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -683,6 +688,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         };
         record_turn("m", &msgs2, &tools, &fin).unwrap();

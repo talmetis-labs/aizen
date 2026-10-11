@@ -468,6 +468,7 @@ pub(crate) async fn stream_turn_at(
                 finish_reason: Some("tool_calls".into()),
                 usage: acc.usage.clone(),
                 empty_wire_note: None,
+                empty_wire_raw: None,
                 eager,
             });
         }
@@ -990,6 +991,7 @@ impl SseAccumulator {
             finish_reason,
             usage: self.usage,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Default::default(),
         }
     }

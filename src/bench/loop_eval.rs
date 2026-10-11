@@ -69,6 +69,7 @@ fn tool_turn(name: &str, args: &str) -> ChatTurn {
         finish_reason: Some("stop".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -80,6 +81,7 @@ fn final_turn(text: &str) -> ChatTurn {
         finish_reason: Some("stop".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -104,6 +106,7 @@ fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
         finish_reason: Some("stop".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -694,6 +697,7 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
             finish_reason: t.finish_reason.clone(),
             usage: t.usage.clone(),
             empty_wire_note: t.empty_wire_note.clone(),
+            empty_wire_raw: t.empty_wire_raw.clone(),
             eager: Vec::new(),
         })
         .collect()
