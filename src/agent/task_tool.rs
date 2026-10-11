@@ -777,18 +777,26 @@ impl Tool for TaskTool {
         let base_for_repair = base_url.clone();
         let key_for_repair = api_key.clone();
         // Per-child token tally, summed from every call's usage into the report header and the
-        // `/workflows` row.
+        // `/workflows` row. The fold is handed over live (`note_usage`, once the row exists) and
+        // this tally is reset at that moment, so the row and the final report header agree and no
+        // token is counted twice. The row id the closure needs is bound AFTER the chat closure is
+        // built (it exists only once `start_task` runs), so it travels through a slot the loop's
+        // first call is guaranteed to find filled: the loop cannot issue a model call before this
+        // function returns.
         let tally = std::sync::Arc::new((
             std::sync::atomic::AtomicU64::new(0),
             std::sync::atomic::AtomicU64::new(0),
         ));
         let tally_out = tally.clone();
+        let usage_row = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let usage_row_out = usage_row.clone();
         let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
             let client = client.clone();
             let base = base.clone();
             let key = key.clone();
             let model = model.clone();
             let tally = tally.clone();
+            let usage_row = usage_row.clone();
             async move {
                 // DEADLINE, not just a step budget: see `SUBAGENT_CALL_TIMEOUT`. The timeout must
                 // wrap the call INSIDE this future — the whole loop runs under `block_in_place`
@@ -805,14 +813,27 @@ impl Tool for TaskTool {
                     Ok(result) => {
                         if let Ok(turn) = &result {
                             if let Some(u) = &turn.usage {
-                                tally.0.fetch_add(
-                                    u.input_total(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                tally.1.fetch_add(
-                                    u.completion_tokens.unwrap_or(0),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                let row = usage_row.load(std::sync::atomic::Ordering::Relaxed);
+                                if row != 0 {
+                                    // Live row: hand the whole tally over and start a fresh one —
+                                    // `note_usage` ACCUMULATES, so folding in only this call's
+                                    // delta would double-count everything already handed over.
+                                    let tin = tally.0.swap(0, std::sync::atomic::Ordering::Relaxed)
+                                        + u.input_total();
+                                    let tout =
+                                        tally.1.swap(0, std::sync::atomic::Ordering::Relaxed)
+                                            + u.completion_tokens.unwrap_or(0);
+                                    crate::agent::orchestration::note_usage(row, tin, tout);
+                                } else {
+                                    tally.0.fetch_add(
+                                        u.input_total(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    tally.1.fetch_add(
+                                        u.completion_tokens.unwrap_or(0),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
                             }
                         }
                         result
@@ -914,11 +935,17 @@ impl Tool for TaskTool {
         // board a bare role — `coder`, for minutes, with nothing about what it went off to do. Fall
         // back to the prompt's opening line here (not in `header_label`: the result header should
         // not grow a clip of the prompt the model itself wrote). Same helper as the spawn line, so
-        // one run cannot appear under two different names on two surfaces.
+        // one run cannot appear under two different names on two surfaces. The board label carries
+        // the fuller subject clip: the `/workflows` panel wraps, so the user can read what the
+        // dispatch actually is (the old 44-char clip cut most briefs mid-sentence); the sidebar and
+        // the spawn line keep their own tighter one-line clips at their call sites.
         let board_label = match user_label {
             Some(_) => header_label.clone(),
             None => {
-                let subject = crate::agent::subagent_subject(args, 44);
+                let subject = crate::agent::subagent_subject(
+                    args,
+                    crate::agent::orchestration::BOARD_SUBJECT_MAX,
+                );
                 if subject.is_empty() {
                     header_label.clone()
                 } else {
@@ -931,6 +958,8 @@ impl Tool for TaskTool {
         // advertised handle isn't wired up yet.
         track.arm_stop(own_cancel);
         cfg.step_note = Some((track.id(), crate::agent::orchestration::note_step));
+        // Arm the live token fold — from here on every model call grows the row's tok count.
+        usage_row_out.store(track.id(), std::sync::atomic::Ordering::Relaxed);
 
         // Run-log: record this spawn so a crash mid-child leaves a durable trace of what was
         // dispatched (and with what prompt hash), enabling a future `resume` to find the child's
@@ -972,7 +1001,13 @@ impl Tool for TaskTool {
         // child that runs out of time or fails verification gets ONE retry with a tightened
         // brief (its own partial report attached), and if that also fails the tree goes back
         // to the checkpoint taken before the dispatch, so half-done edits do not stay.
+        //
+        // The local tally is rewound between attempts: attempt one's usage was already folded
+        // into the board row LIVE (the closure hands over and zeroes the tally as it goes), so a
+        // leftover non-zero tally would be handed to the row a second time by the retry's fold.
         let run_once = |user_text: String| -> Result<(crate::agent::AgentOutcome, Vec<Message>)> {
+            tally_out.0.store(0, std::sync::atomic::Ordering::Relaxed);
+            tally_out.1.store(0, std::sync::atomic::Ordering::Relaxed);
             tokio::task::block_in_place(|| {
                 let _effort = crate::core::cli_config::suppress_effort_override();
                 tokio::runtime::Handle::current().block_on(async {

@@ -1475,17 +1475,25 @@ pub(crate) async fn run_one_task(
     let base_url_repair = ep.base_url.clone();
     let key_repair = ep.api_key.clone();
     // Per-child token tally, summed from every call's usage into the outcome and the board row.
+    // The fold is handed over live (`note_usage`, once the row exists) and this tally is reset at
+    // that moment, so the row and the outcome agree and no token is counted twice. The row id the
+    // closure needs is bound AFTER the closure is built (it exists only once `start_workflow_child`
+    // runs), so it travels through a slot the loop's first call is guaranteed to find filled: the
+    // loop cannot issue a model call before this function reaches that store below.
     let tally = std::sync::Arc::new((
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
     ));
     let tally_out = tally.clone();
+    let usage_row = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let usage_row_out = usage_row.clone();
     let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
         let client = client.clone();
         let base = base.clone();
         let key = key.clone();
         let model = model_s.clone();
         let tally = tally.clone();
+        let usage_row = usage_row.clone();
         async move {
             // Same wall-clock deadline as a `task` child (see
             // `task_tool::SUBAGENT_CALL_TIMEOUT`): none of this child's budgets count TIME, so a
@@ -1503,13 +1511,26 @@ pub(crate) async fn run_one_task(
                 Ok(result) => {
                     if let Ok(turn) = &result {
                         if let Some(u) = &turn.usage {
-                            tally
-                                .0
-                                .fetch_add(u.input_total(), std::sync::atomic::Ordering::Relaxed);
-                            tally.1.fetch_add(
-                                u.completion_tokens.unwrap_or(0),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            let row = usage_row.load(std::sync::atomic::Ordering::Relaxed);
+                            if row != 0 {
+                                // Live row: hand the whole tally over and start a fresh one —
+                                // `note_usage` ACCUMULATES, so folding in only this call's delta
+                                // would double-count everything already handed over.
+                                let tin = tally.0.swap(0, std::sync::atomic::Ordering::Relaxed)
+                                    + u.input_total();
+                                let tout = tally.1.swap(0, std::sync::atomic::Ordering::Relaxed)
+                                    + u.completion_tokens.unwrap_or(0);
+                                crate::agent::orchestration::note_usage(row, tin, tout);
+                            } else {
+                                tally.0.fetch_add(
+                                    u.input_total(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                tally.1.fetch_add(
+                                    u.completion_tokens.unwrap_or(0),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
                         }
                     }
                     result
@@ -1603,27 +1624,35 @@ pub(crate) async fn run_one_task(
     // `task.id` is positional (`t1`, `refute-3`) — it identifies a row but says nothing about the
     // work, and `label` only names the ROLE. With N children running silently and concurrently, a
     // trace of `⋯ t1 (reviewer) running…` gives the user no way to tell them apart, so carry each
-    // child's own subject. Same clipper as the `workflow` spawn line, so one task cannot appear
-    // under two different names on two surfaces.
-    let subject =
-        crate::agent::subagent_subject(&serde_json::json!({"prompt": task.prompt.as_str()}), 44);
+    // child's own subject.
+    // Two clips on purpose: the board row gets the fuller one (the `/workflows` panel wraps, so a
+    // whole brief stays readable — the old 44-char clip cut most task prompts mid-sentence), while
+    // the transcript line below keeps the one-line 44-char form. The sidebar clips to its own width.
+    let board_subject = crate::agent::subagent_subject(
+        &serde_json::json!({"prompt": task.prompt.as_str()}),
+        crate::agent::orchestration::BOARD_SUBJECT_MAX,
+    );
     let child_track = crate::agent::orchestration::start_workflow_child(
         parent,
         &task.id,
         // The board's own row already prints the id; spend its label on role + subject.
-        if subject.is_empty() {
+        if board_subject.is_empty() {
             label.clone()
         } else {
-            format!("{label} · {subject}")
+            format!("{label} · {board_subject}")
         },
     );
     child_track.arm_stop(own_cancel);
     let child_id = child_track.id();
     cfg.step_note = Some((child_id, crate::agent::orchestration::note_step));
-    if subject.is_empty() {
+    // Arm the live token fold — from here on every model call grows the row's tok count.
+    usage_row_out.store(child_id, std::sync::atomic::Ordering::Relaxed);
+    let trace_subject =
+        crate::agent::subagent_subject(&serde_json::json!({"prompt": task.prompt.as_str()}), 44);
+    if trace_subject.is_empty() {
         wf_trace(&format!("⋯ {} ({label}) running…", task.id));
     } else {
-        wf_trace(&format!("⋯ {} ({label}) {subject} …", task.id));
+        wf_trace(&format!("⋯ {} ({label}) {trace_subject} …", task.id));
     }
 
     // Drive the loop over a LOCAL transcript (what `run_agent` did internally) so both exits

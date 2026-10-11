@@ -170,6 +170,13 @@ fn safe_text(value: &str, max: usize) -> String {
         .collect()
 }
 
+/// Board label cap, in CHARS. The `/workflows` overlay is informational and wraps, so it can afford
+/// a whole brief; the sidebar's expanded rows get ONE line (they hard-clip), so anything past it is
+/// wasted — and a model that front-loads a 400-char prompt would otherwise drown the role that leads
+/// the label. 160 keeps the panel genuinely readable while ending the "44 chars and the task name is
+/// gone" complaint. The elided transcript/spawn lines keep their own shorter clips at the call sites.
+pub(crate) const BOARD_SUBJECT_MAX: usize = 160;
+
 /// Detail strings are free text — a provider error sentence can run 200+ chars and make a panel
 /// row wrap until the job label scrolls off the side. Panel rows carry the detail only as a short
 /// elided tail; the full text stays in the manifest / transcript.
@@ -574,6 +581,21 @@ pub fn note_step(id: u64, step: usize, tool: &str) {
     publish_panel();
 }
 
+/// Fold one finished model call's usage into the row — live, while the child is still running.
+///
+/// The child spawns' per-call tallies call this from inside the chat closure, so `/workflows`
+/// answers "what is it doing" with a growing token count instead of a number that only appears
+/// after the loop returns (the final [`add_usage`] then lands on a zero base — the tallies reset
+/// theirs when they hand the count over — and adds nothing twice). Cheap enough to skip the panel
+/// publish: the next step note repaints, and the finished row reports the same totals regardless.
+pub fn note_usage(id: u64, tokens_in: u64, tokens_out: u64) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.live.iter_mut().find(|e| e.id == id) {
+        e.tokens_in += tokens_in;
+        e.tokens_out += tokens_out;
+    }
+}
+
 /// Add a run's model tokens (input, output) to its row — live or already finished, since the
 /// runner sums them after the child's loop returns.
 pub fn add_usage(id: u64, tokens_in: u64, tokens_out: u64) {
@@ -640,6 +662,10 @@ pub fn live_count() -> usize {
 /// Compact `(handle, label, elapsed)` rows for every live run, for the sidebar's monitor section and
 /// the jobs panel. The handle is the typeable short form so `/workflows stop #3` works from what the
 /// panel shows. Ordered newest-last (the store's own order), which matches how runs start.
+///
+/// The label is elided to [`BOARD_SUBJECT_MAX`]+~48 chars of prefix: these surfaces print one row per
+/// line with no wrap, so an unelided full brief would push elapsed/handle off the right edge, while
+/// 160 chars still swallows any realistic task name whole.
 pub fn live_rows() -> Vec<(String, String, String)> {
     let g = store().lock().unwrap_or_else(|e| e.into_inner());
     g.live
@@ -652,7 +678,7 @@ pub fn live_rows() -> Vec<(String, String, String)> {
             };
             (
                 short_handle(e.id),
-                label,
+                elide_detail(&label, BOARD_SUBJECT_MAX + 48),
                 fmt_elapsed(e.started, e.finished),
             )
         })
@@ -1059,6 +1085,61 @@ mod tests {
         assert!(!recent.contains("step 9 · file_read"), "{recent}");
         assert_eq!(fmt_tokens(999), "999");
         assert_eq!(fmt_tokens(12_345), "12.3k");
+    }
+
+    #[test]
+    fn note_usage_grows_a_live_row_without_a_finish() {
+        // The "what is it doing" number: a child mid-run must show its tokens climbing, not a row
+        // that reads 0 until the loop returns and `add_usage` lands.
+        let t = start_task("daedalus · live tokens");
+        let id = t.id();
+        note_usage(id, 4_000, 300);
+        let live = format_status();
+        assert!(live.contains("4000→300 tok"), "{live}");
+        // The fold ACCUMULATES — the chat closure zeroes its own tally at hand-over, so two calls
+        // add up rather than the second replacing the first.
+        note_usage(id, 4_000, 300);
+        let live = format_status();
+        assert!(live.contains("8000→600 tok"), "{live}");
+        t.finish_ok("done");
+        // Live rows only: a late live-note on a finished entry is dropped (the runner's final
+        // `add_usage` is the one that still lands on history).
+        note_usage(id, 9_999, 9_999);
+        let recent = format_status();
+        assert!(recent.contains("8000→600 tok"), "{recent}");
+        assert!(!recent.contains("17.9k"), "{recent}");
+    }
+
+    #[test]
+    fn the_board_label_carries_a_full_task_brief() {
+        // The complaint: a 44-char clip cut the task name mid-sentence, so `/workflows` showed
+        // `reviewer · Check src/agent/mod.rs for …` and nothing more. The panel wraps — give the
+        // row the whole brief (bounded by BOARD_SUBJECT_MAX against a model that front-loads a
+        // whole file into the prompt's first line).
+        let long_prompt = "Review the orchestration registry in src/agent/orchestration.rs and the \
+                           workflow runner in src/agent/workflow.rs for races between the store lock \
+                           and manifest persistence, then report each finding with a file:line";
+        let subject = crate::agent::subagent_subject(
+            &serde_json::json!({"prompt": long_prompt}),
+            BOARD_SUBJECT_MAX,
+        );
+        let t = start_workflow_child(None, "t1", format!("reviewer · {subject}"));
+        let live = format_status();
+        assert!(
+            live.contains("races between the store lock"),
+            "the middle of the brief survives: {live}"
+        );
+        t.finish_ok("done");
+        // And the clip is still bounded: a giant first line cannot produce a giant row.
+        let giant = "x".repeat(BOARD_SUBJECT_MAX * 3);
+        let clipped = crate::agent::subagent_subject(
+            &serde_json::json!({"prompt": giant}),
+            BOARD_SUBJECT_MAX,
+        );
+        // `first_line_clip` takes `max` chars and then appends the ellipsis (its convention at
+        // every call site), so a clipped brief is BOARD_SUBJECT_MAX + 1 chars, never more.
+        assert_eq!(clipped.chars().count(), BOARD_SUBJECT_MAX + 1);
+        assert!(clipped.ends_with('…'));
     }
 
     #[test]
