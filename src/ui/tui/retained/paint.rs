@@ -279,16 +279,22 @@ fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
     }
 
     // Live background work: long-running `process` handles and live monitor runs (sub-agent /
-    // workflow). Running processes first, each on one line (`▸ proc_3  7m03s  npm run dev`), with
-    // finished ones dimmed below — so a dev server the agent started is visible from the sidebar.
+    // workflow). What's ALIVE leads: running processes and monitor runs first, finished processes
+    // dimmed below — so a dev server the agent started is visible from the sidebar, and its tombstone
+    // never pushes a live sub-agent row out of the capped section. The header counts done processes
+    // too, because "Jobs 0 running" above three dim rows read as a contradiction.
     if !state.jobs.is_empty() {
         let running = state.jobs.running_processes();
         let live = state.jobs.live_monitor();
-        let head = match (running, live) {
+        let done = state.jobs.processes.len() - running;
+        let mut head = match (running, live) {
             (r, 0) => format!("{r} running"),
             (0, m) => format!("monitor {m}"),
             (r, m) => format!("{r} proc · {m} monitor"),
         };
+        if done > 0 {
+            head.push_str(&format!(" · {done} done"));
+        }
         body.push(Line::from(vec![
             Span::styled("Jobs ", bold),
             Span::styled(head, muted),
@@ -302,7 +308,9 @@ fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
             .jobs
             .processes
             .iter()
+            .filter(|r| r.running)
             .chain(state.jobs.monitor.iter())
+            .chain(state.jobs.processes.iter().filter(|r| !r.running))
             .collect();
         // Cap at a few rows so the section never crowds the plan/where-here blocks.
         all.truncate(6);

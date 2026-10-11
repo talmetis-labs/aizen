@@ -1763,6 +1763,78 @@ fn sidebar_shows_jobs_and_the_narrow_strip_replaces_it() {
 }
 
 #[test]
+fn sidebar_jobs_lead_with_the_living_and_count_the_done() {
+    use crate::ui::tui::{JobRow, JobsStatus};
+    let proc_row = |id: &str, running: bool, detail: &str| JobRow {
+        id: id.to_string(),
+        running,
+        elapsed: "7m03s".to_string(),
+        detail: detail.to_string(),
+    };
+    let monitor_row = |id: &str, detail: &str| JobRow {
+        id: id.to_string(),
+        running: true,
+        elapsed: "12s".to_string(),
+        detail: detail.to_string(),
+    };
+
+    // The complaint: three killed processes left "Jobs 0 running" sitting on top of three rows that
+    // looked alive. The header must own the tombstones, and the dim rows must follow the live ones.
+    let mut state = AppState::new("intro", "status");
+    state.jobs = JobsStatus {
+        processes: vec![
+            proc_row("proc_1", false, "old build"),
+            proc_row("proc_2", false, "old serve"),
+            proc_row("proc_3", false, "old node"),
+        ],
+        monitor: vec![],
+    };
+    let joined = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24).join("\n");
+    assert!(
+        joined.contains("0 running · 3 done"),
+        "the header must explain the dim rows:\n{joined}"
+    );
+    let h = joined.find("0 running").unwrap();
+    let f = joined.find("old build").unwrap();
+    assert!(h < f, "header above its rows");
+
+    // A live monitor run leads the section even when finished processes outnumber it — the
+    // truncate(6) cap must never spend the section on tombstones while a sub-agent is live.
+    state.jobs = JobsStatus {
+        processes: vec![
+            proc_row("proc_1", false, "old build"),
+            proc_row("proc_2", false, "old serve"),
+            proc_row("proc_3", false, "old node"),
+            proc_row("proc_4", false, "old test"),
+        ],
+        monitor: vec![monitor_row("#4", "reviewer · t1")],
+    };
+    let joined = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24).join("\n");
+    assert!(
+        joined.contains("monitor 1 · 4 done"),
+        "header counts the monitor lane and the done:\n{joined}"
+    );
+    let m = joined.find("reviewer · t1").expect("live monitor shown");
+    let d = joined.find("old build").expect("a done row still shown");
+    assert!(m < d, "live monitor row leads the done rows:\n{joined}");
+
+    // And a running process still outranks the monitor lane.
+    state.jobs = JobsStatus {
+        processes: vec![
+            proc_row("proc_1", false, "old build"),
+            proc_row("proc_9", true, "npm run dev"),
+        ],
+        monitor: vec![monitor_row("#4", "reviewer · t1")],
+    };
+    let joined = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24).join("\n");
+    assert!(joined.contains("1 proc · 1 monitor · 1 done"), "{joined}");
+    let r = joined.find("npm run dev").unwrap();
+    let m = joined.find("reviewer · t1").unwrap();
+    let d = joined.find("old build").unwrap();
+    assert!(r < m && m < d, "running → monitor → done:\n{joined}");
+}
+
+#[test]
 fn sidebar_wrap_breaks_words_and_marks_overflow() {
     assert_eq!(
         wrap_plain("hello world again", 11, 3),
