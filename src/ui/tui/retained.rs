@@ -990,22 +990,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 session.take();
                 let _ = ack.send(());
                 dirty = false;
-                // Drain any raw input bytes the terminal queued while the menu owned stdin.
-                // When the alternate screen is dropped, mouse capture ends and the terminal's
-                // alternateScroll turns wheel motion into ↑/↓ key presses — those bytes sit in
-                // the stdin buffer. If we don't drain them here, the resumed session reads them
-                // as phantom history-scroll keys.
-                #[cfg(unix)]
-                {
-                    use std::io::Read;
-                    let mut stdin = std::io::stdin();
-                    let mut buf = [0u8; 256];
-                    while let Ok(n) = stdin.read(&mut buf) {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                }
+                // NOTE: no stdin drain here — a blocking read on the render thread wedges the
+                // suspend/resume handshake (the 0.7.1 Linux freeze). Stale menu-session bytes are
+                // drained by the input thread at its unpark edge instead (see tui.rs input_loop).
             }
             Ok(Command::Resume { status, ack }) => {
                 state.input.status = status;
@@ -1079,22 +1066,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     session.take();
                     let _ = ack.send(());
                     dirty = false;
-                    // Drain any raw input bytes the terminal queued while the menu owned stdin.
-                    // When the alternate screen is dropped, mouse capture ends and the terminal's
-                    // alternateScroll turns wheel motion into ↑/↓ key presses — those bytes sit in
-                    // the stdin buffer. If we don't drain them here, the resumed session reads them
-                    // as phantom history-scroll keys.
-                    #[cfg(unix)]
-                    {
-                        use std::io::Read;
-                        let mut stdin = std::io::stdin();
-                        let mut buf = [0u8; 256];
-                        while let Ok(n) = stdin.read(&mut buf) {
-                            if n == 0 {
-                                break;
-                            }
-                        }
-                    }
+                    // NOTE: no stdin drain here — see the blocking-recv Suspend arm above.
                 }
                 Command::Resume { status, ack } => {
                     state.input.status = status;

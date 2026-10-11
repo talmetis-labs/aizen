@@ -3654,6 +3654,15 @@ fn input_loop(
             KEYBOARD_RELEASED.store(false, Ordering::SeqCst);
             // Drain resume pings buffered by the old park protocol so they can't unpark a later menu.
             while resume_rx.try_recv().is_ok() {}
+            // Drain stale terminal input queued while the menu owned stdin: with mouse capture off,
+            // the terminal's alternateScroll turns wheel motion into ↑/↓ key presses, and those bytes
+            // would surface here as phantom history-scroll keys. Non-blocking — poll(0) returns
+            // instantly, so the unpark edge can never wedge the way the render thread did when it
+            // tried to drain stdin with a blocking read (the 0.7.1 Linux freeze).
+            #[cfg(unix)]
+            while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                let _ = event::read();
+            }
             last_activity = Instant::now();
         }
         // Raw mode is required for crossterm's event reader (no line buffering / echo). Re-assert it
