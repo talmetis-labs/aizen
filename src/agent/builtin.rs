@@ -2324,6 +2324,29 @@ impl Tool for FileGlob {
         // (cwd → ancestors → Desktop/Documents/Downloads/home) so the file is found even when it
         // lives above the cwd — the whole reason a model no longer needs to shell out to `where`.
         let (anchor, sub) = glob_anchor(&self.root, pattern);
+        // STRUCTURED vs BARE-NAME (decided below) — but a fully LITERAL structured pattern (has a
+        // separator or absolute/`..` prefix, yet NO `*`/`?`) names ONE exact path, so a single
+        // stat answers it: no walk at all (this is the `ls that path` case — ripgrep-adjacent tools
+        // short-circuit the same way). `glob_anchor` already anchored a pure-literal pattern at its
+        // PARENT with the final segment in `sub`, so `anchor.join(sub)` is the literal target.
+        // Careful: (a) BARE names (`Cargo.toml`, `miniproject`) must NOT take this path — they are
+        // intentionally a broad ranked/fuzzy search across the familiar-location seeds; (b) on a
+        // MISS we fall through to the normal walk — stat can't answer smart-case and the walk would
+        // find `src/A.RS` for `src/a.rs` (mirrors file_read: a missing literal path reaches the same
+        // "not found" messaging, just slower); (c) the `?` exclusion matters — `?` is a glob char
+        // here, and on Windows it is also illegal in a real file name, so stat could never settle
+        // it either way.
+        {
+            let has_glob_char = sub.contains('*') || sub.contains('?');
+            let bare_name = sub == pattern.replace('\\', "/") && anchor == self.root;
+            if !has_glob_char && !bare_name {
+                let literal = anchor.join(&sub);
+                if std::fs::symlink_metadata(&literal).is_ok() {
+                    let s = display_path(&self.root, &literal);
+                    return Ok(if literal.is_dir() { format!("{s}/") } else { s });
+                }
+            }
+        }
         let sub_re = if sub.is_empty() {
             pattern.replace('\\', "/")
         } else {
@@ -4936,6 +4959,96 @@ mod tests {
         assert!(out.contains("src/a.rs"));
         assert!(out.contains("src/sub/b.rs"));
         assert!(!out.contains("c.ts"));
+    }
+
+    #[test]
+    fn file_glob_literal_path_short_circuits_the_walk() {
+        // A structured pattern that names ONE literal path (separator present, no `*`/`?`) is
+        // answered by a single stat — the same output line as the exact-walk would produce, without
+        // walking anything.
+        let root = temp_root("glob-literal");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        let t = FileGlob::new(root);
+
+        let file = t
+            .execute(&serde_json::json!({"pattern":"src/a.rs"}))
+            .unwrap();
+        assert_eq!(file, "src/a.rs", "exact file, one clean line: {file}");
+
+        let dir = t.execute(&serde_json::json!({"pattern":"./src"})).unwrap();
+        assert_eq!(dir, "src/", "directories keep the trailing slash: {dir}");
+
+        // A `..`-anchored literal reaches a real sibling file above the root exactly like the walk
+        // would — deterministic stat hit, no deep walk of the whole temp parent.
+        let base = temp_root("glob-literal-parent");
+        let child = base.join("proj");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(base.join("sibling.rs"), "").unwrap();
+        let t = FileGlob::new(child.canonicalize().unwrap());
+        let out = t
+            .execute(&serde_json::json!({"pattern":"../sibling.rs"}))
+            .unwrap();
+        assert!(
+            out.ends_with("sibling.rs") && !out.contains("…["),
+            "single absolute answer, no walk trailers: {out}"
+        );
+    }
+
+    #[test]
+    fn file_glob_literal_miss_falls_through_to_the_walk() {
+        // A literal structured pattern that does NOT exist must NOT return empty-handed from the
+        // short-circuit: it falls through so the walk can answer smart-case (`src/A.RS` for
+        // `src/a.rs`) — and, failing that, the fuzzy fallback suggests near names exactly as before.
+        let root = temp_root("glob-literal-miss");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/A.RS"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t
+            .execute(&serde_json::json!({"pattern":"src/a.rs"}))
+            .unwrap();
+        if cfg!(any(windows, target_os = "macos")) {
+            // Case-insensitive filesystems: the stat itself hits `A.RS`, so the short-circuit
+            // answers with the queried casing — the fall-through only runs on Linux.
+            assert_eq!(
+                out, "src/a.rs",
+                "stat resolves case-insensitively on this platform: {out}"
+            );
+        } else {
+            assert!(
+                out.contains("A.RS"),
+                "smart-case hit via the walk, not a stat miss: {out}"
+            );
+        }
+
+        let out = t
+            .execute(&serde_json::json!({"pattern":"src/totally-missing.txt"}))
+            .unwrap();
+        assert!(
+            !out.contains("A.RS") || out.contains("closest matches"),
+            "true miss reaches the usual not-found messaging: {out}"
+        );
+    }
+
+    #[test]
+    fn file_glob_bare_name_never_short_circuits() {
+        // A BARE name (`Cargo.toml`) is deliberately a broad ranked search, NOT a stat of
+        // root.join(name) — a file sitting ABOVE the cwd must still be found. Guard that the
+        // short-circuit only fires for structured patterns.
+        let base = temp_root("glob-bare");
+        let ws = base.join("sub").join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        // The needle lives at `base/Cargo.toml` — outside the walk anchor's direct stat reach
+        // (root is the workspace), reachable only by the broad seed walk over ancestors.
+        std::fs::write(base.join("Cargo.toml"), "").unwrap();
+        let t = FileGlob::new(ws.canonicalize().unwrap());
+        let out = t
+            .execute(&serde_json::json!({"pattern":"Cargo.toml"}))
+            .unwrap();
+        assert!(
+            out.contains("Cargo.toml"),
+            "bare name still searched broadly above the cwd: {out}"
+        );
     }
 
     #[test]

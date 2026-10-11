@@ -69,6 +69,11 @@ url = "2"
 # with the `regex` crate already in the tree for line matching. This is the exact pure-Rust walker rg
 # is built on — no C/C++ → single static binary preserved. Removes the "rg must be on PATH" footgun.
 ignore = "0.4"
+# ripgrep's other matcher-side speed secret, already in the dependency tree (memchr ← aho-corasick
+# ← regex), so declaring it direct is ZERO marginal binary cost and pure-Rust. SIMD byte search —
+# the search_files literal prefilter skips a file that can't possibly match before any regex runs.
+memchr = "2"
+
 # MCP remote-app OAuth 2.1 (PKCE S256) — lets `aizen apps` sign into Linear/Notion/Slack/Gmail/Atlassian
 # the way Hermes does (the apps people actually want, all OAuth-only). `ring` (SHA-256 for the PKCE
 # challenge + a CSPRNG) and `getrandom` are BOTH already in the dependency tree via reqwest→rustls
