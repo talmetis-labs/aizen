@@ -1774,8 +1774,7 @@ fn the_product_identity_is_pinned() {
     // environment, so this holds in a test process with any HOME/AIZEN_HOME.
     let probe = std::path::Path::new("/tmp/identity-probe");
     assert!(
-        crate::core::config::resolve_default_home_for_test(probe)
-            .ends_with(".aizen"),
+        crate::core::config::resolve_default_home_for_test(probe).ends_with(".aizen"),
         "the home directory holds every saved session; renaming it strands them"
     );
 }

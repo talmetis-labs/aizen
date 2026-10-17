@@ -207,10 +207,7 @@ pub(crate) async fn guided_vision_preflight(
 /// narrow one (this task, this destination/account route, originals), and disclosure to the
 /// provider stays governed by the vision declaration, so nothing about sending became more
 /// permissive; the question was asked once per attachment and always answered the same way.
-pub(crate) fn prepare_current_references(
-    turn: &mut ResolvedTurn,
-    images: &[String],
-) -> Result<()> {
+pub(crate) fn prepare_current_references(turn: &mut ResolvedTurn, images: &[String]) -> Result<()> {
     if images.is_empty() {
         return Ok(());
     }

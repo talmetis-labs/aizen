@@ -136,13 +136,20 @@ struct Budget {
 
 impl Budget {
     fn new(limits: Limits) -> Self {
-        Self { limits, work: 0, cells: 0, hunks: 0, tokens: 0 }
+        Self {
+            limits,
+            work: 0,
+            cells: 0,
+            hunks: 0,
+            tokens: 0,
+        }
     }
 
     fn work(&mut self, amount: usize) -> Checked<()> {
-        self.work = self.work.checked_add(amount).ok_or(
-            ConflictKind::LimitExceeded(LimitKind::Work),
-        )?;
+        self.work = self
+            .work
+            .checked_add(amount)
+            .ok_or(ConflictKind::LimitExceeded(LimitKind::Work))?;
         if self.work > self.limits.max_work {
             return Err(ConflictKind::LimitExceeded(LimitKind::Work));
         }
@@ -150,9 +157,10 @@ impl Budget {
     }
 
     fn cells(&mut self, amount: usize) -> Checked<()> {
-        self.cells = self.cells.checked_add(amount).ok_or(
-            ConflictKind::LimitExceeded(LimitKind::DiffCells),
-        )?;
+        self.cells = self
+            .cells
+            .checked_add(amount)
+            .ok_or(ConflictKind::LimitExceeded(LimitKind::DiffCells))?;
         if self.cells > self.limits.max_diff_cells {
             return Err(ConflictKind::LimitExceeded(LimitKind::DiffCells));
         }
@@ -217,7 +225,11 @@ pub(crate) fn merge(
         return Err(conflict(ConflictKind::EmptyInput, &[], None));
     }
     if changes.len() > limits.max_changes {
-        return Err(conflict(ConflictKind::LimitExceeded(LimitKind::Changes), &[], None));
+        return Err(conflict(
+            ConflictKind::LimitExceeded(LimitKind::Changes),
+            &[],
+            None,
+        ));
     }
     if changes.iter().any(|c| {
         c.author.is_empty() || c.author.len() > 128 || c.author.chars().any(char::is_control)
@@ -232,7 +244,9 @@ pub(crate) fn merge(
     let mut total = 0usize;
     for change in &ordered {
         if change.result.len() > limits.max_bytes
-            || change.base.is_some_and(|base| base.len() > limits.max_bytes)
+            || change
+                .base
+                .is_some_and(|base| base.len() > limits.max_bytes)
         {
             return Err(fail(ConflictKind::LimitExceeded(LimitKind::SourceBytes)));
         }
@@ -244,7 +258,9 @@ pub(crate) fn merge(
     }
     if ordered.iter().any(|change| {
         std::str::from_utf8(change.result).is_err()
-            || change.base.is_some_and(|base| std::str::from_utf8(base).is_err())
+            || change
+                .base
+                .is_some_and(|base| std::str::from_utf8(base).is_err())
     }) {
         return Err(fail(ConflictKind::InvalidUtf8));
     }
@@ -267,7 +283,9 @@ pub(crate) fn merge(
         contributors.push(change.author);
         let mut found = false;
         for variant in &mut variants {
-            budget.work(change.result.len().saturating_add(1)).map_err(&fail)?;
+            budget
+                .work(change.result.len().saturating_add(1))
+                .map_err(&fail)?;
             if variant.result == change.result {
                 variant.rewrite |= change.operation == Operation::Rewrite;
                 found = true;
@@ -326,7 +344,11 @@ pub(crate) fn merge(
     if language != Language::Rust {
         return Err(fail(ConflictKind::UnsupportedLanguage));
     }
-    if diffs.iter().flatten().any(|hunk| !base.is_empty() && hunk.base == (0..base.len())) {
+    if diffs
+        .iter()
+        .flatten()
+        .any(|hunk| !base.is_empty() && hunk.base == (0..base.len()))
+    {
         return Err(fail(ConflictKind::WholeRewrite));
     }
     let original = scan_rust(base, &mut budget).map_err(&fail)?;
@@ -337,14 +359,16 @@ pub(crate) fn merge(
             return Err(fail(ConflictKind::OutsideFunction));
         }
         for hunk in hunks {
-            let function = locate(&original, &hunk.base).map_err(|kind| {
-                conflict(kind, &authors, Some(hunk.base.clone()))
-            })?;
-            let target = locate(&parsed, &hunk.result).map_err(|kind| {
-                conflict(kind, &authors, Some(hunk.base.clone()))
-            })?;
+            let function = locate(&original, &hunk.base)
+                .map_err(|kind| conflict(kind, &authors, Some(hunk.base.clone())))?;
+            let target = locate(&parsed, &hunk.result)
+                .map_err(|kind| conflict(kind, &authors, Some(hunk.base.clone())))?;
             if function != target {
-                return Err(conflict(ConflictKind::OutsideFunction, &authors, Some(hunk.base.clone())));
+                return Err(conflict(
+                    ConflictKind::OutsideFunction,
+                    &authors,
+                    Some(hunk.base.clone()),
+                ));
             }
             edits.push(Edit {
                 base: hunk.base.clone(),
@@ -356,7 +380,9 @@ pub(crate) fn merge(
     }
     // Stable, explicit byte ordering; author-sorted variant IDs are only owner bits.
     edits.sort_by(|a, b| {
-        a.base.start.cmp(&b.base.start)
+        a.base
+            .start
+            .cmp(&b.base.start)
             .then(a.base.end.cmp(&b.base.end))
             .then(a.replacement.cmp(b.replacement))
     });
@@ -386,7 +412,11 @@ pub(crate) fn merge(
         // Multiple authors may share an identical complete edit set in this item,
         // but cannot each make a different edit anywhere in the same function.
         if edit.owners != function_owners[edit.function] {
-            return Err(conflict(ConflictKind::SameFunction, &authors, Some(edit.base.clone())));
+            return Err(conflict(
+                ConflictKind::SameFunction,
+                &authors,
+                Some(edit.base.clone()),
+            ));
         }
     }
     let removed: usize = unique.iter().map(|edit| edit.base.len()).sum();
@@ -449,13 +479,18 @@ fn units(bytes: &[u8], range: Range<usize>, budget: &mut Budget) -> Checked<Vec<
     budget.work(range.len())?;
     // The public entry point checked UTF-8; line boundaries preserve it.
     let text = std::str::from_utf8(&bytes[range.clone()]).map_err(|_| ConflictKind::InvalidUtf8)?;
-    Ok(text.char_indices().map(|(i, c)| {
-        range.start + i..range.start + i + c.len_utf8()
-    }).collect())
+    Ok(text
+        .char_indices()
+        .map(|(i, c)| range.start + i..range.start + i + c.len_utf8())
+        .collect())
 }
 
 fn equal(
-    left: &[u8], a: &Range<usize>, right: &[u8], b: &Range<usize>, budget: &mut Budget,
+    left: &[u8],
+    a: &Range<usize>,
+    right: &[u8],
+    b: &Range<usize>,
+    budget: &mut Budget,
 ) -> Checked<bool> {
     budget.work(1 + if a.len() == b.len() { a.len() } else { 0 })?;
     Ok(left[a.clone()] == right[b.clone()])
@@ -466,10 +501,15 @@ fn equal(
 /// occur in any optimal alignment is counted; more than LCS-length pairs means
 /// different equally good anchors exist, so no alignment is silently chosen.
 fn anchors(
-    left: &[u8], a: &[Range<usize>], right: &[u8], b: &[Range<usize>], budget: &mut Budget,
+    left: &[u8],
+    a: &[Range<usize>],
+    right: &[u8],
+    b: &[Range<usize>],
+    budget: &mut Budget,
 ) -> Checked<Vec<(usize, usize)>> {
     let width = b.len() + 1;
-    let count = (a.len() + 1).checked_mul(width)
+    let count = (a.len() + 1)
+        .checked_mul(width)
         .ok_or(ConflictKind::LimitExceeded(LimitKind::DiffCells))?;
     budget.cells(count)?;
     let mut suffix = vec![0u32; count];
@@ -497,7 +537,11 @@ fn anchors(
                 }
                 result.push((i, j));
             }
-            row[j + 1] = if same { previous[j] + 1 } else { previous[j + 1].max(row[j]) };
+            row[j + 1] = if same {
+                previous[j] + 1
+            } else {
+                previous[j + 1].max(row[j])
+            };
         }
         std::mem::swap(&mut previous, &mut row);
     }
@@ -511,11 +555,25 @@ fn diff(base: &[u8], result: &[u8], budget: &mut Budget) -> Checked<Vec<Hunk>> {
     let mut hunks = Vec::new();
     let (mut old, mut new) = (0, 0);
     for (i, j) in matches {
-        refine(base, old..old_lines[i].start, result, new..new_lines[j].start, &mut hunks, budget)?;
+        refine(
+            base,
+            old..old_lines[i].start,
+            result,
+            new..new_lines[j].start,
+            &mut hunks,
+            budget,
+        )?;
         old = old_lines[i].end;
         new = new_lines[j].end;
     }
-    refine(base, old..base.len(), result, new..result.len(), &mut hunks, budget)?;
+    refine(
+        base,
+        old..base.len(),
+        result,
+        new..result.len(),
+        &mut hunks,
+        budget,
+    )?;
     Ok(hunks)
 }
 
@@ -535,15 +593,22 @@ fn structural_diff(base: &[u8], result: &[u8], budget: &mut Budget) -> Checked<V
                 return Err(ConflictKind::MacroOrAttribute);
             }
             budget.hunk()?;
-            hunks.push(Hunk { base: old.body.clone(), result: new.body.clone() });
+            hunks.push(Hunk {
+                base: old.body.clone(),
+                result: new.body.clone(),
+            });
         }
     }
     Ok(hunks)
 }
 
 fn refine(
-    base: &[u8], old: Range<usize>, result: &[u8], new: Range<usize>,
-    hunks: &mut Vec<Hunk>, budget: &mut Budget,
+    base: &[u8],
+    old: Range<usize>,
+    result: &[u8],
+    new: Range<usize>,
+    hunks: &mut Vec<Hunk>,
+    budget: &mut Budget,
 ) -> Checked<()> {
     if old.is_empty() && new.is_empty() {
         return Ok(());
@@ -555,14 +620,20 @@ fn refine(
     for (x, y) in matches {
         if i != a[x].start || j != b[y].start {
             budget.hunk()?;
-            hunks.push(Hunk { base: i..a[x].start, result: j..b[y].start });
+            hunks.push(Hunk {
+                base: i..a[x].start,
+                result: j..b[y].start,
+            });
         }
         i = a[x].end;
         j = b[y].end;
     }
     if i != old.end || j != new.end {
         budget.hunk()?;
-        hunks.push(Hunk { base: i..old.end, result: j..new.end });
+        hunks.push(Hunk {
+            base: i..old.end,
+            result: j..new.end,
+        });
     }
     Ok(())
 }
@@ -598,17 +669,22 @@ fn word(bytes: &[u8], token: &Token, expected: &[u8]) -> bool {
     token.kind == Kind::Ident && &bytes[token.span.clone()] == expected
 }
 
-fn escape(bytes: &[u8], i: &mut usize, byte_literal: bool, allow_continuation: bool) -> Checked<()> {
+fn escape(
+    bytes: &[u8],
+    i: &mut usize,
+    byte_literal: bool,
+    allow_continuation: bool,
+) -> Checked<()> {
     *i += 1;
     let next = *bytes.get(*i).ok_or(ConflictKind::AmbiguousRust)?;
     *i += 1;
     match next {
         b'n' | b'r' | b't' | b'0' | b'\\' | b'\'' | b'"' => Ok(()),
         b'x' => {
-            let digits = bytes.get(*i..i.saturating_add(2)).ok_or(ConflictKind::AmbiguousRust)?;
-            if !digits.iter().all(u8::is_ascii_hexdigit)
-                || (!byte_literal && digits[0] > b'7')
-            {
+            let digits = bytes
+                .get(*i..i.saturating_add(2))
+                .ok_or(ConflictKind::AmbiguousRust)?;
+            if !digits.iter().all(u8::is_ascii_hexdigit) || (!byte_literal && digits[0] > b'7') {
                 return Err(ConflictKind::AmbiguousRust);
             }
             *i += 2;
@@ -628,7 +704,9 @@ fn escape(bytes: &[u8], i: &mut usize, byte_literal: bool, allow_continuation: b
                     break;
                 }
                 if byte != b'_' {
-                    let digit = (byte as char).to_digit(16).ok_or(ConflictKind::AmbiguousRust)?;
+                    let digit = (byte as char)
+                        .to_digit(16)
+                        .ok_or(ConflictKind::AmbiguousRust)?;
                     digits += 1;
                     if digits > 6 {
                         return Err(ConflictKind::AmbiguousRust);
@@ -690,14 +768,14 @@ fn raw(bytes: &[u8], r: usize, byte_literal: bool, budget: &mut Budget) -> Check
     while let Some(&byte) = bytes.get(i) {
         if byte == b'"' {
             budget.work(hashes + 1)?;
-            if bytes.get(i + 1..i + 1 + hashes)
+            if bytes
+                .get(i + 1..i + 1 + hashes)
                 .is_some_and(|tail| tail.iter().all(|b| *b == b'#'))
             {
                 return Ok(Some(i + 1 + hashes));
             }
         }
-        if (byte_literal && !byte.is_ascii())
-            || (byte == b'\r' && bytes.get(i + 1) != Some(&b'\n'))
+        if (byte_literal && !byte.is_ascii()) || (byte == b'\r' && bytes.get(i + 1) != Some(&b'\n'))
         {
             return Err(ConflictKind::AmbiguousRust);
         }
@@ -717,10 +795,22 @@ fn character(bytes: &[u8], quote: usize, byte_literal: bool) -> Checked<Option<u
         }
         // Decode only this scalar, not the entire remaining file (which would
         // make a file containing many character literals quadratic to scan).
-        let width = if byte < 0x80 { 1 } else if byte < 0xe0 { 2 } else if byte < 0xf0 { 3 } else { 4 };
+        let width = if byte < 0x80 {
+            1
+        } else if byte < 0xe0 {
+            2
+        } else if byte < 0xf0 {
+            3
+        } else {
+            4
+        };
         let scalar = bytes.get(i..i + width).ok_or(ConflictKind::AmbiguousRust)?;
         let text = std::str::from_utf8(scalar).map_err(|_| ConflictKind::AmbiguousRust)?;
-        i += text.chars().next().ok_or(ConflictKind::AmbiguousRust)?.len_utf8();
+        i += text
+            .chars()
+            .next()
+            .ok_or(ConflictKind::AmbiguousRust)?
+            .len_utf8();
     }
     if bytes.get(i) == Some(&b'\'') {
         Ok(Some(i + 1))
@@ -821,7 +911,10 @@ fn lex(bytes: &[u8], budget: &mut Budget) -> Checked<Vec<Token>> {
             }
         } else if byte.is_ascii_digit() {
             i += 1;
-            while bytes.get(i).is_some_and(|byte| ident_continue(*byte) || *byte == b'.') {
+            while bytes
+                .get(i)
+                .is_some_and(|byte| ident_continue(*byte) || *byte == b'.')
+            {
                 i += 1;
             }
         } else if b"{}()[];:,.<>+-=*/%!&|^?@#$".contains(&byte) {
@@ -833,7 +926,11 @@ fn lex(bytes: &[u8], budget: &mut Budget) -> Checked<Vec<Token>> {
         }
         budget.token()?;
         let index = tokens.len();
-        let mut token = Token { kind, span: start..i, mate: usize::MAX };
+        let mut token = Token {
+            kind,
+            span: start..i,
+            mate: usize::MAX,
+        };
         if let Kind::Punct(byte) = kind {
             if b"{([".contains(&byte) {
                 if stack.len() >= budget.limits.max_depth {
@@ -842,7 +939,11 @@ fn lex(bytes: &[u8], budget: &mut Budget) -> Checked<Vec<Token>> {
                 stack.push(index);
             } else if b"})]".contains(&byte) {
                 let open = stack.pop().ok_or(ConflictKind::AmbiguousRust)?;
-                let expected = match byte { b'}' => b'{', b')' => b'(', _ => b'[' };
+                let expected = match byte {
+                    b'}' => b'{',
+                    b')' => b'(',
+                    _ => b'[',
+                };
                 if !punct(&tokens[open], expected) {
                     return Err(ConflictKind::AmbiguousRust);
                 }
@@ -878,11 +979,15 @@ struct Scanner<'a, 'b> {
 
 impl Scanner<'_, '_> {
     fn is_word(&self, index: usize, expected: &[u8]) -> bool {
-        self.tokens.get(index).is_some_and(|token| word(self.bytes, token, expected))
+        self.tokens
+            .get(index)
+            .is_some_and(|token| word(self.bytes, token, expected))
     }
 
     fn is_punct(&self, index: usize, byte: u8) -> bool {
-        self.tokens.get(index).is_some_and(|token| punct(token, byte))
+        self.tokens
+            .get(index)
+            .is_some_and(|token| punct(token, byte))
     }
 
     fn group_end(&self, index: usize, end: usize) -> Checked<usize> {
@@ -948,7 +1053,11 @@ impl Scanner<'_, '_> {
 
     fn function(&mut self, mut i: usize, end: usize, attributed: bool) -> Checked<usize> {
         // i points just after `fn`. Only ordinary named functions are recognized.
-        if self.tokens.get(i).is_none_or(|token| token.kind != Kind::Ident) {
+        if self
+            .tokens
+            .get(i)
+            .is_none_or(|token| token.kind != Kind::Ident)
+        {
             return Err(ConflictKind::AmbiguousRust);
         }
         i += 1;
@@ -974,14 +1083,18 @@ impl Scanner<'_, '_> {
             return Err(ConflictKind::AmbiguousRust);
         }
         let args_end = self.group_end(i, end)?;
-        if self.tokens[i..=args_end].iter().any(|token| punct(token, b'!') || punct(token, b'{')) {
+        if self.tokens[i..=args_end]
+            .iter()
+            .any(|token| punct(token, b'!') || punct(token, b'{'))
+        {
             return Err(ConflictKind::AmbiguousRust);
         }
         let tail = args_end + 1;
         // After the argument group a function can only end, introduce a return
         // type, or introduce a where-clause. Unknown trailing tokens are not a
         // license to scan ahead until some unrelated opening brace.
-        if !(self.is_punct(tail, b'{') || self.is_punct(tail, b';')
+        if !(self.is_punct(tail, b'{')
+            || self.is_punct(tail, b';')
             || self.is_word(tail, b"where")
             || self.is_punct(tail, b'-') && self.is_punct(tail + 1, b'>'))
         {
@@ -999,26 +1112,46 @@ impl Scanner<'_, '_> {
             // A nested item is not a body-local expression edit: it can contain
             // signatures/imports/attributes of its own. Do not try to infer its
             // visibility or treat nested functions as independent merge slots.
-            if [b"fn".as_slice(), b"use", b"mod", b"struct", b"enum", b"union", b"impl",
-                b"trait", b"type", b"const", b"static", b"extern", b"macro"]
-                .iter().any(|keyword| self.is_word(j, keyword))
-                || self.is_punct(j, b'#') || self.is_punct(j, b'$')
+            if [
+                b"fn".as_slice(),
+                b"use",
+                b"mod",
+                b"struct",
+                b"enum",
+                b"union",
+                b"impl",
+                b"trait",
+                b"type",
+                b"const",
+                b"static",
+                b"extern",
+                b"macro",
+            ]
+            .iter()
+            .any(|keyword| self.is_word(j, keyword))
+                || self.is_punct(j, b'#')
+                || self.is_punct(j, b'$')
             {
                 return Err(ConflictKind::AmbiguousRust);
             }
-            let invocation = self.is_punct(j, b'!') && j > open + 1
-                && self.tokens[j - 1].kind == Kind::Ident;
+            let invocation =
+                self.is_punct(j, b'!') && j > open + 1 && self.tokens[j - 1].kind == Kind::Ident;
             if invocation {
                 let mut group = j + 1;
                 if self.is_word(j - 1, b"macro_rules") {
-                    if self.tokens.get(group).is_none_or(|token| token.kind != Kind::Ident) {
+                    if self
+                        .tokens
+                        .get(group)
+                        .is_none_or(|token| token.kind != Kind::Ident)
+                    {
                         return Err(ConflictKind::AmbiguousRust);
                     }
                     group += 1;
                 }
-                if !matches!(self.tokens.get(group).map(|token| token.kind),
-                    Some(Kind::Punct(b'{' | b'(' | b'[')))
-                {
+                if !matches!(
+                    self.tokens.get(group).map(|token| token.kind),
+                    Some(Kind::Punct(b'{' | b'(' | b'['))
+                ) {
                     return Err(ConflictKind::AmbiguousRust);
                 }
                 let last = self.group_end(group, close)?;
@@ -1066,12 +1199,19 @@ impl Scanner<'_, '_> {
             }
             let head = i;
             let mut qualified = i;
-            while self.is_word(qualified, b"async") || self.is_word(qualified, b"unsafe")
-                || self.is_word(qualified, b"const") || self.is_word(qualified, b"extern")
+            while self.is_word(qualified, b"async")
+                || self.is_word(qualified, b"unsafe")
+                || self.is_word(qualified, b"const")
+                || self.is_word(qualified, b"extern")
             {
                 let foreign = self.is_word(qualified, b"extern");
                 qualified += 1;
-                if foreign && self.tokens.get(qualified).is_some_and(|t| t.kind == Kind::Literal) {
+                if foreign
+                    && self
+                        .tokens
+                        .get(qualified)
+                        .is_some_and(|t| t.kind == Kind::Literal)
+                {
                     qualified += 1;
                 }
             }
@@ -1085,7 +1225,11 @@ impl Scanner<'_, '_> {
             if self.is_word(i, b"impl") || self.is_word(i, b"trait") || self.is_word(i, b"mod") {
                 let module = self.is_word(i, b"mod");
                 let body = if module {
-                    if self.tokens.get(i + 1).is_none_or(|token| token.kind != Kind::Ident) {
+                    if self
+                        .tokens
+                        .get(i + 1)
+                        .is_none_or(|token| token.kind != Kind::Ident)
+                    {
                         return Err(ConflictKind::AmbiguousRust);
                     }
                     i + 2
@@ -1105,13 +1249,22 @@ impl Scanner<'_, '_> {
                     self.items(body + 1, close, depth + 1, attributed)?;
                     i = close + 1;
                 }
-            } else if self.is_word(i, b"use") || self.is_word(i, b"type")
-                || self.is_word(i, b"const") || self.is_word(i, b"static")
+            } else if self.is_word(i, b"use")
+                || self.is_word(i, b"type")
+                || self.is_word(i, b"const")
+                || self.is_word(i, b"static")
             {
                 i = self.terminated(i + 1, end)?;
-            } else if self.is_word(i, b"struct") || self.is_word(i, b"enum") || self.is_word(i, b"union") {
+            } else if self.is_word(i, b"struct")
+                || self.is_word(i, b"enum")
+                || self.is_word(i, b"union")
+            {
                 let body = self.body_or_semicolon(i + 1, end)?;
-                i = if self.is_punct(body, b';') { body + 1 } else { self.group_end(body, end)? + 1 };
+                i = if self.is_punct(body, b';') {
+                    body + 1
+                } else {
+                    self.group_end(body, end)? + 1
+                };
             } else if self.is_word(i, b"extern") {
                 if self.is_word(i + 1, b"crate") {
                     i = self.terminated(i + 2, end)?;
@@ -1124,7 +1277,10 @@ impl Scanner<'_, '_> {
                 }
             } else if self.is_word(i, b"macro_rules") && self.is_punct(i + 1, b'!') {
                 if self.tokens.get(i + 2).is_none_or(|t| t.kind != Kind::Ident)
-                    || !matches!(self.tokens.get(i + 3).map(|t| t.kind), Some(Kind::Punct(b'{' | b'(' | b'[')))
+                    || !matches!(
+                        self.tokens.get(i + 3).map(|t| t.kind),
+                        Some(Kind::Punct(b'{' | b'(' | b'['))
+                    )
                 {
                     return Err(ConflictKind::AmbiguousRust);
                 }
@@ -1132,11 +1288,17 @@ impl Scanner<'_, '_> {
             } else {
                 // A named item macro is opaque. Never interpret `fn` inside it.
                 let mut bang = head;
-                while bang < end && (self.tokens[bang].kind == Kind::Ident || self.is_punct(bang, b':')) {
+                while bang < end
+                    && (self.tokens[bang].kind == Kind::Ident || self.is_punct(bang, b':'))
+                {
                     bang += 1;
                 }
-                if bang == head || !self.is_punct(bang, b'!')
-                    || !matches!(self.tokens.get(bang + 1).map(|t| t.kind), Some(Kind::Punct(b'{' | b'(' | b'[')))
+                if bang == head
+                    || !self.is_punct(bang, b'!')
+                    || !matches!(
+                        self.tokens.get(bang + 1).map(|t| t.kind),
+                        Some(Kind::Punct(b'{' | b'(' | b'['))
+                    )
                 {
                     return Err(ConflictKind::AmbiguousRust);
                 }
@@ -1150,13 +1312,24 @@ impl Scanner<'_, '_> {
 fn scan_rust(bytes: &[u8], budget: &mut Budget) -> Checked<Parsed> {
     let tokens = lex(bytes, budget)?;
     let end = tokens.len();
-    let mut scanner = Scanner { bytes, tokens, functions: Vec::new(), budget };
+    let mut scanner = Scanner {
+        bytes,
+        tokens,
+        functions: Vec::new(),
+        budget,
+    };
     scanner.items(0, end, 0, false)?;
-    Ok(Parsed { functions: scanner.functions })
+    Ok(Parsed {
+        functions: scanner.functions,
+    })
 }
 
 fn same_shell(
-    base: &[u8], original: &Parsed, result: &[u8], parsed: &Parsed, budget: &mut Budget,
+    base: &[u8],
+    original: &Parsed,
+    result: &[u8],
+    parsed: &Parsed,
+    budget: &mut Budget,
 ) -> Checked<bool> {
     if original.functions.len() != parsed.functions.len() {
         return Ok(false);

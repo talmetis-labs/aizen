@@ -189,15 +189,24 @@ impl StartedSafeCall {
         // Admission precedes spawn and watcher creation, including eager calls never adopted.
         let worker = if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
             drop(body);
-            Err(anyhow::anyhow!("tool launch was cancelled or its deadline elapsed; nothing started"))
+            Err(anyhow::anyhow!(
+                "tool launch was cancelled or its deadline elapsed; nothing started"
+            ))
         } else {
-            workers::launch_prepared(producer, &prepared, move || {
-                if worker_cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                    ToolOutcome::failed("error: tool launch was cancelled or its deadline elapsed")
-                } else {
-                    body()
-                }
-            }, ToolEffectState::UnknownWorker)
+            workers::launch_prepared(
+                producer,
+                &prepared,
+                move || {
+                    if worker_cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                        ToolOutcome::failed(
+                            "error: tool launch was cancelled or its deadline elapsed",
+                        )
+                    } else {
+                        body()
+                    }
+                },
+                ToolEffectState::UnknownWorker,
+            )
         };
         let handle = tokio::spawn(async move {
             let outcome = match worker {
@@ -241,11 +250,20 @@ impl StartedSafeCall {
                             ToolEffectState::UnknownWorker,
                         )
                     }
-                },
+                }
             };
-            ToolExecution { call_id, prepared: Some(prepared), outcome }
+            ToolExecution {
+                call_id,
+                prepared: Some(prepared),
+                outcome,
+            }
         });
-        Self { handle, prepared: actual_prepared, settling: false, delegation_cancel }
+        Self {
+            handle,
+            prepared: actual_prepared,
+            settling: false,
+            delegation_cancel,
+        }
     }
 
     pub fn start_settling_mutation(
@@ -259,15 +277,22 @@ impl StartedSafeCall {
         let actual_prepared = prepared.clone();
         let worker = if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
             drop(body);
-            Err(anyhow::anyhow!("mutation launch was cancelled or its deadline elapsed; nothing started"))
+            Err(anyhow::anyhow!(
+                "mutation launch was cancelled or its deadline elapsed; nothing started"
+            ))
         } else {
-            workers::launch_prepared(producer, &prepared, move || {
-                if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                    ToolOutcome::failed("error: mutation launch was cancelled or its deadline elapsed; nothing started")
-                } else {
-                    body()
-                }
-            }, ToolEffectState::PossiblyApplied(None))
+            workers::launch_prepared(
+                producer,
+                &prepared,
+                move || {
+                    if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                        ToolOutcome::failed("error: mutation launch was cancelled or its deadline elapsed; nothing started")
+                    } else {
+                        body()
+                    }
+                },
+                ToolEffectState::PossiblyApplied(None),
+            )
         };
         let handle = tokio::spawn(async move {
             // Only result observation lives here. Actual join ownership is independent of it.
@@ -280,9 +305,18 @@ impl StartedSafeCall {
                 }),
                 Err(error) => ToolOutcome::failed(format!("error: mutation launch refused: {error:#}")),
             };
-            ToolExecution { call_id, prepared: Some(prepared), outcome }
+            ToolExecution {
+                call_id,
+                prepared: Some(prepared),
+                outcome,
+            }
         });
-        Self { handle, prepared: actual_prepared, settling: true, delegation_cancel: None }
+        Self {
+            handle,
+            prepared: actual_prepared,
+            settling: true,
+            delegation_cancel: None,
+        }
     }
 
     pub fn prepared(&self) -> &PreparedToolCall {

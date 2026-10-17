@@ -452,13 +452,17 @@ impl IntegrationReceiptLink {
         }
         if self.integration_id.is_empty()
             || self.integration_id.len() > 128
-            || !self.integration_id.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-            })
+            || !self
+                .integration_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
             || self.integration_id == "."
             || self.integration_id == ".."
             || self.receipt_sha256.len() != 64
-            || !self.receipt_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self
+                .receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
             bail!("invalid Time Machine integration receipt linkage");
         }
@@ -779,10 +783,15 @@ pub(crate) fn plan_speculation_binding(
     canonical_root: &Path,
 ) -> Result<Option<PlannedTimeMachineBinding>> {
     let identity = crate::core::workspace_txn::WorkspaceIdentity::discover(canonical_root)?;
-    if identity.canonical_root != canonical_root || fs::canonicalize(canonical_root)? != canonical_root {
+    if identity.canonical_root != canonical_root
+        || fs::canonicalize(canonical_root)? != canonical_root
+    {
         bail!("Time Machine binding requires the canonical workspace root");
     }
-    match (&identity.canonical_git_dir, &identity.canonical_common_git_dir) {
+    match (
+        &identity.canonical_git_dir,
+        &identity.canonical_common_git_dir,
+    ) {
         (None, None) => return Ok(None),
         (Some(_), Some(_)) => {}
         _ => bail!("Time Machine binding requires a complete Git workspace identity"),
@@ -791,10 +800,7 @@ pub(crate) fn plan_speculation_binding(
 }
 
 impl PlannedTimeMachineBinding {
-    fn plan(
-        identity: crate::core::workspace_txn::WorkspaceIdentity,
-        home: &Path,
-    ) -> Result<Self> {
+    fn plan(identity: crate::core::workspace_txn::WorkspaceIdentity, home: &Path) -> Result<Self> {
         let (metadata_root, ancestor) = plan_metadata_directory(&home.join("timemachine"))?;
         if metadata_root.starts_with(&identity.canonical_root) {
             bail!("speculative Time Machine metadata must be outside the live workspace");
@@ -809,7 +815,8 @@ impl PlannedTimeMachineBinding {
         .into_iter()
         .map(|path| {
             crate::core::workspace_txn::NativeResource::resolve(
-                &path.context("Time Machine binding requires complete Git directories")?
+                &path
+                    .context("Time Machine binding requires complete Git directories")?
                     .join(".tm-git-boundary"),
             )
         })
@@ -828,16 +835,28 @@ impl PlannedTimeMachineBinding {
     }
 
     fn registry_ids(&self, registry: &identity::Registry) -> Result<Option<(String, String)>> {
-        let common = self.identity.canonical_common_git_dir.as_ref()
+        let common = self
+            .identity
+            .canonical_common_git_dir
+            .as_ref()
             .context("Time Machine binding has no common Git directory")?;
-        let git = self.identity.canonical_git_dir.as_ref()
+        let git = self
+            .identity
+            .canonical_git_dir
+            .as_ref()
             .context("Time Machine binding has no worktree Git directory")?;
         let common = common.to_string_lossy().replace('\\', "/");
         let git = git.to_string_lossy().replace('\\', "/");
-        Ok(registry.repos.iter().find(|repo| repo.common_git_dir == common).and_then(|repo| {
-            repo.worktrees.iter().find(|wt| wt.git_dir == git)
-                .map(|wt| (repo.repo_id.clone(), wt.worktree_id.clone()))
-        }))
+        Ok(registry
+            .repos
+            .iter()
+            .find(|repo| repo.common_git_dir == common)
+            .and_then(|repo| {
+                repo.worktrees
+                    .iter()
+                    .find(|wt| wt.git_dir == git)
+                    .map(|wt| (repo.repo_id.clone(), wt.worktree_id.clone()))
+            }))
     }
 
     fn verify_admission(
@@ -846,7 +865,9 @@ impl PlannedTimeMachineBinding {
         physical: &crate::core::workspace_txn::PhysicalEffectLease,
     ) -> Result<()> {
         if !physical.is_exclusive() || writer.identity() != &self.identity {
-            bail!("Time Machine metadata requires matching writer and exclusive physical admission");
+            bail!(
+                "Time Machine metadata requires matching writer and exclusive physical admission"
+            );
         }
         self.ancestor.verify()?;
         self.workspace.verify()?;
@@ -887,9 +908,15 @@ impl PlannedTimeMachineBinding {
         if self.planned_ids.is_some() && self.registry_ids(&registry)? != self.planned_ids {
             bail!("Time Machine registry mapping changed after planning");
         }
-        let common = self.identity.canonical_common_git_dir.as_ref()
+        let common = self
+            .identity
+            .canonical_common_git_dir
+            .as_ref()
             .context("Time Machine binding has no common Git directory")?;
-        let git = self.identity.canonical_git_dir.as_ref()
+        let git = self
+            .identity
+            .canonical_git_dir
+            .as_ref()
             .context("Time Machine binding has no worktree Git directory")?;
         let common_key = common.to_string_lossy().replace('\\', "/");
         let git_key = git.to_string_lossy().replace('\\', "/");
@@ -897,16 +924,23 @@ impl PlannedTimeMachineBinding {
         let legacy_wt_id = format!("wt-{:016x}", fnv1a64(&git_key));
         let path_exists = |path: &str| Path::new(path).exists();
         let new_id = |prefix: &str| random_id(prefix);
-        let resolved = identity::resolve(&mut registry, &identity::ResolveInput {
-            common_git_dir: common_key,
-            git_dir: git_key,
-            root_commit: root_commit_of(&self.identity.canonical_root),
-            legacy_store_exists: self.metadata_root.join(&legacy_repo_id).join("store.git").is_dir(),
-            legacy_repo_id,
-            legacy_wt_id,
-            path_exists: &path_exists,
-            new_id: &new_id,
-        });
+        let resolved = identity::resolve(
+            &mut registry,
+            &identity::ResolveInput {
+                common_git_dir: common_key,
+                git_dir: git_key,
+                root_commit: root_commit_of(&self.identity.canonical_root),
+                legacy_store_exists: self
+                    .metadata_root
+                    .join(&legacy_repo_id)
+                    .join("store.git")
+                    .is_dir(),
+                legacy_repo_id,
+                legacy_wt_id,
+                path_exists: &path_exists,
+                new_id: &new_id,
+            },
+        );
         validate_speculation_registry(&registry)?;
         let ids = (resolved.repo_id, resolved.worktree_id);
         if self.registry_ids(&registry)?.as_ref() != Some(&ids) {
@@ -941,7 +975,11 @@ impl PlannedTimeMachineBinding {
             ref_prefix: format!("refs/ng/tm/{}", ids.1),
             worktree_id: ids.1,
         };
-        Ok(TimeMachineBinding { plan: self.clone(), binding, namespace })
+        Ok(TimeMachineBinding {
+            plan: self.clone(),
+            binding,
+            namespace,
+        })
     }
 }
 
@@ -973,14 +1011,26 @@ impl TimeMachineBinding {
         require_recovery_report_parent(parent)?;
         self.with_transaction_lock(writer, physical, || {
             let directory = recovery_cohort_directory(self.namespace_dir(), cohort)?;
-            let (inventory_sha256, files, native_receipt) = read_recovery_selection(&directory, cohort, prepared)?;
-            let envelope: serde_json::Value = serde_json::from_slice(&read_speculation_evidence(&directory.join(prepared), 2 * 1024 * 1024)?)?;
+            let (inventory_sha256, files, native_receipt) =
+                read_recovery_selection(&directory, cohort, prepared)?;
+            let envelope: serde_json::Value = serde_json::from_slice(&read_speculation_evidence(
+                &directory.join(prepared),
+                2 * 1024 * 1024,
+            )?)?;
             let owner = evidence_text(&envelope, "owner")?.to_owned();
             validate_recovery_base_identity(&directory, &self.plan.identity)?;
-            if recovery_inventory_digest(&directory)? != inventory_sha256 { bail!("restart base evidence changed during identity inspection"); }
+            if recovery_inventory_digest(&directory)? != inventory_sha256 {
+                bail!("restart base evidence changed during identity inspection");
+            }
             Ok(SpeculationRecoverySelection {
-                identity: writer.identity().clone(), namespace: self.namespace_dir().to_path_buf(),
-                cohort: cohort.to_owned(), prepared: prepared.to_owned(), inventory_sha256, files, native_receipt, owner,
+                identity: writer.identity().clone(),
+                namespace: self.namespace_dir().to_path_buf(),
+                cohort: cohort.to_owned(),
+                prepared: prepared.to_owned(),
+                inventory_sha256,
+                files,
+                native_receipt,
+                owner,
             })
         })
     }
@@ -1013,14 +1063,18 @@ impl TimeMachineBinding {
         }
         self.plan.verify_admission(writer, physical)?;
         // Sorted exact-resource exclusion precedes the actual TM transaction and cohort journal.
-        let resources = acquire_recovery_resources(&self.plan.identity.canonical_root, selection, approved)?;
+        let resources =
+            acquire_recovery_resources(&self.plan.identity.canonical_root, selection, approved)?;
         self.with_transaction_lock(writer, physical, || {
             let directory = recovery_cohort_directory(self.namespace_dir(), &selection.cohort)?;
             // Current store inspection takes a shared owner probe, so inspect before taking our
             // exclusive descriptor. Both are ZERO-time attempts; no shared->exclusive upgrade.
-            let (revision, _, _) = read_recovery_selection(&directory, &selection.cohort, &selection.prepared)?;
+            let (revision, _, _) =
+                read_recovery_selection(&directory, &selection.cohort, &selection.prepared)?;
             validate_recovery_base_identity(&directory, &self.plan.identity)?;
-            if revision != selection.inventory_sha256 { bail!("restart report selection is stale; evidence retained"); }
+            if revision != selection.inventory_sha256 {
+                bail!("restart report selection is stale; evidence retained");
+            }
             let inspect = || -> Result<SpeculationRecoveryReport> {
                 if recovery_inventory_digest(&directory)? != selection.inventory_sha256 {
                     bail!("restart evidence changed before exclusive ownership; evidence retained");
@@ -1031,23 +1085,34 @@ impl TimeMachineBinding {
                     bail!("restart evidence changed during classification; evidence retained");
                 }
                 Ok(SpeculationRecoveryReport {
-                    cohort: selection.cohort.clone(), prepared: selection.prepared.clone(),
+                    cohort: selection.cohort.clone(),
+                    prepared: selection.prepared.clone(),
                     inventory_sha256: selection.inventory_sha256,
-                    status: RecoveryReportStatus::InspectionOnly, files: observations, native_records,
-                    native_coverage: selection.native_receipt.as_ref().and_then(|receipt| receipt.coverage.clone()),
+                    status: RecoveryReportStatus::InspectionOnly,
+                    files: observations,
+                    native_records,
+                    native_coverage: selection
+                        .native_receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.coverage.clone()),
                     observation: None,
                 })
             };
             if record_observation {
                 let mut owner = crate::core::speculation::store::ExistingObservationOwner::acquire(
-                    &directory, selection.inventory_sha256, writer, physical,
+                    &directory,
+                    selection.inventory_sha256,
+                    writer,
+                    physical,
                 )?;
                 let mut report = inspect()?;
                 let observation = report.nonterminal_observation(parent, selection)?;
                 // No cached/deserialized report becomes fresh authority. All exact resources and
                 // metadata admission remain held through this final recheck and immutable append.
                 for file in &report.files {
-                    if recovery_live_fingerprint(resources.resources[file.key.as_str()])? != file.current {
+                    if recovery_live_fingerprint(resources.resources[file.key.as_str()])?
+                        != file.current
+                    {
                         bail!("restart source drifted before observation publication");
                     }
                 }
@@ -1071,13 +1136,22 @@ impl TimeMachineBinding {
     ) -> Result<T> {
         self.plan.verify_admission(writer, physical)?;
         self.namespace.verify()?;
-        let ids = self.plan.registry_ids(&read_speculation_registry(&self.plan.metadata_root)?)?;
-        if ids.as_ref() != Some(&(self.binding.repo_id.clone(), self.binding.worktree_id.clone())) {
+        let ids = self
+            .plan
+            .registry_ids(&read_speculation_registry(&self.plan.metadata_root)?)?;
+        if ids.as_ref()
+            != Some(&(
+                self.binding.repo_id.clone(),
+                self.binding.worktree_id.clone(),
+            ))
+        {
             bail!("Time Machine registry mapping no longer matches the admitted binding");
         }
         let ctx = self.binding.context()?;
-        let store_guard = crate::core::workspace_txn::NativeResource::resolve(&ctx.store_lock_path())?;
-        let transaction_guard = crate::core::workspace_txn::NativeResource::resolve(&ctx.lock_path())?;
+        let store_guard =
+            crate::core::workspace_txn::NativeResource::resolve(&ctx.store_lock_path())?;
+        let transaction_guard =
+            crate::core::workspace_txn::NativeResource::resolve(&ctx.lock_path())?;
         let _store = ctx.store_shared()?;
         let _transaction = ctx.lock()?;
         store_guard.verify()?;
@@ -1091,24 +1165,37 @@ impl TimeMachineBinding {
 fn plan_metadata_directory(
     path: &Path,
 ) -> Result<(PathBuf, crate::core::workspace_txn::NativeResource)> {
-    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     let mut parent = absolute.as_path();
     let mut suffix = Vec::new();
     loop {
         match fs::symlink_metadata(parent) {
             Ok(metadata) => {
-                if !metadata.is_dir() || crate::core::file_placement::is_link_or_reparse(&metadata) {
+                if !metadata.is_dir() || crate::core::file_placement::is_link_or_reparse(&metadata)
+                {
                     bail!("Time Machine metadata requires non-link directories");
                 }
-                let guard = crate::core::workspace_txn::NativeResource::resolve(&parent.join(".tm-boundary"))?;
+                let guard = crate::core::workspace_txn::NativeResource::resolve(
+                    &parent.join(".tm-boundary"),
+                )?;
                 let mut canonical = fs::canonicalize(parent)?;
-                for component in suffix.iter().rev() { canonical.push(component); }
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
                 return Ok((canonical, guard));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = parent.file_name().context("invalid Time Machine metadata directory")?;
+                let name = parent
+                    .file_name()
+                    .context("invalid Time Machine metadata directory")?;
                 suffix.push(name.to_os_string());
-                parent = parent.parent().context("Time Machine metadata has no existing parent")?;
+                parent = parent
+                    .parent()
+                    .context("Time Machine metadata has no existing parent")?;
             }
             Err(error) => return Err(error).context("checking Time Machine metadata directory"),
         }
@@ -1117,8 +1204,13 @@ fn plan_metadata_directory(
 
 fn create_metadata_directory(path: &Path) -> Result<crate::core::workspace_txn::NativeResource> {
     let (canonical, mut guard) = plan_metadata_directory(path)?;
-    if canonical != path { bail!("Time Machine metadata directory is not canonical"); }
-    let parent = guard.path().parent().context("Time Machine metadata boundary has no parent")?;
+    if canonical != path {
+        bail!("Time Machine metadata directory is not canonical");
+    }
+    let parent = guard
+        .path()
+        .parent()
+        .context("Time Machine metadata boundary has no parent")?;
     let suffix: Vec<_> = path.strip_prefix(parent)?.components().collect();
     let mut current = parent.to_path_buf();
     for component in suffix {
@@ -1127,9 +1219,12 @@ fn create_metadata_directory(path: &Path) -> Result<crate::core::workspace_txn::
         match fs::create_dir(&current) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("creating admitted Time Machine metadata directory"),
+            Err(error) => {
+                return Err(error).context("creating admitted Time Machine metadata directory")
+            }
         }
-        let next = crate::core::workspace_txn::NativeResource::resolve(&current.join(".tm-boundary"))?;
+        let next =
+            crate::core::workspace_txn::NativeResource::resolve(&current.join(".tm-boundary"))?;
         harden_metadata_directory(&current)?;
         guard.verify()?;
         guard = next;
@@ -1159,10 +1254,16 @@ fn read_speculation_registry(root: &Path) -> Result<identity::Registry> {
     let bytes = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             let guard = crate::core::workspace_txn::NativeResource::resolve(&path)?;
-            if metadata.len() > MAX_SPECULATION_REGISTRY_BYTES { bail!("Time Machine registry exceeds safety bound"); }
+            if metadata.len() > MAX_SPECULATION_REGISTRY_BYTES {
+                bail!("Time Machine registry exceeds safety bound");
+            }
             let mut bytes = Vec::new();
-            fs::File::open(&path)?.take(MAX_SPECULATION_REGISTRY_BYTES + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_SPECULATION_REGISTRY_BYTES { bail!("Time Machine registry exceeds safety bound"); }
+            fs::File::open(&path)?
+                .take(MAX_SPECULATION_REGISTRY_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_SPECULATION_REGISTRY_BYTES {
+                bail!("Time Machine registry exceeds safety bound");
+            }
             guard.verify()?;
             bytes
         }
@@ -1176,13 +1277,18 @@ fn read_speculation_registry(root: &Path) -> Result<identity::Registry> {
     let registry: identity::Registry = serde_json::from_slice(&bytes)
         .context("speculative Time Machine registry is corrupt; it was not replaced")?;
     validate_speculation_registry(&registry)?;
-    if registry.schema_version == 0 { require_no_unmapped_speculation(root)?; }
+    if registry.schema_version == 0 {
+        require_no_unmapped_speculation(root)?;
+    }
     Ok(registry)
 }
 
 fn require_no_unmapped_speculation(root: &Path) -> Result<()> {
     for path in checked_metadata_entries(root)? {
-        if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("repo-"))
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("repo-"))
             && store_has_speculation_evidence(&path)?
         {
             bail!("missing/unversioned Time Machine registry cannot re-key speculative evidence");
@@ -1192,22 +1298,30 @@ fn require_no_unmapped_speculation(root: &Path) -> Result<()> {
 }
 
 fn validate_speculation_registry(registry: &identity::Registry) -> Result<()> {
-    if registry.schema_version > 1 { bail!("unsupported future Time Machine registry schema"); }
-    let valid_id = |id: &str, prefix: &str| id.strip_prefix(prefix)
-        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if registry.schema_version > 1 {
+        bail!("unsupported future Time Machine registry schema");
+    }
+    let valid_id = |id: &str, prefix: &str| {
+        id.strip_prefix(prefix)
+            .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    };
     let mut repos = HashSet::new();
     let mut common_dirs = HashSet::new();
     let mut git_dirs = HashSet::new();
     for repo in &registry.repos {
-        if !valid_id(&repo.repo_id, "repo-") || !repos.insert(&repo.repo_id)
-            || !common_dirs.insert(&repo.common_git_dir) || !Path::new(&repo.common_git_dir).is_absolute()
+        if !valid_id(&repo.repo_id, "repo-")
+            || !repos.insert(&repo.repo_id)
+            || !common_dirs.insert(&repo.common_git_dir)
+            || !Path::new(&repo.common_git_dir).is_absolute()
         {
             bail!("invalid or ambiguous Time Machine repository registry mapping");
         }
         let mut worktrees = HashSet::new();
         for wt in &repo.worktrees {
-            if !valid_id(&wt.worktree_id, "wt-") || !worktrees.insert(&wt.worktree_id)
-                || !git_dirs.insert(&wt.git_dir) || !Path::new(&wt.git_dir).is_absolute()
+            if !valid_id(&wt.worktree_id, "wt-")
+                || !worktrees.insert(&wt.worktree_id)
+                || !git_dirs.insert(&wt.git_dir)
+                || !Path::new(&wt.git_dir).is_absolute()
             {
                 bail!("invalid or ambiguous Time Machine worktree registry mapping");
             }
@@ -1230,12 +1344,15 @@ fn checked_metadata_entries(path: &Path) -> Result<Vec<PathBuf>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("reading speculation metadata directory"),
-        Ok(metadata) if !metadata.is_dir() || crate::core::file_placement::is_link_or_reparse(&metadata) => {
+        Ok(metadata)
+            if !metadata.is_dir() || crate::core::file_placement::is_link_or_reparse(&metadata) =>
+        {
             bail!("speculation metadata requires non-link directories");
         }
         Ok(_) => {}
     }
-    let boundary = crate::core::workspace_txn::NativeResource::resolve(&path.join(".tm-inspection-boundary"))?;
+    let boundary =
+        crate::core::workspace_txn::NativeResource::resolve(&path.join(".tm-inspection-boundary"))?;
     let mut entries = Vec::new();
     for entry in fs::read_dir(path)? {
         if entries.len() >= MAX_SPECULATION_SCAN_ENTRIES {
@@ -1252,41 +1369,77 @@ fn read_speculation_evidence(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 fn evidence_text<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str> {
-    value.get(field).and_then(serde_json::Value::as_str)
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
         .with_context(|| format!("speculation record has invalid {field}"))
 }
 
 fn evidence_digest(value: &serde_json::Value) -> bool {
-    value.as_array().is_some_and(|bytes| bytes.len() == 32
-        && bytes.iter().all(|byte| byte.as_u64().is_some_and(|byte| byte <= 255)))
+    value.as_array().is_some_and(|bytes| {
+        bytes.len() == 32
+            && bytes
+                .iter()
+                .all(|byte| byte.as_u64().is_some_and(|byte| byte <= 255))
+    })
 }
 
 fn evidence_fingerprint(value: &serde_json::Value) -> bool {
-    value.get("exists").and_then(serde_json::Value::as_bool).is_some()
-        && value.get("byte_len").and_then(serde_json::Value::as_u64)
+    value
+        .get("exists")
+        .and_then(serde_json::Value::as_bool)
+        .is_some()
+        && value
+            .get("byte_len")
+            .and_then(serde_json::Value::as_u64)
             .is_some_and(|len| len <= crate::core::speculation::store::MAX_FILE_BYTES as u64)
         && value.get("sha256").is_some_and(evidence_digest)
 }
 
-fn parsed_evidence_fingerprint(value: &serde_json::Value) -> Result<crate::core::persist::FileFingerprint> {
-    if !evidence_fingerprint(value) { bail!("invalid integration fingerprint evidence"); }
-    let exists = value["exists"].as_bool().context("invalid integration existence evidence")?;
-    let byte_len = value["byte_len"].as_u64().context("invalid integration image length")?;
+fn parsed_evidence_fingerprint(
+    value: &serde_json::Value,
+) -> Result<crate::core::persist::FileFingerprint> {
+    if !evidence_fingerprint(value) {
+        bail!("invalid integration fingerprint evidence");
+    }
+    let exists = value["exists"]
+        .as_bool()
+        .context("invalid integration existence evidence")?;
+    let byte_len = value["byte_len"]
+        .as_u64()
+        .context("invalid integration image length")?;
     let mut sha256 = [0u8; 32];
-    for (index, byte) in value["sha256"].as_array().context("invalid integration digest")?.iter().enumerate() {
+    for (index, byte) in value["sha256"]
+        .as_array()
+        .context("invalid integration digest")?
+        .iter()
+        .enumerate()
+    {
         sha256[index] = byte.as_u64().context("invalid integration digest byte")? as u8;
     }
-    let fingerprint = crate::core::persist::FileFingerprint { exists, byte_len, sha256 };
+    let fingerprint = crate::core::persist::FileFingerprint {
+        exists,
+        byte_len,
+        sha256,
+    };
     if !exists && fingerprint != crate::core::persist::FileFingerprint::missing() {
         bail!("missing integration image has nonempty fingerprint");
     }
     Ok(fingerprint)
 }
 
-fn evidence_array<'a>(value: &'a serde_json::Value, field: &str, bound: usize) -> Result<&'a [serde_json::Value]> {
-    let rows = value.get(field).and_then(serde_json::Value::as_array)
+fn evidence_array<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    bound: usize,
+) -> Result<&'a [serde_json::Value]> {
+    let rows = value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
         .with_context(|| format!("integration {field} evidence missing"))?;
-    if rows.len() > bound { bail!("integration {field} evidence exceeds bound"); }
+    if rows.len() > bound {
+        bail!("integration {field} evidence exceeds bound");
+    }
     Ok(rows)
 }
 
@@ -1304,8 +1457,13 @@ fn validate_prepared_image(
     next_image: &mut usize,
 ) -> Result<()> {
     if parsed_evidence_fingerprint(descriptor)? != *fingerprint
-        || descriptor.get("missing").and_then(serde_json::Value::as_bool) != Some(!fingerprint.exists)
-    { bail!("prepared image descriptor differs from its file fingerprint"); }
+        || descriptor
+            .get("missing")
+            .and_then(serde_json::Value::as_bool)
+            != Some(!fingerprint.exists)
+    {
+        bail!("prepared image descriptor differs from its file fingerprint");
+    }
     if !fingerprint.exists {
         if descriptor.get("index") != Some(&serde_json::Value::Null) {
             bail!("absent prepared preimage must not reference an image");
@@ -1315,7 +1473,9 @@ fn validate_prepared_image(
     if descriptor.get("index").and_then(serde_json::Value::as_u64) != Some(*next_image as u64) {
         bail!("prepared image index is missing, reused or out of deterministic order");
     }
-    let image = images.get(*next_image).context("prepared image bytes are missing")?;
+    let image = images
+        .get(*next_image)
+        .context("prepared image bytes are missing")?;
     if crate::core::persist::FileFingerprint::for_bytes(image) != *fingerprint {
         bail!("prepared image bytes/hash differ from declared exact image");
     }
@@ -1327,7 +1487,10 @@ fn validate_prepared_image(
 /// bookkeeping may be created; no source bytes, speculative records, or native journal are changed.
 /// The caller must already be the current plain parent; only the top-level CLI may seat one.
 pub(crate) fn inspect_speculation_recovery(
-    root: &Path, cohort: &str, prepared: &str, resource_paths: &[String],
+    root: &Path,
+    cohort: &str,
+    prepared: &str,
+    resource_paths: &[String],
 ) -> Result<SpeculationRecoveryReport> {
     inspect_or_record_speculation_recovery(root, cohort, prepared, resource_paths, false)
 }
@@ -1335,15 +1498,25 @@ pub(crate) fn inspect_speculation_recovery(
 /// Record a freshly admitted inspection in an existing cohort. This is nonterminal historical
 /// evidence only; source/native journal bytes and ordinary pending guards remain unchanged.
 pub(crate) fn record_speculation_recovery_observation(
-    root: &Path, cohort: &str, prepared: &str, resource_paths: &[String],
+    root: &Path,
+    cohort: &str,
+    prepared: &str,
+    resource_paths: &[String],
 ) -> Result<SpeculationRecoveryReport> {
     inspect_or_record_speculation_recovery(root, cohort, prepared, resource_paths, true)
 }
 
 fn inspect_or_record_speculation_recovery(
-    root: &Path, cohort: &str, prepared: &str, resource_paths: &[String], record_observation: bool,
+    root: &Path,
+    cohort: &str,
+    prepared: &str,
+    resource_paths: &[String],
+    record_observation: bool,
 ) -> Result<SpeculationRecoveryReport> {
-    use crate::core::{exec_ctx, workspace_txn::{PhysicalEffectLease, WorkspaceIdentity, WorkspaceWriterLease}};
+    use crate::core::{
+        exec_ctx,
+        workspace_txn::{PhysicalEffectLease, WorkspaceIdentity, WorkspaceWriterLease},
+    };
     let parent = exec_ctx::current().context("restart report requires the current plain parent")?;
     require_recovery_report_parent(&parent)?;
     validate_recovery_report_request(cohort, prepared, resource_paths)?;
@@ -1355,31 +1528,52 @@ fn inspect_or_record_speculation_recovery(
     let start = std::time::Instant::now();
     let scope = parent.resource_scope();
     let writer = WorkspaceWriterLease::acquire_identity_scoped(
-        identity, LOCK_TIMEOUT, cancel.as_ref(), "restart inspection", &scope,
+        identity,
+        LOCK_TIMEOUT,
+        cancel.as_ref(),
+        "restart inspection",
+        &scope,
     )?;
     let physical = PhysicalEffectLease::exclusive(
-        LOCK_TIMEOUT.saturating_sub(start.elapsed()), cancel.as_ref(), "restart inspection", &scope,
+        LOCK_TIMEOUT.saturating_sub(start.elapsed()),
+        cancel.as_ref(),
+        "restart inspection",
+        &scope,
     )?;
-    let body_ctx = parent.with_writer_lease(writer.clone()).with_physical_effect_lease(physical.clone());
+    let body_ctx = parent
+        .with_writer_lease(writer.clone())
+        .with_physical_effect_lease(physical.clone());
     exec_ctx::with_current(body_ctx, || {
         let binding = plan.admit(&writer, &physical)?;
-        let selection = binding.select_speculation_recovery(&parent, &writer, &physical, cohort, prepared)?;
+        let selection =
+            binding.select_speculation_recovery(&parent, &writer, &physical, cohort, prepared)?;
         // Selection releases its TM locks. Report then takes Resource -> TimeMachine -> Journal.
         if record_observation {
-            binding.inspect_selected_recovery(&parent, &writer, &physical, &selection, &approved, true)
+            binding
+                .inspect_selected_recovery(&parent, &writer, &physical, &selection, &approved, true)
         } else {
             binding.report_speculation_recovery(&parent, &writer, &physical, &selection, &approved)
         }
     })
 }
 
-fn validate_recovery_report_request(cohort: &str, prepared: &str, resource_paths: &[String]) -> Result<()> {
+fn validate_recovery_report_request(
+    cohort: &str,
+    prepared: &str,
+    resource_paths: &[String],
+) -> Result<()> {
     if cohort.len() != 32 || !cohort.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("restart report needs an exact bounded cohort identifier");
     }
-    let digest = prepared.strip_prefix("m-").and_then(|name| name.strip_suffix(".json"))
+    let digest = prepared
+        .strip_prefix("m-")
+        .and_then(|name| name.strip_suffix(".json"))
         .context("restart report needs an exact immutable prepared-record identifier")?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         bail!("restart report needs an exact immutable prepared-record identifier");
     }
     if resource_paths.len() > crate::core::speculation::store::MAX_COHORT_FILES {
@@ -1392,7 +1586,8 @@ fn validate_recovery_report_request(cohort: &str, prepared: &str, resource_paths
 }
 
 fn resolve_recovery_report_resources(
-    root: &Path, resource_paths: &[String],
+    root: &Path,
+    resource_paths: &[String],
 ) -> Result<Vec<crate::core::workspace_txn::NativeResource>> {
     use crate::core::workspace_txn::NativeResource;
     let mut approved = Vec::with_capacity(resource_paths.len());
@@ -1401,13 +1596,26 @@ fn resolve_recovery_report_resources(
         let supplied = Path::new(supplied);
         // Check original spelling before joining a Windows verbatim root can erase traversal.
         NativeResource::validate_spelling(supplied)?;
-        let path = if supplied.is_absolute() { supplied.to_path_buf() } else { root.join(supplied) };
+        let path = if supplied.is_absolute() {
+            supplied.to_path_buf()
+        } else {
+            root.join(supplied)
+        };
         let resource = NativeResource::resolve(&path)?;
-        let relative = resource.path().strip_prefix(root).context("restart selected resource is outside workspace")?;
-        if relative.as_os_str().is_empty() || relative.components().any(|component| {
-            component.as_os_str().to_str().is_none_or(|part| [".git", ".aizen", "native-journal-v1", "speculation-v1"]
-                .iter().any(|internal| part.eq_ignore_ascii_case(internal)))
-        }) || !keys.insert(resource.key().to_owned()) {
+        let relative = resource
+            .path()
+            .strip_prefix(root)
+            .context("restart selected resource is outside workspace")?;
+        if relative.as_os_str().is_empty()
+            || relative.components().any(|component| {
+                component.as_os_str().to_str().is_none_or(|part| {
+                    [".git", ".aizen", "native-journal-v1", "speculation-v1"]
+                        .iter()
+                        .any(|internal| part.eq_ignore_ascii_case(internal))
+                })
+            })
+            || !keys.insert(resource.key().to_owned())
+        {
             bail!("restart report refuses internal or duplicate resource selection");
         }
         approved.push(resource);
@@ -1484,27 +1692,59 @@ pub(crate) struct SpeculationRecoveryReport {
 
 impl SpeculationRecoveryReport {
     fn nonterminal_observation(
-        &self, parent: &crate::core::exec_ctx::ExecutionContext, selection: &SpeculationRecoverySelection,
+        &self,
+        parent: &crate::core::exec_ctx::ExecutionContext,
+        selection: &SpeculationRecoverySelection,
     ) -> Result<crate::core::speculation::recovery::InspectionObservation> {
-        use crate::core::speculation::recovery::{InspectionObservation, ObservationState, ObservedFile,
-            ObservedImageClass, ObservedNativeRecord};
-        let owner = selection.native_receipt.as_ref().map(|receipt| receipt.owner.clone())
+        use crate::core::speculation::recovery::{
+            InspectionObservation, ObservationState, ObservedFile, ObservedImageClass,
+            ObservedNativeRecord,
+        };
+        let owner = selection
+            .native_receipt
+            .as_ref()
+            .map(|receipt| receipt.owner.clone())
             .unwrap_or_else(|| selection.owner.clone());
-        let files = self.files.iter().map(|file| {
-            let class = match file.class {
-                RecoveryImageClass::Pre => ObservedImageClass::Pre,
-                RecoveryImageClass::Post => ObservedImageClass::Post,
-                RecoveryImageClass::SamePreAndPost => ObservedImageClass::SamePreAndPost,
-                RecoveryImageClass::Foreign => bail!("foreign image cannot become an inspection observation"),
-            };
-            Ok(ObservedFile { key: file.key.clone(), class, fingerprint: (&file.current).into() })
-        }).collect::<Result<Vec<_>>>()?;
+        let files = self
+            .files
+            .iter()
+            .map(|file| {
+                let class = match file.class {
+                    RecoveryImageClass::Pre => ObservedImageClass::Pre,
+                    RecoveryImageClass::Post => ObservedImageClass::Post,
+                    RecoveryImageClass::SamePreAndPost => ObservedImageClass::SamePreAndPost,
+                    RecoveryImageClass::Foreign => {
+                        bail!("foreign image cannot become an inspection observation")
+                    }
+                };
+                Ok(ObservedFile {
+                    key: file.key.clone(),
+                    class,
+                    fingerprint: (&file.current).into(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(InspectionObservation {
-            schema: 1, base: self.cohort.clone(), prepared: self.prepared.clone(), owner,
-            receipt: selection.native_receipt.as_ref().map(|receipt| receipt.id.clone()),
-            observer: parent.resource_scope(), state: ObservationState::ObservedNonterminal,
-            inventory_sha256: self.inventory_sha256, files,
-            native_records: self.native_records.iter().map(|proof| ObservedNativeRecord { id: proof.id, status: proof.status.into() }).collect(),
+            schema: 1,
+            base: self.cohort.clone(),
+            prepared: self.prepared.clone(),
+            owner,
+            receipt: selection
+                .native_receipt
+                .as_ref()
+                .map(|receipt| receipt.id.clone()),
+            observer: parent.resource_scope(),
+            state: ObservationState::ObservedNonterminal,
+            inventory_sha256: self.inventory_sha256,
+            files,
+            native_records: self
+                .native_records
+                .iter()
+                .map(|proof| ObservedNativeRecord {
+                    id: proof.id,
+                    status: proof.status.into(),
+                })
+                .collect(),
         })
     }
 
@@ -1531,13 +1771,19 @@ impl SpeculationRecoveryReport {
                 "exists":file.current.exists,"byte_len":file.current.byte_len,"sha256":file.current.sha256,
             }})
         }).collect();
-        let native_records: Vec<_> = self.native_records.iter().map(|record| {
-            let status = match record.status {
-                RecordProofStatus::Prepared => "prepared", RecordProofStatus::Applied => "applied",
-                RecordProofStatus::SettledApplied => "settled_applied", RecordProofStatus::SettledNotApplied => "settled_not_applied",
-            };
-            serde_json::json!({"id":record.id,"status":status})
-        }).collect();
+        let native_records: Vec<_> = self
+            .native_records
+            .iter()
+            .map(|record| {
+                let status = match record.status {
+                    RecordProofStatus::Prepared => "prepared",
+                    RecordProofStatus::Applied => "applied",
+                    RecordProofStatus::SettledApplied => "settled_applied",
+                    RecordProofStatus::SettledNotApplied => "settled_not_applied",
+                };
+                serde_json::json!({"id":record.id,"status":status})
+            })
+            .collect();
         serde_json::json!({
             "schema":1,"cohort":self.cohort,"prepared":self.prepared,"inventory_sha256":self.inventory_sha256,
             "status":status,"inspection_only":publication.is_none(),"pending_guard_unchanged":true,
@@ -1549,12 +1795,25 @@ impl SpeculationRecoveryReport {
 
     pub(crate) fn to_text(&self) -> String {
         let value = self.to_json();
-        let mut out = format!("Speculation recovery inspection: {}\ncohort {}\nprepared {}\n", value["status"].as_str().unwrap(), self.cohort, self.prepared);
+        let mut out = format!(
+            "Speculation recovery inspection: {}\ncohort {}\nprepared {}\n",
+            value["status"].as_str().unwrap(),
+            self.cohort,
+            self.prepared
+        );
         for file in value["files"].as_array().unwrap() {
-            out.push_str(&format!("  resource {}: {}\n", file["key"].as_str().unwrap(), file["class"].as_str().unwrap()));
+            out.push_str(&format!(
+                "  resource {}: {}\n",
+                file["key"].as_str().unwrap(),
+                file["class"].as_str().unwrap()
+            ));
         }
         for record in value["native_records"].as_array().unwrap() {
-            out.push_str(&format!("  historical native record {}: {}\n", record["id"], record["status"].as_str().unwrap()));
+            out.push_str(&format!(
+                "  historical native record {}: {}\n",
+                record["id"],
+                record["status"].as_str().unwrap()
+            ));
         }
         if self.native_coverage.is_some() {
             out.push_str("  complete historical native batch checked; not physical-worker closure or recovery authority\n");
@@ -1562,7 +1821,10 @@ impl SpeculationRecoveryReport {
             out.push_str("  native evidence is selected-record-only or missing; complete coverage unproven\n");
         }
         if let Some(publication) = &self.observation {
-            out.push_str(&format!("  nonterminal observation {}\n", publication.record));
+            out.push_str(&format!(
+                "  nonterminal observation {}\n",
+                publication.record
+            ));
             out.push_str("Inspection recorded; pending guard unchanged. ");
         } else {
             out.push_str("Inspection only; pending guard unchanged. ");
@@ -1598,10 +1860,20 @@ fn validate_prepared_evidence(
 ) -> Result<PreparedEvidence> {
     use std::collections::{BTreeMap, BTreeSet};
     let sealed = crate::core::speculation::store::sealed_lineage(value)?;
-    let generations: BTreeMap<_, _> = sealed.iter().flatten()
-        .map(|identity| (format!("{}/{}", identity.owner, identity.overlay), identity.generation)).collect();
+    let generations: BTreeMap<_, _> = sealed
+        .iter()
+        .flatten()
+        .map(|identity| {
+            (
+                format!("{}/{}", identity.owner, identity.overlay),
+                identity.generation,
+            )
+        })
+        .collect();
     let overlays = evidence_array(value, "overlays", 32)?;
-    if overlays.is_empty() { bail!("prepared integration has no overlay lineage"); }
+    if overlays.is_empty() {
+        bail!("prepared integration has no overlay lineage");
+    }
     let mut authors = BTreeSet::new();
     let mut overlay_ids = BTreeSet::new();
     for overlay in overlays {
@@ -1611,13 +1883,25 @@ fn validate_prepared_evidence(
         evidence_name(overlay_owner)?;
         evidence_name(id)?;
         if evidence_text(overlay, "base")? != base
-            || !(overlay_owner == owner || overlay_owner.strip_prefix(owner).is_some_and(|tail| tail.starts_with('/')))
+            || !(overlay_owner == owner
+                || overlay_owner
+                    .strip_prefix(owner)
+                    .is_some_and(|tail| tail.starts_with('/')))
             || author != format!("{overlay_owner}/{id}")
-            || !overlay_ids.insert(id) || !authors.insert(author)
-        { bail!("invalid or ambiguous prepared overlay lineage"); }
+            || !overlay_ids.insert(id)
+            || !authors.insert(author)
+        {
+            bail!("invalid or ambiguous prepared overlay lineage");
+        }
     }
-    let files = evidence_array(value, "files", crate::core::speculation::store::MAX_COHORT_FILES)?;
-    if images.len() > files.len() * 2 { bail!("prepared integration has unreferenced images"); }
+    let files = evidence_array(
+        value,
+        "files",
+        crate::core::speculation::store::MAX_COHORT_FILES,
+    )?;
+    if images.len() > files.len() * 2 {
+        bail!("prepared integration has unreferenced images");
+    }
     let mut next_image = 0usize;
     let mut keys = Vec::new();
     let mut applied_paths = Vec::new();
@@ -1630,17 +1914,42 @@ fn validate_prepared_evidence(
         let path = evidence_text(file, "path")?;
         evidence_name(key)?;
         evidence_name(path)?;
-        if keys.iter().any(|previous| previous == key) { bail!("duplicate prepared file key"); }
+        if keys.iter().any(|previous| previous == key) {
+            bail!("duplicate prepared file key");
+        }
         keys.push(key.to_owned());
         applied_paths.push(path.to_owned());
         paths.insert(key, path);
-        let expected = parsed_evidence_fingerprint(file.get("expected").context("prepared preimage fingerprint missing")?)?;
-        let after = parsed_evidence_fingerprint(file.get("after").context("prepared postimage fingerprint missing")?)?;
-        if !after.exists { bail!("prepared postimage cannot be absent"); }
-        validate_prepared_image(file.get("preimage").context("prepared preimage mapping missing")?, &expected, images, &mut next_image)?;
-        validate_prepared_image(file.get("postimage").context("prepared postimage mapping missing")?, &after, images, &mut next_image)?;
+        let expected = parsed_evidence_fingerprint(
+            file.get("expected")
+                .context("prepared preimage fingerprint missing")?,
+        )?;
+        let after = parsed_evidence_fingerprint(
+            file.get("after")
+                .context("prepared postimage fingerprint missing")?,
+        )?;
+        if !after.exists {
+            bail!("prepared postimage cannot be absent");
+        }
+        validate_prepared_image(
+            file.get("preimage")
+                .context("prepared preimage mapping missing")?,
+            &expected,
+            images,
+            &mut next_image,
+        )?;
+        validate_prepared_image(
+            file.get("postimage")
+                .context("prepared postimage mapping missing")?,
+            &after,
+            images,
+            &mut next_image,
+        )?;
         file_images.push(PreparedFileEvidence {
-            key: key.to_owned(), path: path.to_owned(), preimage: expected.clone(), postimage: after,
+            key: key.to_owned(),
+            path: path.to_owned(),
+            preimage: expected.clone(),
+            postimage: after,
         });
         expected_images.insert(key, expected);
         let mut changed_authors = BTreeSet::new();
@@ -1648,16 +1957,28 @@ fn validate_prepared_evidence(
         for change in evidence_array(file, "lineage", 32)? {
             let author = evidence_text(change, "author")?;
             let operation = evidence_text(change, "operation")?;
-            if !authors.contains(author) || !changed_authors.insert(author)
-                || change.get("generation").and_then(serde_json::Value::as_u64).is_none_or(|generation|
-                    generation == 0 || generations.get(author).is_some_and(|maximum| generation > *maximum))
+            if !authors.contains(author)
+                || !changed_authors.insert(author)
+                || change
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none_or(|generation| {
+                        generation == 0
+                            || generations
+                                .get(author)
+                                .is_some_and(|maximum| generation > *maximum)
+                    })
                 || !matches!(operation, "localized" | "rewrite")
-            { bail!("invalid prepared change lineage"); }
+            {
+                bail!("invalid prepared change lineage");
+            }
             rewrite |= operation == "rewrite";
         }
         if changed_authors.is_empty()
             || evidence_text(file, "operation")? != if rewrite { "rewrite" } else { "localized" }
-        { bail!("prepared operation disagrees with lineage"); }
+        {
+            bail!("prepared operation disagrees with lineage");
+        }
         let mut contributors = BTreeSet::new();
         for author in evidence_array(file, "contributors", 32)? {
             let author = author.as_str().context("invalid prepared contributor")?;
@@ -1667,7 +1988,9 @@ fn validate_prepared_evidence(
         }
         changes.insert(key, changed_authors);
     }
-    if next_image != images.len() { bail!("prepared integration has unused image bytes"); }
+    if next_image != images.len() {
+        bail!("prepared integration has unused image bytes");
+    }
     let mut expected_dependencies: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
     let mut observed_versions = BTreeSet::new();
     let mut base_observers = BTreeSet::new();
@@ -1676,26 +1999,48 @@ fn validate_prepared_evidence(
         let author = evidence_text(observation, "author")?;
         let key = evidence_text(observation, "key")?;
         let path = evidence_text(observation, "path")?;
-        let generation = observation.get("generation").and_then(serde_json::Value::as_u64)
+        let generation = observation
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
             .context("prepared read observation generation missing")?;
         evidence_name(key)?;
         evidence_name(path)?;
-        if !authors.contains(author) || !observed_versions.insert((author, key, generation))
-            || generations.get(author).is_some_and(|maximum| generation > *maximum)
+        if !authors.contains(author)
+            || !observed_versions.insert((author, key, generation))
+            || generations
+                .get(author)
+                .is_some_and(|maximum| generation > *maximum)
             || paths.get(key).is_some_and(|previous| *previous != path)
-        { bail!("invalid or duplicate prepared read observation evidence"); }
+        {
+            bail!("invalid or duplicate prepared read observation evidence");
+        }
         paths.insert(key, path);
-        let fingerprint = parsed_evidence_fingerprint(observation.get("fingerprint").context("prepared observation fingerprint missing")?)?;
+        let fingerprint = parsed_evidence_fingerprint(
+            observation
+                .get("fingerprint")
+                .context("prepared observation fingerprint missing")?,
+        )?;
         if generation == 0 {
-            if expected_images.get(key).is_some_and(|expected| *expected != fingerprint)
-                || base_fingerprints.get(key).is_some_and(|expected| *expected != fingerprint)
-            { bail!("prepared base read differs from exact preimage evidence"); }
+            if expected_images
+                .get(key)
+                .is_some_and(|expected| *expected != fingerprint)
+                || base_fingerprints
+                    .get(key)
+                    .is_some_and(|expected| *expected != fingerprint)
+            {
+                bail!("prepared base read differs from exact preimage evidence");
+            }
             base_fingerprints.insert(key, fingerprint);
             base_observers.insert((author, key));
         }
         if let Some(peers) = changes.get(key) {
             for peer in peers {
-                if *peer != author { expected_dependencies.entry((author, key)).or_default().insert(peer); }
+                if *peer != author {
+                    expected_dependencies
+                        .entry((author, key))
+                        .or_default()
+                        .insert(peer);
+                }
             }
         }
     }
@@ -1706,33 +2051,60 @@ fn validate_prepared_evidence(
             }
         }
     }
-    let read_dependencies = evidence_array(value, "read_dependencies", 32 * crate::core::speculation::store::MAX_COHORT_FILES)?;
+    let read_dependencies = evidence_array(
+        value,
+        "read_dependencies",
+        32 * crate::core::speculation::store::MAX_COHORT_FILES,
+    )?;
     let mut declared = BTreeMap::new();
     for dependency in read_dependencies {
         let observer = evidence_text(dependency, "observer")?;
         let key = evidence_text(dependency, "key")?;
         let mut peers = BTreeSet::new();
         for peer in evidence_array(dependency, "peer_authors", 32)? {
-            let peer = peer.as_str().context("invalid integration peer-read author")?;
+            let peer = peer
+                .as_str()
+                .context("invalid integration peer-read author")?;
             if peer == observer || !authors.contains(peer) || !peers.insert(peer) {
                 bail!("invalid integration peer-read dependency");
             }
         }
-        if !authors.contains(observer) || peers.is_empty() || declared.insert((observer, key), peers).is_some() {
+        if !authors.contains(observer)
+            || peers.is_empty()
+            || declared.insert((observer, key), peers).is_some()
+        {
             bail!("invalid or duplicate integration read dependency");
         }
     }
-    if declared != expected_dependencies { bail!("prepared read dependencies disagree with observations/change lineage"); }
+    if declared != expected_dependencies {
+        bail!("prepared read dependencies disagree with observations/change lineage");
+    }
     let native_coverage = evidence_native_coverage(value)?;
-    Ok(PreparedEvidence { keys, paths: applied_paths, files: file_images, native_coverage, read_dependencies: read_dependencies.to_vec() })
+    Ok(PreparedEvidence {
+        keys,
+        paths: applied_paths,
+        files: file_images,
+        native_coverage,
+        read_dependencies: read_dependencies.to_vec(),
+    })
 }
 
 fn require_recovery_report_parent(parent: &crate::core::exec_ctx::ExecutionContext) -> Result<()> {
-    let current = crate::core::exec_ctx::current().context("restart report requires the current plain parent")?;
-    if !parent.can_restore_workspace() || parent.native_scope().is_some() || parent.overlay().is_some()
-        || !current.can_restore_workspace() || current.native_scope().is_some() || current.overlay().is_some()
-        || current.resource_scope() != parent.resource_scope() || parent.resource_scope().is_empty()
-    { bail!("restart report requires fresh coordinating-parent admission, not delegated authority"); }
+    let current = crate::core::exec_ctx::current()
+        .context("restart report requires the current plain parent")?;
+    if !parent.can_restore_workspace()
+        || parent.native_scope().is_some()
+        || parent.overlay().is_some()
+        || !current.can_restore_workspace()
+        || current.native_scope().is_some()
+        || current.overlay().is_some()
+        || current.resource_scope() != parent.resource_scope()
+        || parent.resource_scope().is_empty()
+    {
+        bail!(
+            "restart report requires fresh coordinating-parent admission, not delegated authority"
+        );
+    }
     Ok(())
 }
 
@@ -1752,35 +2124,58 @@ fn recovery_inventory_digest(directory: &Path) -> Result<[u8; 32]> {
 }
 
 fn validate_recovery_base_identity(
-    directory: &Path, identity: &crate::core::workspace_txn::WorkspaceIdentity,
+    directory: &Path,
+    identity: &crate::core::workspace_txn::WorkspaceIdentity,
 ) -> Result<()> {
     for path in checked_metadata_entries(directory)? {
-        if !path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("m-")) { continue; }
-        let value: serde_json::Value = serde_json::from_slice(&read_speculation_evidence(&path, 2 * 1024 * 1024)?)?;
-        if evidence_text(&value, "kind")? != "base" { continue; }
-        if evidence_text(&value, "repo")? != identity.repo_id || evidence_text(&value, "worktree")? != identity.worktree_id
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("m-"))
+        {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&read_speculation_evidence(&path, 2 * 1024 * 1024)?)?;
+        if evidence_text(&value, "kind")? != "base" {
+            continue;
+        }
+        if evidence_text(&value, "repo")? != identity.repo_id
+            || evidence_text(&value, "worktree")? != identity.worktree_id
             || Some(evidence_text(&value, "root")?) != identity.canonical_root.to_str()
-        { bail!("restart base evidence does not match fresh workspace identity"); }
+        {
+            bail!("restart base evidence does not match fresh workspace identity");
+        }
     }
     Ok(())
 }
 
 fn validate_inspection_observation(
-    base: &str, record: &crate::core::speculation::store::InspectedRecord,
+    base: &str,
+    record: &crate::core::speculation::store::InspectedRecord,
     records: &[crate::core::speculation::store::InspectedRecord],
 ) -> Result<()> {
     use crate::core::speculation::recovery::{InspectionObservation, ObservedNativeStatus};
     let observation: InspectionObservation = serde_json::from_slice(&record.metadata)?;
     observation.validate()?;
-    if observation.base != base || observation.observer != record.owner || !record.images.is_empty() {
+    if observation.base != base || observation.observer != record.owner || !record.images.is_empty()
+    {
         bail!("inspection observation identity/images mismatch");
     }
-    let mut candidates = records.iter().filter(|record| record.id == observation.prepared && record.label == "integration-prepared");
-    let prepared = candidates.next().context("inspection observation prepared record missing")?;
-    if candidates.next().is_some() || prepared.owner != observation.owner { bail!("inspection observation prepared owner ambiguous"); }
+    let mut candidates = records.iter().filter(|record| {
+        record.id == observation.prepared && record.label == "integration-prepared"
+    });
+    let prepared = candidates
+        .next()
+        .context("inspection observation prepared record missing")?;
+    if candidates.next().is_some() || prepared.owner != observation.owner {
+        bail!("inspection observation prepared owner ambiguous");
+    }
     let value: serde_json::Value = serde_json::from_slice(&prepared.metadata)?;
     let evidence = validate_prepared_evidence(base, &prepared.owner, &value, &prepared.images)?;
-    if evidence.files.len() != observation.files.len() { bail!("inspection observation file count mismatch"); }
+    if evidence.files.len() != observation.files.len() {
+        bail!("inspection observation file count mismatch");
+    }
     let mut pre = false;
     let mut post = false;
     for (file, expected) in observation.files.iter().zip(&evidence.files) {
@@ -1788,44 +2183,86 @@ fn validate_inspection_observation(
         let class = recovery_image_class(&fingerprint, &expected.preimage, &expected.postimage);
         let recorded = match file.class {
             crate::core::speculation::recovery::ObservedImageClass::Pre => RecoveryImageClass::Pre,
-            crate::core::speculation::recovery::ObservedImageClass::Post => RecoveryImageClass::Post,
-            crate::core::speculation::recovery::ObservedImageClass::SamePreAndPost => RecoveryImageClass::SamePreAndPost,
+            crate::core::speculation::recovery::ObservedImageClass::Post => {
+                RecoveryImageClass::Post
+            }
+            crate::core::speculation::recovery::ObservedImageClass::SamePreAndPost => {
+                RecoveryImageClass::SamePreAndPost
+            }
         };
-        if file.key != expected.key || class != recorded { bail!("inspection observation fingerprint/class mismatch"); }
+        if file.key != expected.key || class != recorded {
+            bail!("inspection observation fingerprint/class mismatch");
+        }
         pre |= class == RecoveryImageClass::Pre;
         post |= class == RecoveryImageClass::Post;
     }
-    if pre && post { bail!("inspection observation cannot certify mixed pre/post images"); }
+    if pre && post {
+        bail!("inspection observation cannot certify mixed pre/post images");
+    }
     let mut receipt = records.iter().filter_map(|record| {
-        if record.label != "integration-receipt" || observation.receipt.as_deref() != Some(record.id.as_str()) { return None; }
-        let value: serde_json::Value = match serde_json::from_slice(&record.metadata) { Ok(value) => value, Err(error) => return Some(Err(anyhow::Error::from(error))) };
-        (value.get("prepared").and_then(serde_json::Value::as_str) == Some(observation.prepared.as_str()))
-            .then_some(Ok((record, value)))
+        if record.label != "integration-receipt"
+            || observation.receipt.as_deref() != Some(record.id.as_str())
+        {
+            return None;
+        }
+        let value: serde_json::Value = match serde_json::from_slice(&record.metadata) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(anyhow::Error::from(error))),
+        };
+        (value.get("prepared").and_then(serde_json::Value::as_str)
+            == Some(observation.prepared.as_str()))
+        .then_some(Ok((record, value)))
     });
     if let Some(entry) = receipt.next() {
         let (record, value) = entry?;
-        if receipt.next().is_some() || record.owner != observation.owner { bail!("inspection observation receipt ambiguous"); }
+        if receipt.next().is_some() || record.owner != observation.owner {
+            bail!("inspection observation receipt ambiguous");
+        }
         validate_receipt_evidence(&value, &evidence)?;
-        let files = evidence_array(&value, "files", crate::core::speculation::store::MAX_COHORT_FILES)?;
+        let files = evidence_array(
+            &value,
+            "files",
+            crate::core::speculation::store::MAX_COHORT_FILES,
+        )?;
         let mut proofs = observation.native_records.iter();
         for file in files {
-            if let Some(id) = file.get("native_record_id").and_then(serde_json::Value::as_u64) {
-                let proof = proofs.next().context("inspection observation exact native proof missing")?;
-                if proof.id != id || (evidence_text(file, "state")? == "applied" && proof.status != ObservedNativeStatus::SettledApplied) {
+            if let Some(id) = file
+                .get("native_record_id")
+                .and_then(serde_json::Value::as_u64)
+            {
+                let proof = proofs
+                    .next()
+                    .context("inspection observation exact native proof missing")?;
+                if proof.id != id
+                    || (evidence_text(file, "state")? == "applied"
+                        && proof.status != ObservedNativeStatus::SettledApplied)
+                {
                     bail!("inspection observation native proof mismatch");
                 }
             }
         }
-        if proofs.next().is_some() { bail!("inspection observation has unlinked native proof"); }
-    } else if observation.receipt.is_some() || !observation.native_records.is_empty() { bail!("inspection observation lacks exact receipt linkage"); }
+        if proofs.next().is_some() {
+            bail!("inspection observation has unlinked native proof");
+        }
+    } else if observation.receipt.is_some() || !observation.native_records.is_empty() {
+        bail!("inspection observation lacks exact receipt linkage");
+    }
     Ok(())
 }
 
 fn read_recovery_selection(
-    directory: &Path, cohort: &str, prepared_id: &str,
-) -> Result<([u8; 32], Vec<PreparedFileEvidence>, Option<RecoveryNativeReceipt>)> {
+    directory: &Path,
+    cohort: &str,
+    prepared_id: &str,
+) -> Result<(
+    [u8; 32],
+    Vec<PreparedFileEvidence>,
+    Option<RecoveryNativeReceipt>,
+)> {
     let before = recovery_inventory_digest(directory)?;
-    if read_speculation_evidence(&directory.join("owner.lock"), 1024)? != b"aizen-speculation-owner-v1\n" {
+    if read_speculation_evidence(&directory.join("owner.lock"), 1024)?
+        != b"aizen-speculation-owner-v1\n"
+    {
         bail!("unsupported restart owner marker");
     }
     let records = crate::core::speculation::store::inspect_controller_records(directory)?;
@@ -1833,9 +2270,18 @@ fn read_recovery_selection(
     crate::core::speculation::workers::validate_worker_records(cohort, &records)?;
     let mut bases = 0usize;
     for path in checked_metadata_entries(directory)? {
-        if !path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("m-")) { continue; }
-        let value: serde_json::Value = serde_json::from_slice(&read_speculation_evidence(&path, 2 * 1024 * 1024)?)?;
-        if evidence_text(&value, "format")? != "aizen-speculation-v1" || evidence_text(&value, "base")? != cohort {
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("m-"))
+        {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&read_speculation_evidence(&path, 2 * 1024 * 1024)?)?;
+        if evidence_text(&value, "format")? != "aizen-speculation-v1"
+            || evidence_text(&value, "base")? != cohort
+        {
             bail!("unsupported or foreign restart manifest");
         }
         match evidence_text(&value, "kind")? {
@@ -1844,11 +2290,16 @@ fn read_recovery_selection(
             _ => bail!("unknown restart manifest kind"),
         }
     }
-    if bases != 1 { bail!("restart report requires one exact base manifest"); }
-    let prepared = records.iter().find(|record| record.id == prepared_id && record.label == "integration-prepared")
+    if bases != 1 {
+        bail!("restart report requires one exact base manifest");
+    }
+    let prepared = records
+        .iter()
+        .find(|record| record.id == prepared_id && record.label == "integration-prepared")
         .context("selected immutable prepared record is missing")?;
     let prepared_value: serde_json::Value = serde_json::from_slice(&prepared.metadata)?;
-    let evidence = validate_prepared_evidence(cohort, &prepared.owner, &prepared_value, &prepared.images)?;
+    let evidence =
+        validate_prepared_evidence(cohort, &prepared.owner, &prepared_value, &prepared.images)?;
     crate::core::speculation::workers::validate_worker_records(cohort, &records)?
         .check_selected_lineage(&prepared_value)?;
     let mut prepared_count = 0;
@@ -1867,9 +2318,12 @@ fn read_recovery_selection(
         }
         let value: serde_json::Value = serde_json::from_slice(&record.metadata)?;
         if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1)
-            || evidence_text(&value, "base")? != cohort || evidence_text(&value, "owner")? != prepared.owner
+            || evidence_text(&value, "base")? != cohort
+            || evidence_text(&value, "owner")? != prepared.owner
             || record.owner != prepared.owner
-        { bail!("foreign or unsupported restart record identity"); }
+        {
+            bail!("foreign or unsupported restart record identity");
+        }
         match record.label.as_str() {
             "integration-prepared" => {
                 prepared_count += 1;
@@ -1878,32 +2332,63 @@ fn read_recovery_selection(
                 }
             }
             "integration-receipt" => {
-                if evidence_text(&value, "prepared")? != prepared_id || receipt_id.replace(record.id.as_str()).is_some()
-                    || !matches!(evidence_text(&value, "state")?, "partial" | "applied-unverified")
+                if evidence_text(&value, "prepared")? != prepared_id
+                    || receipt_id.replace(record.id.as_str()).is_some()
+                    || !matches!(
+                        evidence_text(&value, "state")?,
+                        "partial" | "applied-unverified"
+                    )
                     || !record.images.is_empty()
-                { bail!("ambiguous or unknown restart receipt"); }
+                {
+                    bail!("ambiguous or unknown restart receipt");
+                }
                 validate_receipt_evidence(&value, &evidence)?;
-                let applied = value.get("applied").and_then(serde_json::Value::as_u64)
+                let applied = value
+                    .get("applied")
+                    .and_then(serde_json::Value::as_u64)
                     .context("restart receipt application count missing")?;
-                let files = evidence_array(&value, "files", crate::core::speculation::store::MAX_COHORT_FILES)?;
-                if value.get("total").and_then(serde_json::Value::as_u64) != Some(evidence.files.len() as u64)
-                    || applied > evidence.files.len() as u64 || files.len() != evidence.files.len()
-                { bail!("restart receipt file count differs from prepared evidence"); }
+                let files = evidence_array(
+                    &value,
+                    "files",
+                    crate::core::speculation::store::MAX_COHORT_FILES,
+                )?;
+                if value.get("total").and_then(serde_json::Value::as_u64)
+                    != Some(evidence.files.len() as u64)
+                    || applied > evidence.files.len() as u64
+                    || files.len() != evidence.files.len()
+                {
+                    bail!("restart receipt file count differs from prepared evidence");
+                }
                 let mut exact_records = Vec::new();
                 for (index, (file, prepared)) in files.iter().zip(&evidence.files).enumerate() {
                     if evidence_text(file, "key")? != prepared.key
-                        || !matches!(evidence_text(file, "state")?, "applied" | "possibly-applied" | "not-applied")
-                        || file.get("postimage_checked").and_then(serde_json::Value::as_bool).is_none()
-                    { bail!("restart receipt file evidence is unknown or mismatched"); }
-                    if let Some(id) = file.get("native_record_id").and_then(serde_json::Value::as_u64) {
+                        || !matches!(
+                            evidence_text(file, "state")?,
+                            "applied" | "possibly-applied" | "not-applied"
+                        )
+                        || file
+                            .get("postimage_checked")
+                            .and_then(serde_json::Value::as_bool)
+                            .is_none()
+                    {
+                        bail!("restart receipt file evidence is unknown or mismatched");
+                    }
+                    if let Some(id) = file
+                        .get("native_record_id")
+                        .and_then(serde_json::Value::as_u64)
+                    {
                         exact_records.push(RecoveryNativeRecord {
-                            file: index, id, applied: evidence_text(file, "state")? == "applied",
+                            file: index,
+                            id,
+                            applied: evidence_text(file, "state")? == "applied",
                         });
                     }
                 }
                 native_receipt = Some(RecoveryNativeReceipt {
-                    id: record.id.clone(), owner: prepared.owner.clone(),
-                    coverage: evidence.native_coverage.clone(), records: exact_records,
+                    id: record.id.clone(),
+                    owner: prepared.owner.clone(),
+                    coverage: evidence.native_coverage.clone(),
+                    records: exact_records,
                 });
             }
             "integration-verification-started" => {
@@ -1913,35 +2398,54 @@ fn read_recovery_selection(
                 // Strict lifecycle linkage was checked across the complete, unordered inventory.
             }
             "integration-verification" => {
-                if evidence_text(&value, "prepared")? != prepared_id || verification.replace(value).is_some()
+                if evidence_text(&value, "prepared")? != prepared_id
+                    || verification.replace(value).is_some()
                     || !record.images.is_empty()
-                { bail!("ambiguous restart verification"); }
+                {
+                    bail!("ambiguous restart verification");
+                }
             }
             _ => bail!("unsupported restart controller record; no recovery action is authorized"),
         }
     }
-    if prepared_count != 1 { bail!("ambiguous restart prepared selection"); }
+    if prepared_count != 1 {
+        bail!("ambiguous restart prepared selection");
+    }
     if let Some(value) = verification {
         if Some(evidence_text(&value, "integration")?) != receipt_id
-            || !matches!(evidence_text(&value, "state")?, "verified" | "stale" | "verification_failed" | "unverified")
-        { bail!("orphan or unknown restart verification"); }
+            || !matches!(
+                evidence_text(&value, "state")?,
+                "verified" | "stale" | "verification_failed" | "unverified"
+            )
+        {
+            bail!("orphan or unknown restart verification");
+        }
     }
     let after = recovery_inventory_digest(directory)?;
-    if before != after { bail!("restart evidence changed during selection"); }
+    if before != after {
+        bail!("restart evidence changed during selection");
+    }
     Ok((after, evidence.files, native_receipt))
 }
 
 fn with_recovery_owner_claim<T>(directory: &Path, body: impl FnOnce() -> Result<T>) -> Result<T> {
     let lock = directory.join("owner.lock");
     let resource = crate::core::workspace_txn::NativeResource::resolve(&lock)?;
-    let stamp = crate::core::file_placement::NodeStamp::capture(&lock, &fs::symlink_metadata(&lock)?, false)?;
-    let owner = crate::core::repo_lock::RepoTxnLock::acquire_existing_exclusive(&lock, Duration::ZERO)?;
+    let stamp = crate::core::file_placement::NodeStamp::capture(
+        &lock,
+        &fs::symlink_metadata(&lock)?,
+        false,
+    )?;
+    let owner =
+        crate::core::repo_lock::RepoTxnLock::acquire_existing_exclusive(&lock, Duration::ZERO)?;
     owner.verify_existing_path(&lock)?;
     if owner.read_bounded_exclusive(1024)? != b"aizen-speculation-owner-v1\n" {
         bail!("unsupported restart owner marker under exclusive ownership");
     }
     resource.verify()?;
-    if crate::core::file_placement::NodeStamp::capture(&lock, &fs::symlink_metadata(&lock)?, false)? != stamp {
+    if crate::core::file_placement::NodeStamp::capture(&lock, &fs::symlink_metadata(&lock)?, false)?
+        != stamp
+    {
         bail!("restart owner lock identity changed");
     }
     let result = body()?;
@@ -1950,25 +2454,33 @@ fn with_recovery_owner_claim<T>(directory: &Path, body: impl FnOnce() -> Result<
         bail!("restart owner marker changed during report");
     }
     resource.verify()?;
-    if crate::core::file_placement::NodeStamp::capture(&lock, &fs::symlink_metadata(&lock)?, false)? != stamp {
+    if crate::core::file_placement::NodeStamp::capture(&lock, &fs::symlink_metadata(&lock)?, false)?
+        != stamp
+    {
         bail!("restart owner lock changed during report");
     }
     Ok(result)
 }
 
-fn recovery_live_fingerprint(resource: &crate::core::workspace_txn::NativeResource) -> Result<crate::core::persist::FileFingerprint> {
+fn recovery_live_fingerprint(
+    resource: &crate::core::workspace_txn::NativeResource,
+) -> Result<crate::core::persist::FileFingerprint> {
     resource.verify()?;
     match fs::symlink_metadata(resource.path()) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             resource.verify()?;
-            if !matches!(fs::symlink_metadata(resource.path()), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            if !matches!(fs::symlink_metadata(resource.path()), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
                 bail!("restart source changed during missing-file inspection");
             }
             Ok(crate::core::persist::FileFingerprint::missing())
         }
         Err(error) => Err(error).context("restart source metadata unreadable"),
         Ok(_) => {
-            let bytes = read_speculation_evidence(resource.path(), crate::core::speculation::store::MAX_FILE_BYTES as u64)?;
+            let bytes = read_speculation_evidence(
+                resource.path(),
+                crate::core::speculation::store::MAX_FILE_BYTES as u64,
+            )?;
             resource.verify()?;
             Ok(crate::core::persist::FileFingerprint::for_bytes(&bytes))
         }
@@ -1976,7 +2488,8 @@ fn recovery_live_fingerprint(resource: &crate::core::workspace_txn::NativeResour
 }
 
 fn recovery_image_class(
-    actual: &crate::core::persist::FileFingerprint, before: &crate::core::persist::FileFingerprint,
+    actual: &crate::core::persist::FileFingerprint,
+    before: &crate::core::persist::FileFingerprint,
     after: &crate::core::persist::FileFingerprint,
 ) -> RecoveryImageClass {
     match (actual == before, actual == after) {
@@ -1993,48 +2506,94 @@ struct LockedRecoveryResources<'a> {
 }
 
 fn acquire_recovery_resources<'a>(
-    root: &Path, selection: &SpeculationRecoverySelection,
+    root: &Path,
+    selection: &SpeculationRecoverySelection,
     approved: &'a [crate::core::workspace_txn::NativeResource],
 ) -> Result<LockedRecoveryResources<'a>> {
     use crate::core::workspace_txn::{LockClass, LockOwner, LockRequest, LockSet};
-    if approved.len() != selection.files.len() { bail!("restart report requires exact fresh resource selection"); }
+    if approved.len() != selection.files.len() {
+        bail!("restart report requires exact fresh resource selection");
+    }
     let mut resources = std::collections::BTreeMap::new();
     for resource in approved {
         resource.verify()?;
-        let relative = resource.path().strip_prefix(root).context("restart approved resource is outside workspace")?;
-        if relative.as_os_str().is_empty() || relative.components().any(|component| {
-            component.as_os_str().to_str().is_none_or(|part| [".git", ".aizen", "native-journal-v1", "speculation-v1"]
-                .iter().any(|internal| part.eq_ignore_ascii_case(internal)))
-        }) || resources.insert(resource.key(), resource).is_some() {
+        let relative = resource
+            .path()
+            .strip_prefix(root)
+            .context("restart approved resource is outside workspace")?;
+        if relative.as_os_str().is_empty()
+            || relative.components().any(|component| {
+                component.as_os_str().to_str().is_none_or(|part| {
+                    [".git", ".aizen", "native-journal-v1", "speculation-v1"]
+                        .iter()
+                        .any(|internal| part.eq_ignore_ascii_case(internal))
+                })
+            })
+            || resources.insert(resource.key(), resource).is_some()
+        {
             bail!("restart report refuses internal or duplicate resources");
         }
     }
     for file in &selection.files {
-        if resources.get(file.key.as_str()).is_none_or(|resource| resource.path().to_str() != Some(file.path.as_str())) {
+        if resources
+            .get(file.key.as_str())
+            .is_none_or(|resource| resource.path().to_str() != Some(file.path.as_str()))
+        {
             bail!("restart report recorded key/path differs from fresh approved binding");
         }
     }
-    let requests = approved.iter().map(|resource| LockRequest::new(
-        LockClass::Resource, crate::core::workspace_txn::resource_lock("native-file", resource.key()),
-        crate::core::repo_lock::LockMode::Exclusive, "restart data-only classification",
-    )).collect();
-    let locks = LockSet::acquire(requests, Duration::ZERO, None, &LockOwner::new("restart-report", "data-only classification"))?;
-    for resource in approved { resource.verify()?; }
-    Ok(LockedRecoveryResources { resources, _locks: locks })
+    let requests = approved
+        .iter()
+        .map(|resource| {
+            LockRequest::new(
+                LockClass::Resource,
+                crate::core::workspace_txn::resource_lock("native-file", resource.key()),
+                crate::core::repo_lock::LockMode::Exclusive,
+                "restart data-only classification",
+            )
+        })
+        .collect();
+    let locks = LockSet::acquire(
+        requests,
+        Duration::ZERO,
+        None,
+        &LockOwner::new("restart-report", "data-only classification"),
+    )?;
+    for resource in approved {
+        resource.verify()?;
+    }
+    Ok(LockedRecoveryResources {
+        resources,
+        _locks: locks,
+    })
 }
 
 fn inspect_recovery_native_records(
-    selection: &SpeculationRecoverySelection, locked: &LockedRecoveryResources<'_>,
+    selection: &SpeculationRecoverySelection,
+    locked: &LockedRecoveryResources<'_>,
 ) -> Result<Vec<crate::core::native_journal::RecordProof>> {
     use crate::core::native_journal::{RecordClaim, RecordProofStatus};
     // A missing receipt/ID is lack of proof, NEVER evidence that no live effect occurred.
-    let Some(receipt) = &selection.native_receipt else { return Ok(Vec::new()); };
+    let Some(receipt) = &selection.native_receipt else {
+        return Ok(Vec::new());
+    };
     let mut claims = Vec::with_capacity(receipt.records.len());
     for record in &receipt.records {
-        let file = selection.files.get(record.file).context("restart record file is missing")?;
-        let resource = locked.resources.get(file.key.as_str()).context("restart record resource is not freshly approved")?;
-        claims.push(RecordClaim { id: record.id, expected_owner: &receipt.owner, resource,
-            before: &file.preimage, after: &file.postimage });
+        let file = selection
+            .files
+            .get(record.file)
+            .context("restart record file is missing")?;
+        let resource = locked
+            .resources
+            .get(file.key.as_str())
+            .context("restart record resource is not freshly approved")?;
+        claims.push(RecordClaim {
+            id: record.id,
+            expected_owner: &receipt.owner,
+            resource,
+            before: &file.preimage,
+            after: &file.postimage,
+        });
     }
     // Resource -> actual TM -> cohort owner -> Journal; the reader drops journal ownership here.
     // Covered evidence enumerates the complete fence even when the receipt lists no records.
@@ -2043,9 +2602,13 @@ fn inspect_recovery_native_records(
         Some(identity) => crate::core::native_journal::inspect_existing_batch(identity, &claims)?,
         None => crate::core::native_journal::inspect_existing_records(&claims)?,
     };
-    if proofs.len() != receipt.records.len() { bail!("restart native record proof count differs from receipt"); }
+    if proofs.len() != receipt.records.len() {
+        bail!("restart native record proof count differs from receipt");
+    }
     for (proof, record) in proofs.iter().zip(&receipt.records) {
-        if proof.id != record.id || (record.applied && proof.status != RecordProofStatus::SettledApplied) {
+        if proof.id != record.id
+            || (record.applied && proof.status != RecordProofStatus::SettledApplied)
+        {
             bail!("restart applied receipt lacks exact settled native record evidence");
         }
     }
@@ -2054,7 +2617,8 @@ fn inspect_recovery_native_records(
 
 #[cfg(test)]
 fn classify_recovery_resources(
-    root: &Path, selection: &SpeculationRecoverySelection,
+    root: &Path,
+    selection: &SpeculationRecoverySelection,
     approved: &[crate::core::workspace_txn::NativeResource],
 ) -> Result<Vec<RecoveryFileObservation>> {
     let resources = acquire_recovery_resources(root, selection, approved)?;
@@ -2062,7 +2626,8 @@ fn classify_recovery_resources(
 }
 
 fn classify_locked_recovery_resources(
-    selection: &SpeculationRecoverySelection, locked: &LockedRecoveryResources<'_>,
+    selection: &SpeculationRecoverySelection,
+    locked: &LockedRecoveryResources<'_>,
 ) -> Result<Vec<RecoveryFileObservation>> {
     let resources = &locked.resources;
     let mut observations = Vec::new();
@@ -2074,10 +2639,18 @@ fn classify_locked_recovery_resources(
         let class = recovery_image_class(&current, &file.preimage, &file.postimage);
         pre |= class == RecoveryImageClass::Pre;
         post |= class == RecoveryImageClass::Post;
-        if class == RecoveryImageClass::Foreign { bail!("restart source has foreign bytes; evidence retained, no effect authorized"); }
-        observations.push(RecoveryFileObservation { key: file.key.clone(), class, current });
+        if class == RecoveryImageClass::Foreign {
+            bail!("restart source has foreign bytes; evidence retained, no effect authorized");
+        }
+        observations.push(RecoveryFileObservation {
+            key: file.key.clone(),
+            class,
+            current,
+        });
     }
-    if pre && post { bail!("restart source contains mixed pre/post images; evidence retained, no effect authorized"); }
+    if pre && post {
+        bail!("restart source contains mixed pre/post images; evidence retained, no effect authorized");
+    }
     for observation in &observations {
         if recovery_live_fingerprint(resources[observation.key.as_str()])? != observation.current {
             bail!("restart source drifted during classification");
@@ -2086,10 +2659,14 @@ fn classify_locked_recovery_resources(
     Ok(observations)
 }
 
-fn evidence_native_coverage(value: &serde_json::Value) -> Result<Option<crate::core::native_journal::BatchIdentity>> {
-    let Some(value) = value.get("native_coverage") else { return Ok(None); };
-    let identity: crate::core::native_journal::BatchIdentity = serde_json::from_value(value.clone())
-        .context("invalid native batch coverage identity")?;
+fn evidence_native_coverage(
+    value: &serde_json::Value,
+) -> Result<Option<crate::core::native_journal::BatchIdentity>> {
+    let Some(value) = value.get("native_coverage") else {
+        return Ok(None);
+    };
+    let identity: crate::core::native_journal::BatchIdentity =
+        serde_json::from_value(value.clone()).context("invalid native batch coverage identity")?;
     identity.validate()?;
     Ok(Some(identity))
 }
@@ -2097,13 +2674,19 @@ fn evidence_native_coverage(value: &serde_json::Value) -> Result<Option<crate::c
 /// Legacy selected-ID linkage stays legacy. A covered receipt must repeat its exact prepared fence;
 /// neither a matching numeric record ID nor an unsupported version can manufacture complete coverage.
 fn validate_receipt_coverage(
-    value: &serde_json::Value, prepared: Option<&crate::core::native_journal::BatchIdentity>,
+    value: &serde_json::Value,
+    prepared: Option<&crate::core::native_journal::BatchIdentity>,
 ) -> Result<Option<crate::core::native_journal::BatchIdentity>> {
     let coverage = evidence_native_coverage(value)?;
-    match value.get("native_journal_linkage").and_then(serde_json::Value::as_u64) {
+    match value
+        .get("native_journal_linkage")
+        .and_then(serde_json::Value::as_u64)
+    {
         Some(1) if prepared.is_none() && coverage.is_none() => Ok(None),
         Some(2) if prepared.is_some() && coverage.as_ref() == prepared => Ok(coverage),
-        _ => bail!("integration receipt native coverage differs from prepared evidence; evidence retained"),
+        _ => bail!(
+            "integration receipt native coverage differs from prepared evidence; evidence retained"
+        ),
     }
 }
 
@@ -2114,45 +2697,82 @@ fn validate_receipt_evidence(value: &serde_json::Value, prepared: &PreparedEvide
 
 /// Validate copied journal identities as evidence only. Neither an ID nor a matching image grants
 /// restart mutation/undo authority. Older receipts without supported linkage remain unresolved.
-fn validate_receipt_record_ids(value: &serde_json::Value, prepared: &[PreparedFileEvidence]) -> Result<()> {
-    match value.get("native_journal_linkage").and_then(serde_json::Value::as_u64) {
+fn validate_receipt_record_ids(
+    value: &serde_json::Value,
+    prepared: &[PreparedFileEvidence],
+) -> Result<()> {
+    match value
+        .get("native_journal_linkage")
+        .and_then(serde_json::Value::as_u64)
+    {
         Some(1) if evidence_native_coverage(value)?.is_none() => {}
         Some(2) if evidence_native_coverage(value)?.is_some() => {}
-        _ => bail!("integration receipt lacks supported exact native-journal linkage; evidence retained"),
+        _ => bail!(
+            "integration receipt lacks supported exact native-journal linkage; evidence retained"
+        ),
     }
-    let applied = value.get("applied").and_then(serde_json::Value::as_u64)
+    let applied = value
+        .get("applied")
+        .and_then(serde_json::Value::as_u64)
         .context("integration receipt application count missing")?;
     let possible = match value.get("possibly_applied_record") {
         Some(serde_json::Value::Null) => None,
-        Some(value) => Some(value.as_u64().filter(|id| *id > 0).context("invalid possible native record ID")?),
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|id| *id > 0)
+                .context("invalid possible native record ID")?,
+        ),
         None => bail!("integration receipt possible record evidence missing"),
     };
-    let files = evidence_array(value, "files", crate::core::speculation::store::MAX_COHORT_FILES)?;
-    if applied > prepared.len() as u64 || files.len() != prepared.len()
+    let files = evidence_array(
+        value,
+        "files",
+        crate::core::speculation::store::MAX_COHORT_FILES,
+    )?;
+    if applied > prepared.len() as u64
+        || files.len() != prepared.len()
         || value.get("total").and_then(serde_json::Value::as_u64) != Some(prepared.len() as u64)
         || (possible.is_some() && applied == prepared.len() as u64)
-    { bail!("integration receipt journal linkage has inconsistent file counts"); }
+    {
+        bail!("integration receipt journal linkage has inconsistent file counts");
+    }
     let mut previous = 0u64;
     for (index, (file, expected)) in files.iter().zip(prepared).enumerate() {
         let is_applied = (index as u64) < applied;
         let is_possible = index as u64 == applied && possible.is_some();
-        let state = if is_applied { "applied" } else if is_possible { "possibly-applied" } else { "not-applied" };
+        let state = if is_applied {
+            "applied"
+        } else if is_possible {
+            "possibly-applied"
+        } else {
+            "not-applied"
+        };
         if evidence_text(file, "key")? != expected.key || evidence_text(file, "state")? != state {
             bail!("integration receipt record linkage differs from prepared file order");
         }
         let record = match file.get("native_record_id") {
             Some(serde_json::Value::Null) => None,
-            Some(value) => Some(value.as_u64().filter(|id| *id > 0).context("invalid native record ID")?),
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|id| *id > 0)
+                    .context("invalid native record ID")?,
+            ),
             None => bail!("integration receipt file lacks exact native record evidence"),
         };
         let changed = expected.preimage != expected.postimage;
         if is_possible {
-            if !changed || record != possible { bail!("possible native record differs from its exact file"); }
+            if !changed || record != possible {
+                bail!("possible native record differs from its exact file");
+            }
         } else if record.is_some() != (is_applied && changed) {
             bail!("native record attribution disagrees with the file effect (including no-op)");
         }
         if let Some(id) = record {
-            if id <= previous { bail!("native record IDs are duplicate or out of application order"); }
+            if id <= previous {
+                bail!("native record IDs are duplicate or out of application order");
+            }
             previous = id;
         }
     }
@@ -2177,21 +2797,31 @@ fn classify_integration_records(
             validate_inspection_observation(base, record, records)?;
             continue;
         }
-        if !record.label.starts_with("integration-") { continue; }
+        if !record.label.starts_with("integration-") {
+            continue;
+        }
         let value: serde_json::Value = serde_json::from_slice(&record.metadata)
             .context("corrupt speculative integration metadata")?;
         if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1)
             || evidence_text(&value, "base")? != base
             || evidence_text(&value, "owner")? != record.owner
         {
-            bail!("unsupported or mismatched speculative integration record {}", record.id);
+            bail!(
+                "unsupported or mismatched speculative integration record {}",
+                record.id
+            );
         }
         match record.label.as_str() {
             "integration-prepared" => {
-                if evidence_text(&value, "state")? != "prepared" { bail!("invalid integration prepared state"); }
+                if evidence_text(&value, "state")? != "prepared" {
+                    bail!("invalid integration prepared state");
+                }
                 let keys = validate_prepared_evidence(base, &record.owner, &value, &record.images)?;
                 workers.check_selected_lineage(&value)?;
-                if prepared.insert(record.id.as_str(), (record.owner.as_str(), keys)).is_some() {
+                if prepared
+                    .insert(record.id.as_str(), (record.owner.as_str(), keys))
+                    .is_some()
+                {
                     bail!("duplicate integration prepared evidence");
                 }
             }
@@ -2220,39 +2850,62 @@ fn classify_integration_records(
     }
     for (id, (owner, evidence)) in &prepared {
         let keys = &evidence.keys;
-        let (receipt, value) = receipts.get(*id)
+        let (receipt, value) = receipts
+            .get(*id)
             .with_context(|| format!("prepared integration {id} has no durable receipt"))?;
         if receipt.owner != *owner
             || evidence_text(value, "state")? != "applied-unverified"
             || value.get("applied").and_then(serde_json::Value::as_u64) != Some(keys.len() as u64)
             || value.get("total").and_then(serde_json::Value::as_u64) != Some(keys.len() as u64)
-            || value.get("postimage_verified").and_then(serde_json::Value::as_bool) != Some(true)
+            || value
+                .get("postimage_verified")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
         {
             bail!("integration {id} is partial or its postimage is unconfirmed; evidence retained");
         }
         validate_receipt_evidence(value, evidence)?;
-        let receipt_files = evidence_array(value, "files", crate::core::speculation::store::MAX_COHORT_FILES)?;
-        if receipt_files.len() != keys.len() || !receipt.images.is_empty()
+        let receipt_files = evidence_array(
+            value,
+            "files",
+            crate::core::speculation::store::MAX_COHORT_FILES,
+        )?;
+        if receipt_files.len() != keys.len()
+            || !receipt.images.is_empty()
             || value.get("possibly_applied_record") != Some(&serde_json::Value::Null)
             || value.get("stop") != Some(&serde_json::Value::Null)
-        { bail!("settled receipt has incomplete file evidence or possible effects"); }
+        {
+            bail!("settled receipt has incomplete file evidence or possible effects");
+        }
         for (file, key) in receipt_files.iter().zip(keys) {
             if evidence_text(file, "key")? != key
                 || evidence_text(file, "state")? != "applied"
-                || file.get("postimage_checked").and_then(serde_json::Value::as_bool) != Some(true)
-            { bail!("receipt file application differs from prepared order/images"); }
+                || file
+                    .get("postimage_checked")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                bail!("receipt file application differs from prepared order/images");
+            }
         }
-        let (verification, value) = verifications.get(*id)
-            .with_context(|| format!("integration {id} is applied but has no accepted verification"))?;
+        let (verification, value) = verifications.get(*id).with_context(|| {
+            format!("integration {id} is applied but has no accepted verification")
+        })?;
         // Legacy verdicts lack physical lifecycle evidence and remain unresolved even if accepted.
         let finished: crate::core::speculation::verification::VerificationFinished =
             serde_json::from_slice(&verification.metadata)
                 .context("integration verification lacks supported durable lifecycle evidence")?;
         finished.validate()?;
-        if finished.effect_state != crate::core::speculation::verification::DurableEffectState::Settled {
+        if finished.effect_state
+            != crate::core::speculation::verification::DurableEffectState::Settled
+        {
             bail!("integration verifier has unsettled physical effects; evidence retained");
         }
-        let dependency_status = if evidence.read_dependencies.is_empty() { "none" } else { "requires_semantic_review" };
+        let dependency_status = if evidence.read_dependencies.is_empty() {
+            "none"
+        } else {
+            "requires_semantic_review"
+        };
         if verification.owner != *owner
             || evidence_text(value, "integration")? != receipt.id
             || evidence_text(value, "state")? != "verified"
@@ -2260,15 +2913,29 @@ fn classify_integration_records(
             || !value.get("source_identity").is_some_and(evidence_digest)
             || !verification.images.is_empty()
             || evidence_text(value, "read_dependency_status")? != dependency_status
-            || evidence_array(value, "read_dependencies", 32 * crate::core::speculation::store::MAX_COHORT_FILES)?
-                != evidence.read_dependencies.as_slice()
-            || evidence_array(value, "applied_paths", crate::core::speculation::store::MAX_COHORT_FILES)?
-                != evidence.paths.iter().map(|path| serde_json::Value::String(path.clone())).collect::<Vec<_>>().as_slice()
+            || evidence_array(
+                value,
+                "read_dependencies",
+                32 * crate::core::speculation::store::MAX_COHORT_FILES,
+            )? != evidence.read_dependencies.as_slice()
+            || evidence_array(
+                value,
+                "applied_paths",
+                crate::core::speculation::store::MAX_COHORT_FILES,
+            )? != evidence
+                .paths
+                .iter()
+                .map(|path| serde_json::Value::String(path.clone()))
+                .collect::<Vec<_>>()
+                .as_slice()
         {
             bail!("integration {id} verification is stale, failed, unverified or mismatched (including retained read concerns); evidence retained");
         }
     }
-    let concerns = prepared.values().map(|(_, evidence)| evidence.read_dependencies.len()).sum();
+    let concerns = prepared
+        .values()
+        .map(|(_, evidence)| evidence.read_dependencies.len())
+        .sum();
     Ok((prepared.len(), verifications.len(), concerns))
 }
 
@@ -2279,20 +2946,30 @@ fn inspect_speculation_namespace(namespace: &Path) -> Result<SpeculationInspecti
         let Some(name) = version.file_name().and_then(|name| name.to_str()) else {
             bail!("invalid speculation namespace name");
         };
-        if !name.starts_with("speculation-") { continue; }
-        if name != "speculation-v1" { bail!("unsupported future speculation namespace; evidence retained"); }
+        if !name.starts_with("speculation-") {
+            continue;
+        }
+        if name != "speculation-v1" {
+            bail!("unsupported future speculation namespace; evidence retained");
+        }
         for directory in checked_metadata_entries(&version)? {
             if summary.cohorts >= MAX_SPECULATION_COHORTS {
                 bail!("speculation cohort inspection exceeds {MAX_SPECULATION_COHORTS}; evidence retained");
             }
             summary.cohorts += 1;
-            let base = directory.file_name().and_then(|name| name.to_str()).context("invalid speculation cohort name")?;
+            let base = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("invalid speculation cohort name")?;
             let paths = checked_metadata_entries(&directory)?;
-            if paths.len() > 2049 { bail!("speculation cohort object count exceeds inspection bound"); }
+            if paths.len() > 2049 {
+                bail!("speculation cohort object count exceeds inspection bound");
+            }
             // Bound aggregate bytes BEFORE the store inspector materializes any record/image data.
             for path in &paths {
                 let resource = crate::core::workspace_txn::NativeResource::resolve(path)?;
-                scan_bytes = scan_bytes.checked_add(fs::symlink_metadata(path)?.len())
+                scan_bytes = scan_bytes
+                    .checked_add(fs::symlink_metadata(path)?.len())
                     .context("speculation inspection byte overflow")?;
                 if scan_bytes > MAX_SPECULATION_INSPECTION_BYTES {
                     bail!("speculation namespace inspection exceeds 64 MiB; evidence retained");
@@ -2305,11 +2982,16 @@ fn inspect_speculation_namespace(namespace: &Path) -> Result<SpeculationInspecti
             let mut bases = 0usize;
             for path in paths {
                 let resource = crate::core::workspace_txn::NativeResource::resolve(&path)?;
-                if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("m-")) {
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("m-"))
+                {
                     // The store inspector checks content addresses/images. Check every envelope too:
                     // its data-only API deliberately skips non-controller manifests, including future kinds.
                     let bytes = read_speculation_evidence(&path, 2 * 1024 * 1024)?;
-                    let value: serde_json::Value = serde_json::from_slice(&bytes).context("corrupt speculation manifest")?;
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&bytes).context("corrupt speculation manifest")?;
                     if evidence_text(&value, "format")? != "aizen-speculation-v1"
                         || evidence_text(&value, "base")? != base
                     {
@@ -2323,7 +3005,9 @@ fn inspect_speculation_namespace(namespace: &Path) -> Result<SpeculationInspecti
                 }
                 resource.verify()?;
             }
-            if bases != 1 { bail!("speculation cohort has missing/ambiguous base evidence"); }
+            if bases != 1 {
+                bail!("speculation cohort has missing/ambiguous base evidence");
+            }
             let (prepared, verified, concerns) = classify_integration_records(base, &records)?;
             summary.prepared += prepared;
             summary.verified += verified;
@@ -2353,12 +3037,23 @@ fn require_settled_speculation(namespace: &Path) -> Result<SpeculationInspection
 /// without waiting; controllers must publish through TimeMachineBinding::with_transaction_lock.
 fn require_settled_store_speculation(root: &Path, already_locked: Option<&Path>) -> Result<()> {
     let namespaces = checked_metadata_entries(&root.join("worktrees"))?;
-    if namespaces.len() > MAX_SPECULATION_WORKTREES { bail!("speculation worktree traversal exceeds bound"); }
+    if namespaces.len() > MAX_SPECULATION_WORKTREES {
+        bail!("speculation worktree traversal exceeds bound");
+    }
     for namespace in namespaces {
-        let boundary = crate::core::workspace_txn::NativeResource::resolve(&namespace.join(".tm-inspection-boundary"))?;
-        let _transaction = if Some(namespace.as_path()) == already_locked { None } else {
-            let lock = crate::core::workspace_txn::NativeResource::resolve(&namespace.join("transaction.lock"))?;
-            let guard = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(lock.path(), Duration::ZERO)?;
+        let boundary = crate::core::workspace_txn::NativeResource::resolve(
+            &namespace.join(".tm-inspection-boundary"),
+        )?;
+        let _transaction = if Some(namespace.as_path()) == already_locked {
+            None
+        } else {
+            let lock = crate::core::workspace_txn::NativeResource::resolve(
+                &namespace.join("transaction.lock"),
+            )?;
+            let guard = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+                lock.path(),
+                Duration::ZERO,
+            )?;
             lock.verify()?;
             Some(guard)
         };
@@ -2372,15 +3067,25 @@ fn require_settled_store_speculation(root: &Path, already_locked: Option<&Path>)
 /// records are immutable history too. Unknown versions/corrupt directories must never become garbage.
 fn store_has_speculation_evidence(root: &Path) -> Result<bool> {
     for path in checked_metadata_entries(root)? {
-        if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("speculation-")) {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("speculation-"))
+        {
             return Ok(true);
         }
     }
     let namespaces = checked_metadata_entries(&root.join("worktrees"))?;
-    if namespaces.len() > MAX_SPECULATION_WORKTREES { bail!("speculation worktree traversal exceeds bound"); }
+    if namespaces.len() > MAX_SPECULATION_WORKTREES {
+        bail!("speculation worktree traversal exceeds bound");
+    }
     for namespace in namespaces {
         for path in checked_metadata_entries(&namespace)? {
-            if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("speculation-")) {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("speculation-"))
+            {
                 return Ok(true);
             }
         }
@@ -2390,10 +3095,16 @@ fn store_has_speculation_evidence(root: &Path) -> Result<bool> {
 
 fn trash_has_speculation_evidence(stamp: &Path) -> Result<bool> {
     for store in checked_metadata_entries(stamp)? {
-        if !store.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("repo-")) {
+        if !store
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("repo-"))
+        {
             bail!("unrecognized trash entry; cannot rule out speculation evidence");
         }
-        if store_has_speculation_evidence(&store)? { return Ok(true); }
+        if store_has_speculation_evidence(&store)? {
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -2796,15 +3507,25 @@ impl RepoContext {
         self.checked_store_lock(crate::core::repo_lock::LockMode::Shared)
     }
 
-    fn checked_store_lock(&self, mode: crate::core::repo_lock::LockMode) -> Result<crate::core::repo_lock::RepoTxnLock> {
+    fn checked_store_lock(
+        &self,
+        mode: crate::core::repo_lock::LockMode,
+    ) -> Result<crate::core::repo_lock::RepoTxnLock> {
         let path = self.store_lock_path();
-        let parent_path = path.parent().context("Time Machine store lock has no parent")?;
+        let parent_path = path
+            .parent()
+            .context("Time Machine store lock has no parent")?;
         let (_, parent) = plan_metadata_directory(parent_path)?;
         if fs::symlink_metadata(parent_path).is_ok() {
             crate::core::workspace_txn::NativeResource::resolve(&path)?;
         }
         let cancel = crate::core::cancel::current();
-        let lock = crate::core::repo_lock::RepoTxnLock::acquire_mode(&path, mode, LOCK_TIMEOUT, cancel.as_ref())?;
+        let lock = crate::core::repo_lock::RepoTxnLock::acquire_mode(
+            &path,
+            mode,
+            LOCK_TIMEOUT,
+            cancel.as_ref(),
+        )?;
         parent.verify()?;
         crate::core::workspace_txn::NativeResource::resolve(&path)?.verify()?;
         Ok(lock)
@@ -4017,7 +4738,10 @@ fn resolve_identity(
             // Preserve legacy direct-mode availability only when a bounded, alias-checked scan can
             // rule out speculation evidence anywhere the unreadable registry might have named.
             for path in checked_metadata_entries(&home.join("timemachine"))? {
-                if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("repo-"))
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("repo-"))
                     && store_has_speculation_evidence(&path)?
                 {
                     return Err(error).context("Time Machine registry is unavailable while speculative evidence exists; identity fallback refused, metadata retained");
@@ -4544,7 +5268,9 @@ fn compact_if_loose(ctx: &RepoContext) {
         return;
     };
     // Re-count under the lease: a sibling worktree may have compacted this store while we queued.
-    let Some(root) = ctx.store_git_dir.parent() else { return; };
+    let Some(root) = ctx.store_git_dir.parent() else {
+        return;
+    };
     if require_settled_store_speculation(root, None).is_err() {
         return; // Housekeeping never mutates a store whose integration evidence is uncertain.
     }
@@ -5838,7 +6564,9 @@ pub fn doctor_gc() -> Result<(DoctorReport, Option<CompactReport>, Option<PruneR
     let _store = ctx.store_exclusive()?;
     let _lock = ctx.lock()?;
     require_settled_store_speculation(
-        ctx.store_git_dir.parent().context("Time Machine store has no root")?,
+        ctx.store_git_dir
+            .parent()
+            .context("Time Machine store has no root")?,
         Some(&ctx.namespace_dir),
     )?;
     let mut ledger = ctx.load_ledger()?;
@@ -6038,12 +6766,20 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     let mut visited = 0usize;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(directory) = stack.pop() {
-        let Ok(entries) = checked_metadata_entries(&directory) else { continue; };
+        let Ok(entries) = checked_metadata_entries(&directory) else {
+            continue;
+        };
         for path in entries {
-            if visited >= MAX_SPECULATION_SCAN_ENTRIES { return total; }
+            if visited >= MAX_SPECULATION_SCAN_ENTRIES {
+                return total;
+            }
             visited += 1;
-            let Ok(metadata) = fs::symlink_metadata(&path) else { continue; };
-            if crate::core::file_placement::is_link_or_reparse(&metadata) { continue; }
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if crate::core::file_placement::is_link_or_reparse(&metadata) {
+                continue;
+            }
             if metadata.is_dir() {
                 stack.push(path);
             } else if metadata.is_file() {
@@ -6058,7 +6794,9 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 /// JSON directly rather than through `Ledger` so a schema the current binary cannot fully parse still
 /// yields a usable count. Best-effort: a missing/garbage ledger contributes 0.
 fn store_checkpoint_count(store_root: &Path) -> usize {
-    let Ok(namespaces) = checked_metadata_entries(&store_root.join("worktrees")) else { return 0; };
+    let Ok(namespaces) = checked_metadata_entries(&store_root.join("worktrees")) else {
+        return 0;
+    };
     let mut count = 0usize;
     for namespace in namespaces.into_iter().take(MAX_SPECULATION_WORKTREES) {
         let ledger = namespace.join("ledger.json");
@@ -6139,16 +6877,15 @@ fn classify_store(
 /// any registry entry that named a reaped store. A store that is still reachable is never touched.
 fn store_deletion_pins(root: &Path) -> Result<(bool, Vec<crate::core::repo_lock::RepoTxnLock>)> {
     let namespaces = checked_metadata_entries(&root.join("worktrees"))?;
-    if namespaces.len() > MAX_SPECULATION_WORKTREES { bail!("store GC worktree traversal exceeds bound"); }
+    if namespaces.len() > MAX_SPECULATION_WORKTREES {
+        bail!("store GC worktree traversal exceeds bound");
+    }
     let mut live = false;
     let mut guards = Vec::new();
     for namespace in namespaces {
         for pin in checked_metadata_entries(&namespace.join("pins"))? {
             let resource = crate::core::workspace_txn::NativeResource::resolve(&pin)?;
-            match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
-                &pin,
-                Duration::ZERO,
-            ) {
+            match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&pin, Duration::ZERO) {
                 Ok(guard) => guards.push(guard),
                 Err(error)
                     if error
@@ -6176,7 +6913,11 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
 
     let entries = checked_metadata_entries(&root)?;
     for store_root in entries {
-        let name = store_root.file_name().context("invalid Time Machine store name")?.to_string_lossy().into_owned();
+        let name = store_root
+            .file_name()
+            .context("invalid Time Machine store name")?
+            .to_string_lossy()
+            .into_owned();
         // Only sweep repo stores. Skip our own `.trash/` and any unrelated dirs.
         if !name.starts_with("repo-") {
             continue;
@@ -6234,13 +6975,19 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
         let now = std::time::SystemTime::now();
         for path in checked_metadata_entries(&root.join(".trash"))? {
             let metadata = fs::symlink_metadata(&path)?;
-            let expired = metadata.modified().ok()
+            let expired = metadata
+                .modified()
+                .ok()
                 .and_then(|time| now.duration_since(time).ok())
                 .is_some_and(|age| age.as_secs() > TRASH_TTL_SECS);
             if expired {
                 // A failed inspection is NOT permission to delete. Aged evidence is evidence too.
-                if !matches!(trash_has_speculation_evidence(&path), Ok(false)) { continue; }
-                let boundary = crate::core::workspace_txn::NativeResource::resolve(&path.join(".tm-trash-boundary"))?;
+                if !matches!(trash_has_speculation_evidence(&path), Ok(false)) {
+                    continue;
+                }
+                let boundary = crate::core::workspace_txn::NativeResource::resolve(
+                    &path.join(".tm-trash-boundary"),
+                )?;
                 boundary.verify()?;
                 let _ = fs::remove_dir_all(&path);
             }
@@ -6263,7 +7010,8 @@ pub fn gc_all(apply: bool) -> Result<GcAllReport> {
         let mut retained_orphans = Vec::new();
         for o in &orphans {
             let from = root.join(&o.repo_id);
-            let store_guard = crate::core::workspace_txn::NativeResource::resolve(&from.join("store.lock"))?;
+            let store_guard =
+                crate::core::workspace_txn::NativeResource::resolve(&from.join("store.lock"))?;
             let _store = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
                 store_guard.path(),
                 LOCK_TIMEOUT,
@@ -6752,24 +7500,45 @@ impl crate::agent::tools::Tool for CheckpointView {
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
         if Self::action_of(args) != Some("recovery_report")
-            && ["cohort", "prepared", "resource_paths"].iter().any(|key| args.get(key).is_some())
-        { bail!("restart report fields require action=recovery_report"); }
+            && ["cohort", "prepared", "resource_paths"]
+                .iter()
+                .any(|key| args.get(key).is_some())
+        {
+            bail!("restart report fields require action=recovery_report");
+        }
         match Self::action_of(args) {
             Some("list") => self.list(),
             Some("diff") => self.diff_report(args),
             Some("recovery_report") => {
-                if ["from", "to", "patch", "paths"].iter().any(|key| args.get(key).is_some()) {
+                if ["from", "to", "patch", "paths"]
+                    .iter()
+                    .any(|key| args.get(key).is_some())
+                {
                     bail!("recovery_report does not accept diff fields; select exact files with resource_paths");
                 }
-                let cohort = args.get("cohort").and_then(serde_json::Value::as_str).context("recovery_report requires cohort")?;
-                let prepared = args.get("prepared").and_then(serde_json::Value::as_str).context("recovery_report requires prepared")?;
-                let paths = args.get("resource_paths").and_then(serde_json::Value::as_array)
+                let cohort = args
+                    .get("cohort")
+                    .and_then(serde_json::Value::as_str)
+                    .context("recovery_report requires cohort")?;
+                let prepared = args
+                    .get("prepared")
+                    .and_then(serde_json::Value::as_str)
+                    .context("recovery_report requires prepared")?;
+                let paths = args
+                    .get("resource_paths")
+                    .and_then(serde_json::Value::as_array)
                     .context("recovery_report requires an explicit resource_paths array")?;
                 if paths.len() > crate::core::speculation::store::MAX_COHORT_FILES {
                     bail!("restart report resource selection exceeds cohort capacity");
                 }
-                let paths = paths.iter().map(|path| path.as_str().map(str::to_owned)
-                    .context("recovery_report resource_paths must contain only exact file strings")).collect::<Result<Vec<_>>>()?;
+                let paths = paths
+                    .iter()
+                    .map(|path| {
+                        path.as_str().map(str::to_owned).context(
+                            "recovery_report resource_paths must contain only exact file strings",
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(inspect_speculation_recovery(&self.root, cohort, prepared, &paths)?.to_text())
             }
             _ => {
@@ -8496,9 +9265,18 @@ mod tests {
         let (planned, guard) = plan_metadata_directory(&target).unwrap();
         // The missing suffix cannot itself be canonicalized. Its existing parent is the identity
         // anchor; on Windows canonicalization deliberately preserves the verbatim \\?\ prefix.
-        assert_eq!(planned, fs::canonicalize(&home).unwrap().join("timemachine"));
-        assert_eq!(guard.path().parent(), Some(fs::canonicalize(&home).unwrap().as_path()));
-        assert!(!target.exists(), "planning must not create the metadata suffix");
+        assert_eq!(
+            planned,
+            fs::canonicalize(&home).unwrap().join("timemachine")
+        );
+        assert_eq!(
+            guard.path().parent(),
+            Some(fs::canonicalize(&home).unwrap().as_path())
+        );
+        assert!(
+            !target.exists(),
+            "planning must not create the metadata suffix"
+        );
         guard.verify().unwrap();
         fs::remove_dir_all(fixture).unwrap();
     }
@@ -8534,7 +9312,10 @@ mod tests {
             canonical_common_git_dir: None,
         };
         assert_ne!(workspace.repo_id, registry.repos[0].repo_id);
-        assert_ne!(workspace.worktree_id, registry.repos[0].worktrees[0].worktree_id);
+        assert_ne!(
+            workspace.worktree_id,
+            registry.repos[0].worktrees[0].worktree_id
+        );
     }
 
     #[test]
@@ -8558,9 +9339,24 @@ mod tests {
             receipt_sha256: "a".repeat(64),
         };
         valid.validate().unwrap();
-        assert!(IntegrationReceiptLink { schema_version: 2, ..valid.clone() }.validate().is_err());
-        assert!(IntegrationReceiptLink { integration_id: "../escape".into(), ..valid.clone() }.validate().is_err());
-        assert!(IntegrationReceiptLink { receipt_sha256: "not-a-hash".into(), ..valid }.validate().is_err());
+        assert!(IntegrationReceiptLink {
+            schema_version: 2,
+            ..valid.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(IntegrationReceiptLink {
+            integration_id: "../escape".into(),
+            ..valid.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(IntegrationReceiptLink {
+            receipt_sha256: "not-a-hash".into(),
+            ..valid
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -8575,12 +9371,19 @@ mod tests {
     #[test]
     fn admitted_binding_uses_actual_transaction_namespace_not_workspace_lock_name() {
         let fixture = scratch("speculation-namespace-shape");
-        let root = fixture.join("tm").join("repo-0123456789abcdef").join("worktrees").join("wt-fedcba9876543210");
+        let root = fixture
+            .join("tm")
+            .join("repo-0123456789abcdef")
+            .join("worktrees")
+            .join("wt-fedcba9876543210");
         let binding = RepoBinding {
             root: fixture.join("repo"),
             git_dir: fixture.join("repo").join(".git"),
             common_git_dir: fixture.join("repo").join(".git"),
-            store_git_dir: fixture.join("tm").join("repo-0123456789abcdef").join("store.git"),
+            store_git_dir: fixture
+                .join("tm")
+                .join("repo-0123456789abcdef")
+                .join("store.git"),
             namespace_dir: root.clone(),
             repo_id: "repo-0123456789abcdef".into(),
             worktree_id: "wt-fedcba9876543210".into(),
@@ -8602,15 +9405,24 @@ mod tests {
             skip_dirs: std::cell::RefCell::new(None),
         };
         assert_eq!(ctx.lock_path(), root.join("transaction.lock"));
-        assert_eq!(ctx.store_lock_path(), binding.store_git_dir.parent().unwrap().join("store.lock"));
-        assert_ne!(ctx.lock_path(), fixture.join("locks").join("timemachine.lock"));
+        assert_eq!(
+            ctx.store_lock_path(),
+            binding.store_git_dir.parent().unwrap().join("store.lock")
+        );
+        assert_ne!(
+            ctx.lock_path(),
+            fixture.join("locks").join("timemachine.lock")
+        );
         fs::remove_dir_all(fixture).unwrap();
     }
 
-
     pub(super) fn speculation_git_fixture(
         tag: &str,
-    ) -> Option<(crate::core::file_placement::tests::TestDir, crate::core::workspace_txn::WorkspaceIdentity, PathBuf)> {
+    ) -> Option<(
+        crate::core::file_placement::tests::TestDir,
+        crate::core::workspace_txn::WorkspaceIdentity,
+        PathBuf,
+    )> {
         if !git_available() {
             return None;
         }
@@ -8628,35 +9440,66 @@ mod tests {
     fn speculation_binding_admission_is_metadata_only_and_locks_actual_transaction() {
         use crate::core::repo_lock::{LockBusy, RepoTxnLock};
         use crate::core::workspace_txn::{PhysicalEffectLease, WorkspaceWriterLease};
-        let _home = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let Some((fixture, identity, home)) = speculation_git_fixture("binding-admission") else { return; };
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((fixture, identity, home)) = speculation_git_fixture("binding-admission") else {
+            return;
+        };
         let plan = PlannedTimeMachineBinding::plan(identity.clone(), &home).unwrap();
-        assert!(!home.exists(), "planning cannot create even the home directory");
+        assert!(
+            !home.exists(),
+            "planning cannot create even the home directory"
+        );
         crate::core::workspace_txn::with_test_lock_home(fixture.path(), || {
             let writer = WorkspaceWriterLease::acquire_identity_scoped(
-                identity.clone(), Duration::ZERO, None, "binding fixture", "binding-parent",
-            ).unwrap();
+                identity.clone(),
+                Duration::ZERO,
+                None,
+                "binding fixture",
+                "binding-parent",
+            )
+            .unwrap();
             let physical = PhysicalEffectLease::exclusive(
-                Duration::ZERO, None, "binding metadata", "binding-parent",
-            ).unwrap();
+                Duration::ZERO,
+                None,
+                "binding metadata",
+                "binding-parent",
+            )
+            .unwrap();
             let binding = plan.admit(&writer, &physical).unwrap();
             assert!(binding.namespace_dir().is_dir());
             assert_ne!(binding.repo_id(), identity.repo_id);
             assert_ne!(binding.worktree_id(), identity.worktree_id);
-            assert!(!binding.binding.store_git_dir.exists(), "admission must not initialize Git storage");
+            assert!(
+                !binding.binding.store_git_dir.exists(),
+                "admission must not initialize Git storage"
+            );
             assert!(!binding.namespace_dir().join("ledger.json").exists());
             assert!(!binding.namespace_dir().join("journal.json").exists());
             let ctx = binding.binding.context().unwrap();
-            binding.with_transaction_lock(&writer, &physical, || {
-                let transaction = RepoTxnLock::acquire_exclusive(&ctx.lock_path(), Duration::ZERO).unwrap_err();
-                assert!(transaction.downcast_ref::<LockBusy>().is_some());
-                let store = RepoTxnLock::acquire_exclusive(&ctx.store_lock_path(), Duration::ZERO).unwrap_err();
-                assert!(store.downcast_ref::<LockBusy>().is_some());
-                Ok(())
-            }).unwrap();
+            binding
+                .with_transaction_lock(&writer, &physical, || {
+                    let transaction =
+                        RepoTxnLock::acquire_exclusive(&ctx.lock_path(), Duration::ZERO)
+                            .unwrap_err();
+                    assert!(transaction.downcast_ref::<LockBusy>().is_some());
+                    let store =
+                        RepoTxnLock::acquire_exclusive(&ctx.store_lock_path(), Duration::ZERO)
+                            .unwrap_err();
+                    assert!(store.downcast_ref::<LockBusy>().is_some());
+                    Ok(())
+                })
+                .unwrap();
             RepoTxnLock::acquire_exclusive(&ctx.lock_path(), Duration::ZERO).unwrap();
-            assert_eq!(fs::read(identity.canonical_root.join("live.txt")).unwrap(), b"unchanged live bytes");
-            assert!(!ctx.journal_path().exists(), "adapter must not call recovery or normal save");
+            assert_eq!(
+                fs::read(identity.canonical_root.join("live.txt")).unwrap(),
+                b"unchanged live bytes"
+            );
+            assert!(
+                !ctx.journal_path().exists(),
+                "adapter must not call recovery or normal save"
+            );
             assert!(!ctx.ledger_path().exists());
         });
     }
@@ -8664,18 +9507,31 @@ mod tests {
     #[test]
     fn speculation_binding_refuses_wrong_writer_and_replaced_git_ancestor_before_creation() {
         use crate::core::workspace_txn::{PhysicalEffectLease, WorkspaceWriterLease};
-        let _home = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let Some((fixture, identity, home)) = speculation_git_fixture("binding-replacement") else { return; };
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((fixture, identity, home)) = speculation_git_fixture("binding-replacement") else {
+            return;
+        };
         let plan = PlannedTimeMachineBinding::plan(identity.clone(), &home).unwrap();
         crate::core::workspace_txn::with_test_lock_home(fixture.path(), || {
             let mut wrong = identity.clone();
             wrong.worktree_id.push_str("-wrong");
             let writer = WorkspaceWriterLease::acquire_identity_scoped(
-                wrong, Duration::ZERO, None, "wrong binding fixture", "wrong-binding-parent",
-            ).unwrap();
+                wrong,
+                Duration::ZERO,
+                None,
+                "wrong binding fixture",
+                "wrong-binding-parent",
+            )
+            .unwrap();
             let physical = PhysicalEffectLease::exclusive(
-                Duration::ZERO, None, "wrong binding metadata", "wrong-binding-parent",
-            ).unwrap();
+                Duration::ZERO,
+                None,
+                "wrong binding metadata",
+                "wrong-binding-parent",
+            )
+            .unwrap();
             assert!(plan.admit(&writer, &physical).is_err());
             assert!(!home.exists());
             drop(physical);
@@ -8684,40 +9540,76 @@ mod tests {
             fs::rename(git, identity.canonical_root.join("saved-git")).unwrap();
             fs::create_dir(git).unwrap();
             let writer = WorkspaceWriterLease::acquire_identity_scoped(
-                identity.clone(), Duration::ZERO, None, "stale binding fixture", "stale-binding-parent",
-            ).unwrap();
+                identity.clone(),
+                Duration::ZERO,
+                None,
+                "stale binding fixture",
+                "stale-binding-parent",
+            )
+            .unwrap();
             let physical = PhysicalEffectLease::exclusive(
-                Duration::ZERO, None, "stale binding metadata", "stale-binding-parent",
-            ).unwrap();
+                Duration::ZERO,
+                None,
+                "stale binding metadata",
+                "stale-binding-parent",
+            )
+            .unwrap();
             assert!(plan.admit(&writer, &physical).is_err());
-            assert!(!home.exists(), "stale identity must refuse before metadata creation");
-            assert_eq!(fs::read(identity.canonical_root.join("live.txt")).unwrap(), b"unchanged live bytes");
+            assert!(
+                !home.exists(),
+                "stale identity must refuse before metadata creation"
+            );
+            assert_eq!(
+                fs::read(identity.canonical_root.join("live.txt")).unwrap(),
+                b"unchanged live bytes"
+            );
         });
     }
 
     #[test]
     fn speculation_registry_corrupt_future_and_changed_mappings_fail_closed() {
         use crate::core::workspace_txn::{PhysicalEffectLease, WorkspaceWriterLease};
-        let _home = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let Some((fixture, identity, home)) = speculation_git_fixture("binding-registry") else { return; };
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((fixture, identity, home)) = speculation_git_fixture("binding-registry") else {
+            return;
+        };
         let root = home.join("timemachine");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("registry.json");
-        for bytes in [b"not-json".as_slice(), br#"{"schema_version":2,"repos":[]}"#.as_slice()] {
+        for bytes in [
+            b"not-json".as_slice(),
+            br#"{"schema_version":2,"repos":[]}"#.as_slice(),
+        ] {
             fs::write(&path, bytes).unwrap();
             assert!(PlannedTimeMachineBinding::plan(identity.clone(), &home).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
-            assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "read-only planning creates no lock file");
+            assert_eq!(
+                fs::read_dir(&root).unwrap().count(),
+                1,
+                "read-only planning creates no lock file"
+            );
         }
         let mut registry = identity::Registry {
             schema_version: 1,
             repos: vec![identity::RepoEntry {
                 repo_id: "repo-0123456789abcdef".into(),
                 root_commit: None,
-                common_git_dir: identity.canonical_common_git_dir.as_ref().unwrap().to_string_lossy().replace('\\', "/"),
+                common_git_dir: identity
+                    .canonical_common_git_dir
+                    .as_ref()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
                 worktrees: vec![identity::WorktreeEntry {
                     worktree_id: "wt-0123456789abcdef".into(),
-                    git_dir: identity.canonical_git_dir.as_ref().unwrap().to_string_lossy().replace('\\', "/"),
+                    git_dir: identity
+                        .canonical_git_dir
+                        .as_ref()
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
                 }],
             }],
         };
@@ -8728,11 +9620,20 @@ mod tests {
         fs::write(&path, &changed).unwrap();
         crate::core::workspace_txn::with_test_lock_home(fixture.path(), || {
             let writer = WorkspaceWriterLease::acquire_identity_scoped(
-                identity.clone(), Duration::ZERO, None, "registry fixture", "registry-binding-parent",
-            ).unwrap();
+                identity.clone(),
+                Duration::ZERO,
+                None,
+                "registry fixture",
+                "registry-binding-parent",
+            )
+            .unwrap();
             let physical = PhysicalEffectLease::exclusive(
-                Duration::ZERO, None, "registry metadata", "registry-binding-parent",
-            ).unwrap();
+                Duration::ZERO,
+                None,
+                "registry metadata",
+                "registry-binding-parent",
+            )
+            .unwrap();
             assert!(plan.admit(&writer, &physical).is_err());
             assert_eq!(fs::read(&path).unwrap(), changed);
             assert!(!root.join("repo-0123456789abcdef").exists());
@@ -8743,7 +9644,9 @@ mod tests {
 
     #[test]
     fn speculation_non_git_planning_has_no_binding_or_metadata() {
-        let _home = crate::core::config::TEST_HOME_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let fixture = crate::core::file_placement::tests::TestDir::new();
         let root = fs::canonicalize(fixture.path()).unwrap();
         assert!(plan_speculation_binding(&root).unwrap().is_none());

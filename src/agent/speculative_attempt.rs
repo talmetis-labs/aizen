@@ -9,8 +9,8 @@ use crate::agent::tools::workers::ToolWorkerOwner;
 use crate::core::exec_ctx::{AttemptCarrierRegistry, ExecutionContext};
 use crate::core::native_scope::NativeWriteScope;
 use crate::core::speculation::lifecycle::{AttemptLifecycle, WorkerJoinFact};
-use crate::core::speculation::workers::DriverResult;
 use crate::core::speculation::store::OverlayHandle;
+use crate::core::speculation::workers::DriverResult;
 use crate::core::workspace_txn::WorkspaceActivity;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -99,8 +99,10 @@ impl AttemptOwner {
         overlay: OverlayHandle,
         scope: &NativeWriteScope,
     ) -> Result<Self> {
-        anyhow::ensure!(overlay.lifecycle().is_some(),
-            "speculative worker roster was not frozen before native admission");
+        anyhow::ensure!(
+            overlay.lifecycle().is_some(),
+            "speculative worker roster was not frozen before native admission"
+        );
         Self::new(slot, root, owner_scope, overlay, scope)
     }
 
@@ -145,11 +147,14 @@ impl AttemptOwner {
     /// still present, so `Drop` quarantines the complete state instead of releasing it.
     #[cfg(test)]
     pub(crate) async fn finish(self, deadline: Instant) -> Result<ReleasedAttempt> {
-        self.finish_with_driver(deadline, DriverResult::Completed).await
+        self.finish_with_driver(deadline, DriverResult::Completed)
+            .await
     }
 
     pub(crate) async fn finish_with_driver(
-        mut self, deadline: Instant, driver: DriverResult,
+        mut self,
+        deadline: Instant,
+        driver: DriverResult,
     ) -> Result<ReleasedAttempt> {
         let state = self
             .state
@@ -208,7 +213,9 @@ impl AttemptOwner {
 
 /// Capture the loop's typed terminal result before settlement; a later cancel flag is not
 /// evidence that a completed driver was cancelled.
-pub(crate) fn driver_result(result: Result<&crate::agent::AgentOutcome, &anyhow::Error>) -> DriverResult {
+pub(crate) fn driver_result(
+    result: Result<&crate::agent::AgentOutcome, &anyhow::Error>,
+) -> DriverResult {
     match result {
         Ok(outcome) => match outcome.stop {
             crate::agent::StopReason::Done => DriverResult::Completed,
@@ -257,11 +264,17 @@ impl ReleasedAttempt {
     }
 
     pub(crate) fn into_joined_for(
-        self, lifecycle: &AttemptLifecycle, overlay: &OverlayHandle,
+        self,
+        lifecycle: &AttemptLifecycle,
+        overlay: &OverlayHandle,
     ) -> Result<(Vec<WorkerJoinFact>, DriverResult)> {
         self.check_overlay(overlay)?;
-        anyhow::ensure!(self.lifecycle.as_ref().is_some_and(|bound| bound.same_attempt(lifecycle)),
-            "released attempt belongs to another live lifecycle");
+        anyhow::ensure!(
+            self.lifecycle
+                .as_ref()
+                .is_some_and(|bound| bound.same_attempt(lifecycle)),
+            "released attempt belongs to another live lifecycle"
+        );
         Ok((self.facts, self.driver))
     }
 

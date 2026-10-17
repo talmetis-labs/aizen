@@ -99,14 +99,31 @@ impl Fixture {
         });
         let overlay = base.create_overlay(OWNER, &scope).unwrap();
         let lifecycle = crate::core::speculation::lifecycle::CohortLifecycle::freeze(
-            &base, "controller", vec![(crate::core::speculation::workers::AttemptMember {
-                attempt: 1, owner: OWNER.to_owned(), overlay: overlay.id().to_owned(),
-                scope_sha256: crate::core::speculation::workers::scope_sha256(scope.resources().iter().map(|resource| {
-                    (resource.key(), resource.path(), scope.write_keys().iter().any(|key| key == resource.key()))
-                })).unwrap(),
-            }, scope.clone())],
-        ).unwrap();
-        overlay.bind_lifecycle(lifecycle.attempt(0, &scope).unwrap()).unwrap();
+            &base,
+            "controller",
+            vec![(
+                crate::core::speculation::workers::AttemptMember {
+                    attempt: 1,
+                    owner: OWNER.to_owned(),
+                    overlay: overlay.id().to_owned(),
+                    scope_sha256: crate::core::speculation::workers::scope_sha256(
+                        scope.resources().iter().map(|resource| {
+                            (
+                                resource.key(),
+                                resource.path(),
+                                scope.write_keys().iter().any(|key| key == resource.key()),
+                            )
+                        }),
+                    )
+                    .unwrap(),
+                },
+                scope.clone(),
+            )],
+        )
+        .unwrap();
+        overlay
+            .bind_lifecycle(lifecycle.attempt(0, &scope).unwrap())
+            .unwrap();
         let context = ExecutionContext::default()
             .with_resource_scope(OWNER)
             .with_native_scope(scope.clone())
@@ -275,7 +292,13 @@ async fn native_admission_ready_running_released_and_taken_token_stay_distinct()
     assert!(!admission.physically_finished());
     assert!(require_workspace_quiescent(&fixture.work).is_err());
     drop(executable);
-    admission.finish_native(deadline(), crate::core::speculation::workers::DriverResult::Completed).await.unwrap();
+    admission
+        .finish_native(
+            deadline(),
+            crate::core::speculation::workers::DriverResult::Completed,
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         admission,
         WorkflowAttemptAdmission::NativeReleased(Some(_))
@@ -308,7 +331,10 @@ async fn cancelled_native_finish_stays_unknown_and_retains_slot_and_activity() {
     let mut admission = WorkflowAttemptAdmission::new(ExecutionMode::Speculative, fixture.slot());
     let executable = admission.bind_context(&fixture.work, &context).unwrap();
     let producer = executable.tool_workers().unwrap().clone();
-    let mut finish = Box::pin(admission.finish_native(deadline(), crate::core::speculation::workers::DriverResult::Completed));
+    let mut finish = Box::pin(admission.finish_native(
+        deadline(),
+        crate::core::speculation::workers::DriverResult::Completed,
+    ));
     std::future::poll_fn(|cx| {
         assert!(matches!(finish.as_mut().poll(cx), Poll::Pending));
         Poll::Ready(())

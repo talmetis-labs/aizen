@@ -1192,10 +1192,7 @@ fn a_failed_tool_row_stays_one_line_and_points_at_ctrl_e() {
         !plain.contains("│ line 9") && !plain.contains("│ line 4"),
         "a failed call no longer auto-expands its tail: {plain}"
     );
-    assert!(
-        plain.contains("9 more line(s) — Ctrl-E expands"),
-        "{plain}"
-    );
+    assert!(plain.contains("9 more line(s) — Ctrl-E expands"), "{plain}");
     assert_eq!(
         plain.lines().count(),
         3,

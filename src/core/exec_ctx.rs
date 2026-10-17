@@ -37,8 +37,8 @@
 
 use crate::core::convo::ConversationId;
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Volatile ownership accounting for one speculative attempt.
 ///
@@ -61,7 +61,9 @@ impl AttemptCarrierRegistry {
 
     pub(crate) fn acquire(self: &Arc<Self>) -> AttemptCarrier {
         self.live.fetch_add(1, Ordering::AcqRel);
-        AttemptCarrier { registry: self.clone() }
+        AttemptCarrier {
+            registry: self.clone(),
+        }
     }
 
     pub(crate) fn live(&self) -> usize {
@@ -78,12 +80,15 @@ impl AttemptCarrierRegistry {
             }
             tokio::time::timeout_at(deadline, notified)
                 .await
-                .map_err(|_| anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
-                    crate::agent::tools::ToolEffectState::UnknownWorker,
-                )).context(format!(
-                    "speculative attempt carriers remain live ({}); release not certified",
-                    self.live()
-                )))?;
+                .map_err(|_| {
+                    anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                        crate::agent::tools::ToolEffectState::UnknownWorker,
+                    ))
+                    .context(format!(
+                        "speculative attempt carriers remain live ({}); release not certified",
+                        self.live()
+                    ))
+                })?;
         }
     }
 }
@@ -198,6 +203,9 @@ struct Inner {
     references: Option<crate::core::reference_media::ReferenceAccess>,
     /// Current completed tool image groups for this one resource scope; never a session/global index.
     tool_images: Arc<std::sync::Mutex<Vec<crate::core::tool_media::ToolImage>>>,
+    /// Keep the owned fixture directory alive until this context's lock leases have dropped.
+    #[cfg(test)]
+    test_lock_namespace: Option<crate::core::workspace_txn::TestLockNamespace>,
     /// Last field: retire the carrier only after this context's resource fields have dropped.
     /// This ordering still does not prove release of raw handles cloned outside the context.
     attempt_carrier: Option<AttemptCarrier>,
@@ -232,6 +240,8 @@ impl Default for Inner {
             deadline: None,
             references: None,
             tool_images: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_lock_namespace: crate::core::workspace_txn::explicit_test_lock_namespace(),
         }
     }
 }
@@ -295,9 +305,26 @@ impl ExecutionContext {
             deadline: self.0.deadline,
             references: self.0.references.clone(),
             tool_images: self.0.tool_images.clone(),
+            #[cfg(test)]
+            test_lock_namespace: self.0.test_lock_namespace.clone(),
         };
         f(&mut next);
         Self(Arc::new(next))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_lock_namespace(
+        &self,
+        namespace: crate::core::workspace_txn::TestLockNamespace,
+    ) -> Self {
+        self.with(|i| i.test_lock_namespace = Some(namespace))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lock_namespace(
+        &self,
+    ) -> Option<&crate::core::workspace_txn::TestLockNamespace> {
+        self.0.test_lock_namespace.as_ref()
     }
 
     pub fn with_deadline(&self, deadline: Option<std::time::Instant>) -> Self {
@@ -525,13 +552,16 @@ impl ExecutionContext {
 
     #[cfg(test)]
     pub(crate) fn with_speculative_driver_join_probe(
-        &self, probe: crate::agent::tools::workers::WorkerJoinTestProbe,
+        &self,
+        probe: crate::agent::tools::workers::WorkerJoinTestProbe,
     ) -> Self {
         self.with(|i| i.speculative_driver_join_probe = Some(probe))
     }
 
     #[cfg(test)]
-    pub(crate) fn speculative_driver_join_probe(&self) -> Option<&crate::agent::tools::workers::WorkerJoinTestProbe> {
+    pub(crate) fn speculative_driver_join_probe(
+        &self,
+    ) -> Option<&crate::agent::tools::workers::WorkerJoinTestProbe> {
         self.0.speculative_driver_join_probe.as_ref()
     }
 
@@ -593,7 +623,10 @@ impl ExecutionContext {
         })?;
         overlay.check_owner_scope(&self.resource_scope(), scope)?;
         if let Some(current) = &self.0.overlay {
-            anyhow::ensure!(current.same_handle(&overlay), "cannot replace an active overlay");
+            anyhow::ensure!(
+                current.same_handle(&overlay),
+                "cannot replace an active overlay"
+            );
         }
         Ok(self.with(|i| {
             i.overlay = Some(overlay);
@@ -688,6 +721,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_lock_namespace_survives_child_worker_until_physical_completion() {
+        use crate::core::workspace_txn::{
+            TestLockNamespace, WorkspaceIdentity, WorkspaceWriterLease,
+        };
+        use std::time::Duration;
+
+        let namespace = TestLockNamespace::owned();
+        let root = namespace.root().to_path_buf();
+        let mut run = Box::pin(crate::core::workspace_txn::with_test_lock_namespace_future(
+            Some(namespace),
+            async { ExecutionContext::default() },
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let std::task::Poll::Ready(parent) = std::future::Future::poll(run.as_mut(), &mut cx)
+        else {
+            panic!("context creation must complete in one poll");
+        };
+        drop(run);
+        assert!(
+            root.is_dir(),
+            "the context created during polling must retain the namespace owner"
+        );
+        let child = parent
+            .with_resource_scope("parent/task")
+            .with_trace_visible(false)
+            .fork_recovery();
+        let worker_root = root.clone();
+        let (ready, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            with_current(child, || {
+                assert_eq!(
+                    current().unwrap().test_lock_namespace().unwrap().root(),
+                    worker_root.as_path()
+                );
+                let identity = WorkspaceIdentity {
+                    repo_id: "namespace-worker-repo".into(),
+                    worktree_id: "namespace-worker-tree".into(),
+                    canonical_root: worker_root.clone(),
+                    canonical_git_dir: None,
+                    canonical_common_git_dir: None,
+                };
+                assert!(identity.lock_root().starts_with(&worker_root));
+                let lease = WorkspaceWriterLease::acquire_identity(
+                    identity,
+                    Duration::ZERO,
+                    None,
+                    "namespace worker regression",
+                )
+                .unwrap();
+                ready.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(worker_root.is_dir());
+                drop(lease);
+            });
+        });
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(parent);
+        assert!(root.is_dir(), "the running worker still owns the fixture");
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            !root.exists(),
+            "the final context releases its owned fixture"
+        );
+    }
+
+    #[test]
     fn attempt_carriers_track_context_forks_until_all_handles_retire() {
         let registry = AttemptCarrierRegistry::new();
         let mut ctx = ExecutionContext::default().with_attempt_carrier_registry(&registry);
@@ -697,9 +799,17 @@ mod tests {
         ctx = ctx.with_trace_visible(false);
         assert_eq!(registry.live(), 2, "a context fork owns a distinct carrier");
         ctx = ctx.with_dispatch_label(Some("owned-attempt".into()));
-        assert_eq!(registry.live(), 2, "assignment retires the replaced context fork");
+        assert_eq!(
+            registry.live(),
+            2,
+            "assignment retires the replaced context fork"
+        );
         drop(ctx);
-        assert_eq!(registry.live(), 1, "the earlier executable handle still owns authority");
+        assert_eq!(
+            registry.live(),
+            1,
+            "the earlier executable handle still owns authority"
+        );
         drop(retained);
         assert_eq!(registry.live(), 0);
     }
@@ -710,12 +820,20 @@ mod tests {
         let ctx = ExecutionContext::default().with_attempt_carrier_registry(&registry);
         let prepared_capture = ctx.with_trace_visible(false);
         drop(ctx);
-        let error = registry.wait_empty(tokio::time::Instant::now()).await.unwrap_err();
-        assert_eq!(crate::agent::tool_error_effect_state(&error),
-            crate::agent::tools::ToolEffectState::UnknownWorker);
+        let error = registry
+            .wait_empty(tokio::time::Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::agent::tool_error_effect_state(&error),
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
         assert!(error.to_string().contains("remain live (1)"));
         drop(prepared_capture);
-        registry.wait_empty(tokio::time::Instant::now()).await.unwrap();
+        registry
+            .wait_empty(tokio::time::Instant::now())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -736,7 +854,10 @@ mod tests {
             assert_eq!(registry.live(), 1);
             release.send(()).unwrap();
             waiting.await.unwrap();
-            tokio::time::timeout_at(deadline, retirement).await.unwrap().unwrap();
+            tokio::time::timeout_at(deadline, retirement)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(registry.live(), 0);
         }
     }

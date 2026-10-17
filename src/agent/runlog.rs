@@ -443,14 +443,25 @@ pub(crate) fn validate_speculative_cohorts(
     let mut open: Option<(String, Vec<AttemptKey>)> = None;
     for event in events {
         match event {
-            Event::SpeculativeCohortCaptured { cohort_id, members, .. } => {
-                anyhow::ensure!(open.is_none() && !cohort_id.is_empty() && cohort_id.len() <= 128
-                    && captured.insert(cohort_id.clone()) && !members.is_empty() && members.len() <= 32,
-                    "invalid or overlapping speculative cohort capture; reconciliation required");
+            Event::SpeculativeCohortCaptured {
+                cohort_id, members, ..
+            } => {
+                anyhow::ensure!(
+                    open.is_none()
+                        && !cohort_id.is_empty()
+                        && cohort_id.len() <= 128
+                        && captured.insert(cohort_id.clone())
+                        && !members.is_empty()
+                        && members.len() <= 32,
+                    "invalid or overlapping speculative cohort capture; reconciliation required"
+                );
                 for key in members {
-                    anyhow::ensure!(key.kind == AttemptKind::Initial && key.ordinal == 1
-                        && membership.insert(key.clone(), cohort_id.clone()).is_none(),
-                        "speculative membership is duplicated or an automatic retry");
+                    anyhow::ensure!(
+                        key.kind == AttemptKind::Initial
+                            && key.ordinal == 1
+                            && membership.insert(key.clone(), cohort_id.clone()).is_none(),
+                        "speculative membership is duplicated or an automatic retry"
+                    );
                 }
                 open = Some((cohort_id.clone(), members.clone()));
             }
@@ -459,30 +470,60 @@ pub(crate) fn validate_speculative_cohorts(
                 anyhow::ensure!(speculative == membership.contains_key(&intent.key),
                     "speculative dispatch has no captured cohort, or direct work names private membership");
                 if let Some((_, members)) = &open {
-                    anyhow::ensure!(members.contains(&intent.key), "direct or foreign dispatch entered an active speculative cohort");
+                    anyhow::ensure!(
+                        members.contains(&intent.key),
+                        "direct or foreign dispatch entered an active speculative cohort"
+                    );
                 }
                 if speculative {
-                    anyhow::ensure!(!integrated.contains(&intent.key) && dispatched.insert(intent.key.clone()),
-                        "speculative attempt dispatched twice or after integration");
+                    anyhow::ensure!(
+                        !integrated.contains(&intent.key) && dispatched.insert(intent.key.clone()),
+                        "speculative attempt dispatched twice or after integration"
+                    );
                 }
             }
-            Event::AttemptCompleted { key, status, summary, .. } if membership.contains_key(key) => {
+            Event::AttemptCompleted {
+                key,
+                status,
+                summary,
+                ..
+            } if membership.contains_key(key) => {
                 anyhow::ensure!(dispatched.contains(key) && !integrated.contains(key)
                     && completed.insert(key.clone()) && crate::agent::workflow::completed_status(status),
                     "speculative attempt failed, incomplete or not uniquely dispatched; reconciliation required");
                 let report = crate::agent::workflow::TaskOutcome {
-                    id: key.display(), attempt: Some(key.clone()), selected_for: None,
-                    role: String::new(), model: String::new(), status: status.clone(), summary: summary.clone(),
-                    iters: 0, tokens_in: 0, tokens_out: 0, evidence_images: Vec::new(),
+                    id: key.display(),
+                    attempt: Some(key.clone()),
+                    selected_for: None,
+                    role: String::new(),
+                    model: String::new(),
+                    status: status.clone(),
+                    summary: summary.clone(),
+                    iters: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    evidence_images: Vec::new(),
                 };
-                anyhow::ensure!(!crate::agent::workflow::verdict_failed(&report),
-                    "speculative attempt reported FAIL; integration cannot authorize replay");
+                anyhow::ensure!(
+                    !crate::agent::workflow::verdict_failed(&report),
+                    "speculative attempt reported FAIL; integration cannot authorize replay"
+                );
             }
-            Event::SpeculativeCohortIntegrated { cohort_id, members, receipt, .. } => {
-                let (expected_id, expected_members) = open.as_ref().context("integration without captured cohort")?;
-                anyhow::ensure!(cohort_id == expected_id && members == expected_members
-                    && members.iter().all(|key| completed.contains(key)),
-                    "integration receipt does not cover the complete successful frozen cohort");
+            Event::SpeculativeCohortIntegrated {
+                cohort_id,
+                members,
+                receipt,
+                ..
+            } => {
+                let (expected_id, expected_members) = open
+                    .as_ref()
+                    .context("integration without captured cohort")?;
+                anyhow::ensure!(
+                    cohort_id == expected_id
+                        && members == expected_members
+                        && members.iter().all(|key| completed.contains(key)),
+                    "integration receipt does not cover the complete successful frozen cohort"
+                );
                 // This proves a supported lifecycle summary, not current source truth or renewed
                 // execution authority. Legacy/arbitrary strings cannot release dependencies.
                 crate::core::speculation::verification::parse_success_summary(receipt, cohort_id)
@@ -491,7 +532,10 @@ pub(crate) fn validate_speculative_cohorts(
                 open = None;
             }
             Event::TaskSettled { selected, .. } if membership.contains_key(selected) => {
-                anyhow::ensure!(integrated.contains(selected), "speculative settlement precedes accepted integration");
+                anyhow::ensure!(
+                    integrated.contains(selected),
+                    "speculative settlement precedes accepted integration"
+                );
             }
             _ => {}
         }
@@ -504,7 +548,8 @@ pub(crate) fn validate_speculative_cohorts(
 /// interpreted only where ownership is unambiguous; failures never authorize repeating a write.
 pub fn plan(events: &[Event], task_ids: &[&str]) -> Vec<Action> {
     if let Err(error) = workflow_header(events, task_ids)
-        .and_then(|_| validate_speculative_cohorts(events).map(|_| ())) {
+        .and_then(|_| validate_speculative_cohorts(events).map(|_| ()))
+    {
         return task_ids
             .iter()
             .map(|_| Action::Reconcile {
@@ -621,8 +666,15 @@ pub fn describe(e: &Event) -> String {
             "#{seq:>4} completed {} → {status} [{tokens_in}+{tokens_out} tok]",
             key.display()
         ),
-        Event::SpeculativeCohortCaptured { seq, cohort_id, members } => {
-            format!("#{seq:>4} speculative {cohort_id} · {} frozen attempts", members.len())
+        Event::SpeculativeCohortCaptured {
+            seq,
+            cohort_id,
+            members,
+        } => {
+            format!(
+                "#{seq:>4} speculative {cohort_id} · {} frozen attempts",
+                members.len()
+            )
         }
         Event::SpeculativeCohortIntegrated { seq, cohort_id, .. } => {
             format!("#{seq:>4} speculative {cohort_id} · integrated and verified")

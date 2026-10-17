@@ -1481,8 +1481,7 @@ async fn run_menu_plain() -> Result<()> {
                 }
             }
         }
-        if let Err(e) = crate::repl::turn::prepare_current_references(&mut resolved, &images)
-        {
+        if let Err(e) = crate::repl::turn::prepare_current_references(&mut resolved, &images) {
             tui::note_line(&format!("reference setup: {e}"));
             cli_config::clear_effort_override();
             continue;

@@ -495,11 +495,15 @@ fn file_identity(_path: &Path, _md: &Metadata, _follow: bool) -> Result<(u64, u6
 /// Read existing evidence through a bounded, checked descriptor. No creation, hardening or writes.
 /// Path/descriptor rechecks detect ordinary drift, not hostile kernel-atomic path substitution.
 pub(crate) fn read_existing_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    limit.checked_add(1).context("existing file byte bound overflow")?;
+    limit
+        .checked_add(1)
+        .context("existing file byte bound overflow")?;
     let resource = crate::core::workspace_txn::NativeResource::resolve(path)?;
     let md = fs::symlink_metadata(path)?;
-    anyhow::ensure!(md.is_file() && !is_link_or_reparse(&md) && md.len() <= limit,
-        "existing evidence must be a bounded regular non-link file");
+    anyhow::ensure!(
+        md.is_file() && !is_link_or_reparse(&md) && md.len() <= limit,
+        "existing evidence must be a bounded regular non-link file"
+    );
     let stamp = NodeStamp::capture(path, &md, false)?;
     resource.verify()?;
     let file = open_existing_read_only(path)?;
@@ -512,30 +516,52 @@ fn read_existing_regular_descriptor(
     mut file: fs::File,
     limit: u64,
 ) -> Result<Vec<u8>> {
-    let read_limit = limit.checked_add(1).context("existing file byte bound overflow")?;
-    anyhow::ensure!(stamp.len <= limit && existing_regular_stamp(&file)? == *stamp,
-        "existing evidence descriptor differs from selected file");
+    let read_limit = limit
+        .checked_add(1)
+        .context("existing file byte bound overflow")?;
+    anyhow::ensure!(
+        stamp.len <= limit && existing_regular_stamp(&file)? == *stamp,
+        "existing evidence descriptor differs from selected file"
+    );
     resource.verify()?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(usize::try_from(stamp.len).context("existing file length overflow")?)?;
+    bytes
+        .try_reserve_exact(usize::try_from(stamp.len).context("existing file length overflow")?)?;
     (&mut file).take(read_limit).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() as u64 == stamp.len && existing_regular_stamp(&file)? == *stamp,
-        "existing evidence descriptor changed during inspection");
+    anyhow::ensure!(
+        bytes.len() as u64 == stamp.len && existing_regular_stamp(&file)? == *stamp,
+        "existing evidence descriptor changed during inspection"
+    );
     resource.verify()?;
-    anyhow::ensure!(NodeStamp::capture(resource.path(), &fs::symlink_metadata(resource.path())?, false)? == *stamp,
-        "existing evidence pathname changed during inspection");
+    anyhow::ensure!(
+        NodeStamp::capture(
+            resource.path(),
+            &fs::symlink_metadata(resource.path())?,
+            false
+        )? == *stamp,
+        "existing evidence pathname changed during inspection"
+    );
     Ok(bytes)
 }
 
 fn open_existing_read_only(path: &Path) -> Result<fs::File> {
-    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))]
     {
         let mut options = OpenOptions::new();
         options.read(true).create(false);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
         }
         #[cfg(unix)]
         {
@@ -548,7 +574,14 @@ fn open_existing_read_only(path: &Path) -> Result<fs::File> {
         }
         Ok(options.open(path)?)
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    )))]
     {
         let _ = path;
         bail!("existing-only evidence reads unavailable on this platform")
@@ -557,12 +590,17 @@ fn open_existing_read_only(path: &Path) -> Result<fs::File> {
 
 fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
     let md = file.metadata()?;
-    anyhow::ensure!(md.is_file() && !is_link_or_reparse(&md),
-        "existing evidence descriptor must be a regular non-link file");
+    anyhow::ensure!(
+        md.is_file() && !is_link_or_reparse(&md),
+        "existing evidence descriptor must be a regular non-link file"
+    );
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt;
-        anyhow::ensure!(md.nlink() == 1, "existing evidence descriptor must be single-link");
+        anyhow::ensure!(
+            md.nlink() == 1,
+            "existing evidence descriptor must be single-link"
+        );
         (md.dev(), md.ino())
     };
     #[cfg(windows)]
@@ -573,12 +611,17 @@ fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
         };
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-            return Err(std::io::Error::last_os_error()).context("reading existing evidence identity");
+            return Err(std::io::Error::last_os_error())
+                .context("reading existing evidence identity");
         }
-        anyhow::ensure!(info.nNumberOfLinks == 1 && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-            "existing evidence descriptor must be a non-link single-link file");
-        (info.dwVolumeSerialNumber as u64,
-            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+        anyhow::ensure!(
+            info.nNumberOfLinks == 1 && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "existing evidence descriptor must be a non-link single-link file"
+        );
+        (
+            info.dwVolumeSerialNumber as u64,
+            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        )
     };
     #[cfg(not(any(unix, windows)))]
     let identity = {

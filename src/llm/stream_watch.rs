@@ -37,7 +37,10 @@ impl Watchdog {
         deadline.saturating_duration_since(now)
     }
 
-    pub(crate) async fn wait<T>(&self, next: impl std::future::Future<Output = T>) -> Result<T, ()> {
+    pub(crate) async fn wait<T>(
+        &self,
+        next: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
         // A ready ping must not win against an already-expired deadline.
         let remaining = self.remaining();
         if remaining.is_zero() {
@@ -133,11 +136,17 @@ mod tests {
     #[test]
     fn reasoning_and_advancing_tools_are_progress_but_repeated_headers_are_not() {
         let mut watch = Watchdog::new(Duration::from_secs(60), Duration::from_secs(10));
-        assert!(watch.observe(&chunk(r#"{"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#)));
-        let header = chunk(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"file_read","arguments":""}}]}}]}"#);
+        assert!(watch.observe(&chunk(
+            r#"{"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#
+        )));
+        let header = chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"file_read","arguments":""}}]}}]}"#,
+        );
         assert!(watch.observe(&header));
         assert!(!watch.observe(&header));
-        assert!(watch.observe(&chunk(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#)));
+        assert!(watch.observe(&chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#
+        )));
     }
 
     #[tokio::test]
@@ -147,7 +156,10 @@ mod tests {
         loop {
             // A provider that answers 200 and then pings forever must lose to the deadline even
             // though every read is immediately ready.
-            match watch.wait(async { Some(chunk(r#"{"type":"ping"}"#)) }).await {
+            match watch
+                .wait(async { Some(chunk(r#"{"type":"ping"}"#)) })
+                .await
+            {
                 Ok(Some(chunk)) => {
                     assert!(!watch.observe(&chunk));
                     assert!(started.elapsed() < Duration::from_secs(5));
@@ -173,9 +185,13 @@ mod tests {
     #[test]
     fn finish_tail_deadline_does_not_renew_on_metadata_or_more_content() {
         let mut watch = Watchdog::new(Duration::from_secs(60), Duration::from_secs(90));
-        watch.observe(&chunk(r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#));
+        watch.observe(&chunk(
+            r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        ));
         let finished = watch.finished;
-        watch.observe(&chunk(r#"{"choices":[{"delta":{"content":"late"},"finish_reason":"stop"}]}"#));
+        watch.observe(&chunk(
+            r#"{"choices":[{"delta":{"content":"late"},"finish_reason":"stop"}]}"#,
+        ));
         assert_eq!(watch.finished, finished);
         assert!(watch.remaining() <= Duration::from_secs(5));
         assert_eq!(watch.stage(), "completion trailer");

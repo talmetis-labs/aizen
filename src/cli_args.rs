@@ -1887,14 +1887,45 @@ mod time_recovery_report_args_tests {
             vec!["--record-observation"],
             vec!["--record-observation", "--cohort", "cohort"],
             vec!["--record-observation", "--prepared", "prepared"],
-            vec!["--record-observation", "--cohort", "cohort", "--prepared", "prepared", "--repair"],
+            vec![
+                "--record-observation",
+                "--cohort",
+                "cohort",
+                "--prepared",
+                "prepared",
+                "--repair",
+            ],
         ] {
-            assert!(Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err());
+            assert!(
+                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+            );
         }
-        let cli = Cli::try_parse_from(["aizen", "time", "doctor", "--cohort", "cohort", "--prepared", "prepared",
-            "--record-observation", "--resource", "a.txt", "--json"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared",
+            "--record-observation",
+            "--resource",
+            "a.txt",
+            "--json",
+        ])
+        .unwrap();
         match cli.command {
-            Some(Commands::Time { cmd: TimeCmd::Doctor { json, repair, cohort, prepared, resources, record_observation } }) => {
+            Some(Commands::Time {
+                cmd:
+                    TimeCmd::Doctor {
+                        json,
+                        repair,
+                        cohort,
+                        prepared,
+                        resources,
+                        record_observation,
+                    },
+            }) => {
                 assert!(record_observation && json && !repair);
                 assert_eq!(cohort.as_deref(), Some("cohort"));
                 assert_eq!(prepared.as_deref(), Some("prepared"));
@@ -1911,14 +1942,47 @@ mod time_recovery_report_args_tests {
             vec!["--prepared", "prepared"],
             vec!["--resource", "a.txt"],
             vec!["--cohort", "cohort", "--prepared", "prepared", "--repair"],
-            vec!["--cohort", "cohort", "--prepared", "prepared", "--resource", "a.txt", "--repair"],
+            vec![
+                "--cohort",
+                "cohort",
+                "--prepared",
+                "prepared",
+                "--resource",
+                "a.txt",
+                "--repair",
+            ],
         ] {
-            assert!(Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err());
+            assert!(
+                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+            );
         }
-        let cli = Cli::try_parse_from(["aizen", "time", "doctor", "--cohort", "cohort", "--prepared", "prepared",
-            "--resource", "a.txt", "--resource", "b.txt", "--json"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared",
+            "--resource",
+            "a.txt",
+            "--resource",
+            "b.txt",
+            "--json",
+        ])
+        .unwrap();
         match cli.command {
-            Some(Commands::Time { cmd: TimeCmd::Doctor { json, repair, cohort, prepared, resources, record_observation } }) => {
+            Some(Commands::Time {
+                cmd:
+                    TimeCmd::Doctor {
+                        json,
+                        repair,
+                        cohort,
+                        prepared,
+                        resources,
+                        record_observation,
+                    },
+            }) => {
                 assert!(!record_observation);
                 assert!(json);
                 assert!(!repair);
@@ -1928,7 +1992,16 @@ mod time_recovery_report_args_tests {
             }
             _ => panic!("expected exact recovery report doctor selection"),
         }
-        assert!(Cli::try_parse_from(["aizen", "time", "doctor", "--cohort", "cohort", "--prepared", "prepared"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared"
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from(["aizen", "time", "doctor"]).is_ok());
         assert!(Cli::try_parse_from(["aizen", "time", "doctor", "--repair"]).is_ok());
     }

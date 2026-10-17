@@ -56,12 +56,22 @@ pub(crate) struct PlannedFile {
 }
 
 impl PlannedFile {
-    pub(crate) fn key(&self) -> &str { &self.key }
-    pub(crate) fn resource(&self) -> &NativeResource { &self.resource }
-    pub(crate) fn expected(&self) -> &FileFingerprint { &self.expected }
-    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+    pub(crate) fn resource(&self) -> &NativeResource {
+        &self.resource
+    }
+    pub(crate) fn expected(&self) -> &FileFingerprint {
+        &self.expected
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
     #[cfg(test)]
-    pub(crate) fn contributors(&self) -> &[String] { &self.contributors }
+    pub(crate) fn contributors(&self) -> &[String] {
+        &self.contributors
+    }
 }
 
 pub(crate) struct IntegrationPlan {
@@ -118,11 +128,18 @@ pub(crate) struct IntegrationUnsettled {
 
 impl std::fmt::Display for IntegrationUnsettled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "integration effects are unsettled; retain prepared {}", self.prepared.as_str())?;
+        write!(
+            f,
+            "integration effects are unsettled; retain prepared {}",
+            self.prepared.as_str()
+        )?;
         if let Some(receipt) = &self.receipt {
             write!(f, " and receipt {}", receipt.as_str())?;
         }
-        write!(f, "; no retry, rollback or automatic recovery is authorized")
+        write!(
+            f,
+            "; no retry, rollback or automatic recovery is authorized"
+        )
     }
 }
 impl std::error::Error for IntegrationUnsettled {}
@@ -136,7 +153,11 @@ struct FingerprintDto {
 
 impl From<&FileFingerprint> for FingerprintDto {
     fn from(value: &FileFingerprint) -> Self {
-        Self { exists: value.exists, byte_len: value.byte_len, sha256: value.sha256 }
+        Self {
+            exists: value.exists,
+            byte_len: value.byte_len,
+            sha256: value.sha256,
+        }
     }
 }
 
@@ -236,10 +257,20 @@ impl IntegrationPlan {
         overlays: &[SealedOverlay],
         limits: &Limits,
     ) -> Result<PlanningOutcome> {
-        ensure!(!overlays.is_empty(), "integration requires at least one sealed overlay");
-        ensure!(overlays.len() <= MAX_OVERLAYS, "integration overlay count exceeds bound");
-        ensure!(parent.can_restore_workspace() && parent.native_scope().is_none() && parent.overlay().is_none(),
-            "integration planning requires the plain coordinating parent");
+        ensure!(
+            !overlays.is_empty(),
+            "integration requires at least one sealed overlay"
+        );
+        ensure!(
+            overlays.len() <= MAX_OVERLAYS,
+            "integration overlay count exceeds bound"
+        );
+        ensure!(
+            parent.can_restore_workspace()
+                && parent.native_scope().is_none()
+                && parent.overlay().is_none(),
+            "integration planning requires the plain coordinating parent"
+        );
         let owner = parent.resource_scope();
         ensure!(!owner.is_empty(), "integration parent scope is empty");
         let mut selected = BTreeSet::new();
@@ -247,19 +278,30 @@ impl IntegrationPlan {
         let mut observations = Vec::new();
         let mut input = Vec::new();
         for overlay in overlays {
-            ensure!(overlay.belongs_to(base), "sealed overlay belongs to another base");
-            ensure!(selected.insert(overlay.id()), "duplicate sealed integration overlay");
+            ensure!(
+                overlay.belongs_to(base),
+                "sealed overlay belongs to another base"
+            );
+            ensure!(
+                selected.insert(overlay.id()),
+                "duplicate sealed integration overlay"
+            );
             let overlay_owner = overlay.owner();
             ensure!(
                 overlay_owner == owner
-                    || overlay_owner.strip_prefix(&owner).is_some_and(|tail| tail.starts_with('/')),
+                    || overlay_owner
+                        .strip_prefix(&owner)
+                        .is_some_and(|tail| tail.starts_with('/')),
                 "sealed overlay owner is outside parent scope"
             );
             let author = format!("{}/{}", overlay_owner, overlay.id());
             let identity = overlay.manifest_identity()?;
-            ensure!(identity.base == base.id() && identity.overlay == overlay.id()
-                && identity.owner == overlay_owner,
-                "sealed overlay manifest identity differs from live lineage");
+            ensure!(
+                identity.base == base.id()
+                    && identity.overlay == overlay.id()
+                    && identity.owner == overlay_owner,
+                "sealed overlay manifest identity differs from live lineage"
+            );
             lineage.push(OverlayLineage {
                 base: identity.base,
                 owner: identity.owner,
@@ -270,38 +312,65 @@ impl IntegrationPlan {
             });
             for observation in overlay.observations()? {
                 observations.push(ObservationEvidence {
-                    author: author.clone(), key: observation.resource().key().to_owned(),
-                    path: observation.resource().path().to_path_buf(), generation: observation.generation(),
+                    author: author.clone(),
+                    key: observation.resource().key().to_owned(),
+                    path: observation.resource().path().to_path_buf(),
+                    generation: observation.generation(),
                     fingerprint: observation.fingerprint().into(),
                 });
             }
             for change in overlay.changes()? {
                 validate_change_history(&change)?;
                 input.push((author.clone(), change));
-                ensure!(input.len() <= MAX_INPUT_CHANGES, "integration changed-image count exceeds bound");
+                ensure!(
+                    input.len() <= MAX_INPUT_CHANGES,
+                    "integration changed-image count exceeds bound"
+                );
             }
         }
         lineage.sort_by(|a, b| a.author.cmp(&b.author));
-        observations.sort_by(|a, b| a.author.cmp(&b.author)
-            .then(a.key.cmp(&b.key)).then(a.generation.cmp(&b.generation)));
+        observations.sort_by(|a, b| {
+            a.author
+                .cmp(&b.author)
+                .then(a.key.cmp(&b.key))
+                .then(a.generation.cmp(&b.generation))
+        });
         let mut dependencies: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for observation in &observations {
             for (author, change) in &input {
                 if author != &observation.author && change.resource().key() == observation.key {
-                    dependencies.entry((observation.author.clone(), observation.key.clone()))
-                        .or_default().insert(author.clone());
+                    dependencies
+                        .entry((observation.author.clone(), observation.key.clone()))
+                        .or_default()
+                        .insert(author.clone());
                 }
             }
         }
-        let read_dependencies: Vec<_> = dependencies.into_iter().map(|((observer, key), peers)| {
-            ReadDependencyConcern { observer, key, peer_authors: peers.into_iter().collect() }
-        }).collect();
-        input.sort_by(|a, b| a.1.resource().key().cmp(b.1.resource().key()).then(a.0.cmp(&b.0)));
+        let read_dependencies: Vec<_> = dependencies
+            .into_iter()
+            .map(|((observer, key), peers)| ReadDependencyConcern {
+                observer,
+                key,
+                peer_authors: peers.into_iter().collect(),
+            })
+            .collect();
+        input.sort_by(|a, b| {
+            a.1.resource()
+                .key()
+                .cmp(b.1.resource().key())
+                .then(a.0.cmp(&b.0))
+        });
         let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, (_, change)) in input.iter().enumerate() {
-            grouped.entry(change.resource().key().to_owned()).or_default().push(index);
+            grouped
+                .entry(change.resource().key().to_owned())
+                .or_default()
+                .push(index);
         }
-        ensure!(grouped.len() <= MAX_PLAN_FILES, "integration changed-file count exceeds bound");
+        ensure!(
+            grouped.len() <= MAX_PLAN_FILES,
+            "integration changed-file count exceeds bound"
+        );
         let mut files = Vec::new();
         let mut conflicts = Vec::new();
         for (key, members) in grouped {
@@ -310,48 +379,79 @@ impl IntegrationPlan {
             let mut changes = Vec::with_capacity(members.len());
             for index in members {
                 let (author, change) = &input[index];
-                ensure!(change.resource() == first.resource(), "integration resource identity differs for key");
+                ensure!(
+                    change.resource() == first.resource(),
+                    "integration resource identity differs for key"
+                );
                 // Provenance is per change. One rewrite must not relabel another child's localized edit.
                 let operation = change_operation(change);
                 changes.push(ChangeLineage {
-                    author: author.clone(), generation: change.generation(), operation: operation_name(operation),
+                    author: author.clone(),
+                    generation: change.generation(),
+                    operation: operation_name(operation),
                 });
                 authored.push(AuthoredChange {
-                    author, base: change.base_bytes(), result: change.bytes(), operation,
+                    author,
+                    base: change.base_bytes(),
+                    result: change.bytes(),
+                    operation,
                 });
             }
-            let operation = if authored.iter().any(|change| change.operation == Operation::Rewrite) {
+            let operation = if authored
+                .iter()
+                .any(|change| change.operation == Operation::Rewrite)
+            {
                 Operation::Rewrite
             } else {
                 Operation::Localized
             };
             match merge::merge(language_for(first.resource().path()), &authored, limits) {
-                Ok(candidate) => files.push(planned_file(key, first, candidate, operation, changes)),
+                Ok(candidate) => {
+                    files.push(planned_file(key, first, candidate, operation, changes))
+                }
                 Err(conflict) => conflicts.push(conflict_artifact(key, conflict)),
             }
         }
         if !conflicts.is_empty() {
             // A conflict outcome must not be the sole, ephemeral copy of conflict evidence.
-            let metadata = bounded_metadata(&serde_json::json!({
-                "schema": 1, "overlay_lineage_version": 1,
-                "state": "conflicted", "base": base.id(), "owner": owner,
-                "overlays": lineage, "observations": observations,
-                "read_dependencies": read_dependencies, "conflicts": conflicts,
-            }), "conflict")?;
+            let metadata = bounded_metadata(
+                &serde_json::json!({
+                    "schema": 1, "overlay_lineage_version": 1,
+                    "state": "conflicted", "base": base.id(), "owner": owner,
+                    "overlays": lineage, "observations": observations,
+                    "read_dependencies": read_dependencies, "conflicts": conflicts,
+                }),
+                "conflict",
+            )?;
             base.controller_record(&owner, "integration-conflict", &metadata, &[])?;
             return Ok(PlanningOutcome::Conflicted(conflicts));
         }
         // BTreeMap traversal has already established deterministic file and image ordering.
-        let prepared_meta = prepared_metadata(base, &owner, &files, &lineage, &observations, &read_dependencies)?;
+        let prepared_meta = prepared_metadata(
+            base,
+            &owner,
+            &files,
+            &lineage,
+            &observations,
+            &read_dependencies,
+        )?;
         Ok(PlanningOutcome::Ready(Self {
-            base: base.clone(), files, parent_scope: owner, prepared_meta, read_dependencies,
+            base: base.clone(),
+            files,
+            parent_scope: owner,
+            prepared_meta,
+            read_dependencies,
         }))
     }
 
     #[cfg(test)]
-    pub(crate) fn files(&self) -> &[PlannedFile] { &self.files }
+    pub(crate) fn files(&self) -> &[PlannedFile] {
+        &self.files
+    }
     #[cfg(test)]
-    pub(crate) fn read_dependencies(&self) -> &[ReadDependencyConcern] { &self.read_dependencies }
+    pub(crate) fn read_dependencies(&self) -> &[ReadDependencyConcern] {
+        &self.read_dependencies
+    }
 
     /// The caller acquires writer -> exclusive physical admission. This method only acquires the
     /// later, globally sorted resource locks; it MUST NOT nest another physical lease.
@@ -362,55 +462,109 @@ impl IntegrationPlan {
         physical: &PhysicalEffectLease,
         cancel: Option<&crate::core::cancel::TurnCancel>,
     ) -> Result<IntegrationReceipt> {
-        ensure!(physical.is_exclusive(), "integration requires exclusive physical admission");
-        ensure!(parent.can_restore_workspace(), "delegated execution cannot integrate a cohort");
-        ensure!(parent.native_scope().is_none() && parent.overlay().is_none(), "integration requires the plain parent lane");
-        let current = crate::core::exec_ctx::current().context("integration requires the current parent context")?;
-        ensure!(current.resource_scope() == parent.resource_scope()
-            && current.can_restore_workspace() && current.native_scope().is_none() && current.overlay().is_none(),
-            "integration parent is not current");
-        ensure!(parent.resource_scope() == self.parent_scope, "integration plan belongs to another parent");
-        ensure!(cancel.is_none_or(|token| !token.is_cancelled()), "integration cancelled before admission");
-        ensure!(self.files.len() <= MAX_PLAN_FILES, "integration file count exceeds bound");
-        ensure!(writer.identity() == self.base.identity(), "integration writer identity differs from base");
-        let requests = self.files.iter().map(|file| LockRequest::new(
-            LockClass::Resource,
-            crate::core::workspace_txn::resource_lock("native-file", file.key()),
-            LockMode::Exclusive,
-            "speculation integration exact file",
-        )).collect();
+        ensure!(
+            physical.is_exclusive(),
+            "integration requires exclusive physical admission"
+        );
+        ensure!(
+            parent.can_restore_workspace(),
+            "delegated execution cannot integrate a cohort"
+        );
+        ensure!(
+            parent.native_scope().is_none() && parent.overlay().is_none(),
+            "integration requires the plain parent lane"
+        );
+        let current = crate::core::exec_ctx::current()
+            .context("integration requires the current parent context")?;
+        ensure!(
+            current.resource_scope() == parent.resource_scope()
+                && current.can_restore_workspace()
+                && current.native_scope().is_none()
+                && current.overlay().is_none(),
+            "integration parent is not current"
+        );
+        ensure!(
+            parent.resource_scope() == self.parent_scope,
+            "integration plan belongs to another parent"
+        );
+        ensure!(
+            cancel.is_none_or(|token| !token.is_cancelled()),
+            "integration cancelled before admission"
+        );
+        ensure!(
+            self.files.len() <= MAX_PLAN_FILES,
+            "integration file count exceeds bound"
+        );
+        ensure!(
+            writer.identity() == self.base.identity(),
+            "integration writer identity differs from base"
+        );
+        let requests = self
+            .files
+            .iter()
+            .map(|file| {
+                LockRequest::new(
+                    LockClass::Resource,
+                    crate::core::workspace_txn::resource_lock("native-file", file.key()),
+                    LockMode::Exclusive,
+                    "speculation integration exact file",
+                )
+            })
+            .collect();
         let _locks = LockSet::acquire(
-            requests, MAX_TIMEOUT, cancel,
+            requests,
+            MAX_TIMEOUT,
+            cancel,
             &LockOwner::new(parent.resource_scope(), "speculation integration"),
         )?;
         self.base.revalidate_live(writer, physical)?;
-        for file in &self.files { file.resource.verify()?; }
+        for file in &self.files {
+            file.resource.verify()?;
+        }
         let images = self.prepared_images()?;
-        let image_bytes = images.iter().try_fold(0usize, |sum, bytes| sum.checked_add(bytes.len()))
+        let image_bytes = images
+            .iter()
+            .try_fold(0usize, |sum, bytes| sum.checked_add(bytes.len()))
             .context("integration image reservation overflow")?;
         // Both evidence records and ALL their image capacity are reserved before any live effect.
         let mut reservation = self.base.reserve_controller_records(
-            &self.parent_scope, 2, MAX_RECORD_RESERVATION_META, image_bytes,
+            &self.parent_scope,
+            2,
+            MAX_RECORD_RESERVATION_META,
+            image_bytes,
         )?;
-        let writes: Vec<_> = self.files.iter()
-            .map(|file| (file.resource(), file.expected(), file.bytes())).collect();
+        let writes: Vec<_> = self
+            .files
+            .iter()
+            .map(|file| (file.resource(), file.expected(), file.bytes()))
+            .collect();
         // Retain the actual late journal lock so every file's capacity is admitted before source
         // effects; no other workspace can consume this batch's records or image bytes mid-apply.
         let mut batch = native_journal::begin_covered_batch(&self.parent_scope, &writes)?;
-        let native_coverage = batch.coverage_identity()
-            .context("integration batch lacks complete native-intent coverage")?.clone();
+        let native_coverage = batch
+            .coverage_identity()
+            .context("integration batch lacks complete native-intent coverage")?
+            .clone();
         native_coverage.validate()?;
         // Planning is pure/deterministic; attach the admitted durable fence only at materialization.
         // This exact identity must reach the prepared record before any batch entry is applied.
         let mut prepared_value: serde_json::Value = serde_json::from_slice(&self.prepared_meta)?;
-        prepared_value.as_object_mut().context("integration prepared metadata is not an object")?
-            .insert("native_coverage".into(), serde_json::to_value(&native_coverage)?);
+        prepared_value
+            .as_object_mut()
+            .context("integration prepared metadata is not an object")?
+            .insert(
+                "native_coverage".into(),
+                serde_json::to_value(&native_coverage)?,
+            );
         let prepared_meta = bounded_metadata(&prepared_value, "covered prepared")?;
         let image_refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
         #[cfg(test)]
         test_fault(TestFault::BeforePrepared)?;
         let prepared = self.base.controller_record_reserved(
-            &mut reservation, "integration-prepared", &prepared_meta, &image_refs,
+            &mut reservation,
+            "integration-prepared",
+            &prepared_meta,
+            &image_refs,
         )?;
         let mut applied = 0usize;
         let mut native_record_ids = vec![None; self.files.len()];
@@ -435,13 +589,15 @@ impl IntegrationPlan {
                     }
                 }
                 Err(error) => {
-                    if let Some(uncertain) = error.downcast_ref::<native_journal::PossiblyApplied>() {
+                    if let Some(uncertain) = error.downcast_ref::<native_journal::PossiblyApplied>()
+                    {
                         possible_index = Some(index);
                         possible_record = Some(uncertain.record_id);
                         native_record_ids[index] = Some(uncertain.record_id);
                         parent.note_workspace_changes(&[file.resource.path().to_path_buf()]);
                     }
-                    failure = Some(error.context(format!("integration stopped after {applied} files")));
+                    failure =
+                        Some(error.context(format!("integration stopped after {applied} files")));
                     stop = Some("native-apply");
                     break;
                 }
@@ -462,8 +618,11 @@ impl IntegrationPlan {
                     #[cfg(test)]
                     test_fault(TestFault::Postimage)?;
                     file.resource.verify()?;
-                    ensure!(persist::fingerprint(file.resource.path())? == FileFingerprint::for_bytes(file.bytes()),
-                        "integration postimage does not match the prepared candidate");
+                    ensure!(
+                        persist::fingerprint(file.resource.path())?
+                            == FileFingerprint::for_bytes(file.bytes()),
+                        "integration postimage does not match the prepared candidate"
+                    );
                     Ok(())
                 })();
                 match check {
@@ -476,50 +635,104 @@ impl IntegrationPlan {
                 }
             }
         }
-        let postimage_verified = failure.is_none() && applied == self.files.len() && checked.iter().all(|checked| *checked);
-        let state = if postimage_verified { ReceiptState::AppliedUnverified } else { ReceiptState::Partial };
+        let postimage_verified = failure.is_none()
+            && applied == self.files.len()
+            && checked.iter().all(|checked| *checked);
+        let state = if postimage_verified {
+            ReceiptState::AppliedUnverified
+        } else {
+            ReceiptState::Partial
+        };
         let has_effects = applied > 0 || possible_index.is_some();
         let receipt_result = (|| -> Result<StoredRecordId> {
-            let receipt_meta = bounded_metadata(&ReceiptMetadata {
-                schema: 1, native_journal_linkage: 2, native_coverage: &native_coverage,
-                state: match state { ReceiptState::Partial => "partial", ReceiptState::AppliedUnverified => "applied-unverified" },
-                base: self.base.id(), owner: &self.parent_scope, prepared: prepared.as_str(), applied,
-                total: self.files.len(), postimage_verified, possibly_applied_record: possible_record, stop,
-                files: self.files.iter().enumerate().map(|(index, file)| ReceiptFile {
-                    key: &file.key,
-                    state: if index < applied { "applied" } else if possible_index == Some(index) { "possibly-applied" } else { "not-applied" },
-                    postimage_checked: checked[index],
-                    native_record_id: native_record_ids[index],
-                }).collect(),
-            }, "receipt")?;
+            let receipt_meta = bounded_metadata(
+                &ReceiptMetadata {
+                    schema: 1,
+                    native_journal_linkage: 2,
+                    native_coverage: &native_coverage,
+                    state: match state {
+                        ReceiptState::Partial => "partial",
+                        ReceiptState::AppliedUnverified => "applied-unverified",
+                    },
+                    base: self.base.id(),
+                    owner: &self.parent_scope,
+                    prepared: prepared.as_str(),
+                    applied,
+                    total: self.files.len(),
+                    postimage_verified,
+                    possibly_applied_record: possible_record,
+                    stop,
+                    files: self
+                        .files
+                        .iter()
+                        .enumerate()
+                        .map(|(index, file)| ReceiptFile {
+                            key: &file.key,
+                            state: if index < applied {
+                                "applied"
+                            } else if possible_index == Some(index) {
+                                "possibly-applied"
+                            } else {
+                                "not-applied"
+                            },
+                            postimage_checked: checked[index],
+                            native_record_id: native_record_ids[index],
+                        })
+                        .collect(),
+                },
+                "receipt",
+            )?;
             #[cfg(test)]
             test_fault(TestFault::BeforeReceipt)?;
-            self.base.controller_record_reserved(&mut reservation, "integration-receipt", &receipt_meta, &[])
+            self.base.controller_record_reserved(
+                &mut reservation,
+                "integration-receipt",
+                &receipt_meta,
+                &[],
+            )
         })();
         let receipt = match receipt_result {
             Ok(receipt) => receipt,
             Err(error) => {
                 if has_effects {
                     return Err(anyhow::Error::new(IntegrationUnsettled {
-                        possibly_applied_record: possible_record, prepared, receipt: None,
-                    }).context(format!("integration receipt persistence failed: {error:#}")));
+                        possibly_applied_record: possible_record,
+                        prepared,
+                        receipt: None,
+                    })
+                    .context(format!("integration receipt persistence failed: {error:#}")));
                 }
-                return Err(error.context("integration receipt persistence failed before any live effect"));
+                return Err(
+                    error.context("integration receipt persistence failed before any live effect")
+                );
             }
         };
         if let Some(error) = failure {
             if has_effects {
                 return Err(anyhow::Error::new(IntegrationUnsettled {
-                    possibly_applied_record: possible_record, prepared, receipt: Some(receipt),
-                }).context(format!("integration stopped: {error:#}")));
+                    possibly_applied_record: possible_record,
+                    prepared,
+                    receipt: Some(receipt),
+                })
+                .context(format!("integration stopped: {error:#}")));
             }
-            return Err(error.context(format!("integration stopped without live effects; receipt {}", receipt.as_str())));
+            return Err(error.context(format!(
+                "integration stopped without live effects; receipt {}",
+                receipt.as_str()
+            )));
         }
         Ok(IntegrationReceipt {
-            state, prepared, receipt, postimage_verified,
+            state,
+            prepared,
+            receipt,
+            postimage_verified,
             read_dependencies: self.read_dependencies.clone(),
-            applied_paths: self.files.iter().take(applied)
-                .map(|file| file.resource.path().to_string_lossy().into_owned()).collect(),
+            applied_paths: self
+                .files
+                .iter()
+                .take(applied)
+                .map(|file| file.resource.path().to_string_lossy().into_owned())
+                .collect(),
         })
     }
 
@@ -527,8 +740,14 @@ impl IntegrationPlan {
         let mut images = Vec::with_capacity(self.files.len() * 2);
         for file in &self.files {
             if file.expected.exists {
-                let bytes = self.base.image(file.resource())?.context("integration base image missing")?;
-                ensure!(FileFingerprint::for_bytes(&bytes) == file.expected, "integration base image fingerprint mismatch");
+                let bytes = self
+                    .base
+                    .image(file.resource())?
+                    .context("integration base image missing")?;
+                ensure!(
+                    FileFingerprint::for_bytes(&bytes) == file.expected,
+                    "integration base image fingerprint mismatch"
+                );
                 images.push(bytes);
             }
             images.push(file.bytes.clone());
@@ -541,20 +760,30 @@ fn validate_change_history(change: &OverlayChange) -> Result<()> {
     let mut fingerprint = change.base_fingerprint();
     let mut generation = 0;
     for edit in change.edits() {
-        ensure!(edit.generation() > generation && edit.generation() <= change.generation(),
-            "overlay edit generations are not ordered");
-        ensure!(edit.before_fingerprint() == &fingerprint,
-            "overlay edit history does not match its exact preimage");
+        ensure!(
+            edit.generation() > generation && edit.generation() <= change.generation(),
+            "overlay edit generations are not ordered"
+        );
+        ensure!(
+            edit.before_fingerprint() == &fingerprint,
+            "overlay edit history does not match its exact preimage"
+        );
         fingerprint = FileFingerprint::for_bytes(edit.bytes());
         generation = edit.generation();
     }
-    ensure!(generation == change.generation() && fingerprint == change.fingerprint(),
-        "overlay edit history does not reach its sealed result");
+    ensure!(
+        generation == change.generation() && fingerprint == change.fingerprint(),
+        "overlay edit history does not reach its sealed result"
+    );
     Ok(())
 }
 
 fn change_operation(change: &OverlayChange) -> Operation {
-    if change.edits().iter().any(|edit| edit.provenance() == WriteProvenance::Rewrite) {
+    if change
+        .edits()
+        .iter()
+        .any(|edit| edit.provenance() == WriteProvenance::Rewrite)
+    {
         Operation::Rewrite
     } else {
         Operation::Localized
@@ -562,62 +791,123 @@ fn change_operation(change: &OverlayChange) -> Operation {
 }
 
 fn operation_name(operation: Operation) -> &'static str {
-    match operation { Operation::Localized => "localized", Operation::Rewrite => "rewrite" }
+    match operation {
+        Operation::Localized => "localized",
+        Operation::Rewrite => "rewrite",
+    }
 }
 
 fn planned_file(
-    key: String, change: &OverlayChange, candidate: Candidate, operation: Operation, lineage: Vec<ChangeLineage>,
+    key: String,
+    change: &OverlayChange,
+    candidate: Candidate,
+    operation: Operation,
+    lineage: Vec<ChangeLineage>,
 ) -> PlannedFile {
     PlannedFile {
-        key, resource: change.resource().clone(), expected: change.base_fingerprint(),
-        bytes: candidate.bytes, contributors: candidate.contributors, operation, lineage,
+        key,
+        resource: change.resource().clone(),
+        expected: change.base_fingerprint(),
+        bytes: candidate.bytes,
+        contributors: candidate.contributors,
+        operation,
+        lineage,
     }
 }
 
 fn language_for(path: &Path) -> Language {
-    if path.extension().and_then(|ext| ext.to_str()) == Some("rs") { Language::Rust } else { Language::Other }
+    if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+        Language::Rust
+    } else {
+        Language::Other
+    }
 }
 
 fn conflict_artifact(key: String, conflict: Conflict) -> ConflictArtifact {
-    ConflictArtifact { key, kind: format!("{:?}", conflict.kind), authors: conflict.authors, base_range: conflict.base_range }
+    ConflictArtifact {
+        key,
+        kind: format!("{:?}", conflict.kind),
+        authors: conflict.authors,
+        base_range: conflict.base_range,
+    }
 }
 
 fn prepared_metadata(
-    base: &BaseSnapshot, owner: &str, files: &[PlannedFile], overlays: &[OverlayLineage],
-    observations: &[ObservationEvidence], read_dependencies: &[ReadDependencyConcern],
+    base: &BaseSnapshot,
+    owner: &str,
+    files: &[PlannedFile],
+    overlays: &[OverlayLineage],
+    observations: &[ObservationEvidence],
+    read_dependencies: &[ReadDependencyConcern],
 ) -> Result<Vec<u8>> {
     let mut next_image = 0usize;
-    let files = files.iter().map(|file| {
-        let before_index = if file.expected.exists {
-            let index = next_image;
+    let files = files
+        .iter()
+        .map(|file| {
+            let before_index = if file.expected.exists {
+                let index = next_image;
+                next_image += 1;
+                Some(index)
+            } else {
+                None
+            };
+            let after_index = next_image;
             next_image += 1;
-            Some(index)
-        } else { None };
-        let after_index = next_image;
-        next_image += 1;
-        let after = FileFingerprint::for_bytes(&file.bytes);
-        PreparedFile {
-            key: &file.key, path: file.resource.path(), expected: (&file.expected).into(), after: (&after).into(),
-            preimage: PreparedImage { index: before_index, missing: !file.expected.exists, fingerprint: (&file.expected).into() },
-            postimage: PreparedImage { index: Some(after_index), missing: false, fingerprint: (&after).into() },
-            contributors: &file.contributors, operation: operation_name(file.operation), lineage: &file.lineage,
-        }
-    }).collect();
-    bounded_metadata(&PreparedMetadata {
-        schema: 1, overlay_lineage_version: 1, state: "prepared", base: base.id(), owner,
-        overlays, observations, read_dependencies, files,
-    }, "prepared")
+            let after = FileFingerprint::for_bytes(&file.bytes);
+            PreparedFile {
+                key: &file.key,
+                path: file.resource.path(),
+                expected: (&file.expected).into(),
+                after: (&after).into(),
+                preimage: PreparedImage {
+                    index: before_index,
+                    missing: !file.expected.exists,
+                    fingerprint: (&file.expected).into(),
+                },
+                postimage: PreparedImage {
+                    index: Some(after_index),
+                    missing: false,
+                    fingerprint: (&after).into(),
+                },
+                contributors: &file.contributors,
+                operation: operation_name(file.operation),
+                lineage: &file.lineage,
+            }
+        })
+        .collect();
+    bounded_metadata(
+        &PreparedMetadata {
+            schema: 1,
+            overlay_lineage_version: 1,
+            state: "prepared",
+            base: base.id(),
+            owner,
+            overlays,
+            observations,
+            read_dependencies,
+            files,
+        },
+        "prepared",
+    )
 }
 
 fn bounded_metadata(value: &impl Serialize, label: &str) -> Result<Vec<u8>> {
     let metadata = serde_json::to_vec(value)?;
-    ensure!(metadata.len() <= MAX_RECORD_META, "integration {label} metadata exceeds durable record bound");
+    ensure!(
+        metadata.len() <= MAX_RECORD_META,
+        "integration {label} metadata exceeds durable record bound"
+    );
     Ok(metadata)
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TestFault { BeforePrepared, AfterApplied(usize), Postimage, BeforeReceipt }
+enum TestFault {
+    BeforePrepared,
+    AfterApplied(usize),
+    Postimage,
+    BeforeReceipt,
+}
 #[cfg(test)]
 thread_local! { static TEST_FAULT: std::cell::Cell<Option<TestFault>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]

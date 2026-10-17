@@ -31,13 +31,16 @@ pub(crate) struct WorkerJoinTestProbe(Arc<dyn Fn(usize) + Send + Sync>);
 
 #[cfg(test)]
 impl WorkerJoinTestProbe {
-    pub(crate) fn new(probe: impl Fn(usize) + Send + Sync + 'static) -> Self { Self(Arc::new(probe)) }
+    pub(crate) fn new(probe: impl Fn(usize) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(probe))
+    }
 }
 
 #[cfg(test)]
 impl std::fmt::Debug for WorkerJoinTestProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkerJoinTestProbe").finish_non_exhaustive()
+        f.debug_struct("WorkerJoinTestProbe")
+            .finish_non_exhaustive()
     }
 }
 
@@ -74,7 +77,9 @@ pub(crate) struct JoinedToolBodies {
 }
 
 impl ToolWorkerOwner {
-    pub(crate) fn new() -> Self { Self::new_with_optional_lifecycle(None) }
+    pub(crate) fn new() -> Self {
+        Self::new_with_optional_lifecycle(None)
+    }
 
     pub(crate) fn new_with_lifecycle(lifecycle: AttemptLifecycle) -> Self {
         Self::new_with_optional_lifecycle(Some(lifecycle))
@@ -83,24 +88,37 @@ impl ToolWorkerOwner {
     fn new_with_optional_lifecycle(lifecycle: Option<AttemptLifecycle>) -> Self {
         Self {
             admission: Arc::new(Mutex::new(Admission::default())),
-            pending: Vec::new(), joined: 0, unsettled: false, facts: Vec::new(), lifecycle,
+            pending: Vec::new(),
+            joined: 0,
+            unsettled: false,
+            facts: Vec::new(),
+            lifecycle,
         }
     }
 
     pub(crate) fn producer(&self) -> ToolWorkerProducer {
-        ToolWorkerProducer { admission: Arc::downgrade(&self.admission), lifecycle: self.lifecycle.clone() }
+        ToolWorkerProducer {
+            admission: Arc::downgrade(&self.admission),
+            lifecycle: self.lifecycle.clone(),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn observe_joins(&mut self, probe: WorkerJoinTestProbe) {
         let mut admission = self.admission.lock().unwrap();
-        assert!(!admission.closed && admission.handles.is_empty(), "join probe must precede launch");
+        assert!(
+            !admission.closed && admission.handles.is_empty(),
+            "join probe must precede launch"
+        );
         admission.join_probe = Some(probe);
     }
 
     /// Close launch admission without discarding any physical joins.
     pub(crate) fn close_admission(&mut self) {
-        let mut admission = self.admission.lock().unwrap_or_else(|error| error.into_inner());
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         admission.closed = true;
     }
 
@@ -125,7 +143,9 @@ impl ToolWorkerOwner {
             match result {
                 Ok(closed) => {
                     self.unsettled |= closed.effect != ToolEffectState::Settled;
-                    if let Some(fact) = closed.fact { self.facts.push(fact); }
+                    if let Some(fact) = closed.fact {
+                        self.facts.push(fact);
+                    }
                 }
                 Err(_) => self.unsettled = true,
             }
@@ -134,7 +154,10 @@ impl ToolWorkerOwner {
             !self.unsettled,
             ToolEffectsUnsettled(ToolEffectState::UnknownWorker)
         );
-        Ok(JoinedToolBodies { _workers: self.joined, facts: std::mem::take(&mut self.facts) })
+        Ok(JoinedToolBodies {
+            _workers: self.joined,
+            facts: std::mem::take(&mut self.facts),
+        })
     }
 }
 
@@ -142,7 +165,10 @@ impl Drop for ToolWorkerOwner {
     fn drop(&mut self) {
         // Prevent already-upgraded producers from launching after owner abandonment. Dropping
         // JoinHandles detaches their supervisors; it never aborts or fabricates closure proof.
-        let mut admission = self.admission.lock().unwrap_or_else(|error| error.into_inner());
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         admission.closed = true;
     }
 }
@@ -156,10 +182,16 @@ pub(crate) fn launch_prepared(
 ) -> Result<oneshot::Receiver<JoinedBody>> {
     match crate::agent::builtin::prepared_native_worker(prepared)? {
         Some(worker) => {
-            let lifecycle = producer.and_then(|producer| producer.lifecycle.clone())
+            let lifecycle = producer
+                .and_then(|producer| producer.lifecycle.clone())
                 .context("native worker producer has no live lifecycle controller")?;
             worker.check_lifecycle(&lifecycle)?;
-            launch_inner(producer, Some((lifecycle, worker.kind(), worker.digest())), body, panic_effect)
+            launch_inner(
+                producer,
+                Some((lifecycle, worker.kind(), worker.digest())),
+                body,
+                panic_effect,
+            )
         }
         None => launch(producer, body, panic_effect),
     }
@@ -170,8 +202,10 @@ pub(crate) fn launch(
     body: impl FnOnce() -> ToolOutcome + Send + 'static,
     panic_effect: ToolEffectState,
 ) -> Result<oneshot::Receiver<JoinedBody>> {
-    anyhow::ensure!(producer.is_none_or(|producer| producer.lifecycle.is_none()),
-        "native attempt requires a typed frozen worker; nothing started");
+    anyhow::ensure!(
+        producer.is_none_or(|producer| producer.lifecycle.is_none()),
+        "native attempt requires a typed frozen worker; nothing started"
+    );
     launch_inner(producer, None, body, panic_effect)
 }
 
@@ -188,22 +222,46 @@ fn launch_inner(
     panic_effect: ToolEffectState,
 ) -> Result<oneshot::Receiver<JoinedBody>> {
     let runtime = tokio::runtime::Handle::try_current().context("tool body requires a runtime")?;
-    let admission = producer.map(|producer| {
-        producer.admission.upgrade().context("tool-body owner is gone; nothing started")
-    }).transpose()?;
-    let mut gate = admission.as_ref().map(|admission| {
-        admission.lock().map_err(|_| anyhow::anyhow!("tool-body admission poisoned; nothing started"))
-    }).transpose()?;
+    let admission = producer
+        .map(|producer| {
+            producer
+                .admission
+                .upgrade()
+                .context("tool-body owner is gone; nothing started")
+        })
+        .transpose()?;
+    let mut gate = admission
+        .as_ref()
+        .map(|admission| {
+            admission
+                .lock()
+                .map_err(|_| anyhow::anyhow!("tool-body admission poisoned; nothing started"))
+        })
+        .transpose()?;
     if let Some(gate) = gate.as_ref() {
-        anyhow::ensure!(!gate.closed, "tool-body admission is closed; nothing started");
-        anyhow::ensure!(gate.handles.len() < MAX_BODIES, "tool-body inventory exceeds 128; nothing started");
+        anyhow::ensure!(
+            !gate.closed,
+            "tool-body admission is closed; nothing started"
+        );
+        anyhow::ensure!(
+            gate.handles.len() < MAX_BODIES,
+            "tool-body inventory exceeds 128; nothing started"
+        );
     }
-    let native = native.map(|(lifecycle, kind, prepared_sha256)| Ok::<_, anyhow::Error>(NativeLaunch {
-        ticket: lifecycle.reserve_launch()?, kind, prepared_sha256,
-    })).transpose()?;
+    let native = native
+        .map(|(lifecycle, kind, prepared_sha256)| {
+            Ok::<_, anyhow::Error>(NativeLaunch {
+                ticket: lifecycle.reserve_launch()?,
+                kind,
+                prepared_sha256,
+            })
+        })
+        .transpose()?;
     #[cfg(test)]
     let join_probe = gate.as_ref().and_then(|gate| {
-        gate.join_probe.clone().map(|probe| (probe, gate.handles.len()))
+        gate.join_probe
+            .clone()
+            .map(|probe| (probe, gate.handles.len()))
     });
     let (send, receive) = oneshot::channel();
     let delivery = Arc::new(Mutex::new(Some(send)));
@@ -269,9 +327,14 @@ fn launch_inner(
 }
 
 fn deliver(delivery: &Mutex<Option<oneshot::Sender<JoinedBody>>>, outcome: ToolOutcome) {
-    let joined = JoinedBody { completed: Instant::now(), outcome };
+    let joined = JoinedBody {
+        completed: Instant::now(),
+        outcome,
+    };
     if let Ok(mut send) = delivery.lock() {
-        if let Some(send) = send.take() { let _ = send.send(joined); }
+        if let Some(send) = send.take() {
+            let _ = send.send(joined);
+        }
     }
 }
 

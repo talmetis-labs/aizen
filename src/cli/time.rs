@@ -94,7 +94,14 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             );
             Ok(())
         }
-        TimeCmd::Doctor { json, repair, cohort, prepared, resources, record_observation } => {
+        TimeCmd::Doctor {
+            json,
+            repair,
+            cohort,
+            prepared,
+            resources,
+            record_observation,
+        } => {
             match (cohort, prepared) {
                 (Some(cohort), Some(prepared)) if !repair => {
                     return run_recovery_report(&cohort, &prepared, &resources, json, record_observation);
@@ -257,22 +264,35 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
 }
 
 /// Explicit inspection CLI boundary; metadata append requires its separate flag. No ordinary repair.
-fn run_recovery_report(cohort: &str, prepared: &str, resources: &[String], json: bool, record_observation: bool) -> Result<()> {
+fn run_recovery_report(
+    cohort: &str,
+    prepared: &str,
+    resources: &[String],
+    json: bool,
+    record_observation: bool,
+) -> Result<()> {
     use crate::core::exec_ctx::{self, ExecutionContext};
     let root = std::env::current_dir()?;
     let inspect = || {
-        if record_observation { timemachine::record_speculation_recovery_observation(&root, cohort, prepared, resources) }
-        else { timemachine::inspect_speculation_recovery(&root, cohort, prepared, resources) }
+        if record_observation {
+            timemachine::record_speculation_recovery_observation(&root, cohort, prepared, resources)
+        } else {
+            timemachine::inspect_speculation_recovery(&root, cohort, prepared, resources)
+        }
     };
     // Only this top-level CLI boundary may seat a parent; never replace an existing restriction.
     let report = if exec_ctx::current().is_some() {
         inspect()?
     } else {
-        let parent = ExecutionContext::default().with_resource_scope(format!("cli/recovery-report/{}", std::process::id()));
+        let parent = ExecutionContext::default()
+            .with_resource_scope(format!("cli/recovery-report/{}", std::process::id()));
         exec_ctx::with_current(parent, inspect)?
     };
-    if json { println!("{}", serde_json::to_string_pretty(&report.to_json())?); }
-    else { println!("{}", report.to_text()); }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+    } else {
+        println!("{}", report.to_text());
+    }
     Ok(())
 }
 

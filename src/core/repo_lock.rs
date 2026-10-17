@@ -70,7 +70,9 @@ impl RepoTxnLock {
     pub(crate) fn acquire_existing(path: &Path, mode: LockMode, timeout: Duration) -> Result<Self> {
         let resource = crate::core::workspace_txn::NativeResource::resolve(path)?;
         let stamp = crate::core::file_placement::NodeStamp::capture(
-            path, &std::fs::symlink_metadata(path)?, false,
+            path,
+            &std::fs::symlink_metadata(path)?,
+            false,
         )?;
         let file = open_existing_lock(path)?;
         let lock = Self::acquire_open_file(path, mode, timeout, None, file)?;
@@ -87,7 +89,9 @@ impl RepoTxnLock {
     pub(crate) fn verify_existing_path(&self, path: &Path) -> Result<()> {
         let resource = crate::core::workspace_txn::NativeResource::resolve(path)?;
         let stamp = crate::core::file_placement::NodeStamp::capture(
-            path, &std::fs::symlink_metadata(path)?, false,
+            path,
+            &std::fs::symlink_metadata(path)?,
+            false,
         )?;
         self.verify_existing_stamp(path, &stamp)?;
         resource.verify()
@@ -99,11 +103,18 @@ impl RepoTxnLock {
         stamp: &crate::core::file_placement::NodeStamp,
     ) -> Result<()> {
         let owned = lock_file_identity(&self.file)?;
-        anyhow::ensure!((owned.0, owned.1) == stamp.identity(),
-            "existing transaction lock descriptor/path identity changed");
-        anyhow::ensure!(crate::core::file_placement::NodeStamp::capture(
-            path, &std::fs::symlink_metadata(path)?, false,
-        )? == *stamp, "existing transaction lock changed during inspection");
+        anyhow::ensure!(
+            (owned.0, owned.1) == stamp.identity(),
+            "existing transaction lock descriptor/path identity changed"
+        );
+        anyhow::ensure!(
+            crate::core::file_placement::NodeStamp::capture(
+                path,
+                &std::fs::symlink_metadata(path)?,
+                false,
+            )? == *stamp,
+            "existing transaction lock changed during inspection"
+        );
         Ok(())
     }
 
@@ -166,13 +177,27 @@ impl RepoTxnLock {
     /// descriptor cannot read a Windows byte-range-locked marker, even in the same process.
     pub(crate) fn read_bounded_exclusive(&self, limit: u64) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
-        anyhow::ensure!(self.mode == LockMode::Exclusive, "lock marker read requires exclusive ownership");
-        anyhow::ensure!(self.file.metadata()?.len() <= limit, "lock marker exceeds byte bound");
+        anyhow::ensure!(
+            self.mode == LockMode::Exclusive,
+            "lock marker read requires exclusive ownership"
+        );
+        anyhow::ensure!(
+            self.file.metadata()?.len() <= limit,
+            "lock marker exceeds byte bound"
+        );
         let mut file = &self.file;
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
-        file.take(limit.checked_add(1).context("lock marker byte bound overflow")?).read_to_end(&mut bytes)?;
-        anyhow::ensure!(bytes.len() as u64 <= limit, "lock marker exceeds byte bound");
+        file.take(
+            limit
+                .checked_add(1)
+                .context("lock marker byte bound overflow")?,
+        )
+        .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= limit,
+            "lock marker exceeds byte bound"
+        );
         Ok(bytes)
     }
 
@@ -189,7 +214,14 @@ impl Drop for RepoTxnLock {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+))]
 fn open_existing_lock(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(false);
@@ -208,13 +240,21 @@ fn open_existing_lock(path: &Path) -> Result<File> {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
         options.custom_flags(0x100 | 0x4);
     }
-    let file = options.open(path)
+    let file = options
+        .open(path)
         .with_context(|| format!("opening existing transaction lock {}", path.display()))?;
     lock_file_identity(&file)?;
     Ok(file)
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
 fn open_existing_lock(_path: &Path) -> Result<File> {
     anyhow::bail!("existing-only lock acquisition unavailable on this platform")
 }
@@ -229,20 +269,27 @@ fn lock_file_identity(file: &File) -> Result<(u64, u64, u64)> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(std::io::Error::last_os_error()).context("reading transaction lock identity");
     }
-    anyhow::ensure!(file.metadata()?.is_file()
-        && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 && info.nNumberOfLinks == 1,
-        "existing transaction lock must be a regular non-link single-link file");
-    Ok((info.dwVolumeSerialNumber as u64,
+    anyhow::ensure!(
+        file.metadata()?.is_file()
+            && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            && info.nNumberOfLinks == 1,
+        "existing transaction lock must be a regular non-link single-link file"
+    );
+    Ok((
+        info.dwVolumeSerialNumber as u64,
         ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
-        info.nNumberOfLinks as u64))
+        info.nNumberOfLinks as u64,
+    ))
 }
 
 #[cfg(unix)]
 fn lock_file_identity(file: &File) -> Result<(u64, u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let md = file.metadata()?;
-    anyhow::ensure!(md.is_file() && md.nlink() == 1,
-        "existing transaction lock must be a regular non-link single-link file");
+    anyhow::ensure!(
+        md.is_file() && md.nlink() == 1,
+        "existing transaction lock must be a regular non-link single-link file"
+    );
     Ok((md.dev(), md.ino(), md.nlink()))
 }
 
@@ -415,14 +462,16 @@ mod tests {
         let path = fixture.path().join("owner.lock");
         std::fs::write(&path, b"marker").unwrap();
         let first = RepoTxnLock::acquire_existing(&path, LockMode::Shared, Duration::ZERO).unwrap();
-        let second = RepoTxnLock::acquire_existing(&path, LockMode::Shared, Duration::ZERO).unwrap();
+        let second =
+            RepoTxnLock::acquire_existing(&path, LockMode::Shared, Duration::ZERO).unwrap();
         let error = RepoTxnLock::acquire_existing_exclusive(&path, Duration::ZERO).unwrap_err();
         assert!(error.downcast_ref::<LockBusy>().is_some(), "{error:#}");
         first.verify_existing_path(&path).unwrap();
         second.verify_existing_path(&path).unwrap();
         drop((first, second));
         let owner = RepoTxnLock::acquire_existing_exclusive(&path, Duration::ZERO).unwrap();
-        let error = RepoTxnLock::acquire_existing(&path, LockMode::Shared, Duration::ZERO).unwrap_err();
+        let error =
+            RepoTxnLock::acquire_existing(&path, LockMode::Shared, Duration::ZERO).unwrap_err();
         assert!(error.downcast_ref::<LockBusy>().is_some(), "{error:#}");
         drop(owner);
         assert_eq!(std::fs::read(&path).unwrap(), b"marker");
@@ -439,7 +488,10 @@ mod tests {
         assert!(owner.verify_existing_path(&path).is_err());
         assert!(!path.exists());
         std::fs::write(&path, b"marker").unwrap();
-        assert!(owner.verify_existing_path(&path).is_err(), "identical bytes cannot replace lock identity");
+        assert!(
+            owner.verify_existing_path(&path).is_err(),
+            "identical bytes cannot replace lock identity"
+        );
         owner.verify_existing_path(&retained).unwrap();
         drop(owner);
         std::fs::remove_file(&retained).unwrap();
@@ -462,22 +514,34 @@ mod tests {
         let substituted = fixture.path().join("substituted.lock");
         std::fs::write(&path, b"same bytes").unwrap();
         let stamp = crate::core::file_placement::NodeStamp::capture(
-            &path, &std::fs::symlink_metadata(&path).unwrap(), false,
-        ).unwrap();
+            &path,
+            &std::fs::symlink_metadata(&path).unwrap(),
+            false,
+        )
+        .unwrap();
         std::fs::rename(&path, &original).unwrap();
         std::fs::write(&path, b"same bytes").unwrap();
         let file = open_existing_lock(&path).unwrap();
-        let owner = RepoTxnLock::acquire_open_file(
-            &path, LockMode::Exclusive, Duration::ZERO, None, file,
-        ).unwrap();
+        let owner =
+            RepoTxnLock::acquire_open_file(&path, LockMode::Exclusive, Duration::ZERO, None, file)
+                .unwrap();
         owner.verify_existing_path(&path).unwrap();
         std::fs::rename(&path, &substituted).unwrap();
         std::fs::rename(&original, &path).unwrap();
-        assert_eq!(crate::core::file_placement::NodeStamp::capture(
-            &path, &std::fs::symlink_metadata(&path).unwrap(), false,
-        ).unwrap(), stamp, "pathname ABA restores the exact original node");
-        assert!(owner.verify_existing_stamp(&path, &stamp).is_err(),
-            "a matching pathname stamp cannot bless a different locked descriptor");
+        assert_eq!(
+            crate::core::file_placement::NodeStamp::capture(
+                &path,
+                &std::fs::symlink_metadata(&path).unwrap(),
+                false,
+            )
+            .unwrap(),
+            stamp,
+            "pathname ABA restores the exact original node"
+        );
+        assert!(
+            owner.verify_existing_stamp(&path, &stamp).is_err(),
+            "a matching pathname stamp cannot bless a different locked descriptor"
+        );
         drop(owner);
         assert_eq!(std::fs::read(&path).unwrap(), b"same bytes");
         assert_eq!(std::fs::read(&substituted).unwrap(), b"same bytes");
@@ -525,7 +589,6 @@ mod tests {
         RepoTxnLock::acquire_exclusive(&path, Duration::from_millis(100)).unwrap();
         let _ = std::fs::remove_file(path);
     }
-
 
     #[test]
     fn cancellation_stops_a_waiter_without_releasing_owner() {

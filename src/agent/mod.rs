@@ -1162,7 +1162,13 @@ where
     // be mistaken for the request.
     retire_nudges(messages);
     let scoped = pin_placement_context(cfg)?;
-    run_agent_loop_body(chat, summarize, oracle, &scoped, registry, messages).await
+    let run = run_agent_loop_body(chat, summarize, oracle, &scoped, registry, messages);
+    #[cfg(test)]
+    let run = crate::core::workspace_txn::with_test_lock_namespace_future(
+        scoped.exec_ctx.test_lock_namespace().cloned(),
+        run,
+    );
+    run.await
 }
 
 fn pin_placement_context(cfg: &AgentConfig) -> Result<AgentConfig> {
@@ -1772,8 +1778,12 @@ where
                 }
                 match crate::core::cancel::race(
                     &cfg.cancel,
-                    crate::llm::delegated::run(call_control.as_ref(), chat(messages.clone(), defs.clone())),
-                ).await
+                    crate::llm::delegated::run(
+                        call_control.as_ref(),
+                        chat(messages.clone(), defs.clone()),
+                    ),
+                )
+                .await
                 {
                     None => {
                         if nudge_pushed {
@@ -1834,7 +1844,12 @@ where
                                 ),
                                 delay,
                             );
-                            if goal_sleep_or_cancel(&cfg.cancel, crate::llm::delegated::remaining(call_control.as_ref(), delay)).await {
+                            if goal_sleep_or_cancel(
+                                &cfg.cancel,
+                                crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                            )
+                            .await
+                            {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
@@ -1902,7 +1917,12 @@ where
                                     &format!("client error; retry {permanent_tries}/{GOAL_PERMANENT_RETRIES}"),
                                     delay,
                                 );
-                            if goal_sleep_or_cancel(&cfg.cancel, crate::llm::delegated::remaining(call_control.as_ref(), delay)).await {
+                            if goal_sleep_or_cancel(
+                                &cfg.cancel,
+                                crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                            )
+                            .await
+                            {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
@@ -1928,7 +1948,12 @@ where
                             let delay = crate::llm::client::goal_backoff_ms(attempt);
                             attempt += 1;
                             goal_retry_line(&format!("API error; retry #{attempt}"), delay);
-                            if goal_sleep_or_cancel(&cfg.cancel, crate::llm::delegated::remaining(call_control.as_ref(), delay)).await {
+                            if goal_sleep_or_cancel(
+                                &cfg.cancel,
+                                crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                            )
+                            .await
+                            {
                                 if nudge_pushed {
                                     messages.pop();
                                 }
@@ -2019,8 +2044,12 @@ where
                 }
                 match crate::core::cancel::race(
                     &cfg.cancel,
-                    crate::llm::delegated::run(call_control.as_ref(), chat(messages.clone(), defs.clone())),
-                ).await
+                    crate::llm::delegated::run(
+                        call_control.as_ref(),
+                        chat(messages.clone(), defs.clone()),
+                    ),
+                )
+                .await
                 {
                     None => {
                         rollback(messages, empty_nudges, nudge_pushed);
@@ -2089,7 +2118,12 @@ where
                             ),
                             delay,
                         );
-                        if goal_sleep_or_cancel(&cfg.cancel, crate::llm::delegated::remaining(call_control.as_ref(), delay)).await {
+                        if goal_sleep_or_cancel(
+                            &cfg.cancel,
+                            crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                        )
+                        .await
+                        {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
                                 final_text: None,
@@ -2166,7 +2200,12 @@ where
                                 delay,
                             );
                         }
-                        if goal_sleep_or_cancel(&cfg.cancel, crate::llm::delegated::remaining(call_control.as_ref(), delay)).await {
+                        if goal_sleep_or_cancel(
+                            &cfg.cancel,
+                            crate::llm::delegated::remaining(call_control.as_ref(), delay),
+                        )
+                        .await
+                        {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
                                 final_text: None,
@@ -3874,16 +3913,27 @@ async fn execute_execution_calls_with_policy(
         // Direct native calls below retain their existing read/write conflict barriers.
         let mut speculative = Vec::new();
         for k in i..n.min(i + MAX_PARALLEL) {
-            let Some(tool) = registry.get_arc(&calls[k].function.name) else { break };
-            if tool.name() != "task" || eager.contains_key(&k) { break; }
+            let Some(tool) = registry.get_arc(&calls[k].function.name) else {
+                break;
+            };
+            if tool.name() != "task" || eager.contains_key(&k) {
+                break;
+            }
             if bind_at_boundary && parsed[k].as_ref().is_ok_and(|p| p.delegation.is_none()) {
-                parsed[k] = tool.prepare_call(
-                    &planned[k].as_ref().expect("parsed task has planned args").args,
-                    &cfg.exec_ctx,
-                ).map_err(|error| format!("error: {error}"));
+                parsed[k] = tool
+                    .prepare_call(
+                        &planned[k]
+                            .as_ref()
+                            .expect("parsed task has planned args")
+                            .args,
+                        &cfg.exec_ctx,
+                    )
+                    .map_err(|error| format!("error: {error}"));
             }
             let Ok(prepared) = &parsed[k] else { break };
-            if task_tool::speculative_scope(prepared).is_none() { break; }
+            if task_tool::speculative_scope(prepared).is_none() {
+                break;
+            }
             speculative.push((k, tool, prepared.clone()));
         }
         if !speculative.is_empty() {
@@ -3891,7 +3941,12 @@ async fn execute_execution_calls_with_policy(
             let mut approved = Vec::new();
             for (k, tool, prepared) in speculative {
                 if let Some(denied) = gate_prepared_and_approve(tool.as_ref(), &prepared, cfg) {
-                    land(k, note_unrun_prepared_call(tool.name(), &prepared, denied, cfg).into(), &mut results, sink);
+                    land(
+                        k,
+                        note_unrun_prepared_call(tool.name(), &prepared, denied, cfg).into(),
+                        &mut results,
+                        sink,
+                    );
                 } else {
                     approved.push((k, tool, prepared));
                 }
@@ -3900,14 +3955,28 @@ async fn execute_execution_calls_with_policy(
                 let root = cfg.effective_root();
                 let gate_dir = verify_gate::verify_root(&root).unwrap_or(root);
                 if let Some(baseline) = verify_gate::run_verify_gate_in_context(
-                    &gate_dir, cfg.verify_gate_timeout_secs, &cfg.exec_ctx,
-                ).await {
+                    &gate_dir,
+                    cfg.verify_gate_timeout_secs,
+                    &cfg.exec_ctx,
+                )
+                .await
+                {
                     if baseline.effect_state != tools::ToolEffectState::Settled {
                         for (k, tool, prepared) in approved.drain(..) {
-                            land(k, tools::ToolOutcome::failed_with_effect_state(
-                                note_unrun_prepared_call(tool.name(), &prepared, baseline.output.clone(), cfg),
-                                baseline.effect_state,
-                            ), &mut results, sink);
+                            land(
+                                k,
+                                tools::ToolOutcome::failed_with_effect_state(
+                                    note_unrun_prepared_call(
+                                        tool.name(),
+                                        &prepared,
+                                        baseline.output.clone(),
+                                        cfg,
+                                    ),
+                                    baseline.effect_state,
+                                ),
+                                &mut results,
+                                sink,
+                            );
                         }
                         cancelled = true;
                     } else {
@@ -3918,7 +3987,9 @@ async fn execute_execution_calls_with_policy(
             if !approved.is_empty() {
                 for (k, prepared, outcome) in speculation::run_task_cohort(approved, cfg).await {
                     parsed[k] = Ok(prepared);
-                    if outcome.effect_state != tools::ToolEffectState::Settled { cancelled = true; }
+                    if outcome.effect_state != tools::ToolEffectState::Settled {
+                        cancelled = true;
+                    }
                     land(k, outcome, &mut results, sink);
                 }
             }
@@ -4138,9 +4209,15 @@ async fn execute_execution_calls_with_policy(
                     let budgets = cfg.result_budgets();
                     let deadline = safe_tool_deadline(cfg);
                     let delegated = args.delegation.is_some();
-                    let cancel = if delegated { cfg.cancel.child() } else { cfg.cancel.clone() };
+                    let cancel = if delegated {
+                        cfg.cancel.child()
+                    } else {
+                        cfg.cancel.clone()
+                    };
                     let exec_ctx = if delegated {
-                        cfg.exec_ctx.clone().with_deadline(Some(deadline.into_std()))
+                        cfg.exec_ctx
+                            .clone()
+                            .with_deadline(Some(deadline.into_std()))
                     } else {
                         cfg.exec_ctx.clone()
                     };
@@ -4162,13 +4239,21 @@ async fn execute_execution_calls_with_policy(
                     };
                     let started = if delegated {
                         tools::StartedSafeCall::start_delegated(
-                            calls[k].id.clone(), args, cancel, deadline,
-                            cfg.exec_ctx.tool_workers(), body,
+                            calls[k].id.clone(),
+                            args,
+                            cancel,
+                            deadline,
+                            cfg.exec_ctx.tool_workers(),
+                            body,
                         )
                     } else {
                         tools::StartedSafeCall::start(
-                            calls[k].id.clone(), args, cancel, deadline,
-                            cfg.exec_ctx.tool_workers(), body,
+                            calls[k].id.clone(),
+                            args,
+                            cancel,
+                            deadline,
+                            cfg.exec_ctx.tool_workers(),
+                            body,
                         )
                     };
                     handles.push((k, started));
@@ -4472,15 +4557,18 @@ async fn execute_execution_calls_with_policy(
                                         move || {
                                             let _leases = (worker_lease, worker_additional_lease);
                                             crate::core::cancel::with_current(cancel, || {
-                                                crate::core::exec_ctx::with_current(exec_ctx, || {
-                                                    run_prepared_tool_body(
-                                                        tool,
-                                                        &args,
-                                                        quiet,
-                                                        budgets,
-                                                        image_destination,
-                                                    )
-                                                })
+                                                crate::core::exec_ctx::with_current(
+                                                    exec_ctx,
+                                                    || {
+                                                        run_prepared_tool_body(
+                                                            tool,
+                                                            &args,
+                                                            quiet,
+                                                            budgets,
+                                                            image_destination,
+                                                        )
+                                                    },
+                                                )
                                             })
                                         },
                                         tools::ToolEffectState::PossiblyApplied(None),
@@ -4751,9 +4839,15 @@ pub fn eager_starter<'a>(
         // deadline, so an expired observer stops this child instead of leaving it running unnoticed.
         let deadline = safe_tool_deadline(cfg);
         let delegated = prepared.delegation.is_some();
-        let turn_cancel = if delegated { cancel.child() } else { cancel.clone() };
+        let turn_cancel = if delegated {
+            cancel.child()
+        } else {
+            cancel.clone()
+        };
         let turn_ctx = if delegated {
-            cfg.exec_ctx.clone().with_deadline(Some(deadline.into_std()))
+            cfg.exec_ctx
+                .clone()
+                .with_deadline(Some(deadline.into_std()))
         } else {
             cfg.exec_ctx.clone()
         };
@@ -4903,7 +4997,10 @@ fn check_native_capability(
     let Some(scope) = ctx.native_scope() else {
         anyhow::ensure!(overlay.is_none(), "overlay lost its exact native authority");
         anyhow::ensure!(
-            !matches!(prepared.footprint, Some(tools::PreparedFootprint::Overlay { .. })),
+            !matches!(
+                prepared.footprint,
+                Some(tools::PreparedFootprint::Overlay { .. })
+            ),
             "private overlay call cannot execute in a live context"
         );
         return Ok(());
@@ -4917,19 +5014,32 @@ fn check_native_capability(
         let Some(tools::PreparedFootprint::Overlay { handle, files }) = &prepared.footprint else {
             anyhow::bail!("private overlay requires sealed private resources; no live fallback");
         };
-        anyhow::ensure!(active.same_handle(handle), "prepared overlay context changed");
+        anyhow::ensure!(
+            active.same_handle(handle),
+            "prepared overlay context changed"
+        );
         active.check_owner_scope(&ctx.resource_scope(), scope)?;
         anyhow::ensure!(!files.is_empty(), "private overlay has no approved files");
-        let root = ctx.placement().ok_or_else(|| anyhow::anyhow!("private overlay lost its workspace binding"))?.workspace_root();
+        let root = ctx
+            .placement()
+            .ok_or_else(|| anyhow::anyhow!("private overlay lost its workspace binding"))?
+            .workspace_root();
         for (file, mode) in files {
             active.check_file(file)?;
             let bound = active.resolve(root, file.logical_path())?;
-            anyhow::ensure!(bound.key() == file.key(), "private resource binding changed");
-            anyhow::ensure!(scope.resources().iter().any(|r| r.key() == file.key()),
-                "private read exceeds sealed native scope");
+            anyhow::ensure!(
+                bound.key() == file.key(),
+                "private resource binding changed"
+            );
+            anyhow::ensure!(
+                scope.resources().iter().any(|r| r.key() == file.key()),
+                "private read exceeds sealed native scope"
+            );
             if *mode == crate::core::repo_lock::LockMode::Exclusive {
-                anyhow::ensure!(file.is_writable() && scope.write_keys().iter().any(|k| k == file.key()),
-                    "private write exceeds sealed native scope");
+                anyhow::ensure!(
+                    file.is_writable() && scope.write_keys().iter().any(|k| k == file.key()),
+                    "private write exceeds sealed native scope"
+                );
             }
         }
         let worker = builtin::prepared_native_worker(prepared)?
@@ -4941,7 +5051,10 @@ fn check_native_capability(
             "file_write" => crate::core::speculation::workers::NativeWorkerKind::Write,
             _ => unreachable!("native file allowlist checked above"),
         };
-        anyhow::ensure!(worker.kind() == kind, "prepared private operation belongs to another tool");
+        anyhow::ensure!(
+            worker.kind() == kind,
+            "prepared private operation belongs to another tool"
+        );
         return Ok(());
     }
     let Some(tools::PreparedFootprint::Native(resources)) = &prepared.footprint else {
@@ -5693,7 +5806,9 @@ pub(crate) fn tool_error_effect_state(error: &anyhow::Error) -> tools::ToolEffec
     } else if let Some(error) = error.downcast_ref::<crate::core::native_journal::PossiblyApplied>()
     {
         tools::ToolEffectState::PossiblyApplied(Some(error.record_id))
-    } else if let Some(error) = error.downcast_ref::<crate::core::speculation::integration::IntegrationUnsettled>() {
+    } else if let Some(error) =
+        error.downcast_ref::<crate::core::speculation::integration::IntegrationUnsettled>()
+    {
         tools::ToolEffectState::PossiblyApplied(error.possibly_applied_record)
     } else if let Some(error) = error.downcast_ref::<native_undo::NativeUndoFailure>() {
         tools::ToolEffectState::PossiblyApplied(error.possibly_applied_record)
@@ -9368,10 +9483,15 @@ mod tests {
             "vision",
         ));
         let call = call("capture", "capture_test", "{}");
-        for _ in 0..36 {
-            assert!(execute_one_for_test(&registry, &call, &config).contains("capture failed"));
+        for attempt in 0..36 {
+            let output = execute_one_for_test(&registry, &call, &config);
+            assert!(
+                output.contains("capture failed"),
+                "attempt {attempt}: {output}"
+            );
         }
-        assert!(execute_one_for_test(&registry, &call, &config).contains("budget exhausted"));
+        let output = execute_one_for_test(&registry, &call, &config);
+        assert!(output.contains("budget exhausted"), "{output}");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 36);
         assert_eq!(ctx.snapshot().visual_operations, 36);
         assert!(matches!(ctx.gate(), design::GateDecision::Failed(_)));
@@ -10505,6 +10625,13 @@ mod tests {
     }
 
     fn cfg() -> AgentConfig {
+        // Opaque mock tools still take real leases, but must not borrow another test's HOME.
+        let exec_ctx = crate::core::exec_ctx::ExecutionContext::default();
+        let namespace = exec_ctx
+            .test_lock_namespace()
+            .cloned()
+            .unwrap_or_else(crate::core::workspace_txn::TestLockNamespace::owned);
+        let exec_ctx = exec_ctx.with_test_lock_namespace(namespace);
         // Verify gate OFF in unit tests (it spawns a real `cargo check`, non-hermetic).
         AgentConfig {
             max_iters: 5,
@@ -10516,7 +10643,7 @@ mod tests {
             nudge_role: NudgeRole::System,
             approval_mode: crate::core::approval::ApprovalMode::Ask,
             cancel: crate::core::cancel::TurnCancel::new(),
-            exec_ctx: crate::core::exec_ctx::ExecutionContext::default(),
+            exec_ctx,
             workspace_root: None,
             quiet: true,
             enable_verify_gate: false,
@@ -10886,14 +11013,17 @@ mod tests {
             .collect();
         let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(
-            r,
-            calls,
-            c,
-            &mut sink,
-            Vec::new(),
-            &mut checkpointed,
-            &mut writer_lease,
+        let results = crate::core::workspace_txn::with_test_lock_namespace_future(
+            c.exec_ctx.test_lock_namespace().cloned(),
+            execute_calls(
+                r,
+                calls,
+                c,
+                &mut sink,
+                Vec::new(),
+                &mut checkpointed,
+                &mut writer_lease,
+            ),
         )
         .await;
         // The sink must mirror the returned results (the loop relies on it).
@@ -11342,10 +11472,16 @@ mod tests {
             .map(|n| tool_turn("fail", &format!(r#"{{"n":"{n}"}}"#)))
             .collect();
         turns.push(final_turn("synth-answer"));
-        let out = run_agent(scripted(turns), &c, &r, "sys", "task")
+        let mut messages = vec![Message::system("sys"), Message::user("task")];
+        let out = run_agent_loop(scripted(turns), &c, &r, &mut messages)
             .await
             .unwrap();
-        assert_eq!(out.stop, StopReason::Divergence);
+        assert_eq!(
+            out.stop,
+            StopReason::Divergence,
+            "history: {}",
+            serde_json::to_string_pretty(&messages).unwrap()
+        );
         assert_eq!(out.iters, 4);
         assert_eq!(out.final_text.as_deref(), Some("synth-answer"));
     }
@@ -12019,7 +12155,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the fixture HOME and physical lock namespace stable through awaited tool settlement"
+    )]
     async fn a_deadline_cuts_a_healthy_run_that_still_has_steps_and_ignores_goal_mode() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
         // The case the ceiling exists for: a run that is making genuine progress (fresh tool call every
         // turn, so neither the divergence latch nor the stall guard fires) and has plenty of budget
         // left. Steps alone would let it continue; only time stops it.
@@ -13140,14 +13285,16 @@ mod tests {
         // A disjoint native body remains admitted. Whole-tree admission would conflict with its
         // shared global gate; the undo must acquire only the selected exact resource instead.
         let b = NativeResource::resolve(&root.join("b.txt")).unwrap();
-        let _sibling = NativeResourceLease::acquire(
-            &root,
-            &[(b, crate::core::repo_lock::LockMode::Shared)],
-            std::time::Duration::from_secs(1),
-            None,
-            "undo-sibling",
-        )
-        .unwrap();
+        let _sibling = crate::core::exec_ctx::with_current(config.exec_ctx.clone(), || {
+            NativeResourceLease::acquire(
+                &root,
+                &[(b, crate::core::repo_lock::LockMode::Shared)],
+                std::time::Duration::from_secs(1),
+                None,
+                "undo-sibling",
+            )
+            .unwrap()
+        });
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(native_undo::NativeOwnerUndo::new(root.clone())));
         let calls = vec![call(
@@ -13160,18 +13307,21 @@ mod tests {
         let mut checkpointed = false;
         let mut writer_lease = None;
         let mut baseline = None;
-        let executions = execute_execution_calls(
-            &registry,
-            &calls,
-            &planned,
-            true,
-            &config,
-            &mut sink,
-            Vec::new(),
-            &mut checkpointed,
-            &mut writer_lease,
-            &mut baseline,
-            &[],
+        let executions = crate::core::workspace_txn::with_test_lock_namespace_future(
+            config.exec_ctx.test_lock_namespace().cloned(),
+            execute_execution_calls(
+                &registry,
+                &calls,
+                &planned,
+                true,
+                &config,
+                &mut sink,
+                Vec::new(),
+                &mut checkpointed,
+                &mut writer_lease,
+                &mut baseline,
+                &[],
+            ),
         )
         .await;
         assert!(executions[0].failure.is_none(), "{executions:?}");

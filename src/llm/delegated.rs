@@ -3,8 +3,8 @@
 use anyhow::Result;
 use std::future::Future;
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::{Duration, Instant};
 
@@ -65,9 +65,11 @@ impl Control {
 
     fn send(&self) -> Result<()> {
         self.check()?;
-        self.sends.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < 3).then_some(n + 1)
-        }).map_err(|_| Failure::Exhausted)?;
+        self.sends
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 3).then_some(n + 1)
+            })
+            .map_err(|_| Failure::Exhausted)?;
         self.note("sending / waiting for first output");
         Ok(())
     }
@@ -90,16 +92,19 @@ impl Control {
         }
         self.last_stage.store(stage_id, Ordering::Release);
         self.last_note_ms.store(elapsed_ms, Ordering::Release);
-        crate::agent::orchestration::note_transport(
-            row, self.sends.load(Ordering::Acquire), stage,
-        );
+        crate::agent::orchestration::note_transport(row, self.sends.load(Ordering::Acquire), stage);
     }
 }
 
 /// Scope only the HTTP future, never a mutation/settlement future. Dropping a stream still runs
 /// its usage guard; blocking tool ownership continues to be managed by the worker registry.
-pub(crate) async fn run<T>(control: Option<&Arc<Control>>, future: impl Future<Output = Result<T>>) -> Result<T> {
-    let Some(control) = control else { return future.await; };
+pub(crate) async fn run<T>(
+    control: Option<&Arc<Control>>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(control) = control else {
+        return future.await;
+    };
     control.check()?;
     if control.sends.load(Ordering::Acquire) >= 3 {
         return Err(Failure::Exhausted.into());
@@ -148,8 +153,14 @@ pub(crate) async fn sleep(delay: Duration) -> Result<()> {
 pub(crate) fn remaining(control: Option<&Arc<Control>>, delay: u64) -> u64 {
     control.map_or(delay, |c| {
         c.note("retry backoff");
-        if c.sends.load(Ordering::Acquire) >= 3 { return 0; }
-        delay.min(c.deadline.saturating_duration_since(Instant::now()).as_millis() as u64)
+        if c.sends.load(Ordering::Acquire) >= 3 {
+            return 0;
+        }
+        delay.min(
+            c.deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        )
     })
 }
 
@@ -163,20 +174,30 @@ mod tests {
         for _ in 0..3 {
             run(Some(&control), async { before_send() }).await.unwrap();
         }
-        let error = run(Some(&control), async { before_send() }).await.unwrap_err();
+        let error = run(Some(&control), async { before_send() })
+            .await
+            .unwrap_err();
         assert_eq!(error.downcast_ref::<Failure>(), Some(&Failure::Exhausted));
         assert_eq!(control.sends.load(Ordering::Acquire), 3);
     }
 
     #[tokio::test]
     async fn pending_call_and_backoff_use_original_parent_deadline() {
-        let control = Control::new(Duration::from_secs(300), Some(Instant::now() + Duration::from_millis(25)), None);
+        let control = Control::new(
+            Duration::from_secs(300),
+            Some(Instant::now() + Duration::from_millis(25)),
+            None,
+        );
         let error = run(Some(&control), async {
             before_send()?;
             sleep(Duration::from_secs(300)).await
-        }).await.unwrap_err();
+        })
+        .await
+        .unwrap_err();
         assert_eq!(error.downcast_ref::<Failure>(), Some(&Failure::Deadline));
-        let error = run(Some(&control), async { before_send() }).await.unwrap_err();
+        let error = run(Some(&control), async { before_send() })
+            .await
+            .unwrap_err();
         assert_eq!(error.downcast_ref::<Failure>(), Some(&Failure::Deadline));
         assert_eq!(control.sends.load(Ordering::Acquire), 1);
     }
@@ -185,9 +206,13 @@ mod tests {
     async fn controls_are_child_local_and_uncontrolled_chat_is_unchanged() {
         let a = Control::new(Duration::from_secs(1), None, None);
         let b = Control::new(Duration::from_secs(1), None, None);
-        for _ in 0..3 { run(Some(&a), async { before_send() }).await.unwrap(); }
+        for _ in 0..3 {
+            run(Some(&a), async { before_send() }).await.unwrap();
+        }
         run(Some(&b), async { before_send() }).await.unwrap();
-        for _ in 0..5 { before_send().unwrap(); }
+        for _ in 0..5 {
+            before_send().unwrap();
+        }
         assert_eq!(b.sends.load(Ordering::Acquire), 1);
     }
 }

@@ -16,22 +16,99 @@ const LOCK_PROTOCOL: u32 = 1;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_LOCK_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static TEST_LOCK_HOME: std::cell::RefCell<Option<TestLockNamespace>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only lock domain. Owned mock domains survive until the last executable context drops;
+/// explicit fixture domains borrow their caller-owned directory and never delete it.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestLockNamespace {
+    root: PathBuf,
+    _owner: Option<std::sync::Arc<crate::core::file_placement::tests::TestDir>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestLockNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TestLockNamespace")
+            .field(&self.root)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl TestLockNamespace {
+    pub(crate) fn owned() -> Self {
+        let owner = std::sync::Arc::new(crate::core::file_placement::tests::TestDir::new());
+        Self {
+            root: owner.path().to_path_buf(),
+            _owner: Some(owner),
+        }
+    }
+
+    pub(crate) fn fixture(root: &Path) -> Self {
+        assert!(
+            root.is_absolute() && root.is_dir(),
+            "lock home must be an existing owned fixture"
+        );
+        Self {
+            root: std::fs::canonicalize(root).expect("canonical fixture lock home"),
+            _owner: None,
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn explicit_test_lock_namespace() -> Option<TestLockNamespace> {
+    TEST_LOCK_HOME.with(|home| home.borrow().clone())
 }
 
 fn lock_home() -> PathBuf {
     #[cfg(test)]
-    if let Some(home) = TEST_LOCK_HOME.with(|home| home.borrow().clone()) {
-        return home;
+    {
+        if let Some(namespace) = explicit_test_lock_namespace() {
+            return namespace.root;
+        }
+        if let Some(namespace) =
+            crate::core::exec_ctx::current().and_then(|ctx| ctx.test_lock_namespace().cloned())
+        {
+            return namespace.root;
+        }
     }
     crate::core::config::aizen_home()
+}
+
+#[cfg(test)]
+fn test_namespace_key() -> String {
+    let home = lock_home();
+    // Normalize existing aliases as well as Windows verbatim/case spellings. Fallback is needed
+    // for legacy tests whose environment home has not been created yet.
+    let canonical = canonical_existing_or_parent(&home).unwrap_or(home);
+    crate::core::config::normalize_path_key(&canonical)
+}
+
+fn held_workspace_key(identity: &WorkspaceIdentity) -> String {
+    #[cfg(test)]
+    return format!("{}:{}", test_namespace_key(), identity.worktree_id);
+    #[cfg(not(test))]
+    identity.worktree_id.clone()
 }
 
 /// Thread-local fixture override, restored on return or unwind. Worker threads must opt in with the
 /// same fixture root explicitly; this never changes process-global environment or production paths.
 #[cfg(test)]
 pub(crate) fn with_test_lock_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<PathBuf>);
+    with_test_lock_namespace(&TestLockNamespace::fixture(root), f)
+}
+
+#[cfg(test)]
+fn with_test_lock_namespace<T>(namespace: &TestLockNamespace, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<TestLockNamespace>);
     impl Drop for Restore {
         fn drop(&mut self) {
             TEST_LOCK_HOME.with(|home| {
@@ -39,13 +116,24 @@ pub(crate) fn with_test_lock_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
             });
         }
     }
-    assert!(
-        root.is_absolute() && root.is_dir(),
-        "lock home must be an existing owned fixture"
-    );
-    let previous = TEST_LOCK_HOME.with(|home| home.replace(Some(root.to_path_buf())));
+    let previous = TEST_LOCK_HOME.with(|home| home.replace(Some(namespace.clone())));
     let _restore = Restore(previous);
     f()
+}
+
+/// Pin only the test lock domain during each poll, never across a suspended await. The owned
+/// namespace remains alive for the entire future; blocking workers receive it through their context.
+#[cfg(test)]
+pub(crate) fn with_test_lock_namespace_future<F: std::future::Future>(
+    namespace: Option<TestLockNamespace>,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    // Keep large agent futures out of the wrapper's inline state on nested dispatch stacks.
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| match namespace.as_ref() {
+        Some(namespace) => with_test_lock_namespace(namespace, || future.as_mut().poll(cx)),
+        None => future.as_mut().poll(cx),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,21 +289,39 @@ struct Held {
 static HELD: Mutex<Option<HashMap<String, Held>>> = Mutex::new(None);
 // The exclusive native-effects gate is shared only with its holder's authorized scope tree.
 // Its Weak entry never owns the lock. Resource and per-worktree locks still acquire independently.
+#[cfg(not(test))]
 static GLOBAL_HELD: Mutex<Option<Held>> = Mutex::new(None);
+#[cfg(test)]
+static GLOBAL_HELD: Mutex<Option<HashMap<String, Option<Held>>>> = Mutex::new(None);
 
-fn inherited_global_gate(scope: &str) -> Option<std::sync::Arc<LockSet>> {
-    let mut held = GLOBAL_HELD
+fn global_held<T>(f: impl FnOnce(&mut Option<Held>) -> T) -> T {
+    #[cfg(test)]
+    let namespace = test_namespace_key();
+    let mut guard = GLOBAL_HELD
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if held
-        .as_ref()
-        .is_some_and(|held| held.locks.strong_count() == 0)
+    #[cfg(test)]
     {
-        *held = None;
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.retain(|_, held| held.as_ref().is_some_and(|h| h.locks.strong_count() > 0));
+        f(map.entry(namespace).or_default())
     }
-    held.as_ref()
-        .filter(|held| reentry_allowed(&held.scope, scope))
-        .and_then(|held| held.locks.upgrade())
+    #[cfg(not(test))]
+    f(&mut guard)
+}
+
+fn inherited_global_gate(scope: &str) -> Option<std::sync::Arc<LockSet>> {
+    global_held(|held| {
+        if held
+            .as_ref()
+            .is_some_and(|held| held.locks.strong_count() == 0)
+        {
+            *held = None;
+        }
+        held.as_ref()
+            .filter(|held| reentry_allowed(&held.scope, scope))
+            .and_then(|held| held.locks.upgrade())
+    })
 }
 
 fn native_effects_gate() -> PathBuf {
@@ -231,14 +337,11 @@ fn exclusive_global_gate(
     if let Some(gate) = inherited_global_gate(scope) {
         return Ok(gate);
     }
-    let other_holder = {
-        let held = GLOBAL_HELD
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    let other_holder = global_held(|held| {
         held.as_ref()
             .filter(|held| held.locks.strong_count() > 0)
             .map(|held| format!("{} ({})", held.scope, held.operation))
-    };
+    });
     let gate = LockSet::acquire(
         vec![LockRequest::new(
             LockClass::Capacity,
@@ -255,13 +358,12 @@ fn exclusive_global_gate(
         None => error,
     })?;
     let gate = std::sync::Arc::new(gate);
-    let mut held = GLOBAL_HELD
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    *held = Some(Held {
-        scope: scope.to_string(),
-        operation: operation.to_string(),
-        locks: std::sync::Arc::downgrade(&gate),
+    global_held(|held| {
+        *held = Some(Held {
+            scope: scope.to_string(),
+            operation: operation.to_string(),
+            locks: std::sync::Arc::downgrade(&gate),
+        });
     });
     Ok(gate)
 }
@@ -353,7 +455,8 @@ impl WorkspaceWriterLease {
         // Already ours — the same scope, or a child running inside our dispatch? Take a nested
         // reference instead of deadlocking against our own handle. Any other scope in this
         // process is a second writer and goes through the OS lock below like another process.
-        let (reentrant, other_holder) = held_map(|m| match m.get(&identity.worktree_id) {
+        let workspace_key = held_workspace_key(&identity);
+        let (reentrant, other_holder) = held_map(|m| match m.get(&workspace_key) {
             Some(h) if reentry_allowed(&h.scope, scope) => (h.locks.upgrade(), None),
             Some(h) => (None, Some(format!("{} ({})", h.scope, h.operation))),
             None => (None, None),
@@ -401,7 +504,7 @@ impl WorkspaceWriterLease {
         let locks = std::sync::Arc::new(locks);
         held_map(|m| {
             m.insert(
-                identity.worktree_id.clone(),
+                workspace_key,
                 Held {
                     scope: scope.to_string(),
                     operation: operation.to_string(),
@@ -421,7 +524,8 @@ impl WorkspaceWriterLease {
     /// caller has to ask first. Kept as the queryable form of that state.
     #[allow(dead_code)]
     pub fn held_by_this_process(identity: &WorkspaceIdentity) -> bool {
-        held_map(|m| m.contains_key(&identity.worktree_id))
+        let workspace_key = held_workspace_key(identity);
+        held_map(|m| m.contains_key(&workspace_key))
     }
 
     /// Deprecated compatibility shim. Time Machine's real transaction lock is owned by its
@@ -970,8 +1074,9 @@ impl NativeResourceLease {
         let identity = WorkspaceIdentity::discover_cached(root)?;
         // The holder's exact scope or a '/' descendant may borrow its exclusive gate. The Arc
         // owns the OS handles even if the ancestor/observer disappears during this worker's run.
+        let workspace_key = held_workspace_key(&identity);
         let inherited = held_map(|map| {
-            map.get(&identity.worktree_id)
+            map.get(&workspace_key)
                 .filter(|held| reentry_allowed(&held.scope, scope))
                 .and_then(|held| held.locks.upgrade())
         });
@@ -1494,6 +1599,69 @@ mod tests {
         let a = NativeResource::resolve(&temp.path().join("workspace/a.txt")).unwrap();
         let b = NativeResource::resolve(&temp.path().join("workspace/b.txt")).unwrap();
         (temp, a, b)
+    }
+
+    #[test]
+    fn test_lock_namespace_polling_restores_outer_domain_on_pending_ready_and_drop() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let outer = TestLockNamespace::owned();
+        let first = TestLockNamespace::owned();
+        let second = TestLockNamespace::owned();
+        with_test_lock_home(outer.root(), || {
+            let mut polls = 0;
+            let mut first_run = Box::pin(with_test_lock_namespace_future(
+                Some(first.clone()),
+                std::future::poll_fn(|_| {
+                    assert_eq!(lock_home(), first.root());
+                    polls += 1;
+                    if polls == 1 {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                }),
+            ));
+            let mut second_run = Box::pin(with_test_lock_namespace_future(
+                Some(second.clone()),
+                std::future::poll_fn(|_| {
+                    assert_eq!(lock_home(), second.root());
+                    Poll::<()>::Pending
+                }),
+            ));
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(first_run.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(lock_home(), outer.root());
+            assert!(second_run.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(lock_home(), outer.root());
+            drop(second_run);
+            assert_eq!(lock_home(), outer.root());
+            assert!(first_run.as_mut().poll(&mut cx).is_ready());
+            assert_eq!(lock_home(), outer.root());
+            drop(first_run);
+            assert_eq!(lock_home(), outer.root());
+
+            let mut panicking_run = Box::pin(with_test_lock_namespace_future(
+                Some(second.clone()),
+                std::future::poll_fn(|_| -> Poll<()> {
+                    assert_eq!(lock_home(), second.root());
+                    panic!("exercise poll-local namespace restoration");
+                }),
+            ));
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = panicking_run.as_mut().poll(&mut cx);
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(lock_home(), outer.root());
+            assert!(
+                explicit_test_lock_namespace().unwrap()._owner.is_none(),
+                "the outer fixture must remain borrowed after poll unwind"
+            );
+            drop(panicking_run);
+            assert_eq!(lock_home(), outer.root());
+        });
     }
 
     #[test]
@@ -2050,6 +2218,56 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_namespaces_isolate_registries_without_weakening_exclusion() {
+        let workspace = crate::core::file_placement::tests::TestDir::new();
+        let first = TestLockNamespace::owned();
+        let second = TestLockNamespace::owned();
+        let acquire = |namespace: &TestLockNamespace, scope: &str| {
+            with_test_lock_home(namespace.root(), || {
+                WorkspaceWriterLease::acquire_scoped(
+                    workspace.path(),
+                    Duration::ZERO,
+                    None,
+                    "namespace regression",
+                    scope,
+                )
+            })
+        };
+        let parent = acquire(&first, "parent").unwrap();
+        let independent = acquire(&second, "parent").unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&parent._locks, &independent._locks),
+            "identical workspace/scope in different fixtures must not inherit a lease"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(
+                parent._locks._parent.as_ref().unwrap(),
+                independent._locks._parent.as_ref().unwrap(),
+            ),
+            "different fixtures must not inherit the same global gate"
+        );
+        let child = acquire(&first, "parent/task").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&parent._locks, &child._locks));
+        assert!(acquire(&first, "unrelated").is_err());
+        assert!(acquire(&second, "unrelated").is_err());
+        drop(parent);
+        assert!(
+            acquire(&first, "unrelated").is_err(),
+            "the child must retain its parent's exclusion"
+        );
+        drop(independent);
+        let second_after = acquire(&second, "unrelated").unwrap();
+        assert!(
+            acquire(&first, "unrelated").is_err(),
+            "releasing another fixture must not release the child's gate"
+        );
+        drop(child);
+        let first_after = acquire(&first, "unrelated").unwrap();
+        drop(first_after);
+        drop(second_after);
+    }
+
+    #[test]
     fn native_descendants_reuse_only_the_gate_not_resource_locks() {
         let _home = crate::core::config::TEST_HOME_LOCK
             .lock()
@@ -2352,8 +2570,9 @@ mod tests {
             // A live LANGUAGE SERVER no longer starves scoped native bodies. This is the regression
             // the maintainer hit: with one exclusive gate, an attached language server barred every
             // native body of every parallel child, so they silently edited nothing.
-            let lsp = SidecarEffectLease::acquire(SidecarKind::LanguageServer, Duration::ZERO, None)
-                .unwrap();
+            let lsp =
+                SidecarEffectLease::acquire(SidecarKind::LanguageServer, Duration::ZERO, None)
+                    .unwrap();
             let pooled =
                 SidecarEffectLease::acquire(SidecarKind::LanguageServer, Duration::ZERO, None)
                     .unwrap();
@@ -2367,8 +2586,8 @@ mod tests {
                 drop(body);
             });
             // …while a live MCP SERVER still excludes it, because its effects are arbitrary.
-            let mcp = SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None)
-                .unwrap();
+            let mcp =
+                SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None).unwrap();
             assert!(
                 !std::sync::Arc::ptr_eq(&lsp._locks[0], &mcp._locks[0]),
                 "the two categories hold separate gates and must not pool across them"
@@ -2418,14 +2637,16 @@ mod tests {
                 )
                 .unwrap();
                 assert!(
-                    SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None).is_err(),
+                    SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None)
+                        .is_err(),
                     "scoped native shared barrier excludes a new MCP server"
                 );
                 SidecarEffectLease::acquire(SidecarKind::LanguageServer, Duration::ZERO, None)
                     .expect("a scoped native body must not bar a language server");
                 drop(first);
                 assert!(
-                    SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None).is_err()
+                    SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None)
+                        .is_err()
                 );
                 drop(second);
             });
@@ -2607,7 +2828,23 @@ mod tests {
             });
             thread.join().unwrap();
         });
-        assert_eq!(TEST_LOCK_HOME.with(|home| home.borrow().clone()), saved);
+        let restored = explicit_test_lock_namespace();
+        assert_eq!(
+            restored.as_ref().map(TestLockNamespace::root),
+            saved.as_ref().map(TestLockNamespace::root)
+        );
+        match (
+            restored
+                .as_ref()
+                .and_then(|namespace| namespace._owner.as_ref()),
+            saved
+                .as_ref()
+                .and_then(|namespace| namespace._owner.as_ref()),
+        ) {
+            (Some(restored), Some(saved)) => assert!(std::sync::Arc::ptr_eq(restored, saved)),
+            (None, None) => {}
+            _ => panic!("TLS restoration must preserve namespace ownership"),
+        }
     }
 
     #[test]

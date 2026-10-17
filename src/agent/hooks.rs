@@ -153,7 +153,10 @@ pub fn configured() -> Option<HooksConfig> {
 /// Speculation cannot safely run workspace hooks. Inspect configuration without executing it;
 /// an environment toggle is not a durable isolation policy.
 pub(crate) fn check_speculative_policy() -> anyhow::Result<()> {
-    if cli_config::load().hooks.is_some_and(|hooks| !hooks.is_empty()) {
+    if cli_config::load()
+        .hooks
+        .is_some_and(|hooks| !hooks.is_empty())
+    {
         anyhow::bail!("speculative native execution is unavailable while lifecycle hooks are configured; use direct execution so guards/formatters run normally (no hooks were skipped)");
     }
     Ok(())
@@ -386,7 +389,8 @@ fn execute(
     };
     // Even a policy change after admission cannot smuggle a process through a native overlay.
     if crate::core::exec_ctx::current().is_some_and(|ctx| ctx.overlay().is_some()) {
-        let reason = "lifecycle hooks cannot execute inside a private native overlay; use direct execution";
+        let reason =
+            "lifecycle hooks cannot execute inside a private native overlay; use direct execution";
         out.decision = Some(Decision::Deny);
         out.reason = Some(reason.to_string());
         out.error = Some(reason.to_string());

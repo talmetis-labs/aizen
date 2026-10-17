@@ -8865,7 +8865,9 @@ mod tests {
                 assert_eq!(resources[0].1, LockMode::Shared);
             }
             PreparedFootprint::Global => panic!("regular read target should resolve exactly"),
-            PreparedFootprint::Overlay { .. } => panic!("overlay footprint is not valid in live fixture"),
+            PreparedFootprint::Overlay { .. } => {
+                panic!("overlay footprint is not valid in live fixture")
+            }
         }
         std::fs::write(&target, "new one\nnew two\n").unwrap();
         prepared.args = serde_json::json!({"path":"other.txt","files":[{"path":"other.txt"}],"start":1,"number":false});
@@ -8905,7 +8907,9 @@ mod tests {
                 }
             }
             PreparedFootprint::Global => panic!("valid batch should resolve exact read footprint"),
-            PreparedFootprint::Overlay { .. } => panic!("overlay footprint is not valid in live fixture"),
+            PreparedFootprint::Overlay { .. } => {
+                panic!("overlay footprint is not valid in live fixture")
+            }
         }
         prepared.args["files"] = serde_json::json!([{"path":"8.txt"}]);
         let output = read.execute_prepared(&prepared).unwrap().text;

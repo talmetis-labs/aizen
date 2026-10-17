@@ -510,7 +510,9 @@ mod tests {
             .unwrap();
         let requests = match prepared.footprint.as_ref().unwrap() {
             PreparedFootprint::Native(resources) => resources,
-            PreparedFootprint::Global | PreparedFootprint::Overlay { .. } => panic!("exact live resources required"),
+            PreparedFootprint::Global | PreparedFootprint::Overlay { .. } => {
+                panic!("exact live resources required")
+            }
         };
         let _lease = NativeResourceLease::acquire(
             &workspace,

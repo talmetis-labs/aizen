@@ -8,8 +8,8 @@ use super::{
     completed_status, verdict_failed, with_fix_request, with_upstream, TaskOutcome, WorkflowTask,
 };
 use crate::agent::runlog::Event;
-use crate::agent::task_tool::SlotDenied;
 use crate::agent::speculation::ExecutionMode;
+use crate::agent::task_tool::SlotDenied;
 use crate::core::cancel::TurnCancel;
 use anyhow::{bail, Context, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -77,12 +77,14 @@ fn unix_ms() -> u64 {
 
 impl DispatchIntent {
     pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
-        self.live_deadline.or_else(|| self.deadline_unix_ms.map(|d| {
-            let now = std::time::Instant::now();
-            // Invalid journal timestamps fail closed instead of overflowing Instant.
-            now.checked_add(Duration::from_millis(d.saturating_sub(unix_ms())))
-                .unwrap_or(now)
-        }))
+        self.live_deadline.or_else(|| {
+            self.deadline_unix_ms.map(|d| {
+                let now = std::time::Instant::now();
+                // Invalid journal timestamps fail closed instead of overflowing Instant.
+                now.checked_add(Duration::from_millis(d.saturating_sub(unix_ms())))
+                    .unwrap_or(now)
+            })
+        })
     }
 }
 
@@ -203,19 +205,28 @@ impl<'a> State<'a> {
     }
 
     fn freeze_deadline(&mut self, intent: &mut DispatchIntent) {
-        let live = *self.live_deadlines.entry(intent.goal.clone()).or_insert_with(|| {
-            let local = crate::agent::task_tool::subagent_wall_deadline();
-            match (local, self.policy.parent_deadline) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            }
-        });
-        intent.deadline_unix_ms = *self.deadlines.entry(intent.goal.clone()).or_insert_with(|| {
-            live.map(|d| unix_ms().saturating_add(
-                d.saturating_duration_since(std::time::Instant::now()).as_millis()
-                    .min(u64::MAX as u128) as u64,
-            ))
-        });
+        let live = *self
+            .live_deadlines
+            .entry(intent.goal.clone())
+            .or_insert_with(|| {
+                let local = crate::agent::task_tool::subagent_wall_deadline();
+                match (local, self.policy.parent_deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            });
+        intent.deadline_unix_ms = *self
+            .deadlines
+            .entry(intent.goal.clone())
+            .or_insert_with(|| {
+                live.map(|d| {
+                    unix_ms().saturating_add(
+                        d.saturating_duration_since(std::time::Instant::now())
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                    )
+                })
+            });
         intent.live_deadline = live;
     }
 
@@ -287,9 +298,19 @@ impl<'a> State<'a> {
             return Ok(());
         }
         let primary = outcome.status.split('·').next().map(str::trim);
-        if matches!(primary, Some("deadline" | "retry-exhausted" | "protocol-error"
-            | "authentication-error" | "permanent-error" | "cancelled"
-            | "unknown-worker" | "possibly-applied")) {
+        if matches!(
+            primary,
+            Some(
+                "deadline"
+                    | "retry-exhausted"
+                    | "protocol-error"
+                    | "authentication-error"
+                    | "permanent-error"
+                    | "cancelled"
+                    | "unknown-worker"
+                    | "possibly-applied"
+            )
+        ) {
             self.settlements.push_back((intent.goal, intent.key));
             return Ok(());
         }
@@ -472,7 +493,8 @@ impl<'a> State<'a> {
                             bail!("durable attempt changed its logical execution deadline");
                         }
                     } else {
-                        self.deadlines.insert(intent.goal.clone(), intent.deadline_unix_ms);
+                        self.deadlines
+                            .insert(intent.goal.clone(), intent.deadline_unix_ms);
                         let mut restored = intent.clone();
                         restored.live_deadline = None;
                         let live = match (restored.deadline(), self.policy.parent_deadline) {
@@ -482,7 +504,8 @@ impl<'a> State<'a> {
                         self.live_deadlines.insert(intent.goal.clone(), live);
                     }
                     expected.deadline_unix_ms = intent.deadline_unix_ms;
-                    expected.live_deadline = self.live_deadlines.get(&intent.goal).copied().flatten();
+                    expected.live_deadline =
+                        self.live_deadlines.get(&intent.goal).copied().flatten();
                     if serde_json::to_value(&expected)? != serde_json::to_value(intent)? {
                         bail!("durable attempt payload/transition mismatch");
                     }
@@ -563,8 +586,13 @@ impl<'a> State<'a> {
         }
         // A legacy/unbounded journal proves what completed, not how much execution time remains.
         // Read settled history, but never mint fresh retry/planner authority from an ambiguous error.
-        if self.queue.iter().any(|p| p.intent.key.kind != AttemptKind::Initial
-            && self.deadlines.get(&p.intent.goal).is_some_and(Option::is_none)) {
+        if self.queue.iter().any(|p| {
+            p.intent.key.kind != AttemptKind::Initial
+                && self
+                    .deadlines
+                    .get(&p.intent.goal)
+                    .is_some_and(Option::is_none)
+        }) {
             bail!("queued recovery has no durable execution deadline; completed reports are retained, but a new explicit dispatch is required");
         }
         // Backoff/admission windows are new finite waits after resume, not refreshed execution budgets.
@@ -612,8 +640,11 @@ impl CohortLifecycle for NoCohorts {
     fn capture(&self, _intents: &mut [DispatchIntent]) -> Result<String> {
         bail!("speculative workflow requires its controller-owned cohort lifecycle")
     }
-    fn finish<'a>(&'a self, _id: &'a str, _intents: &'a [DispatchIntent])
-        -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
+    fn finish<'a>(
+        &'a self,
+        _id: &'a str,
+        _intents: &'a [DispatchIntent],
+    ) -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
         Box::pin(async { bail!("no speculative cohort was captured") })
     }
 }
@@ -686,16 +717,35 @@ where
     Persist: FnMut(Event) -> Result<()>,
 {
     schedule_driver(
-        tasks, width, model, cancel, policy, replay, prepare, admit, persist, run,
-        scoped_admission, &NoCohorts,
-    ).await
+        tasks,
+        width,
+        model,
+        cancel,
+        policy,
+        replay,
+        prepare,
+        admit,
+        persist,
+        run,
+        scoped_admission,
+        &NoCohorts,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn schedule_cohorts<F, Fut, P, Admit, Prepare, Persist, C>(
-    tasks: &[WorkflowTask], width: usize, model: &str, cancel: &TurnCancel,
-    policy: Policy, replay: &[Event], prepare: Prepare, admit: Admit, persist: Persist,
-    run: F, cohorts: &C,
+    tasks: &[WorkflowTask],
+    width: usize,
+    model: &str,
+    cancel: &TurnCancel,
+    policy: Policy,
+    replay: &[Event],
+    prepare: Prepare,
+    admit: Admit,
+    persist: Persist,
+    run: F,
+    cohorts: &C,
 ) -> Result<Vec<TaskOutcome>>
 where
     F: Fn(DispatchIntent, P) -> Fut,
@@ -705,15 +755,37 @@ where
     Persist: FnMut(Event) -> Result<()>,
     C: CohortLifecycle,
 {
-    schedule_driver(tasks, width, model, cancel, policy, replay, prepare, admit, persist,
-        run, super::SCOPED_NATIVE_PARALLEL_ENABLED, cohorts).await
+    schedule_driver(
+        tasks,
+        width,
+        model,
+        cancel,
+        policy,
+        replay,
+        prepare,
+        admit,
+        persist,
+        run,
+        super::SCOPED_NATIVE_PARALLEL_ENABLED,
+        cohorts,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn schedule_driver<F, Fut, P, Admit, Prepare, Persist, C>(
-    tasks: &[WorkflowTask], width: usize, model: &str, cancel: &TurnCancel,
-    policy: Policy, replay: &[Event], mut prepare: Prepare, mut admit: Admit,
-    mut persist: Persist, run: F, scoped_admission: bool, cohorts: &C,
+    tasks: &[WorkflowTask],
+    width: usize,
+    model: &str,
+    cancel: &TurnCancel,
+    policy: Policy,
+    replay: &[Event],
+    mut prepare: Prepare,
+    mut admit: Admit,
+    mut persist: Persist,
+    run: F,
+    scoped_admission: bool,
+    cohorts: &C,
 ) -> Result<Vec<TaskOutcome>>
 where
     F: Fn(DispatchIntent, P) -> Fut,
@@ -752,9 +824,17 @@ where
         }
         let stopping = cancel.is_cancelled() || failure.is_some();
         if !stopping {
-            if let Some(selected) = cohort.as_ref().filter(|selected|
-                selected.intents.iter().all(|intent| state.completed.contains(&intent.key))) {
-                let members = selected.intents.iter().map(|intent| intent.key.clone()).collect();
+            if let Some(selected) = cohort.as_ref().filter(|selected| {
+                selected
+                    .intents
+                    .iter()
+                    .all(|intent| state.completed.contains(&intent.key))
+            }) {
+                let members = selected
+                    .intents
+                    .iter()
+                    .map(|intent| intent.key.clone())
+                    .collect();
                 let integrated = cohorts.finish(&selected.id, &selected.intents).await.and_then(|receipt| {
                     crate::core::speculation::verification::parse_success_summary(&receipt, &selected.id)
                         .context("speculative integration lifecycle summary invalid; reconcile retained evidence")?;
@@ -802,22 +882,39 @@ where
         }
         if !stopping && failure.is_none() {
             if cohort.is_none() && in_flight.is_empty() {
-                let first = state.queue.iter().find(|pending|
-                    state.eligible(pending) && pending.due <= Instant::now());
-                if first.is_some_and(|pending| pending.intent.task.execution == ExecutionMode::Speculative) {
-                    let keys: Vec<_> = state.queue.iter().filter(|pending|
-                        pending.intent.task.execution == ExecutionMode::Speculative
-                            && state.eligible(pending) && pending.due <= Instant::now())
-                        .take(width.clamp(1, 32)).map(|pending| pending.intent.key.clone()).collect();
+                let first = state
+                    .queue
+                    .iter()
+                    .find(|pending| state.eligible(pending) && pending.due <= Instant::now());
+                if first.is_some_and(|pending| {
+                    pending.intent.task.execution == ExecutionMode::Speculative
+                }) {
+                    let keys: Vec<_> = state
+                        .queue
+                        .iter()
+                        .filter(|pending| {
+                            pending.intent.task.execution == ExecutionMode::Speculative
+                                && state.eligible(pending)
+                                && pending.due <= Instant::now()
+                        })
+                        .take(width.clamp(1, 32))
+                        .map(|pending| pending.intent.key.clone())
+                        .collect();
                     let mut selected = Vec::with_capacity(keys.len());
                     for key in &keys {
-                        let position = state.queue.iter().position(|pending| &pending.intent.key == key).unwrap();
+                        let position = state
+                            .queue
+                            .iter()
+                            .position(|pending| &pending.intent.key == key)
+                            .unwrap();
                         let mut pending = state.queue.remove(position).unwrap();
                         // Freeze the logical budget at capture too: a private attempt is a physical
                         // attempt like any other and must not outlive the parent's deadline.
                         state.freeze_deadline(&mut pending.intent);
-                        if let Err(error) = state.materialize(&mut pending.intent)
-                            .and_then(|()| prepare(&mut pending.intent)) {
+                        if let Err(error) = state
+                            .materialize(&mut pending.intent)
+                            .and_then(|()| prepare(&mut pending.intent))
+                        {
                             failure = Some(error.context("preparing frozen speculative ready set"));
                             break;
                         }
@@ -826,28 +923,50 @@ where
                     if failure.is_none() {
                         match cohorts.capture(&mut selected) {
                             Ok(id) if !id.is_empty() && id.len() <= 128 => {
-                                let members = selected.iter().map(|intent| intent.key.clone()).collect();
+                                let members =
+                                    selected.iter().map(|intent| intent.key.clone()).collect();
                                 if let Err(error) = persist(Event::SpeculativeCohortCaptured {
-                                    seq: 0, cohort_id: id.clone(), members,
+                                    seq: 0,
+                                    cohort_id: id.clone(),
+                                    members,
                                 }) {
                                     journal_failed = true;
-                                    failure = Some(error.context("persisting speculative membership; dispatch not started"));
+                                    failure = Some(error.context(
+                                        "persisting speculative membership; dispatch not started",
+                                    ));
                                 } else {
                                     for intent in selected.iter().rev() {
                                         state.queue.push_front(Pending {
-                                            intent: intent.clone(), due: Instant::now(), admission_deadline: None,
+                                            intent: intent.clone(),
+                                            due: Instant::now(),
+                                            admission_deadline: None,
                                         });
                                     }
-                                    cohort = Some(ActiveCohort { id, intents: selected });
+                                    cohort = Some(ActiveCohort {
+                                        id,
+                                        intents: selected,
+                                    });
                                 }
                             }
-                            Ok(_) => failure = Some(anyhow::anyhow!("invalid controller cohort identity")),
-                            Err(error) => failure = Some(error.context("capturing speculative cohort; no dispatch started")),
+                            Ok(_) => {
+                                failure =
+                                    Some(anyhow::anyhow!("invalid controller cohort identity"))
+                            }
+                            Err(error) => {
+                                failure =
+                                    Some(error.context(
+                                        "capturing speculative cohort; no dispatch started",
+                                    ))
+                            }
                         }
                     }
                 }
             }
-            let count = if failure.is_none() { state.queue.len() } else { 0 };
+            let count = if failure.is_none() {
+                state.queue.len()
+            } else {
+                0
+            };
             for _ in 0..count {
                 if in_flight.len() >= width.max(1) {
                     break;
@@ -860,7 +979,11 @@ where
                     continue;
                 }
                 if let Some(selected) = &cohort {
-                    if !selected.intents.iter().any(|intent| intent.key == pending.intent.key) {
+                    if !selected
+                        .intents
+                        .iter()
+                        .any(|intent| intent.key == pending.intent.key)
+                    {
                         state.queue.push_back(pending);
                         continue;
                     }
@@ -876,16 +999,31 @@ where
                     }
                 }
                 state.freeze_deadline(&mut pending.intent);
-                if pending.intent.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                if pending
+                    .intent
+                    .deadline()
+                    .is_some_and(|d| d <= std::time::Instant::now())
+                {
                     let intent = pending.intent;
                     let outcome = TaskOutcome {
-                        id: intent.key.display(), attempt: Some(intent.key.clone()), selected_for: None,
-                        role: intent.task.role.clone(), model: model.to_string(), status: "deadline".into(),
+                        id: intent.key.display(),
+                        attempt: Some(intent.key.clone()),
+                        selected_for: None,
+                        role: intent.task.role.clone(),
+                        model: model.to_string(),
+                        status: "deadline".into(),
                         summary: "logical task deadline elapsed; no new attempt dispatched".into(),
-                        iters: 0, tokens_in: 0, tokens_out: 0, evidence_images: Vec::new(),
+                        iters: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        evidence_images: Vec::new(),
                     };
-                    if let Err(error) = persist(Event::DispatchIntent { seq: 0, intent: intent.clone() })
-                        .and_then(|()| persist(completion_event(&intent, &outcome))) {
+                    if let Err(error) = persist(Event::DispatchIntent {
+                        seq: 0,
+                        intent: intent.clone(),
+                    })
+                    .and_then(|()| persist(completion_event(&intent, &outcome)))
+                    {
                         journal_failed = true;
                         failure = Some(error.context("recording expired logical task"));
                         break;
@@ -904,13 +1042,14 @@ where
                 }
                 let writer = super::workflow_task_is_writer(&pending.intent.task);
                 let mode = super::workflow_dispatch_mode(&pending.intent.task);
-                let conflict = cohort.is_none() && active.values().any(|(other, other_writer)| {
-                    if scoped_admission {
-                        !mode.compatible(other)
-                    } else {
-                        writer && *other_writer
-                    }
-                });
+                let conflict = cohort.is_none()
+                    && active.values().any(|(other, other_writer)| {
+                        if scoped_admission {
+                            !mode.compatible(other)
+                        } else {
+                            writer && *other_writer
+                        }
+                    });
                 if conflict {
                     state.queue.push_back(pending);
                     continue;

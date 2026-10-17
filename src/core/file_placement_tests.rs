@@ -496,7 +496,10 @@ fn existing_evidence_descriptor_cannot_be_blessed_by_pathname_aba() {
     let file = open_existing_read_only(&path).unwrap();
     fs::rename(&path, &substituted).unwrap();
     fs::rename(&original, &path).unwrap();
-    assert_eq!(NodeStamp::capture(&path, &fs::symlink_metadata(&path).unwrap(), false).unwrap(), stamp);
+    assert_eq!(
+        NodeStamp::capture(&path, &fs::symlink_metadata(&path).unwrap(), false).unwrap(),
+        stamp
+    );
     assert!(read_existing_regular_descriptor(&resource, &stamp, file, 10).is_err());
     assert_eq!(fs::read(&path).unwrap(), b"same bytes");
     assert_eq!(fs::read(&substituted).unwrap(), b"same bytes");
@@ -557,7 +560,8 @@ fn existing_evidence_opener_keeps_fifo_nonblocking_and_refuses_descriptor() {
     use std::os::unix::fs::OpenOptionsExt;
     extern "C" {
         fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> std::os::raw::c_int;
-        fn fcntl(fd: std::os::raw::c_int, command: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+        fn fcntl(fd: std::os::raw::c_int, command: std::os::raw::c_int, ...)
+            -> std::os::raw::c_int;
     }
     let fixture = TestDir::new();
     let path = fixture.path().join("evidence.bin");
@@ -569,7 +573,12 @@ fn existing_evidence_opener_keeps_fifo_nonblocking_and_refuses_descriptor() {
     assert_eq!(unsafe { mkfifo(name.as_ptr(), 0o600) }, 0);
     // Keep both ends open so even a regressed opener cannot strand this test. Assert the actual
     // O_NONBLOCK descriptor flag (F_GETFL = 3 on Linux/Android) before attempting any reads.
-    let _keeper = OpenOptions::new().read(true).write(true).custom_flags(0x800).open(&path).unwrap();
+    let _keeper = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(0x800)
+        .open(&path)
+        .unwrap();
     let file = open_existing_read_only(&path).unwrap();
     let flags = unsafe { fcntl(file.as_raw_fd(), 3) };
     assert!(flags >= 0 && flags & 0x800 != 0);

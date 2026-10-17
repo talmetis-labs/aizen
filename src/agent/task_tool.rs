@@ -519,9 +519,13 @@ struct SpeculativeTaskReport {
 pub(crate) fn speculative_scope(
     call: &PreparedToolCall,
 ) -> Option<crate::core::native_scope::NativeWriteScope> {
-    let prepared = call.delegation.as_ref()?.downcast_ref::<PreparedTaskDispatch>()?;
+    let prepared = call
+        .delegation
+        .as_ref()?
+        .downcast_ref::<PreparedTaskDispatch>()?;
     (prepared.execution == super::speculation::ExecutionMode::Speculative)
-        .then(|| prepared.dispatch.native_scope.clone()).flatten()
+        .then(|| prepared.dispatch.native_scope.clone())
+        .flatten()
 }
 
 pub(crate) fn seat_speculative(
@@ -529,19 +533,36 @@ pub(crate) fn seat_speculative(
     cohort: std::sync::Arc<super::speculation::Cohort>,
     parent: &crate::core::exec_ctx::ExecutionContext,
 ) -> Result<PreparedToolCall> {
-    let mut prepared = call.delegation.as_ref()
+    let mut prepared = call
+        .delegation
+        .as_ref()
         .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
-        .context("speculation requires a frozen task dispatch")?.clone();
-    anyhow::ensure!(prepared.execution == super::speculation::ExecutionMode::Speculative
-        && prepared.speculative.is_none(), "speculative task is already seated or requested direct execution");
-    let scope = prepared.dispatch.native_scope.as_ref().context("speculative task lost its exact scope")?;
-    let child_scope = format!("{}/task/{}", parent.resource_scope(),
-        NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        .context("speculation requires a frozen task dispatch")?
+        .clone();
+    anyhow::ensure!(
+        prepared.execution == super::speculation::ExecutionMode::Speculative
+            && prepared.speculative.is_none(),
+        "speculative task is already seated or requested direct execution"
+    );
+    let scope = prepared
+        .dispatch
+        .native_scope
+        .as_ref()
+        .context("speculative task lost its exact scope")?;
+    let child_scope = format!(
+        "{}/task/{}",
+        parent.resource_scope(),
+        NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let owner = format!("{child_scope}/attempt/1");
     let overlay = cohort.overlay(&owner, scope)?;
     prepared.speculative = Some(std::sync::Arc::new(SpeculativeTask {
-        cohort, child_scope, overlay, logical_complete: std::sync::atomic::AtomicBool::new(false),
-        track: std::sync::Mutex::new(None), report: std::sync::Mutex::new(None),
+        cohort,
+        child_scope,
+        overlay,
+        logical_complete: std::sync::atomic::AtomicBool::new(false),
+        track: std::sync::Mutex::new(None),
+        report: std::sync::Mutex::new(None),
         released: std::sync::Mutex::new(None),
     }));
     let mut call = call.clone();
@@ -555,25 +576,40 @@ pub(crate) fn seal_speculative_after_driver(
     call: &PreparedToolCall,
     parent: &crate::core::exec_ctx::ExecutionContext,
 ) -> Result<super::speculation::ReleasedOverlay> {
-    let task = call.delegation.as_ref()
+    let task = call
+        .delegation
+        .as_ref()
         .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
         .and_then(|prepared| prepared.speculative.as_ref())
         .context("task has no controller-seated speculative attempt")?;
-    anyhow::ensure!(task.logical_complete.load(std::sync::atomic::Ordering::Acquire),
-        "speculative child did not complete its logical contract");
-    let released = task.released.lock().map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?
-        .take().context("speculative task has no unused resource-release token")?;
+    anyhow::ensure!(
+        task.logical_complete
+            .load(std::sync::atomic::Ordering::Acquire),
+        "speculative child did not complete its logical contract"
+    );
+    let released = task
+        .released
+        .lock()
+        .map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?
+        .take()
+        .context("speculative task has no unused resource-release token")?;
     task.cohort.seal_released(parent, &task.overlay, released)
 }
 
 pub(crate) fn finish_speculative_status(call: &PreparedToolCall, verified: bool, detail: &str) {
-    if let Some(task) = call.delegation.as_ref()
+    if let Some(task) = call
+        .delegation
+        .as_ref()
         .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
         .and_then(|dispatch| dispatch.speculative.as_ref())
     {
         // Taking the deferred report makes accepted publication idempotent. Private findings
         // remain tied to the captured base even after a command verifies the combined tree.
-        let report = task.report.lock().unwrap_or_else(|error| error.into_inner()).take();
+        let report = task
+            .report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         if verified {
             if let Some(report) = report {
                 crate::agent::blackboard::note(
@@ -584,9 +620,19 @@ pub(crate) fn finish_speculative_status(call: &PreparedToolCall, verified: bool,
                 );
             }
         }
-        if let Some(track) = task.track.lock().unwrap_or_else(|error| error.into_inner()).take() {
-            if verified { track.finish_ok(format!("integrated and verified · {detail}")); }
-            else { track.finish_err(format!("cohort not verified; inspect retained evidence · {detail}")); }
+        if let Some(track) = task
+            .track
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            if verified {
+                track.finish_ok(format!("integrated and verified · {detail}"));
+            } else {
+                track.finish_err(format!(
+                    "cohort not verified; inspect retained evidence · {detail}"
+                ));
+            }
         }
     }
 }
@@ -1175,9 +1221,10 @@ impl Tool for TaskTool {
     /// are still destructive: only frozen disjoint resource keys unlock their separate write batch.
     /// Shell/build, images and unrestricted dispatches never gain that admission from a role name.
     fn is_concurrency_safe_for(&self, args: &Value) -> bool {
-        self.prepare_dispatch(args, false)
-            .is_ok_and(|d| d.execution == super::speculation::ExecutionMode::Direct
-                && dispatch_is_read_only(&d.dispatch.registry))
+        self.prepare_dispatch(args, false).is_ok_and(|d| {
+            d.execution == super::speculation::ExecutionMode::Direct
+                && dispatch_is_read_only(&d.dispatch.registry)
+        })
     }
     fn plan_call(
         &self,
@@ -1196,12 +1243,22 @@ impl Tool for TaskTool {
         seat_native_dispatch(&mut prepared.dispatch, args, &self.root, ctx)?;
         if prepared.execution == super::speculation::ExecutionMode::Speculative {
             crate::agent::hooks::check_speculative_policy()?;
-            anyhow::ensure!(ctx.overlay().is_none() && ctx.native_scope().is_none() && ctx.can_restore_workspace(),
-                "only the unrestricted coordinating parent may request speculative children");
-            anyhow::ensure!(prepared.dispatch.native_scope.is_some(), "speculative execution requires exact read_paths/write_paths");
-            anyhow::ensure!(reference_ids(args)?.is_empty() && evidence_ids(args).is_empty(),
-                "speculative native execution does not accept or return media");
-            prepared.image_config.response_visuals = Some(crate::core::cli_config::ResponseVisuals::Off);
+            anyhow::ensure!(
+                ctx.overlay().is_none()
+                    && ctx.native_scope().is_none()
+                    && ctx.can_restore_workspace(),
+                "only the unrestricted coordinating parent may request speculative children"
+            );
+            anyhow::ensure!(
+                prepared.dispatch.native_scope.is_some(),
+                "speculative execution requires exact read_paths/write_paths"
+            );
+            anyhow::ensure!(
+                reference_ids(args)?.is_empty() && evidence_ids(args).is_empty(),
+                "speculative native execution does not accept or return media"
+            );
+            prepared.image_config.response_visuals =
+                Some(crate::core::cli_config::ResponseVisuals::Off);
             prepared.image_policy = crate::llm::media::VisionPolicy::Unsupported;
             prepared.relay_allowed = false;
             prepared.dispatch.system.push_str("\n<private_overlay>All file reads and edits use your private immutable-base overlay. No live project file changes until the parent integrates the complete cohort. Read your own writes; do not claim builds, live integration or verification. This native-only lane returns text, not media. A failure retains only private work for parent inspection.</private_overlay>\n");
@@ -1210,7 +1267,9 @@ impl Tool for TaskTool {
             call.preview = Some(crate::agent::tools::ApprovalPreview {
                 title: if prepared.execution == super::speculation::ExecutionMode::Speculative {
                     "Private native overlay; parent integrates and verifies".into()
-                } else { "Native-only child file scope".into() },
+                } else {
+                    "Native-only child file scope".into()
+                },
                 diff: None,
                 lines: scope.prompt().lines().map(str::to_owned).collect(),
             });
@@ -1225,8 +1284,10 @@ impl Tool for TaskTool {
         call.delegation
             .as_ref()?
             .downcast_ref::<PreparedTaskDispatch>()
-            .map(|d| d.execution == super::speculation::ExecutionMode::Direct
-                && dispatch_is_read_only(&d.dispatch.registry))
+            .map(|d| {
+                d.execution == super::speculation::ExecutionMode::Direct
+                    && dispatch_is_read_only(&d.dispatch.registry)
+            })
     }
     fn is_destructive_prepared(&self, call: &PreparedToolCall) -> bool {
         self.delegation_read_only_prepared(call) != Some(true)
@@ -1247,7 +1308,9 @@ impl Tool for TaskTool {
             .delegation
             .as_ref()?
             .downcast_ref::<PreparedTaskDispatch>()?;
-        if frozen.execution != super::speculation::ExecutionMode::Direct { return None; }
+        if frozen.execution != super::speculation::ExecutionMode::Direct {
+            return None;
+        }
         frozen.dispatch.native_scope.clone()
     }
     fn workspace_effect_prepared(&self, call: &PreparedToolCall) -> super::tools::WorkspaceEffect {
@@ -1373,8 +1436,10 @@ impl TaskTool {
     ) -> Result<ToolObservation> {
         if prepared.execution == super::speculation::ExecutionMode::Speculative {
             crate::agent::hooks::check_speculative_policy()?;
-            anyhow::ensure!(prepared.speculative.is_some(),
-                "speculative task requires controller-seated cohort admission; no live fallback");
+            anyhow::ensure!(
+                prepared.speculative.is_some(),
+                "speculative task requires controller-seated cohort admission; no live fallback"
+            );
         }
         let prompt = args
             .get("prompt")
@@ -1455,7 +1520,12 @@ impl TaskTool {
                     &key,
                     &model,
                     crate::llm::client::stream_chat_with_tools_sink_frozen(
-                        &client, &base, &key, &model, &msgs, &defs,
+                        &client,
+                        &base,
+                        &key,
+                        &model,
+                        &msgs,
+                        &defs,
                         crate::llm::client::StreamSink {
                             observed_usage: Some(&on_usage),
                             ..Default::default()
@@ -1463,7 +1533,9 @@ impl TaskTool {
                         effort,
                         &frozen_cfg,
                     ),
-                ).await.map(|(turn, receipt)| {
+                )
+                .await
+                .map(|(turn, receipt)| {
                     if let Some(design) = ctx.design() {
                         crate::agent::mark_image_delivery(&msgs, &receipt, &design);
                     }
@@ -1487,8 +1559,11 @@ impl TaskTool {
         );
         let child_scope = match &prepared.speculative {
             Some(task) => task.child_scope.clone(),
-            None => format!("{}/task/{}", parent_ctx.resource_scope(),
-                NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            None => format!(
+                "{}/task/{}",
+                parent_ctx.resource_scope(),
+                NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
         };
         let selected_reference_ids = reference_ids(args)?;
         let child_ctx = seat_child_references(
@@ -1508,9 +1583,10 @@ impl TaskTool {
         let child_ctx = if prepared.speculative.is_some() {
             child_ctx
         } else {
-            child_ctx.with_workspace_activity(
-                crate::core::workspace_txn::WorkspaceActivity::begin(&self.root, &child_scope)?,
-            )
+            child_ctx.with_workspace_activity(crate::core::workspace_txn::WorkspaceActivity::begin(
+                &self.root,
+                &child_scope,
+            )?)
         };
         let native_scoped = child_ctx.native_scope().is_some();
         let mut cfg = AgentConfig {
@@ -1670,8 +1746,10 @@ impl TaskTool {
         // brief (its own partial report attached). Both attempts retain their actual edits;
         // only the coordinating parent may inspect and reconcile incomplete work.
         //
-        let dispatch_lease = if sub_verify_gate && prepared.speculative.is_none()
-            && !(native_scoped && scoped_native_parallel) {
+        let dispatch_lease = if sub_verify_gate
+            && prepared.speculative.is_none()
+            && !(native_scoped && scoped_native_parallel)
+        {
             Some(
                 crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
                     &self.root,
@@ -1725,14 +1803,25 @@ impl TaskTool {
                 .with_recovery(cfg.exec_ctx.recovery().clone());
                 if let Some(task) = &prepared.speculative {
                     crate::agent::hooks::check_speculative_policy()?;
-                    attempt_cfg.exec_ctx = attempt_cfg.exec_ctx.with_overlay(task.overlay.clone())?;
-                    let scope = attempt_cfg.exec_ctx.native_scope()
+                    attempt_cfg.exec_ctx =
+                        attempt_cfg.exec_ctx.with_overlay(task.overlay.clone())?;
+                    let scope = attempt_cfg
+                        .exec_ctx
+                        .native_scope()
                         .context("speculative task lost its complete exact scope")?;
-                    native_owner = Some(crate::agent::speculative_attempt::AttemptOwner::new_required(
-                        slot, &self.root, &attempt_scope, task.overlay.clone(), scope,
-                    )?);
-                    attempt_cfg.exec_ctx = native_owner.as_ref()
-                        .context("speculative task owner unavailable")?.bind_context(&attempt_cfg.exec_ctx)?;
+                    native_owner = Some(
+                        crate::agent::speculative_attempt::AttemptOwner::new_required(
+                            slot,
+                            &self.root,
+                            &attempt_scope,
+                            task.overlay.clone(),
+                            scope,
+                        )?,
+                    );
+                    attempt_cfg.exec_ctx = native_owner
+                        .as_ref()
+                        .context("speculative task owner unavailable")?
+                        .bind_context(&attempt_cfg.exec_ctx)?;
                 } else {
                     let slot = std::sync::Arc::new(slot);
                     attempt_cfg.exec_ctx = attempt_cfg.exec_ctx.with_attempt_slot(slot.clone());
@@ -1792,13 +1881,22 @@ impl TaskTool {
                     );
                     let released = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(owner.finish_with_driver(
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(15), driver,
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+                            driver,
                         ))
                     })?;
-                    let task = prepared.speculative.as_ref().context("speculative task lost its controller")?;
-                    let mut destination = task.released.lock()
+                    let task = prepared
+                        .speculative
+                        .as_ref()
+                        .context("speculative task lost its controller")?;
+                    let mut destination = task
+                        .released
+                        .lock()
                         .map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?;
-                    anyhow::ensure!(destination.is_none(), "speculative task already released an attempt");
+                    anyhow::ensure!(
+                        destination.is_none(),
+                        "speculative task already released an attempt"
+                    );
                     *destination = Some(released);
                 }
                 if let Some(slot) = direct_slot {
@@ -1832,12 +1930,17 @@ impl TaskTool {
             None
         };
         let first_text = crate::agent::context_pack::prepend(pack.as_deref(), prompt);
-        let (outcome, retried) = run_task_attempts(first_text, sub_verify_gate && prepared.speculative.is_none(), run_once, |stop| {
-            track.set_phase(
-                crate::agent::orchestration::Phase::Running,
-                format!("retry: {}", stop_phrase(stop)),
-            )
-        });
+        let (outcome, retried) = run_task_attempts(
+            first_text,
+            sub_verify_gate && prepared.speculative.is_none(),
+            run_once,
+            |stop| {
+                track.set_phase(
+                    crate::agent::orchestration::Phase::Running,
+                    format!("retry: {}", stop_phrase(stop)),
+                )
+            },
+        );
         let (outcome, msgs, final_scope) = match outcome {
             Ok(o) => o,
             Err(e) => {
@@ -1929,8 +2032,10 @@ impl TaskTool {
         if let Some(task) = &prepared.speculative {
             // Logical success never seals private bytes. The coordinator joins this entire
             // driver (including TLS/cfg cleanup) before requesting a private-body-quiescent seal.
-            task.logical_complete.store(ok && !json_tag.contains("json:invalid"),
-                std::sync::atomic::Ordering::Release);
+            task.logical_complete.store(
+                ok && !json_tag.contains("json:invalid"),
+                std::sync::atomic::Ordering::Release,
+            );
         }
         let (tokens_in, tokens_out) = usage_out.finish();
         let retry_tag = if retried { " · retried" } else { "" };
@@ -1949,11 +2054,20 @@ impl TaskTool {
         );
         if let Some(task) = &prepared.speculative {
             if ok && !json_tag.contains("json:invalid") {
-                track.set_phase(crate::agent::orchestration::Phase::Running,
-                    format!("private attempt returned; awaiting parent sealing/integration · {detail}"));
-                *task.track.lock().map_err(|_| anyhow::anyhow!("speculative status poisoned"))? = Some(track);
+                track.set_phase(
+                    crate::agent::orchestration::Phase::Running,
+                    format!(
+                        "private attempt returned; awaiting parent sealing/integration · {detail}"
+                    ),
+                );
+                *task
+                    .track
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("speculative status poisoned"))? = Some(track);
             } else {
-                track.finish_err(format!("private attempt incomplete; no integration · {detail}"));
+                track.finish_err(format!(
+                    "private attempt incomplete; no integration · {detail}"
+                ));
             }
         } else if ok {
             track.finish_ok(detail);
@@ -1972,9 +2086,13 @@ impl TaskTool {
         // its budget, a later child can `file_read` all of it.
         if let Some(task) = &prepared.speculative {
             if ok && !json_tag.contains("json:invalid") {
-                *task.report.lock().map_err(|_| anyhow::anyhow!("speculative report poisoned"))? =
+                *task
+                    .report
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("speculative report poisoned"))? =
                     Some(SpeculativeTaskReport {
-                        parent_scope: parent_ctx.resource_scope(), label: label.clone(),
+                        parent_scope: parent_ctx.resource_scope(),
+                        label: label.clone(),
                         body: format!("{warning}{body}"),
                     });
             }
@@ -1998,8 +2116,14 @@ impl TaskTool {
             warning.push_str("[Visual evidence not relayed: this child used a different provider destination; evidence IDs do not authorize disclosure across providers.]\n");
         }
         let overlay_tag = if let Some(task) = &prepared.speculative {
-            format!(", private overlay; not yet integrated; base={} overlay={}", task.cohort.base().id(), task.overlay.id())
-        } else { String::new() };
+            format!(
+                ", private overlay; not yet integrated; base={} overlay={}",
+                task.cohort.base().id(),
+                task.overlay.id()
+            )
+        } else {
+            String::new()
+        };
         Ok(ToolObservation {
             text: format!(
                 "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}{overlay_tag}]\n{warning}{body}",

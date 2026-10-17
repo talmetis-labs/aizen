@@ -12,9 +12,7 @@ use crate::agent::tools::{PreparedFootprint, PreparedToolCall, WorkspaceEffect};
 use crate::core::exec_ctx::ExecutionContext;
 use crate::core::native_scope::NativeWriteScope;
 use crate::core::repo_lock::LockMode;
-use crate::core::speculation::store::{
-    OverlayFile, OverlayHandle, OverlayRead, WriteProvenance,
-};
+use crate::core::speculation::store::{OverlayFile, OverlayHandle, OverlayRead, WriteProvenance};
 use crate::core::speculation::workers::{scope_sha256, NativeWorkerKind};
 use anyhow::{bail, ensure, Context, Result};
 use ring::digest::{Context as DigestContext, SHA256};
@@ -68,7 +66,9 @@ pub(crate) struct FrozenOverlayWrite {
 }
 
 fn overlay_parts(ctx: &ExecutionContext) -> Result<(&OverlayHandle, &NativeWriteScope, String)> {
-    let handle = ctx.overlay().context("private overlay context is missing its handle")?;
+    let handle = ctx
+        .overlay()
+        .context("private overlay context is missing its handle")?;
     let scope = ctx
         .native_scope()
         .context("private overlay context is missing its sealed native scope")?;
@@ -92,7 +92,10 @@ fn snapshot_text(snapshot: &OverlayRead, label: &str) -> Result<String> {
     let bytes = snapshot
         .bytes()
         .context("private overlay target is missing; no live file was read")?;
-    ensure!(bytes.len() <= PREPARED_EDIT_MAX_BYTES, "private overlay file exceeds the 4 MiB limit");
+    ensure!(
+        bytes.len() <= PREPARED_EDIT_MAX_BYTES,
+        "private overlay file exceeds the 4 MiB limit"
+    );
     String::from_utf8(bytes.to_vec()).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
@@ -175,29 +178,57 @@ pub(crate) struct PreparedNativeWorker {
 }
 
 impl PreparedNativeWorker {
-    pub(crate) fn check_attempt(&self, overlay: &OverlayHandle, scope: &NativeWriteScope) -> Result<()> {
-        ensure!(self.handle.same_handle(overlay), "prepared worker belongs to another overlay");
+    pub(crate) fn check_attempt(
+        &self,
+        overlay: &OverlayHandle,
+        scope: &NativeWriteScope,
+    ) -> Result<()> {
+        ensure!(
+            self.handle.same_handle(overlay),
+            "prepared worker belongs to another overlay"
+        );
         overlay.check_owner_scope(overlay.owner(), scope)?;
         overlay.check_scope(scope)?;
-        ensure!(self.scope_sha256 == native_scope_sha256(scope)?, "prepared worker scope changed");
-        ensure!(self.generation == overlay.generation()?, "prepared worker generation changed before launch");
+        ensure!(
+            self.scope_sha256 == native_scope_sha256(scope)?,
+            "prepared worker scope changed"
+        );
+        ensure!(
+            self.generation == overlay.generation()?,
+            "prepared worker generation changed before launch"
+        );
         Ok(())
     }
 
-    pub(crate) fn check_lifecycle(&self, lifecycle: &crate::core::speculation::lifecycle::AttemptLifecycle) -> Result<()> {
+    pub(crate) fn check_lifecycle(
+        &self,
+        lifecycle: &crate::core::speculation::lifecycle::AttemptLifecycle,
+    ) -> Result<()> {
         lifecycle.check_overlay(self.handle.base_id(), self.handle.id(), self.handle.owner())?;
-        ensure!(self.handle.lifecycle().is_some_and(|bound| bound.same_attempt(lifecycle)),
-            "prepared worker belongs to another live lifecycle");
+        ensure!(
+            self.handle
+                .lifecycle()
+                .is_some_and(|bound| bound.same_attempt(lifecycle)),
+            "prepared worker belongs to another live lifecycle"
+        );
         self.check_attempt(&self.handle, lifecycle.scope())
     }
 
-    pub(crate) fn kind(&self) -> NativeWorkerKind { self.kind }
-    pub(crate) fn digest(&self) -> [u8; 32] { self.prepared_sha256 }
+    pub(crate) fn kind(&self) -> NativeWorkerKind {
+        self.kind
+    }
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.prepared_sha256
+    }
 }
 
 pub(crate) fn native_scope_sha256(scope: &NativeWriteScope) -> Result<[u8; 32]> {
     scope_sha256(scope.resources().iter().map(|resource| {
-        (resource.key(), resource.path(), scope.write_keys().iter().any(|key| key == resource.key()))
+        (
+            resource.key(),
+            resource.path(),
+            scope.write_keys().iter().any(|key| key == resource.key()),
+        )
     }))
 }
 
@@ -209,17 +240,33 @@ impl OperationDigest {
         self.0.update(bytes);
     }
 
-    fn u64(&mut self, value: u64) { self.0.update(&value.to_le_bytes()); }
-    fn flag(&mut self, value: bool) { self.0.update(&[u8::from(value)]); }
+    fn u64(&mut self, value: u64) {
+        self.0.update(&value.to_le_bytes());
+    }
+    fn flag(&mut self, value: bool) {
+        self.0.update(&[u8::from(value)]);
+    }
 
     fn optional_u64(&mut self, value: Option<u64>) {
         self.flag(value.is_some());
-        if let Some(value) = value { self.u64(value); }
+        if let Some(value) = value {
+            self.u64(value);
+        }
     }
 
-    fn snapshot(&mut self, file: &OverlayFile, snapshot: &OverlayRead, writable: bool) -> Result<()> {
+    fn snapshot(
+        &mut self,
+        file: &OverlayFile,
+        snapshot: &OverlayRead,
+        writable: bool,
+    ) -> Result<()> {
         self.bytes(file.key().as_bytes());
-        self.bytes(file.logical_path().to_str().context("prepared worker path is not UTF-8")?.as_bytes());
+        self.bytes(
+            file.logical_path()
+                .to_str()
+                .context("prepared worker path is not UTF-8")?
+                .as_bytes(),
+        );
         self.flag(writable);
         self.u64(snapshot.generation());
         let fingerprint = snapshot.fingerprint();
@@ -249,44 +296,90 @@ fn begin_worker_digest(
     kind: NativeWorkerKind,
     files: &[(&OverlayFile, LockMode)],
 ) -> Result<(PreparedNativeWorker, OperationDigest)> {
-    let scope = ctx.native_scope().context("prepared worker lost its exact native scope")?;
-    ensure!(ctx.overlay().is_some_and(|active| active.same_handle(handle)), "prepared worker context changed");
+    let scope = ctx
+        .native_scope()
+        .context("prepared worker lost its exact native scope")?;
+    ensure!(
+        ctx.overlay()
+            .is_some_and(|active| active.same_handle(handle)),
+        "prepared worker context changed"
+    );
     handle.check_owner_scope(&ctx.resource_scope(), scope)?;
     handle.check_scope(scope)?;
-    ensure!(prepared.file.is_none(), "private worker cannot carry a live file preparation");
-    let Some(PreparedFootprint::Overlay { handle: footprint, files: bound }) = &prepared.footprint else {
+    ensure!(
+        prepared.file.is_none(),
+        "private worker cannot carry a live file preparation"
+    );
+    let Some(PreparedFootprint::Overlay {
+        handle: footprint,
+        files: bound,
+    }) = &prepared.footprint
+    else {
         bail!("prepared worker requires a typed private footprint");
     };
-    ensure!(handle.same_handle(footprint) && !files.is_empty() && bound.len() == files.len(),
-        "prepared worker footprint differs from frozen operation");
+    ensure!(
+        handle.same_handle(footprint) && !files.is_empty() && bound.len() == files.len(),
+        "prepared worker footprint differs from frozen operation"
+    );
     for ((expected, mode), (file, bound_mode)) in files.iter().zip(bound) {
         handle.check_file(expected)?;
         handle.check_file(file)?;
-        ensure!(expected.key() == file.key() && mode == bound_mode,
-            "prepared worker resource/access differs from frozen operation");
+        ensure!(
+            expected.key() == file.key() && mode == bound_mode,
+            "prepared worker resource/access differs from frozen operation"
+        );
     }
     let scope_sha256 = native_scope_sha256(scope)?;
     let mut digest = OperationDigest(DigestContext::new(&SHA256));
     digest.bytes(b"aizen-speculation-prepared-native-v1");
-    digest.bytes(match kind { NativeWorkerKind::Read => b"read", NativeWorkerKind::Edit => b"edit", NativeWorkerKind::Write => b"write" });
+    digest.bytes(match kind {
+        NativeWorkerKind::Read => b"read",
+        NativeWorkerKind::Edit => b"edit",
+        NativeWorkerKind::Write => b"write",
+    });
     digest.bytes(handle.base_id().as_bytes());
     digest.bytes(handle.id().as_bytes());
     digest.bytes(handle.owner().as_bytes());
     digest.bytes(&scope_sha256);
     digest.u64(generation);
-    Ok((PreparedNativeWorker { handle: handle.clone(), scope_sha256, generation, kind, prepared_sha256: [0; 32] }, digest))
+    Ok((
+        PreparedNativeWorker {
+            handle: handle.clone(),
+            scope_sha256,
+            generation,
+            kind,
+            prepared_sha256: [0; 32],
+        },
+        digest,
+    ))
 }
 
 /// Encode the actual typed frozen operation, never mutable model args, previews, or Debug output.
 /// No live source read, stat, scope resolution, or executable context clone occurs here.
-pub(crate) fn prepared_native_worker(prepared: &PreparedToolCall) -> Result<Option<PreparedNativeWorker>> {
+pub(crate) fn prepared_native_worker(
+    prepared: &PreparedToolCall,
+) -> Result<Option<PreparedNativeWorker>> {
     let Some(frozen) = &prepared.delegation else {
-        ensure!(!matches!(prepared.footprint, Some(PreparedFootprint::Overlay { .. })), "private worker lost its frozen operation");
+        ensure!(
+            !matches!(prepared.footprint, Some(PreparedFootprint::Overlay { .. })),
+            "private worker lost its frozen operation"
+        );
         return Ok(None);
     };
     let (mut worker, digest) = if let Some(read) = frozen.downcast_ref::<FrozenOverlayRead>() {
-        let files = read.entries.iter().map(|entry| (&entry.file, LockMode::Shared)).collect::<Vec<_>>();
-        let (worker, mut digest) = begin_worker_digest(prepared, &read.ctx, &read.handle, read.generation, NativeWorkerKind::Read, &files)?;
+        let files = read
+            .entries
+            .iter()
+            .map(|entry| (&entry.file, LockMode::Shared))
+            .collect::<Vec<_>>();
+        let (worker, mut digest) = begin_worker_digest(
+            prepared,
+            &read.ctx,
+            &read.handle,
+            read.generation,
+            NativeWorkerKind::Read,
+            &files,
+        )?;
         digest.flag(read.number);
         digest.flag(read.batch);
         digest.u64(read.omitted as u64);
@@ -299,7 +392,14 @@ pub(crate) fn prepared_native_worker(prepared: &PreparedToolCall) -> Result<Opti
         }
         (worker, digest)
     } else if let Some(edit) = frozen.downcast_ref::<FrozenOverlayEdit>() {
-        let (worker, mut digest) = begin_worker_digest(prepared, &edit.ctx, &edit.handle, edit.generation, NativeWorkerKind::Edit, &[(&edit.file, LockMode::Exclusive)])?;
+        let (worker, mut digest) = begin_worker_digest(
+            prepared,
+            &edit.ctx,
+            &edit.handle,
+            edit.generation,
+            NativeWorkerKind::Edit,
+            &[(&edit.file, LockMode::Exclusive)],
+        )?;
         digest.snapshot(&edit.file, &edit.snapshot, true)?;
         digest.bytes(edit.content.as_bytes());
         digest.provenance(edit.provenance);
@@ -308,7 +408,14 @@ pub(crate) fn prepared_native_worker(prepared: &PreparedToolCall) -> Result<Opti
         digest.bytes(edit.output.as_bytes());
         (worker, digest)
     } else if let Some(write) = frozen.downcast_ref::<FrozenOverlayWrite>() {
-        let (worker, mut digest) = begin_worker_digest(prepared, &write.ctx, &write.handle, write.generation, NativeWorkerKind::Write, &[(&write.file, LockMode::Exclusive)])?;
+        let (worker, mut digest) = begin_worker_digest(
+            prepared,
+            &write.ctx,
+            &write.handle,
+            write.generation,
+            NativeWorkerKind::Write,
+            &[(&write.file, LockMode::Exclusive)],
+        )?;
         digest.snapshot(&write.file, &write.snapshot, true)?;
         digest.bytes(write.content.as_bytes());
         digest.provenance(write.provenance);
@@ -316,10 +423,15 @@ pub(crate) fn prepared_native_worker(prepared: &PreparedToolCall) -> Result<Opti
         digest.bytes(write.output.as_bytes());
         (worker, digest)
     } else {
-        ensure!(!matches!(prepared.footprint, Some(PreparedFootprint::Overlay { .. })), "private worker has an unknown frozen operation");
+        ensure!(
+            !matches!(prepared.footprint, Some(PreparedFootprint::Overlay { .. })),
+            "private worker has an unknown frozen operation"
+        );
         return Ok(None);
     };
-    worker.prepared_sha256.copy_from_slice(digest.0.finish().as_ref());
+    worker
+        .prepared_sha256
+        .copy_from_slice(digest.0.finish().as_ref());
     Ok(Some(worker))
 }
 
@@ -421,7 +533,10 @@ pub(crate) fn prepare_read_overlay(
     }
     drop(body);
     let generation = handle.generation()?;
-    ensure!(generation == generation_before, "private overlay changed during preparation; prepare again");
+    ensure!(
+        generation == generation_before,
+        "private overlay changed during preparation; prepare again"
+    );
     let mut prepared = PreparedToolCall::new(args.clone());
     prepared.footprint = Some(overlay_footprint(
         handle,
@@ -435,7 +550,9 @@ pub(crate) fn prepare_read_overlay(
         entries,
         number: args.get("number").and_then(Value::as_bool).unwrap_or(false),
         batch: list.is_some(),
-        omitted: list.map_or(0, |items| items.len().saturating_sub(super::MULTI_READ_MAX_FILES)),
+        omitted: list.map_or(0, |items| {
+            items.len().saturating_sub(super::MULTI_READ_MAX_FILES)
+        }),
         generation,
     }));
     Ok(prepared)
@@ -449,12 +566,7 @@ fn render_overlay_read_entry(
 ) -> Result<String> {
     let content = snapshot_text(&entry.snapshot, &entry.label)?;
     if entry.start.is_none() && entry.end.is_none() && !number {
-        return Ok(budget_view(
-            &content,
-            &entry.label,
-            max_lines,
-            max_bytes,
-        ));
+        return Ok(budget_view(&content, &entry.label, max_lines, max_bytes));
     }
     let lines: Vec<&str> = content.lines().collect();
     let start = entry.start.unwrap_or(1).max(1) as usize;
@@ -473,9 +585,7 @@ fn render_overlay_read_entry(
     ))
 }
 
-pub(crate) fn execute_read_overlay(
-    prepared: &PreparedToolCall,
-) -> Option<Result<String>> {
+pub(crate) fn execute_read_overlay(prepared: &PreparedToolCall) -> Option<Result<String>> {
     let frozen = prepared
         .delegation
         .as_ref()
@@ -514,7 +624,10 @@ fn execute_read_overlay_inner(frozen: &FrozenOverlayRead) -> Result<String> {
             FILE_READ_MAX_LINES,
             FILE_READ_MAX_BYTES,
         )?;
-        ensure!(output.len() <= PREPARED_EDIT_MAX_BYTES, "file_read output exceeds the 4 MiB limit");
+        ensure!(
+            output.len() <= PREPARED_EDIT_MAX_BYTES,
+            "file_read output exceeds the 4 MiB limit"
+        );
         return Ok(format!("{output}\n[{PRIVATE_OVERLAY_NOTE}]"));
     }
     let per_lines = (FILE_READ_MAX_LINES / frozen.entries.len()).max(1);
@@ -587,8 +700,16 @@ fn parse_edit_inputs(args: &Value) -> Result<(String, Option<&Vec<Value>>, usize
     let input_bytes = if let Some(edits) = edits {
         edits.iter().fold(0usize, |total, edit| {
             total
-                .saturating_add(edit.get("old_string").and_then(Value::as_str).map_or(0, str::len))
-                .saturating_add(edit.get("new_string").and_then(Value::as_str).map_or(0, str::len))
+                .saturating_add(
+                    edit.get("old_string")
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len),
+                )
+                .saturating_add(
+                    edit.get("new_string")
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len),
+                )
         })
     } else {
         args.get("old_string")
@@ -596,7 +717,10 @@ fn parse_edit_inputs(args: &Value) -> Result<(String, Option<&Vec<Value>>, usize
             .map_or(0, str::len)
             .saturating_add(super::str_arg(args, "new_string")?.len())
     };
-    ensure!(input_bytes <= PREPARED_EDIT_MAX_BYTES, "file_edit arguments exceed the 4 MiB preparation limit; nothing written");
+    ensure!(
+        input_bytes <= PREPARED_EDIT_MAX_BYTES,
+        "file_edit arguments exceed the 4 MiB preparation limit; nothing written"
+    );
     Ok((path, edits, input_bytes))
 }
 
@@ -613,7 +737,10 @@ pub(crate) fn prepare_edit_overlay(
     let generation_before = handle.generation()?;
     let snapshot = prepare_snapshot(handle, &owner, &file, true)?;
     let generation = handle.generation()?;
-    ensure!(generation == generation_before, "private overlay changed during preparation; prepare again");
+    ensure!(
+        generation == generation_before,
+        "private overlay changed during preparation; prepare again"
+    );
     let original = snapshot_text(&snapshot, &path)?;
     let dry_run = dry_run_arg(args);
     let (content, mut output) = if let Some(edits) = edits {
@@ -654,17 +781,33 @@ pub(crate) fn prepare_edit_overlay(
             preview_bytes = preview_bytes
                 .saturating_add(summary.len())
                 .saturating_add(diff.len());
-            ensure!(preview_bytes <= PREPARED_EDIT_MAX_BYTES, "file_edit preview exceeds the 4 MiB preparation limit; nothing written");
+            ensure!(
+                preview_bytes <= PREPARED_EDIT_MAX_BYTES,
+                "file_edit preview exceeds the 4 MiB preparation limit; nothing written"
+            );
             summaries.push(summary);
             diffs.push(diff);
             buf = applied.content;
         }
         let output = if buf == original {
-            format!("{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing", edits.len())
+            format!(
+                "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
+                edits.len()
+            )
         } else if dry_run {
-            format!("{DRY_RUN_PREFIX}: would edit {path} ({} edits); nothing written\n{}\n{}", edits.len(), summaries.join("\n"), diffs.join("\n"))
+            format!(
+                "{DRY_RUN_PREFIX}: would edit {path} ({} edits); nothing written\n{}\n{}",
+                edits.len(),
+                summaries.join("\n"),
+                diffs.join("\n")
+            )
         } else {
-            format!("edited {path} ({} edits applied)\n{}\n{}", edits.len(), summaries.join("\n"), diffs.join("\n"))
+            format!(
+                "edited {path} ({} edits applied)\n{}\n{}",
+                edits.len(),
+                summaries.join("\n"),
+                diffs.join("\n")
+            )
         };
         (buf, output)
     } else {
@@ -672,23 +815,39 @@ pub(crate) fn prepare_edit_overlay(
             &original,
             super::str_arg(args, "old_string")?,
             super::str_arg(args, "new_string")?,
-            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+            args.get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             &path,
         )?;
         let output = if applied.content == original {
             format!("{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)")
         } else if dry_run {
-            format!("{DRY_RUN_PREFIX}: would edit {path} ({}); nothing written\n{}", applied.summary(), diff_preview(&applied.before, &applied.after, applied.start_line))
+            format!(
+                "{DRY_RUN_PREFIX}: would edit {path} ({}); nothing written\n{}",
+                applied.summary(),
+                diff_preview(&applied.before, &applied.after, applied.start_line)
+            )
         } else {
-            format!("edited {path} ({})\n{}", applied.summary(), diff_preview(&applied.before, &applied.after, applied.start_line))
+            format!(
+                "edited {path} ({})\n{}",
+                applied.summary(),
+                diff_preview(&applied.before, &applied.after, applied.start_line)
+            )
         };
         (applied.content, output)
     };
-    ensure!(content.len() <= PREPARED_EDIT_MAX_BYTES, "file_edit output exceeds the 4 MiB preparation limit; nothing written");
+    ensure!(
+        content.len() <= PREPARED_EDIT_MAX_BYTES,
+        "file_edit output exceeds the 4 MiB preparation limit; nothing written"
+    );
     let no_op = content == original;
     let actual = file.logical_path().display().to_string();
     output = overlay_output(output);
-    ensure!(output.len() <= PREPARED_EDIT_MAX_BYTES, "file_edit preview exceeds the 4 MiB preparation limit; nothing written");
+    ensure!(
+        output.len() <= PREPARED_EDIT_MAX_BYTES,
+        "file_edit preview exceeds the 4 MiB preparation limit; nothing written"
+    );
     let (first, rest) = output.split_once('\n').unwrap_or((&output, ""));
     let mut prepared = PreparedToolCall::new(args.clone());
     prepared.args["path"] = Value::String(actual.clone());
@@ -698,7 +857,10 @@ pub(crate) fn prepare_edit_overlay(
         (!rest.is_empty()).then(|| rest.to_string()),
     ));
     prepared.preview_lines = vec![PRIVATE_OVERLAY_NOTE.to_string()];
-    prepared.footprint = Some(overlay_footprint(handle, [(file.clone(), LockMode::Exclusive)]));
+    prepared.footprint = Some(overlay_footprint(
+        handle,
+        [(file.clone(), LockMode::Exclusive)],
+    ));
     prepared.delegation = Some(Arc::new(FrozenOverlayEdit {
         ctx: ctx.clone(),
         handle: handle.clone(),
@@ -714,9 +876,7 @@ pub(crate) fn prepare_edit_overlay(
     Ok(prepared)
 }
 
-pub(crate) fn execute_edit_overlay(
-    prepared: &PreparedToolCall,
-) -> Option<Result<String>> {
+pub(crate) fn execute_edit_overlay(prepared: &PreparedToolCall) -> Option<Result<String>> {
     let frozen = prepared
         .delegation
         .as_ref()
@@ -726,13 +886,26 @@ pub(crate) fn execute_edit_overlay(
 
 fn execute_edit_overlay_inner(frozen: &FrozenOverlayEdit) -> Result<String> {
     super::verify_frozen_native_context(Some(&frozen.ctx))?;
-    let scope = frozen.ctx.native_scope().context("private overlay edit lost its sealed native scope")?;
-    frozen.handle.check_owner_scope(&frozen.ctx.resource_scope(), scope)?;
-    ensure!(frozen.handle.generation()? == frozen.generation, "private overlay changed after preparation; prepare again");
+    let scope = frozen
+        .ctx
+        .native_scope()
+        .context("private overlay edit lost its sealed native scope")?;
+    frozen
+        .handle
+        .check_owner_scope(&frozen.ctx.resource_scope(), scope)?;
+    ensure!(
+        frozen.handle.generation()? == frozen.generation,
+        "private overlay changed after preparation; prepare again"
+    );
     let body = frozen.handle.body_lease(&frozen.ctx.resource_scope())?;
     frozen.handle.validate(&frozen.file, true)?;
-    frozen.handle.validate_snapshot(&frozen.file, &frozen.snapshot, &body)?;
-    ensure!(frozen.handle.generation()? == frozen.generation, "private overlay changed before edit; prepare again");
+    frozen
+        .handle
+        .validate_snapshot(&frozen.file, &frozen.snapshot, &body)?;
+    ensure!(
+        frozen.handle.generation()? == frozen.generation,
+        "private overlay changed before edit; prepare again"
+    );
     if frozen.dry_run || frozen.no_op {
         return Ok(frozen.output.clone());
     }
@@ -756,9 +929,18 @@ pub(crate) fn prepare_write_overlay(
     bounded_native_arguments(args, "file_write")?;
     let path = super::str_arg(args, "path")?;
     let content = super::str_arg(args, "content")?;
-    ensure!(content.len() <= PREPARED_EDIT_MAX_BYTES, "file_write content exceeds the 4 MiB preparation limit; nothing written");
+    ensure!(
+        content.len() <= PREPARED_EDIT_MAX_BYTES,
+        "file_write content exceeds the 4 MiB preparation limit; nothing written"
+    );
     let purpose = crate::core::file_placement::FilePurpose::parse_optional(args.get("purpose"))?;
-    if matches!(purpose, Some(crate::core::file_placement::FilePurpose::Artifact | crate::core::file_placement::FilePurpose::Scratch)) {
+    if matches!(
+        purpose,
+        Some(
+            crate::core::file_placement::FilePurpose::Artifact
+                | crate::core::file_placement::FilePurpose::Scratch
+        )
+    ) {
         bail!("private overlay permits only exact project files, not managed destinations");
     }
     let (handle, _scope, owner) = overlay_parts(ctx)?;
@@ -767,11 +949,17 @@ pub(crate) fn prepare_write_overlay(
     let generation_before = handle.generation()?;
     let snapshot = prepare_snapshot(handle, &owner, &file, true)?;
     let generation = handle.generation()?;
-    ensure!(generation == generation_before, "private overlay changed during preparation; prepare again");
+    ensure!(
+        generation == generation_before,
+        "private overlay changed during preparation; prepare again"
+    );
     let before = snapshot
         .bytes()
         .map(|bytes| {
-            ensure!(bytes.len() <= PREPARED_EDIT_MAX_BYTES, "private overlay file exceeds the 4 MiB limit");
+            ensure!(
+                bytes.len() <= PREPARED_EDIT_MAX_BYTES,
+                "private overlay file exceeds the 4 MiB limit"
+            );
             String::from_utf8(bytes.to_vec()).with_context(|| format!("{path} is not valid UTF-8"))
         })
         .transpose()?;
@@ -785,7 +973,11 @@ pub(crate) fn prepare_write_overlay(
     let lines = vec![if no_op {
         format!("{actual} unchanged (identical content)")
     } else {
-        format!("overwrite {actual}: {} → {} bytes", before.as_ref().map_or(0, |text| text.len()), content.len())
+        format!(
+            "overwrite {actual}: {} → {} bytes",
+            before.as_ref().map_or(0, |text| text.len()),
+            content.len()
+        )
     }];
     let raw_output = if no_op {
         format!("{NOOP_WRITE_PREFIX}: {actual} already holds this exact content")
@@ -798,12 +990,18 @@ pub(crate) fn prepare_write_overlay(
         output
     };
     let output = overlay_output(raw_output);
-    ensure!(output.len() <= PREPARED_EDIT_MAX_BYTES, "file_write output exceeds the 4 MiB preparation limit; nothing written");
+    ensure!(
+        output.len() <= PREPARED_EDIT_MAX_BYTES,
+        "file_write output exceeds the 4 MiB preparation limit; nothing written"
+    );
     let mut prepared = PreparedToolCall::new(args.clone());
     prepared.args["path"] = Value::String(actual.clone());
     prepared.preview = Some(overlay_preview(actual, lines, diff));
     prepared.preview_lines = vec![PRIVATE_OVERLAY_NOTE.to_string()];
-    prepared.footprint = Some(overlay_footprint(handle, [(file.clone(), LockMode::Exclusive)]));
+    prepared.footprint = Some(overlay_footprint(
+        handle,
+        [(file.clone(), LockMode::Exclusive)],
+    ));
     prepared.delegation = Some(Arc::new(FrozenOverlayWrite {
         ctx: ctx.clone(),
         handle: handle.clone(),
@@ -818,9 +1016,7 @@ pub(crate) fn prepare_write_overlay(
     Ok(prepared)
 }
 
-pub(crate) fn execute_write_overlay(
-    prepared: &PreparedToolCall,
-) -> Option<Result<String>> {
+pub(crate) fn execute_write_overlay(prepared: &PreparedToolCall) -> Option<Result<String>> {
     let frozen = prepared
         .delegation
         .as_ref()
@@ -830,13 +1026,26 @@ pub(crate) fn execute_write_overlay(
 
 fn execute_write_overlay_inner(frozen: &FrozenOverlayWrite) -> Result<String> {
     super::verify_frozen_native_context(Some(&frozen.ctx))?;
-    let scope = frozen.ctx.native_scope().context("private overlay write lost its sealed native scope")?;
-    frozen.handle.check_owner_scope(&frozen.ctx.resource_scope(), scope)?;
-    ensure!(frozen.handle.generation()? == frozen.generation, "private overlay changed after preparation; prepare again");
+    let scope = frozen
+        .ctx
+        .native_scope()
+        .context("private overlay write lost its sealed native scope")?;
+    frozen
+        .handle
+        .check_owner_scope(&frozen.ctx.resource_scope(), scope)?;
+    ensure!(
+        frozen.handle.generation()? == frozen.generation,
+        "private overlay changed after preparation; prepare again"
+    );
     let body = frozen.handle.body_lease(&frozen.ctx.resource_scope())?;
     frozen.handle.validate(&frozen.file, true)?;
-    frozen.handle.validate_snapshot(&frozen.file, &frozen.snapshot, &body)?;
-    ensure!(frozen.handle.generation()? == frozen.generation, "private overlay changed before write; prepare again");
+    frozen
+        .handle
+        .validate_snapshot(&frozen.file, &frozen.snapshot, &body)?;
+    ensure!(
+        frozen.handle.generation()? == frozen.generation,
+        "private overlay changed before write; prepare again"
+    );
     if frozen.no_op {
         return Ok(frozen.output.clone());
     }

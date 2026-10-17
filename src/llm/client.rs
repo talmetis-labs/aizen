@@ -859,15 +859,30 @@ fn truncate_frame(data: &str) -> String {
 /// echoing a rejected payload in diagnostics. Parseable metadata (including JSON pings) has
 /// default-empty fields: only the semantic watchdog decides whether the model made progress.
 fn parse_chunk(data: &str) -> Result<ChatChunk> {
-    let value: serde_json::Value = serde_json::from_str(data)
-        .map_err(|_| super::delegated::Failure::Protocol)?;
-    if matches!(value.get("type").and_then(|v| v.as_str()),
-        Some("message_start" | "message_delta" | "message_stop" | "content_block_start"
-            | "content_block_delta" | "content_block_stop"))
-        || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| t.starts_with("response."))
-        || value.get("choices").and_then(|v| v.as_array()).is_some_and(|choices| {
-            choices.iter().any(|choice| choice.get("message").is_some() && choice.get("delta").is_none())
-        })
+    let value: serde_json::Value =
+        serde_json::from_str(data).map_err(|_| super::delegated::Failure::Protocol)?;
+    if matches!(
+        value.get("type").and_then(|v| v.as_str()),
+        Some(
+            "message_start"
+                | "message_delta"
+                | "message_stop"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+        )
+    ) || value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.starts_with("response."))
+        || value
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|choice| choice.get("message").is_some() && choice.get("delta").is_none())
+            })
     {
         return Err(super::delegated::Failure::Protocol.into());
     }
@@ -1893,10 +1908,8 @@ async fn stream_chat_with_visual_contract_live(
     // would otherwise park this loop until reqwest's 300s read timeout — and only if it withholds
     // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
     // eager handles to detach and its caller already prints the error.
-    let mut watchdog = super::stream_watch::Watchdog::new(
-        stream_first_frame_timeout(),
-        stream_stall_timeout(),
-    );
+    let mut watchdog =
+        super::stream_watch::Watchdog::new(stream_first_frame_timeout(), stream_stall_timeout());
     loop {
         let event = match watchdog.wait(stream.next()).await {
             Ok(Some(Ok(e))) => e,
@@ -2969,10 +2982,10 @@ async fn stream_chat_with_tools_eager_live(
                         }
                         if let Some(content) = &choice.delta.content {
                             spin.take(); // stop+clear the spinner before the first token prints
-                            // Nonempty text is real output even when the display filter drops it
-                            // (`<think>` spans). An EMPTY delta is metadata: it must not disarm the
-                            // blank-stream replay, or a provider that only ever emits empty deltas
-                            // would be reported as a finished answer instead of being retried.
+                                         // Nonempty text is real output even when the display filter drops it
+                                         // (`<think>` spans). An EMPTY delta is metadata: it must not disarm the
+                                         // blank-stream replay, or a provider that only ever emits empty deltas
+                                         // would be reported as a finished answer instead of being retried.
                             produced |= !content.is_empty();
                             let shown = think.push(content);
                             if !shown.is_empty() {
@@ -4998,7 +5011,9 @@ pub(crate) mod tests {
         let counter = seen.clone();
         let srv = tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
                 let mut buf = vec![0u8; 4096];
                 let _ = socket.read(&mut buf).await;
                 *counter.lock().unwrap() += 1;
@@ -5012,15 +5027,12 @@ pub(crate) mod tests {
             }
         });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let control = crate::llm::delegated::Control::new(
-            std::time::Duration::from_secs(30),
-            None,
-            None,
-        );
-        let error = crate::llm::delegated::run(Some(&control), send_with_retry_render(
-            || client.post(&url).body("{}"),
-            false,
-        ))
+        let control =
+            crate::llm::delegated::Control::new(std::time::Duration::from_secs(30), None, None);
+        let error = crate::llm::delegated::run(
+            Some(&control),
+            send_with_retry_render(|| client.post(&url).body("{}"), false),
+        )
         .await
         .unwrap_err();
         assert_eq!(
@@ -5028,7 +5040,11 @@ pub(crate) mod tests {
             Some(&crate::llm::delegated::Failure::Exhausted),
             "{error}"
         );
-        assert_eq!(*seen.lock().unwrap(), 3, "HTTP retry, blank replay and outer retry share one budget");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            3,
+            "HTTP retry, blank replay and outer retry share one budget"
+        );
         srv.abort();
     }
 
@@ -5044,7 +5060,9 @@ pub(crate) mod tests {
         let counter = seen.clone();
         let srv = tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
                 let mut buf = vec![0u8; 4096];
                 let _ = socket.read(&mut buf).await;
                 *counter.lock().unwrap() += 1;
@@ -5058,15 +5076,22 @@ pub(crate) mod tests {
         });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let cfg = crate::core::cli_config::CliConfig::default();
-        let control = crate::llm::delegated::Control::new(
-            std::time::Duration::from_secs(30),
-            None,
-            None,
-        );
-        let turn = crate::llm::delegated::run(Some(&control), stream_chat_with_tools_eager_live(
-            &client, &base, "fixture-key", "healthy-delegated", &[Message::user("hi")], &[],
-            StreamSink::default(), None, &cfg,
-        ))
+        let control =
+            crate::llm::delegated::Control::new(std::time::Duration::from_secs(30), None, None);
+        let turn = crate::llm::delegated::run(
+            Some(&control),
+            stream_chat_with_tools_eager_live(
+                &client,
+                &base,
+                "fixture-key",
+                "healthy-delegated",
+                &[Message::user("hi")],
+                &[],
+                StreamSink::default(),
+                None,
+                &cfg,
+            ),
+        )
         .await
         .unwrap();
         assert_eq!(turn.content.as_deref(), Some("ok"));
@@ -5089,7 +5114,9 @@ pub(crate) mod tests {
         let counter = seen.clone();
         let srv = tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
                 let mut buf = vec![0u8; 4096];
                 let _ = socket.read(&mut buf).await;
                 *counter.lock().unwrap() += 1;
@@ -5104,11 +5131,22 @@ pub(crate) mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let cfg = crate::core::cli_config::CliConfig::default();
         let turn = stream_chat_with_tools_eager_live(
-            &client, &base, "fixture-key", "metadata-only", &[Message::user("hi")], &[],
-            StreamSink::default(), None, &cfg,
-        ).await;
+            &client,
+            &base,
+            "fixture-key",
+            "metadata-only",
+            &[Message::user("hi")],
+            &[],
+            StreamSink::default(),
+            None,
+            &cfg,
+        )
+        .await;
         let error = turn.err().expect("metadata is not an answer");
-        assert!(error.to_string().contains("validated finish reason"), "{error}");
+        assert!(
+            error.to_string().contains("validated finish reason"),
+            "{error}"
+        );
         let requests = *seen.lock().unwrap();
         assert_eq!(
             requests,

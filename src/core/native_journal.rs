@@ -37,8 +37,10 @@ pub(crate) struct BatchIdentity {
 
 impl BatchIdentity {
     pub(crate) fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.epoch != [0; 32] && self.batch != [0; 32],
-            "native journal invalid batch identity");
+        anyhow::ensure!(
+            self.epoch != [0; 32] && self.batch != [0; 32],
+            "native journal invalid batch identity"
+        );
         Ok(())
     }
 }
@@ -153,18 +155,25 @@ struct BatchFence {
     intents: Vec<ExpectedIntent>,
 }
 
-fn deserialize_intents<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<ExpectedIntent>, D::Error> {
+fn deserialize_intents<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<ExpectedIntent>, D::Error> {
     struct Intents;
     impl<'de> serde::de::Visitor<'de> for Intents {
         type Value = Vec<ExpectedIntent>;
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("a bounded native intent manifest")
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
             let mut intents = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_RECORDS));
             while let Some(intent) = seq.next_element()? {
                 if intents.len() == MAX_RECORDS {
-                    return Err(serde::de::Error::custom("native journal intent count exceeds limit"));
+                    return Err(serde::de::Error::custom(
+                        "native journal intent count exceeds limit",
+                    ));
                 }
                 intents.push(intent);
             }
@@ -216,9 +225,13 @@ pub(crate) struct FencePublicationUncertain {
 impl std::fmt::Display for FencePublicationUncertain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "native journal covered fence ")?;
-        for byte in self.identity.epoch { write!(f, "{byte:02x}")?; }
+        for byte in self.identity.epoch {
+            write!(f, "{byte:02x}")?;
+        }
         write!(f, "/")?;
-        for byte in self.identity.batch { write!(f, "{byte:02x}")?; }
+        for byte in self.identity.batch {
+            write!(f, "{byte:02x}")?;
+        }
         write!(f, " publication is uncertain; retain this identity for inspection; no source effect or retry authority")
     }
 }
@@ -275,21 +288,29 @@ pub(crate) fn inspect_existing_batch(
     claims: &[RecordClaim<'_>],
 ) -> Result<Vec<RecordProof>> {
     identity.validate()?;
-    inspect_existing_records_inner(Some(identity), claims)
-        .map_err(|_| anyhow::anyhow!("native journal batch proof unavailable or incomplete exact coverage"))
+    inspect_existing_records_inner(Some(identity), claims).map_err(|_| {
+        anyhow::anyhow!("native journal batch proof unavailable or incomplete exact coverage")
+    })
 }
 
 fn inspect_existing_records_inner(
-    coverage: Option<&BatchIdentity>, claims: &[RecordClaim<'_>],
+    coverage: Option<&BatchIdentity>,
+    claims: &[RecordClaim<'_>],
 ) -> Result<Vec<RecordProof>> {
     use crate::core::file_placement::NodeStamp;
     use crate::core::repo_lock::LockMode;
     use std::io::Read;
 
-    anyhow::ensure!(claims.len() <= MAX_RECORDS, "too many native journal claims");
+    anyhow::ensure!(
+        claims.len() <= MAX_RECORDS,
+        "too many native journal claims"
+    );
     let mut ids = std::collections::BTreeSet::new();
     for claim in claims {
-        anyhow::ensure!(claim.id > 0 && ids.insert(claim.id), "invalid native journal claim ID");
+        anyhow::ensure!(
+            claim.id > 0 && ids.insert(claim.id),
+            "invalid native journal claim ID"
+        );
         check_text(claim.expected_owner, MAX_OWNER_BYTES, "owner")?;
         claim.resource.verify()?;
     }
@@ -306,47 +327,85 @@ fn inspect_existing_records_inner(
     let lock = RepoTxnLock::acquire_existing(&lock_path, LockMode::Shared, Duration::ZERO)?;
     record_guard.verify()?;
     lock_guard.verify()?;
-    anyhow::ensure!(NodeStamp::capture(&dir, &fs::symlink_metadata(&dir)?, false)? == dir_stamp,
-        "native journal directory changed");
+    anyhow::ensure!(
+        NodeStamp::capture(&dir, &fs::symlink_metadata(&dir)?, false)? == dir_stamp,
+        "native journal directory changed"
+    );
     let record_meta = fs::symlink_metadata(&path)?;
-    anyhow::ensure!(record_meta.is_file() && record_meta.len() <= MAX_JOURNAL_BYTES as u64,
-        "native journal records missing or oversized");
+    anyhow::ensure!(
+        record_meta.is_file() && record_meta.len() <= MAX_JOURNAL_BYTES as u64,
+        "native journal records missing or oversized"
+    );
     let record_stamp = NodeStamp::capture(&path, &record_meta, false)?;
     let mut file = open_existing_records(&path)?;
     let identity = proof_file_identity(&file)?;
-    anyhow::ensure!(identity == record_stamp.identity(), "native journal descriptor changed");
+    anyhow::ensure!(
+        identity == record_stamp.identity(),
+        "native journal descriptor changed"
+    );
     let descriptor_stamp = file.metadata()?;
-    anyhow::ensure!(descriptor_stamp.len() <= MAX_JOURNAL_BYTES as u64,
-        "native journal records oversized");
+    anyhow::ensure!(
+        descriptor_stamp.len() <= MAX_JOURNAL_BYTES as u64,
+        "native journal records oversized"
+    );
     let mut bytes = Vec::new();
-    (&mut file).take(MAX_JOURNAL_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() <= MAX_JOURNAL_BYTES
-        && bytes.len() as u64 == descriptor_stamp.len(), "native journal records oversized or changed");
+    (&mut file)
+        .take(MAX_JOURNAL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_JOURNAL_BYTES && bytes.len() as u64 == descriptor_stamp.len(),
+        "native journal records oversized or changed"
+    );
     let journal = Journal::decode(&bytes)?;
     if let Some(identity) = coverage {
-        anyhow::ensure!(journal.epoch == Some(identity.epoch), "native journal epoch mismatch");
-        let fence = journal.fences.iter().find(|fence| fence.batch == identity.batch)
+        anyhow::ensure!(
+            journal.epoch == Some(identity.epoch),
+            "native journal epoch mismatch"
+        );
+        let fence = journal
+            .fences
+            .iter()
+            .find(|fence| fence.batch == identity.batch)
             .context("native journal coverage fence missing")?;
-        anyhow::ensure!(fence.intents.len() == claims.len(), "native journal incomplete coverage claims");
+        anyhow::ensure!(
+            fence.intents.len() == claims.len(),
+            "native journal incomplete coverage claims"
+        );
         for (ordinal, (intent, claim)) in fence.intents.iter().zip(claims).enumerate() {
-            anyhow::ensure!(intent.id == claim.id && fence.owner == claim.expected_owner,
-                "native journal coverage claim order mismatch");
-            let record = journal.records.iter().find(|record| record.meta.id == intent.id)
+            anyhow::ensure!(
+                intent.id == claim.id && fence.owner == claim.expected_owner,
+                "native journal coverage claim order mismatch"
+            );
+            let record = journal
+                .records
+                .iter()
+                .find(|record| record.meta.id == intent.id)
                 .context("native journal expected intent unresolved")?;
-            anyhow::ensure!(record.meta.coverage == Some(IntentTag { batch: identity.batch, ordinal: ordinal as u32 }),
-                "native journal coverage tag mismatch");
+            anyhow::ensure!(
+                record.meta.coverage
+                    == Some(IntentTag {
+                        batch: identity.batch,
+                        ordinal: ordinal as u32
+                    }),
+                "native journal coverage tag mismatch"
+            );
         }
     }
     let mut proofs = Vec::with_capacity(claims.len());
     for claim in claims {
-        let record = journal.records.iter().find(|record| record.meta.id == claim.id)
+        let record = journal
+            .records
+            .iter()
+            .find(|record| record.meta.id == claim.id)
             .context("native journal claimed record missing")?;
-        anyhow::ensure!(record.meta.owner == claim.expected_owner
-            && matches!(record.meta.operation, Operation::Write)
-            && matches_resource(record, claim.resource)?
-            && record.meta.before.file() == *claim.before
-            && record.meta.after.file() == *claim.after,
-            "native journal exact claim mismatch");
+        anyhow::ensure!(
+            record.meta.owner == claim.expected_owner
+                && matches!(record.meta.operation, Operation::Write)
+                && matches_resource(record, claim.resource)?
+                && record.meta.before.file() == *claim.before
+                && record.meta.after.file() == *claim.after,
+            "native journal exact claim mismatch"
+        );
         let status = match (record.meta.state, record.meta.outcome) {
             (State::Prepared, None) => RecordProofStatus::Prepared,
             (State::Applied, Some(Outcome::Applied)) => RecordProofStatus::Applied,
@@ -354,35 +413,53 @@ fn inspect_existing_records_inner(
             (State::Settled, Some(Outcome::NotApplied)) => RecordProofStatus::SettledNotApplied,
             _ => anyhow::bail!("native journal invalid proof status"),
         };
-        proofs.push(RecordProof { id: claim.id, status });
+        proofs.push(RecordProof {
+            id: claim.id,
+            status,
+        });
         claim.resource.verify()?;
     }
     let after_meta = file.metadata()?;
-    anyhow::ensure!(proof_file_identity(&file)? == identity
-        && after_meta.len() == descriptor_stamp.len()
-        && after_meta.modified().ok() == descriptor_stamp.modified().ok(),
-        "native journal descriptor drift");
-    anyhow::ensure!(NodeStamp::capture(&path, &fs::symlink_metadata(&path)?, false)? == record_stamp,
-        "native journal records changed");
+    anyhow::ensure!(
+        proof_file_identity(&file)? == identity
+            && after_meta.len() == descriptor_stamp.len()
+            && after_meta.modified().ok() == descriptor_stamp.modified().ok(),
+        "native journal descriptor drift"
+    );
+    anyhow::ensure!(
+        NodeStamp::capture(&path, &fs::symlink_metadata(&path)?, false)? == record_stamp,
+        "native journal records changed"
+    );
     record_guard.verify()?;
     lock_guard.verify()?;
     lock.verify_existing_path(&lock_path)?;
-    anyhow::ensure!(NodeStamp::capture(&lock_path, &fs::symlink_metadata(&lock_path)?, false)? == lock_stamp
-        && NodeStamp::capture(&dir, &fs::symlink_metadata(&dir)?, false)? == dir_stamp,
-        "native journal storage changed");
+    anyhow::ensure!(
+        NodeStamp::capture(&lock_path, &fs::symlink_metadata(&lock_path)?, false)? == lock_stamp
+            && NodeStamp::capture(&dir, &fs::symlink_metadata(&dir)?, false)? == dir_stamp,
+        "native journal storage changed"
+    );
     Ok(proofs)
 }
 
 // Never follow a substituted link or wait on a substituted FIFO. No create or write access.
 fn open_existing_records(path: &Path) -> Result<fs::File> {
-    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))]
     {
         let mut options = OpenOptions::new();
         options.read(true).create(false);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
         }
         #[cfg(unix)]
         {
@@ -396,7 +473,14 @@ fn open_existing_records(path: &Path) -> Result<fs::File> {
         proof_file_identity(&file)?;
         Ok(file)
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    )))]
     {
         let _ = path;
         anyhow::bail!("existing native journal inspection unavailable")
@@ -408,7 +492,10 @@ fn proof_file_identity(file: &fs::File) -> Result<(u64, u64)> {
     {
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
-        anyhow::ensure!(meta.is_file() && meta.nlink() == 1, "unsafe native journal record file");
+        anyhow::ensure!(
+            meta.is_file() && meta.nlink() == 1,
+            "unsafe native journal record file"
+        );
         Ok((meta.dev(), meta.ino()))
     }
     #[cfg(windows)]
@@ -418,13 +505,20 @@ fn proof_file_identity(file: &fs::File) -> Result<(u64, u64)> {
             GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
         };
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        anyhow::ensure!(unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0,
-            "native journal record identity unavailable");
-        anyhow::ensure!(file.metadata()?.is_file() && info.nNumberOfLinks == 1
-            && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-            "unsafe native journal record file");
-        Ok((info.dwVolumeSerialNumber as u64,
-            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
+        anyhow::ensure!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0,
+            "native journal record identity unavailable"
+        );
+        anyhow::ensure!(
+            file.metadata()?.is_file()
+                && info.nNumberOfLinks == 1
+                && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "unsafe native journal record file"
+        );
+        Ok((
+            info.dwVolumeSerialNumber as u64,
+            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -534,17 +628,30 @@ fn begin_batch_inner(
     covered: bool,
 ) -> Result<ApplyBatch> {
     check_owner(owner)?;
-    anyhow::ensure!(writes.len() <= MAX_RECORDS, "native journal batch exceeds record capacity; nothing was written");
+    anyhow::ensure!(
+        writes.len() <= MAX_RECORDS,
+        "native journal batch exceeds record capacity; nothing was written"
+    );
     let storage = Storage::open()?;
     let mut journal = storage.load()?;
     let coverage = if covered {
-        anyhow::ensure!(journal.fences.len() < MAX_FENCES, "native journal fence capacity exhausted");
-        let epoch = match journal.epoch { Some(epoch) => epoch, None => random_identity()? };
+        anyhow::ensure!(
+            journal.fences.len() < MAX_FENCES,
+            "native journal fence capacity exhausted"
+        );
+        let epoch = match journal.epoch {
+            Some(epoch) => epoch,
+            None => random_identity()?,
+        };
         let batch = random_identity()?;
-        anyhow::ensure!(!journal.fences.iter().any(|fence| fence.batch == batch),
-            "native journal batch identity collision");
+        anyhow::ensure!(
+            !journal.fences.iter().any(|fence| fence.batch == batch),
+            "native journal batch identity collision"
+        );
         Some(BatchIdentity { epoch, batch })
-    } else { None };
+    } else {
+        None
+    };
     let mut keys = std::collections::BTreeSet::new();
     let mut entries = Vec::with_capacity(writes.len());
     let mut sizes = Vec::with_capacity(writes.len());
@@ -552,39 +659,71 @@ fn begin_batch_inner(
     for (resource, expected, bytes) in writes {
         resource.verify()?;
         storage.check_resource(resource)?;
-        anyhow::ensure!(keys.insert(resource.key()), "native journal batch has duplicate resources");
-        anyhow::ensure!(bytes.len() <= MAX_SOURCE_BYTES, "native journal source exceeds 4 MiB");
+        anyhow::ensure!(
+            keys.insert(resource.key()),
+            "native journal batch has duplicate resources"
+        );
+        anyhow::ensure!(
+            bytes.len() <= MAX_SOURCE_BYTES,
+            "native journal source exceeds 4 MiB"
+        );
         let binding = binding(resource)?;
         reconcile_locked(resource, &storage, &mut journal)?;
         ensure_resolved(resource, &journal)?;
         let (before, actual) = read_image(resource.path())?;
-        anyhow::ensure!(&actual == *expected, "native journal batch preimage conflict; nothing was written");
+        anyhow::ensure!(
+            &actual == *expected,
+            "native journal batch preimage conflict; nothing was written"
+        );
         let after = FileFingerprint::for_bytes(bytes);
         let intent = if actual != after {
-            let id = journal.next_id()?.checked_add(planned.len() as u64)
+            let id = journal
+                .next_id()?
+                .checked_add(planned.len() as u64)
                 .context("native journal batch record ID exhausted")?;
             let meta = Metadata {
-                id, owner: owner.to_owned(), binding,
-                operation: Operation::Write, state: State::Prepared, outcome: None,
-                before: (&actual).into(), after: (&after).into(),
+                id,
+                owner: owner.to_owned(),
+                binding,
+                operation: Operation::Write,
+                state: State::Prepared,
+                outcome: None,
+                before: (&actual).into(),
+                after: (&after).into(),
                 coverage: coverage.as_ref().map(|identity| IntentTag {
-                    batch: identity.batch, ordinal: planned.len() as u32,
+                    batch: identity.batch,
+                    ordinal: planned.len() as u32,
                 }),
             };
             metadata_bytes(&meta)?;
             sizes.push((before.as_ref().map_or(0, Vec::len), bytes.len()));
             planned.push(meta.clone());
             Some(meta)
-        } else { None };
-        entries.push(BatchEntry { resource: (*resource).clone(), expected: actual, after, intent });
+        } else {
+            None
+        };
+        entries.push(BatchEntry {
+            resource: (*resource).clone(),
+            expected: actual,
+            after,
+            intent,
+        });
     }
     if let Some(identity) = &coverage {
         journal.epoch = Some(identity.epoch);
         let fence = BatchFence {
-            version: 1, batch: identity.batch, owner: owner.to_owned(),
-            intents: planned.iter().map(|meta| ExpectedIntent {
-                id: meta.id, binding: meta.binding.clone(), before: meta.before.clone(), after: meta.after.clone(),
-            }).collect(),
+            version: 1,
+            batch: identity.batch,
+            owner: owner.to_owned(),
+            intents: planned
+                .iter()
+                .map(|meta| ExpectedIntent {
+                    id: meta.id,
+                    binding: meta.binding.clone(),
+                    before: meta.before.clone(),
+                    after: meta.after.clone(),
+                })
+                .collect(),
         };
         fence_bytes(&fence)?;
         journal.fences.push(fence);
@@ -598,10 +737,21 @@ fn begin_batch_inner(
         fault(Fault::BeforeFence)?;
         // Atomic replacement or its later hardening/sync may fail after publication. Preserve the
         // assigned identity without exposing the underlying error or manufacturing retry authority.
-        storage.save(&journal).and_then(|()| fault(Fault::AfterFence))
-            .map_err(|_| FencePublicationUncertain { identity: identity.clone() })?;
+        storage
+            .save(&journal)
+            .and_then(|()| fault(Fault::AfterFence))
+            .map_err(|_| FencePublicationUncertain {
+                identity: identity.clone(),
+            })?;
     }
-    Ok(ApplyBatch { storage, journal, owner: owner.to_owned(), entries, next: 0, coverage })
+    Ok(ApplyBatch {
+        storage,
+        journal,
+        owner: owner.to_owned(),
+        entries,
+        next: 0,
+        coverage,
+    })
 }
 
 pub(crate) struct BatchApply {
@@ -625,11 +775,20 @@ impl ApplyBatch {
         bytes: &[u8],
     ) -> Result<BatchApply> {
         check_owner(&self.owner)?;
-        anyhow::ensure!(bytes.len() <= MAX_SOURCE_BYTES, "native journal source exceeds 4 MiB");
-        let entry = self.entries.get(self.next).context("native journal batch exhausted")?;
-        anyhow::ensure!(entry.resource == *resource && entry.expected == *expected
-            && entry.after == FileFingerprint::for_bytes(bytes),
-            "native journal batch write differs from admitted candidate");
+        anyhow::ensure!(
+            bytes.len() <= MAX_SOURCE_BYTES,
+            "native journal source exceeds 4 MiB"
+        );
+        let entry = self
+            .entries
+            .get(self.next)
+            .context("native journal batch exhausted")?;
+        anyhow::ensure!(
+            entry.resource == *resource
+                && entry.expected == *expected
+                && entry.after == FileFingerprint::for_bytes(bytes),
+            "native journal batch write differs from admitted candidate"
+        );
         let after = entry.after.clone();
         let intent = entry.intent.clone();
         let next = self.next + 1;
@@ -638,22 +797,36 @@ impl ApplyBatch {
         resource.verify()?;
         self.storage.check_resource(resource)?;
         let (before, actual) = read_image(resource.path())?;
-        anyhow::ensure!(&actual == expected, "native journal batch edit conflict; nothing was written");
+        anyhow::ensure!(
+            &actual == expected,
+            "native journal batch edit conflict; nothing was written"
+        );
         let native_record_id = if actual != after {
             let meta = intent.context("native journal batch changed intent missing")?;
-            anyhow::ensure!(meta.binding == binding(resource)?, "native journal batch historical binding changed");
-            let record = Record { meta, before, after: Some(bytes.to_vec()) };
+            anyhow::ensure!(
+                meta.binding == binding(resource)?,
+                "native journal batch historical binding changed"
+            );
+            let record = Record {
+                meta,
+                before,
+                after: Some(bytes.to_vec()),
+            };
             self.journal.append(record)?;
             Some(commit_last(resource, &self.storage, &mut self.journal)?)
         } else {
             None
         };
         if native_record_id.is_some() {
-            exec_ctx::current().context("native journal lost its pinned execution context")?
+            exec_ctx::current()
+                .context("native journal lost its pinned execution context")?
                 .note_workspace_changes(&[resource.path().to_path_buf()]);
         }
         self.next = next;
-        Ok(BatchApply { fingerprint: after, native_record_id })
+        Ok(BatchApply {
+            fingerprint: after,
+            native_record_id,
+        })
     }
 
     /// Compatibility wrapper for tests that only need the resulting image.
@@ -668,7 +841,6 @@ impl ApplyBatch {
             .map(|result| result.fingerprint)
     }
 }
-
 
 /// Reconcile only this leased resource. Never restore/undo bytes. A conflict remains unresolved and
 /// is returned explicitly; apply/undo refuse to proceed while any unresolved intent remains.
@@ -955,7 +1127,10 @@ fn ensure_resolved(resource: &NativeResource, journal: &Journal) -> Result<()> {
                 continue;
             }
             anyhow::ensure!(
-                journal.records.iter().any(|record| record.meta.id == intent.id),
+                journal
+                    .records
+                    .iter()
+                    .any(|record| record.meta.id == intent.id),
                 "native journal covered intent {} has no durable record; mutation refused",
                 intent.id
             );
@@ -1046,7 +1221,9 @@ fn commit_last(resource: &NativeResource, storage: &Storage, journal: &mut Journ
         storage.save(journal)?;
         Ok(())
     })();
-    completed.map(|()| id).map_err(|_| PossiblyApplied { record_id: id }.into())
+    completed
+        .map(|()| id)
+        .map_err(|_| PossiblyApplied { record_id: id }.into())
 }
 
 fn guarded_mutation(
@@ -1340,112 +1517,224 @@ fn reject_link(path: &Path) -> Result<()> {
 
 impl Journal {
     fn next_id(&self) -> Result<u64> {
-        self.records.iter().map(|record| record.meta.id)
-            .chain(self.fences.iter().flat_map(|fence| fence.intents.iter().map(|intent| intent.id)))
-            .max().map_or(Some(1), |id| id.checked_add(1))
+        self.records
+            .iter()
+            .map(|record| record.meta.id)
+            .chain(
+                self.fences
+                    .iter()
+                    .flat_map(|fence| fence.intents.iter().map(|intent| intent.id)),
+            )
+            .max()
+            .map_or(Some(1), |id| id.checked_add(1))
             .context("native journal record ID exhausted")
     }
 
     fn reserved_records(&self) -> usize {
-        self.records.len() + self.fences.iter().flat_map(|fence| &fence.intents)
-            .filter(|intent| !self.records.iter().any(|record| record.meta.id == intent.id)).count()
+        self.records.len()
+            + self
+                .fences
+                .iter()
+                .flat_map(|fence| &fence.intents)
+                .filter(|intent| {
+                    !self
+                        .records
+                        .iter()
+                        .any(|record| record.meta.id == intent.id)
+                })
+                .count()
     }
 
     fn reserve_batch(&self, planned: &[Metadata], sizes: &[(usize, usize)]) -> Result<()> {
-        anyhow::ensure!(planned.len() == sizes.len(), "native journal reservation mismatch");
-        anyhow::ensure!(self.reserved_records().checked_add(planned.len()).is_some_and(|total| total <= MAX_RECORDS),
-            "native journal batch full; nothing was written");
+        anyhow::ensure!(
+            planned.len() == sizes.len(),
+            "native journal reservation mismatch"
+        );
+        anyhow::ensure!(
+            self.reserved_records()
+                .checked_add(planned.len())
+                .is_some_and(|total| total <= MAX_RECORDS),
+            "native journal batch full; nothing was written"
+        );
         let mut total = self.reserved_size()?;
         for (meta, (before_len, after_len)) in planned.iter().zip(sizes) {
-            anyhow::ensure!(*before_len <= MAX_SOURCE_BYTES && *after_len <= MAX_SOURCE_BYTES,
-                "native journal image exceeds limit");
-            total = total.checked_add(record_reserved_size(meta, *before_len, *after_len)?)
+            anyhow::ensure!(
+                *before_len <= MAX_SOURCE_BYTES && *after_len <= MAX_SOURCE_BYTES,
+                "native journal image exceeds limit"
+            );
+            total = total
+                .checked_add(record_reserved_size(meta, *before_len, *after_len)?)
                 .context("native journal batch size overflow")?;
         }
-        anyhow::ensure!(total <= MAX_JOURNAL_BYTES, "native journal batch full; nothing was written");
+        anyhow::ensure!(
+            total <= MAX_JOURNAL_BYTES,
+            "native journal batch full; nothing was written"
+        );
         Ok(())
     }
 
     fn reserve(&self, before_len: usize, after_len: usize) -> Result<()> {
-        anyhow::ensure!(before_len <= MAX_SOURCE_BYTES && after_len <= MAX_SOURCE_BYTES,
-            "native journal image exceeds limit");
-        anyhow::ensure!(self.reserved_records() < MAX_RECORDS, "native journal full; nothing was written");
-        let total = self.reserved_size()?.checked_add(MAX_META_BYTES + 12 + before_len + after_len)
+        anyhow::ensure!(
+            before_len <= MAX_SOURCE_BYTES && after_len <= MAX_SOURCE_BYTES,
+            "native journal image exceeds limit"
+        );
+        anyhow::ensure!(
+            self.reserved_records() < MAX_RECORDS,
+            "native journal full; nothing was written"
+        );
+        let total = self
+            .reserved_size()?
+            .checked_add(MAX_META_BYTES + 12 + before_len + after_len)
             .context("native journal size overflow")?;
-        anyhow::ensure!(total <= MAX_JOURNAL_BYTES, "native journal full; nothing was written");
+        anyhow::ensure!(
+            total <= MAX_JOURNAL_BYTES,
+            "native journal full; nothing was written"
+        );
         Ok(())
     }
 
     fn append(&mut self, record: Record) -> Result<()> {
         validate_record(&record)?;
-        anyhow::ensure!(self.records.last().is_none_or(|last| last.meta.id < record.meta.id),
-            "native journal record IDs out of order");
+        anyhow::ensure!(
+            self.records
+                .last()
+                .is_none_or(|last| last.meta.id < record.meta.id),
+            "native journal record IDs out of order"
+        );
         metadata_bytes(&record.meta)?;
         if record.meta.coverage.is_some() {
             self.validate_tagged_record(&record)?;
-            anyhow::ensure!(!self.records.iter().any(|other| other.meta.id == record.meta.id),
-                "native journal duplicate covered intent");
-            anyhow::ensure!(self.reserved_records() <= MAX_RECORDS && self.reserved_size()? <= MAX_JOURNAL_BYTES,
-                "native journal full; nothing was written");
+            anyhow::ensure!(
+                !self
+                    .records
+                    .iter()
+                    .any(|other| other.meta.id == record.meta.id),
+                "native journal duplicate covered intent"
+            );
+            anyhow::ensure!(
+                self.reserved_records() <= MAX_RECORDS
+                    && self.reserved_size()? <= MAX_JOURNAL_BYTES,
+                "native journal full; nothing was written"
+            );
         } else {
-            self.reserve_batch(std::slice::from_ref(&record.meta), &[(
-                record.before.as_ref().map_or(0, Vec::len), record.after.as_ref().map_or(0, Vec::len),
-            )])?;
-            anyhow::ensure!(!self.fences.iter().flat_map(|fence| &fence.intents).any(|intent| intent.id == record.meta.id),
-                "native journal reserved intent ID reused");
+            self.reserve_batch(
+                std::slice::from_ref(&record.meta),
+                &[(
+                    record.before.as_ref().map_or(0, Vec::len),
+                    record.after.as_ref().map_or(0, Vec::len),
+                )],
+            )?;
+            anyhow::ensure!(
+                !self
+                    .fences
+                    .iter()
+                    .flat_map(|fence| &fence.intents)
+                    .any(|intent| intent.id == record.meta.id),
+                "native journal reserved intent ID reused"
+            );
         }
         self.records.push(record);
         Ok(())
     }
 
     fn reserved_size(&self) -> Result<usize> {
-        let mut total = if self.epoch.is_some() { MAGIC_V2.len() + 32 + 8 } else { MAGIC.len() + 4 };
+        let mut total = if self.epoch.is_some() {
+            MAGIC_V2.len() + 32 + 8
+        } else {
+            MAGIC.len() + 4
+        };
         for fence in &self.fences {
-            total = total.checked_add(4 + fence_bytes(fence)?.len()).context("native journal size overflow")?;
+            total = total
+                .checked_add(4 + fence_bytes(fence)?.len())
+                .context("native journal size overflow")?;
             for (ordinal, intent) in fence.intents.iter().enumerate() {
-                if !self.records.iter().any(|record| record.meta.id == intent.id) {
+                if !self
+                    .records
+                    .iter()
+                    .any(|record| record.meta.id == intent.id)
+                {
                     let meta = fence_metadata(fence, ordinal, intent);
-                    total = total.checked_add(record_reserved_size(&meta, intent.before.byte_len as usize,
-                        intent.after.byte_len as usize)?).context("native journal size overflow")?;
+                    total = total
+                        .checked_add(record_reserved_size(
+                            &meta,
+                            intent.before.byte_len as usize,
+                            intent.after.byte_len as usize,
+                        )?)
+                        .context("native journal size overflow")?;
                 }
             }
         }
         for record in &self.records {
-            total = total.checked_add(record_reserved_size(&record.meta,
-                record.before.as_ref().map_or(0, Vec::len), record.after.as_ref().map_or(0, Vec::len))?)
+            total = total
+                .checked_add(record_reserved_size(
+                    &record.meta,
+                    record.before.as_ref().map_or(0, Vec::len),
+                    record.after.as_ref().map_or(0, Vec::len),
+                )?)
                 .context("native journal size overflow")?;
         }
         Ok(total)
     }
 
     fn validate_tagged_record(&self, record: &Record) -> Result<()> {
-        let tag = record.meta.coverage.as_ref().context("native journal missing intent tag")?;
-        let fence = self.fences.iter().find(|fence| fence.batch == tag.batch)
+        let tag = record
+            .meta
+            .coverage
+            .as_ref()
+            .context("native journal missing intent tag")?;
+        let fence = self
+            .fences
+            .iter()
+            .find(|fence| fence.batch == tag.batch)
             .context("native journal unknown intent tag")?;
-        let intent = fence.intents.get(tag.ordinal as usize).context("native journal unknown intent ordinal")?;
-        anyhow::ensure!(record.meta.id == intent.id && record.meta.owner == fence.owner
-            && matches!(record.meta.operation, Operation::Write) && record.meta.binding == intent.binding
-            && record.meta.before == intent.before && record.meta.after == intent.after,
-            "native journal covered intent mismatch");
+        let intent = fence
+            .intents
+            .get(tag.ordinal as usize)
+            .context("native journal unknown intent ordinal")?;
+        anyhow::ensure!(
+            record.meta.id == intent.id
+                && record.meta.owner == fence.owner
+                && matches!(record.meta.operation, Operation::Write)
+                && record.meta.binding == intent.binding
+                && record.meta.before == intent.before
+                && record.meta.after == intent.after,
+            "native journal covered intent mismatch"
+        );
         Ok(())
     }
 
     fn validate_coverage(&self) -> Result<()> {
-        anyhow::ensure!(self.fences.len() <= MAX_FENCES, "native journal fence capacity exceeded");
-        anyhow::ensure!(self.records.len() <= MAX_RECORDS && self.reserved_records() <= MAX_RECORDS,
-            "native journal reserved record capacity exceeded");
+        anyhow::ensure!(
+            self.fences.len() <= MAX_FENCES,
+            "native journal fence capacity exceeded"
+        );
+        anyhow::ensure!(
+            self.records.len() <= MAX_RECORDS && self.reserved_records() <= MAX_RECORDS,
+            "native journal reserved record capacity exceeded"
+        );
         if let Some(epoch) = self.epoch {
             anyhow::ensure!(epoch != [0; 32], "native journal invalid epoch");
         } else {
-            anyhow::ensure!(self.fences.is_empty() && self.records.iter().all(|record| record.meta.coverage.is_none()),
-                "native journal legacy coverage invalid");
+            anyhow::ensure!(
+                self.fences.is_empty()
+                    && self
+                        .records
+                        .iter()
+                        .all(|record| record.meta.coverage.is_none()),
+                "native journal legacy coverage invalid"
+            );
         }
         let mut batches = std::collections::BTreeSet::new();
         let mut ids = std::collections::BTreeSet::new();
         let mut previous = 0;
         for fence in &self.fences {
-            anyhow::ensure!(fence.version == 1 && fence.batch != [0; 32] && batches.insert(fence.batch)
-                && fence.intents.len() <= MAX_RECORDS, "native journal invalid coverage fence");
+            anyhow::ensure!(
+                fence.version == 1
+                    && fence.batch != [0; 32]
+                    && batches.insert(fence.batch)
+                    && fence.intents.len() <= MAX_RECORDS,
+                "native journal invalid coverage fence"
+            );
             check_text(&fence.owner, MAX_OWNER_BYTES, "owner")?;
             let mut keys = std::collections::BTreeSet::new();
             let mut paths = std::collections::BTreeSet::new();
@@ -1453,17 +1742,35 @@ impl Journal {
                 validate_binding(&intent.binding)?;
                 validate_fingerprint(&intent.before)?;
                 validate_fingerprint(&intent.after)?;
-                anyhow::ensure!(intent.id > previous && ids.insert(intent.id) && intent.before != intent.after
-                    && intent.after.exists && keys.insert(&intent.binding.key) && paths.insert(&intent.binding.path),
-                    "native journal invalid expected intent");
+                anyhow::ensure!(
+                    intent.id > previous
+                        && ids.insert(intent.id)
+                        && intent.before != intent.after
+                        && intent.after.exists
+                        && keys.insert(&intent.binding.key)
+                        && paths.insert(&intent.binding.path),
+                    "native journal invalid expected intent"
+                );
                 if ordinal > 0 {
-                    anyhow::ensure!(fence.intents[ordinal - 1].id.checked_add(1) == Some(intent.id),
-                        "native journal expected intent order invalid");
+                    anyhow::ensure!(
+                        fence.intents[ordinal - 1].id.checked_add(1) == Some(intent.id),
+                        "native journal expected intent order invalid"
+                    );
                 }
                 previous = intent.id;
-                if let Some(record) = self.records.iter().find(|record| record.meta.id == intent.id) {
-                    anyhow::ensure!(record.meta.coverage == Some(IntentTag { batch: fence.batch, ordinal: ordinal as u32 }),
-                        "native journal intent tag absent or changed");
+                if let Some(record) = self
+                    .records
+                    .iter()
+                    .find(|record| record.meta.id == intent.id)
+                {
+                    anyhow::ensure!(
+                        record.meta.coverage
+                            == Some(IntentTag {
+                                batch: fence.batch,
+                                ordinal: ordinal as u32
+                            }),
+                        "native journal intent tag absent or changed"
+                    );
                 }
             }
             fence_bytes(fence)?;
@@ -1472,20 +1779,32 @@ impl Journal {
             if record.meta.coverage.is_some() {
                 self.validate_tagged_record(record)?;
             } else {
-                anyhow::ensure!(!ids.contains(&record.meta.id), "native journal expected intent tag missing");
+                anyhow::ensure!(
+                    !ids.contains(&record.meta.id),
+                    "native journal expected intent tag missing"
+                );
             }
         }
-        let bindings: Vec<_> = self.fences.iter().flat_map(|fence| fence.intents.iter().map(|intent| &intent.binding))
-            .chain(self.records.iter().map(|record| &record.meta.binding)).collect();
+        let bindings: Vec<_> = self
+            .fences
+            .iter()
+            .flat_map(|fence| fence.intents.iter().map(|intent| &intent.binding))
+            .chain(self.records.iter().map(|record| &record.meta.binding))
+            .collect();
         for (index, binding) in bindings.iter().enumerate() {
             for earlier in &bindings[..index] {
                 let same_key = binding.key == earlier.key;
-                anyhow::ensure!(same_key == (binding.path == earlier.path)
-                    && (!same_key || binding.parent_identity == earlier.parent_identity),
-                    "native journal inconsistent fenced binding");
+                anyhow::ensure!(
+                    same_key == (binding.path == earlier.path)
+                        && (!same_key || binding.parent_identity == earlier.parent_identity),
+                    "native journal inconsistent fenced binding"
+                );
             }
         }
-        anyhow::ensure!(self.reserved_records() <= MAX_RECORDS, "native journal reserved record capacity exceeded");
+        anyhow::ensure!(
+            self.reserved_records() <= MAX_RECORDS,
+            "native journal reserved record capacity exceeded"
+        );
         Ok(())
     }
 
@@ -1567,15 +1886,23 @@ impl Journal {
         let mut cursor = Cursor(bytes);
         let magic = cursor.take(MAGIC.len())?;
         let (epoch, fences) = if magic == MAGIC_V2 {
-            let epoch: [u8; 32] = cursor.take(32)?.try_into()
+            let epoch: [u8; 32] = cursor
+                .take(32)?
+                .try_into()
                 .map_err(|_| anyhow::anyhow!("native journal epoch truncated"))?;
             anyhow::ensure!(epoch != [0; 32], "native journal invalid epoch");
             let count = cursor.u32()? as usize;
-            anyhow::ensure!(count <= MAX_FENCES, "native journal fence count exceeds limit");
+            anyhow::ensure!(
+                count <= MAX_FENCES,
+                "native journal fence count exceeds limit"
+            );
             let mut fences = Vec::with_capacity(count);
             for _ in 0..count {
                 let len = cursor.u32()? as usize;
-                anyhow::ensure!(len <= MAX_FENCE_META_BYTES, "native journal fence metadata exceeds limit");
+                anyhow::ensure!(
+                    len <= MAX_FENCE_META_BYTES,
+                    "native journal fence metadata exceeds limit"
+                );
                 let fence: BatchFence = serde_json::from_slice(cursor.take(len)?)
                     .map_err(|_| anyhow::anyhow!("native journal fence metadata corrupt"))?;
                 fences.push(fence);
@@ -1614,7 +1941,11 @@ impl Journal {
             records.push(record);
         }
         anyhow::ensure!(cursor.0.is_empty(), "native journal trailing bytes");
-        let journal = Self { epoch, fences, records };
+        let journal = Self {
+            epoch,
+            fences,
+            records,
+        };
         journal.validate_coverage()?;
         anyhow::ensure!(
             journal.reserved_size()? <= MAX_JOURNAL_BYTES,
@@ -1652,27 +1983,41 @@ impl Journal {
 
 fn fence_metadata(fence: &BatchFence, ordinal: usize, intent: &ExpectedIntent) -> Metadata {
     Metadata {
-        id: intent.id, owner: fence.owner.clone(), binding: intent.binding.clone(),
-        operation: Operation::Write, state: State::Prepared, outcome: None,
-        before: intent.before.clone(), after: intent.after.clone(),
-        coverage: Some(IntentTag { batch: fence.batch, ordinal: ordinal as u32 }),
+        id: intent.id,
+        owner: fence.owner.clone(),
+        binding: intent.binding.clone(),
+        operation: Operation::Write,
+        state: State::Prepared,
+        outcome: None,
+        before: intent.before.clone(),
+        after: intent.after.clone(),
+        coverage: Some(IntentTag {
+            batch: fence.batch,
+            ordinal: ordinal as u32,
+        }),
     }
 }
 
 fn record_reserved_size(meta: &Metadata, before_len: usize, after_len: usize) -> Result<usize> {
-    anyhow::ensure!(before_len <= MAX_SOURCE_BYTES && after_len <= MAX_SOURCE_BYTES,
-        "native journal image exceeds limit");
+    anyhow::ensure!(
+        before_len <= MAX_SOURCE_BYTES && after_len <= MAX_SOURCE_BYTES,
+        "native journal image exceeds limit"
+    );
     let mut future = meta.clone();
     let mut len = metadata_bytes(meta)?.len();
     for (state, outcome) in [
-        (State::Prepared, None), (State::Applied, Some(Outcome::Applied)),
-        (State::Settled, Some(Outcome::Applied)), (State::Settled, Some(Outcome::NotApplied)),
+        (State::Prepared, None),
+        (State::Applied, Some(Outcome::Applied)),
+        (State::Settled, Some(Outcome::Applied)),
+        (State::Settled, Some(Outcome::NotApplied)),
     ] {
         future.state = state;
         future.outcome = outcome;
         len = len.max(metadata_bytes(&future)?.len());
     }
-    len.checked_add(12).and_then(|n| n.checked_add(before_len)).and_then(|n| n.checked_add(after_len))
+    len.checked_add(12)
+        .and_then(|n| n.checked_add(before_len))
+        .and_then(|n| n.checked_add(after_len))
         .context("native journal size overflow")
 }
 
@@ -1685,18 +2030,28 @@ fn metadata_bytes(meta: &Metadata) -> Result<Vec<u8>> {
 }
 
 fn bounded_metadata_bytes(value: &impl Serialize, limit: usize) -> Result<Vec<u8>> {
-    struct Bounded { bytes: Vec<u8>, limit: usize }
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
     impl Write for Bounded {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-                return Err(std::io::Error::other("native journal metadata exceeds limit"));
+                return Err(std::io::Error::other(
+                    "native journal metadata exceeds limit",
+                ));
             }
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    let mut out = Bounded { bytes: Vec::with_capacity(limit.min(MAX_META_BYTES)), limit };
+    let mut out = Bounded {
+        bytes: Vec::with_capacity(limit.min(MAX_META_BYTES)),
+        limit,
+    };
     serde_json::to_writer(&mut out, value)
         .map_err(|_| anyhow::anyhow!("native journal metadata encoding failed or exceeds limit"))?;
     Ok(out.bytes)
@@ -1704,16 +2059,21 @@ fn bounded_metadata_bytes(value: &impl Serialize, limit: usize) -> Result<Vec<u8
 
 fn validate_binding(binding: &Binding) -> Result<()> {
     check_text(&binding.key, MAX_BINDING_BYTES, "key")?;
-    let path = binding.path.to_str().context("native journal invalid path encoding")?;
+    let path = binding
+        .path
+        .to_str()
+        .context("native journal invalid path encoding")?;
     check_text(path, MAX_BINDING_BYTES, "path")?;
     anyhow::ensure!(binding.path.is_absolute(), "native journal invalid binding");
     Ok(())
 }
 
 fn validate_fingerprint(fingerprint: &Fingerprint) -> Result<()> {
-    anyhow::ensure!(fingerprint.byte_len <= MAX_SOURCE_BYTES as u64
-        && (fingerprint.exists || fingerprint.file() == FileFingerprint::missing()),
-        "native journal invalid expected fingerprint");
+    anyhow::ensure!(
+        fingerprint.byte_len <= MAX_SOURCE_BYTES as u64
+            && (fingerprint.exists || fingerprint.file() == FileFingerprint::missing()),
+        "native journal invalid expected fingerprint"
+    );
     Ok(())
 }
 
@@ -2119,7 +2479,13 @@ mod tests {
         before: &'a FileFingerprint,
         after: &'a FileFingerprint,
     ) -> RecordClaim<'a> {
-        RecordClaim { id, expected_owner, resource, before, after }
+        RecordClaim {
+            id,
+            expected_owner,
+            resource,
+            before,
+            after,
+        }
     }
 
     fn proof_fixture(f: impl FnOnce(&TestDir)) {
@@ -2145,10 +2511,21 @@ mod tests {
             // A foreign source edit does not change what this historical proof says. Inspection
             // must not read source bytes or confuse history with the current image.
             fs::write(selected.path(), b"foreign").unwrap();
-            let proofs = inspect_existing_records(&[
-                proof_claim(2, "proof-owner", &selected, &before, &after),
-            ]).unwrap();
-            assert_eq!(proofs, vec![RecordProof { id: 2, status: RecordProofStatus::SettledApplied }]);
+            let proofs = inspect_existing_records(&[proof_claim(
+                2,
+                "proof-owner",
+                &selected,
+                &before,
+                &after,
+            )])
+            .unwrap();
+            assert_eq!(
+                proofs,
+                vec![RecordProof {
+                    id: 2,
+                    status: RecordProofStatus::SettledApplied
+                }]
+            );
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert_eq!(fs::read(selected.path()).unwrap(), b"foreign");
         });
@@ -2173,14 +2550,19 @@ mod tests {
                 proof_claim(1, "proof-owner", &selected, &before, &wrong),
             ] {
                 let error = inspect_existing_records(&[claim]).unwrap_err();
-                assert_eq!(error.to_string(), "native journal proof unavailable or exact claim mismatch");
+                assert_eq!(
+                    error.to_string(),
+                    "native journal proof unavailable or exact claim mismatch"
+                );
             }
             assert!(inspect_existing_records(&[
                 proof_claim(1, "proof-owner", &selected, &before, &after),
                 proof_claim(1, "proof-owner", &selected, &before, &after),
-            ]).is_err());
+            ])
+            .is_err());
             let oversized: Vec<_> = (1..=MAX_RECORDS + 1)
-                .map(|id| proof_claim(id as u64, "proof-owner", &selected, &before, &after)).collect();
+                .map(|id| proof_claim(id as u64, "proof-owner", &selected, &before, &after))
+                .collect();
             assert!(inspect_existing_records(&oversized).is_err());
             assert_eq!(fs::read(selected.path()).unwrap(), b"selected");
         });
@@ -2195,12 +2577,22 @@ mod tests {
             let base = FileFingerprint::for_bytes(b"base");
             let after = write(&selected, &base, b"selected", "proof-owner").unwrap();
             assert_eq!(undo(&selected, "proof-owner").unwrap(), 1);
-            assert!(inspect_existing_records(&[
-                proof_claim(2, "parent", &selected, &after, &base),
-            ]).is_err());
-            assert_eq!(inspect_existing_records(&[
-                proof_claim(1, "proof-owner", &selected, &base, &after),
-            ]).unwrap()[0].status, RecordProofStatus::SettledApplied);
+            assert!(inspect_existing_records(&[proof_claim(
+                2, "parent", &selected, &after, &base
+            ),])
+            .is_err());
+            assert_eq!(
+                inspect_existing_records(&[proof_claim(
+                    1,
+                    "proof-owner",
+                    &selected,
+                    &base,
+                    &after
+                ),])
+                .unwrap()[0]
+                    .status,
+                RecordProofStatus::SettledApplied
+            );
         });
     }
 
@@ -2213,9 +2605,21 @@ mod tests {
             let after = write(&selected, &before, b"selected", "proof-owner").unwrap();
             for (state, outcome, expected) in [
                 (State::Prepared, None, RecordProofStatus::Prepared),
-                (State::Applied, Some(Outcome::Applied), RecordProofStatus::Applied),
-                (State::Settled, Some(Outcome::Applied), RecordProofStatus::SettledApplied),
-                (State::Settled, Some(Outcome::NotApplied), RecordProofStatus::SettledNotApplied),
+                (
+                    State::Applied,
+                    Some(Outcome::Applied),
+                    RecordProofStatus::Applied,
+                ),
+                (
+                    State::Settled,
+                    Some(Outcome::Applied),
+                    RecordProofStatus::SettledApplied,
+                ),
+                (
+                    State::Settled,
+                    Some(Outcome::NotApplied),
+                    RecordProofStatus::SettledNotApplied,
+                ),
             ] {
                 let path = {
                     let storage = Storage::open().unwrap();
@@ -2227,12 +2631,20 @@ mod tests {
                 };
                 let bytes = fs::read(&path).unwrap();
                 let metadata = fs::metadata(&path).unwrap();
-                let proof = inspect_existing_records(&[
-                    proof_claim(1, "proof-owner", &selected, &before, &after),
-                ]).unwrap();
+                let proof = inspect_existing_records(&[proof_claim(
+                    1,
+                    "proof-owner",
+                    &selected,
+                    &before,
+                    &after,
+                )])
+                .unwrap();
                 assert_eq!(proof[0].status, expected);
                 assert_eq!(fs::read(&path).unwrap(), bytes);
-                assert_eq!(fs::metadata(&path).unwrap().modified().ok(), metadata.modified().ok());
+                assert_eq!(
+                    fs::metadata(&path).unwrap().modified().ok(),
+                    metadata.modified().ok()
+                );
                 assert_eq!(fs::read(selected.path()).unwrap(), b"selected");
             }
         });
@@ -2244,9 +2656,15 @@ mod tests {
             let selected = dir.resource("selected.txt");
             let before = FileFingerprint::missing();
             let after = FileFingerprint::for_bytes(b"selected");
-            let check = || inspect_existing_records(&[
-                proof_claim(1, "proof-owner", &selected, &before, &after),
-            ]);
+            let check = || {
+                inspect_existing_records(&[proof_claim(
+                    1,
+                    "proof-owner",
+                    &selected,
+                    &before,
+                    &after,
+                )])
+            };
             let absent_home = dir.home.join("absent");
             with_test_storage(&absent_home, || {
                 assert!(inspect_existing_records(&[]).unwrap().is_empty());
@@ -2263,7 +2681,11 @@ mod tests {
             assert!(check().is_err());
             assert!(!dir_path.join("records.bin").exists());
             fs::remove_file(dir_path.join("storage.lock")).unwrap();
-            fs::write(dir_path.join("records.bin"), Journal::default().encode().unwrap()).unwrap();
+            fs::write(
+                dir_path.join("records.bin"),
+                Journal::default().encode().unwrap(),
+            )
+            .unwrap();
             assert!(check().is_err());
             assert!(!dir_path.join("storage.lock").exists());
         });
@@ -2284,9 +2706,14 @@ mod tests {
                 storage.path.clone()
             };
             let bytes = fs::read(&path).unwrap();
-            assert!(inspect_existing_records(&[
-                proof_claim(1, "proof-owner", &selected, &before, &after),
-            ]).is_err());
+            assert!(inspect_existing_records(&[proof_claim(
+                1,
+                "proof-owner",
+                &selected,
+                &before,
+                &after
+            ),])
+            .is_err());
             assert_eq!(fs::read(path).unwrap(), bytes);
         });
     }
@@ -2300,9 +2727,15 @@ mod tests {
             let _lease = dir.lease(&[&selected]);
             let before = FileFingerprint::missing();
             let after = write(&selected, &before, b"selected", "proof-owner").unwrap();
-            let check = || inspect_existing_records(&[
-                proof_claim(1, "proof-owner", &selected, &before, &after),
-            ]);
+            let check = || {
+                inspect_existing_records(&[proof_claim(
+                    1,
+                    "proof-owner",
+                    &selected,
+                    &before,
+                    &after,
+                )])
+            };
             let directory = storage_directory().unwrap();
             let path = directory.join("records.bin");
             let moved = directory.join("moved-records.bin");
@@ -2317,7 +2750,10 @@ mod tests {
             assert!(check().is_err());
             fs::remove_file(&directory).unwrap();
             fs::rename(&moved_directory, &directory).unwrap();
-            assert_eq!(check().unwrap()[0].status, RecordProofStatus::SettledApplied);
+            assert_eq!(
+                check().unwrap()[0].status,
+                RecordProofStatus::SettledApplied
+            );
         });
     }
 
@@ -2328,9 +2764,15 @@ mod tests {
             let _lease = dir.lease(&[&selected]);
             let before = FileFingerprint::missing();
             let after = write(&selected, &before, b"selected", "proof-owner").unwrap();
-            let check = || inspect_existing_records(&[
-                proof_claim(1, "proof-owner", &selected, &before, &after),
-            ]);
+            let check = || {
+                inspect_existing_records(&[proof_claim(
+                    1,
+                    "proof-owner",
+                    &selected,
+                    &before,
+                    &after,
+                )])
+            };
             {
                 let storage = Storage::open().unwrap();
                 let bytes = fs::read(&storage.path).unwrap();
@@ -2358,7 +2800,10 @@ mod tests {
             fs::hard_link(&lock_path, &lock_alias).unwrap();
             assert!(check().is_err());
             fs::remove_file(lock_alias).unwrap();
-            assert_eq!(check().unwrap()[0].status, RecordProofStatus::SettledApplied);
+            assert_eq!(
+                check().unwrap()[0].status,
+                RecordProofStatus::SettledApplied
+            );
         });
     }
 
@@ -2371,15 +2816,23 @@ mod tests {
             let _lease = dir.lease(&[&filler, &a, &b]);
             let mut expected = FileFingerprint::missing();
             for index in 0..MAX_RECORDS - 1 {
-                expected = apply(&filler, &expected, &(index as u64).to_le_bytes(), "parent/batch").unwrap();
+                expected = apply(
+                    &filler,
+                    &expected,
+                    &(index as u64).to_le_bytes(),
+                    "parent/batch",
+                )
+                .unwrap();
             }
             let missing = FileFingerprint::missing();
             // Either candidate individually fits, but admitting BOTH must fail before a.txt exists.
             drop(begin_batch("parent/batch", &[(&a, &missing, b"after-a")]).unwrap());
             drop(begin_batch("parent/batch", &[(&b, &missing, b"after-b")]).unwrap());
-            assert!(begin_batch("parent/batch", &[
-                (&a, &missing, b"after-a"), (&b, &missing, b"after-b"),
-            ]).is_err());
+            assert!(begin_batch(
+                "parent/batch",
+                &[(&a, &missing, b"after-a"), (&b, &missing, b"after-b"),]
+            )
+            .is_err());
             assert!(!a.path().exists());
             assert!(!b.path().exists());
             assert_eq!(persist::fingerprint(filler.path()).unwrap(), expected);
@@ -2395,14 +2848,19 @@ mod tests {
             let before = vec![b'a'; MAX_SOURCE_BYTES];
             let after = vec![b'b'; MAX_SOURCE_BYTES];
             let expected = FileFingerprint::for_bytes(&before);
-            let resources: Vec<_> = (0..8).map(|index| {
-                let resource = dir.resource(&format!("large-{index}.txt"));
-                fs::write(resource.path(), &before).unwrap();
-                resource
-            }).collect();
+            let resources: Vec<_> = (0..8)
+                .map(|index| {
+                    let resource = dir.resource(&format!("large-{index}.txt"));
+                    fs::write(resource.path(), &before).unwrap();
+                    resource
+                })
+                .collect();
             let resource_refs: Vec<_> = resources.iter().collect();
             let _lease = dir.lease(&resource_refs);
-            let writes: Vec<_> = resources.iter().map(|resource| (resource, &expected, after.as_slice())).collect();
+            let writes: Vec<_> = resources
+                .iter()
+                .map(|resource| (resource, &expected, after.as_slice()))
+                .collect();
             drop(begin_batch("parent/batch", &writes[..7]).unwrap());
             assert!(begin_batch("parent/batch", &writes).is_err());
             for resource in &resources {
@@ -2423,22 +2881,37 @@ mod tests {
             let before_a = FileFingerprint::for_bytes(b"base-a");
             let before_b = FileFingerprint::for_bytes(b"base-b");
             let wrong = FileFingerprint::for_bytes(b"not-b");
-            assert!(begin_batch("parent/batch", &[
-                (&a, &before_a, b"after-a"), (&a, &before_a, b"after-a"),
-            ]).is_err());
+            assert!(begin_batch(
+                "parent/batch",
+                &[(&a, &before_a, b"after-a"), (&a, &before_a, b"after-a"),]
+            )
+            .is_err());
             // A bad SECOND entry must not publish intent or mutate the otherwise valid first file.
-            assert!(begin_batch("parent/batch", &[
-                (&a, &before_a, b"after-a"), (&b, &wrong, b"after-b"),
-            ]).is_err());
+            assert!(begin_batch(
+                "parent/batch",
+                &[(&a, &before_a, b"after-a"), (&b, &wrong, b"after-b"),]
+            )
+            .is_err());
             assert_eq!(fs::read(a.path()).unwrap(), b"base-a");
             assert_eq!(fs::read(b.path()).unwrap(), b"base-b");
             assert!(states().is_empty());
-            let mut batch = begin_batch("parent/batch", &[
-                (&a, &before_a, b"after-a"), (&b, &before_b, b"after-b"),
-            ]).unwrap();
-            assert!(batch.apply(&b, &before_b, b"after-b").is_err(), "order is authority");
-            assert!(batch.apply(&a, &wrong, b"after-a").is_err(), "preimage is authority");
-            assert!(batch.apply(&a, &before_a, b"substituted").is_err(), "candidate bytes are authority");
+            let mut batch = begin_batch(
+                "parent/batch",
+                &[(&a, &before_a, b"after-a"), (&b, &before_b, b"after-b")],
+            )
+            .unwrap();
+            assert!(
+                batch.apply(&b, &before_b, b"after-b").is_err(),
+                "order is authority"
+            );
+            assert!(
+                batch.apply(&a, &wrong, b"after-a").is_err(),
+                "preimage is authority"
+            );
+            assert!(
+                batch.apply(&a, &before_a, b"substituted").is_err(),
+                "candidate bytes are authority"
+            );
             assert!(batch.journal.records.is_empty());
             assert_eq!(fs::read(a.path()).unwrap(), b"base-a");
             assert_eq!(fs::read(b.path()).unwrap(), b"base-b");
@@ -2463,10 +2936,16 @@ mod tests {
             let changes = std::sync::Arc::new(crate::core::exec_ctx::WorkspaceChanges::default());
             let ctx = owner("parent/batch").with_workspace_changes(changes.clone());
             exec_ctx::with_current(ctx, || {
-                let mut batch = begin_batch("parent/batch", &[
-                    (&a, &before_a, b"after-a"), (&unchanged, &same, b"same"),
-                    (&empty, &missing, b""), (&b, &before_b, b"after-b"),
-                ]).unwrap();
+                let mut batch = begin_batch(
+                    "parent/batch",
+                    &[
+                        (&a, &before_a, b"after-a"),
+                        (&unchanged, &same, b"same"),
+                        (&empty, &missing, b""),
+                        (&b, &before_b, b"after-b"),
+                    ],
+                )
+                .unwrap();
                 assert!(batch.journal.records.is_empty());
                 let first = batch.apply_with_record(&a, &before_a, b"after-a").unwrap();
                 assert_eq!(first.fingerprint, FileFingerprint::for_bytes(b"after-a"));
@@ -2474,7 +2953,11 @@ mod tests {
                 let noop = batch.apply_with_record(&unchanged, &same, b"same").unwrap();
                 assert_eq!(noop.fingerprint, same);
                 assert_eq!(noop.native_record_id, None);
-                assert_eq!(batch.journal.records.len(), 1, "no-op never gains undo ownership");
+                assert_eq!(
+                    batch.journal.records.len(),
+                    1,
+                    "no-op never gains undo ownership"
+                );
                 let created = batch.apply_with_record(&empty, &missing, b"").unwrap();
                 assert_eq!(created.fingerprint, FileFingerprint::for_bytes(b""));
                 assert_eq!(created.native_record_id, Some(2));
@@ -2482,15 +2965,31 @@ mod tests {
                 assert_eq!(last.fingerprint, FileFingerprint::for_bytes(b"after-b"));
                 assert_eq!(last.native_record_id, Some(3));
                 let durable = batch.storage.load().unwrap();
-                assert_eq!(durable.records.iter().map(|record| record.meta.id).collect::<Vec<_>>(), vec![1, 2, 3]);
-                assert!(durable.records.iter().all(|record| record.meta.state == State::Settled
-                    && record.meta.outcome == Some(Outcome::Applied)));
-                assert!(batch.apply(&b, &before_b, b"after-b").is_err(), "batch cannot be replayed");
+                assert_eq!(
+                    durable
+                        .records
+                        .iter()
+                        .map(|record| record.meta.id)
+                        .collect::<Vec<_>>(),
+                    vec![1, 2, 3]
+                );
+                assert!(durable
+                    .records
+                    .iter()
+                    .all(|record| record.meta.state == State::Settled
+                        && record.meta.outcome == Some(Outcome::Applied)));
+                assert!(
+                    batch.apply(&b, &before_b, b"after-b").is_err(),
+                    "batch cannot be replayed"
+                );
                 assert_eq!(batch.journal.records.len(), 3);
                 assert_eq!(batch.journal.records[0].meta.binding.key, a.key());
                 assert_eq!(batch.journal.records[1].meta.binding.key, empty.key());
                 assert!(batch.journal.records[1].before.is_none());
-                assert_eq!(batch.journal.records[1].after.as_deref(), Some(b"".as_slice()));
+                assert_eq!(
+                    batch.journal.records[1].after.as_deref(),
+                    Some(b"".as_slice())
+                );
                 assert_eq!(batch.journal.records[2].meta.binding.key, b.key());
             });
             assert_eq!(fs::read(a.path()).unwrap(), b"after-a");
@@ -2498,12 +2997,22 @@ mod tests {
             assert!(empty.path().is_file());
             assert!(fs::read(empty.path()).unwrap().is_empty());
             assert_eq!(fs::read(b.path()).unwrap(), b"after-b");
-            assert_eq!(changes.paths(), vec![a.path().to_path_buf(), empty.path().to_path_buf(), b.path().to_path_buf()]);
-            assert_eq!(states(), vec![
-                (1, State::Settled, Some(Outcome::Applied)),
-                (2, State::Settled, Some(Outcome::Applied)),
-                (3, State::Settled, Some(Outcome::Applied)),
-            ]);
+            assert_eq!(
+                changes.paths(),
+                vec![
+                    a.path().to_path_buf(),
+                    empty.path().to_path_buf(),
+                    b.path().to_path_buf()
+                ]
+            );
+            assert_eq!(
+                states(),
+                vec![
+                    (1, State::Settled, Some(Outcome::Applied)),
+                    (2, State::Settled, Some(Outcome::Applied)),
+                    (3, State::Settled, Some(Outcome::Applied)),
+                ]
+            );
         });
     }
 
@@ -2517,9 +3026,11 @@ mod tests {
             let _lease = dir.lease(&[&a, &b]);
             let before_a = FileFingerprint::for_bytes(b"base-a");
             let before_b = FileFingerprint::for_bytes(b"base-b");
-            let mut batch = begin_batch("parent/batch", &[
-                (&a, &before_a, b"after-a"), (&b, &before_b, b"after-b"),
-            ]).unwrap();
+            let mut batch = begin_batch(
+                "parent/batch",
+                &[(&a, &before_a, b"after-a"), (&b, &before_b, b"after-b")],
+            )
+            .unwrap();
             batch.apply(&a, &before_a, b"after-a").unwrap();
             fs::write(b.path(), b"external").unwrap();
             let error = batch.apply(&b, &before_b, b"after-b").unwrap_err();
@@ -2543,15 +3054,31 @@ mod tests {
             let c = dir.resource("c.txt");
             let _lease = dir.lease(&[&a, &b, &c]);
             let missing = FileFingerprint::missing();
-            let mut batch = begin_batch("parent/batch", &[
-                (&a, &missing, b"after-a"), (&b, &missing, b"after-b"), (&c, &missing, b"after-c"),
-            ]).unwrap();
+            let mut batch = begin_batch(
+                "parent/batch",
+                &[
+                    (&a, &missing, b"after-a"),
+                    (&b, &missing, b"after-b"),
+                    (&c, &missing, b"after-c"),
+                ],
+            )
+            .unwrap();
             batch.apply(&a, &missing, b"after-a").unwrap();
-            let error = with_test_after_write_failure(|| batch.apply(&b, &missing, b"after-b")).unwrap_err();
-            assert_eq!(error.downcast_ref::<PossiblyApplied>().unwrap().record_id, 2);
+            let error = with_test_after_write_failure(|| batch.apply(&b, &missing, b"after-b"))
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<PossiblyApplied>().unwrap().record_id,
+                2
+            );
             assert_eq!(batch.next, batch.entries.len());
-            assert!(batch.apply(&b, &missing, b"after-b").is_err(), "uncertain entry cannot retry");
-            assert!(batch.apply(&c, &missing, b"after-c").is_err(), "later entry cannot continue");
+            assert!(
+                batch.apply(&b, &missing, b"after-b").is_err(),
+                "uncertain entry cannot retry"
+            );
+            assert!(
+                batch.apply(&c, &missing, b"after-c").is_err(),
+                "later entry cannot continue"
+            );
             assert_eq!(batch.journal.records.len(), 2);
             assert_eq!(batch.journal.records[0].meta.state, State::Settled);
             assert_eq!(batch.journal.records[1].meta.state, State::Prepared);
@@ -2559,7 +3086,13 @@ mod tests {
             assert_eq!(fs::read(a.path()).unwrap(), b"after-a");
             assert_eq!(fs::read(b.path()).unwrap(), b"after-b");
             assert!(!c.path().exists());
-            assert_eq!(states(), vec![(1, State::Settled, Some(Outcome::Applied)), (2, State::Prepared, None)]);
+            assert_eq!(
+                states(),
+                vec![
+                    (1, State::Settled, Some(Outcome::Applied)),
+                    (2, State::Prepared, None)
+                ]
+            );
         });
     }
 
@@ -2571,12 +3104,28 @@ mod tests {
             let c = dir.resource("c.txt");
             let _lease = dir.lease(&[&a, &b, &c]);
             let missing = FileFingerprint::missing();
-            let mut batch = begin_batch("parent/batch", &[
-                (&a, &missing, b"after-a"), (&b, &missing, b"after-b"), (&c, &missing, b"after-c"),
-            ]).unwrap();
-            assert_eq!(batch.apply_with_record(&a, &missing, b"after-a").unwrap().native_record_id, Some(1));
-            let error = with_test_prepared_failure(|| batch.apply(&b, &missing, b"after-b")).unwrap_err();
-            assert_eq!(error.downcast_ref::<PossiblyApplied>().unwrap().record_id, 2);
+            let mut batch = begin_batch(
+                "parent/batch",
+                &[
+                    (&a, &missing, b"after-a"),
+                    (&b, &missing, b"after-b"),
+                    (&c, &missing, b"after-c"),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                batch
+                    .apply_with_record(&a, &missing, b"after-a")
+                    .unwrap()
+                    .native_record_id,
+                Some(1)
+            );
+            let error =
+                with_test_prepared_failure(|| batch.apply(&b, &missing, b"after-b")).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<PossiblyApplied>().unwrap().record_id,
+                2
+            );
             assert_eq!(batch.next, batch.entries.len());
             assert!(batch.apply(&b, &missing, b"after-b").is_err());
             assert!(batch.apply(&c, &missing, b"after-c").is_err());
@@ -2586,15 +3135,47 @@ mod tests {
             assert!(!c.path().exists());
             let path = storage_directory().unwrap().join("records.bin");
             let before = fs::read(&path).unwrap();
-            assert_eq!(inspect_existing_records(&[
-                proof_claim(1, "parent/batch", &a, &missing, &FileFingerprint::for_bytes(b"after-a")),
-                proof_claim(2, "parent/batch", &b, &missing, &FileFingerprint::for_bytes(b"after-b")),
-            ]).unwrap(), vec![
-                RecordProof { id: 1, status: RecordProofStatus::SettledApplied },
-                RecordProof { id: 2, status: RecordProofStatus::Prepared },
-            ]);
-            assert_eq!(fs::read(path).unwrap(), before, "inspection cannot settle the pending intent");
-            assert_eq!(states(), vec![(1, State::Settled, Some(Outcome::Applied)), (2, State::Prepared, None)]);
+            assert_eq!(
+                inspect_existing_records(&[
+                    proof_claim(
+                        1,
+                        "parent/batch",
+                        &a,
+                        &missing,
+                        &FileFingerprint::for_bytes(b"after-a")
+                    ),
+                    proof_claim(
+                        2,
+                        "parent/batch",
+                        &b,
+                        &missing,
+                        &FileFingerprint::for_bytes(b"after-b")
+                    ),
+                ])
+                .unwrap(),
+                vec![
+                    RecordProof {
+                        id: 1,
+                        status: RecordProofStatus::SettledApplied
+                    },
+                    RecordProof {
+                        id: 2,
+                        status: RecordProofStatus::Prepared
+                    },
+                ]
+            );
+            assert_eq!(
+                fs::read(path).unwrap(),
+                before,
+                "inspection cannot settle the pending intent"
+            );
+            assert_eq!(
+                states(),
+                vec![
+                    (1, State::Settled, Some(Outcome::Applied)),
+                    (2, State::Prepared, None)
+                ]
+            );
         });
     }
 
@@ -2607,26 +3188,50 @@ mod tests {
                 let _lease = dir.lease(&[&resource]);
                 let before = FileFingerprint::for_bytes(b"before");
                 let after = FileFingerprint::for_bytes(b"after");
-                let mut batch = begin_batch("parent/batch", &[(&resource, &before, b"after")]).unwrap();
-                let error = with_test_fault(point, || batch.apply(&resource, &before, b"after")).unwrap_err();
-                assert_eq!(error.downcast_ref::<PossiblyApplied>().unwrap().record_id, 1);
+                let mut batch =
+                    begin_batch("parent/batch", &[(&resource, &before, b"after")]).unwrap();
+                let error = with_test_fault(point, || batch.apply(&resource, &before, b"after"))
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<PossiblyApplied>().unwrap().record_id,
+                    1
+                );
                 assert!(batch.apply(&resource, &before, b"after").is_err());
                 drop(batch);
                 assert_eq!(fs::read(resource.path()).unwrap(), b"before");
                 let path = storage_directory().unwrap().join("records.bin");
                 if point == Fault::SaveAfterPublish {
                     let bytes = fs::read(&path).unwrap();
-                    assert_eq!(inspect_existing_records(&[
-                        proof_claim(1, "parent/batch", &resource, &before, &after),
-                    ]).unwrap(), vec![RecordProof { id: 1, status: RecordProofStatus::Prepared }]);
+                    assert_eq!(
+                        inspect_existing_records(&[proof_claim(
+                            1,
+                            "parent/batch",
+                            &resource,
+                            &before,
+                            &after
+                        ),])
+                        .unwrap(),
+                        vec![RecordProof {
+                            id: 1,
+                            status: RecordProofStatus::Prepared
+                        }]
+                    );
                     assert_eq!(fs::read(&path).unwrap(), bytes);
                     assert_eq!(states(), vec![(1, State::Prepared, None)]);
                 } else {
                     assert!(!path.exists());
-                    assert!(inspect_existing_records(&[
-                        proof_claim(1, "parent/batch", &resource, &before, &after),
-                    ]).is_err());
-                    assert!(!path.exists(), "read-only proof cannot recreate absent intent");
+                    assert!(inspect_existing_records(&[proof_claim(
+                        1,
+                        "parent/batch",
+                        &resource,
+                        &before,
+                        &after
+                    ),])
+                    .is_err());
+                    assert!(
+                        !path.exists(),
+                        "read-only proof cannot recreate absent intent"
+                    );
                 }
             });
         }
@@ -2639,7 +3244,8 @@ mod tests {
             let _lease = dir.lease(&[&resource]);
             let missing = FileFingerprint::missing();
             assert!(begin_batch("parent/batch/child", &[(&resource, &missing, b"after")]).is_err());
-            let mut batch = begin_batch("parent/batch", &[(&resource, &missing, b"after")]).unwrap();
+            let mut batch =
+                begin_batch("parent/batch", &[(&resource, &missing, b"after")]).unwrap();
             exec_ctx::with_current(owner("parent/batch/sibling"), || {
                 assert!(batch.apply(&resource, &missing, b"after").is_err());
             });
@@ -2690,7 +3296,10 @@ mod tests {
             assert!(states().is_empty());
             FAULT.with(|slot| slot.set(Some(Fault::Prepared)));
             let error = write(&resource, &before, b"after", "a").unwrap_err();
-            assert_eq!(error.downcast_ref::<PossiblyApplied>().unwrap().record_id, 1);
+            assert_eq!(
+                error.downcast_ref::<PossiblyApplied>().unwrap().record_id,
+                1
+            );
             assert_eq!(fs::read(resource.path()).unwrap(), b"before");
             assert_eq!(states(), vec![(1, State::Prepared, None)]);
             assert_eq!(
