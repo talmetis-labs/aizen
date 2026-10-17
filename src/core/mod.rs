@@ -9,6 +9,7 @@ pub mod cli_config;
 pub mod config;
 pub mod convo;
 pub mod device;
+pub mod download;
 pub mod effort;
 pub mod endpoint;
 pub mod exec_ctx;

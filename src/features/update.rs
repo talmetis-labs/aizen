@@ -4,19 +4,17 @@
 //! current process: the current terminal keeps its loaded image, while a new terminal resolves the
 //! replaced path and starts the selected version.
 
+use crate::core::download::{download_to, fetch_checksum, http_client, verify_checksum};
 use anyhow::{bail, Context, Result};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REPO: &str = "talmetis-labs/aizen";
 const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_BINARY_BYTES: u64 = 300 * 1024 * 1024;
-const HTTP_TIMEOUT_SECS: u64 = 120;
 /// A previous build (`aizen*.old-*`) is kept this long before the startup sweep removes it,
 /// so a bad update can be rolled back by hand for a week rather than until the next launch
 /// (quality plan S6).
@@ -111,17 +109,28 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn asset_suffix_for(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("windows", "x86_64") => Some("windows-x86_64.exe"),
-        ("linux", "x86_64") => Some("linux-x86_64"),
-        ("macos", "aarch64") => Some("macos-aarch64"),
+fn asset_suffix_for(os: &str, arch: &str, voice: bool) -> Option<&'static str> {
+    match (os, arch, voice) {
+        ("windows", "x86_64", false) => Some("windows-x86_64.exe"),
+        ("windows", "x86_64", true) => Some("windows-x86_64-voice.exe"),
+        ("linux", "x86_64", false) => Some("linux-x86_64"),
+        ("linux", "x86_64", true) => Some("linux-x86_64-voice"),
+        ("macos", "aarch64", false) => Some("macos-aarch64"),
+        ("macos", "aarch64", true) => Some("macos-aarch64-voice"),
         _ => None,
     }
 }
 
+/// The asset suffix this binary must look for in a release. A `voice` build is a DISTINCT
+/// artifact, not a runtime toggle: the speech input is compile-time (`--features voice`), so a
+/// voice build that looked for the plain suffix would update itself onto a binary where F9/F10 no
+/// longer exist. The variant is therefore part of the binary's identity.
 fn asset_suffix() -> Option<&'static str> {
-    asset_suffix_for(std::env::consts::OS, std::env::consts::ARCH)
+    asset_suffix_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "voice"),
+    )
 }
 
 fn repo() -> String {
@@ -213,14 +222,6 @@ fn parse_releases(json: &str, suffix: &str) -> Vec<ReleaseInfo> {
     out
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .build()
-        .context("building update client")
-}
-
 async fn list_releases(limit: usize) -> Result<Vec<ReleaseInfo>> {
     let suffix = asset_suffix().ok_or_else(|| {
         anyhow::anyhow!(
@@ -257,113 +258,6 @@ async fn list_releases(limit: usize) -> Result<Vec<ReleaseInfo>> {
         );
     }
     Ok(parse_releases(&body, suffix))
-}
-
-/// Lower-case hex of a digest.
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Check a downloaded asset's SHA-256 against the published checksum text. Accepts the
-/// `sha256sum` / `shasum -a 256` line shapes (`<hex>  <name>`, `<hex> *<name>`) and a bare hex
-/// digest; when a line names a file, it must name THIS asset. A mismatch is a refusal, not a
-/// warning: a tampered or corrupt binary must never be renamed over the live one (S4).
-fn verify_checksum(published: &str, asset_name: &str, digest_hex: &str) -> Result<()> {
-    for line in published.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        let Some(hex) = it.next() else {
-            continue;
-        };
-        let named = it.next().map(|n| n.trim_start_matches('*'));
-        if named.is_some_and(|n| n != asset_name) {
-            continue; // another asset's line in a combined SHA256SUMS
-        }
-        if hex.eq_ignore_ascii_case(digest_hex) {
-            return Ok(());
-        }
-        bail!(
-            "refusing to install {asset_name}: SHA-256 mismatch (published {hex}, downloaded {digest_hex}) — the asset is corrupt or tampered"
-        );
-    }
-    // Every line naming this asset returned above; reaching here means none did.
-    bail!("refusing to install {asset_name}: the published checksum file names no digest for it")
-}
-
-/// Stream the asset to `part`, returning its size and SHA-256 (hex). The file is `sync_all`ed
-/// before it is handed to the swap: a rename over the live executable of bytes still in the
-/// page cache is how a power cut leaves a zero-length `aizen` (S5).
-async fn download_to(url: &str, part: &Path, expected_size: u64) -> Result<(u64, String)> {
-    let client = http_client()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("downloading {url}"))?;
-    if !response.status().is_success() {
-        bail!("download returned HTTP {}", response.status().as_u16());
-    }
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_BINARY_BYTES)
-    {
-        bail!("release asset is too large");
-    }
-    let mut file = tokio::fs::File::create(part)
-        .await
-        .with_context(|| format!("creating {}", part.display()))?;
-    let mut stream = response.bytes_stream();
-    let mut total = 0u64;
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading release asset")?;
-        digest.update(&chunk);
-        total = total.saturating_add(chunk.len() as u64);
-        if total > MAX_BINARY_BYTES {
-            let _ = tokio::fs::remove_file(part).await;
-            bail!(
-                "release asset exceeds {} MiB",
-                MAX_BINARY_BYTES / 1024 / 1024
-            );
-        }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .context("writing release asset")?;
-    }
-    file.flush().await.context("flushing release asset")?;
-    file.sync_all()
-        .await
-        .context("syncing release asset to disk")?;
-    drop(file);
-    if expected_size > 0 && expected_size != total {
-        let _ = tokio::fs::remove_file(part).await;
-        bail!("release asset size mismatch (expected {expected_size}, downloaded {total})");
-    }
-    Ok((total, hex_lower(digest.finish().as_ref())))
-}
-
-/// Fetch the small published checksum text for a release asset.
-async fn fetch_checksum(url: &str) -> Result<String> {
-    let client = http_client()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("downloading checksum {url}"))?;
-    if !response.status().is_success() {
-        bail!(
-            "checksum download returned HTTP {}",
-            response.status().as_u16()
-        );
-    }
-    let text = response.text().await.context("reading checksum")?;
-    if text.len() > 64 * 1024 {
-        bail!("checksum file is implausibly large");
-    }
-    Ok(text)
 }
 
 fn backup_path(target: &Path) -> PathBuf {
@@ -610,7 +504,13 @@ async fn install(release: &ReleaseInfo, target: &Path) -> Result<()> {
         fmt_size(release.asset_size)
     ));
     let part = target.with_file_name(format!(".aizen-update-{}.part", std::process::id()));
-    let (size, digest) = download_to(&release.asset_url, &part, release.asset_size).await?;
+    let (size, digest) = download_to(
+        &release.asset_url,
+        &part,
+        release.asset_size,
+        MAX_BINARY_BYTES,
+    )
+    .await?;
     match &release.checksum_url {
         Some(url) => {
             let published = match fetch_checksum(url).await {
@@ -658,6 +558,7 @@ async fn install(release: &ReleaseInfo, target: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::download::hex_lower;
 
     #[test]
     fn versions_compare_numerically_and_release_beats_pre() {
@@ -670,12 +571,38 @@ mod tests {
     #[test]
     fn assets_match_published_matrix() {
         assert_eq!(
-            asset_suffix_for("windows", "x86_64"),
+            asset_suffix_for("windows", "x86_64", false),
             Some("windows-x86_64.exe")
         );
-        assert_eq!(asset_suffix_for("linux", "x86_64"), Some("linux-x86_64"));
-        assert_eq!(asset_suffix_for("macos", "aarch64"), Some("macos-aarch64"));
-        assert_eq!(asset_suffix_for("macos", "x86_64"), None);
+        assert_eq!(
+            asset_suffix_for("linux", "x86_64", false),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            asset_suffix_for("macos", "aarch64", false),
+            Some("macos-aarch64")
+        );
+        assert_eq!(asset_suffix_for("macos", "x86_64", false), None);
+    }
+
+    #[test]
+    fn voice_builds_update_to_the_voice_asset_not_the_plain_one() {
+        // The feature is compile-time: a voice build that resolved the plain suffix would replace
+        // itself with a binary that has no F9/F10 at all.
+        assert_eq!(
+            asset_suffix_for("windows", "x86_64", true),
+            Some("windows-x86_64-voice.exe")
+        );
+        assert_eq!(
+            asset_suffix_for("linux", "x86_64", true),
+            Some("linux-x86_64-voice")
+        );
+        assert_eq!(
+            asset_suffix_for("macos", "aarch64", true),
+            Some("macos-aarch64-voice")
+        );
+        // An unsupported platform stays unsupported in both variants.
+        assert_eq!(asset_suffix_for("macos", "x86_64", true), None);
     }
 
     #[test]

@@ -43,8 +43,28 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Install ALSA headers (Linux only — the `voice` feature links cpal/ALSA)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
       - name: Build
         run: cargo build --bin aizen
+
+      # The `voice` feature is OFF in the default build (and must stay that way — the two lines
+      # above are the gate). But a PR that breaks the voice code would sail through `cargo build`
+      # and only explode at release time, once the tag is cut. BUILD, not `check`: the Linux voice
+      # artifact links libasound, and only the link step proves the ALSA headers/dev package are
+      # enough. Runs on all three OSes (macOS CoreAudio, Linux ALSA, Windows WASAPI).
+      - name: Build voice feature (gated code compiles and links on all 3 OSes)
+        run: cargo build --features voice --bin aizen
+
+      # The installer's pure logic (asset matrix, checksum shapes, tar wrapper stripping, pack
+      # swap) needs no microphone and no network — run it here so `aizen voice install` cannot rot
+      # unnoticed.
+      - name: Voice installer unit tests
+        run: cargo test --features voice --bin aizen voice_install
 
       - name: Test
         run: cargo test --bin aizen

@@ -15,7 +15,8 @@ $Dir    = if ($env:AIZEN_INSTALL) { $env:AIZEN_INSTALL } else { Join-Path $env:L
 Write-Host "Installing aizen..." -ForegroundColor Cyan
 
 $rel = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'aizen-installer' }
-$asset = $rel.assets | Where-Object { $_.name -like "*$Suffix" } | Select-Object -First 1
+# `-voice` is a separate opt-in artifact: never what a plain install fetches.
+$asset = $rel.assets | Where-Object { $_.name -like "*$Suffix" -and $_.name -notlike "*-voice*" } | Select-Object -First 1
 if (-not $asset) { throw "No Windows asset (*$Suffix) found in release $($rel.tag_name)." }
 
 New-Item -ItemType Directory -Force $Dir | Out-Null

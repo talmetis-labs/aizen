@@ -49,6 +49,32 @@ impl FromStr for ResponseVisuals {
     }
 }
 
+/// Voice input settings (hold F9 → speech → prompt draft). Only read by `ui::voice`
+/// on a `--features voice` build; default builds never compile the reader, so the
+/// single-static-binary posture holds regardless of what this file contains.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Master switch: `true` enables the hold-to-talk key in the REPL. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Optional override for the sherpa-onnx sidecar dir. When set, expects
+    /// `<dir>\sherpa-onnx-offline.exe` (flat) plus the model files; the default
+    /// search order is `AIZEN_VOICE_HOME`, then `~/.aizen/voice`, then the adjacent dev layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sherpa_dir: Option<String>,
+    /// Optional override for the alternate hotkey ("F1"…"F12", default "F10").
+    /// F10 pins the streaming Zipformer-en engine (multi-day trial) while F9 stays on
+    /// Zipformer-vi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey_alt: Option<String>,
+    /// Capture key name: F1…"F12" (default "F9").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
+    /// Whisper language hint ("vi", "en", …). Default "vi".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,6 +164,11 @@ pub struct CliConfig {
     /// disables them all without an edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
+    /// Voice input (hold F9 → speech → prompt draft). Settings storage only; read by
+    /// `ui::voice` on a `--features voice` build. `None`/`enabled: false` ⇒ fully inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "voice")]
+    pub voice: Option<VoiceConfig>,
     /// Fold NEW LSP diagnostics into edit-tool results (only meaningful while LSP is on).
     /// `None` ⇒ ON. Toggle live with `/lsp edits on|off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

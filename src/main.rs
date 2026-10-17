@@ -328,6 +328,10 @@ async fn main() -> Result<()> {
             progress,
             verify,
         } => run_init(status, force, progress, verify).await,
+        #[cfg(feature = "voice")]
+        Commands::Voice { cmd } => match cmd {
+            VoiceCmd::Install { with_english } => features::voice_install::run(with_english).await,
+        },
         Commands::PromptSize {
             model,
             tools,

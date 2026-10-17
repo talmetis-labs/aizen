@@ -4016,6 +4016,22 @@ fn input_loop(
             }
             match ev {
                 Event::Key(ke) if ke.kind == KeyEventKind::Press => {
+                    // Voice hold-to-talk: press OPENS the capture; the release arm below closes it
+                    // and lands the transcribed text in the draft. Intercepted before the console
+                    // key mapper (which would drop F9 silently) exactly like the paste cases.
+                    // Feature-gated: a default build never compiles this branch.
+                    // F9 = Zipformer-vi (fast, vi-focused), F10 = streaming English zipformer
+                    // (opt-in pack) — each hotkey owns its engine.
+                    #[cfg(feature = "voice")]
+                    if ke.modifiers.is_empty() && ke.code == crate::ui::voice::hotkey() {
+                        crate::ui::voice::toggle_primary();
+                        continue;
+                    }
+                    #[cfg(feature = "voice")]
+                    if ke.modifiers.is_empty() && ke.code == crate::ui::voice::alt_hotkey() {
+                        crate::ui::voice::toggle_alt();
+                        continue;
+                    }
                     // Shift+Insert = paste (classic Windows / terminal convention). Handled here
                     // because `crossterm_to_console_key` drops the Shift bit on Insert.
                     if ke.code == KeyCode::Insert && ke.modifiers.contains(KeyModifiers::SHIFT) {
@@ -4154,6 +4170,19 @@ fn input_loop(
                         &mut dragging_scrollbar,
                         &mut dragging_draft,
                     );
+                    continue;
+                }
+                // Voice hold-to-talk: the release of EITHER capture hotkey (F9/F10) closes the
+                // capture and finalizes with the engine pinned at press. The is_listening()
+                // gate keeps other keys' releases from ever cutting a capture short.
+                #[cfg(feature = "voice")]
+                Event::Key(ke)
+                    if ke.kind == KeyEventKind::Release
+                        && crate::ui::voice::is_listening()
+                        && (ke.code == crate::ui::voice::hotkey()
+                            || ke.code == crate::ui::voice::alt_hotkey()) =>
+                {
+                    crate::ui::voice::finish();
                     continue;
                 }
                 // Release/Repeat key records, other mouse, resize, focus → not actioned here.

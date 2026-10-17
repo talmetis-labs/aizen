@@ -22,3 +22,6 @@ pub mod spinner;
 pub mod splash;
 pub mod theme;
 pub mod tui;
+// Voice input (keep F9 → speech → prompt draft). Opt-in only: no default-build cost.
+#[cfg(feature = "voice")]
+pub mod voice;

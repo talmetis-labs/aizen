@@ -24,7 +24,9 @@ case "$os" in
 esac
 
 api="https://api.github.com/repos/$repo/releases/latest"
-url="$(curl -fsSL "$api" | grep -o "https://github.com/[^\"]*aizen-[^\"]*${plat}" | head -1)"
+# The URL must END at the platform suffix: a `-voice` build is a separate, opt-in artifact and
+# must never be what a plain `curl | sh` installs (its Linux binary needs libasound.so.2).
+url="$(curl -fsSL "$api" | grep -o "https://github.com/[^\"]*-${plat}\"" | head -1 | tr -d '"')"
 if [ -z "$url" ]; then
   echo "aizen: no release asset for '$plat' yet (still building?) -- see $api" >&2
   exit 1

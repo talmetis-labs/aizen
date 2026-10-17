@@ -120,6 +120,15 @@ tokio-util = { version = "0.7", default-features = false, features = ["compat"] 
 # in a handler becomes an error response instead of killing the MainLoop). Trait-only crate, ALREADY
 # in the tree via async-lsp → zero marginal cost.
 tower-layer = "0.3"
+
+# Mic capture for the opt-in voice input (`voice` feature). Pure-Rust on the platforms we
+# ship (Windows WASAPI bindings — no native toolchain). WAV header + 16 kHz downsample are
+# hand-rolled in ui/voice.rs — no extra audio crate. On LINUX cpal is not C-free: it links
+# `alsa` (libasound2-dev at build time, libasound.so.2 at run time). That is why the feature is
+# opt-in and ships as a separate artifact instead of the default binary. The STT engine stays a
+# separate process either way (the sherpa-onnx CLI, spawned per utterance): never linked, so a
+# default build (no `voice`) compiles none of this and the binary posture holds.
+cpal = { version = "0.16", optional = true, default-features = false }
 # Gzip decompression for the reach layer's StackExchange backend (api.stackexchange.com compresses
 # every response unconditionally). `rust_backend` = miniz_oxide, pure Rust — NO C zlib (this machine
 # has no C toolchain, and the single-static-binary posture must hold). flate2 + miniz_oxide are
@@ -131,6 +140,12 @@ zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2
 yaml-rust2 = { version = "0.10.4", default-features = false }
 # Already used by ratatui; keep whole graphemes when wrapping/slicing styled tool paths.
 unicode-segmentation = "1.13"
+# `.tar.bz2` extraction for `aizen voice install` (sherpa-onnx engine + model packs). BOTH pure
+# Rust: `tar` builds no C, and `bzip2-rs` is a pure-Rust bzip2 DECODER — the `bzip2` crate would
+# pull bzip2-sys + a `cc` build of libbz2, which breaks the single-static-binary/no-C contract.
+# Optional: only the `voice` feature carries them, so a default build never compiles or links them.
+tar = { version = "0.4", optional = true }
+bzip2-rs = { version = "0.1", optional = true }
 
 [features]
 # CDP client only: lazy, attach-only, never bundles or launches a browser engine.
@@ -140,6 +155,15 @@ dense = ["dep:model2vec-rs", "dep:tokenizers"]
 # CDP tools are shipped by default; `--no-default-features` excludes them.
 # tokio-tungstenite is a base dependency for Discord too, so this only gates browser code.
 browser = []
+# Voice input: F9 hold-to-talk records the mic, writes a 16 kHz WAV, runs the external
+# sherpa-onnx CLI on it (one short-lived subprocess per utterance — never linked), and lands the
+# transcript in the prompt draft. Build: `cargo build --features voice`.
+# Windows/macOS need no C toolchain (WASAPI/CoreAudio are system frameworks); Linux links ALSA,
+# so a voice build there needs `libasound2-dev` + `pkg-config`, and the binary needs
+# `libasound.so.2` at run time. The default build compiles none of it.
+# `tar` + `bzip2-rs` back `aizen voice install` (fetch/verify/extract the sherpa-onnx
+# engine + models) — both pure Rust, see their comments above.
+voice = ["dep:cpal", "dep:tar", "dep:bzip2-rs"]
 
 # Release profile is tuned for a small, hard-to-reverse binary (the CI runners build this; the local
 # windows-gnu toolchain can't do an optimized build — see the repo notes). `panic` is deliberately

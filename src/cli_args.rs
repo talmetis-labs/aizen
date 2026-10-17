@@ -277,6 +277,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         verify: bool,
     },
+    /// Voice input (F9/F10 hold-to-talk): install the sherpa-onnx engine + speech models.
+    /// (`--features voice` builds only.)
+    #[cfg(feature = "voice")]
+    Voice {
+        #[command(subcommand)]
+        cmd: VoiceCmd,
+    },
     /// Show a byte breakdown of what every turn resends: the system prompt (static base +
     /// environment + memory lanes) and the JSON tool schemas. Runs offline — no request is made.
     #[command(name = "prompt-size")]
@@ -299,6 +306,18 @@ pub(crate) enum Commands {
     },
     /// Render the moonlit braille art scene (one frame) to the terminal.
     Art,
+}
+
+/// `aizen voice …` — the opt-in speech engine (`--features voice` builds only).
+#[cfg(feature = "voice")]
+#[derive(Subcommand, Debug)]
+pub(crate) enum VoiceCmd {
+    /// Download, verify, and extract the sherpa-onnx engine + speech models into ~/.aizen/voice/.
+    Install {
+        /// Also install the English streaming pack for F10 (~484 MiB compressed).
+        #[arg(long)]
+        with_english: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -33,6 +33,15 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - name: Install ALSA headers (Linux only — cpal voice capture needs libasound at build time)
+        if: runner.os == 'Linux'
+        # `cpal` (the `voice` feature) links ALSA on Linux. libasound2-dev + pkg-config are a
+        # BUILD-time probe only; end users need only the runtime libasound.so.2, present on every
+        # desktop distro. No effect on Windows/macOS (WASAPI/CoreAudio are system frameworks).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
       - name: Show toolchain
         run: rustc -V && cargo -V
 
@@ -44,7 +53,7 @@ jobs:
         # windows-gnu dev box), so the getrandom-0.3 raw-dylib link wall doesn't apply here.
         run: cargo build --release --features dense --bin aizen
 
-      - name: Package binary
+      - name: Package the default binary
         shell: bash
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
@@ -59,10 +68,35 @@ jobs:
             shasum -a 256 "$asset" > "$asset.sha256"
           fi
           ls -lh "$asset" "$asset.sha256"
-          cat "$asset.sha256"
-          echo "ASSET=$asset" >> "$GITHUB_ENV"
+          echo "$asset" >> assets.txt
 
-      - name: Publish binary to this repo's release
+      # The voice build is a SECOND, opt-in artifact, not the default one: `voice` links cpal
+      # (ALSA on Linux), and a binary that needs libasound.so.2 just to start would be a
+      # regression for headless servers that never use a microphone. The engine and speech models
+      # are NOT bundled — `aizen voice install` fetches them into ~/.aizen/voice/ — and the feature
+      # is inert at runtime unless `voice.enabled: true`.
+      #
+      # `aizen update` inside a voice build resolves the `-voice` suffix (see
+      # `features::update::asset_suffix`), so the variant survives self-updates instead of being
+      # silently replaced by the plain binary.
+      - name: Build (release, dense tier + voice)
+        run: cargo build --release --features dense,voice --bin aizen
+
+      - name: Package the voice binary
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          asset="aizen-${tag}-${{ matrix.plat }}-voice${{ matrix.ext }}"
+          cp "target/release/aizen${{ matrix.ext }}" "$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          ls -lh "$asset" "$asset.sha256"
+          echo "$asset" >> assets.txt
+
+      - name: Publish binaries to this repo's release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -76,4 +110,6 @@ jobs:
           # so swallow "already exists".
           gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" \
             --notes "Automated build for $tag." 2>/dev/null || true
-          gh release upload "$tag" "$ASSET" "$ASSET.sha256" --clobber --repo "${{ github.repository }}"
+          while read -r asset; do
+            gh release upload "$tag" "$asset" "$asset.sha256" --clobber --repo "${{ github.repository }}"
+          done < assets.txt
