@@ -15,9 +15,13 @@ pub(super) fn draw_overlay(
     overlay: &OverlaySnapshot,
     scroll: usize,
 ) -> (usize, Rect) {
-    let width = area.width.saturating_sub(4).min(84).max(20);
-    let height = (overlay.lines.len() as u16 + 4)
-        .min(area.height.saturating_sub(2))
+    // An informational overlay is READ, not clicked, so give it the room: a hard 84-column cap
+    // wrapped long child labels into three or four rows each and made the board much taller than the
+    // text it carried. Take almost the whole frame instead, and let the height follow the content up
+    // to the frame (the paragraph wraps, so nothing is clipped horizontally).
+    let width = area.width.saturating_sub(4).clamp(20, area.width.max(20));
+    let height = (overlay.lines.len() as u16 + 5)
+        .min(area.height.saturating_sub(1))
         .max(5);
     let rect = centered(area, width, height);
     frame.render_widget(Clear, rect);
@@ -139,18 +143,28 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
         format!("{} ", t.icon)
     };
     let name_styled = theme::lane(&t.name, &t.name).to_string();
-    let call_line = if t.target.is_empty() {
+    let target = if t.display.paths.is_empty() {
+        &t.target
+    } else {
+        &t.display.text
+    };
+    let call_line = if target.is_empty() {
         format!("{}{}", theme::lane(&t.name, &icon), name_styled)
     } else {
         format!(
             "{}{}   {}",
             theme::lane(&t.name, &icon),
             name_styled,
-            theme::accent_dim(&t.target)
+            theme::accent_dim(target)
         )
     };
+    let bounded = |text: &str| {
+        // This renderer is also used by the non-TTY fallback. Bound the actual shared output,
+        // not just ratatui's cells: the OSC8 injector later overprints these same rows verbatim.
+        wrap_keep_sgr(&sanitize_keep_sgr(text), width).join("\n")
+    };
     if t.digest.is_empty() {
-        return call_line;
+        return bounded(&call_line);
     }
     // Result on the line below: `└ <digest> · <time>`, digest tinted by outcome, time dimmed.
     let digest_styled = match t.state {
@@ -168,37 +182,30 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
         "{call_line}\n{} {digest_styled}{time_styled}",
         theme::faint("└")
     );
-    // A failed call auto-expands: its last lines ride under the digest, so `exit 101` is never
-    // the whole story on screen. `Ctrl-E` opens the full tail; the hint says so only when
-    // there is more than what is shown.
+    // A failed call used to auto-expand its last few lines under the digest. Six indented rows per
+    // failure made a run with several failed calls unreadable, so the row now stays ONE line: the
+    // digest (already the first line of the error) plus a hint that the detail is one key away.
+    // Nothing is lost — the full tail still goes to `Ctrl-E` through `note_tool_body`.
     if t.state == ToolState::Err && !t.body.is_empty() {
-        let lines: Vec<&str> = t.body.lines().filter(|l| !l.trim().is_empty()).collect();
-        let shown = lines.len().min(AUTO_EXPAND_LINES);
-        let max_w = width.saturating_sub(4).max(16);
-        for l in &lines[lines.len() - shown..] {
-            let clipped: String = l.chars().take(max_w).collect();
+        let digest = sanitize_text(&t.digest);
+        let more = t
+            .body
+            .lines()
+            .filter(|line| {
+                let text = sanitize_text(line);
+                !text.trim().is_empty() && text.trim() != digest.trim()
+            })
+            .count();
+        if more > 0 {
             out.push_str(&format!(
                 "\n  {} {}",
                 theme::faint("│"),
-                theme::faint(&clipped)
-            ));
-        }
-        if lines.len() > shown {
-            out.push_str(&format!(
-                "\n  {} {}",
-                theme::faint("│"),
-                theme::faint(&format!(
-                    "… {} more line(s) — Ctrl-E expands",
-                    lines.len() - shown
-                ))
+                theme::faint(&format!("{more} more line(s) — Ctrl-E expands"))
             ));
         }
     }
-    out
+    bounded(&out)
 }
-
-/// Lines of a failed tool's tail painted under its row.
-pub(crate) const AUTO_EXPAND_LINES: usize = 6;
 
 /// Render the in-place plan panel as a boxed checklist: a `☑ done/total · plan` header row, then one
 /// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses — but in
@@ -218,7 +225,7 @@ pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
     let done = rows.iter().filter(|r| r.status == 2).count();
     let header = format!("☑ {done}/{} · plan", rows.len());
     // Inner width: cap so the box doesn't sprawl on a very wide pane; leave room for `│ ` + ` │`.
-    let inner = width.saturating_sub(2).min(72).max(12);
+    let inner = width.saturating_sub(2).clamp(12, 72);
     let bar = "─".repeat(inner);
     let mut out = Vec::new();
     out.push(frame(format!(
@@ -373,7 +380,7 @@ pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
         } else {
             theme::ACCENT
         }),
-        format!(
+        format_args!(
             "{} {}",
             theme::ok(format!("+{}", d.adds)),
             theme::err(format!("−{}", d.dels))
@@ -486,7 +493,7 @@ pub(crate) fn render_subagents_block(p: &SubAgentsPayload, width: usize) -> Vec<
         theme::ACCENT_DIM
     };
     let frame = |s: String| console::style(s).color256(frame_color).to_string();
-    let inner = width.saturating_sub(2).min(72).max(12);
+    let inner = width.saturating_sub(2).clamp(12, 72);
     let bar = "─".repeat(inner);
     let n = p.rows.len();
     let running = p.rows.iter().filter(|r| r.running).count();

@@ -499,7 +499,7 @@ fn apply_store(
 
         if let Some(old_id) = retire_id {
             if let Some(old_e) = existing.iter().find(|e| e.id == old_id) {
-                let _ = store::mark_superseded(old_e, &id)?;
+                store::mark_superseded(old_e, &id)?;
                 report.superseded.push((old_id.clone(), id.clone()));
                 audit::append(audit::AuditEvent {
                     ts: audit::ts_now(),

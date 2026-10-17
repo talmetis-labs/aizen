@@ -87,7 +87,7 @@ pub const CATALOG: &[ToolsetInfo] = &[
     ToolsetInfo {
         id: "browser",
         label: "browser",
-        blurb: "CDP browser automation (--features browser)",
+        blurb: "lazy attach-only CDP automation and screenshots",
     },
 ];
 
@@ -123,12 +123,18 @@ pub fn toolset_allowed(id: &str, cfg: &CliConfig) -> bool {
 
 /// Drop tools whose bundle is disabled. Unknown tools are kept (forward-compatible).
 pub fn apply_toolset_filter(registry: &mut ToolRegistry) {
-    let cfg = cli_config::load();
+    apply_toolset_filter_in(registry, &cli_config::load());
+}
+
+fn apply_toolset_filter_in(registry: &mut ToolRegistry, cfg: &CliConfig) {
     registry.retain(|name| {
         classify_tool(name)
-            .map(|ts| toolset_allowed(ts, &cfg))
+            .map(|ts| toolset_allowed(ts, cfg))
             .unwrap_or(true)
     });
+    // Discovery is a registry capability, not an MCP-only capability. Rebuild its entries after
+    // filtering so disabled MCP tools cannot leak, while enabled deferred built-ins stay reachable.
+    crate::agent::builtin::install_tool_search(registry);
 }
 
 /// Human summary for `/tools` and `config show`.
@@ -231,10 +237,68 @@ pub fn format_config_status() -> String {
 mod tests {
     use super::*;
 
+    struct DeferredStub(&'static str);
+
+    impl crate::agent::tools::Tool for DeferredStub {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "Deferred capability for filtering tests."
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn execute(&self, _: &serde_json::Value) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn disabled_mcp_does_not_hide_enabled_builtin_discovery_or_leak_entries() {
+        let mut registry = ToolRegistry::new();
+        for (name, origin) in [
+            ("mcp_private_lookup", "private"),
+            ("browser_screenshot", "browser"),
+            ("image_read", "file"),
+        ] {
+            registry.register_deferred(std::sync::Arc::new(DeferredStub(name)), origin.into());
+        }
+        crate::agent::builtin::install_tool_search(&mut registry);
+        apply_toolset_filter_in(
+            &mut registry,
+            &CliConfig {
+                disabled_toolsets: Some(vec!["mcp".into()]),
+                ..Default::default()
+            },
+        );
+        assert!(registry.get("mcp_private_lookup").is_none());
+        let discovery = registry
+            .get("tool_search")
+            .expect("built-ins still need discovery");
+        let result = discovery.execute(&serde_json::json!({})).unwrap();
+        assert!(result.contains("browser_screenshot") && result.contains("image_read"));
+        assert!(!result.contains("mcp_private_lookup") && !result.contains("private ("));
+        apply_toolset_filter_in(
+            &mut registry,
+            &CliConfig {
+                disabled_toolsets: Some(vec!["mcp".into(), "browser".into(), "file".into()]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            registry.get("tool_search").is_none(),
+            "empty discovery is removed"
+        );
+    }
+
     #[test]
     fn classify_core_bundles() {
         assert_eq!(classify_tool("memory_search"), Some("memory"));
         assert_eq!(classify_tool("file_edit"), Some("file"));
+        assert_eq!(classify_tool("reference_read"), Some("file"));
+        assert_eq!(classify_tool("reference_compare"), Some("todo"));
+        assert_eq!(classify_tool("reference_trace"), Some("todo"));
         assert_eq!(classify_tool("shell_run"), Some("terminal"));
         assert_eq!(classify_tool("web_search"), Some("web"));
         assert_eq!(classify_tool("task"), Some("delegation"));
@@ -242,7 +306,7 @@ mod tests {
         assert_eq!(
             classify_tool("tool_search"),
             Some("mcp"),
-            "the deferred-tool discovery door filters with the mcp bundle"
+            "classification is retained for the catalog; the discovery door is rebuilt after filtering"
         );
         assert_eq!(classify_tool("lsp_references"), Some("lsp"));
         assert_eq!(classify_tool("read_symbol"), Some("lsp"));
@@ -255,6 +319,51 @@ mod tests {
         assert_eq!(classify_tool("team_status"), Some("delegation"));
         assert_eq!(classify_tool("goal_complete"), Some("todo"));
         assert_eq!(classify_tool("bot_admin"), Some("messaging"));
+    }
+
+    #[test]
+    fn reference_tools_follow_existing_file_and_todo_filters_not_browser_or_shell() {
+        let mut registry = ToolRegistry::new();
+        for name in [
+            "reference_read",
+            "reference_compare",
+            "reference_trace",
+            "shell_run",
+            "browser_screenshot",
+        ] {
+            registry.register(Box::new(DeferredStub(name)));
+        }
+        apply_toolset_filter_in(
+            &mut registry,
+            &CliConfig {
+                disabled_toolsets: Some(vec!["browser".into(), "terminal".into()]),
+                ..Default::default()
+            },
+        );
+        assert!(registry.get("shell_run").is_none());
+        assert!(registry.get("browser_screenshot").is_none());
+        for name in ["reference_read", "reference_compare", "reference_trace"] {
+            assert!(registry.get(name).is_some());
+        }
+        apply_toolset_filter_in(
+            &mut registry,
+            &CliConfig {
+                disabled_toolsets: Some(vec!["file".into()]),
+                ..Default::default()
+            },
+        );
+        assert!(registry.get("reference_read").is_none());
+        assert!(registry.get("reference_compare").is_some());
+        assert!(registry.get("reference_trace").is_some());
+        apply_toolset_filter_in(
+            &mut registry,
+            &CliConfig {
+                disabled_toolsets: Some(vec!["todo".into()]),
+                ..Default::default()
+            },
+        );
+        assert!(registry.get("reference_compare").is_none());
+        assert!(registry.get("reference_trace").is_none());
     }
 
     #[test]

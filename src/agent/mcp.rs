@@ -13,7 +13,8 @@
 //!   initialized`. Then `tools/list` (cursor-paged) → wrap each tool.
 //! - `include`/`exclude` per-server tool filtering (Hermes-style).
 //! - External tools are **destructive-by-default** (approval-gated) UNLESS the server advertises
-//!   `annotations.readOnlyHint == true` — then we trust it as read-only.
+//!   `annotations.readOnlyHint == true`. That is an approval hint, NOT proof that the server cannot
+//!   write: scoped native exclusion covers the sidecar's lifetime regardless of annotations.
 //!
 //! Static-binary posture: hand-rolled JSON-RPC over `serde_json` + the existing
 //! `reqwest`(rustls) / `tokio::process` — NO `*-sys` crate, NEVER the Python/TS MCP SDK.
@@ -25,8 +26,12 @@
 //! Connections are process-global and reused across calls.
 
 use crate::agent::cmd_guard;
-use crate::agent::tools::Tool;
+use crate::agent::tools::{Tool, ToolObservation};
+use crate::core::tool_media::{
+    ImageProvenance, ToolImage, MAX_REQUEST_IMAGES, MAX_REQUEST_IMAGE_BYTES,
+};
 use anyhow::{anyhow, bail, Context, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -218,7 +223,7 @@ fn project_key() -> String {
 /// Whether the current repo is trusted to load its project-local MCP servers.
 pub fn project_trusted() -> bool {
     let key = project_key();
-    load_trust().trusted.iter().any(|t| *t == key)
+    load_trust().trusted.contains(&key)
 }
 
 /// Trust the current repo's project MCP servers (idempotent; clears any prior dismissal).
@@ -226,7 +231,7 @@ pub fn trust_project() -> Result<()> {
     let key = project_key();
     update_trust(|t| {
         t.dismissed.retain(|d| *d != key);
-        if !t.trusted.iter().any(|x| *x == key) {
+        if !t.trusted.contains(&key) {
             t.trusted.push(key.clone());
         }
     })
@@ -245,7 +250,7 @@ pub fn untrust_project() -> Result<()> {
 pub fn dismiss_project() -> Result<()> {
     let key = project_key();
     update_trust(|t| {
-        if !t.dismissed.iter().any(|x| *x == key) {
+        if !t.dismissed.contains(&key) {
             t.dismissed.push(key.clone());
         }
     })
@@ -260,7 +265,7 @@ pub fn project_trust_prompt() -> Option<usize> {
     }
     let key = project_key();
     let t = load_trust();
-    if t.trusted.iter().any(|x| *x == key) || t.dismissed.iter().any(|x| *x == key) {
+    if t.trusted.contains(&key) || t.dismissed.contains(&key) {
         return None;
     }
     Some(cfg.servers.len())
@@ -307,6 +312,10 @@ fn is_response_to(msg: &Value, id: u64) -> bool {
     msg.get("id").and_then(|v| v.as_u64()) == Some(id)
 }
 
+fn is_terminal_response_to(msg: &Value, id: u64) -> bool {
+    is_response_to(msg, id) && (msg.get("result").is_some() || msg.get("error").is_some())
+}
+
 /// Observe server-initiated lifecycle notifications without mutating the live registry. A
 /// `tools/list_changed` event only latches a dirty bit; the actual reconnect/re-list happens at the
 /// next fresh user-turn boundary via [`prepare_fresh_turn`].
@@ -330,6 +339,7 @@ fn short_kind(v: &Value) -> &'static str {
 
 /// Flatten an MCP `tools/call` result's `content[]` into plain text for the model. Text blocks are
 /// concatenated; non-text blocks (image/audio/resource) become a short typed placeholder.
+#[cfg(test)]
 fn render_content(result: &Value) -> String {
     let Some(items) = result.get("content").and_then(|c| c.as_array()) else {
         // No `content[]`: prefer the typed `structuredContent` (what the model actually wants) over a
@@ -362,6 +372,129 @@ fn render_content(result: &Value) -> String {
     out
 }
 
+/// Convert an application result without ever dumping a base64 envelope into diagnostics.
+fn observation_from_result(result: &Value, server: &str, tool: &str) -> Result<ToolObservation> {
+    const TEXT_CAP: usize = 32 * 1024;
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut observation = ToolObservation::default();
+    let mut bytes = 0usize;
+    if let Some(items) = result.get("content").and_then(Value::as_array) {
+        for item in items.iter().take(32) {
+            let line = match item.get("type").and_then(Value::as_str) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(TEXT_CAP)
+                    .collect::<String>(),
+                Some("image") if is_error => "[image error content omitted]".into(),
+                Some("image") => {
+                    if observation.images.len() >= MAX_REQUEST_IMAGES {
+                        "[image omitted: observation limit]".into()
+                    } else if let (Some(data), Some(mime)) = (
+                        item.get("data").and_then(Value::as_str),
+                        item.get("mimeType").and_then(Value::as_str),
+                    ) {
+                        match ToolImage::from_base64(
+                            data,
+                            mime,
+                            ImageProvenance::new("mcp", Some(format!("{server}/{tool}"))),
+                        ) {
+                            Ok(image)
+                                if bytes.saturating_add(image.metadata().byte_len)
+                                    <= MAX_REQUEST_IMAGE_BYTES =>
+                            {
+                                bytes += image.metadata().byte_len;
+                                let line = format!(
+                                    "[image observation: {} {} bytes sha256={}]",
+                                    image.metadata().mime,
+                                    image.metadata().byte_len,
+                                    image.metadata().sha256
+                                );
+                                observation.images.push(image);
+                                line
+                            }
+                            Ok(_) => "[image omitted: observation byte limit]".into(),
+                            Err(error) => format!("[image rejected: {error}]"),
+                        }
+                    } else {
+                        "[image rejected: missing data or MIME]".into()
+                    }
+                }
+                Some(_) => "[non-text content omitted]".into(),
+                None => String::new(),
+            };
+            if !line.is_empty() && observation.text.len() < TEXT_CAP {
+                if !observation.text.is_empty() {
+                    observation.text.push('\n');
+                }
+                let remaining = TEXT_CAP.saturating_sub(observation.text.len());
+                let mut end = remaining.min(line.len());
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                observation.text.push_str(&line[..end]);
+            }
+        }
+    } else {
+        // Structured-only replies can include images too. Strip binary-shaped fields recursively,
+        // bound strings/depth/count before serialization, and never fall back to the raw envelope.
+        fn text_value(value: &Value, depth: usize) -> Value {
+            if depth == 0 {
+                return json!("[nested content omitted]");
+            }
+            match value {
+                Value::String(text) => json!(text.chars().take(2048).collect::<String>()),
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .take(16)
+                        .map(|v| text_value(v, depth - 1))
+                        .collect(),
+                ),
+                Value::Object(object) => Value::Object(
+                    object
+                        .iter()
+                        .take(32)
+                        .map(|(key, value)| {
+                            let binary = matches!(
+                                key.as_str(),
+                                "data" | "base64" | "image_url" | "imageUrl" | "blob" | "bytes"
+                            );
+                            (
+                                key.clone(),
+                                if binary {
+                                    json!("[binary content omitted]")
+                                } else {
+                                    text_value(value, depth - 1)
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            }
+        }
+        let safe = text_value(result.get("structuredContent").unwrap_or(result), 5);
+        observation.text = serde_json::to_string(&safe)
+            .unwrap_or_default()
+            .chars()
+            .take(TEXT_CAP)
+            .collect();
+    }
+    if is_error {
+        if observation.text.trim().is_empty() {
+            observation.text = "MCP tool returned isError with no usable text".into();
+        }
+        bail!("{}", observation.text);
+    }
+    Ok(observation)
+}
+
 // ───────────────────────────── secret redaction ─────────────────────────────
 
 /// The placeholder every masked secret collapses to — one token so tests can assert a sentinel is
@@ -376,6 +509,7 @@ const REDACTED: &str = "«redacted»";
 ///   2. Generic patterns — `Bearer <...>` / `Basic <...>` authorization values, and `?token=`/
 ///      `?key=`/`?access_token=`/`?api_key=` query parameters — masked structurally so an unknown
 ///      credential (one we didn't pass in `known`) still doesn't leak.
+///
 /// Short/empty `known` values are skipped so we never blanket-replace a 1-char string across output.
 fn redact_secrets(input: &str, known: &[String]) -> String {
     let mut s = input.to_string();
@@ -581,14 +715,234 @@ fn err_poisons(e: &anyhow::Error) -> bool {
 
 // ───────────────────────────── transport ─────────────────────────────
 
+/// Admission belongs to an actual local server, not a query or an observer. Shared by the LSP
+/// mainloop/MCP transport and every pipe worker; only verified tree exit can release the lease.
+pub(crate) struct LocalSidecarOwnership {
+    _lease: crate::core::workspace_txn::SidecarEffectLease,
+    containment: Arc<crate::core::proctree::Containment>,
+    _sandbox: crate::sandbox::runner::SpawnGuard,
+    name: String,
+}
+pub(crate) type LocalSidecarLifetime =
+    crate::agent::process::SettlementLifetime<LocalSidecarOwnership>;
+
+static LOCAL_SIDECAR_QUARANTINE: std::sync::Mutex<Vec<LocalSidecarOwnership>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Protected-spawn cleanup may fail before a normal lifetime/monitor can be installed. Keep the
+/// complete error (including its child and Job), exclusion and private sandbox temp together.
+struct FailedLocalSidecarSpawn {
+    _error: crate::core::proctree::ContainedSpawnError<tokio::process::Child>,
+    _lease: crate::core::workspace_txn::SidecarEffectLease,
+    _sandbox: crate::sandbox::runner::SpawnGuard,
+}
+static FAILED_LOCAL_SIDECAR_SPAWNS: std::sync::Mutex<Vec<FailedLocalSidecarSpawn>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn classify_local_spawn_failure<E>(
+    error: E,
+    cleanup_verified: bool,
+    quarantine: impl FnOnce(E),
+) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if cleanup_verified {
+        return anyhow::Error::new(error);
+    }
+    // Capture diagnostics before transferring ALL physical ownership to process-long quarantine.
+    let detail = error.to_string();
+    quarantine(error);
+    anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+        crate::agent::tools::ToolEffectState::UnknownWorker,
+    ))
+    .context(detail)
+}
+
+pub(crate) fn local_sidecar_spawn_failure(
+    error: crate::core::proctree::ContainedSpawnError<tokio::process::Child>,
+    lease: crate::core::workspace_txn::SidecarEffectLease,
+    sandbox: crate::sandbox::runner::SpawnGuard,
+) -> anyhow::Error {
+    let verified = error.cleanup_verified();
+    classify_local_spawn_failure(error, verified, move |error| {
+        // Retained ownership with no monitor means no proof path: charge it permanently so the
+        // boundary refuses new work until process exit (never waits — nothing is in flight).
+        LOCAL_SIDECAR_UNSETTLED.charge_permanent();
+        FAILED_LOCAL_SIDECAR_SPAWNS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(FailedLocalSidecarSpawn {
+                _error: error,
+                _lease: lease,
+                _sandbox: sandbox,
+            });
+    })
+}
+
+/// A completed RPC error does not prove a local child and its teardown have settled.
+/// Call only after actual startup work exists; config/admission errors keep their ordinary type.
+pub(crate) fn startup_failure_without_settlement(
+    error: anyhow::Error,
+    physical_pending: bool,
+) -> anyhow::Error {
+    startup_failure_with_policy(
+        error,
+        physical_pending,
+        crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED,
+    )
+}
+
+fn startup_failure_with_policy(
+    error: anyhow::Error,
+    physical_pending: bool,
+    strict_ownership: bool,
+) -> anyhow::Error {
+    if !strict_ownership
+        || !physical_pending
+        || error
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some()
+    {
+        return error;
+    }
+    anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+        crate::agent::tools::ToolEffectState::UnknownWorker,
+    ))
+    .context(format!(
+        "startup failed; physical settlement unproven: {error:#}"
+    ))
+}
+
+fn mcp_startup_failure(error: anyhow::Error, local_child: bool) -> anyhow::Error {
+    let pending = local_child
+        || error
+            .downcast_ref::<McpTransportError>()
+            .is_some_and(|error| error.kind.poisons());
+    // No charge is taken here: a stdio child's settlement charge was taken when the transport was
+    // admitted and is still held by it, so it clears only when the monitor proves the tree exited.
+    startup_failure_without_settlement(error, pending)
+}
+
+fn quarantine_local_sidecar(ownership: LocalSidecarOwnership) {
+    // Task/runtime cancellation may bypass the monitor's teardown branch. Request termination,
+    // but keep ownership: a kill request alone still does not prove descendants have exited.
+    crate::core::proctree::terminate_tree(&ownership.containment);
+    crate::ui::tui::note_line(&format!(
+        "sidecar '{}' settlement unproven; scoped native admission quarantined until CLI exit",
+        ownership.name
+    ));
+    LOCAL_SIDECAR_QUARANTINE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(ownership);
+}
+
+pub(crate) fn local_sidecar_lifetime(
+    lease: crate::core::workspace_txn::SidecarEffectLease,
+    containment: Arc<crate::core::proctree::Containment>,
+    sandbox: crate::sandbox::runner::SpawnGuard,
+    name: String,
+) -> Arc<LocalSidecarLifetime> {
+    Arc::new(LocalSidecarLifetime::new(
+        LocalSidecarOwnership {
+            _lease: lease,
+            containment,
+            _sandbox: sandbox,
+            name,
+        },
+        quarantine_local_sidecar,
+    ))
+}
+
+/// The monitor, not a dropped transport, owns/reaps the child. Register every IO drain token before
+/// starting it. Runtime/task cancellation drops an UNPROVEN lifetime into quarantine; neither an
+/// abort, `kill_on_drop`, nor a successful termination request is tree-settlement proof.
+pub(crate) fn monitor_local_sidecar(
+    mut child: tokio::process::Child,
+    containment: Arc<crate::core::proctree::Containment>,
+    lifetime: Arc<LocalSidecarLifetime>,
+) -> tokio::sync::oneshot::Sender<()> {
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let reaped = tokio::select! {
+            status = child.wait() => status.is_ok(),
+            _ = stopped => {
+                crate::core::proctree::terminate_tree(&containment);
+                let _ = child.start_kill();
+                matches!(tokio::time::timeout(Duration::from_secs(5), child.wait()).await, Ok(Ok(_)))
+            }
+        };
+        // Direct-child exit is not tree exit: terminate remaining descendants, then ask the kernel.
+        crate::core::proctree::terminate_tree(&containment);
+        if reaped {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match containment.known_quiescent() {
+                    Ok(Some(true)) => {
+                        lifetime.prove_tree_settled();
+                        break;
+                    }
+                    Ok(Some(false)) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    // Missing containment / Unix detached descendants / errors remain unproven.
+                    _ => break,
+                }
+            }
+        }
+    });
+    stop
+}
+
+/// HTTP has no local child lifetime to observe. A dispatched operation keeps admission until its
+/// matching terminal response; cancellation/unknown outcome quarantines instead of asserting that
+/// the remote stopped. A response proves the RPC boundary, not that arbitrary remote work stopped.
+struct RemoteSidecarOperation {
+    lease: Option<crate::core::workspace_txn::SidecarEffectLease>,
+}
+static REMOTE_SIDECAR_QUARANTINE: std::sync::Mutex<
+    Vec<crate::core::workspace_txn::SidecarEffectLease>,
+> = std::sync::Mutex::new(Vec::new());
+
+impl RemoteSidecarOperation {
+    fn acquire() -> Result<Self> {
+        let lease = crate::core::workspace_txn::SidecarEffectLease::acquire(
+            crate::core::workspace_txn::SidecarKind::McpServer,
+            Duration::ZERO,
+            crate::core::cancel::current().as_ref(),
+        )
+        .context("MCP HTTP refused while scoped native work owns sidecar admission")?;
+        Ok(Self { lease: Some(lease) })
+    }
+
+    fn terminal_response(&mut self) {
+        self.lease.take();
+    }
+}
+
+impl Drop for RemoteSidecarOperation {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            crate::ui::tui::note_line(
+                "MCP HTTP operation outcome unknown; scoped native admission quarantined until CLI exit",
+            );
+            REMOTE_SIDECAR_QUARANTINE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(lease);
+        }
+    }
+}
+
 enum Transport {
     Stdio(StdioTransport),
     Http(HttpTransport),
 }
 
 struct StdioTransport {
-    // Kept so the child is killed on drop (tokio Command sets `kill_on_drop`).
-    _child: tokio::process::Child,
+    /// Dropping this sender wakes the actual child monitor; observer drop does not release admission.
+    _stop: tokio::sync::oneshot::Sender<()>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     /// Tail of the child's stderr (bounded), drained by a background task — so a failed handshake or
@@ -596,20 +950,18 @@ struct StdioTransport {
     stderr: Arc<std::sync::Mutex<String>>,
     /// Literal secret values (env/header/token) to strip from the stderr tail before it's surfaced.
     secrets: Vec<String>,
-    /// Whole-TREE containment (Windows Job Object / Unix process group). `kill_on_drop` on
-    /// `_child` reaps only the direct child — the `cmd /C` shim on Windows — so without this the
-    /// real server process it launched outlived the transport, holding pipes open. Terminated in
-    /// `Drop` below.
-    containment: crate::core::proctree::Containment,
-    /// Sandbox bookkeeping (audit already written as `spawned`); holds the server's private temp
-    /// directory alive for the connection's lifetime.
-    _sandbox: crate::sandbox::runner::SpawnGuard,
+    /// Retained until the monitor proves tree exit and all transport/pipe workers are gone.
+    containment: Arc<crate::core::proctree::Containment>,
+    /// This child's startup settlement charge. Dropped (kept charged) when this transport is dropped
+    /// by a FAILED start; taken by `release_settlement_charge` once the handshake proved it live.
+    charge: Option<crate::agent::process::UnsettledCharge>,
+    // Drop after the transport's pipe handles, so settlement cannot release before IO closes.
+    _lifetime: crate::agent::process::DrainLifetime<LocalSidecarOwnership>,
 }
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        // Kill the whole tree, not just the shim. Runs before the fields drop, so `kill_on_drop`
-        // on `_child` afterwards is a harmless second shot at an already-dead process.
+        // Request teardown now; the monitor verifies/reaps and retains exclusion until settlement.
         crate::core::proctree::terminate_tree(&self.containment);
     }
 }
@@ -673,7 +1025,7 @@ impl StdioTransport {
                 continue;
             };
             observe_server_message(&v);
-            if is_response_to(&v, id) {
+            if is_terminal_response_to(&v, id) {
                 return Ok(v);
             }
             // else: a notification or a response to another id — ignore and keep reading.
@@ -822,6 +1174,7 @@ impl HttpTransport {
         let secrets = self.live_secrets();
         let safe_url = redact_secrets(&self.url, &secrets);
         let rb = self.apply_headers(self.client.post(&self.url)).json(msg);
+        let mut operation = RemoteSidecarOperation::acquire()?;
         let mut resp = match rb.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -854,12 +1207,14 @@ impl HttpTransport {
         if !status.is_success() {
             // 401 → the bearer is missing/expired; let `request` try a refresh + replay.
             if status.as_u16() == 401 {
+                operation.terminal_response(); // explicit authentication rejection, not cancellation
                 return Err(anyhow::Error::new(Unauthorized));
             }
             // Spec: a 404 to a request carrying an Mcp-Session-Id means the session expired → the
             // client MUST start a new session. Signal that distinctly so `Connection::call` can
             // re-`initialize` and replay once, rather than the session going permanently dead.
             if status.as_u16() == 404 && self.session_id.is_some() {
+                operation.terminal_response(); // explicit expired-session rejection
                 self.session_id = None;
                 self.protocol_version = None;
                 self.server_info = Value::Null;
@@ -877,7 +1232,9 @@ impl HttpTransport {
             // Stream the SSE response and return as soon as the frame answering `id` arrives — a
             // buffered `.text()` would block until the server CLOSES the stream (compliant servers
             // may hold it open for progress/keep-alive), hanging the whole call until the timeout.
-            return read_sse_response(&mut resp, id).await;
+            let response = read_sse_response(&mut resp, id).await?;
+            operation.terminal_response();
+            return Ok(response);
         }
         let body = match resp.text().await {
             Ok(b) => b,
@@ -892,7 +1249,14 @@ impl HttpTransport {
             }
         };
         match serde_json::from_str::<Value>(&body) {
-            Ok(v) => Ok(v),
+            Ok(v) if is_terminal_response_to(&v, id) => {
+                operation.terminal_response();
+                Ok(v)
+            }
+            Ok(_) => Err(anyhow::Error::new(McpTransportError::new(
+                TransportErrorKind::AmbiguousResult,
+                "MCP JSON response did not contain the dispatched request's terminal result/error",
+            ))),
             // A dispatched request answered with a non-JSON / partial body: the outcome is unknown.
             Err(e) => Err(anyhow::Error::new(McpTransportError::new(
                 TransportErrorKind::AmbiguousResult,
@@ -908,6 +1272,7 @@ impl HttpTransport {
         let secrets = self.live_secrets();
         let safe_url = redact_secrets(&self.url, &secrets);
         let rb = self.apply_headers(self.client.post(&self.url)).json(msg);
+        let mut operation = RemoteSidecarOperation::acquire()?;
         let resp = match rb.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -922,6 +1287,7 @@ impl HttpTransport {
         };
         let status = resp.status();
         if status.as_u16() == 404 && self.session_id.is_some() {
+            operation.terminal_response();
             self.session_id = None;
             self.protocol_version = None;
             self.server_info = Value::Null;
@@ -930,13 +1296,19 @@ impl HttpTransport {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let body = redact_secrets(&body.chars().take(200).collect::<String>(), &secrets);
-            bail!(
-                "MCP notify HTTP {} from {}: {}",
-                status.as_u16(),
-                safe_url,
-                body
-            );
+            return Err(startup_failure_without_settlement(
+                anyhow!(
+                    "MCP notify HTTP {} from {}: {}",
+                    status.as_u16(),
+                    safe_url,
+                    body
+                ),
+                true,
+            ));
         }
+        // This path only sends notifications/initialized: acceptance settles that protocol
+        // notification, not a claim that a remote tool or background operation stopped.
+        operation.terminal_response();
         Ok(())
     }
 }
@@ -1028,7 +1400,7 @@ async fn read_sse_response(resp: &mut reqwest::Response, id: u64) -> Result<Valu
             Ok(Some(bytes)) => {
                 for v in parser.push(&String::from_utf8_lossy(&bytes)) {
                     observe_server_message(&v);
-                    if is_response_to(&v, id) {
+                    if is_terminal_response_to(&v, id) {
                         return Ok(v);
                     }
                 }
@@ -1046,7 +1418,7 @@ async fn read_sse_response(resp: &mut reqwest::Response, id: u64) -> Result<Valu
     }
     if let Some(v) = parser.flush() {
         observe_server_message(&v);
-        if is_response_to(&v, id) {
+        if is_terminal_response_to(&v, id) {
             return Ok(v);
         }
     }
@@ -1076,6 +1448,27 @@ impl Transport {
         match self {
             Transport::Stdio(t) => t.stderr_tail(),
             Transport::Http(_) => String::new(),
+        }
+    }
+
+    /// A verified live owner now holds this transport's child, so its startup charge may go. Only the
+    /// caller that just proved the handshake completed may call this; a failed start marks the charge
+    /// failed instead and waits for the monitor's tree proof.
+    fn release_settlement_charge(&mut self) {
+        if let Transport::Stdio(t) = self {
+            if let Some(charge) = t.charge.take() {
+                charge.release();
+            }
+        }
+    }
+
+    /// Startup failed with no live owner: the child must keep blocking until its monitor proves the
+    /// tree exited. The charge is left held by the transport, whose drop cannot resolve it as settled.
+    fn fail_settlement_charge(&mut self) {
+        if let Transport::Stdio(t) = self {
+            if let Some(charge) = t.charge.take() {
+                charge.mark_failed();
+            }
         }
     }
 }
@@ -1145,6 +1538,7 @@ impl Connection {
     /// Rebuild the transport from `self.cfg` and re-run the handshake. Clears poison + bumps the
     /// generation on success; leaves it poisoned on failure so the caller can surface a clean error.
     async fn reconnect(&mut self) -> Result<()> {
+        check_startup_effects()?;
         let transport = if self.cfg.command.is_some() {
             connect_stdio(&self.cfg).await?
         } else if self.cfg.url.is_some() {
@@ -1157,15 +1551,30 @@ impl Connection {
         };
         self.transport = transport;
         self.next_id = 0;
-        tokio::time::timeout(CONNECT_TIMEOUT, self.initialize())
-            .await
-            .map_err(|_| {
+        let initialized = tokio::time::timeout(CONNECT_TIMEOUT, self.initialize()).await;
+        let error = match initialized {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(mcp_startup_failure(
+                error,
+                matches!(&self.transport, Transport::Stdio(_)),
+            )),
+            Err(_) => Some(startup_failure_without_settlement(
                 anyhow!(
                     "`{}` re-initialize timed out after {}s",
                     self.name,
                     CONNECT_TIMEOUT.as_secs()
-                )
-            })??;
+                ),
+                true,
+            )),
+        };
+        if let Some(error) = error {
+            // The fresh stdio transport keeps its settlement charge, marked failed: this reconnect
+            // could not verify the new child, so it blocks until its teardown is proven.
+            self.transport.fail_settlement_charge();
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.transport.release_settlement_charge();
         self.poisoned = false;
         self.generation += 1;
         Ok(())
@@ -1267,41 +1676,10 @@ impl Connection {
         Ok(out)
     }
 
-    async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {
+    async fn call_tool(&mut self, name: &str, args: &Value) -> Result<ToolObservation> {
         let params = json!({"name": name, "arguments": args});
         let result = self.call("tools/call", params).await?;
-        // A tool that errored at the application level sets `isError: true` (distinct from a
-        // JSON-RPC protocol error). Feed that back to the model as an `Err` so it can recover.
-        if result
-            .get("isError")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(false)
-        {
-            let msg = render_content(&result);
-            // An isError whose content is empty / image-only would otherwise hand the model a blank
-            // error — fall back to the full result. Detect "no usable text" STRUCTURALLY (is there a
-            // non-empty text block?), NOT by sniffing a leading '[' — many real errors legitimately
-            // start with one (e.g. "[Errno 2] No such file"), and discarding those degraded the error.
-            let has_text = result
-                .get("content")
-                .and_then(|c| c.as_array())
-                .map(|items| {
-                    items.iter().any(|i| {
-                        i.get("type").and_then(|t| t.as_str()) == Some("text")
-                            && i.get("text")
-                                .and_then(|t| t.as_str())
-                                .is_some_and(|s| !s.trim().is_empty())
-                    })
-                })
-                .unwrap_or(false);
-            let msg = if has_text {
-                msg
-            } else {
-                serde_json::to_string(&result).unwrap_or(msg)
-            };
-            bail!("{msg}");
-        }
-        Ok(render_content(&result))
+        observation_from_result(&result, &self.name, name)
     }
 }
 
@@ -1383,6 +1761,46 @@ pub struct Manager {
 }
 
 static MANAGER: std::sync::RwLock<Option<Manager>> = std::sync::RwLock::new(None);
+/// Sticky across invalidation: quarantined physical ownership survives cached manager rebuilds.
+/// Local sidecar ownership whose physical settlement is still unproven. Process-wide: LSP and MCP
+/// stdio share one classification because they share one admission gate, and a charge here refuses
+/// new work. A charge clears the moment the child's containment PROVES the tree exited; a quarantined
+/// owner never releases, so its charge stands until process exit (see [`UnsettledOwnership`]).
+pub(crate) static LOCAL_SIDECAR_UNSETTLED: Lazy<Arc<crate::agent::process::UnsettledOwnership>> =
+    Lazy::new(|| Arc::new(crate::agent::process::UnsettledOwnership::new()));
+
+/// How long a boundary waits for a JUST-failed start's teardown before refusing new work. Long enough
+/// for a monitor to reap a killed child and query the Job, short enough that a user never notices;
+/// an older charge is never waited on (it is quarantined ownership, not teardown in flight).
+pub(crate) const STARTUP_SETTLEMENT_GRACE: Duration = Duration::from_millis(1_500);
+
+/// The shared check: refuse while any admitted sidecar child's settlement is unproven. Waits a
+/// bounded grace period for a JUST-failed start's teardown, and refuses immediately for an older
+/// charge (that is quarantined ownership, not teardown in flight).
+pub(crate) fn startup_effects_check(
+    state: &crate::agent::process::UnsettledOwnership,
+) -> Result<()> {
+    if !state.wait_for_recent_settlement(STARTUP_SETTLEMENT_GRACE) {
+        return Err(
+            anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                crate::agent::tools::ToolEffectState::UnknownWorker,
+            ))
+            .context(
+                "a sidecar child (LSP/MCP) from an earlier failed start has not been proven exited, \
+                 so new work is refused. This clears by itself as soon as its containment proves the \
+                 process tree exited — retry in a moment; if it keeps refusing, that child could not \
+                 be accounted for and aizen must be restarted",
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Check at the central turn boundary AFTER discovery and BEFORE dispatch/new provider work.
+/// Never clears pending uncertainty; invalidation/reconnect is not settlement proof.
+pub(crate) fn check_startup_effects() -> Result<()> {
+    startup_effects_check(&LOCAL_SIDECAR_UNSETTLED)
+}
 static NEXT_MANAGER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A server sent `notifications/tools/list_changed`: its tool surface changed. We do NOT swap the
@@ -1467,6 +1885,14 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
     // and receives its own configured env (`cfg.env`, applied after the scrub) — what it must not
     // inherit is Aizen's environment (provider keys, bot tokens). The Windows `cmd /C` shim for
     // `.cmd`/`.bat` runners (npx/uvx/bunx) and the proctree prep both live in the runner now.
+    // Categorized sidecars pool with each other, but must not start inside a scoped native body.
+    // Refuse rather than block this runtime worker (including post-edit/reentrant callers).
+    let sidecar = crate::core::workspace_txn::SidecarEffectLease::acquire(
+        crate::core::workspace_txn::SidecarKind::McpServer,
+        Duration::ZERO,
+        crate::core::cancel::current().as_ref(),
+    )
+    .context("MCP stdio refused while scoped native work owns sidecar admission")?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut sbx = crate::sandbox::runner::prepare_tokio(
         crate::sandbox::request::SandboxRequest::exec(
@@ -1490,27 +1916,65 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match sbx.command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
-            return Err(e).with_context(|| format!("spawning MCP server `{command}`"));
+    // Job assignment/resume is part of the protected spawn, before any child can execute.
+    let (mut child, containment) = match sbx.spawn_contained_tokio() {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Err(local_sidecar_spawn_failure(
+                error,
+                sidecar,
+                sbx.into_guard(),
+            ))
+            .with_context(|| format!("spawning MCP server `{command}`"));
         }
     };
-    // TREE containment, same as every other runner-prepared spawn. `kill_on_drop` alone reaps
-    // only the direct child — which on Windows is the `cmd /C` shim, so dropping the transport
-    // orphaned the real `node.exe`/`python.exe` holding the pipes: exactly the orphan class
-    // `proctree` exists to eliminate. This also arms the sandbox policy's Windows JobLimits,
-    // which ride on containment and were never applied to MCP children before.
-    let containment = sbx.contain_tokio(&child);
+    let containment = Arc::new(containment);
     let mut server_guard = sbx.into_guard();
     server_guard.finish(crate::sandbox::runner::Outcome::Spawned);
-    let stdin = child.stdin.take().context("child stdin unavailable")?;
-    let stdout = child.stdout.take().context("child stdout unavailable")?;
+    let lifetime = local_sidecar_lifetime(
+        sidecar,
+        Arc::clone(&containment),
+        server_guard,
+        format!("MCP {command}"),
+    );
+    // Charge this child as it starts: while startup is in flight nobody is blocked, and a failure
+    // marks the charge failed so it blocks until the monitor proves the tree exited.
+    let charge = LOCAL_SIDECAR_UNSETTLED.track(&lifetime);
+    // Seat both tokens before the monitor can publish settlement. Pipe setup errors also retain
+    // the admitted child's lifetime: a missing pipe must not release it at this `?` boundary.
+    let transport_lifetime = lifetime.drain();
+    let stderr_lifetime = lifetime.drain();
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stop = monitor_local_sidecar(child, Arc::clone(&containment), Arc::clone(&lifetime));
+    // Both pipes are taken BEFORE the checks, and every failure path below marks the charge failed:
+    // a missing pipe must not release an admitted child, and must not leave it looking settled.
+    let stdin = match stdin {
+        Some(stdin) => stdin,
+        None => {
+            charge.mark_failed();
+            return Err(startup_failure_without_settlement(
+                anyhow!("child stdin unavailable"),
+                true,
+            ));
+        }
+    };
+    let stdout = match stdout {
+        Some(stdout) => stdout,
+        None => {
+            charge.mark_failed();
+            return Err(startup_failure_without_settlement(
+                anyhow!("child stdout unavailable"),
+                true,
+            ));
+        }
+    };
     let stderr_buf: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
-    if let Some(err) = child.stderr.take() {
+    if let Some(err) = stderr {
         let sink = Arc::clone(&stderr_buf);
         tokio::spawn(async move {
+            let _lifetime = stderr_lifetime;
             let mut reader = BufReader::new(err);
             let mut line = String::new();
             loop {
@@ -1531,14 +1995,17 @@ async fn connect_stdio(cfg: &ServerConfig) -> Result<Transport> {
         });
     }
     Ok(Transport::Stdio(StdioTransport {
-        _child: child,
+        _stop: stop,
+        _lifetime: transport_lifetime,
         stdin,
         stdout: BufReader::new(stdout),
         stderr: stderr_buf,
         // Env values commonly carry the child's API key/token — mask them out of the stderr tail.
         secrets: server_secrets(cfg, None),
         containment,
-        _sandbox: server_guard,
+        // Held until the handshake decides: released as a live owner on success, marked failed (and
+        // dropped by the failing caller) on any later startup error.
+        charge: Some(charge),
     }))
 }
 
@@ -1576,6 +2043,7 @@ fn connect_http(name: &str, cfg: &ServerConfig) -> Result<Transport> {
 
 /// Connect one server: build transport → handshake → list tools (all under a timeout).
 async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
+    check_startup_effects()?;
     let transport = if cfg.command.is_some() {
         // Hard floor: the same `cmd_guard` that protects `shell_run` gates an MCP child too, so a
         // hostile registry entry or a (trusted) project mcp.json can't smuggle a catastrophic
@@ -1605,11 +2073,18 @@ async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
         Ok(Ok(si)) => si,
         Ok(Err(e)) => {
             let tail = conn.transport.stderr_tail();
-            return Err(if tail.is_empty() {
+            let error = if tail.is_empty() {
                 e
             } else {
                 e.context(format!("server stderr:\n{tail}"))
-            });
+            };
+            // Startup failed with no live owner: keep the child charged until its monitor proves the
+            // tree exited, then the charge clears by itself.
+            conn.transport.fail_settlement_charge();
+            return Err(mcp_startup_failure(
+                error,
+                matches!(&conn.transport, Transport::Stdio(_)),
+            ));
         }
         Err(_) => {
             let tail = conn.transport.stderr_tail();
@@ -1618,20 +2093,38 @@ async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
             } else {
                 format!(" — stderr:\n{tail}")
             };
-            bail!(
-                "`{name}` initialize timed out after {}s{suffix}",
-                CONNECT_TIMEOUT.as_secs()
-            );
+            conn.transport.fail_settlement_charge();
+            return Err(startup_failure_without_settlement(
+                anyhow!(
+                    "`{name}` initialize timed out after {}s{suffix}",
+                    CONNECT_TIMEOUT.as_secs()
+                ),
+                true,
+            ));
         }
     };
     let tools = match tokio::time::timeout(CONNECT_TIMEOUT, conn.list_tools()).await {
         Ok(Ok(t)) => t,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => bail!(
-            "`{name}` tools/list timed out after {}s",
-            CONNECT_TIMEOUT.as_secs()
-        ),
+        Ok(Err(error)) => {
+            conn.transport.fail_settlement_charge();
+            return Err(mcp_startup_failure(
+                error,
+                matches!(&conn.transport, Transport::Stdio(_)),
+            ));
+        }
+        Err(_) => {
+            conn.transport.fail_settlement_charge();
+            return Err(startup_failure_without_settlement(
+                anyhow!(
+                    "`{name}` tools/list timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ),
+                true,
+            ));
+        }
     };
+    // Handshake complete: a verified live owner now holds this child, so its startup charge is taken.
+    conn.transport.release_settlement_charge();
     let tools: Vec<ToolMeta> = tools.into_iter().filter(|t| cfg.allows(&t.name)).collect();
     let schema_hash = schema_hash(&tools);
     Ok(ServerHandle {
@@ -1696,6 +2189,9 @@ async fn probe_www_authenticate(url: &str) -> Option<String> {
         "initialize",
         json!({"protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "aizen", "version": env!("CARGO_PKG_VERSION")}}),
     );
+    // This auth discovery probe dispatches initialize too; interrupted/ambiguous network work
+    // cannot silently release scoped-native exclusion just because its future was dropped.
+    let mut operation = RemoteSidecarOperation::acquire().ok()?;
     let resp = client
         .post(url)
         .header(
@@ -1708,11 +2204,33 @@ async fn probe_www_authenticate(url: &str) -> Option<String> {
         .await
         .ok()?;
     if resp.status().as_u16() == 401 {
+        operation.terminal_response();
         return resp
             .headers()
             .get("WWW-Authenticate")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
+    }
+    // Reuse normal terminal-response validation for an endpoint that unexpectedly accepts the
+    // unauthenticated initialize. No auth challenge, but do not quarantine a completed RPC.
+    if resp.status().is_success() {
+        let sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"));
+        let mut resp = resp;
+        let terminal = if sse {
+            read_sse_response(&mut resp, 1).await.is_ok()
+        } else {
+            resp.json::<Value>()
+                .await
+                .ok()
+                .is_some_and(|value| is_terminal_response_to(&value, 1))
+        };
+        if terminal {
+            operation.terminal_response();
+        }
     }
     None
 }
@@ -1777,10 +2295,9 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
         set.spawn(async move {
             let r = match tokio::time::timeout(overall, connect_one(&name, &sc)).await {
                 Ok(r) => r,
-                Err(_) => Err(anyhow!(
-                    "`{name}` connect timed out after {}s",
-                    overall.as_secs()
-                )),
+                Err(_) => Err(startup_failure_without_settlement(anyhow!(
+                    "`{name}` startup observer timed out after {}s; physical settlement unproven", overall.as_secs()
+                ), true)),
             };
             (name, r)
         });
@@ -1795,11 +2312,19 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
                     .yellow()
                     .to_string(),
             ),
-            Err(je) => crate::ui::tui::note_line(
-                &console::style(format!("mcp: a connect task failed — {je}"))
+            Err(je) => {
+                // The task died outside any error return, so its own charge bookkeeping never ran:
+                // whatever it owned has no proof path. Charge permanently (a permanent charge makes
+                // the boundary refuse immediately instead of waiting on teardown that cannot land).
+                LOCAL_SIDECAR_UNSETTLED.charge_permanent();
+                crate::ui::tui::note_line(
+                    &console::style(format!(
+                        "mcp: a connect task failed; physical settlement UNKNOWN — {je}"
+                    ))
                     .yellow()
                     .to_string(),
-            ),
+                );
+            }
         }
     }
     // JoinSet completes out of order; sort for a deterministic tool listing across runs.
@@ -1820,6 +2345,9 @@ fn block<F: std::future::Future>(f: F) -> F::Output {
 /// turn; `invalidate()` clears it so a freshly-added app is picked up on the next registry build (no
 /// process relaunch). Leaves it `None` (unbuilt) when there's no Tokio runtime (e.g. unit tests).
 fn ensure_manager() {
+    if check_startup_effects().is_err() {
+        return;
+    }
     let mut guard = MANAGER.write().unwrap();
     if guard.is_some() {
         return;
@@ -2027,6 +2555,10 @@ pub struct Discovered {
 /// can't silently shadow a tool or make the provider reject the whole tool array.
 pub fn discovered_tools() -> Vec<Discovered> {
     ensure_manager();
+    // Keep the legacy Vec surface; the parent consumes the sticky typed check, never a retry.
+    if check_startup_effects().is_err() {
+        return Vec::new();
+    }
     let guard = MANAGER.read().unwrap();
     let Some(mgr) = guard.as_ref() else {
         return Vec::new();
@@ -2177,7 +2709,7 @@ async fn call_once(
     cancel: Option<&crate::core::cancel::TurnCancel>,
     server: &str,
     after_reconnect: bool,
-) -> Result<String> {
+) -> Result<ToolObservation> {
     let timed = tokio::time::timeout(CALL_TIMEOUT, c.call_tool(name, args));
     let outcome = match cancel {
         Some(tok) => tokio::select! {
@@ -2261,6 +2793,14 @@ impl Tool for McpTool {
         true
     }
     fn execute(&self, args: &Value) -> Result<String> {
+        self.execute_observation(args)
+            .map(|observation| observation.text)
+    }
+    fn may_return_images(&self, _args: &Value) -> bool {
+        true
+    }
+    fn execute_observation(&self, args: &Value) -> Result<ToolObservation> {
+        check_startup_effects()?;
         let conn = self.conn.clone();
         let name = self.remote_name.clone();
         let server = self.server.clone();
@@ -2289,7 +2829,7 @@ impl Tool for McpTool {
             // The call + at-most-one recovery, computed as its own value so the SINGLE tail below can
             // make the invalidation decision deterministically from the connection's final poison
             // state — never from string-matching an error message.
-            let result: Result<String> = async {
+            let result: Result<ToolObservation> = async {
                 // POISON GATE: a prior transport failure this turn left the connection desynced. A
                 // read-only tool may reconnect+replay once (its call has no side effect to double). A
                 // destructive tool must NOT auto-reconnect-and-run: the earlier failure's side effect
@@ -2337,7 +2877,13 @@ impl Tool for McpTool {
                 // call hits the gate above). If a reconnect reveals a CHANGED schema, don't replay
                 // against a tool the model never saw.
                 if first.is_err() && !destructive && c.is_poisoned() {
-                    if c.reconnect().await.is_err() {
+                    if let Err(error) = c.reconnect().await {
+                        if error
+                            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+                            .is_some()
+                        {
+                            return Err(error); // Never erase unproven protected-spawn ownership.
+                        }
                         return first; // still poisoned → tail invalidates
                     }
                     if c.generation() <= built_gen || c.schema_hash_now().await != Some(built_hash) {
@@ -2371,6 +2917,241 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_in_flight_start_never_blocks_but_a_failed_one_does_until_proven() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        let held: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {
+                panic!("must not quarantine")
+            }));
+        let charge = state.track(&held);
+        let drain = held.drain();
+        assert!(
+            startup_effects_check(&state).is_ok(),
+            "a start somebody is still awaiting must not block the session — a slow cold index is \
+             not a failure"
+        );
+        // Startup failed with nobody owning the child: now it blocks, and it keeps blocking while the
+        // IO worker is still outstanding even after the tree is proven gone.
+        charge.mark_failed();
+        assert!(state.is_unsettled());
+        held.prove_tree_settled();
+        assert!(
+            state.is_unsettled(),
+            "tree proof alone must not release while an IO drain token is still outstanding"
+        );
+        drop(drain);
+        assert!(
+            !state.is_unsettled(),
+            "proven release retires the charge — the failed start stops blocking by itself"
+        );
+        assert!(startup_effects_check(&state).is_ok());
+    }
+
+    #[test]
+    fn a_released_charge_is_settled_immediately() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        let live: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        let charge = state.track(&live);
+        charge.release();
+        assert!(
+            !state.is_unsettled(),
+            "a live, verified owner means the startup is settled — nothing may block"
+        );
+        // The monitor's later proven exit must not decrement a second time for the same child.
+        live.prove_tree_settled();
+        assert!(!state.is_unsettled());
+    }
+
+    #[test]
+    fn dropping_an_unresolved_charge_blocks_rather_than_reporting_settlement() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        let abandoned: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        {
+            // No `release`/`mark_failed`: the path holding the charge went away undecided.
+            let _charge = state.track(&abandoned);
+        }
+        assert!(
+            state.is_unsettled(),
+            "an undecided charge must read as unowned, never as settled"
+        );
+        assert!(startup_effects_check(&state).is_err());
+    }
+
+    #[test]
+    fn quarantined_ownership_never_retires_its_charge() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        let quarantined: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        let charge = state.track(&quarantined);
+        charge.mark_failed();
+        // No tree proof ever arrives: dropping the lifetime hands ownership to quarantine, which is
+        // exactly the case that must keep blocking rather than silently declaring settlement.
+        drop(quarantined);
+        assert!(state.is_unsettled());
+        assert!(startup_effects_check(&state).is_err());
+    }
+
+    #[test]
+    fn one_childs_two_resolution_paths_cannot_cancel_another_childs_charge() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        let first: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        let second: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(2, |_| {}));
+        let first_charge = state.track(&first);
+        let second_charge = state.track(&second);
+        first_charge.release();
+        second_charge.mark_failed();
+        // The first child's live-owner release AND its later proven exit must not decrement twice and
+        // silently cancel the second child's outstanding charge.
+        first.prove_tree_settled();
+        assert!(
+            state.is_unsettled(),
+            "the second child's failed charge must survive the first child's two resolution paths"
+        );
+        assert!(startup_effects_check(&state).is_err());
+    }
+
+    #[test]
+    fn charging_an_already_settled_lifetime_leaves_no_stale_charge() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        let released: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        released.prove_tree_settled();
+        let charge = state.track(&released);
+        assert!(
+            !state.is_unsettled(),
+            "charging an already-proven lifetime must not leave a stale count behind"
+        );
+        charge.release();
+        assert!(!state.is_unsettled());
+    }
+
+    #[test]
+    fn a_permanent_charge_refuses_immediately_and_is_never_waited_on() {
+        let state = std::sync::Arc::new(crate::agent::process::UnsettledOwnership::new());
+        assert!(startup_effects_check(&state).is_ok());
+        state.charge_permanent();
+        let started = std::time::Instant::now();
+        let error = startup_effects_check(&state).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+                .unwrap()
+                .0,
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
+        assert!(
+            started.elapsed() < crate::agent::mcp::STARTUP_SETTLEMENT_GRACE,
+            "ownership with no proof path has nothing to wait for — refusing must not burn the grace"
+        );
+    }
+
+    #[test]
+    fn postspawn_startup_failure_requires_physical_settlement_proof() {
+        let pre_spawn =
+            startup_failure_with_policy(anyhow!("binary/config/admission refused"), false, true);
+        assert!(pre_spawn
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_none());
+        let compatible =
+            startup_failure_with_policy(anyhow!("ordinary handshake failure"), true, false);
+        assert!(compatible
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_none());
+        let protected_unknown = startup_failure_with_policy(
+            anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                crate::agent::tools::ToolEffectState::UnknownWorker,
+            )),
+            true,
+            false,
+        );
+        assert!(protected_unknown
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some());
+        // A post-spawn failure is typed UnknownWorker until the child's monitor proves exit — the
+        // type is what makes the boundary refuse, and the charge is what makes it stop refusing.
+        let post_spawn =
+            startup_failure_with_policy(anyhow!("initialize terminal RPC error"), true, true);
+        assert_eq!(
+            post_spawn
+                .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+                .unwrap()
+                .0,
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
+        let timeout =
+            startup_failure_with_policy(anyhow!("admitted handshake observer timeout"), true, true);
+        assert!(timeout
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some());
+    }
+
+    #[test]
+    fn protected_sidecar_spawn_verified_cleanup_is_an_ordinary_error() {
+        let error = crate::core::proctree::ContainedSpawnError::<tokio::process::Child> {
+            cause: std::io::Error::other("owned fixture failure"),
+            cleanup_verified: true,
+            child: None,
+            containment: None,
+        };
+        let failure = classify_local_spawn_failure(error, true, |_| {
+            panic!("verified cleanup must release ownership, never quarantine")
+        });
+        assert!(failure
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_none());
+        assert!(failure
+            .downcast_ref::<crate::core::proctree::ContainedSpawnError<tokio::process::Child>>()
+            .is_some());
+    }
+
+    #[test]
+    fn protected_sidecar_spawn_unknown_cleanup_retains_whole_error_and_is_typed() {
+        let retained = std::sync::Mutex::new(None);
+        let error = crate::core::proctree::ContainedSpawnError::<tokio::process::Child> {
+            cause: std::io::Error::other("owned unknown cleanup"),
+            cleanup_verified: false,
+            child: None, // No actual process is needed to test ownership transfer/classification.
+            containment: None,
+        };
+        let failure = classify_local_spawn_failure(error, false, |error| {
+            *retained.lock().unwrap() = Some(error);
+        })
+        .context("owned fixture sidecar");
+        let uncertainty = failure
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .unwrap();
+        assert_eq!(
+            uncertainty.0,
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
+        let retained = retained.lock().unwrap().take().unwrap();
+        assert!(!retained.cleanup_verified());
+        assert_eq!(retained.cause.to_string(), "owned unknown cleanup");
+    }
+
+    #[test]
+    fn only_matching_terminal_rpc_response_settles_remote_operation() {
+        assert!(is_terminal_response_to(&json!({"id": 7, "result": {}}), 7));
+        assert!(is_terminal_response_to(
+            &json!({"id": 7, "error": {"code": -1}}),
+            7
+        ));
+        assert!(!is_terminal_response_to(&json!({"id": 8, "result": {}}), 7));
+        assert!(!is_terminal_response_to(
+            &json!({"id": 7, "method": "progress"}),
+            7
+        ));
+        assert!(!is_terminal_response_to(
+            &json!({"method": "notifications/cancelled"}),
+            7
+        ));
+    }
 
     #[test]
     fn slug_normalizes_to_safe_charset() {
@@ -2642,6 +3423,37 @@ mod tests {
         assert!(a.len() <= 64 && b.len() <= 64, "must fit the 64-char cap");
         assert!(a.starts_with("mcp_"));
         assert_ne!(a, b, "distinct long names must not collapse to the same id");
+    }
+
+    #[test]
+    fn observations_forward_validated_images_and_bound_image_only_errors() {
+        use crate::core::tool_media::{base64_encode, encode_rgba_png};
+        let bytes = encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap();
+        let data = base64_encode(&bytes);
+        let result = json!({"content":[{"type":"text","text":"screenshot"},
+            {"type":"image","mimeType":"image/png","data":data}]});
+        let observation = observation_from_result(&result, "server", "capture").unwrap();
+        assert_eq!(observation.images.len(), 1);
+        assert_eq!(observation.images[0].bytes().unwrap(), bytes);
+        assert!(!observation.text.contains(&data));
+        let image_error = json!({"isError":true,"content":[{"type":"image","mimeType":"image/png","data":data.repeat(100)}]});
+        let error = observation_from_result(&image_error, "server", "capture")
+            .unwrap_err()
+            .to_string();
+        assert!(error.len() < 100);
+        assert!(!error.contains("base64"));
+        assert!(!error.contains(&data));
+        let invalid = json!({"content":[{"type":"image","mimeType":"image/jpeg","data":data}]});
+        let rejected = observation_from_result(&invalid, "server", "capture").unwrap();
+        assert!(rejected.images.is_empty());
+        assert!(rejected.text.contains("MIME"));
+        let structured_error =
+            json!({"isError":true,"structuredContent":{"data":data,"diagnostic":"bad"}});
+        let error = observation_from_result(&structured_error, "server", "capture")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(&data));
+        assert!(error.contains("diagnostic"));
     }
 
     #[test]

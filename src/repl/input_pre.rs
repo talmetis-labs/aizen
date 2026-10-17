@@ -116,7 +116,7 @@ pub(crate) fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) 
         .map(std::path::Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut sbx = match crate::sandbox::runner::prepare_std(
+    let sbx = match crate::sandbox::runner::prepare_std(
         crate::sandbox::request::SandboxRequest::shell(origin, command, cwd.clone(), cwd)
             .private_tmp(false) // a user-typed command writing to %TEMP% should see the real one
             .wall_timeout(ESCAPE_TIMEOUT),
@@ -124,15 +124,10 @@ pub(crate) fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) 
         Ok(s) => s,
         Err(e) => return format!("[refused: {e}]"),
     };
-    let bounded =
-        crate::core::proctree::output_bounded(&mut sbx.command, ESCAPE_TIMEOUT, ESCAPE_DRAIN_GRACE);
-    sbx.finish(match &bounded {
-        Ok(o) if o.timed_out => crate::sandbox::runner::Outcome::Timeout,
-        Ok(o) => crate::sandbox::runner::Outcome::Exit(o.code),
-        Err(_) => crate::sandbox::runner::Outcome::SpawnFailed,
-    });
+    let bounded = sbx.output_bounded(ESCAPE_TIMEOUT, ESCAPE_DRAIN_GRACE);
     match bounded {
         Ok(o) => {
+            let unsettled = o.settlement == crate::core::proctree::BoundedSettlement::Unknown;
             let mut s = o.stdout;
             if !o.stderr.trim().is_empty() {
                 if !s.is_empty() && !s.ends_with('\n') {
@@ -150,10 +145,16 @@ pub(crate) fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) 
             } else {
                 s
             };
+            if unsettled && crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED {
+                return format!(
+                    "[effects unknown — further agent work blocked until CLI exit]\n{s}"
+                );
+            }
             if o.timed_out {
                 return format!(
-                    "[timed out after {}s — killed the whole process tree]\n{s}",
-                    ESCAPE_TIMEOUT.as_secs()
+                    "[timed out after {}s — termination requested; settlement {}]\n{s}",
+                    ESCAPE_TIMEOUT.as_secs(),
+                    if unsettled { "unproven" } else { "verified" }
                 )
                 .trim_end()
                 .to_string();

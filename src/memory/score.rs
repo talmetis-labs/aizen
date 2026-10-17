@@ -328,7 +328,7 @@ mod tests {
             "kubernetes deployment {}",
             "unrelated filler words ".repeat(20)
         ));
-        let docs = vec![short.clone(), long.clone()];
+        let docs = [short.clone(), long.clone()];
         let idx = Bm25Index::build(docs.iter().map(Vec::as_slice));
         let s_short = idx.score(&tokenize("kubernetes"), &short);
         let s_long = idx.score(&tokenize("kubernetes"), &long);

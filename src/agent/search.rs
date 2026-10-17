@@ -443,9 +443,8 @@ impl Tool for SearchFiles {
     }
     fn description(&self) -> &str {
         concat!(
-            "Search file CONTENT by regular expression. Skips hidden + binary + .gitignored unless \
-         hidden:true. Rows are `path:line: text`; context:N adds ±N lines. Do NOT shell out \
-         to grep/ripgrep. Read-only.",
+            "Regex file content; skips hidden/binary/.gitignored unless hidden:true. \
+             Rows path:line: text; context:N adds ±N lines.",
             crate::search_routing!()
         )
     }
@@ -454,14 +453,14 @@ impl Tool for SearchFiles {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "pattern": {"type": "string", "description": "regular expression matched per line"},
-                "path": {"type": "string", "description": "directory (subdir, ../ or absolute)"},
-                "glob": {"type": "string", "description": "file glob, e.g. *.rs or src/**/*.ts"},
-                "ignore_case": {"type": "boolean", "description": "case-insensitive match (default false)"},
-                "hidden": {"type": "boolean", "description": "also hidden and .gitignored paths (default false)"},
+                "pattern": {"type": "string", "description": "per-line regex"},
+                "path": {"type": "string", "description": "directory: subdir, ../ or absolute"},
+                "glob": {"type": "string", "description": "file glob: *.rs, src/**/*.ts"},
+                "ignore_case": {"type": "boolean", "description": "case-insensitive (default false)"},
+                "hidden": {"type": "boolean", "description": "include hidden/.gitignored (default false)"},
                 "max_results": {"type": "integer", "description": "cap (default 200)"},
-                "context": {"type": "integer", "description": "±N lines of context (default 0, max 10)"},
-                "output_mode": {"type": "string", "enum": ["content", "files_with_matches"], "description": "files_with_matches lists matching paths only"},
+                "context": {"type": "integer", "description": "±N lines (default 0, max 10)"},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches"], "description": "files_with_matches: paths only"},
                 "format": crate::agent::result_format::schema_property()
             },
             "required": ["pattern"]

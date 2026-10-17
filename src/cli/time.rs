@@ -94,7 +94,14 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
             );
             Ok(())
         }
-        TimeCmd::Doctor { json, repair } => {
+        TimeCmd::Doctor { json, repair, cohort, prepared, resources, record_observation } => {
+            match (cohort, prepared) {
+                (Some(cohort), Some(prepared)) if !repair => {
+                    return run_recovery_report(&cohort, &prepared, &resources, json, record_observation);
+                }
+                (None, None) if resources.is_empty() && !record_observation => {}
+                _ => bail!("restart report requires cohort and prepared together and cannot be combined with repair"),
+            }
             let report = if repair {
                 timemachine::doctor_repair()?
             } else {
@@ -249,13 +256,28 @@ pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
     }
 }
 
+/// Explicit inspection CLI boundary; metadata append requires its separate flag. No ordinary repair.
+fn run_recovery_report(cohort: &str, prepared: &str, resources: &[String], json: bool, record_observation: bool) -> Result<()> {
+    use crate::core::exec_ctx::{self, ExecutionContext};
+    let root = std::env::current_dir()?;
+    let inspect = || {
+        if record_observation { timemachine::record_speculation_recovery_observation(&root, cohort, prepared, resources) }
+        else { timemachine::inspect_speculation_recovery(&root, cohort, prepared, resources) }
+    };
+    // Only this top-level CLI boundary may seat a parent; never replace an existing restriction.
+    let report = if exec_ctx::current().is_some() {
+        inspect()?
+    } else {
+        let parent = ExecutionContext::default().with_resource_scope(format!("cli/recovery-report/{}", std::process::id()));
+        exec_ctx::with_current(parent, inspect)?
+    };
+    if json { println!("{}", serde_json::to_string_pretty(&report.to_json())?); }
+    else { println!("{}", report.to_text()); }
+    Ok(())
+}
+
 /// Resolve the `[FROM] [TO]` positional pair into two timeline sides.
-///
-/// The defaults encode the question people actually ask. Bare `time diff` means "what have I changed
-/// since the last checkpoint" (cursor → working tree), which is the state you want before deciding
-/// whether to keep or rewind. One argument means "since THAT point" (given → working tree), because
-/// naming a single checkpoint and getting a checkpoint↔checkpoint diff against an unnamed second
-/// point would be guesswork.
+/// Defaults: cursor -> working; with one argument, that checkpoint -> working.
 fn resolve_diff_sides(
     from: Option<&str>,
     to: Option<&str>,
@@ -484,7 +506,7 @@ fn print_timeline() -> Result<()> {
 /// saved to its own session file before being replaced.
 pub(crate) async fn timemachine_menu(
     history: &mut Vec<Message>,
-    model_label: &mut String,
+    model_label: &mut str,
 ) -> Result<()> {
     let theme = ui_theme();
     loop {
@@ -577,7 +599,7 @@ pub(crate) async fn timemachine_menu(
 fn restore_checkpoint(
     snap: &timemachine::Snapshot,
     history: &mut Vec<Message>,
-    model_label: &mut String,
+    model_label: &mut str,
 ) -> Result<()> {
     // Files-only checkpoints (auto/agent) have no chat to restore.
     if !snap.has_chat {

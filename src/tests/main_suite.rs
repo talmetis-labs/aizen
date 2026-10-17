@@ -365,6 +365,10 @@ async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_n
 /// awaiting a byte that never comes. `AIZEN_SUBAGENT_CALL_SECS=1` shrinks the ceiling so the test
 /// finishes in ~1s; the env lock keeps it from racing the other env-touching tests.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "The env fixture lock must cover the awaited request; the loopback server does not acquire it"
+)]
 async fn a_chore_call_against_a_silent_gateway_returns_err_not_a_permanent_park() {
     use tokio::io::AsyncReadExt;
 
@@ -475,6 +479,10 @@ fn the_steer_guard_closes_the_mailbox_and_requeues_what_the_turn_never_took() {
 /// wrapper must (a) report in-flight so Esc routes to cancel, (b) actually return on cancel
 /// rather than waiting out the call, and (c) leave the slot clean for the next turn.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "Serialize the global cancel fixture for the full request; the presser only uses the cancel slot"
+)]
 async fn cancellable_slash_lets_esc_abort_a_hung_model_call() {
     let _g = tui::TEST_CANCEL_LOCK
         .lock()
@@ -1603,7 +1611,7 @@ fn suggested_name_drops_credential_shaped_tokens() {
         "ghp_abcdefghijklmnopqrstuvwxyz0123",
     ];
     for k in keyish {
-        let name = suggest_session_name(&[Message::user(&format!("{k}"))]);
+        let name = suggest_session_name(&[Message::user(k)]);
         assert!(
             name.starts_with("chat-"),
             "a lone key must fall back to the generic stem, got {name}"
@@ -1614,7 +1622,7 @@ fn suggested_name_drops_credential_shaped_tokens() {
             "key material reached the name: {name}"
         );
         // With surrounding prose the topic survives and only the key is dropped.
-        let mixed = suggest_session_name(&[Message::user(&format!("set my api key to {k}"))]);
+        let mixed = suggest_session_name(&[Message::user(format!("set my api key to {k}"))]);
         assert!(mixed.starts_with("set-my-api-key"), "topic lost: {mixed}");
         assert!(
             !mixed.contains(&core.to_lowercase()),

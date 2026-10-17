@@ -15,9 +15,8 @@ use crate::*;
 /// `% context` HUD only — not a hard cap (the upstream enforces the real limit). Defaults to 128K.
 pub(crate) fn ctx_window_for(model: &str) -> usize {
     let m = model.to_ascii_lowercase();
-    if m.contains("1m") {
-        1_000_000 // explicit 1M-context variants (e.g. opus-4-8-1m-thinking) — checked before the family heuristics
-    } else if m.contains("gemini") {
+    if m.contains("1m") || m.contains("gemini") {
+        // Explicit 1M-context variants take precedence over the family heuristics.
         1_000_000
     } else if m.contains("claude")
         || m.contains("opus")

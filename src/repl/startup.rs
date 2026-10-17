@@ -14,7 +14,7 @@ use console::style;
 use dialoguer::Confirm;
 
 /// One-time prompt when a cloned repo ships project-local MCP servers (`./.aizen/mcp.json`): trust
-/// + load them, or dismiss (won't nag again — `aizen mcp trust` re-enables). MCP servers can run
+/// and load them, or dismiss (won't nag again — `aizen mcp trust` re-enables). MCP servers can run
 /// commands, hence the explicit gate before auto-arming a stranger's repo.
 pub(crate) fn prompt_mcp_trust(server_count: usize) {
     let theme = ui_theme();

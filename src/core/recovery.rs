@@ -5,6 +5,7 @@
 //! tool call: it restores the last safe conversation boundary and places the interrupted request back
 //! in the input box for review.
 
+use crate::agent::design::TaskDesignState;
 use crate::core::persist::{atomic_write_owner_only, remove_if_exists};
 use crate::core::types::Message;
 use anyhow::{Context, Result};
@@ -53,10 +54,16 @@ pub struct RecoveryManifest {
     pub safe_history_len: usize,
     pub checkpoint_id: Option<u32>,
     pub sidecar_generation: u64,
+    /// State is in the same generation's history envelope, never an unrelated active singleton.
+    #[serde(default)]
+    pub has_design_state: bool,
     pub turn_id: Option<u64>,
-    /// Monotonic within a turn: once a potentially effecting tool starts, keep this true until a
-    /// complete post-turn Idle boundary is durably committed.
+    /// Only a completed coordinating loop can clear this; autosave/Idle is not settlement proof.
     pub side_effects_possible: bool,
+    /// Sticky across later turns and clean exit until explicit reconciliation; observer return is
+    /// not proof that a worker stopped or that a possibly-applied mutation has been reconciled.
+    #[serde(default)]
+    pub effects_unsettled: bool,
     pub updated_unix: u64,
 }
 
@@ -65,6 +72,11 @@ pub struct RecoveryOffer {
     pub path: PathBuf,
     pub manifest: RecoveryManifest,
     pub history: Vec<Message>,
+    #[expect(
+        dead_code,
+        reason = "recovery preview retains design state; acceptance reloads the authoritative generation"
+    )]
+    pub design_state: Option<TaskDesignState>,
     pub pending_draft: Option<String>,
 }
 
@@ -144,8 +156,10 @@ pub fn begin(repo_scope: impl Into<String>, session_name: Option<String>) {
         safe_history_len: 0,
         checkpoint_id: None,
         sidecar_generation: 0,
+        has_design_state: false,
         turn_id: None,
         side_effects_possible: false,
+        effects_unsettled: false,
         updated_unix: now_unix(),
     };
     if write_manifest(&dir, &manifest).is_err() {
@@ -163,14 +177,21 @@ fn write_manifest(dir: &Path, manifest: &RecoveryManifest) -> Result<()> {
     atomic_write_owner_only(&manifest_path(dir), &bytes)
 }
 
-/// Persist the safe conversation + optional unsent draft as one committed generation.
-///
-/// Sidecars are written first and the manifest last. On any failure the previous manifest/generation
-/// remains authoritative and the incomplete new sidecars are removed best-effort.
-pub fn checkpoint_history(
+#[derive(Serialize, Deserialize)]
+struct HistoryGeneration {
+    generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    design_state: Option<TaskDesignState>,
+    messages: Vec<serde_json::Value>,
+}
+
+/// Persist safe conversation, optional draft and design state as one committed generation.
+/// Sidecars are written first and the manifest last; incomplete sidecars are removed on failure.
+pub fn checkpoint_history_with_design(
     history: &[Message],
     pending_draft: Option<&str>,
     phase: RecoveryPhase,
+    design: Option<&TaskDesignState>,
 ) -> Result<()> {
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(active) = guard.as_mut() else {
@@ -181,21 +202,31 @@ pub fn checkpoint_history(
     let hist_path = history_path(&active.dir, generation);
     let draft_path_new = draft_path(&active.dir, generation);
     let result = (|| -> Result<()> {
-        atomic_write_owner_only(&hist_path, &serde_json::to_vec(history)?)?;
+        let stored = HistoryGeneration {
+            generation,
+            design_state: design.cloned(),
+            messages: crate::core::session_store::stored_history(history)?,
+        };
+        atomic_write_owner_only(&hist_path, &serde_json::to_vec(&stored)?)?;
         if let Some(draft) = pending_draft {
             atomic_write_owner_only(&draft_path_new, draft.as_bytes())?;
         }
         let mut next = old.clone();
-        next.phase = phase;
+        // Saving a transcript does not settle effects. Only TurnBoundary can close a proven turn.
+        next.phase = if phase == RecoveryPhase::Idle
+            && (old.side_effects_possible || old.effects_unsettled)
+        {
+            RecoveryPhase::Finalizing
+        } else {
+            phase
+        };
         next.safe_history_len = history.len();
         next.sidecar_generation = generation;
-        next.turn_id = pending_draft.map(|_| generation);
-        next.updated_unix = now_unix();
-        if phase == RecoveryPhase::Idle {
-            next.side_effects_possible = false;
-            next.checkpoint_id = None;
-            next.turn_id = None;
+        next.has_design_state = design.is_some();
+        if !old.effects_unsettled {
+            next.turn_id = pending_draft.map(|_| generation).or(old.turn_id);
         }
+        next.updated_unix = now_unix();
         write_manifest(&active.dir, &next)?;
         active.manifest = next;
         Ok(())
@@ -212,11 +243,83 @@ pub fn checkpoint_history(
     Ok(())
 }
 
+/// The REPL owns one boundary per coordinating loop, never one per child. Dropping a turn future
+/// with pending effects cannot be mistaken for successful settlement by a later autosave.
+pub(crate) struct TurnBoundary {
+    completed: bool,
+}
+
+impl TurnBoundary {
+    pub(crate) fn new() -> Self {
+        Self { completed: false }
+    }
+
+    pub(crate) fn complete(&mut self, settled: bool) {
+        record_turn_completion(settled);
+        self.completed = true;
+    }
+}
+
+impl Drop for TurnBoundary {
+    fn drop(&mut self) {
+        if !self.completed {
+            record_turn_completion(false);
+        }
+    }
+}
+
+fn record_turn_completion(settled: bool) {
+    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    if !settled
+        && !active.manifest.side_effects_possible
+        && active.manifest.phase != RecoveryPhase::ExecutingTools
+    {
+        return;
+    }
+    let old = active.manifest.clone();
+    if settled && !active.manifest.effects_unsettled {
+        active.manifest.side_effects_possible = false;
+        active.manifest.checkpoint_id = None;
+        active.manifest.turn_id = None;
+    } else {
+        active.manifest.effects_unsettled = true;
+        active.manifest.side_effects_possible = true;
+    }
+    active.manifest.updated_unix = now_unix();
+    if write_manifest(&active.dir, &active.manifest).is_err() && settled {
+        // A failed settlement commit must leave the old durable warning intact. Failed uncertainty
+        // commits retain the in-memory latch so the next autosave retries rather than clearing it.
+        active.manifest = old;
+    }
+}
+
+pub(crate) fn mark_effects_unsettled() {
+    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    active.manifest.effects_unsettled = true;
+    active.manifest.side_effects_possible = true;
+    active.manifest.updated_unix = now_unix();
+    let _ = write_manifest(&active.dir, &active.manifest);
+}
+
 pub fn set_phase(phase: RecoveryPhase) {
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else { return };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
     let old = active.manifest.clone();
-    active.manifest.phase = phase;
+    active.manifest.phase = if phase == RecoveryPhase::Idle
+        && (active.manifest.side_effects_possible || active.manifest.effects_unsettled)
+    {
+        RecoveryPhase::Finalizing
+    } else {
+        phase
+    };
     active.manifest.updated_unix = now_unix();
     if write_manifest(&active.dir, &active.manifest).is_err() {
         active.manifest = old;
@@ -225,7 +328,9 @@ pub fn set_phase(phase: RecoveryPhase) {
 
 pub fn mark_side_effects_possible() {
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else { return };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
     if active.manifest.side_effects_possible {
         return;
     }
@@ -239,7 +344,12 @@ pub fn mark_side_effects_possible() {
 
 pub fn set_checkpoint(id: Option<u32>) {
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else { return };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    if active.manifest.effects_unsettled {
+        return;
+    }
     let old = active.manifest.clone();
     active.manifest.checkpoint_id = id;
     active.manifest.updated_unix = now_unix();
@@ -250,7 +360,9 @@ pub fn set_checkpoint(id: Option<u32>) {
 
 pub fn set_session_name(name: Option<String>) {
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else { return };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
     let old = active.manifest.clone();
     active.manifest.session_name = name;
     active.manifest.updated_unix = now_unix();
@@ -259,11 +371,22 @@ pub fn set_session_name(name: Option<String>) {
     }
 }
 
-/// Clean exit: drop the lease and delete recovery artifacts for this process.
+/// Clean exit retires only proven leases; uncertain effects remain available for inspection and keep
+/// their lease lock until this process actually exits.
 pub fn clear() {
-    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    if active.manifest.effects_unsettled || active.manifest.side_effects_possible {
+        return;
+    }
+    let active = guard.take();
+    drop(guard);
     if let Some(active) = active {
-        let _ = fs::remove_dir_all(&active.dir);
+        let dir = active.dir.clone();
+        drop(active); // Windows cannot delete a directory while its lease handle is open.
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
@@ -313,7 +436,14 @@ pub fn sweep_expired() {
             fs::read_to_string(manifest_path(&path))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<RecoveryManifest>(&raw).ok())
-                .map(|m| m.updated_unix)
+                .map(|m| {
+                    if m.effects_unsettled || m.side_effects_possible {
+                        // Age is not reconciliation. Retain uncertain attribution/baseline pointers.
+                        now
+                    } else {
+                        m.updated_unix
+                    }
+                })
         };
         let age_ok = match stamp {
             Some(updated) => now.saturating_sub(updated) > LEASE_TTL_SECS,
@@ -371,6 +501,11 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
         ) else {
             continue;
         };
+        if path.join("consumed-manifest.json").is_file() {
+            // Consumption already committed under this same lease lock; interrupted cleanup is
+            // TTL-swept residue, never another recovery offer or a corrupt manifest to quarantine.
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(manifest_path(&path)) else {
             quarantine(&path);
             continue;
@@ -389,18 +524,10 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
         if manifest.sidecar_generation == 0 || manifest.safe_history_len == 0 {
             continue;
         }
-        let Some(mut history) = fs::read(history_path(&path, manifest.sidecar_generation))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Vec<Message>>(&b).ok())
-        else {
+        let Ok((history, design_state)) = read_authoritative_snapshot(&path, &manifest) else {
             quarantine(&path);
             continue;
         };
-        if history.len() < manifest.safe_history_len {
-            quarantine(&path);
-            continue;
-        }
-        history.truncate(manifest.safe_history_len);
         let pending_draft = fs::read_to_string(draft_path(&path, manifest.sidecar_generation))
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -408,6 +535,7 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
             path,
             manifest,
             history,
+            design_state,
             pending_draft,
         });
     }
@@ -424,9 +552,11 @@ fn quarantine(path: &Path) {
     let _ = fs::rename(path, q);
 }
 
-/// Accept one recovery offer: restore its conversation and consume the lease directory exactly once.
-pub fn accept(offer: &RecoveryOffer) -> Result<(Vec<Message>, Option<String>)> {
-    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+/// Restore the authoritative conversation/design generation and consume the lease exactly once.
+pub fn accept_with_design(
+    offer: &RecoveryOffer,
+) -> Result<(Vec<Message>, Option<String>, Option<TaskDesignState>)> {
+    let lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
         &lock_path(&offer.path),
         Duration::from_secs(1),
     )?;
@@ -439,17 +569,17 @@ pub fn accept(offer: &RecoveryOffer) -> Result<(Vec<Message>, Option<String>)> {
     {
         anyhow::bail!("recovery offer changed before it could be consumed; rescan and retry");
     }
-    let history = read_authoritative_history(&offer.path, &current)?;
+    let (history, design) = read_authoritative_snapshot(&offer.path, &current)?;
     let draft = fs::read_to_string(draft_path(&offer.path, current.sidecar_generation))
         .ok()
         .filter(|s| !s.trim().is_empty());
-    consume_dir(&offer.path)?;
-    Ok((history, draft))
+    consume_dir(&offer.path, lock)?;
+    Ok((history, draft, design))
 }
 
 /// Discard one recovery offer exactly once.
 pub fn discard(offer: &RecoveryOffer) -> Result<()> {
-    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+    let lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
         &lock_path(&offer.path),
         Duration::from_secs(1),
     )?;
@@ -461,26 +591,66 @@ pub fn discard(offer: &RecoveryOffer) -> Result<()> {
     {
         anyhow::bail!("recovery offer changed before it could be discarded; rescan and retry");
     }
-    consume_dir(&offer.path)
+    consume_dir(&offer.path, lock)
 }
 
-fn read_authoritative_history(path: &Path, manifest: &RecoveryManifest) -> Result<Vec<Message>> {
-    let mut history: Vec<Message> = fs::read(history_path(path, manifest.sidecar_generation))
-        .with_context(|| format!("reading recovery history for run {}", manifest.run_id))
-        .and_then(|b| serde_json::from_slice(&b).context("parsing recovery history"))?;
-    if history.len() < manifest.safe_history_len {
-        anyhow::bail!("recovery history is incomplete; refusing to consume offer");
-    }
+fn read_authoritative_snapshot(
+    path: &Path,
+    manifest: &RecoveryManifest,
+) -> Result<(Vec<Message>, Option<TaskDesignState>)> {
+    let bytes = crate::core::session_store::read_bounded(
+        &history_path(path, manifest.sidecar_generation),
+        128 * 1024 * 1024,
+    )
+    .map_err(|e| anyhow::anyhow!("recovery history unavailable: {e:?}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parsing recovery history")?;
+    let (mut history, design) = if value.is_array() {
+        anyhow::ensure!(
+            !manifest.has_design_state,
+            "recovery generation lost its design state"
+        );
+        (
+            crate::core::session_store::parse_stored_history(&bytes)?,
+            None,
+        )
+    } else {
+        let stored: HistoryGeneration = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            stored.generation == manifest.sidecar_generation,
+            "recovery history/design generation mismatch"
+        );
+        anyhow::ensure!(
+            stored.design_state.is_some() == manifest.has_design_state,
+            "recovery design state does not match commit record"
+        );
+        (
+            crate::core::session_store::parse_stored_history(&serde_json::to_vec(
+                &stored.messages,
+            )?)?,
+            stored.design_state,
+        )
+    };
+    // Truncating a new envelope would pair history from one point with state from a later point.
+    anyhow::ensure!(
+        history.len() == manifest.safe_history_len,
+        "recovery history is incomplete or mismatched"
+    );
     history.truncate(manifest.safe_history_len);
-    Ok(history)
+    Ok((history, design))
 }
 
-fn consume_dir(path: &Path) -> Result<()> {
-    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("offer");
-    let consumed = recovery_root().join(format!("consumed-{stem}-{}", now_unix()));
-    fs::rename(path, &consumed)
+fn consume_dir(path: &Path, lock: crate::core::repo_lock::RepoTxnLock) -> Result<()> {
+    // The lock file lives INSIDE the directory: Windows cannot rename/remove that directory while
+    // its handle is open. Retire the authoritative manifest instead, while still holding the lock.
+    // This is the consumption commit: any other accept/discard sees no manifest and cannot replay.
+    // Dropping the lock BEFORE retiring the manifest would introduce a double-accept race.
+    fs::rename(manifest_path(path), path.join("consumed-manifest.json"))
         .with_context(|| format!("consuming recovery lease {}", path.display()))?;
-    let _ = fs::remove_dir_all(consumed);
+    drop(lock);
+    // Cleanup is not the commit record. A failed deletion leaves no recoverable manifest and can
+    // be collected by sweep_expired later, without making a successful recovery appear to fail.
+    let _ = fs::remove_dir_all(path);
     Ok(())
 }
 
@@ -497,7 +667,9 @@ pub fn format_offer(offer: &RecoveryOffer) -> String {
         .checkpoint_id
         .map(|id| format!(" · checkpoint #{id}"))
         .unwrap_or_default();
-    let effects = if offer.manifest.side_effects_possible {
+    let effects = if offer.manifest.effects_unsettled {
+        " · effects unsettled; inspect before retry or recovery"
+    } else if offer.manifest.side_effects_possible {
         " · side effects possible"
     } else {
         ""
@@ -525,10 +697,377 @@ mod tests {
             safe_history_len: len,
             checkpoint_id: None,
             sidecar_generation: generation,
+            has_design_state: false,
             turn_id: Some(generation),
             side_effects_possible: false,
+            effects_unsettled: false,
             updated_unix: 1,
         }
+    }
+
+    struct ActiveFixture {
+        _root: crate::core::file_placement::tests::TestDir,
+        dir: PathBuf,
+        env: Option<crate::core::config::EnvGuard>,
+        old_slug: Option<String>,
+    }
+
+    impl ActiveFixture {
+        fn new() -> Self {
+            let root = crate::core::file_placement::tests::TestDir::new();
+            let env = crate::core::config::EnvGuard::set([("AIZEN_HOME", root.path().as_os_str())]);
+            let dir = root.path().join("recovery").join("owned-active");
+            fs::create_dir_all(&dir).unwrap();
+            let lock = crate::core::repo_lock::RepoTxnLock::acquire(
+                &lock_path(&dir),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            let mut state = manifest("owned-scope", 0, 0);
+            state.turn_id = None;
+            write_manifest(&dir, &state).unwrap();
+            let mut guard = ACTIVE.lock().unwrap();
+            assert!(guard.is_none(), "fixture must not replace another lease");
+            *guard = Some(ActiveLease {
+                dir: dir.clone(),
+                manifest: state,
+                _lock: lock,
+            });
+            drop(guard);
+            let old_slug = crate::core::session_store::current_session_slug();
+            crate::core::session_store::set_session_slug(Some("owned-recovery-fixture".into()));
+            Self {
+                _root: root,
+                dir,
+                env: Some(env),
+                old_slug,
+            }
+        }
+
+        fn stored(&self) -> RecoveryManifest {
+            serde_json::from_slice(&fs::read(manifest_path(&self.dir)).unwrap()).unwrap()
+        }
+
+        fn exit_process(&self) {
+            let lease = {
+                let mut guard = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+                if guard.as_ref().is_some_and(|active| active.dir == self.dir) {
+                    guard.take()
+                } else {
+                    None
+                }
+            };
+            drop(lease);
+        }
+    }
+
+    impl Drop for ActiveFixture {
+        fn drop(&mut self) {
+            clear();
+            // Fixture teardown simulates process exit, even when production clear retains effects.
+            self.exit_process();
+            crate::core::session_store::set_session_slug(self.old_slug.take());
+            drop(self.env.take());
+        }
+    }
+
+    #[test]
+    fn idle_autosave_preserves_typed_uncertainty_across_later_turn_and_clean_exit() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for effect in [
+            crate::agent::tools::ToolEffectState::UnknownWorker,
+            crate::agent::tools::ToolEffectState::PossiblyApplied(Some(42)),
+        ] {
+            let fixture = ActiveFixture::new();
+            let mut history = vec![Message::user("owned interrupted request")];
+            checkpoint_history_with_design(
+                &history,
+                Some("owned interrupted request"),
+                RecoveryPhase::WaitingModel,
+                None,
+            )
+            .unwrap();
+            let turn_id = fixture.stored().turn_id;
+            set_checkpoint(Some(12));
+            mark_side_effects_possible();
+            let mut boundary = TurnBoundary::new();
+            let _outcome = crate::agent::tools::ToolOutcome::failed_with_effect_state(
+                "owned uncertain body",
+                effect,
+            );
+            boundary.complete(false);
+            crate::core::session_store::autosave_last_with_design(&history, Some("fixture"), None);
+            let stored = fixture.stored();
+            assert!(stored.effects_unsettled && stored.side_effects_possible);
+            assert_eq!(stored.phase, RecoveryPhase::Finalizing);
+            assert_eq!(stored.checkpoint_id, Some(12));
+            assert_eq!(stored.turn_id, turn_id);
+            assert_eq!(
+                read_authoritative_snapshot(&fixture.dir, &stored)
+                    .unwrap()
+                    .0
+                    .len(),
+                history.len()
+            );
+
+            // A successful later reader is not reconciliation of the previous uncertain body.
+            history.push(Message::assistant("later read completed"));
+            checkpoint_history_with_design(
+                &history,
+                Some("new request"),
+                RecoveryPhase::WaitingModel,
+                None,
+            )
+            .unwrap();
+            TurnBoundary::new().complete(true);
+            set_checkpoint(Some(13));
+            crate::core::session_store::autosave_last_with_design(&history, Some("fixture"), None);
+            let mut stored = fixture.stored();
+            assert!(stored.effects_unsettled && stored.side_effects_possible);
+            assert_eq!(stored.checkpoint_id, Some(12));
+            assert_eq!(stored.turn_id, turn_id);
+            clear();
+            assert!(
+                manifest_path(&fixture.dir).is_file(),
+                "clean exit is not settlement"
+            );
+            // `clear` deliberately retains the uncertain lease lock until the owning process exits.
+            // Release the test's simulated process ownership before scanning as a new process would.
+            fixture.exit_process();
+            stored.updated_unix = now_unix().saturating_sub(LEASE_TTL_SECS + 3600);
+            write_manifest(&fixture.dir, &stored).unwrap();
+            sweep_expired();
+            assert!(
+                manifest_path(&fixture.dir).is_file(),
+                "TTL is not reconciliation"
+            );
+            let offers = scan_stale("owned-scope");
+            assert_eq!(offers.len(), 1);
+            assert!(format_offer(&offers[0]).contains("effects unsettled"));
+        }
+    }
+
+    #[test]
+    fn dropped_boundary_retains_effects_but_proven_completion_can_close_a_turn() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let fixture = ActiveFixture::new();
+            set_checkpoint(Some(7));
+            mark_side_effects_possible();
+            drop(TurnBoundary::new());
+            checkpoint_history_with_design(
+                &[Message::user("cancelled")],
+                None,
+                RecoveryPhase::Idle,
+                None,
+            )
+            .unwrap();
+            assert!(fixture.stored().effects_unsettled);
+            assert_eq!(fixture.stored().checkpoint_id, Some(7));
+        }
+        {
+            let fixture = ActiveFixture::new();
+            set_checkpoint(Some(8));
+            mark_side_effects_possible();
+            checkpoint_history_with_design(
+                &[Message::user("still running")],
+                None,
+                RecoveryPhase::Idle,
+                None,
+            )
+            .unwrap();
+            assert!(
+                fixture.stored().side_effects_possible,
+                "autosave cannot close the turn"
+            );
+            TurnBoundary::new().complete(true);
+            checkpoint_history_with_design(
+                &[Message::user("settled")],
+                None,
+                RecoveryPhase::Idle,
+                None,
+            )
+            .unwrap();
+            let stored = fixture.stored();
+            assert_eq!(stored.phase, RecoveryPhase::Idle);
+            assert!(!stored.effects_unsettled && !stored.side_effects_possible);
+            assert!(stored.checkpoint_id.is_none());
+            clear();
+            assert!(!manifest_path(&fixture.dir).exists());
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_manifest_defaults_to_no_unsettled_latch() {
+        let mut stored = serde_json::to_value(manifest("legacy", 1, 0)).unwrap();
+        stored.as_object_mut().unwrap().remove("effects_unsettled");
+        let decoded: RecoveryManifest = serde_json::from_value(stored).unwrap();
+        assert!(!decoded.effects_unsettled);
+    }
+
+    #[test]
+    fn recovery_requires_matching_generation_and_state_commit_record() {
+        let dir =
+            std::env::temp_dir().join(format!("aizen-recovery-generation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state = crate::agent::design::DesignContext::new(
+            "owner",
+            "workspace",
+            crate::agent::design::DesignMode::On,
+        )
+        .snapshot();
+        let stored = HistoryGeneration {
+            generation: 7,
+            design_state: Some(state),
+            messages: vec![serde_json::to_value(Message::user("same-generation")).unwrap()],
+        };
+        atomic_write_owner_only(
+            &history_path(&dir, 7),
+            &serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        let mut manifest = manifest("workspace", 7, 1);
+        manifest.has_design_state = true;
+        let (history, design) = read_authoritative_snapshot(&dir, &manifest).unwrap();
+        assert_eq!(history[0].content.as_deref(), Some("same-generation"));
+        assert_eq!(design.unwrap().owner_id, "owner");
+        manifest.has_design_state = false;
+        assert!(read_authoritative_snapshot(&dir, &manifest).is_err());
+        manifest.has_design_state = true;
+        let mut mismatched = stored;
+        mismatched.generation = 6;
+        atomic_write_owner_only(
+            &history_path(&dir, 7),
+            &serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(read_authoritative_snapshot(&dir, &manifest).is_err());
+        // Legacy bare history defaults to no design, never inherits another run's state.
+        atomic_write_owner_only(
+            &history_path(&dir, 7),
+            &serde_json::to_vec(&vec![Message::user("legacy")]).unwrap(),
+        )
+        .unwrap();
+        manifest.has_design_state = false;
+        assert!(read_authoritative_snapshot(&dir, &manifest)
+            .unwrap()
+            .1
+            .is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_and_repeated_accepts_have_only_one_successful_consumer() {
+        let dir = std::env::temp_dir().join(format!(
+            "aizen-consume-lock-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = manifest("fixture", 1, 1);
+        let history = vec![Message::user("only one restore")];
+        atomic_write_owner_only(
+            &history_path(&dir, 1),
+            &serde_json::to_vec(&history).unwrap(),
+        )
+        .unwrap();
+        write_manifest(&dir, &manifest).unwrap();
+        let offer = RecoveryOffer {
+            path: dir.clone(),
+            manifest,
+            history,
+            design_state: None,
+            pending_draft: None,
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let offer = offer.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    accept_with_design(&offer)
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1,
+            "retire authoritative manifest under lock; cleanup must not turn its winner into failure");
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+        assert!(
+            !manifest_path(&dir).exists(),
+            "successful consumption retires the authoritative record"
+        );
+        assert!(
+            accept_with_design(&offer).is_err(),
+            "a consumed offer must never restore twice"
+        );
+        assert!(
+            discard(&offer).is_err(),
+            "a consumed offer cannot be discarded a second time"
+        );
+    }
+
+    #[test]
+    fn committed_consumption_residue_is_not_a_recovery_offer() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "aizen-consumed-residue-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        struct Cleanup {
+            root: PathBuf,
+            env: Option<crate::core::config::EnvGuard>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                drop(self.env.take());
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+        fs::create_dir_all(&root).unwrap();
+        let _cleanup = Cleanup {
+            root: root.clone(),
+            env: Some(crate::core::config::EnvGuard::set([(
+                "AIZEN_HOME",
+                root.as_os_str(),
+            )])),
+        };
+        let dir = root.join("recovery").join("consumed-before-cleanup");
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = manifest("fixture", 1, 1);
+        atomic_write_owner_only(
+            &dir.join("consumed-manifest.json"),
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        atomic_write_owner_only(
+            &history_path(&dir, 1),
+            &serde_json::to_vec(&vec![Message::user("consumed")]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            scan_stale("fixture").is_empty(),
+            "a tombstone is not authoritative manifest.json"
+        );
     }
 
     #[test]

@@ -209,7 +209,7 @@ fn parse_releases(json: &str, suffix: &str) -> Vec<ReleaseInfo> {
             checksum_url,
         });
     }
-    out.sort_by(|a, b| parse_version(&b.tag).cmp(&parse_version(&a.tag)));
+    out.sort_by_key(|release| std::cmp::Reverse(parse_version(&release.tag)));
     out
 }
 
@@ -455,7 +455,7 @@ fn now_unix() -> u64 {
 }
 
 fn should_check(last: Option<u64>, now: u64) -> bool {
-    last.map_or(true, |last| now.saturating_sub(last) >= CHECK_TTL_SECS)
+    last.is_none_or(|last| now.saturating_sub(last) >= CHECK_TTL_SECS)
 }
 
 fn read_cache() -> Option<UpdateCache> {

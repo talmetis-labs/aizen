@@ -161,8 +161,7 @@ pub(crate) fn run_persona(cmd: PersonaCmd) -> Result<()> {
                         .map(|s| s.importance)
                         .unwrap_or(6)
                 })
-                .max(persona::self_mem::FORMATIVE_MIN)
-                .min(10);
+                .clamp(persona::self_mem::FORMATIVE_MIN, 10);
             let body = if text.trim().starts_with("correction:")
                 || text.trim().starts_with("preference:")
                 || text.trim().starts_with("work:")

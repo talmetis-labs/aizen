@@ -252,12 +252,14 @@ fn a_role_pinned_to_a_profile_sets_and_clears_like_any_other_field() {
 
     // A per-role effort nobody can set from the CLI still counts as the role being configured:
     // clearing the fields we *can* see must not take a hand-written one down with it.
-    let mut roles = cli_config::RolesConfig::default();
-    roles.oracle = Some(cli_config::RoleModelConfig {
-        model: Some("strong".into()),
-        reasoning_effort: Some("xhigh".into()),
+    let mut roles = cli_config::RolesConfig {
+        oracle: Some(cli_config::RoleModelConfig {
+            model: Some("strong".into()),
+            reasoning_effort: Some("xhigh".into()),
+            ..Default::default()
+        }),
         ..Default::default()
-    });
+    };
     apply_role_flags(&mut roles, "oracle", None, Some(String::new()), None, None);
     assert_eq!(
         roles.oracle.as_ref().unwrap().reasoning_effort.as_deref(),

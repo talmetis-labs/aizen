@@ -230,7 +230,17 @@ pub(crate) fn previous_turn_used_tools(history: &[Message]) -> bool {
 /// conversation message (including a handoff seed, which is a third system message but NOT part of
 /// the two-lane prefix).
 pub(crate) fn splice_prompt_lanes(history: &mut Vec<Message>, bundle: agent::PromptBundle) {
-    let lead = agent::compact::leading_system_count(history);
+    let lead = history
+        .iter()
+        .take_while(|message| {
+            if message.role != "system" {
+                return false;
+            }
+            let content = message.content.as_deref().unwrap_or("");
+            !content.starts_with(agent::compact::HANDOFF_MARKER_PREFIX)
+                && !content.starts_with(agent::compact::COMPACT_MARKER_PREFIX)
+        })
+        .count();
     let mut lanes = vec![Message::system(bundle.stable)];
     if !bundle.dynamic.trim().is_empty() {
         lanes.push(Message::system(bundle.dynamic));
@@ -355,8 +365,9 @@ pub(crate) fn strip_recall_blocks(history: &mut [Message]) {
         };
         let mut cur = content;
         loop {
-            let next =
-                strip_skill_prefix(strip_session_mem_prefix(memory::strip_recall_prefix(cur)));
+            let next = strip_skill_prefix(strip_session_mem_prefix(memory::strip_recall_prefix(
+                crate::agent::design::prompt::strip_prefix(cur),
+            )));
             if next.len() == cur.len() {
                 break;
             }

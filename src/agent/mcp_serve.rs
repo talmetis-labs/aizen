@@ -34,8 +34,9 @@
 
 use std::io::{BufRead, Write};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 use crate::agent::tools::ToolRegistry;
 
@@ -79,6 +80,13 @@ pub fn run(allow_write: bool) -> Result<()> {
     could write is refused before it starts, so everything that reaches the loop is read-only and
     has nothing to approve. With `--yes` the person starting the server has said the quiet part
     out loud on their own command line. */
+    let roots = DispatchRoots {
+        root: std::env::current_dir()
+            .context("resolving MCP registry workspace")?
+            .canonicalize()
+            .context("canonicalizing MCP registry workspace")?,
+        home: crate::core::config::aizen_home(),
+    };
     let registry = crate::agent::builtin::default_registry_with_task(
         client,
         base_url,
@@ -86,7 +94,7 @@ pub fn run(allow_write: bool) -> Result<()> {
         model,
         crate::core::approval::ApprovalMode::Yolo,
         context_window,
-        None, // cwd IS the project: the client spawned us inside the repository it means
+        Some(roots.root.clone()), // registry and placement share this exact immutable workspace
     )?;
 
     let stdin = std::io::stdin();
@@ -100,7 +108,7 @@ pub fn run(allow_write: bool) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let Some(reply) = respond(&registry, allow_write, &line) else {
+        let Some(reply) = respond_scoped(&registry, allow_write, &line, Some(&roots)) else {
             continue;
         };
         writeln!(out, "{reply}")?;
@@ -112,13 +120,29 @@ pub fn run(allow_write: bool) -> Result<()> {
 /// One line in, at most one line out. `None` means "say nothing" — which is the correct and
 /// required answer to a notification, and to anything unparseable enough that we cannot tell whose
 /// reply it would be.
+/// Server-owned roots, captured alongside the registry. Never taken from JSON-RPC arguments.
+struct DispatchRoots {
+    root: PathBuf,
+    home: PathBuf,
+}
+
+#[cfg(test)]
 fn respond(registry: &ToolRegistry, allow_write: bool, line: &str) -> Option<String> {
+    respond_scoped(registry, allow_write, line, None)
+}
+
+fn respond_scoped(
+    registry: &ToolRegistry,
+    allow_write: bool,
+    line: &str,
+    roots: Option<&DispatchRoots>,
+) -> Option<String> {
     let msg: Value = serde_json::from_str(line).ok()?;
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
 
-    let outcome = dispatch(registry, allow_write, method, &params);
+    let outcome = dispatch(registry, allow_write, method, &params, roots);
 
     // A JSON-RPC notification carries no id and must never be answered. Some clients treat a reply
     // to one as a protocol violation and drop the connection, so this check comes before the work
@@ -140,12 +164,13 @@ fn dispatch(
     allow_write: bool,
     method: &str,
     params: &Value,
+    roots: Option<&DispatchRoots>,
 ) -> Result<Value, String> {
     match method {
         "initialize" => Ok(initialize(params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools(registry, allow_write) })),
-        "tools/call" => Ok(call(registry, allow_write, params)),
+        "tools/call" => Ok(call_scoped(registry, allow_write, params, roots)),
         other => Err(format!("phương thức không hỗ trợ: {other}")),
     }
 }
@@ -205,7 +230,17 @@ fn tools(registry: &ToolRegistry, allow_write: bool) -> Vec<Value> {
     out
 }
 
+#[cfg(test)]
 fn call(registry: &ToolRegistry, allow_write: bool, params: &Value) -> Value {
+    call_scoped(registry, allow_write, params, None)
+}
+
+fn call_scoped(
+    registry: &ToolRegistry,
+    allow_write: bool,
+    params: &Value,
+    roots: Option<&DispatchRoots>,
+) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
         .get("arguments")
@@ -226,15 +261,49 @@ fn call(registry: &ToolRegistry, allow_write: bool, params: &Value) -> Value {
     let Some(tool) = registry.get(name) else {
         return text(format!("không có công cụ tên '{name}'"), true);
     };
-    if !allow_write {
-        if let Some(refusal) = refuse_write(registry, name, &args) {
-            return text(refusal, true);
-        }
+    let preparation_context = crate::core::exec_ctx::ExecutionContext::default();
+    let prepared = match tool.plan_call(&args, &preparation_context) {
+        Ok(call) => call,
+        Err(error) => return text(error.to_string(), true),
+    };
+    if !allow_write && tool.delegation_read_only_prepared(&prepared) != Some(true) {
+        return text(write_refusal(), true);
     }
+    // Pin only after the original allowlist and write gate accept the dispatch. Handshake, list,
+    // roster, unknown tools and denied calls never allocate a placement namespace. Read-only
+    // task/workflow dispatches still need an inherited snapshot for their child loop boundary.
+    let context = match roots {
+        Some(roots) => {
+            let placement = match crate::core::file_placement::PlacementContext::new(
+                roots.root.clone(),
+                roots.home.clone(),
+            ) {
+                Ok(placement) => placement,
+                Err(error) => return text(format!("cannot pin MCP file placement: {error}"), true),
+            };
+            let scope = format!("mcp-request/{}", placement.run_id());
+            Some(
+                crate::core::exec_ctx::ExecutionContext::default()
+                    .with_resource_scope(scope)
+                    .with_placement(placement),
+            )
+        }
+        None => None,
+    };
     // A panicking tool must cost one answer, not the transport: unwinding out of `run()` kills
     // every future call the client was going to make, mid-session, with no protocol goodbye.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.execute(&args))) {
-        Ok(Ok(answer)) => text(bounded(answer), false),
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match context {
+        Some(context) => {
+            crate::core::exec_ctx::with_current(context, || tool.execute_prepared(&prepared))
+        }
+        None => tool.execute_prepared(&prepared),
+    })) {
+        Ok(Ok(answer)) => {
+            let failed = tool
+                .result_is_error(&answer.text)
+                .unwrap_or_else(|| crate::agent::is_failure_result(&answer.text));
+            text(bounded(answer.text), failed)
+        }
         Ok(Err(e)) => text(format!("{e}"), true),
         Err(_) => text(
             "lỗi: công cụ panic khi chạy — chi tiết ở stderr của server",
@@ -258,45 +327,22 @@ fn bounded(mut answer: String) -> String {
     answer
 }
 
-/* The write gate.
-Whether a dispatch can write is not decided here — it is asked of the `task` tool, which answers
-by resolving the dispatch exactly as it would to run it and reporting whether the resulting
-registry holds a destructive tool. That indirection is the point: the rule lives in one place, so
-a specialist card that gains `shell_run` tomorrow is refused tomorrow without this file learning
-anything. A workflow is checked task by task, because one writer among twenty readers is still a
-writer. Verify mode has no roles at all — its children are refuters — so it has nothing to check. */
+/// Unknown or unprepared delegation is not a read-only grant.
+fn write_refusal() -> String {
+    format!(
+        "từ chối: lượt này có quyền sửa tệp hoặc chạy lệnh, hoặc chưa xác định được quyền, mà máy chủ này khởi động \
+         không có --yes.\nDùng role `planner` / `reviewer`, hoặc một specialist chỉ đọc — gọi \
+         `{ROSTER}` để xem ai chỉ đọc.\nMuốn cho ghi thật thì người dùng phải tự chạy lại: \
+         `aizen mcp serve --yes`. Quyền đó không nằm trong tham số bạn gửi."
+    )
+}
+
+#[cfg(test)]
 fn refuse_write(registry: &ToolRegistry, name: &str, args: &Value) -> Option<String> {
-    let task = registry.get("task")?;
-    let refusal = |what: &str| {
-        Some(format!(
-            "từ chối: {what} sẽ chạy với quyền sửa tệp hoặc chạy lệnh, mà máy chủ này khởi động \
-             không có --yes.\nDùng role `planner` / `reviewer`, hoặc một specialist chỉ đọc — gọi \
-             `{ROSTER}` để xem ai chỉ đọc.\nMuốn cho ghi thật thì người dùng phải tự chạy lại: \
-             `aizen mcp serve --yes`. Quyền đó không nằm trong tham số bạn gửi.",
-        ))
-    };
-    match name {
-        "task" => (!task.is_concurrency_safe_for(args)).then(|| refusal("lượt này"))?,
-        "workflow" => args
-            .get("tasks")
-            .and_then(Value::as_array)
-            .and_then(|list| {
-                list.iter()
-                    .position(|t| {
-                        // Judge the shape that will actually run: a task with no `role` runs as
-                        // `nemesis` (workflow_tool's read-only default), while the task tool's own
-                        // oracle defaults to `daedalus` — asking it about the bare value would
-                        // refuse a dispatch that was read-only all along.
-                        let mut t = t.clone();
-                        if let Some(o) = t.as_object_mut() {
-                            o.entry("role").or_insert_with(|| json!("nemesis"));
-                        }
-                        !task.is_concurrency_safe_for(&t)
-                    })
-                    .map(|i| refusal(&format!("việc thứ {} trong workflow", i + 1)))
-            })?,
-        _ => None,
-    }
+    let tool = registry.get(name)?;
+    let call = tool.plan_call(args, &crate::core::exec_ctx::ExecutionContext::default());
+    (!call.is_ok_and(|call| tool.delegation_read_only_prepared(&call) == Some(true)))
+        .then(write_refusal)
 }
 
 /// Who is on the payroll, as a plain table. Read-only status comes from the same resolver the write
@@ -344,6 +390,242 @@ fn text(body: impl Into<String>, failed: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PlacementProbe {
+        root: PathBuf,
+        home: PathBuf,
+    }
+
+    impl crate::agent::tools::Tool for PlacementProbe {
+        fn name(&self) -> &str {
+            "task"
+        }
+        fn description(&self) -> &str {
+            "Hermetic advertised dispatch placement probe"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn delegation_read_only_prepared(
+            &self,
+            _call: &crate::agent::tools::PreparedToolCall,
+        ) -> Option<bool> {
+            Some(true)
+        }
+        fn execute(&self, _args: &Value) -> anyhow::Result<String> {
+            let context = crate::core::exec_ctx::current().expect("internally pinned MCP context");
+            let placement = context
+                .placement()
+                .expect("internally pinned MCP placement");
+            assert_eq!(placement.workspace_root(), self.root);
+            assert_eq!(placement.home_root(), self.home);
+            let child = placement.fork_for(self.root.clone(), "workflow/a")?;
+            let retry = placement.fork_for(self.root.clone(), "task/attempt/2")?;
+            assert_eq!(child.run_id(), placement.run_id());
+            assert_eq!(retry.run_id(), placement.run_id());
+            assert_ne!(child.artifact_root(), retry.artifact_root());
+            assert!(
+                !self.home.exists(),
+                "MCP boundary pinning must be read-only"
+            );
+            Ok(placement.run_id().to_string())
+        }
+    }
+
+    #[test]
+    fn advertised_dispatch_gets_internal_roots_and_a_fresh_shared_run() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let home = fixture.path().join("missing-home");
+        let roots = DispatchRoots {
+            root: root.clone(),
+            home: home.clone(),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(PlacementProbe {
+            root,
+            home: home.clone(),
+        }));
+        let wire = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "task", "arguments": {
+                "placement": {"workspace": "forged-root", "run_id": "forged-run"},
+                "exec_ctx": {"resource_scope": "forged-scope"}
+            }}
+        })
+        .to_string();
+        let first: Value =
+            serde_json::from_str(&respond_scoped(&registry, false, &wire, Some(&roots)).unwrap())
+                .unwrap();
+        let second: Value =
+            serde_json::from_str(&respond_scoped(&registry, false, &wire, Some(&roots)).unwrap())
+                .unwrap();
+        assert_eq!(first["result"]["isError"], false);
+        assert_ne!(
+            first["result"]["content"][0]["text"],
+            second["result"]["content"][0]["text"]
+        );
+        assert!(crate::core::exec_ctx::current().is_none());
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn metadata_and_unadvertised_calls_do_not_use_unavailable_placement_roots() {
+        let registry = ToolRegistry::new();
+        let roots = DispatchRoots {
+            root: PathBuf::from("relative-invalid-workspace"),
+            home: PathBuf::from("unused-home"),
+        };
+        for (method, params) in [
+            ("ping", json!({})),
+            ("tools/list", json!({})),
+            ("tools/call", json!({"name": "file_write", "arguments": {}})),
+        ] {
+            let wire =
+                json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
+            let response: Value = serde_json::from_str(
+                &respond_scoped(&registry, false, &wire, Some(&roots)).unwrap(),
+            )
+            .unwrap();
+            assert!(!response
+                .to_string()
+                .contains("cannot pin MCP file placement"));
+        }
+    }
+
+    struct PreparedProbe {
+        executed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        read_only: Option<bool>,
+    }
+
+    impl crate::agent::tools::Tool for PreparedProbe {
+        fn name(&self) -> &str {
+            "workflow"
+        }
+        fn description(&self) -> &str {
+            "Prepared dispatch gate probe"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn plan_call(
+            &self,
+            args: &Value,
+            _ctx: &crate::core::exec_ctx::ExecutionContext,
+        ) -> anyhow::Result<crate::agent::tools::PreparedToolCall> {
+            if args.get("malformed").and_then(Value::as_bool) == Some(true) {
+                anyhow::bail!("malformed dispatch");
+            }
+            let mut call = crate::agent::tools::PreparedToolCall::new(args.clone());
+            call.delegation = Some(std::sync::Arc::new("frozen reader registry".to_string()));
+            Ok(call)
+        }
+        fn delegation_read_only_prepared(
+            &self,
+            call: &crate::agent::tools::PreparedToolCall,
+        ) -> Option<bool> {
+            assert_eq!(
+                call.delegation
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<String>()
+                    .unwrap(),
+                "frozen reader registry"
+            );
+            self.read_only
+        }
+        fn execute(&self, _args: &Value) -> anyhow::Result<String> {
+            panic!("must execute the authorized prepared dispatch");
+        }
+        fn execute_prepared(
+            &self,
+            call: &crate::agent::tools::PreparedToolCall,
+        ) -> anyhow::Result<crate::agent::tools::ToolObservation> {
+            self.executed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::agent::tools::ToolObservation::text(
+                call.delegation
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<String>()
+                    .unwrap()
+                    .clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn prepared_gate_refuses_unknown_writer_and_malformed_without_execution() {
+        for read_only in [None, Some(false), Some(true)] {
+            let executed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut registry = ToolRegistry::new();
+            registry.register(Box::new(PreparedProbe {
+                executed: executed.clone(),
+                read_only,
+            }));
+            for malformed in [false, true] {
+                let response = call(
+                    &registry,
+                    false,
+                    &json!({"name": "workflow", "arguments": {
+                        "tasks": [{"role": "argus"}], "malformed": malformed
+                    }}),
+                );
+                let accepted = read_only == Some(true) && !malformed;
+                assert_eq!(response["isError"], !accepted);
+                if accepted {
+                    assert_eq!(response["content"][0]["text"], "frozen reader registry");
+                }
+            }
+            assert_eq!(
+                executed.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(read_only == Some(true))
+            );
+        }
+    }
+
+    #[test]
+    fn generated_implement_writer_cannot_hide_behind_supplied_reader_tasks() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", home.as_os_str())]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(crate::agent::workflow_tool::WorkflowTool::new(
+            reqwest::Client::new(),
+            "http://unused.invalid".into(),
+            String::new(),
+            "fake".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            0,
+            root.clone(),
+            0,
+        )));
+        let response = call_scoped(
+            &registry,
+            false,
+            &json!({"name": "workflow", "arguments": {
+                "mode": "implement", "prompt": "Implement the isolated parser fix in src/parser.rs",
+                "tasks": [{"role": "argus", "prompt": "Only inspect src/parser.rs"}]
+            }}),
+            Some(&DispatchRoots {
+                root,
+                home: fixture.path().join("must-not-be-created"),
+            }),
+        );
+        assert_eq!(response["isError"], true);
+        assert!(response["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("--yes"));
+        assert!(!fixture.path().join("must-not-be-created").exists());
+    }
 
     #[test]
     fn a_notification_is_never_answered() {

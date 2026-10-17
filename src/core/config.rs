@@ -310,8 +310,9 @@ pub fn project_key() -> String {
 /// spawn `git rev-parse`, and stamping session provenance wants all three every autosave — three
 /// separate lookups would have meant three git spawns per turn.
 fn identity() -> (PathBuf, String, String) {
-    static CACHE: std::sync::Mutex<Option<(String, (PathBuf, String, String))>> =
-        std::sync::Mutex::new(None);
+    type WorkspaceIdentity = (PathBuf, String, String);
+    type CachedIdentity = Option<(String, WorkspaceIdentity)>;
+    static CACHE: std::sync::Mutex<CachedIdentity> = std::sync::Mutex::new(None);
     let cache_key = format!(
         "{}|{}",
         std::env::var("AIZEN_PROJECT_ROOT").unwrap_or_default(),

@@ -12,6 +12,7 @@
 //! message ahead of the brief: a second user message before the brief would break the strict role
 //! alternation some providers enforce, and the brief is what the child must read last.
 
+use crate::agent::design::DesignContext;
 use serde_json::Value;
 use std::path::Path;
 
@@ -140,9 +141,14 @@ fn assemble(
     out
 }
 
-/// Build the pack for one dispatch from the parent's state: its read-cache scope, the findings it
-/// passed, and the process-global todo list's in-progress item.
-pub fn gather(root: &Path, parent_scope: &str, findings: &[String]) -> Option<String> {
+/// Only brief/evidence pointers cross the delegation boundary, never image payloads or active
+/// ownership. The parent's scoped state stays with its owner; a child can inspect the pointers.
+pub fn gather_with_design(
+    root: &Path,
+    parent_scope: &str,
+    findings: &[String],
+    design: Option<&DesignContext>,
+) -> Option<String> {
     let reads: Vec<ReadLoc> = crate::agent::read_cache_recent(parent_scope, MAX_READS)
         .into_iter()
         .map(|(path, range)| ReadLoc {
@@ -151,7 +157,34 @@ pub fn gather(root: &Path, parent_scope: &str, findings: &[String]) -> Option<St
         })
         .collect();
     let todo = crate::agent::todo::active_item();
-    render(&reads, findings, todo.as_deref())
+    let pack = render(&reads, findings, todo.as_deref());
+    let Some(capsule) = design.and_then(DesignContext::capsule) else {
+        return pack;
+    };
+    // Reserve complete wrappers, then share the existing 2500-char pack budget. A malicious brief
+    // cannot smuggle screenshot base64 into child context even if a future capsule renderer changes.
+    let capsule = capsule
+        .lines()
+        .filter(|line| !line.contains("data:image/") && !line.contains(";base64,"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let close = format!("</{TAG}>");
+    let opening = format!("<{TAG}>\n");
+    let body = pack
+        .as_deref()
+        .unwrap_or("")
+        .strip_prefix(&opening)
+        .unwrap_or("")
+        .strip_suffix(&close)
+        .unwrap_or("");
+    let capsule = clip(&capsule, 1_600);
+    let remaining = MAX_CHARS.saturating_sub(
+        opening.chars().count() + close.chars().count() + capsule.chars().count() + 2,
+    );
+    Some(format!(
+        "{opening}{capsule}\n{}\n{close}",
+        clip(body, remaining)
+    ))
 }
 
 /// A path as the model wrote it: relative to the root when under it, forward slashes. The read
@@ -181,6 +214,25 @@ pub fn prepend(pack: Option<&str>, prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn design_pack_is_bounded_and_contains_no_payload() {
+        let design =
+            DesignContext::new("parent", "workspace", crate::agent::design::DesignMode::On);
+        let findings = vec!["finding".repeat(500)];
+        let pack = gather_with_design(
+            Path::new("."),
+            "empty-design-test",
+            &findings,
+            Some(&design),
+        )
+        .unwrap();
+        assert!(pack.chars().count() <= MAX_CHARS);
+        assert!(pack.starts_with("<parent_context>"));
+        assert!(pack.ends_with("</parent_context>"));
+        assert!(pack.contains("Design guidance"));
+        assert!(!pack.contains("base64"));
+    }
 
     #[test]
     fn findings_come_from_an_array_or_a_string_trimmed_and_capped() {

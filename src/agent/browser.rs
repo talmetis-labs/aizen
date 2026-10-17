@@ -1,20 +1,8 @@
-//! Browser automation over the Chrome DevTools Protocol — OPT-IN (`--features browser`, default OFF
-//! like `dense`). Drives an EXISTING local Chrome/Edge/Brave; it NEVER bundles a browser engine.
-//!
-//! Why this stays a single static binary: CDP's local endpoint is a plain `ws://127.0.0.1:<port>`
-//! WebSocket (never TLS), so `tokio-tungstenite` is taken with NO tls feature → pure-Rust, no
-//! `*-sys`/openssl, no C toolchain. Target discovery reuses the in-tree `reqwest`. Rejected (per the
-//! roadmap): embedded engines (servo/CEF → C++), Playwright/Puppeteer (Node), the cloud/stealth half.
-//!
-//! Use it: launch a browser with remote debugging, then ask the agent to drive it —
-//!   `chrome --remote-debugging-port=9222`   (or `msedge` / `brave`), override host via `AIZEN_BROWSER_CDP`.
-//!
-//! Tools (top-level only): `browser_navigate`, `browser_snapshot` (a11y tree with `@ref` ids),
-//! `browser_click`/`browser_type` (by `@ref`), `browser_eval` (run JS — the "debug localhost:3000"
-//! power tool). All share ONE process-global connection so navigate→snapshot→click keep page state;
-//! all run serially (`is_concurrency_safe()=false`) so the shared stream is never interleaved.
+//! Attach-only browser automation over Chrome DevTools Protocol. Connections are lazy, isolated
+//! per conversation, and never launch/install a browser or borrow a user's profile. All operations
+//! share one cancellable 30-second budget, including discovery, ownership, retries, and capture.
 
-use crate::agent::tools::{Tool, ToolRegistry};
+use crate::agent::tools::{ApprovalPreview, Tool, ToolRegistry, WorkspaceEffect};
 use crate::core::convo::ConversationId;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -28,7 +16,13 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+mod capture;
 mod config;
+mod static_source;
+mod transport;
+pub use capture::{BrowserScreenshot, BrowserSetViewport};
+#[cfg(test)]
+mod transport_tests;
 
 /// Per-op wall-clock cap so a wedged page can't freeze the agent loop.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,15 +39,13 @@ type WsStream =
 const MAX_SESSIONS: usize = 8;
 
 /// One conversation's browser state: its live CDP websocket (if connected), the profile pinned for
-/// that conversation, an invalidation epoch bumped when a cancel/teardown drops the socket, and a
-/// last-used stamp for LRU eviction. Kept behind `Arc<Mutex<…>>` so a long CDP op holds only THIS
+/// that conversation and a last-used stamp for LRU eviction. Kept behind `Arc<Mutex<…>>` so a long CDP op holds only THIS
 /// conversation's lock, never a global one — state can never bleed from one conversation to another.
 struct BrowserSession {
     client: Option<CdpClient>,
     /// Set true before awaiting transport I/O; a cancelled/aborted op leaves it set so the next op on
     /// this conversation reconnects on a fresh socket instead of reusing one left mid-exchange.
     needs_reconnect: bool,
-    epoch: u64,
     last_used: std::time::Instant,
 }
 
@@ -62,7 +54,6 @@ impl BrowserSession {
         Self {
             client: None,
             needs_reconnect: false,
-            epoch: 0,
             last_used: std::time::Instant::now(),
         }
     }
@@ -79,6 +70,8 @@ static SESSIONS: Lazy<std::sync::Mutex<HashMap<ConversationId, SessionHandle>>> 
 /// from the websocket so a transport reconnect stays on the same profile; a profile switch drops that
 /// conversation's socket + `@ref`s. Sync access (no await) → a plain `RwLock`, keyed by conversation.
 static PINNED: Lazy<std::sync::RwLock<HashMap<ConversationId, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+static PINNED_TARGET_IDS: Lazy<std::sync::RwLock<HashMap<ConversationId, String>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
 
 /// Fetch (or lazily create) the session handle for one conversation, evicting the least-recently-used
@@ -113,6 +106,10 @@ pub fn release(id: &ConversationId) {
         .unwrap_or_else(|e| e.into_inner())
         .remove(id);
     PINNED.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+    PINNED_TARGET_IDS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
 }
 
 /// Release the conversation currently marked active (the REPL's `/new` / reset path).
@@ -129,49 +126,18 @@ struct CdpClient {
     profile: String,
     /// Sanitized endpoint label (host/base only; never headers or credential values).
     endpoint: String,
+    selection: config::BrowserProfile,
+    target_id: String,
+    budget: transport::Budget,
+    viewport: Option<capture::Viewport>,
     /// `@ref` number → DOM backendNodeId, rebuilt by each `browser_snapshot`.
     refs: HashMap<u32, i64>,
 }
 
 impl CdpClient {
-    /// Send one CDP command and read until its matching response id (events / other ids skipped).
+    /// Send/read bounded by the operation's one total deadline, not a fresh timeout per command.
     async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let msg = json!({"id": id, "method": method, "params": params});
-        self.ws
-            .send(WsMessage::Text(msg.to_string()))
-            .await
-            .context("CDP send")?;
-        let read = async {
-            loop {
-                match self.ws.next().await {
-                    Some(Ok(WsMessage::Text(txt))) => {
-                        let v: Value = match serde_json::from_str(&txt) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
-                            if let Some(err) = v.get("error") {
-                                let m = err
-                                    .get("message")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("CDP error");
-                                bail!("CDP {method} error: {m}");
-                            }
-                            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-                        }
-                        // else: a protocol event or a stale response → ignore, keep reading
-                    }
-                    Some(Ok(WsMessage::Close(_))) | None => bail!("CDP connection closed"),
-                    Some(Ok(_)) => continue, // ping/pong/binary
-                    Some(Err(e)) => bail!("CDP read error: {e}"),
-                }
-            }
-        };
-        tokio::time::timeout(OP_TIMEOUT, read)
-            .await
-            .map_err(|_| anyhow!("CDP {method} timed out after {}s", OP_TIMEOUT.as_secs()))?
+        transport::call(self, method, params).await
     }
 
     /// Resolve a snapshot `@ref` to a live JS object id (for click/type via `Runtime.callFunctionOn`).
@@ -191,123 +157,53 @@ impl CdpClient {
     }
 }
 
-/// Discover a page target's websocket URL from a configured CDP HTTP endpoint. Optional auth is
-/// resolved from an ENVIRONMENT VARIABLE NAME stored in browser.json; the value is never logged.
-async fn discover_ws_url(profile_name: &str, profile: &config::BrowserProfile) -> Result<String> {
-    let endpoint = profile.endpoint.trim().trim_end_matches('/');
-    let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    let url = format!("{base}/json");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let mut rb = client.get(&url);
-    if let Some(var) = profile.auth_env.as_deref() {
-        let value = std::env::var(var).with_context(|| {
-            format!("browser profile '{profile_name}' requires environment variable {var}")
-        })?;
-        rb = rb.header(reqwest::header::AUTHORIZATION, value);
-    }
-    let resp = rb.send().await.with_context(|| {
-        format!(
-            "no Chrome DevTools endpoint for browser profile '{profile_name}' at {endpoint} — launch a \
-             browser with remote debugging or update {}",
-            config::config_path().display()
-        )
-    })?;
-    let targets: Value = resp
-        .json()
-        .await
-        .context("parsing the CDP /json target list")?;
-    let arr = targets
-        .as_array()
-        .context("CDP /json did not return a list")?;
-    let page = arr
-        .iter()
-        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-        .or_else(|| arr.first())
-        .context("no open page/tab in the browser to attach to")?;
-    page.get("webSocketDebuggerUrl")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .context("the target has no webSocketDebuggerUrl")
-}
-
-/// Open a fresh CDP connection for a named profile and enable the domains we use. When the profile
-/// declares an `auth_env`, the SAME Authorization value used for HTTP discovery is attached to the
-/// WebSocket upgrade request (a remote CDP behind an auth proxy gates the ws:// upgrade too, not just
-/// the `/json` list). The value is read from the environment at connect time and never logged.
-async fn connect(profile_name: String, profile: config::BrowserProfile) -> Result<CdpClient> {
-    let ws_url = discover_ws_url(&profile_name, &profile).await?;
-    let ownership_path = crate::core::workspace_txn::resource_lock(
-        "browser",
-        &format!("{}:{profile_name}:{ws_url}", profile.endpoint),
-    );
-    let ownership = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
-        &ownership_path,
-        std::time::Duration::from_millis(100),
-    )
-    .context("browser target is already owned by another Aizen process")?;
-    let ws = ws_connect_with_auth(&profile_name, &profile, &ws_url)
-        .await
-        .with_context(|| {
-            format!("connecting browser profile '{profile_name}' to its CDP websocket")
-        })?;
+/// Discover + lock + attach within the caller's total deadline. Lock attempts are nonblocking and
+/// separated by cancellable async waits, so no synchronous lock retry can strand cancellation.
+async fn connect(
+    profile_name: String,
+    profile: config::BrowserProfile,
+    budget: transport::Budget,
+) -> Result<CdpClient> {
+    let target = transport::discover(&profile_name, &profile, &budget).await?;
+    // Identity is the selected transport target, not an alias/profile label. Two configurations or
+    // conversations cannot accidentally own the same websocket simultaneously.
+    let ownership_path = crate::core::workspace_txn::resource_lock("browser", &target.ws_url);
+    let ownership = budget
+        .run(async {
+            loop {
+                match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+                    &ownership_path,
+                    Duration::ZERO,
+                ) {
+                    Ok(lock) => break Ok(lock),
+                    Err(e)
+                        if e.downcast_ref::<crate::core::repo_lock::LockBusy>()
+                            .is_some() =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        })
+        .await?;
+    let ws = transport::ws_connect(&profile_name, &profile, &target.ws_url, &budget).await?;
     let mut c = CdpClient {
         ws,
         next_id: 1,
         _ownership: ownership,
         profile: profile_name,
-        endpoint: profile.endpoint,
+        endpoint: profile.endpoint.clone(),
+        selection: profile,
+        target_id: target.id,
+        budget,
+        viewport: None,
         refs: HashMap::new(),
     };
-    // Best-effort domain enables (a browser that doesn't support one shouldn't abort the session).
-    let _ = c.call("Page.enable", json!({})).await;
-    let _ = c.call("DOM.enable", json!({})).await;
-    let _ = c.call("Runtime.enable", json!({})).await;
-    let _ = c.call("Accessibility.enable", json!({})).await;
+    c.call("Page.enable", json!({})).await?;
+    c.call("DOM.enable", json!({})).await?;
+    c.call("Runtime.enable", json!({})).await?;
     Ok(c)
-}
-
-/// Open the CDP WebSocket, attaching the profile's `auth_env` value as an `Authorization` header on
-/// the upgrade request when set. A local `ws://127.0.0.1` endpoint carries no auth (the common case),
-/// so we skip building a custom request there. The header value is pulled from the environment at
-/// call time — it is never persisted in browser.json nor echoed into any error (upgrade failures are
-/// reported by tungstenite without the request headers).
-async fn ws_connect_with_auth(
-    profile_name: &str,
-    profile: &config::BrowserProfile,
-    ws_url: &str,
-) -> Result<WsStream> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let auth_value = match profile.auth_env.as_deref() {
-        Some(var) => Some(std::env::var(var).with_context(|| {
-            format!("browser profile '{profile_name}' requires environment variable {var}")
-        })?),
-        None => None,
-    };
-    match auth_value {
-        None => {
-            let (ws, _) = tokio_tungstenite::connect_async(ws_url).await?;
-            Ok(ws)
-        }
-        Some(value) => {
-            let mut request = ws_url
-                .into_client_request()
-                .context("building CDP websocket upgrade request")?;
-            let header_value = value
-                .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-                .context("browser auth_env value is not a valid HTTP header")?;
-            request
-                .headers_mut()
-                .insert(reqwest::header::AUTHORIZATION.as_str(), header_value);
-            let (ws, _) = tokio_tungstenite::connect_async(request).await?;
-            Ok(ws)
-        }
-    }
 }
 
 /// Run an op against the ACTIVE conversation's profile-pinned connection. `retry_readonly` permits
@@ -322,49 +218,61 @@ async fn with_cdp<T>(
     retry_readonly: bool,
     mut f: impl for<'a> FnMut(&'a mut CdpClient) -> Pin<Box<dyn Future<Output = Result<T>> + 'a>>,
 ) -> Result<T> {
-    // Bind the session to the conversation active at CALL time — a cancel/teardown that bumps the
-    // epoch afterwards can then tell that a reconnect it caused belongs to a session already retired.
-    let handle = session_handle(&crate::core::convo::active());
-    let mut sess = handle.lock().await;
-    sess.last_used = std::time::Instant::now();
-
-    // A profile switch, or a prior op that left the socket mid-exchange, forces a fresh connect.
-    let profile_switched = sess
-        .client
-        .as_ref()
-        .is_some_and(|c| c.profile != profile_name);
-    if profile_switched || sess.needs_reconnect {
-        sess.client = None;
-        sess.needs_reconnect = false;
-    }
-    if sess.client.is_none() {
-        sess.client = Some(connect(profile_name.clone(), profile.clone()).await?);
-    }
-
-    // Mark BEFORE awaiting: if Esc drops this future mid-read, `needs_reconnect` survives so the next
-    // op on THIS conversation reconnects instead of reusing a desynced socket. A clean return clears it.
-    sess.needs_reconnect = true;
-    let first = f(sess.client.as_mut().unwrap()).await;
-    let broken = first.as_ref().err().is_some_and(connection_error);
-    if !broken {
-        sess.needs_reconnect = false;
-        return first;
-    }
-    // Broken transport → drop this conversation's socket + refs.
-    sess.client = None;
-    if !retry_readonly {
-        return first; // needs_reconnect stays set → next op reconnects
-    }
-    // Read-only replay exactly once on a fresh websocket.
-    sess.client = Some(connect(profile_name, profile).await?);
-    sess.needs_reconnect = true;
-    let second = f(sess.client.as_mut().unwrap()).await;
-    if second.as_ref().err().is_some_and(connection_error) {
-        sess.client = None;
-    } else {
-        sess.needs_reconnect = false;
-    }
-    second
+    let budget = transport::Budget::new(OP_TIMEOUT);
+    let bounded = budget.clone();
+    bounded
+        .run(async move {
+            let handle = session_handle(&crate::core::convo::active());
+            let mut sess = handle.lock().await;
+            sess.last_used = std::time::Instant::now();
+            let switched = sess
+                .client
+                .as_ref()
+                .is_some_and(|c| c.profile != profile_name || c.selection != profile);
+            let old_target = if !switched {
+                sess.client.as_ref().map(|c| c.target_id.clone())
+            } else {
+                None
+            };
+            if switched || sess.needs_reconnect {
+                sess.client = None;
+                sess.needs_reconnect = false;
+            }
+            if sess.client.is_none() {
+                let mut reconnect_profile = profile.clone();
+                if reconnect_profile.target_id.is_none() {
+                    reconnect_profile.target_id = old_target;
+                }
+                let mut client =
+                    connect(profile_name.clone(), reconnect_profile, budget.clone()).await?;
+                client.selection = profile.clone();
+                sess.client = Some(client);
+            }
+            sess.client.as_mut().unwrap().budget = budget.clone();
+            // Survives cancellation of this future; the next call cannot reuse a half-read exchange.
+            sess.needs_reconnect = true;
+            let first = f(sess.client.as_mut().unwrap()).await;
+            let broken = first.as_ref().err().is_some_and(connection_error);
+            if !broken {
+                sess.needs_reconnect = first.is_err();
+                return first;
+            }
+            let target_id = sess.client.as_ref().unwrap().target_id.clone();
+            sess.client = None;
+            if !retry_readonly {
+                return first;
+            }
+            let mut replay_profile = profile.clone();
+            replay_profile.target_id = Some(target_id);
+            let mut client = connect(profile_name, replay_profile, budget).await?;
+            client.selection = profile;
+            sess.client = Some(client);
+            sess.needs_reconnect = true;
+            let second = f(sess.client.as_mut().unwrap()).await;
+            sess.needs_reconnect = second.is_err();
+            second
+        })
+        .await
 }
 
 fn connection_error(e: &anyhow::Error) -> bool {
@@ -375,35 +283,133 @@ fn connection_error(e: &anyhow::Error) -> bool {
         || m.contains("timed out")
 }
 
-/// Pin a profile for the ACTIVE conversation (by the URL being navigated to) and return the resolved
-/// target. Per-conversation so two chats can drive different profiles at once.
-fn target_for_url(url: &str) -> Result<(String, config::BrowserProfile)> {
-    let target = config::resolve_for_url(&config::load()?, url)?;
+/// Resolve explicit profile/target arguments without networking. Pins are conversation-local; switching
+/// profile clears target selection and all live refs on the subsequent attach.
+fn operation_target(
+    args: &Value,
+    navigate_url: Option<&str>,
+) -> Result<(String, config::BrowserProfile)> {
+    // Load the explicit authorization snapshot once, before mutating pins or any network I/O.
+    let cfg = config::load_explicit()?;
+    operation_target_from_config(&cfg, args, navigate_url)
+}
+
+fn operation_target_from_config(
+    cfg: &config::BrowserConfig,
+    args: &Value,
+    navigate_url: Option<&str>,
+) -> Result<(String, config::BrowserProfile)> {
+    let id = crate::core::convo::active();
+    let (name, mut profile) = if let Some(name) = args.get("profile") {
+        let name = name.as_str().context("profile must be a string")?;
+        (name.to_string(), config::resolve_named_snapshot(cfg, name)?)
+    } else if let Some(url) = navigate_url {
+        config::resolve_for_url_snapshot(cfg, url)?
+    } else {
+        let name = PINNED
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| cfg.default_profile.clone());
+        let profile = config::resolve_named_snapshot(cfg, &name)?;
+        (name, profile)
+    };
+    let changed = PINNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .is_some_and(|n| n != &name);
+    if changed {
+        PINNED_TARGET_IDS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+    if let Some(target) = args.get("target_id") {
+        let target = target
+            .as_str()
+            .context("target_id must be a string")?
+            .to_string();
+        profile.target_id = Some(target.clone());
+        config::validate_profile(&profile)?;
+        PINNED_TARGET_IDS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), target);
+    } else if let Some(target) = PINNED_TARGET_IDS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+    {
+        profile.target_id = Some(target.clone());
+    }
+    config::validate_profile(&profile)?;
     PINNED
         .write()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(crate::core::convo::active(), target.0.clone());
-    Ok(target)
-}
-
-/// The profile pinned for the ACTIVE conversation (falling back to the config default), resolved to a
-/// live profile. Reads only this conversation's pin — never another chat's.
-fn pinned_target() -> Result<(String, config::BrowserProfile)> {
-    let cfg = config::load()?;
-    let name = PINNED
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&crate::core::convo::active())
-        .cloned()
-        .unwrap_or_else(|| cfg.default_profile.clone());
-    let profile = config::resolve_named(&cfg, &name)?;
+        .insert(id, name.clone());
     Ok((name, profile))
 }
 
-/// Bridge the async CDP op to the sync `Tool::execute` — the shared cancel-aware bridge (valid on
-/// workers AND spawn_blocking threads; Esc aborts a hung CDP round-trip).
+fn tool_parameters(mut schema: Value) -> Value {
+    let props = schema["properties"].as_object_mut().unwrap();
+    props.insert(
+        "profile".into(),
+        json!({"type":"string","description":"Configured attach profile"}),
+    );
+    props.insert(
+        "target_id".into(),
+        json!({"type":"string","description":"Existing CDP page id; required if ambiguous"}),
+    );
+    schema
+}
+
+fn navigate_url(raw: &str) -> Result<url::Url> {
+    if raw.len() > 8192 {
+        bail!("navigation URL is too long");
+    }
+    let url = url::Url::parse(raw).context("navigation requires an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https" | "file") {
+        bail!("navigation permits only http, https, or explicit file URLs");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("navigation URL userinfo is refused");
+    }
+    if matches!(url.scheme(), "http" | "https") && url.host_str().is_none() {
+        bail!("navigation URL has no host");
+    }
+    Ok(url)
+}
+
+fn mark_design_render_changed() {
+    if let Some(design) = crate::core::exec_ctx::current().and_then(|ctx| ctx.design()) {
+        design.mark_render_changed();
+    }
+}
+
+fn browser_preview(name: &str, args: &Value, action: &str) -> Option<ApprovalPreview> {
+    let mut lines = vec![action.to_string(),
+        format!("profile: {} · target: {}", args.get("profile").and_then(Value::as_str).unwrap_or("conversation/config default"),
+            args.get("target_id").and_then(Value::as_str).unwrap_or("pinned/config target; refuse ambiguity")),
+        "Attach only; never launches or installs a browser. Attached page state may persist after cancellation.".into()];
+    if let Some(url) = args.get("url").and_then(Value::as_str) {
+        lines.push(match navigate_url(url) {
+            Ok(url) => format!("navigate: {url}"),
+            Err(_) => "invalid navigation URL (will refuse without connecting)".into(),
+        });
+    }
+    Some(ApprovalPreview {
+        title: name.into(),
+        diff: None,
+        lines,
+    })
+}
+
+/// Sync bridge; CDP's own Budget races cancellation, so its retained-state explanation is not
+/// hidden by the generic outer bridge's cancellation error.
 fn block<T>(f: impl Future<Output = Result<T>>) -> Result<T> {
-    crate::agent::tools::block_for_tool(f)
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
 /// Parse a `@ref` argument: accepts `3`, `"3"`, or `"@3"`.
@@ -515,10 +521,18 @@ impl Tool for BrowserNavigate {
          browsing/debug session (e.g. your localhost dev server); then browser_snapshot to see the page."
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{"url":{"type":"string","description":"absolute URL (http/https/file)"}},"required":["url"],"additionalProperties":false})
+        tool_parameters(
+            json!({"type":"object","properties":{"url":{"type":"string","description":"absolute URL (http/https/file)"}},"required":["url"],"additionalProperties":false}),
+        )
     }
     fn is_destructive(&self) -> bool {
         true
+    }
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::External
+    }
+    fn preview(&self, args: &Value) -> Option<ApprovalPreview> {
+        browser_preview(self.name(), args, "Mutates the explicitly attached browser page; effects are never replayed after transport errors.")
     }
     fn is_concurrency_safe(&self) -> bool {
         false
@@ -529,49 +543,26 @@ impl Tool for BrowserNavigate {
             .and_then(|v| v.as_str())
             .context("missing 'url'")?
             .to_string();
-        let (profile_name, profile) = target_for_url(&url)?;
+        let url = navigate_url(&url)?.to_string();
+        let (profile_name, profile) = operation_target(args, Some(&url))?;
+        mark_design_render_changed();
         block(with_cdp(profile_name, profile, false, |c| {
             Box::pin({
                 let url = url.clone();
                 async move {
-                    c.call("Page.navigate", json!({"url": url})).await?;
-                    // Poll readyState rather than racing a load event (simpler + robust across CDP versions).
-                    let deadline = OP_TIMEOUT;
-                    let start = tokio::time::Instant::now();
-                    loop {
-                        let r = c
-                            .call(
-                                "Runtime.evaluate",
-                                json!({"expression":"document.readyState","returnByValue":true}),
-                            )
-                            .await?;
-                        let state = r
-                            .get("result")
-                            .and_then(|x| x.get("value"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if state == "complete"
-                            || state == "interactive"
-                            || start.elapsed() > deadline
-                        {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    c.refs.clear();
+                    let result = c.call("Page.navigate", json!({"url": url})).await?;
+                    if result
+                        .get("errorText")
+                        .and_then(Value::as_str)
+                        .is_some_and(|e| !e.is_empty())
+                    {
+                        bail!("browser navigation failed");
                     }
-                    let t = c
-                        .call(
-                            "Runtime.evaluate",
-                            json!({"expression":"document.title","returnByValue":true}),
-                        )
-                        .await?;
-                    let title = t
-                        .get("result")
-                        .and_then(|x| x.get("value"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    Ok(format!(
-                        "navigated — title: \"{title}\" (call browser_snapshot to see elements)"
-                    ))
+                    let readiness = capture::settle(c).await?;
+                    let state = capture::page_state(c).await?;
+                    Ok(json!({"action":"navigated", "url":state["url"], "title":state["title"],
+                        "readiness":readiness,"freshness":"unknown", "note":"Source freshness is not inferred from navigation; browser_snapshot to see elements"}).to_string())
                 }
             })
         }))
@@ -589,7 +580,7 @@ impl Tool for BrowserSnapshot {
          Re-run after the page changes — refs are reassigned every snapshot."
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{},"additionalProperties":false})
+        tool_parameters(json!({"type":"object","properties":{},"additionalProperties":false}))
     }
     fn is_destructive(&self) -> bool {
         false
@@ -597,8 +588,8 @@ impl Tool for BrowserSnapshot {
     fn is_concurrency_safe(&self) -> bool {
         false
     }
-    fn execute(&self, _args: &Value) -> Result<String> {
-        let (profile_name, profile) = pinned_target()?;
+    fn execute(&self, args: &Value) -> Result<String> {
+        let (profile_name, profile) = operation_target(args, None)?;
         block(with_cdp(profile_name, profile, true, |c| {
             Box::pin(async move {
                 let tree = c.call("Accessibility.getFullAXTree", json!({})).await?;
@@ -623,17 +614,26 @@ impl Tool for BrowserClick {
          Re-snapshot afterwards to see the result."
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{"ref":{"type":["integer","string"],"description":"the @ref number from browser_snapshot"}},"required":["ref"],"additionalProperties":false})
+        tool_parameters(
+            json!({"type":"object","properties":{"ref":{"type":["integer","string"],"description":"the @ref number from browser_snapshot"}},"required":["ref"],"additionalProperties":false}),
+        )
     }
     fn is_destructive(&self) -> bool {
         true
+    }
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::External
+    }
+    fn preview(&self, args: &Value) -> Option<ApprovalPreview> {
+        browser_preview(self.name(), args, "Mutates the explicitly attached browser page; effects are never replayed after transport errors.")
     }
     fn is_concurrency_safe(&self) -> bool {
         false
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let r = parse_ref(args.get("ref").context("missing 'ref'")?)?;
-        let (profile_name, profile) = pinned_target()?;
+        let (profile_name, profile) = operation_target(args, None)?;
+        mark_design_render_changed();
         block(with_cdp(profile_name, profile, false, |c| {
             Box::pin(async move {
                 let object_id = c.object_for_ref(r).await?;
@@ -658,10 +658,18 @@ impl Tool for BrowserType {
          sets the value, and fires input+change events). For buttons/links use browser_click."
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{"ref":{"type":["integer","string"]},"text":{"type":"string"}},"required":["ref","text"],"additionalProperties":false})
+        tool_parameters(
+            json!({"type":"object","properties":{"ref":{"type":["integer","string"]},"text":{"type":"string"}},"required":["ref","text"],"additionalProperties":false}),
+        )
     }
     fn is_destructive(&self) -> bool {
         true
+    }
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::External
+    }
+    fn preview(&self, args: &Value) -> Option<ApprovalPreview> {
+        browser_preview(self.name(), args, "Mutates the explicitly attached browser page; effects are never replayed after transport errors.")
     }
     fn is_concurrency_safe(&self) -> bool {
         false
@@ -673,7 +681,8 @@ impl Tool for BrowserType {
             .and_then(|v| v.as_str())
             .context("missing 'text'")?
             .to_string();
-        let (profile_name, profile) = pinned_target()?;
+        let (profile_name, profile) = operation_target(args, None)?;
+        mark_design_render_changed();
         block(with_cdp(profile_name, profile, false, |c| {
             Box::pin({
                 let text = text.clone();
@@ -706,10 +715,18 @@ impl Tool for BrowserEval {
          browser_click/browser_type for normal interaction; use this when a snapshot can't express it."
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{"expression":{"type":"string","description":"a JS expression; may be an async expression / Promise"}},"required":["expression"],"additionalProperties":false})
+        tool_parameters(
+            json!({"type":"object","properties":{"expression":{"type":"string","description":"a JS expression; may be an async expression / Promise"}},"required":["expression"],"additionalProperties":false}),
+        )
     }
     fn is_destructive(&self) -> bool {
         true
+    }
+    fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
+        WorkspaceEffect::External
+    }
+    fn preview(&self, args: &Value) -> Option<ApprovalPreview> {
+        browser_preview(self.name(), args, "Mutates the explicitly attached browser page; effects are never replayed after transport errors.")
     }
     fn is_concurrency_safe(&self) -> bool {
         false
@@ -720,7 +737,8 @@ impl Tool for BrowserEval {
             .and_then(|v| v.as_str())
             .context("missing 'expression'")?
             .to_string();
-        let (profile_name, profile) = pinned_target()?;
+        let (profile_name, profile) = operation_target(args, None)?;
+        mark_design_render_changed();
         block(with_cdp(profile_name, profile, false, |c| {
             Box::pin({
                 let expr = expr.clone();
@@ -772,8 +790,13 @@ pub fn status() -> String {
         .unwrap_or_else(|e| e.into_inner())
         .get(&id)
         .cloned();
+    let availability = if is_configured() {
+        "configured; tools available when enabled"
+    } else {
+        "unconfigured; tools not advertised (explicit CDP endpoint/profile required)"
+    };
     let mut out = format!(
-        "browser config: {} · default={} · convo={} · pinned={}\n",
+        "browser: {availability}\nbrowser config: {} · default={} · convo={} · pinned={}\n",
         config::config_path().display(),
         cfg.default_profile,
         id,
@@ -838,7 +861,8 @@ pub async fn doctor() -> String {
                 continue;
             }
         };
-        match discover_ws_url(name, &profile).await {
+        let budget = transport::Budget::new(OP_TIMEOUT);
+        match transport::discover(name, &profile, &budget).await {
             Ok(_) => out.push_str(&format!("● {name} · reachable · {}\n", profile.endpoint)),
             Err(e) => out.push_str(&format!("○ {name} · unavailable · {e}\n")),
         }
@@ -850,6 +874,12 @@ pub async fn doctor() -> String {
     }
 }
 
+/// Purely offline availability check for default registry advertisement. No discovery/attach/probe.
+pub fn is_configured() -> bool {
+    let endpoint = crate::core::cli_config::branded_env("BROWSER_CDP");
+    config::explicitly_configured(&config::config_path(), endpoint.as_deref())
+}
+
 /// Register the browser tools into a registry (top-level only). Called from `default_registry_in`
 /// under `#[cfg(feature = "browser")]`.
 pub fn register_browser_tools(r: &mut ToolRegistry) {
@@ -858,11 +888,49 @@ pub fn register_browser_tools(r: &mut ToolRegistry) {
     r.register(Box::new(BrowserClick));
     r.register(Box::new(BrowserType));
     r.register(Box::new(BrowserEval));
+    r.register(Box::new(BrowserSetViewport));
+    r.register(Box::new(BrowserScreenshot));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_execution_loader_refuses_before_pin_and_snapshot_resolution_is_offline() {
+        let id = ConversationId::new("browser-explicit-config-test");
+        let ctx = crate::core::exec_ctx::ExecutionContext::new(id.clone());
+        let root = std::env::temp_dir().join(format!(
+            "aizen-browser-pin-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("browser.json");
+        release(&id);
+        crate::core::exec_ctx::with_current(ctx, || {
+            let result = config::load_explicit_at(&path, None)
+                .and_then(|cfg| operation_target_from_config(&cfg, &json!({}), None));
+            assert!(result.is_err());
+            assert!(PINNED.read().unwrap().get(&id).is_none());
+            assert!(PINNED_TARGET_IDS.read().unwrap().get(&id).is_none());
+            let mut cfg = config::BrowserConfig::default();
+            cfg.profiles
+                .get_mut(config::DEFAULT_PROFILE)
+                .unwrap()
+                .endpoint = "127.0.0.1:9666".into();
+            std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let snapshot = config::load_explicit_at(&path, None).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let (_, target) =
+                operation_target_from_config(&snapshot, &json!({"target_id":"selected"}), None)
+                    .unwrap();
+            assert_eq!(target.endpoint, "127.0.0.1:9666");
+            assert_eq!(target.target_id.as_deref(), Some("selected"));
+        });
+        release(&id);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn parse_ref_accepts_number_and_at_string() {

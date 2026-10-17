@@ -23,6 +23,22 @@ use dialoguer::{Confirm, Input, Select};
 /// is listed as unreadable rather than as a plausible empty session — see the serialize/deserialize
 /// asymmetry that used to hide those.
 pub(crate) async fn sessions_menu(history: &mut Vec<Message>, model_label: &str) -> Result<()> {
+    sessions_menu_scoped(history, model_label, None).await
+}
+
+pub(crate) async fn sessions_menu_with_design(
+    history: &mut Vec<Message>,
+    model_label: &str,
+    design: &crate::agent::design::DesignContext,
+) -> Result<()> {
+    sessions_menu_scoped(history, model_label, Some(design)).await
+}
+
+async fn sessions_menu_scoped(
+    history: &mut Vec<Message>,
+    model_label: &str,
+    design: Option<&crate::agent::design::DesignContext>,
+) -> Result<()> {
     loop {
         let theme = ui_theme();
         // Newest first, with provenance: age, origin project for foreign/unlabeled files, a
@@ -78,8 +94,17 @@ pub(crate) async fn sessions_menu(history: &mut Vec<Message>, model_label: &str)
 
         if pick < n_sessions {
             let name = &names[pick];
-            match load_session(history, name, model_label) {
-                Ok(n) => {
+            match load_session_with_design(history, name, model_label) {
+                Ok((n, saved_design)) => {
+                    if let Some(design) = design {
+                        design.reset();
+                        if let Some(saved) = saved_design {
+                            if let Err(error) = design.restore_session(saved) {
+                                tui::note_line(&format!("design state not restored: {error}"));
+                            }
+                        }
+                        update_live_history_with_design(history, Some(&design.snapshot()));
+                    }
                     reset_per_session_state(); // thread switch — same contract as /resume
                     println!(
                         "{}",
@@ -123,12 +148,18 @@ pub(crate) async fn sessions_menu(history: &mut Vec<Message>, model_label: &str)
                         continue;
                     }
                 }
-                match save_session(history, name.trim(), Some(model_label)) {
+                let snapshot = design.map(|ctx| ctx.snapshot());
+                match save_session_with_design(
+                    history,
+                    name.trim(),
+                    Some(model_label),
+                    snapshot.as_ref(),
+                ) {
                     Ok(_) => {
                         // Pin the session to this name so later autosaves keep rewriting the SAME file
                         // (both paths route through `sanitize_name`, so the raw name maps to one file).
                         set_session_slug(Some(name.trim().to_string()));
-                        update_live_history(history); // exit-flush snapshot follows the pinned name
+                        update_live_history_with_design(history, snapshot.as_ref()); // exit-flush snapshot follows the pinned name
                         println!(
                             "{}",
                             style(format!("saved '{}'", name.trim())).color256(splash::ACCENT)
@@ -184,6 +215,22 @@ pub(crate) async fn sessions_menu(history: &mut Vec<Message>, model_label: &str)
 /// the live one and is autosaved under a fresh aizen slug from then on, exactly like a `/resume`
 /// of an aizen session. The source file is only ever READ.
 pub(crate) async fn import_menu(history: &mut Vec<Message>, model_label: &str) -> Result<()> {
+    import_menu_scoped(history, model_label, None).await
+}
+
+pub(crate) async fn import_menu_with_design(
+    history: &mut Vec<Message>,
+    model_label: &str,
+    design: &crate::agent::design::DesignContext,
+) -> Result<()> {
+    import_menu_scoped(history, model_label, Some(design)).await
+}
+
+async fn import_menu_scoped(
+    history: &mut Vec<Message>,
+    model_label: &str,
+    design: Option<&crate::agent::design::DesignContext>,
+) -> Result<()> {
     let theme = ui_theme();
     let pool = features::foreign_session::discover(&config::project_root());
     if pool.is_empty() {
@@ -223,6 +270,9 @@ pub(crate) async fn import_menu(history: &mut Vec<Message>, model_label: &str) -
             // Drop any system lanes the source CLI's harness left in (already filtered in parse,
             // but defend against a future schema that embeds them) before splicing aizen's own.
             *history = imported;
+            if let Some(design) = design {
+                design.reset();
+            }
             refresh_prompt_lanes_for_thread_switch(history, model_label);
             // Same thread-switch contract as /resume: the foreign thread's todos/cost/grants
             // belong to it, not to whatever was live before the import.

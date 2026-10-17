@@ -48,3 +48,8 @@ main_diff*.txt
 # task-suite fixtures build in a temp copy, but a hand run inside bench-tasks/<id>/repo would not
 bench-tasks/*/repo/target/
 bench-tasks/*/repo/Cargo.lock
+
+# Test fixtures written to the repo root by hook executor tests (see
+# src/agent/hooks_executor_tests.rs); they are scratch output, never source.
+/hook-pre.txt
+/hook-post.txt

@@ -74,6 +74,106 @@ pub fn cost_meter() -> &'static CostMeter {
     &COST_METER
 }
 
+/// The observed tail belongs to the future: timeout/drop still bills received usage and closes
+/// its renderer. Provider-reported cumulative usage is recorded once, never estimated on drop.
+pub(crate) struct StreamTail<'a, F: FnMut(&str)> {
+    meter: &'a CostMeter,
+    usage: Option<Usage>,
+    usage_observer: Option<&'a (dyn Fn(&Usage) + Send + Sync)>,
+    markdown: crate::ui::markdown::MarkdownStream,
+    emit: F,
+    render: bool,
+    retained: bool,
+    events: bool,
+    newline: bool,
+    closed: bool,
+}
+
+impl<'a, F: FnMut(&str)> StreamTail<'a, F> {
+    pub(crate) fn new(
+        meter: &'a CostMeter,
+        markdown: crate::ui::markdown::MarkdownStream,
+        emit: F,
+        render: bool,
+        retained: bool,
+        newline: bool,
+    ) -> Self {
+        Self {
+            meter,
+            usage: None,
+            usage_observer: None,
+            markdown,
+            emit,
+            render,
+            retained,
+            events: false,
+            newline,
+            closed: false,
+        }
+    }
+
+    pub(crate) fn with_usage_observer(
+        mut self,
+        observer: Option<&'a (dyn Fn(&Usage) + Send + Sync)>,
+    ) -> Self {
+        self.usage_observer = observer;
+        self
+    }
+
+    pub(crate) fn observe_usage(&mut self, usage: &Usage) {
+        self.usage = Some(usage.clone());
+    }
+
+    pub(crate) fn push(&mut self, text: &str) {
+        if !self.render || text.is_empty() {
+            return;
+        }
+        self.newline = true;
+        if self.events {
+            crate::ui::events::text(text);
+        } else if self.retained {
+            crate::ui::tui::assistant_stream_delta(text);
+        } else {
+            let rendered = self.markdown.push(text);
+            if !rendered.is_empty() {
+                (self.emit)(&rendered);
+            }
+        }
+    }
+
+    pub(crate) fn finish(&mut self, interrupted: bool) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        if let Some(usage) = self.usage.take() {
+            self.meter.record(&usage);
+            if let Some(observer) = self.usage_observer {
+                observer(&usage);
+            }
+        }
+        if self.render && !self.events {
+            if self.retained {
+                crate::ui::tui::assistant_stream_finish(interrupted);
+            } else {
+                let closing = self.markdown.finish();
+                if !closing.is_empty() {
+                    (self.emit)(&closing);
+                }
+                if self.newline {
+                    (self.emit)("\n");
+                }
+            }
+        }
+    }
+}
+
+impl<F: FnMut(&str)> Drop for StreamTail<'_, F> {
+    fn drop(&mut self) {
+        self.finish(true);
+    }
+}
+
 /// This process's identity for the usage-ledger cursor: nanoseconds at first use. A session file
 /// records the epoch it was last written under; a different epoch means "another process wrote
 /// this", so every row the live meter holds is new to the file regardless of sequence numbers.
@@ -717,11 +817,9 @@ pub(crate) fn stream_stall_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Deadline for the FIRST parsed frame — the second phase of the watchdog. A reasoning model that
-/// streams nothing until its answer starts (o-series over chat-completions, some local servers)
-/// is legitimately silent for minutes; the single 90 s deadline read that as "never started",
-/// replayed the request up to twice, and billed the thinking three times. Once any frame has
-/// parsed, the inter-frame deadline (`STREAM_STALL_SECS`) takes over.
+/// Deadline for the FIRST useful output. A reasoning model that streams nothing until its answer
+/// starts may be silent for minutes. Metadata/pings do not shorten or renew this allowance; once
+/// text, reasoning or tool fragments arrive, the useful-progress idle deadline takes over.
 const STREAM_FIRST_FRAME_SECS: u64 = 600;
 
 /// Env override for the first-frame deadline, clamped 15s..=3600s.
@@ -740,35 +838,13 @@ pub(crate) fn stream_first_frame_timeout() -> std::time::Duration {
 /// on the blank case — see `stream_chat_with_tools_eager`.
 pub(crate) const STREAM_BLANK_RETRIES: u32 = 2;
 
-/// How many unparseable-frame warnings one stream may print before they collapse into a single
-/// count — and only ever under [`FRAME_DEBUG_ENV`], since the normal path prints none at all.
-///
-/// The failure this bounds is per-TOKEN, not occasional: when our model of a provider's delta shape
-/// is wrong, EVERY frame fails to parse, so an uncapped warn prints one line per streamed token and
-/// buries the session under hundreds of near-identical lines. A handful names the problem; the rest
-/// only repeat it.
-const MAX_FRAME_WARNS: usize = 3;
-
-/// Longest frame payload echoed in a warn line. A full SSE frame is one long JSON line that wraps
-/// across the whole terminal; the head is where the offending key is, and the tail teaches nothing.
+/// Historical truncation bound retained only for UTF-8 fixture coverage; live diagnostics never
+/// echo frame payloads.
+#[cfg(test)]
 const FRAME_WARN_MAX: usize = 160;
 
-/// Opt-in switch for stream-frame diagnostics. Unset (the default) means a frame we cannot read is
-/// handled silently: see [`parse_chunk`] for why the remaining cases carry nothing worth a line.
-const FRAME_DEBUG_ENV: &str = "AIZEN_DEBUG_STREAM";
-
-/// Whether to narrate frames that survived neither parse attempt.
-fn frame_debug() -> bool {
-    std::env::var(FRAME_DEBUG_ENV)
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            !v.is_empty() && v != "0" && v != "false" && v != "off" && v != "no"
-        })
-        .unwrap_or(false)
-}
-
 /// Shorten a frame payload for a warn line, cutting on a char boundary (frames carry UTF-8 text).
+#[cfg(test)]
 fn truncate_frame(data: &str) -> String {
     let data = data.trim();
     if data.chars().count() <= FRAME_WARN_MAX {
@@ -778,33 +854,24 @@ fn truncate_frame(data: &str) -> String {
     format!("{head}… ({} bytes total)", data.len())
 }
 
-/// Deserialize one SSE data frame into a [`ChatChunk`], strictly first and then LENIENTLY.
-///
-/// The lenient retry is the whole point. Deriving `Deserialize` on a struct makes serde reject an
-/// object outright on things that are not actually ambiguous on the wire — most importantly a
-/// DUPLICATE KEY, which OpenRouter-shaped gateways produce every time they mirror one value into two
-/// spellings of the same channel. A rejected frame is not just a warning: whatever `content` or
-/// `tool_calls` rode in that delta is dropped with it, and a lost tool-call fragment is a step the
-/// agent never takes.
-///
-/// Routing through [`serde_json::Value`] fixes that class generically, because its object map takes
-/// duplicate keys last-wins instead of erroring — so the retry succeeds without us having to predict
-/// which field a given gateway will double up next. It costs one extra allocation on a path that,
-/// when everything is well-shaped, is never taken.
-///
-/// What survives BOTH attempts is therefore not a chunk at all: keepalive/comment/`{"type":"ping"}`
-/// noise and other non-completion frames gateways interleave. Those carry nothing this loop wants,
-/// which is why the caller drops them silently unless [`FRAME_DEBUG_ENV`] is set.
-fn parse_chunk(data: &str) -> Result<ChatChunk, serde_json::Error> {
-    match serde_json::from_str::<ChatChunk>(data) {
-        Ok(chunk) => Ok(chunk),
-        Err(strict) => match serde_json::from_str::<serde_json::Value>(data) {
-            // Report the STRICT error on failure, not the lenient one: it names the offending key,
-            // while the second pass only says the value had the wrong shape.
-            Ok(value) => serde_json::from_value::<ChatChunk>(value).map_err(|_| strict),
-            Err(_) => Err(strict),
-        },
+/// Deserialize one SSE data frame, rejecting malformed completion frames and other API dialects.
+/// Routing through `Value` preserves last-wins duplicate keys used by some gateways, without
+/// echoing a rejected payload in diagnostics. Parseable metadata (including JSON pings) has
+/// default-empty fields: only the semantic watchdog decides whether the model made progress.
+fn parse_chunk(data: &str) -> Result<ChatChunk> {
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| super::delegated::Failure::Protocol)?;
+    if matches!(value.get("type").and_then(|v| v.as_str()),
+        Some("message_start" | "message_delta" | "message_stop" | "content_block_start"
+            | "content_block_delta" | "content_block_stop"))
+        || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| t.starts_with("response."))
+        || value.get("choices").and_then(|v| v.as_array()).is_some_and(|choices| {
+            choices.iter().any(|choice| choice.get("message").is_some() && choice.get("delta").is_none())
+        })
+    {
+        return Err(super::delegated::Failure::Protocol.into());
     }
+    serde_json::from_value(value).map_err(|_| super::delegated::Failure::Protocol.into())
 }
 
 /// Tell the user the stream stalled and is being replayed. Routed through the TUI funnel: a raw
@@ -821,25 +888,26 @@ pub(crate) fn retry_caption(status: u16, attempt: u32, max: u32, delay_ms: u64) 
     )
 }
 
-/// Publish a retried send: the working-line caption (so the spinner reads `rate-limited —
-/// retrying in 43s (2/3)` instead of spinning mutely) and one faint transcript note.
+/// Publish a retried send. The caption rides the working line, which REPLACES itself each time — so
+/// a burst of 429s reads as one changing line (`rate-limited — retrying in 2s (3/3)`) instead of a
+/// column of near-identical notes that buried the turn. Nothing is appended to the transcript: the
+/// retry is transient state, not part of the conversation.
 fn send_retry_note(status: u16, attempt: u32, max: u32, delay_ms: u64) {
     let text = retry_caption(status, attempt, max, delay_ms);
     crate::ui::tui::set_work_caption(&text);
-    if crate::ui::tui::active() {
-        crate::ui::tui::emit_line(&crate::ui::theme::faint(format!("⟳ {text}")).to_string());
-    } else {
+    // Off-TTY there is no working line to carry it, so the one line is all the user gets.
+    if !crate::ui::tui::active() {
         crate::ui::tui::note_line(&format!("⟳ {text}"));
     }
 }
 
+/// Same contract as [`send_retry_note`]: caption only, never a transcript line per attempt.
 pub(crate) fn stream_retry_note(reason: &str, attempt: u32, max: u32, delay_ms: u64) {
     let line = format!(
         "⟳ stream died before any output ({reason}) — retrying {attempt}/{max} in {delay_ms}ms"
     );
-    if crate::ui::tui::active() {
-        crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
-    } else {
+    crate::ui::tui::set_work_caption(&line);
+    if !crate::ui::tui::active() {
         crate::ui::tui::note_line(&line);
     }
 }
@@ -872,46 +940,276 @@ fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
 /// Shape the gateway returns for /v1/* errors: {"error":{"message","type","code","correlation_id"}}.
 /// Prefer its message verbatim (pilot already differentiates expired/revoked/unpinned/malformed)
 /// and surface correlation_id so the operator can grep pilot+nginx logs with one id.
-fn format_gateway_error(status: u16, body: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(err) = v.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim();
-            let code = err
-                .get("code")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim();
-            let cid = err
-                .get("correlation_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim();
-            if !msg.is_empty() {
-                if !cid.is_empty() && !code.is_empty() {
-                    return format!(
-                        "{msg} (code={code} correlation_id={cid} HTTP {status}) — raw: {body}"
-                    );
-                }
-                if !cid.is_empty() {
-                    return format!("{msg} (correlation_id={cid} HTTP {status}) — raw: {body}");
-                }
-                return format!("{msg} (HTTP {status}) — raw: {body}");
-            }
+/// Safe evidence that can cross a child boundary. Provider strings are never printed verbatim:
+/// gateways sometimes echo credentials, image data, prompts, or the whole rejected request.
+#[derive(Debug, Clone)]
+pub struct TransportFailure {
+    pub stage: &'static str,
+    pub http_status: Option<u16>,
+    pub provider_code: Option<String>,
+    pub provider_status: Option<u16>,
+    pub correlation_id: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (stage={}", self.message, self.stage)?;
+        if let Some(status) = self.http_status {
+            write!(f, " HTTP {status}")?;
         }
-    }
-    let t = body.trim();
-    if t.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        format!("HTTP {status}: {t}")
+        if let Some(code) = &self.provider_code {
+            write!(f, " code={code}")?;
+        }
+        if let Some(status) = self.provider_status {
+            write!(f, " provider_status={status}")?;
+        }
+        if let Some(id) = &self.correlation_id {
+            write!(f, " correlation_id={id}")?;
+        }
+        write!(f, ")")
     }
 }
 
+impl std::error::Error for TransportFailure {}
+
+fn safe_identifier(value: &str) -> Option<String> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 96
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+        || lower.contains("sk-")
+        || lower.contains("bearer")
+        || lower.starts_with("eyj")
+        || lower.starts_with("data:")
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+pub(crate) fn response_correlation(resp: &reqwest::Response) -> Option<String> {
+    ["x-request-id", "x-correlation-id"]
+        .into_iter()
+        .find_map(|name| {
+            resp.headers()
+                .get(name)?
+                .to_str()
+                .ok()
+                .and_then(safe_identifier)
+        })
+}
+
+/// Retain only recognized diagnostic semantics, not user/provider-supplied text. In particular
+/// known field-quirk and context-overflow recovery must still work after sanitizing the error.
+fn safe_failure_message(detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    if is_overflow_message(&lower) {
+        return "provider rejected the request: context_length_exceeded".into();
+    }
+    let mut message = "provider rejected the request".to_string();
+    for field in [
+        "reasoning_effort",
+        "max_completion_tokens",
+        "max_tokens",
+        "parallel_tool_calls",
+        "tool_choice",
+        "cache_control",
+    ] {
+        if lower.contains(field) {
+            message.push_str("; unsupported parameter ");
+            message.push_str(field);
+        }
+    }
+    if lower.contains("reasoning effort") && !lower.contains("reasoning_effort") {
+        message.push_str("; unsupported reasoning_effort");
+    }
+    message
+}
+
+pub(crate) fn transport_failure(
+    stage: &'static str,
+    status: Option<u16>,
+    body: &str,
+    correlation: Option<String>,
+) -> TransportFailure {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let error = value
+        .as_ref()
+        .and_then(|v| v.get("error").or_else(|| v.pointer("/response/error")))
+        .filter(|e| !e.is_null());
+    let provider_code = error
+        .and_then(|e| e.get("code").or_else(|| e.get("type")))
+        .and_then(|v| v.as_str())
+        .and_then(safe_identifier);
+    let provider_status = error
+        .and_then(|e| e.get("status").or_else(|| e.get("status_code")))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        .and_then(|n| u16::try_from(n).ok());
+    let correlation_id = error
+        .and_then(|e| e.get("correlation_id").or_else(|| e.get("request_id")))
+        .and_then(|v| v.as_str())
+        .and_then(safe_identifier)
+        .or(correlation);
+    TransportFailure {
+        stage,
+        http_status: status,
+        provider_code,
+        provider_status,
+        correlation_id,
+        message: safe_failure_message(body),
+    }
+}
+
+/// Bound bytes before the SSE parser buffers lines/events (including unfinished data and comments).
+pub(crate) const SSE_RAW_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum BoundedSseError<E> {
+    Read(E),
+    Limit,
+}
+
+/// No payload or reqwest diagnostic is ever formatted by this adapter.
+impl<E> std::fmt::Display for BoundedSseError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Read(_) => "SSE transport read failed",
+            Self::Limit => "SSE response exceeds 16 MiB raw-byte limit",
+        })
+    }
+}
+
+pub(crate) struct BoundedSseStream<S> {
+    source: std::pin::Pin<Box<S>>,
+    remaining: usize,
+    terminated: bool,
+}
+
+impl<S, B, E> futures_util::Stream for BoundedSseStream<S>
+where
+    S: futures_util::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    type Item = std::result::Result<B, BoundedSseError<E>>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.terminated {
+            return Poll::Ready(None);
+        }
+        match this.source.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let bytes = chunk.as_ref().len();
+                if bytes > this.remaining {
+                    // Drop the ENTIRE crossing chunk before eventsource can allocate for it.
+                    this.terminated = true;
+                    Poll::Ready(Some(Err(BoundedSseError::Limit)))
+                } else {
+                    this.remaining -= bytes;
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.terminated = true;
+                Poll::Ready(Some(Err(BoundedSseError::Read(error))))
+            }
+            Poll::Ready(None) => {
+                this.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) fn bounded_sse_bytes<S>(source: S) -> BoundedSseStream<S> {
+    bounded_sse_bytes_with_limit(source, SSE_RAW_BYTES_LIMIT)
+}
+
+fn bounded_sse_bytes_with_limit<S>(source: S, limit: usize) -> BoundedSseStream<S> {
+    BoundedSseStream {
+        source: Box::pin(source),
+        remaining: limit,
+        terminated: false,
+    }
+}
+
+/// Parser/UTF-8/limit failures are terminal, unlike a transport drop eligible for narrow salvage.
+/// Never format the parser error: it may embed the buffered provider data.
+pub(crate) fn sse_read_failure<E>(
+    error: eventsource_stream::EventStreamError<BoundedSseError<E>>,
+    correlation_id: Option<String>,
+) -> (TransportFailure, bool) {
+    use eventsource_stream::EventStreamError;
+    let (code, message, terminal) = match error {
+        EventStreamError::Transport(BoundedSseError::Limit) => (
+            "SSE_RAW_LIMIT",
+            "SSE stream error: response exceeds 16 MiB raw-byte limit",
+            true,
+        ),
+        EventStreamError::Parser(_) | EventStreamError::Utf8(_) => (
+            "SSE_MALFORMED",
+            "SSE stream error: malformed framing or UTF-8",
+            true,
+        ),
+        EventStreamError::Transport(BoundedSseError::Read(_)) => (
+            "SSE_READ_FAILED",
+            "SSE stream error: transport read failed",
+            false,
+        ),
+    };
+    (
+        TransportFailure {
+            stage: "sse",
+            http_status: Some(200),
+            provider_code: Some(code.into()),
+            provider_status: None,
+            correlation_id,
+            message: message.into(),
+        },
+        terminal,
+    )
+}
+
+/// Bound error reads as well as error display. A hostile response must not allocate its entire
+/// body or trickle forever after headers; the logical send's remaining deadline is the ceiling.
+pub(crate) async fn bounded_error_body(
+    resp: reqwest::Response,
+    remaining: std::time::Duration,
+) -> String {
+    let read = async {
+        let mut bytes = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(Ok(chunk)) = stream.next().await {
+            let take = chunk.len().min(16_384usize.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..take]);
+            if bytes.len() == 16_384 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    tokio::time::timeout(remaining.min(std::time::Duration::from_secs(10)), read)
+        .await
+        .unwrap_or_default()
+}
+
 async fn send_with_retry<F>(build: F) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    send_with_retry_render(build, true).await
+}
+
+async fn send_with_retry_render<F>(build: F, render: bool) -> Result<reqwest::Response>
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
@@ -935,6 +1233,8 @@ where
                 budget.as_secs()
             );
         }
+        crate::llm::media::validate_image_request()?;
+        super::delegated::before_send()?;
         match tokio::time::timeout(remaining, build().send()).await {
             Err(_) => bail!(
                 "request exceeded the {}s total send budget (no response headers) — timeout",
@@ -952,8 +1252,10 @@ where
                     // Say so: a sleep on `Retry-After` used to be indistinguishable from a
                     // hang. The caption rides the working line; the note lands once in the
                     // transcript.
-                    send_retry_note(status.as_u16(), attempt, MAX_RETRIES, delay);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    if render {
+                        send_retry_note(status.as_u16(), attempt, MAX_RETRIES, delay);
+                    }
+                    super::delegated::sleep(std::time::Duration::from_millis(delay)).await?;
                     continue;
                 }
                 /* A 401 from the Aizen gateway is not "the key in the config is wrong", it is
@@ -967,8 +1269,10 @@ where
                 let url = resp.url().clone();
                 let verdict = (status.as_u16() == 401)
                     .then(|| crate::llm::gateway::on_unauthorized(url.as_str()));
-                let raw = resp.text().await.unwrap_or_default();
-                let detail = format_gateway_error(status.as_u16(), &raw);
+                let correlation = response_correlation(&resp);
+                let raw = bounded_error_body(resp, budget.saturating_sub(start.elapsed())).await;
+                let failure = transport_failure("http", Some(status.as_u16()), &raw, correlation);
+                let detail = failure.to_string();
                 match verdict {
                     // Ending the session here means the NEXT run stops at `resolve_endpoint` with
                     // the sentence that names the fix, instead of failing at the provider with a
@@ -998,16 +1302,17 @@ where
                     ),
                     _ => {}
                 }
-                bail!("upstream returned HTTP {status}: {detail}");
+                return Err(failure.into());
             }
             Ok(Err(e)) => {
                 if attempt < MAX_RETRIES {
                     let delay = backoff_ms(attempt, BASE_MS, CAP_MS);
                     attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    super::delegated::sleep(std::time::Duration::from_millis(delay)).await?;
                     continue;
                 }
-                return Err(anyhow!(e)).context("request failed after retries");
+                let _ = e; // reqwest errors may include credential-bearing URLs.
+                bail!("request failed after retries (stage=send)");
             }
         }
     }
@@ -1061,11 +1366,18 @@ pub enum ApiErrorKind {
 /// its own recovery. After that the real status number decides; anything without one — transport,
 /// timeout, stream drop — is Transient, because goal mode's whole point is surviving a flaky API.
 pub fn classify_api_error(e: &anyhow::Error) -> ApiErrorKind {
+    if e.downcast_ref::<super::delegated::Failure>().is_some() {
+        return ApiErrorKind::Permanent;
+    }
     let msg = e.to_string();
     if is_overflow_message(&msg) {
         return ApiErrorKind::ContextOverflow;
     }
-    match extract_http_status(&msg) {
+    let structured = e.downcast_ref::<TransportFailure>();
+    let status = structured
+        .and_then(|f| f.http_status.filter(|s| *s >= 400).or(f.provider_status))
+        .or_else(|| extract_http_status(&msg));
+    match status {
         // 413 without an overflow-shaped body is still "the request is too large" for a chat
         // call — same recovery. 402 (billing), 422 (unprocessable), 451 (blocked) used to fall
         // through to Transient and burn every retry the budget had.
@@ -1284,13 +1596,42 @@ fn body_blames_effort(detail: &str) -> bool {
 /// without that field, remember the model for the rest of the session, and retry. A call can learn
 /// up to `MAX_QUIRK_RETRIES` such fields in a row; any other error propagates unchanged. Quirks
 /// already learned are stripped up front, so each costs one failed call per model, once.
+struct PreparedChatRequest {
+    body: ChatRequest,
+    wire: Vec<u8>,
+}
+
+impl PreparedChatRequest {
+    fn new(mut body: ChatRequest) -> Result<Self> {
+        apply_known_quirks(&mut body);
+        let wire = serde_json::to_vec(&body)?;
+        Ok(Self { body, wire })
+    }
+
+    fn apply_quirk(&mut self, quirk: Quirk) -> Result<()> {
+        apply_quirk(&mut self.body, quirk);
+        self.wire = serde_json::to_vec(&self.body)?;
+        Ok(())
+    }
+}
+
 async fn send_chat(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
-    mut body: ChatRequest,
+    body: ChatRequest,
 ) -> Result<reqwest::Response> {
-    apply_known_quirks(&mut body);
+    let mut prepared = PreparedChatRequest::new(body)?;
+    send_prepared_chat(client, url, api_key, &mut prepared, true).await
+}
+
+async fn send_prepared_chat(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    prepared: &mut PreparedChatRequest,
+    render: bool,
+) -> Result<reqwest::Response> {
     let mut learned = 0usize;
     loop {
         // `with_provider_auth`, NOT bare `bearer_auth`: Anthropic's native surface wants
@@ -1298,9 +1639,14 @@ async fn send_chat(
         // `/models` probe already sent them — the actual chat traffic must not be the one path
         // that forgets. The host test parses the host out of the full URL, so passing the chat
         // URL (not the base) is fine.
-        let err = match send_with_retry(|| {
-            with_provider_auth(client.post(url), url, api_key).json(&body)
-        })
+        let err = match send_with_retry_render(
+            || {
+                with_provider_auth(client.post(url), url, api_key)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(prepared.wire.clone())
+            },
+            render,
+        )
         .await
         {
             Ok(r) => return Ok(r),
@@ -1308,7 +1654,7 @@ async fn send_chat(
         };
         let msg = err.to_string();
         let quirk = if msg.contains("HTTP 400") {
-            quirk_blamed(&msg, &body)
+            quirk_blamed(&msg, &prepared.body)
         } else {
             None
         };
@@ -1319,12 +1665,15 @@ async fn send_chat(
             return Err(err);
         }
         learned += 1;
-        mark_quirk(&body.model, q);
-        apply_quirk(&mut body, q);
+        mark_quirk(&prepared.body.model, q);
+        prepared.apply_quirk(q)?;
+        if !render {
+            continue;
+        }
         let note = format!(
             "{} not accepted by {} — retrying {} (won't send it again this session)",
             q.field(),
-            body.model,
+            prepared.body.model,
             q.remedy()
         );
         if crate::ui::tui::active() {
@@ -1364,14 +1713,14 @@ pub struct ChatTurn {
     /// A read-only call whose arguments finished streaming may already be running before the
     /// response ends — the executor ADOPTS these instead of re-spawning. Discarding a `ChatTurn`
     /// (divergence, error) just detaches them; eager calls are read-only, so that is harmless.
-    pub eager: Vec<(usize, tokio::task::JoinHandle<String>)>,
+    pub eager: Vec<(usize, crate::agent::tools::StartedSafeCall)>,
 }
 
 /// Hook offered each tool call the moment its streamed arguments complete: return a running
 /// handle to START it early (read-only + prefix-safe only — the caller owns that policy), or
 /// `None` to let the executor run it normally after the stream ends.
 pub type EagerStartFn<'a> =
-    &'a (dyn Fn(usize, &ToolCall) -> Option<tokio::task::JoinHandle<String>> + Send + Sync);
+    &'a (dyn Fn(usize, &ToolCall) -> Option<crate::agent::tools::StartedSafeCall> + Send + Sync);
 
 /// Stream a chat completion. Prints content deltas to stdout as they arrive and
 /// returns the full concatenated assistant text. Returns a typed error on a non-2xx
@@ -1400,6 +1749,33 @@ pub async fn stream_chat_with_visual_contract(
     messages: Vec<Message>,
     visual_contract: bool,
 ) -> Result<String> {
+    let cfg = crate::core::cli_config::load();
+    let effort = crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone());
+    stream_chat_with_visual_contract_frozen(
+        client,
+        base_url,
+        api_key,
+        model,
+        messages,
+        visual_contract,
+        &cfg,
+        effort,
+    )
+    .await
+}
+
+/// Use the caller's immutable request policy rather than reloading it after delegated work.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_chat_with_visual_contract_frozen(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: Vec<Message>,
+    visual_contract: bool,
+    cfg: &crate::core::cli_config::CliConfig,
+    effort: Option<String>,
+) -> Result<String> {
     // Tape first (plain-text calls share the tape as content-only turns). See `llm::replay`.
     if let Some(text) = crate::llm::replay::replay_text(model, &messages)? {
         return Ok(text);
@@ -1416,6 +1792,8 @@ pub async fn stream_chat_with_visual_contract(
         model,
         messages,
         visual_contract,
+        cfg,
+        effort,
     )
     .await?;
     if let Some(view) = recorded_view {
@@ -1424,6 +1802,7 @@ pub async fn stream_chat_with_visual_contract(
     Ok(text)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_chat_with_visual_contract_live(
     client: &reqwest::Client,
     base_url: &str,
@@ -1431,21 +1810,53 @@ async fn stream_chat_with_visual_contract_live(
     model: &str,
     mut messages: Vec<Message>,
     visual_contract: bool,
+    cfg: &crate::core::cli_config::CliConfig,
+    effort: Option<String>,
 ) -> Result<String> {
     if visual_contract {
-        if let Some(block) = crate::agent::response_visuals_prompt_block(
-            crate::core::cli_config::load().response_visuals(),
-        ) {
+        if let Some(block) = crate::agent::response_visuals_prompt_block(cfg.response_visuals()) {
             messages.insert(0, Message::system(block));
         }
     }
+    if crate::llm::oauth_codex::is_codex_base_url(base_url) {
+        let session = std::env::var("AIZEN_CODEX_SESSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
+        return crate::llm::responses_codex::stream_turn_effort_frozen(
+            client,
+            model,
+            &messages,
+            &[],
+            &session,
+            crate::llm::responses_codex::StreamSink {
+                render: true,
+                eager: None,
+                observed_usage: None,
+            },
+            effort,
+            cfg,
+        )
+        .await
+        .map(|turn| turn.content.unwrap_or_default());
+    }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let _request_memory = crate::llm::media::request_memory_lease(&messages)?;
+    let policy = crate::core::cli_config::vision_support_in(cfg, base_url, model).into();
+    crate::llm::media::validate_reference_vision(policy)?;
     // The ONE body builder, like the tool-calling paths: this surface used to hand-roll its
     // request without `stream_options.include_usage`, then read `chunk.usage` — so `aizen chat`
     // turns never reached `/cost` on providers that only send usage when asked.
-    let cfg = crate::core::cli_config::load();
-    let effort = crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone());
-    let body = build_chat_body(&cfg, model, &messages, &[], true, effort);
+    let body = build_chat_body_for_destination(
+        cfg,
+        model,
+        &messages,
+        &[],
+        true,
+        effort,
+        policy,
+        Some(&crate::llm::media::destination_key(base_url, model)),
+    );
 
     let mut spin = Some(crate::ui::spinner::Spinner::start("thinking"));
 
@@ -1457,10 +1868,22 @@ async fn stream_chat_with_visual_contract_live(
         }
     };
 
-    let mut stream = resp.bytes_stream().eventsource();
+    let correlation = response_correlation(&resp);
+    let mut stream = bounded_sse_bytes(resp.bytes_stream()).eventsource();
     let mut full = String::new();
     let decorate = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let mut md = crate::ui::markdown::MarkdownStream::new(decorate, crate::ui::tui::width());
+    let md = crate::ui::markdown::MarkdownStream::new(decorate, crate::ui::tui::width());
+    let mut tail = StreamTail::new(
+        cost_meter(),
+        md,
+        |text: &str| {
+            print!("{text}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        },
+        true,
+        false,
+        true,
+    );
 
     // Capture a mid-stream transport error and break rather than `?`-ing out, so the closing
     // newline below still runs (a clean line break before the error surfaces) — same invariant
@@ -1470,41 +1893,35 @@ async fn stream_chat_with_visual_contract_live(
     // would otherwise park this loop until reqwest's 300s read timeout — and only if it withholds
     // BYTES, which keepalive frames defeat entirely. No replay here: this one-shot surface has no
     // eager handles to detach and its caller already prints the error.
-    let stall = stream_stall_timeout();
-    let first_cap = stream_first_frame_timeout();
-    let mut seen_frame = false;
-    // The last usage report seen; recorded ONCE after the stream ends (see below).
-    let mut last_usage: Option<Usage> = None;
-    // Re-armed only by frames that PARSE, same as the tool-calling path: a `data: {"type":"ping"}`
-    // keepalive reaches this loop as an event but must not keep a dead turn alive.
-    let mut last_useful = std::time::Instant::now();
-    // Rate-limit counter, same reason as the tool-calling path: a delta shape we mis-model breaks
-    // EVERY frame, and one warn per token buries the reply.
-    let mut bad_frames: usize = 0;
+    let mut watchdog = super::stream_watch::Watchdog::new(
+        stream_first_frame_timeout(),
+        stream_stall_timeout(),
+    );
     loop {
-        let cap = if seen_frame { stall } else { first_cap };
-        let remaining = cap.saturating_sub(last_useful.elapsed());
-        let event = match tokio::time::timeout(remaining, stream.next()).await {
+        let event = match watchdog.wait(stream.next()).await {
             Ok(Some(Ok(e))) => e,
-            Ok(Some(Err(e))) => {
-                stream_err = Some(anyhow!("SSE stream error: {e}"));
+            Ok(Some(Err(error))) => {
+                let (failure, _) = sse_read_failure(error, correlation.clone());
+                stream_err = Some(failure.into());
                 break;
             }
             Ok(None) => break,
+            // A validated finish with the socket still open is a completed answer: wait only the
+            // bounded trailer window (which still surfaces late errors/usage), never a full window.
+            Err(_) if watchdog.finished() => break,
             Err(_) => {
                 stream_err = Some(anyhow!(
-                    "SSE stream error: timeout — no data for {}s{}",
-                    cap.as_secs(),
-                    if seen_frame {
-                        " (stream stalled mid-response)"
-                    } else {
-                        " (stream never started)"
-                    }
+                    "SSE stream timeout waiting for {}",
+                    watchdog.stage()
                 ));
                 break;
             }
         };
 
+        if event.event == "error" {
+            stream_err = Some(transport_failure("sse", Some(200), &event.data, None).into());
+            break;
+        }
         // OpenAI signals end-of-stream with a literal `data: [DONE]`.
         if event.data.trim() == "[DONE]" {
             break;
@@ -1515,57 +1932,30 @@ async fn stream_chat_with_visual_contract_live(
 
         match parse_chunk(&event.data) {
             Ok(chunk) => {
-                last_useful = std::time::Instant::now();
-                seen_frame = true;
+                watchdog.observe(&chunk);
                 // Keep the LAST usage report whatever chunk carries it — the final empty-choices
                 // chunk (OpenAI), the last content chunk (llama.cpp, Ollama shims), or a cumulative
                 // object on every chunk (vLLM/LiteLLM/OpenRouter). Recorded once, after the loop.
                 if let Some(u) = &chunk.usage {
-                    last_usage = Some(u.clone());
+                    tail.observe_usage(u);
                 }
                 if let Some(choice) = chunk.choices.first() {
                     if let Some(content) = &choice.delta.content {
                         spin.take(); // clear before the first token prints
-                        let rendered = md.push(content);
-                        if !rendered.is_empty() {
-                            print!("{rendered}");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                        }
+                        tail.push(content);
                         full.push_str(content);
                     }
                 }
             }
-            // Keepalive / ping / non-completion frames gateways interleave. Dropped SILENTLY: after
-            // `parse_chunk`'s lenient retry, what lands here carries nothing this loop consumes, and a
-            // line per frame is one line per token on a stream we merely fail to recognise.
             Err(e) => {
-                bad_frames += 1;
-                if frame_debug() && bad_frames <= MAX_FRAME_WARNS {
-                    spin.take();
-                    eprintln!(
-                        "\n[warn] unparseable stream frame ({e}): {}",
-                        truncate_frame(&event.data)
-                    );
-                }
+                stream_err = Some(e);
+                break;
             }
         }
     }
 
-    if let Some(u) = &last_usage {
-        cost_meter().record(u);
-    }
     spin.take();
-    if frame_debug() && bad_frames > MAX_FRAME_WARNS {
-        eprintln!(
-            "[warn] {} more unparseable stream frames suppressed ({bad_frames} total this response)",
-            bad_frames - MAX_FRAME_WARNS
-        );
-    }
-    let closing = md.finish();
-    if !closing.is_empty() {
-        print!("{closing}");
-    }
-    println!();
+    tail.finish(stream_err.is_some());
     if let Some(e) = stream_err {
         return Err(e);
     }
@@ -1590,6 +1980,7 @@ async fn stream_chat_with_visual_contract_live(
 ///
 /// `cfg` is passed in rather than re-read: `load()` hits the filesystem, and both call sites already
 /// hold the config they resolved `effort` from.
+#[cfg(test)]
 pub(crate) fn build_chat_body(
     cfg: &crate::core::cli_config::CliConfig,
     model: &str,
@@ -1598,7 +1989,50 @@ pub(crate) fn build_chat_body(
     stream: bool,
     effort: Option<String>,
 ) -> ChatRequest {
-    let mut msgs = messages.to_vec();
+    build_chat_body_with_policy(
+        cfg,
+        model,
+        messages,
+        tools,
+        stream,
+        effort,
+        crate::llm::media::VisionPolicy::Unknown,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chat_body_with_policy(
+    cfg: &crate::core::cli_config::CliConfig,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    stream: bool,
+    effort: Option<String>,
+    policy: crate::llm::media::VisionPolicy,
+) -> ChatRequest {
+    build_chat_body_for_destination(cfg, model, messages, tools, stream, effort, policy, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chat_body_for_destination(
+    cfg: &crate::core::cli_config::CliConfig,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    stream: bool,
+    effort: Option<String>,
+    policy: crate::llm::media::VisionPolicy,
+    destination: Option<&str>,
+) -> ChatRequest {
+    let (projected, receipt) = crate::llm::media::project_messages_for_send(
+        messages,
+        policy,
+        destination,
+        crate::llm::media::request_send_policy(),
+    );
+    crate::llm::media::stage_image_delivery(receipt);
+    let mut msgs = projected.messages;
     let mut tool_defs = tools.to_vec();
     // Stamp on cache_enabled alone — the system/history breakpoints pay off even with no tools
     // (summaries, persona/skill learning, sub-tasks); the last-tool-def breakpoint inside is a
@@ -1664,13 +2098,32 @@ pub async fn chat_with_tools_effort(
     tools: &[ToolDef],
     effort: Option<String>,
 ) -> Result<ChatTurn> {
+    let cfg = crate::core::cli_config::load();
+    chat_with_tools_frozen(
+        client, base_url, api_key, model, messages, tools, effort, &cfg,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn chat_with_tools_frozen(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
+) -> Result<ChatTurn> {
     // Tape first: a replayed run never builds a request. See `llm::replay`.
     if let Some(turn) = crate::llm::replay::replay_turn(model, messages, tools)? {
         return Ok(turn);
     }
-    let turn =
-        chat_with_tools_effort_live(client, base_url, api_key, model, messages, tools, effort)
-            .await?;
+    let turn = chat_with_tools_effort_live(
+        client, base_url, api_key, model, messages, tools, effort, cfg,
+    )
+    .await?;
     crate::llm::replay::record_turn(model, messages, tools, &turn)?;
     Ok(turn)
 }
@@ -1684,6 +2137,7 @@ async fn chat_with_tools_effort_live(
     messages: &[Message],
     tools: &[ToolDef],
     effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
 ) -> Result<ChatTurn> {
     if crate::llm::oauth_codex::is_codex_base_url(base_url) {
         let _ = api_key;
@@ -1692,24 +2146,31 @@ async fn chat_with_tools_effort_live(
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
         // The finished turn only: this path's callers print the answer themselves.
-        return crate::llm::responses_codex::stream_turn(
+        return crate::llm::responses_codex::stream_turn_effort_frozen(
             client,
             model,
             messages,
             tools,
             &session,
             crate::llm::responses_codex::StreamSink::default(),
+            effort,
+            cfg,
         )
         .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let body = build_chat_body(
-        &crate::core::cli_config::load(),
+    let _request_memory = crate::llm::media::request_memory_lease(messages)?;
+    let policy = crate::core::cli_config::vision_support_in(cfg, base_url, model).into();
+    crate::llm::media::validate_reference_vision(policy)?;
+    let body = build_chat_body_for_destination(
+        cfg,
         model,
         messages,
         tools,
         false,
         effort,
+        policy,
+        Some(&crate::llm::media::destination_key(base_url, model)),
     );
 
     let resp = send_chat(client, &url, api_key, body).await?;
@@ -1893,7 +2354,7 @@ struct AccCall {
 /// The empty string is deliberately NOT complete. A genuinely argument-less call still streams
 /// `"{}"`; `""` only ever means "the arguments haven't arrived yet". Treating it as complete is what
 /// let a truncated fragment reach a tool as `{}` (see [`ToolCallAccumulator::snapshot`]).
-fn args_complete(raw: &str) -> bool {
+pub(crate) fn args_complete(raw: &str) -> bool {
     let t = raw.trim();
     !t.is_empty()
         && serde_json::from_str::<serde_json::Value>(t)
@@ -1902,6 +2363,12 @@ fn args_complete(raw: &str) -> bool {
 }
 
 impl ToolCallAccumulator {
+    fn has_incomplete(&self) -> bool {
+        self.calls
+            .values()
+            .any(|c| c.name.is_empty() || !args_complete(&c.args))
+    }
+
     /// Merge a batch of fragments. Returns the calls whose arguments COMPLETED because a later
     /// slot started (the eager-execution trigger). The FINAL call only completes at stream end —
     /// `finish`/`finish_indexed` covers it.
@@ -2047,6 +2514,10 @@ impl ToolCallAccumulator {
 /// Streaming variant of `chat_with_tools`: prints assistant content deltas live as they
 /// arrive AND reassembles any tool-call fragments, returning the same `ChatTurn` the loop
 /// consumes. (The loop is unchanged — only the live UX differs.)
+#[expect(
+    dead_code,
+    reason = "compatibility streaming entry point; production dispatch passes explicit per-call effort"
+)]
 pub async fn stream_chat_with_tools(
     client: &reqwest::Client,
     base_url: &str,
@@ -2072,20 +2543,122 @@ pub async fn stream_chat_with_tools_eager(
     tools: &[ToolDef],
     eager_hook: Option<EagerStartFn<'_>>,
 ) -> Result<ChatTurn> {
-    // Tape first: a replayed turn is returned whole (nothing streams, nothing starts eagerly — the
-    // executor runs every replayed call normally). See `llm::replay`.
-    if let Some(turn) = crate::llm::replay::replay_turn(model, messages, tools)? {
-        return Ok(turn);
-    }
-    let turn = stream_chat_with_tools_eager_live(
-        client, base_url, api_key, model, messages, tools, eager_hook,
+    let effort = crate::core::cli_config::resolved_reasoning_effort(
+        crate::core::cli_config::load().reasoning_effort,
+    );
+    stream_chat_with_tools_eager_effort(
+        client, base_url, api_key, model, messages, tools, eager_hook, effort,
     )
-    .await?;
-    crate::llm::replay::record_turn(model, messages, tools, &turn)?;
-    Ok(turn)
+    .await
 }
 
-async fn stream_chat_with_tools_eager_live(
+/// Streaming without consulting process-global effort overrides. `None` explicitly omits effort.
+#[expect(
+    dead_code,
+    reason = "compatibility streaming API; dispatch uses explicit frozen sinks"
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chat_with_tools_effort(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    effort: Option<String>,
+) -> Result<ChatTurn> {
+    stream_chat_with_tools_eager_effort(
+        client, base_url, api_key, model, messages, tools, None, effort,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantTextSink {
+    Events,
+    Retained,
+    Markdown,
+}
+
+fn assistant_text_sink(events: bool, retained: bool) -> AssistantTextSink {
+    if events {
+        AssistantTextSink::Events
+    } else if retained {
+        AssistantTextSink::Retained
+    } else {
+        AssistantTextSink::Markdown
+    }
+}
+
+fn emit_assistant_delta(
+    text: &str,
+    sink: AssistantTextSink,
+    md: &mut crate::ui::markdown::MarkdownStream,
+) {
+    match sink {
+        AssistantTextSink::Events => crate::ui::events::text(text),
+        AssistantTextSink::Retained => crate::ui::tui::assistant_stream_delta(text),
+        AssistantTextSink::Markdown => {
+            let rendered = md.push(text);
+            if !rendered.is_empty() {
+                crate::ui::tui::emit(&rendered);
+            }
+        }
+    }
+}
+
+fn finish_assistant_text(
+    sink: AssistantTextSink,
+    md: &mut crate::ui::markdown::MarkdownStream,
+    interrupted: bool,
+    had_text: bool,
+) {
+    match sink {
+        AssistantTextSink::Events => {}
+        AssistantTextSink::Retained => crate::ui::tui::assistant_stream_finish(interrupted),
+        AssistantTextSink::Markdown => {
+            let closing = md.finish();
+            if !closing.is_empty() {
+                crate::ui::tui::emit(&closing);
+            }
+            if had_text {
+                crate::ui::tui::emit("\n");
+            }
+        }
+    }
+}
+
+/// Only selected answer text enters this funnel, not suppressed reasoning or tool arguments.
+/// A taped answer is already selected/filtered content, and never starts an eager tool here.
+fn emit_completed_assistant_text_with(
+    text: Option<&str>,
+    sink: AssistantTextSink,
+    mut emit: impl FnMut(AssistantTextSink, &str),
+) {
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        emit(sink, text);
+    }
+}
+
+fn emit_completed_assistant_text(text: Option<&str>) {
+    let sink = assistant_text_sink(crate::ui::events::on(), crate::ui::tui::retained_active());
+    emit_completed_assistant_text_with(text, sink, |sink, text| {
+        let decorate = sink == AssistantTextSink::Markdown
+            && (crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout()));
+        let mut md = crate::ui::markdown::MarkdownStream::new(decorate, crate::ui::tui::width());
+        crate::ui::tui::add_stream_chars(text.chars().count() as u64);
+        emit_assistant_delta(text, sink, &mut md);
+        finish_assistant_text(sink, &mut md, false, true);
+    });
+}
+
+fn reasoning_only_answer<'a>(full: &str, has_tools: bool, reasoning: &'a str) -> Option<&'a str> {
+    let text = reasoning.trim();
+    (full.is_empty() && !has_tools && !text.is_empty()).then_some(text)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chat_with_tools_eager_effort(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
@@ -2093,6 +2666,97 @@ async fn stream_chat_with_tools_eager_live(
     messages: &[Message],
     tools: &[ToolDef],
     eager_hook: Option<EagerStartFn<'_>>,
+    effort: Option<String>,
+) -> Result<ChatTurn> {
+    stream_chat_with_tools_sink_effort(
+        client,
+        base_url,
+        api_key,
+        model,
+        messages,
+        tools,
+        StreamSink {
+            render: true,
+            eager: eager_hook,
+            observed_usage: None,
+        },
+        effort,
+    )
+    .await
+}
+
+/// One immutable, per-call display/eager policy. Quiet children use `StreamSink::default()`.
+/// Rendering is never controlled through process-global switches.
+pub use crate::llm::responses_codex::StreamSink;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chat_with_tools_sink_effort(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    sink: StreamSink<'_>,
+    effort: Option<String>,
+) -> Result<ChatTurn> {
+    let cfg = crate::core::cli_config::load();
+    stream_chat_with_tools_sink_frozen(
+        client, base_url, api_key, model, messages, tools, sink, effort, &cfg,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_chat_with_tools_sink_frozen(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    sink: StreamSink<'_>,
+    effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
+) -> Result<ChatTurn> {
+    if let Some(turn) =
+        crate::llm::replay::replay_turn_with_quiet(model, messages, tools, !sink.render)?
+    {
+        return Ok(complete_replayed_turn(turn, sink));
+    }
+    let turn = stream_chat_with_tools_eager_live(
+        client, base_url, api_key, model, messages, tools, sink, effort, cfg,
+    )
+    .await?;
+    crate::llm::replay::record_turn_with_quiet(model, messages, tools, &turn, !sink.render)?;
+    Ok(turn)
+}
+
+/// Replay already records its own usage. Only forward the observation, never re-bill the meter.
+fn complete_replayed_turn(turn: ChatTurn, sink: StreamSink<'_>) -> ChatTurn {
+    if let (Some(observer), Some(usage)) = (sink.observed_usage, turn.usage.as_ref()) {
+        observer(usage);
+    }
+    if sink.render {
+        emit_completed_assistant_text(turn.content.as_deref());
+    }
+    turn
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "live transport mirrors the explicit-effort streaming entry point without interface refactoring"
+)]
+async fn stream_chat_with_tools_eager_live(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    sink: StreamSink<'_>,
+    effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
 ) -> Result<ChatTurn> {
     // Experimental ChatGPT Codex path — full Responses dialect (not /chat/completions).
     if crate::llm::oauth_codex::is_codex_base_url(base_url) {
@@ -2103,24 +2767,27 @@ async fn stream_chat_with_tools_eager_live(
             .unwrap_or_else(|| format!("aizen-{}-{model}", std::process::id()));
         // Same contract as the chat-completions stream below: text paints as it arrives,
         // completed calls go to the eager starter, the shared watchdog bounds a stall.
-        return crate::llm::responses_codex::stream_turn(
-            client,
-            model,
-            messages,
-            tools,
-            &session,
-            crate::llm::responses_codex::StreamSink {
-                render: true,
-                eager: eager_hook,
-            },
+        return crate::llm::responses_codex::stream_turn_effort_frozen(
+            client, model, messages, tools, &session, sink, effort, cfg,
         )
         .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    // ONE config read for the whole request: the effort tier and the body are resolved from it.
-    let cfg = crate::core::cli_config::load();
-    let effort = crate::core::cli_config::resolved_reasoning_effort(cfg.reasoning_effort.clone());
-    let body = build_chat_body(&cfg, model, messages, tools, true, effort);
+    let _request_memory = crate::llm::media::request_memory_lease(messages)?;
+    let policy = crate::core::cli_config::vision_support_in(cfg, base_url, model).into();
+    crate::llm::media::validate_reference_vision(policy)?;
+    // The caller freezes config for the entire dispatch, including Codex/media routing.
+    let body = build_chat_body_for_destination(
+        cfg,
+        model,
+        messages,
+        tools,
+        true,
+        effort,
+        policy,
+        Some(&crate::llm::media::destination_key(base_url, model)),
+    );
+    let mut prepared = PreparedChatRequest::new(body)?;
 
     // BLANK-STREAM REPLAY. The request layer (`send_with_retry`) only covers failures that happen
     // before the 200; a stream that is accepted and then dies or goes silent used to leave the turn
@@ -2134,13 +2801,14 @@ async fn stream_chat_with_tools_eager_live(
         // streams back. TTY-only (silent no-op on pipes/CI). Cleared before any output is printed.
         // Suppressed under the sticky TUI — its box shows the "⚡ working…" indicator instead, and a
         // carriage-return spinner would fight the pinned footer.
-        let mut spin = if crate::ui::tui::active() {
+        let mut spin = if !sink.render || crate::ui::tui::active() {
             None
         } else {
             Some(crate::ui::spinner::Spinner::start("thinking"))
         };
 
-        let resp = match send_chat(client, &url, api_key, body.clone()).await {
+        let resp = match send_prepared_chat(client, &url, api_key, &mut prepared, sink.render).await
+        {
             Ok(r) => r,
             Err(e) => {
                 spin.take(); // clear the spinner before surfacing the error
@@ -2148,42 +2816,55 @@ async fn stream_chat_with_tools_eager_live(
             }
         };
 
-        let mut stream = resp.bytes_stream().eventsource();
+        let correlation = response_correlation(&resp);
+        let mut stream = bounded_sse_bytes(resp.bytes_stream()).eventsource();
         let mut full = String::new();
+        let mut done = false;
+        let mut provider_failed = false;
+        let mut payload_bytes = 0usize;
         let mut acc = ToolCallAccumulator::default();
         let mut finish_reason: Option<String> = None;
         let mut final_usage: Option<Usage> = None; // the final-chunk usage report, threaded to the loop
                                                    // Eager starts, keyed by accumulator SLOT until the final position mapping exists.
-        let mut eager_by_slot: std::collections::HashMap<usize, tokio::task::JoinHandle<String>> =
-            std::collections::HashMap::new();
+        let mut eager_by_slot: std::collections::HashMap<
+            usize,
+            crate::agent::tools::StartedSafeCall,
+        > = std::collections::HashMap::new();
         let mut think = ThinkFilter::default(); // suppress `<think>…</think>` reasoning from the display
                                                 // Retained mode owns raw assistant blocks and reparses the whole active message; classic/one-shot
                                                 // paths keep the line-buffered display renderer. History always keeps the same raw Markdown.
-        let retained_display = crate::ui::tui::retained_active();
-        let decorate = !retained_display
+        let retained_display = sink.render && crate::ui::tui::retained_active();
+        let decorate = sink.render
+            && !retained_display
             && (crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout()));
-        let cols = crate::ui::tui::width(); // wrap to the box width (not a separately-probed window edge)
-        let mut md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
+        let cols = if sink.render {
+            crate::ui::tui::width()
+        } else {
+            80
+        };
+        let md = crate::ui::markdown::MarkdownStream::new(decorate, cols);
+        let mut tail_guard = StreamTail::new(
+            cost_meter(),
+            md,
+            crate::ui::tui::emit,
+            sink.render,
+            retained_display,
+            false,
+        )
+        .with_usage_observer(sink.observed_usage);
+        tail_guard.events = sink.render && crate::ui::events::on();
 
         // A mid-stream transport error (timeout, gateway drop, truncated body) must NOT short-circuit
         // with `?` here: that would skip the `think.finish()` / `md.finish()` cleanup below, stranding
         // the terminal with a half-rendered line or an UNCLOSED code-fence box that corrupts every
         // subsequent turn. Capture the error, break, flush the display to a clean state, THEN propagate.
         let mut stream_err: Option<anyhow::Error> = None;
-        // IDLE WATCHDOG. `reqwest`'s `read_timeout` fires only on a socket that delivers no BYTES; a
-        // gateway that keeps the connection warm with comment/keepalive frames, or an upstream that
-        // stalls after `role`, satisfies it forever — so the turn hung with no cap at all. Bound the
-        // gap between USEFUL events instead: the clock re-arms only when a frame PARSES into a chunk
-        // (`last_useful` below), so a gateway that pings with `data: {"type":"ping"}` frames — which
-        // reach this loop as events but carry nothing — cannot keep a dead turn alive. (Comment-style
-        // `: ping` keepalives never surface as events at all; this closes the data-frame variant.)
-        let idle_cap = stream_stall_timeout();
-        // Two phases: until the first frame PARSES the generous first-frame deadline applies (a
-        // reasoning model can be silent for minutes before its answer starts); after that, the
-        // inter-frame cap.
-        let first_cap = stream_first_frame_timeout();
-        let mut seen_frame = false;
-        let mut last_useful = std::time::Instant::now();
+        // Bytes and parseable metadata are not model progress. Keep the generous first-output
+        // allowance until content/reasoning/tool fragments arrive, then enforce an idle deadline.
+        let mut watchdog = super::stream_watch::Watchdog::new(
+            stream_first_frame_timeout(),
+            stream_stall_timeout(),
+        );
         // Has this stream produced anything a retry would duplicate? Text, a tool-call fragment, or a
         // usage report all count. Governs both the watchdog's error wording and blank-stream replay.
         let mut produced = false;
@@ -2193,44 +2874,62 @@ async fn stream_chat_with_tools_eager_live(
         // re-introduce it. Deliberately NOT counted as `produced`: nothing from this buffer reaches
         // the display or history mid-stream, so a replay after a mid-reasoning stall duplicates nothing.
         let mut reasoning = String::new();
-        // Unparseable frames seen this stream. Counted so the warn can be rate-limited: the shape that
-        // breaks parsing usually breaks EVERY frame, which is one line per token over the live UI.
-        let mut bad_frames: usize = 0;
         loop {
-            let cap = if seen_frame { idle_cap } else { first_cap };
-            let remaining = cap.saturating_sub(last_useful.elapsed());
-            let event = match tokio::time::timeout(remaining, stream.next()).await {
+            let event = match watchdog.wait(stream.next()).await {
                 Ok(Some(Ok(e))) => e,
-                Ok(Some(Err(e))) => {
-                    stream_err = Some(anyhow!("SSE stream error: {e}"));
+                Ok(Some(Err(error))) => {
+                    let (failure, terminal) = sse_read_failure(error, correlation.clone());
+                    provider_failed |= terminal; // no blank retry or tool salvage on parser/limit.
+                    stream_err = Some(failure.into());
                     break;
                 }
                 Ok(None) => break, // stream ended without [DONE]
+                Err(_) if watchdog.finished() => break,
                 Err(_) => {
-                    // No useful frame for `cap`. Name it as a stall so the transcript says why the
-                    // turn ended, and mark it Transient-shaped ("timeout") for goal-mode classification.
                     stream_err = Some(anyhow!(
-                        "SSE stream error: timeout — no data for {}s{}",
-                        cap.as_secs(),
-                        if produced {
-                            " (stream stalled mid-response)"
-                        } else {
-                            " (stream never started)"
-                        }
+                        "SSE stream timeout waiting for {}",
+                        watchdog.stage()
                     ));
                     break;
                 }
             };
+            payload_bytes = payload_bytes.saturating_add(event.data.len());
+            if payload_bytes > 16 * 1024 * 1024 {
+                provider_failed = true;
+                stream_err = Some(anyhow!("SSE stream error: response exceeds 16 MiB limit"));
+                break;
+            }
+            if event.event == "error" {
+                provider_failed = true;
+                stream_err = Some(
+                    transport_failure("sse", Some(200), &event.data, correlation.clone()).into(),
+                );
+                break;
+            }
             if event.data.trim() == "[DONE]" {
+                done = true;
                 break;
             }
             if event.data.trim().is_empty() {
                 continue;
             }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                if value.get("error").is_some_and(|e| !e.is_null())
+                    || value.get("type").and_then(|v| v.as_str()) == Some("error")
+                {
+                    provider_failed = true;
+                    stream_err = Some(
+                        transport_failure("sse", Some(200), &event.data, correlation.clone())
+                            .into(),
+                    );
+                    break;
+                }
+            }
             match parse_chunk(&event.data) {
                 Ok(chunk) => {
-                    last_useful = std::time::Instant::now(); // a real chunk re-arms the watchdog
-                    seen_frame = true;
+                    if watchdog.observe(&chunk) {
+                        super::delegated::progress();
+                    }
                     // Keep the LAST usage report whatever chunk carries it: the final empty-choices
                     // chunk (spec OpenAI), the last content chunk (llama.cpp, Ollama shims, LiteLLM
                     // in some modes — these never registered before, so `/cost` stayed blank and
@@ -2241,6 +2940,7 @@ async fn stream_chat_with_tools_eager_live(
                     // chunk does not, and must not disarm the blank-stream replay.
                     if let Some(u) = &chunk.usage {
                         final_usage = Some(u.clone());
+                        tail_guard.observe_usage(u);
                         if chunk.choices.is_empty() || u.completion_tokens.unwrap_or(0) > 0 {
                             produced = true;
                         }
@@ -2263,32 +2963,31 @@ async fn stream_chat_with_tools_eager_live(
                                 spin.take();
                             }
                             reasoning.push_str(raw);
-                            crate::ui::events::reasoning(raw); // a no-op off the JSON stream
+                            if sink.render {
+                                crate::ui::events::reasoning(raw);
+                            }
                         }
                         if let Some(content) = &choice.delta.content {
                             spin.take(); // stop+clear the spinner before the first token prints
-                            produced = true; // even a content delta filtered to nothing was real output
+                            // Nonempty text is real output even when the display filter drops it
+                            // (`<think>` spans). An EMPTY delta is metadata: it must not disarm the
+                            // blank-stream replay, or a provider that only ever emits empty deltas
+                            // would be reported as a finished answer instead of being retried.
+                            produced |= !content.is_empty();
                             let shown = think.push(content);
                             if !shown.is_empty() {
                                 full.push_str(&shown); // history keeps the RAW markdown
-                                crate::ui::tui::add_stream_chars(shown.chars().count() as u64); // live ↑tok pill
-                                if crate::ui::events::on() {
-                                    crate::ui::events::text(&shown); // one `text` event per delta
-                                } else if retained_display {
-                                    crate::ui::tui::assistant_stream_delta(&shown);
-                                } else {
-                                    let rendered = md.push(&shown); // styled, complete lines (gutter, md, code)
-                                    if !rendered.is_empty() {
-                                        crate::ui::tui::emit(&rendered); // classic TUI funnel / plain print
-                                    }
+                                if sink.render {
+                                    crate::ui::tui::add_stream_chars(shown.chars().count() as u64);
                                 }
+                                tail_guard.push(&shown);
                             }
                         }
                         if !choice.delta.tool_calls.is_empty() {
                             spin.take(); // a tool-only turn: clear before the loop prints tool traces
                             produced = true; // a tool-call fragment must never be re-requested
                             let completed = acc.ingest(&choice.delta.tool_calls);
-                            if let Some(hook) = eager_hook {
+                            if let Some(hook) = sink.eager {
                                 for (slot, tc) in completed {
                                     if let Some(h) = hook(slot, &tc) {
                                         eager_by_slot.insert(slot, h);
@@ -2301,79 +3000,35 @@ async fn stream_chat_with_tools_eager_live(
                         }
                     }
                 }
-                // SILENT BY DEFAULT. What reaches here survived neither parse attempt, so it is not a
-                // completion chunk at all — it is the keepalive / comment / `{"type":"ping"}` noise
-                // gateways interleave, which this loop has nothing to do with. Narrating it taught the
-                // user nothing and, because the shape repeats per frame, printed one line per token
-                // over the live UI. The chunk-shaped failures that WERE worth knowing about (a
-                // duplicate key dropping a `content` or `tool_calls` delta) no longer land here at all:
-                // `parse_chunk` recovers them. Keep the diagnostic behind an env switch for the next
-                // time a gateway invents a shape.
                 Err(e) => {
-                    bad_frames += 1;
-                    if frame_debug() && bad_frames <= MAX_FRAME_WARNS {
-                        // A raw `eprintln!` would bypass the retained render thread and corrupt the
-                        // pinned frame, so route through the TUI funnel when it owns the screen.
-                        let warn = format!(
-                            "[warn] unparseable stream frame ({e}): {}",
-                            truncate_frame(&event.data)
-                        );
-                        if crate::ui::tui::active() {
-                            crate::ui::tui::emit_line(&crate::ui::theme::faint(warn).to_string());
-                        } else {
-                            crate::ui::tui::note_line(&format!("\n{warn}"));
-                        }
-                    }
+                    provider_failed = true;
+                    stream_err = Some(e);
+                    break;
                 }
             }
         }
-        // Usage is recorded here, once, from the last report the stream carried (see above).
-        if let Some(u) = &final_usage {
-            cost_meter().record(u);
-        }
-        spin.take(); // stream ended (e.g. empty turn) — ensure the spinner is gone
-                     // Debug-only tally, for the same reason the per-frame lines are: these frames are
-                     // gateway noise, so a count of them on a healthy turn is a number the user cannot act
-                     // on. Under the env switch it tells whoever is diagnosing a new gateway how wide the
-                     // mismatch is.
-        if frame_debug() && bad_frames > MAX_FRAME_WARNS {
-            let line = format!(
-                "[warn] {} more unparseable stream frames suppressed ({bad_frames} total this response)",
-                bad_frames - MAX_FRAME_WARNS
-            );
-            if crate::ui::tui::active() {
-                crate::ui::tui::emit_line(&crate::ui::theme::faint(line).to_string());
-            } else {
-                crate::ui::tui::note_line(&format!("\n{line}"));
+        if !provider_failed && stream_err.is_none() {
+            if acc.has_incomplete() {
+                provider_failed = true; // invalid tool structures cannot be salvaged as Done.
+                stream_err = Some(anyhow!("SSE stream error: incomplete tool arguments"));
+            } else if !matches!(
+                finish_reason.as_deref(),
+                Some("stop" | "tool_calls" | "function_call")
+            ) {
+                stream_err = Some(anyhow!(if done {
+                    "SSE stream error: [DONE] without a validated finish reason"
+                } else {
+                    "SSE stream error: partial EOF without a validated finish reason"
+                }));
             }
         }
+        spin.take();
         let tail = think.finish();
         if !tail.is_empty() {
             full.push_str(&tail);
-            if crate::ui::events::on() {
-                crate::ui::events::text(&tail);
-            } else if retained_display {
-                crate::ui::tui::assistant_stream_delta(&tail);
-            } else {
-                let rendered = md.push(&tail);
-                if !rendered.is_empty() {
-                    crate::ui::tui::emit(&rendered);
-                }
-            }
+            tail_guard.push(&tail);
         }
-        if crate::ui::events::on() {
-            // Every delta already went out as an event; there is no display line to close.
-        } else if retained_display {
-            crate::ui::tui::assistant_stream_finish(stream_err.is_some());
-        } else {
-            let closing = md.finish(); // flush the final partial line + close any dangling code fence
-            if !closing.is_empty() {
-                crate::ui::tui::emit(&closing);
-            }
-            if !full.is_empty() {
-                crate::ui::tui::emit("\n"); // one blank line of breathing room before the next turn
-            }
-        }
+        tail_guard.finish(stream_err.is_some());
 
         // BLANK STREAM ⇒ REPLAY, not a dead turn. A stall or drop that produced NOTHING is exactly the
         // case the user hits as "it froze; I killed the turn and told it to continue, then it was fine" —
@@ -2381,7 +3036,7 @@ async fn stream_chat_with_tools_eager_live(
         // Guarded on `!produced`, so a stream that emitted any text/tool-fragment/usage never replays
         // (that would duplicate output). Also skipped once the model claimed `finish_reason`: an
         // intentionally empty completion is a real answer, not a failure.
-        let blank_failure = !produced && finish_reason.is_none();
+        let blank_failure = !provider_failed && !produced && finish_reason.is_none();
         if blank_failure && blank_attempt < STREAM_BLANK_RETRIES {
             blank_attempt += 1;
             let delay = backoff_ms(blank_attempt - 1, 400, 4_000);
@@ -2389,7 +3044,9 @@ async fn stream_chat_with_tools_eager_live(
                 .as_ref()
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "stream closed with no output".to_string());
-            stream_retry_note(&why, blank_attempt, STREAM_BLANK_RETRIES, delay);
+            if sink.render {
+                stream_retry_note(&why, blank_attempt, STREAM_BLANK_RETRIES, delay);
+            }
             // Abort any eager handles from the abandoned attempt. They are read-only by policy (the
             // eager starter refuses destructive/unsafe calls), so cutting them short is safe — and
             // aborting rather than detaching means they stop billing/working for a turn that no
@@ -2398,13 +3055,14 @@ async fn stream_chat_with_tools_eager_live(
             for h in eager_by_slot.into_values() {
                 h.abort();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            super::delegated::sleep(std::time::Duration::from_millis(delay)).await?;
             continue;
         }
 
         // Map eager handles from accumulator SLOT to final POSITION (what the executor stitches by).
         // COMPLETE calls only: `finish_indexed` drops any call whose streamed arguments never closed,
         // so everything here is executable regardless of how the stream ended.
+        let has_incomplete = acc.has_incomplete();
         let indexed = acc.finish_indexed();
 
         // The display is now clean (fence closed, partial line flushed) — deal with a transport error
@@ -2417,8 +3075,14 @@ async fn stream_chat_with_tools_eager_live(
         //  * No complete call → fail the turn. Partial TEXT alone is not returned as success: that
         //    would present a cut-off answer as a finished one.
         if let Some(e) = stream_err {
-            if indexed.is_empty() {
-                if produced {
+            if !provider_failed && has_incomplete {
+                provider_failed = true;
+                for handle in eager_by_slot.values() {
+                    handle.abort();
+                }
+            }
+            if indexed.is_empty() || provider_failed {
+                if produced && sink.render {
                     // The loop above will likely retry this turn; the partial text stays on screen
                     // (retained blocks are append-only), so say why the answer may appear twice.
                     let note = "⚠ stream dropped mid-answer — on retry the text above may repeat \
@@ -2434,21 +3098,26 @@ async fn stream_chat_with_tools_eager_live(
                 }
                 return Err(e);
             }
+            // Completed tools can survive a transport drop, but this was not a validated live
+            // completion and cannot attest that any uploaded images were delivered.
+            crate::llm::media::stage_image_delivery(Default::default());
             let note = format!(
                 "⟳ stream dropped mid-turn — continuing with {} completed tool call(s)",
                 indexed.len()
             );
-            if crate::ui::tui::active() {
-                crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
-            } else {
-                crate::ui::tui::note_line(&note);
+            if sink.render {
+                if crate::ui::tui::active() {
+                    crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+                } else {
+                    crate::ui::tui::note_line(&note);
+                }
             }
             if finish_reason.is_none() {
                 finish_reason = Some("tool_calls".to_string());
             }
         }
 
-        let eager: Vec<(usize, tokio::task::JoinHandle<String>)> = indexed
+        let eager: Vec<(usize, crate::agent::tools::StartedSafeCall)> = indexed
             .iter()
             .enumerate()
             .filter_map(|(pos, (slot, _))| eager_by_slot.remove(slot).map(|h| (pos, h)))
@@ -2456,10 +3125,16 @@ async fn stream_chat_with_tools_eager_live(
         // Streaming twin of `resolve_content` (non-streaming): a model that answered ONLY in the
         // reasoning channel produced an answer, not an empty turn. Same narrow gate — no real
         // content, no tool calls — so chain-of-thought is never APPENDED to a real answer.
+        let fallback = reasoning_only_answer(&full, !indexed.is_empty(), &reasoning);
         let content = if !full.is_empty() {
             Some(full)
-        } else if indexed.is_empty() && !reasoning.trim().is_empty() {
-            Some(reasoning.trim().to_string())
+        } else if let Some(answer) = fallback {
+            // Transport errors without complete tools returned above. Only the already-selected
+            // successful fallback becomes answer text; reasoning never supplements a real answer.
+            if sink.render {
+                emit_completed_assistant_text(Some(answer));
+            }
+            Some(answer.to_string())
         } else {
             None
         };
@@ -2534,7 +3209,7 @@ impl ThinkFilter {
 fn partial_suffix(s: &str, tag: &str) -> usize {
     let max = tag.len().min(s.len());
     for k in (1..=max).rev() {
-        if &s.as_bytes()[s.len() - k..] == &tag.as_bytes()[..k] {
+        if s.as_bytes()[s.len() - k..] == tag.as_bytes()[..k] {
             return k;
         }
     }
@@ -2563,7 +3238,7 @@ fn key_probe_prefers_free_pricing_over_paid() {
     // Simulate an OpenRouter list where a paid id appears before the free counterpart; the
     // probe must still choose the free one so a real free-tier credential doesn't fail as
     // "bad key".
-    let infos = vec![
+    let infos = [
         ModelInfo {
             id: "qwen/qwen3-8b".into(),
             context_length: Some(8000),
@@ -2584,9 +3259,561 @@ fn key_probe_prefers_free_pricing_over_paid() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::types::FunctionDelta;
+
+    #[tokio::test]
+    async fn raw_sse_bound_rejects_unterminated_event_before_assembly_and_fuses() {
+        use futures_util::stream;
+        let source = stream::iter([
+            Ok::<_, ()>(b"data: ".to_vec()),
+            Ok(vec![b'x'; SSE_RAW_BYTES_LIMIT]),
+            Ok(b"\n\ndata: [DONE]\n\n".to_vec()),
+        ]);
+        let mut events = bounded_sse_bytes(source).eventsource();
+        let error = events.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            eventsource_stream::EventStreamError::Transport(BoundedSseError::Limit)
+        ));
+        assert!(
+            events.next().await.is_none(),
+            "crossing chunk/later finish must not reach parser"
+        );
+
+        // Exact boundary is allowed; comments/framing consume the same byte budget as data.
+        let mut raw = bounded_sse_bytes_with_limit(
+            stream::iter([
+                Ok::<_, ()>(b":ping\r\n".to_vec()),
+                Ok(b"x".to_vec()),
+                Ok(b"later".to_vec()),
+            ]),
+            7,
+        );
+        assert_eq!(raw.next().await.unwrap().unwrap(), b":ping\r\n");
+        assert!(matches!(
+            raw.next().await,
+            Some(Err(BoundedSseError::Limit))
+        ));
+        assert!(raw.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_sse_bound_preserves_split_crlf_and_multibyte_utf8() {
+        use futures_util::stream;
+        let wire = ": comment\r\nevent: message\r\ndata: Xin chào 世界\r\n\r\n";
+        // Every UTF-8 codepoint and CRLF pair crosses transport chunk boundaries.
+        let chunks = wire.as_bytes().iter().map(|byte| Ok::<_, ()>(vec![*byte]));
+        let mut events =
+            bounded_sse_bytes_with_limit(stream::iter(chunks), wire.len()).eventsource();
+        let event = events.next().await.unwrap().unwrap();
+        assert_eq!(event.event, "message");
+        assert_eq!(event.data, "Xin chào 世界");
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_sse_malformed_error_is_safe_terminal_and_cannot_reach_later_finish() {
+        use futures_util::stream;
+        let chunks = [
+            Ok::<_, ()>(b"data: ".to_vec()),
+            Ok(vec![0xff]),
+            Ok(b"sk-secret data:image/png;base64,PRIVATE\n\ndata: [DONE]\n\n".to_vec()),
+        ];
+        let error = bounded_sse_bytes(stream::iter(chunks))
+            .eventsource()
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        let (failure, terminal) = sse_read_failure(error, Some("req-utf8".into()));
+        assert!(terminal);
+        assert_eq!(failure.provider_code.as_deref(), Some("SSE_MALFORMED"));
+        assert_eq!(failure.correlation_id.as_deref(), Some("req-utf8"));
+        assert!(!failure.to_string().contains("PRIVATE"));
+        assert!(!failure.to_string().contains("sk-secret"));
+    }
+
+    /// Fixture-owned raw receiver shared by both transport modules. No live provider/config.
+    pub(crate) async fn raw_sse_backend(
+        reply: Vec<u8>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0u8; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|n| n.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-Id: req-raw-bound\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len());
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&reply).await;
+                }
+            }
+        });
+        (base, hits, server)
+    }
+
+    pub(crate) fn raw_limit_reply(prefix: &[u8], later_finish: &[u8]) -> Vec<u8> {
+        let mut reply = prefix.to_vec();
+        // Short comments exercise the raw (not assembled data) cap without quadratic long-line
+        // parsing in the dependency. The oversized unterminated line is covered by the unit seam.
+        let comment = format!(": {}\r\n", "x".repeat(4092));
+        while reply.len() <= SSE_RAW_BYTES_LIMIT {
+            reply.extend_from_slice(comment.as_bytes());
+        }
+        reply.extend_from_slice(later_finish);
+        reply
+    }
+
+    #[tokio::test]
+    async fn chat_raw_limit_and_malformed_are_not_replayed_or_tool_salvaged() {
+        use crate::llm::media::with_image_delivery;
+        const TOOL: &[u8] = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        const FINISH: &[u8] = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        for prefix in [b"".as_slice(), TOOL] {
+            for limit in [false, true] {
+                let reply = if limit {
+                    raw_limit_reply(prefix, FINISH)
+                } else {
+                    [
+                        prefix,
+                        b"data: \xffsk-secret PRIVATE\n\n".as_slice(),
+                        FINISH,
+                    ]
+                    .concat()
+                };
+                let (base, hits, server) = raw_sse_backend(reply).await;
+                let http = reqwest::Client::builder().no_proxy().build().unwrap();
+                let cfg = crate::core::cli_config::CliConfig::default();
+                let ctx = crate::core::exec_ctx::ExecutionContext::default();
+                let messages = [Message::user_with_images(
+                    "inspect",
+                    vec!["data:legacy".into()],
+                )];
+                let result = with_image_delivery(
+                    &ctx,
+                    &base,
+                    "fixture-key",
+                    "raw-bound-chat",
+                    stream_chat_with_tools_eager_live(
+                        &http,
+                        &base,
+                        "fixture-key",
+                        "raw-bound-chat",
+                        &messages,
+                        &[],
+                        StreamSink::default(),
+                        None,
+                        &cfg,
+                    ),
+                );
+                let error = tokio::time::timeout(std::time::Duration::from_secs(30), result)
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                let failure = error.downcast_ref::<TransportFailure>().unwrap();
+                assert_eq!(
+                    failure.provider_code.as_deref(),
+                    Some(if limit {
+                        "SSE_RAW_LIMIT"
+                    } else {
+                        "SSE_MALFORMED"
+                    })
+                );
+                assert_eq!(failure.correlation_id.as_deref(), Some("req-raw-bound"));
+                assert!(!error.to_string().contains("PRIVATE"));
+                assert!(!error.to_string().contains("sk-secret"));
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_chat_raw_limit_and_malformed_fail_closed() {
+        for limit in [false, true] {
+            let reply = if limit {
+                raw_limit_reply(b"", b"data: [DONE]\n\n")
+            } else {
+                b"data: \xffPRIVATE\n\ndata: [DONE]\n\n".to_vec()
+            };
+            let (base, hits, server) = raw_sse_backend(reply).await;
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                stream_chat_with_visual_contract_live(
+                    &http,
+                    &base,
+                    "fixture-key",
+                    "plain-raw-bound",
+                    vec![Message::user("hi")],
+                    false,
+                    &cfg,
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+            let failure = error.downcast_ref::<TransportFailure>().unwrap();
+            assert_eq!(
+                failure.provider_code.as_deref(),
+                Some(if limit {
+                    "SSE_RAW_LIMIT"
+                } else {
+                    "SSE_MALFORMED"
+                })
+            );
+            assert!(!error.to_string().contains("PRIVATE"));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_tail_closes_and_records_observed_usage_once_on_deadline_or_drop() {
+        use std::cell::RefCell;
+        for interrupted in [false, true] {
+            let meter = CostMeter::default();
+            let output = RefCell::new(String::new());
+            let observations = std::sync::Mutex::new(Vec::<Usage>::new());
+            let observer = |usage: &Usage| observations.lock().unwrap().push(usage.clone());
+            let call = async {
+                let md = crate::ui::markdown::MarkdownStream::new(false, 80);
+                let mut tail = StreamTail::new(
+                    &meter,
+                    md,
+                    |text: &str| output.borrow_mut().push_str(text),
+                    true,
+                    false,
+                    false,
+                )
+                .with_usage_observer(Some(&observer));
+                tail.observe_usage(&Usage {
+                    prompt_tokens: Some(5),
+                    completion_tokens: Some(1),
+                    ..Default::default()
+                });
+                tail.observe_usage(&Usage {
+                    prompt_tokens: Some(11),
+                    completion_tokens: Some(3),
+                    ..Default::default()
+                });
+                tail.push("partial output");
+                if interrupted {
+                    std::future::pending::<()>().await;
+                }
+                tail.finish(false);
+                tail.finish(false);
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_millis(10), call).await;
+            assert_eq!(result.is_err(), interrupted);
+            assert_eq!(*output.borrow(), "partial output\n");
+            assert_eq!(meter.calls_with_usage.load(Ordering::Relaxed), 1);
+            assert_eq!(meter.prompt_tokens.load(Ordering::Relaxed), 11);
+            assert_eq!(meter.completion_tokens.load(Ordering::Relaxed), 3);
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].prompt_tokens, Some(11));
+            assert_eq!(observations[0].completion_tokens, Some(3));
+        }
+        let meter = CostMeter::default();
+        drop(StreamTail::new(
+            &meter,
+            crate::ui::markdown::MarkdownStream::new(false, 80),
+            |_: &str| panic!("non-rendering empty tail emitted output"),
+            false,
+            false,
+            false,
+        ));
+        assert_eq!(meter.calls_with_usage.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn quiet_usage_observer_dispatch_and_local_meter_count_latest_once_on_finish_or_drop() {
+        for drop_call in [false, true] {
+            let meter = CostMeter::default();
+            let dispatch = crate::agent::orchestration::DispatchUsage::default();
+            let calls = AtomicU64::new(0);
+            let observer = |usage: &Usage| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                dispatch.add(usage.input_total(), usage.completion_tokens.unwrap_or(0));
+            };
+            let call = async {
+                let mut tail = StreamTail::new(
+                    &meter,
+                    crate::ui::markdown::MarkdownStream::new(false, 80),
+                    |_: &str| panic!("quiet usage observer rendered output"),
+                    false,
+                    false,
+                    false,
+                )
+                .with_usage_observer(Some(&observer));
+                tail.push("private child text");
+                tail.observe_usage(&Usage {
+                    prompt_tokens: Some(5),
+                    completion_tokens: Some(1),
+                    ..Default::default()
+                });
+                tail.observe_usage(&Usage {
+                    prompt_tokens: Some(11),
+                    completion_tokens: Some(3),
+                    ..Default::default()
+                });
+                if drop_call {
+                    std::future::pending::<()>().await;
+                }
+                tail.finish(false);
+                tail.finish(true);
+            };
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), call)
+                    .await
+                    .is_err(),
+                drop_call
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(dispatch.finish(), (11, 3));
+            assert_eq!(dispatch.finish(), (11, 3));
+            assert_eq!(meter.calls_with_usage.load(Ordering::Relaxed), 1);
+            assert_eq!(meter.prompt_tokens.load(Ordering::Relaxed), 11);
+            assert_eq!(meter.completion_tokens.load(Ordering::Relaxed), 3);
+        }
+        let meter = CostMeter::default();
+        let observer = |_: &Usage| panic!("no observed usage must not be estimated");
+        drop(
+            StreamTail::new(
+                &meter,
+                crate::ui::markdown::MarkdownStream::new(false, 80),
+                |_: &str| {},
+                false,
+                false,
+                false,
+            )
+            .with_usage_observer(Some(&observer)),
+        );
+        assert_eq!(meter.calls_with_usage.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn replay_usage_observer_forwards_once_without_rebilling_local_meter() {
+        let meter = CostMeter::default();
+        let dispatch = crate::agent::orchestration::DispatchUsage::default();
+        let calls = AtomicU64::new(0);
+        let observer = |usage: &Usage| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            dispatch.add(usage.input_total(), usage.completion_tokens.unwrap_or(0));
+        };
+        for reported in [true, false] {
+            let usage = reported.then_some(Usage {
+                prompt_tokens: Some(7),
+                completion_tokens: Some(2),
+                ..Default::default()
+            });
+            // Replay's own meter recording occurs before this transport forwarding seam.
+            if let Some(usage) = &usage {
+                meter.record(usage);
+            }
+            let turn = ChatTurn {
+                content: Some("private tape answer".into()),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".into()),
+                usage,
+                empty_wire_note: None,
+                empty_wire_raw: None,
+                eager: Vec::new(),
+            };
+            let turn = complete_replayed_turn(
+                turn,
+                StreamSink {
+                    observed_usage: Some(&observer),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(turn.content.as_deref(), Some("private tape answer"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatch.finish(), (7, 2));
+        assert_eq!(meter.calls_with_usage.load(Ordering::Relaxed), 1);
+        assert_eq!(meter.prompt_tokens.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn quiet_chat_usage_observer_reports_latest_once_on_success_and_failure() {
+        const PREFIX: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private reasoning\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\ndata: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n";
+        for (ending, success) in [
+            ("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true),
+            ("event: error\ndata: private failure\n\n", false),
+            ("", false),
+        ] {
+            let (base, hits, server) = raw_sse_backend(format!("{PREFIX}{ending}").into_bytes()).await;
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let dispatch = crate::agent::orchestration::DispatchUsage::default();
+            let calls = AtomicU64::new(0);
+            let observer = |usage: &Usage| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                dispatch.add(usage.input_total(), usage.completion_tokens.unwrap_or(0));
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_with_tools_eager_live(&http, &base, "fixture-key", "usage-observer", &[Message::user("hi")], &[],
+                StreamSink { observed_usage: Some(&observer), ..Default::default() }, None, &cfg)).await.unwrap();
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(dispatch.finish(), (11, 3));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn frozen_synthesis_body_uses_supplied_config_effort_and_image_destination() {
+        use crate::llm::media::{destination_key, tests as media_tests, VisionPolicy};
+
+        let destination = destination_key("https://merge.example/v1", "claude-test");
+        let image = media_tests::image(17).with_approved_destination(destination.clone());
+        let image_url = image.data_url();
+        let mut messages = vec![Message::system("frozen policy")];
+        messages.extend(media_tests::observed_group(image));
+        let frozen = crate::core::cli_config::CliConfig {
+            max_tokens: Some(512),
+            prompt_cache: Some(false),
+            ..Default::default()
+        };
+        let other_destination = destination_key("https://other.example/v1", "claude-test");
+        for stream in [false, true] {
+            for (policy, target, disclosed) in [
+                (VisionPolicy::Unsupported, &destination, false),
+                (VisionPolicy::Supported, &other_destination, false),
+                (VisionPolicy::Supported, &destination, true),
+            ] {
+                let body = build_chat_body_for_destination(
+                    &frozen,
+                    "claude-test",
+                    &messages,
+                    &[],
+                    stream,
+                    Some("low".into()),
+                    policy,
+                    Some(target),
+                );
+                let wire = serde_json::to_value(&body).unwrap();
+                assert_eq!(wire["max_tokens"], 512);
+                assert_eq!(wire["reasoning_effort"], "low");
+                assert_eq!(wire["stream"], stream);
+                assert!(!wire.to_string().contains("cache_control"));
+                assert_eq!(wire.to_string().contains(&image_url), disclosed);
+                assert_eq!(wire.get("stream_options").is_some(), stream);
+                media_tests::assert_no_storage_metadata(&wire);
+            }
+        }
+        let cached = crate::core::cli_config::CliConfig {
+            prompt_cache: Some(true),
+            ..frozen
+        };
+        let body = build_chat_body_for_destination(
+            &cached,
+            "claude-test",
+            &messages,
+            &[],
+            true,
+            None,
+            VisionPolicy::Unsupported,
+            Some(&destination),
+        );
+        let wire = serde_json::to_value(&body).unwrap();
+        assert!(wire.to_string().contains("cache_control"));
+        assert!(wire.get("reasoning_effort").is_none());
+        assert_eq!(
+            messages[2].tool_images[0].data_url(),
+            image_url,
+            "projection never mutates parent evidence"
+        );
+    }
+
+    #[test]
+    fn completed_answer_uses_one_selected_sink_without_global_state() {
+        assert_eq!(assistant_text_sink(true, true), AssistantTextSink::Events);
+        assert_eq!(assistant_text_sink(true, false), AssistantTextSink::Events);
+        assert_eq!(
+            assistant_text_sink(false, true),
+            AssistantTextSink::Retained
+        );
+        assert_eq!(
+            assistant_text_sink(false, false),
+            AssistantTextSink::Markdown
+        );
+        for sink in [
+            AssistantTextSink::Events,
+            AssistantTextSink::Retained,
+            AssistantTextSink::Markdown,
+        ] {
+            let answer = "A replayed answer with **markdown**.\nNo live request.";
+            let mut emitted = Vec::new();
+            emit_completed_assistant_text_with(Some(answer), sink, |sink, text| {
+                emitted.push((sink, text.to_string()));
+            });
+            assert_eq!(emitted, vec![(sink, answer.to_string())]);
+            for empty in [None, Some("")] {
+                emit_completed_assistant_text_with(empty, sink, |_, _| {
+                    panic!("empty answer emitted")
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn only_selected_reasoning_fallback_is_emitted_as_answer() {
+        assert_eq!(
+            reasoning_only_answer("real answer", false, "private reasoning"),
+            None
+        );
+        assert_eq!(reasoning_only_answer("", true, "tool reasoning"), None);
+        assert_eq!(reasoning_only_answer("", false, "  \n"), None);
+        let answer = reasoning_only_answer("", false, "  fallback answer  ").unwrap();
+        let mut emitted = Vec::new();
+        emit_completed_assistant_text_with(
+            Some(answer),
+            AssistantTextSink::Events,
+            |sink, text| {
+                emitted.push((sink, text.to_string()));
+            },
+        );
+        assert_eq!(
+            emitted,
+            vec![(AssistantTextSink::Events, "fallback answer".to_string())]
+        );
+    }
 
     #[test]
     fn stall_timeout_defaults_and_clamps_the_env_override() {
@@ -3518,30 +4745,9 @@ mod tests {
         // Genuine non-chunks stay errors — the caller drops them, it must not treat them as content.
         assert!(parse_chunk(": keepalive").is_err());
         assert!(parse_chunk(r#"{"choices":"not-an-array"}"#).is_err());
-        // The reported error names the offending key (the strict one), not the vaguer second pass.
+        // Invalid frames fail closed without echoing provider payloads (which may carry secrets).
         let e = parse_chunk(r#"{"choices":[{"delta":{"content":"a","content":1}}]}"#).unwrap_err();
-        assert!(e.to_string().contains("duplicate field"), "err: {e}");
-    }
-
-    #[test]
-    fn frame_diagnostics_are_off_unless_the_env_switch_is_truthy() {
-        // The default must be silent: these frames are gateway noise, and one line per frame is one
-        // line per token painted over a live turn. Serial-safe — no other test reads this var.
-        let prev = std::env::var(FRAME_DEBUG_ENV).ok();
-        std::env::remove_var(FRAME_DEBUG_ENV);
-        assert!(!frame_debug(), "unset must mean silent");
-        for off in ["", "0", "false", "off", "no", " OFF "] {
-            std::env::set_var(FRAME_DEBUG_ENV, off);
-            assert!(!frame_debug(), "{off:?} must read as off");
-        }
-        for on in ["1", "true", "yes", "please"] {
-            std::env::set_var(FRAME_DEBUG_ENV, on);
-            assert!(frame_debug(), "{on:?} must read as on");
-        }
-        match prev {
-            Some(v) => std::env::set_var(FRAME_DEBUG_ENV, v),
-            None => std::env::remove_var(FRAME_DEBUG_ENV),
-        }
+        assert!(e.is::<super::super::delegated::Failure>(), "err: {e}");
     }
 
     #[test]
@@ -3664,6 +4870,487 @@ mod tests {
         let calls = acc.finish();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].id.is_empty(), "a missing id must be synthesized");
+    }
+
+    #[tokio::test]
+    async fn actual_chat_receiver_gets_tool_text_group_then_exact_image_bytes_without_metadata() {
+        use crate::llm::media::{destination_key, tests as media_tests, VisionPolicy};
+        let (base, receiver, server) = media_tests::request_receiver(
+            r#"{"choices":[{"message":{"role":"assistant","content":"reviewed"}}]}"#,
+            "application/json",
+        )
+        .await;
+        let image =
+            media_tests::image(31).with_approved_destination(destination_key(&base, "vision-test"));
+        let expected = image.bytes().unwrap();
+        let messages = media_tests::observed_group(image);
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let destination = destination_key(&base, "vision-test");
+        let body = build_chat_body_for_destination(
+            &cfg,
+            "vision-test",
+            &messages,
+            &[],
+            false,
+            Some("low".into()),
+            VisionPolicy::Supported,
+            Some(&destination),
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = send_chat(
+            &client,
+            &format!("{base}/chat/completions"),
+            "test-key",
+            body,
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        let wire = receiver.await.unwrap();
+        server.await.unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["content"], "image text");
+        assert_eq!(messages[2]["content"], "other text");
+        assert_eq!(messages[3]["content"], "last text");
+        assert_eq!(messages[4]["role"], "user");
+        let url = messages[4]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        assert_eq!(media_tests::decode_url(url), expected);
+        media_tests::assert_no_storage_metadata(&wire);
+        assert_eq!(wire["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn transport_evidence_drops_echoed_secrets_but_keeps_machine_evidence() {
+        let raw = r#"{"error":{"code":"UPSTREAM_BAD_RESPONSE","status":0,"correlation_id":"req-17","message":"sk-live-secret data:image/png;base64,SECRET Authorization: Bearer secret"},"request":{"prompt":"private"}}"#;
+        let error = transport_failure("sse", Some(200), raw, None);
+        assert_eq!(error.http_status, Some(200));
+        assert_eq!(error.provider_status, Some(0));
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("UPSTREAM_BAD_RESPONSE")
+        );
+        assert_eq!(error.correlation_id.as_deref(), Some("req-17"));
+        let printed = error.to_string();
+        for secret in [
+            "sk-live",
+            "base64",
+            "Authorization",
+            "Bearer",
+            "private",
+            "SECRET",
+        ] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        let error = transport_failure(
+            "http",
+            Some(400),
+            r#"{"error":{"message":"Unsupported max_tokens; use max_completion_tokens. sk-hidden"}}"#,
+            None,
+        );
+        assert!(error.message.contains("max_completion_tokens"));
+        assert!(!error.message.contains("sk-hidden"));
+    }
+
+    #[tokio::test]
+    async fn quiet_stream_only_receiver_preserves_effort_and_validates_finish() {
+        use crate::llm::media::tests as media_tests;
+        const REPLY: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private reasoning\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
+        let (base, receiver, server) =
+            media_tests::request_receiver(REPLY, "text/event-stream").await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let turn = stream_chat_with_tools_eager_live(
+            &client,
+            &base,
+            "fixture-key",
+            "quiet-stream-only",
+            &[Message::user("hi")],
+            &[],
+            StreamSink::default(),
+            Some("high".into()),
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.content.as_deref(), Some("answer"));
+        assert_eq!(turn.usage.unwrap().completion_tokens, Some(2));
+        assert!(turn.eager.is_empty());
+        let body = receiver.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    /// One logical delegated step gets THREE actual HTTP sends, counting every retry layer. Without
+    /// a control the top-level path keeps its own budget unchanged.
+    #[tokio::test]
+    async fn delegated_step_spends_three_wire_sends_across_all_retry_layers() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = seen.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                *counter.lock().unwrap() += 1;
+                let body = r#"{"error":{"message":"busy"}}"#;
+                let reply = format!(
+                    "HTTP/1.1 503 Busy\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let control = crate::llm::delegated::Control::new(
+            std::time::Duration::from_secs(30),
+            None,
+            None,
+        );
+        let error = crate::llm::delegated::run(Some(&control), send_with_retry_render(
+            || client.post(&url).body("{}"),
+            false,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::llm::delegated::Failure>(),
+            Some(&crate::llm::delegated::Failure::Exhausted),
+            "{error}"
+        );
+        assert_eq!(*seen.lock().unwrap(), 3, "HTTP retry, blank replay and outer retry share one budget");
+        srv.abort();
+    }
+
+    /// A healthy delegated step is untouched by the shared budget: one send, one answer.
+    #[tokio::test]
+    async fn a_healthy_delegated_step_still_spends_exactly_one_send() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const REPLY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = seen.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                *counter.lock().unwrap() += 1;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{REPLY}",
+                    REPLY.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let control = crate::llm::delegated::Control::new(
+            std::time::Duration::from_secs(30),
+            None,
+            None,
+        );
+        let turn = crate::llm::delegated::run(Some(&control), stream_chat_with_tools_eager_live(
+            &client, &base, "fixture-key", "healthy-delegated", &[Message::user("hi")], &[],
+            StreamSink::default(), None, &cfg,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(turn.content.as_deref(), Some("ok"));
+        assert_eq!(*seen.lock().unwrap(), 1);
+        assert_eq!(control.sends(), 1);
+        srv.abort();
+    }
+
+    /// A provider that answers 200 and streams only metadata must not produce a successful empty
+    /// turn. It is not a validated finish either, so the turn fails — after a BOUNDED number of
+    /// blank replays, never an unbounded retry storm.
+    #[tokio::test]
+    async fn metadata_only_stream_never_completes_a_turn() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const PINGS: &str = "data: {\"type\":\"ping\"}\n\ndata: {}\n\ndata: {\"choices\":[]}\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = seen.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                *counter.lock().unwrap() += 1;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PINGS}",
+                    PINGS.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let turn = stream_chat_with_tools_eager_live(
+            &client, &base, "fixture-key", "metadata-only", &[Message::user("hi")], &[],
+            StreamSink::default(), None, &cfg,
+        ).await;
+        let error = turn.err().expect("metadata is not an answer");
+        assert!(error.to_string().contains("validated finish reason"), "{error}");
+        let requests = *seen.lock().unwrap();
+        assert_eq!(
+            requests,
+            1 + STREAM_BLANK_RETRIES as usize,
+            "blank replay stays bounded"
+        );
+        srv.abort();
+    }
+
+    /// A native Messages/Responses frame (or a non-streaming body) on the Chat Completions route is
+    /// a protocol mismatch: it must be reported, not silently parsed as an empty answer.
+    #[tokio::test]
+    async fn a_foreign_dialect_is_a_protocol_error_not_an_empty_answer() {
+        use crate::llm::media::tests as media_tests;
+        for reply in [
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"content\":[]}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"choices\":[{\"message\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]\n\n",
+        ] {
+            let (base, receiver, server) = media_tests::request_receiver(reply, "text/event-stream").await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let error = stream_chat_with_tools_eager_live(
+                &client, &base, "fixture-key", "foreign-dialect", &[Message::user("hi")], &[],
+                StreamSink::default(), None, &cfg,
+            ).await.err().unwrap();
+            assert!(
+                error.downcast_ref::<crate::llm::delegated::Failure>()
+                    == Some(&crate::llm::delegated::Failure::Protocol),
+                "{error}"
+            );
+            assert!(error.to_string().contains("Chat Completions"), "{error}");
+            // The single-connection fixture also proves no blank replay followed a protocol failure.
+            receiver.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    /// `finish_reason` followed by an open connection: a bounded trailer wait that still surfaces a
+    /// late error, instead of either waiting a whole response window or declaring success instantly.
+    #[tokio::test]
+    async fn finish_reason_with_an_open_connection_waits_only_a_bounded_trailer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (tail, expect_ok) in [
+            ("", true),
+            (
+                "event: error\ndata: {\"error\":{\"code\":\"UPSTREAM_BAD_RESPONSE\",\"message\":\"sk-secret\"}}\n\n",
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let srv = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n")
+                    .await
+                    .unwrap();
+                if !tail.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    socket.write_all(tail.as_bytes()).await.unwrap();
+                }
+                socket.flush().await.unwrap();
+                // Hold the connection open far past the trailer window, sending nothing more.
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let started = std::time::Instant::now();
+            let turn = stream_chat_with_tools_eager_live(
+                &client, &base, "fixture-key", "finish-then-open", &[Message::user("hi")], &[],
+                StreamSink::default(), None, &cfg,
+            ).await;
+            let elapsed = started.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(60), "{elapsed:?}");
+            match (expect_ok, turn) {
+                (true, Ok(turn)) => assert_eq!(turn.content.as_deref(), Some("answer")),
+                (false, Err(error)) => {
+                    assert!(error.to_string().contains("UPSTREAM_BAD_RESPONSE"), "{error}");
+                    assert!(!error.to_string().contains("sk-secret"));
+                }
+                (true, Err(error)) => panic!("healthy finish must not fail: {error}"),
+                (false, Ok(_)) => panic!("a late provider error cannot be erased by an earlier finish"),
+            }
+            srv.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_stream_rejects_partial_eof_sse_errors_and_incomplete_calls() {
+        use crate::llm::media::tests as media_tests;
+        for (reply, expected) in [
+            ("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", "partial EOF"),
+            ("data: {\"error\":{\"code\":\"UPSTREAM_BAD_RESPONSE\",\"status\":0,\"message\":\"sk-secret\",\"correlation_id\":\"req-19\"}}\n\n", "UPSTREAM_BAD_RESPONSE"),
+            ("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n", "incomplete tool arguments"),
+        ] {
+            let (base, receiver, server) = media_tests::request_receiver(reply, "text/event-stream").await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let error = stream_chat_with_tools_eager_live(&client, &base, "fixture-key", "quiet-failure", &[Message::user("hi")], &[], StreamSink::default(), None, &cfg).await.err().unwrap();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!error.to_string().contains("sk-secret"));
+            receiver.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn non_json_error_event_cannot_be_erased_by_later_finish_or_done() {
+        use crate::llm::media::{tests as media_tests, with_image_delivery};
+        for reply in [
+            "event: error\ndata: sk-secret data:image/png;base64,PRIVATE\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"later\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\nevent: error\ndata: sk-secret data:image/png;base64,PRIVATE\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\nevent: error\ndata: [DONE]\n\n",
+        ] {
+            let (base, receiver, server) = media_tests::request_receiver(reply, "text/event-stream").await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let messages = vec![Message::user_with_images("inspect", vec!["data:legacy".into()])];
+            let ctx = crate::core::exec_ctx::ExecutionContext::default();
+            let error = with_image_delivery(&ctx, &base, "fixture-key", "raw-sse-error", stream_chat_with_tools_eager_live(
+                &client, &base, "fixture-key", "raw-sse-error", &messages, &[], StreamSink::default(), None, &cfg,
+            )).await.err().unwrap();
+            assert!(error.downcast_ref::<TransportFailure>().is_some());
+            assert!(!error.to_string().contains("sk-secret"));
+            assert!(!error.to_string().contains("PRIVATE"));
+            receiver.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn salvaged_chat_tools_clear_live_image_receipt() {
+        use crate::llm::media::{tests as media_tests, with_image_delivery, ImageDeliveryReceipt};
+        const REPLY: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        let (base, receiver, server) =
+            media_tests::request_receiver(REPLY, "text/event-stream").await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let messages = vec![Message::user_with_images(
+            "inspect",
+            vec!["data:legacy".into()],
+        )];
+        let ctx = crate::core::exec_ctx::ExecutionContext::default();
+        let (turn, receipt) = with_image_delivery(
+            &ctx,
+            &base,
+            "fixture-key",
+            "salvage-image",
+            stream_chat_with_tools_eager_live(
+                &client,
+                &base,
+                "fixture-key",
+                "salvage-image",
+                &messages,
+                &[],
+                StreamSink::default(),
+                None,
+                &cfg,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(receipt, ImageDeliveryReceipt::default());
+        receiver.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_reuse_exact_compact_bytes_and_quirks_only_change_fields() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for (status, response) in [
+                (503, "busy"),
+                (
+                    400,
+                    "{\"error\":{\"message\":\"unsupported reasoning_effort\"}}",
+                ),
+                (200, "ok"),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 4096];
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let size: usize = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if bytes.len() >= end + 4 + size {
+                            bodies.push(bytes[end + 4..end + 4 + size].to_vec());
+                            break;
+                        }
+                    }
+                }
+                let reply = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let body = build_chat_body(
+            &cfg,
+            "quiet-quirk-bytes-fixture",
+            &[Message::user("hi")],
+            &[],
+            true,
+            Some("high".into()),
+        );
+        let mut prepared = PreparedChatRequest::new(body).unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        send_prepared_chat(&client, &url, "fixture-key", &mut prepared, false)
+            .await
+            .unwrap();
+        let bodies = server.await.unwrap();
+        assert_eq!(
+            bodies[0], bodies[1],
+            "ordinary retries reuse the wire verbatim"
+        );
+        let mut first: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        first.as_object_mut().unwrap().remove("reasoning_effort");
+        assert_eq!(
+            first,
+            serde_json::from_slice::<serde_json::Value>(&bodies[2]).unwrap()
+        );
+        assert!(!bodies[0].contains(&b'\n'));
     }
 
     /// A one-request-per-connection stub gateway. `models_status`/`chat_status` let a test model the

@@ -172,13 +172,13 @@ impl Canvas {
             while cx < self.w {
                 let mut bits: u32 = 0;
                 let mut lvl: u8 = 0;
-                for dx in 0..2 {
-                    for dy in 0..4 {
+                for (dx, column) in BIT.iter().enumerate() {
+                    for (dy, &bit) in column.iter().enumerate() {
                         let (px, py) = (cx + dx, cy + dy);
                         if px < self.w && py < self.h {
                             let v = self.px[py * self.w + px];
                             if v > 0 {
-                                bits |= 1 << BIT[dx][dy];
+                                bits |= 1 << bit;
                                 lvl = lvl.max(v - 1);
                             }
                         }

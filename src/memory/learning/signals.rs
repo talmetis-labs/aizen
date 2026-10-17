@@ -176,6 +176,7 @@ mod tests {
             }],
             tool_call_id: None,
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }

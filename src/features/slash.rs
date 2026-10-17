@@ -30,6 +30,7 @@ pub enum SlashId {
     Help,
     Init,
     Where,
+    Files,
     Goal,
     Model,
     Provider,
@@ -61,6 +62,7 @@ pub enum SlashId {
     Reach,
     Approval,
     Sandbox,
+    Design,
     Effort,
     Ultimate,
     Clear,
@@ -170,7 +172,18 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show project root, zone slug, git, and data locations",
         argument_hint: "",
-        help: "show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)",
+        help: "show THIS project's identity: root · zone slug · git executable · memory/skills/sessions and managed artifact/scratch roots (also `aizen where`, `/files`)",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Files,
+        name: "files",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "list managed artifacts and current-process scratch (read-only)",
+        argument_hint: "[artifacts|scratch]",
+        help: "[artifacts|scratch] list paths/sizes only, across artifact runs and this process's scratch; bounded, no link traversal, no creation or deletion (also `aizen files`)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -528,6 +541,17 @@ pub const BUILTINS: &[Builtin] = &[
         description: "OS sandbox around model-run commands",
         argument_hint: "[status|auto|strict|guarded|off]",
         help: "the OS sandbox under approval: status shows what THIS machine enforces (kernel vs software); auto|strict|guarded|off sets the mode (strict fails closed where the kernel can't enforce). Full detail: `aizen sandbox status|doctor`",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Design,
+        name: "design",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "visual design guidance and evidence (this session only)",
+        argument_hint: "[auto|on|off]",
+        help: "bare: scoped status; auto activates on semantic visual briefs, on enables guidance, off disables automatic guidance/gates but leaves manual tools available. No saved config change",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -1050,6 +1074,7 @@ mod tests {
             "autocopy",
             "login",
             "logout",
+            "design",
         ] {
             assert!(names.contains(name), "slash catalog must include /{name}");
         }

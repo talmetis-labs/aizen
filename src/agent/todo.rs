@@ -298,24 +298,24 @@ fn todos_schema() -> serde_json::Value {
         "properties": {
             "todos": {
                 "type": "array",
-                "description": "The full task list (replaces the previous one).",
+                "description": "Full task list; replaces previous.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "content": {"type": "string", "description": "the task, imperative + concise"},
+                        "content": {"type": "string", "description": "concise imperative task"},
                         "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
                         "confidence": {
                             "type": "integer",
                             "minimum": 0,
                             "maximum": 100,
-                            "description": "0–100 honest confidence at assign and at done (optional; omit on trivial tasks)"
+                            "description": "honest confidence at assign/done (0–100); optional, omit if trivial"
                         },
                         "hill_climbable": {
                             "type": "integer",
                             "minimum": 0,
                             "maximum": 100,
-                            "description": "0–100 how quantifiable/iterable this goal is (optional; below ~90 may trigger a reframe nudge)"
+                            "description": "quantifiable/iterable goal (0–100); optional, <~90 may prompt reframe"
                         }
                     },
                     "required": ["content", "status"]
@@ -334,12 +334,9 @@ impl Tool for TodoWrite {
         "todo_write"
     }
     fn description(&self) -> &str {
-        "Track a multi-step task as a visible checklist. Send the COMPLETE list every call (it \
-         REPLACES the previous one). Use it for multi-file or hard-to-undo work: ONE item \
-         in_progress at a time, flip it to done before starting the next. Not for trivial \
-         one-step tasks. Optional confidence (0–100) at assign/done and hill_climbable (0–100) \
-         for quantifiable goals. Shown to the user; resets on /clear. Incomplete items block \
-         Done (harness poke)."
+        "Visible checklist for multi-file/hard-to-undo, not trivial work. Each call replaces FULL \
+         list; one in_progress, mark done before next. Optional 0–100 confidence at assign/done \
+         and hill_climbable for quantifiable goals. /clear resets; incomplete items block Done."
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()
