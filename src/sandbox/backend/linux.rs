@@ -346,6 +346,12 @@ fn build_ruleset(fs: &FsPolicy) -> Result<Option<OwnedFd>, String> {
     ] {
         add(std::path::Path::new(dev), dev_access);
     }
+    // The program being spawned may live outside every granted root (a helper under
+    // `target/debug/deps`). Landlock needs read+execute on that FILE; without it the exec itself
+    // fails with EACCES before the child ever runs.
+    for file in &fs.exec_files {
+        add(file, ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE);
+    }
     Ok(Some(ruleset))
 }
 
@@ -542,6 +548,7 @@ mod tests {
                 "/proc".into(),
                 "/dev".into(),
             ],
+            exec_files: vec![],
             deny: vec![],
         };
         let sbx = LinuxSandbox::build(&fs, false, &SandboxLimits::default());
@@ -585,6 +592,7 @@ mod tests {
                 "/dev".into(),
                 "/proc".into(),
             ],
+            exec_files: vec![],
             deny: vec![],
         };
         let sbx = LinuxSandbox::build(&fs, true, &SandboxLimits::default());

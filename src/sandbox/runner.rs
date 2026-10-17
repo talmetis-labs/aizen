@@ -12,6 +12,8 @@ use super::policy::{self, SandboxSettings};
 use super::request::{CommandSpec, SandboxRequest};
 use super::SandboxMode;
 use anyhow::{anyhow, Result};
+#[cfg(not(windows))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -599,6 +601,28 @@ fn resolve_argv(spec: &CommandSpec) -> (PathBuf, Vec<String>) {
     }
 }
 
+/// A kernel backend only lets a child execute files it may also read. The program itself can live
+/// outside every granted root — a test binary under `target/debug/deps`, a bundled helper — and
+/// Landlock then refuses the exec with EACCES. Grant READ+EXECUTE on that exact file. Not its
+/// directory: a directory grant would also expose unrelated siblings.
+#[cfg(not(windows))]
+fn grant_program_execution(fs: &mut policy::FsPolicy, program: &Path) {
+    if !program.is_absolute() {
+        return; // resolved through PATH; its real file is not known here
+    }
+    if fs
+        .read_write
+        .iter()
+        .chain(fs.read_only.iter())
+        .any(|root| program.starts_with(root))
+    {
+        return;
+    }
+    if !fs.exec_files.iter().any(|granted| granted == program) {
+        fs.exec_files.push(program.to_path_buf());
+    }
+}
+
 macro_rules! build_prepared {
     ($fn_name:ident, $cmd_ty:ty, $new:expr, $proctree_prepare:path, $apply_kernel:ident) => {
         /// Build a sandboxed command of this flavor. Returns `Err` when policy refuses the spawn
@@ -628,6 +652,7 @@ macro_rules! build_prepared {
                         &settings,
                     );
                     fs.read_write.push(req.cwd.clone());
+                    grant_program_execution(&mut fs, &program);
                     let prof = super::backend::macos::profile(&fs, deny_net);
                     let (p, a) = super::backend::macos::wrap(&program, &args, &prof);
                     program = p;
@@ -683,6 +708,7 @@ macro_rules! build_prepared {
                         &settings,
                     );
                     fs.read_write.push(req.cwd.clone());
+                    grant_program_execution(&mut fs, &program);
                     let limits = settings.limits.clone().unwrap_or_default();
                     let sbx = super::backend::linux::LinuxSandbox::build(&fs, deny_net, &limits);
                     if res.effective == "strict" && !sbx.degraded.is_empty() {

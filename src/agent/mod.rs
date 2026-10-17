@@ -13777,7 +13777,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn executor_hung_safe_batch_uses_one_deadline_and_stops_later_windows() {
-        struct SlowReader(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        struct SlowReader {
+            started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            sleep: std::time::Duration,
+        }
         impl Tool for SlowReader {
             fn name(&self) -> &str {
                 "slow_reader"
@@ -13789,17 +13792,46 @@ mod tests {
                 serde_json::json!({"type":"object"})
             }
             fn execute(&self, _: &serde_json::Value) -> Result<String> {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                self.started
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(self.sleep);
                 Ok("late result".into())
             }
         }
-        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(SlowReader(started.clone())));
         let calls: Vec<_> = (0..MAX_PARALLEL + 2)
             .map(|i| call(&format!("id-{i}"), "slow_reader", "{}"))
             .collect();
+
+        // Without an expired deadline every call must actually run. This proves dispatch starts
+        // real workers, independently of how long setup takes on a loaded machine — the deadline
+        // run below may legitimately start none when the deadline lapses before dispatch.
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowReader {
+            started: started.clone(),
+            sleep: std::time::Duration::from_millis(5),
+        }));
+        let results = exec(&registry, &calls, &cfg()).await;
+        assert_eq!(results.len(), calls.len());
+        assert!(
+            results.iter().all(|(_, text)| text == "late result"),
+            "{results:?}"
+        );
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            calls.len(),
+            "a healthy batch dispatches every call"
+        );
+
+        // One absolute deadline for the whole batch. Whether dispatch beats the deadline depends on
+        // the machine; the contract under test is that every call ends at that deadline, no later
+        // window starts, and the run does not serialize one deadline per collected worker.
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowReader {
+            started: started.clone(),
+            sleep: std::time::Duration::from_millis(200),
+        }));
         let now = std::time::Instant::now();
         let config = AgentConfig {
             deadline: Some(now + std::time::Duration::from_millis(70)),
@@ -13815,7 +13847,6 @@ mod tests {
             assert_eq!(result.0, call.id);
             assert!(result.1.contains("deadline"), "{result:?}");
         }
-        assert!(started.load(std::sync::atomic::Ordering::SeqCst) > 0);
         assert!(
             started.load(std::sync::atomic::Ordering::SeqCst) <= MAX_PARALLEL,
             "no later window starts after expiry"
@@ -16291,7 +16322,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin the fixture HOME so another test's hook configuration cannot decide this read"
+    )]
     async fn identical_re_read_short_circuits_only_while_unchanged() {
+        // Hook configuration is read from the process-global AIZEN_HOME at call time. Pin an empty
+        // owned home for the whole run: a hook test that installs a deny hook in ITS fixture home
+        // must not block this file_read while both tests run in parallel.
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home_fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = home_fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
         let dir = std::env::temp_dir().join(format!("aizen-reread-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

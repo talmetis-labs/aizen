@@ -84,7 +84,7 @@ fn lock_home() -> PathBuf {
 }
 
 #[cfg(test)]
-fn test_namespace_key() -> String {
+pub(crate) fn test_namespace_key() -> String {
     let home = lock_home();
     // Normalize existing aliases as well as Windows verbatim/case spellings. Fallback is needed
     // for legacy tests whose environment home has not been created yet.

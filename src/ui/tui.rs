@@ -5787,6 +5787,9 @@ pub(crate) mod tests {
     /// finished).
     #[test]
     fn jobs_is_serviced_inline_while_a_turn_runs() {
+        // The jobs panel is process-global state: without this lock this test's `jobs_menu_close()`
+        // can close the panel a parallel jobs-panel test is asserting on.
+        let _menu = MENU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let token = crate::core::cancel::TurnCancel::new();
         arm_cancel(token.clone());
         ACTIVE.store(true, Ordering::Relaxed); // fake a live surface; the panel needs no render thread

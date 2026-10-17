@@ -1327,7 +1327,7 @@ async fn run_one_verify(
         if pipes_settled && tree_settled {
             lifetime.prove_tree_settled();
         } else {
-            // Unix groups, absent containment, errors, or live descendants are NOT a proof.
+            // Absent containment, query errors, or live descendants are NOT a proof.
             // Do not let a suite timeout become an earlier-pass success in the ladder either.
             return verify_unsettled(&command_line, start,
                 "verification incomplete: process-tree settlement is unproven; physical ownership quarantined until CLI exit".to_string());

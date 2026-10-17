@@ -162,6 +162,12 @@ pub struct FsPolicy {
     pub read_write: Vec<PathBuf>,
     /// Read(+execute)-only roots: system and toolchain directories.
     pub read_only: Vec<PathBuf>,
+    /// Exact programs the child must be able to execute even though they sit outside every root
+    /// (a helper binary under `target/debug/deps`, a bundled tool). Granted READ+EXECUTE on the
+    /// FILE only — never its directory, so this cannot widen access to unrelated siblings. Only the
+    /// Unix kernel backends read it; Windows has no filesystem backend to feed.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub exec_files: Vec<PathBuf>,
     /// Directories that must stay UNREADABLE even where broad reads are otherwise allowed
     /// (macOS deny rules; doctor's adversarial checks everywhere). On Linux the allow-list
     /// already excludes them.
@@ -237,6 +243,7 @@ pub fn fs_policy(workspace: &Path, tmp: Option<&Path>, s: &SandboxSettings) -> F
     FsPolicy {
         read_write: rw,
         read_only: ro,
+        exec_files: Vec::new(),
         deny: credential_dirs(&home),
     }
 }
