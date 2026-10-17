@@ -1754,3 +1754,28 @@ fn exit_flush_persists_the_live_conversation_for_sessions() {
     std::env::remove_var("AIZEN_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The product name is part of the software's contract, not decoration: the binary name, the home
+/// directory every saved session lives under, and the update channel all derive from it. A rename
+/// that lands here by accident — a "consistency" pass, a fork's find-and-replace — would silently
+/// strand existing installs, so the identity is pinned where the test suite runs.
+///
+/// A fork that deliberately rebrands is expected to change these assertions along with everything
+/// in `TRADEMARK.md`'s checklist. That is the point: the change becomes a decision someone made,
+/// visible in the diff, rather than a side effect.
+#[test]
+fn the_product_identity_is_pinned() {
+    assert_eq!(
+        env!("CARGO_PKG_NAME"),
+        "aizen",
+        "the package/binary name is the update channel's and every installer's contract"
+    );
+    // The data root is `<home>/.aizen`. Checked through the resolver rather than by reading the
+    // environment, so this holds in a test process with any HOME/AIZEN_HOME.
+    let probe = std::path::Path::new("/tmp/identity-probe");
+    assert!(
+        crate::core::config::resolve_default_home_for_test(probe)
+            .ends_with(".aizen"),
+        "the home directory holds every saved session; renaming it strands them"
+    );
+}
