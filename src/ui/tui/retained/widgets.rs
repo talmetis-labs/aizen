@@ -15,9 +15,23 @@ pub(super) fn draw_overlay(
     overlay: &OverlaySnapshot,
     scroll: usize,
 ) -> (usize, Rect) {
-    let width = area.width.saturating_sub(4).min(84).max(20);
-    let height = (overlay.lines.len() as u16 + 4)
-        .min(area.height.saturating_sub(2))
+    // Two shapes, because the two kinds of overlay are read differently.
+    //
+    // A SELECTABLE overlay is a menu you answer: its rows are buttons and its content is short, so
+    // a full-width sheet would stretch one question and three options across the whole terminal and
+    // read as a stray line rather than a panel. Keep it a comfortable fixed measure.
+    //
+    // An informational overlay (the `/workflows` board) is READ: a hard 84-column cap wrapped long
+    // child labels into three or four rows each and made the board much taller than the text it
+    // carried, so it takes almost the whole frame and lets the paragraph wrap.
+    let selectable = overlay.selected.is_some();
+    let width = if selectable {
+        area.width.saturating_sub(4).clamp(20, 84)
+    } else {
+        area.width.saturating_sub(4).clamp(20, area.width.max(20))
+    };
+    let height = (overlay.lines.len() as u16 + 5)
+        .min(area.height.saturating_sub(1))
         .max(5);
     let rect = centered(area, width, height);
     frame.render_widget(Clear, rect);
@@ -62,8 +76,8 @@ pub(super) fn draw_overlay(
     // A SELECTABLE overlay is a menu: its rows must stay one screen row each so a mouse click can be
     // mapped back to a row index (`overlay_menu_hit`). Long rows are clipped at the panel edge, not
     // wrapped — wrapping would break the row↔line mapping the hit-test depends on. Informational
-    // overlays (no selection) keep wrapping and publish no geometry.
-    let selectable = overlay.selected.is_some();
+    // overlays (no selection) keep wrapping and publish no geometry. (`selectable` is decided above,
+    // with the width it implies.)
     let paragraph = if selectable {
         Paragraph::new(lines).scroll((clamped.min(u16::MAX as usize) as u16, 0))
     } else {
@@ -93,13 +107,14 @@ pub(super) fn render_assistant_rows(raw: &str, width: usize) -> Vec<String> {
     // ONE renderer for both surfaces. The live turn (streaming) and the replayed transcript
     // (`agent::replay_transcript` → `MarkdownStream`) must produce byte-identical output, or the same
     // message looks different when re-opened than when first shown. So feed the whole raw block through
-    // `MarkdownStream` here too — the block is cached by `content_hash`, so re-parsing the full body on
-    // each width/content change is the same trip `replay_transcript` makes, with none of the
-    // incremental-splice risk an in-place streaming parser would carry.
+    // `MarkdownStream` here too — the block is cached by revision (and throttled by the stream slot
+    // while it is still growing), so re-parsing the full body on each width/revision change is the
+    // same trip `replay_transcript` makes, with none of the incremental-splice risk an in-place
+    // streaming parser would carry.
     //
     // Keep SGR: the renderer emits the moonlight gutter, code-box borders, and syntax highlight as
     // colour codes — `sanitize_keep_sgr` preserves them (dropping only cursor moves) and `ansi_spans`
-    // turns them into styled spans at draw time.
+    // turns them into styled spans once, when the block's rows are rendered into the cache.
     let mut md = crate::ui::markdown::MarkdownStream::new(true, width.max(24));
     let mut rendered = md.push(&format!("{raw}\n"));
     rendered.push_str(&md.finish());
@@ -138,18 +153,28 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
         format!("{} ", t.icon)
     };
     let name_styled = theme::lane(&t.name, &t.name).to_string();
-    let call_line = if t.target.is_empty() {
+    let target = if t.display.paths.is_empty() {
+        &t.target
+    } else {
+        &t.display.text
+    };
+    let call_line = if target.is_empty() {
         format!("{}{}", theme::lane(&t.name, &icon), name_styled)
     } else {
         format!(
             "{}{}   {}",
             theme::lane(&t.name, &icon),
             name_styled,
-            theme::accent_dim(&t.target)
+            theme::accent_dim(target)
         )
     };
+    let bounded = |text: &str| {
+        // This renderer is also used by the non-TTY fallback. Bound the actual shared output,
+        // not just ratatui's cells: the OSC8 injector later overprints these same rows verbatim.
+        wrap_keep_sgr(&sanitize_keep_sgr(text), width).join("\n")
+    };
     if t.digest.is_empty() {
-        return call_line;
+        return bounded(&call_line);
     }
     // Result on the line below: `└ <digest> · <time>`, digest tinted by outcome, time dimmed.
     let digest_styled = match t.state {
@@ -167,37 +192,30 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
         "{call_line}\n{} {digest_styled}{time_styled}",
         theme::faint("└")
     );
-    // A failed call auto-expands: its last lines ride under the digest, so `exit 101` is never
-    // the whole story on screen. `Ctrl-E` opens the full tail; the hint says so only when
-    // there is more than what is shown.
+    // A failed call used to auto-expand its last few lines under the digest. Six indented rows per
+    // failure made a run with several failed calls unreadable, so the row now stays ONE line: the
+    // digest (already the first line of the error) plus a hint that the detail is one key away.
+    // Nothing is lost — the full tail still goes to `Ctrl-E` through `note_tool_body`.
     if t.state == ToolState::Err && !t.body.is_empty() {
-        let lines: Vec<&str> = t.body.lines().filter(|l| !l.trim().is_empty()).collect();
-        let shown = lines.len().min(AUTO_EXPAND_LINES);
-        let max_w = width.saturating_sub(4).max(16);
-        for l in &lines[lines.len() - shown..] {
-            let clipped: String = l.chars().take(max_w).collect();
+        let digest = sanitize_text(&t.digest);
+        let more = t
+            .body
+            .lines()
+            .filter(|line| {
+                let text = sanitize_text(line);
+                !text.trim().is_empty() && text.trim() != digest.trim()
+            })
+            .count();
+        if more > 0 {
             out.push_str(&format!(
                 "\n  {} {}",
                 theme::faint("│"),
-                theme::faint(&clipped)
-            ));
-        }
-        if lines.len() > shown {
-            out.push_str(&format!(
-                "\n  {} {}",
-                theme::faint("│"),
-                theme::faint(&format!(
-                    "… {} more line(s) — Ctrl-E expands",
-                    lines.len() - shown
-                ))
+                theme::faint(&format!("{more} more line(s) — Ctrl-E expands"))
             ));
         }
     }
-    out
+    bounded(&out)
 }
-
-/// Lines of a failed tool's tail painted under its row.
-pub(crate) const AUTO_EXPAND_LINES: usize = 6;
 
 /// Render the in-place plan panel as a boxed checklist: a `☑ done/total · plan` header row, then one
 /// `✓ / ▸ / ○` row per item, framed with the same rounded box the markdown renderer uses — but in
@@ -217,7 +235,7 @@ pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
     let done = rows.iter().filter(|r| r.status == 2).count();
     let header = format!("☑ {done}/{} · plan", rows.len());
     // Inner width: cap so the box doesn't sprawl on a very wide pane; leave room for `│ ` + ` │`.
-    let inner = width.saturating_sub(2).min(72).max(12);
+    let inner = width.saturating_sub(2).clamp(12, 72);
     let bar = "─".repeat(inner);
     let mut out = Vec::new();
     out.push(frame(format!(
@@ -340,7 +358,8 @@ fn diff_cell(cell: Option<&DiffCell>, numw: usize, w: usize) -> String {
 /// GitHub review look — old on the left, new on the right, real file line numbers in the gutters,
 /// removed rows on a deep-red tint and added rows on a deep-green one, context quiet between
 /// them. Narrow, the same rows stack as a single unified column. The header keeps the
-/// `diff · <path>  +A −D` shape with the counts in their semantic colours.
+/// `diff  +A −D` shape with the counts in their semantic colours; the path is intentionally
+/// omitted because the tool row immediately above already names it.
 pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     use crate::ui::theme;
     // The box takes the full width it is handed (the transcript pane): a wide terminal buys the
@@ -357,10 +376,7 @@ pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
     // With the row budgeted at `inner + 2` like every other row, that leaves label+counts+fill =
     // inner − 6. This subtracted 5, painting every header one column wider than the box — the old
     // 100-column clamp kept the overhang inside the pane, so nobody saw it.
-    let label = clip_to(
-        &format!("diff · {}", d.path),
-        inner.saturating_sub(6 + counts_w).max(8),
-    );
+    let label = "diff".to_string();
     let fill = inner.saturating_sub(6 + console::measure_text_width(&label) + counts_w);
     out.push(format!(
         "{}{}  {} {}{}",
@@ -374,7 +390,7 @@ pub(crate) fn render_diff_box(d: &DiffPayload, width: usize) -> Vec<String> {
         } else {
             theme::ACCENT
         }),
-        format!(
+        format_args!(
             "{} {}",
             theme::ok(format!("+{}", d.adds)),
             theme::err(format!("−{}", d.dels))
@@ -471,4 +487,78 @@ pub(crate) fn render_verify_line(v: &VerifyPayload, width: usize) -> String {
         format!("✓ {} — {}", v.cmd, v.detail)
     };
     theme::ok(clip_to(&text, width)).to_string()
+}
+
+/// Render the collapsible sub-agents panel. Collapsed (the default) it is ONE line —
+/// `▸ sub-agents (N) — <recent names> · X running` — so a fan-out never floods the transcript with
+/// one tool row per spawn; Ctrl-E flips it open. Expanded, the header's `▾` reads "open" and one
+/// phase-tinted row per run follows (`✓ coder · fix parser — 12 step(s) · 2m03s`). The frame rides
+/// the TALK lane's pink under `lanes` — delegation/asking is that lane — the dim silver under
+/// `moonlight`.
+pub(crate) fn render_subagents_block(p: &SubAgentsPayload, width: usize) -> Vec<String> {
+    use crate::ui::theme;
+    let frame_color = if theme::lanes_enabled() {
+        theme::LANE_TALK
+    } else {
+        theme::ACCENT_DIM
+    };
+    let frame = |s: String| console::style(s).color256(frame_color).to_string();
+    let inner = width.saturating_sub(2).clamp(12, 72);
+    let bar = "─".repeat(inner);
+    let n = p.rows.len();
+    let running = p.rows.iter().filter(|r| r.running).count();
+    let chevron = if p.expanded { "▾" } else { "▸" };
+    let header = format!("{chevron} sub-agents ({n}) · {running} running");
+    let mut out = Vec::new();
+    out.push(frame(format!(
+        "╭─ {} ─╮",
+        pad_to(&header, inner.saturating_sub(4))
+    )));
+    if !p.expanded {
+        // Collapsed: the publisher's one-line summary (recent done names + counts), nothing more.
+        if !p.summary.is_empty() {
+            out.push(format!(
+                "{} {} {}",
+                frame("│".to_string()),
+                theme::faint(pad_to(
+                    &clip_to(&p.summary, inner.saturating_sub(2)),
+                    inner.saturating_sub(2)
+                )),
+                frame("│".to_string())
+            ));
+        }
+    } else {
+        for r in &p.rows {
+            let mark = r.mark.as_str();
+            let g = match mark {
+                "✓" => theme::ok(mark).to_string(),
+                "✗" => theme::err(mark).to_string(),
+                "✦" => theme::accent(mark).to_string(),
+                _ => theme::faint(mark).to_string(),
+            };
+            let body = if r.detail.is_empty() {
+                format!("{} — {}", r.label, r.elapsed)
+            } else {
+                format!("{} — {} · {}", r.label, r.detail, r.elapsed)
+            };
+            let text_budget = inner.saturating_sub(4);
+            let clipped = clip_to(&body, text_budget);
+            let pad = inner.saturating_sub(4 + console::measure_text_width(&clipped));
+            let styled = if r.running {
+                clipped
+            } else {
+                theme::muted(clipped).to_string()
+            };
+            out.push(format!(
+                "{} {} {}{} {}",
+                frame("│".to_string()),
+                g,
+                styled,
+                " ".repeat(pad),
+                frame("│".to_string())
+            ));
+        }
+    }
+    out.push(frame(format!("╰{bar}╯")));
+    out
 }

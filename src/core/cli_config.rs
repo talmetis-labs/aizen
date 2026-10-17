@@ -61,6 +61,10 @@ pub struct CliConfig {
     /// one) or set manually. Drives the `% context` HUD. `None` ⇒ HUD uses a name heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<usize>,
+    /// Explicit tool-image support for an exact endpoint/model pair. Absent entries are unknown,
+    /// not a guess based on the model's name. Legacy user attachments are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_capabilities: Option<Vec<VisionCapability>>,
     /// Named main-endpoint profiles for manual provider failover. The active profile is copied into
     /// the root `base_url`/`api_key`/`model` fields, so legacy callers keep one resolution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,6 +436,14 @@ pub struct ProviderProfile {
     pub model_context_window: Option<usize>,
 }
 
+/// Tool-image capability declared by the user for one effective endpoint and model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisionCapability {
+    pub base_url: String,
+    pub model: String,
+    pub supported: bool,
+}
+
 /// A fully-resolved (base_url, api_key, model) triple for one call.
 #[derive(Debug, Clone)]
 pub struct ResolvedEndpoint {
@@ -483,6 +495,180 @@ pub fn resolve_role(role: &str, main: &ResolvedEndpoint) -> ResolvedEndpoint {
     }
 }
 
+/// Resolve a role's wire effort from one config snapshot, without consulting the parent's override.
+pub fn role_reasoning_effort_in(
+    cfg: &CliConfig,
+    role: &str,
+    fallback: Option<String>,
+) -> Option<String> {
+    let entry = cfg.roles.as_ref().and_then(|roles| match role {
+        "summarizer" => roles.summarizer.as_ref(),
+        "subagent_default" => roles.subagent_default.as_ref(),
+        "oracle" => roles.oracle.as_ref(),
+        "apply" => roles.apply.as_ref(),
+        _ => roles.pantheon_entry(role),
+    });
+    entry
+        .and_then(|entry| entry.reasoning_effort.as_deref())
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_owned)
+        .or(fallback)
+}
+
+pub fn role_reasoning_effort(role: &str, fallback: Option<String>) -> Option<String> {
+    role_reasoning_effort_in(&load(), role, fallback)
+}
+
+/// Exact endpoint/model matching prevents a capability declared for one provider from leaking to
+/// another provider with the same model alias. Only a trailing slash is normalized.
+pub fn vision_support_in(cfg: &CliConfig, base_url: &str, model: &str) -> Option<bool> {
+    cfg.vision_capabilities.as_ref()?.iter().find_map(|entry| {
+        (entry.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            && entry.model == model)
+            .then_some(entry.supported)
+    })
+}
+
+/// Session declarations are capability statements only, never permission to disclose an image.
+/// Clone this policy once, apply it to the dispatch config, then retain that immutable config for
+/// every request in the dispatch. In-flight workers must not consult the live session slot.
+#[derive(Debug, Default, Clone)]
+pub struct SessionVisionPolicy {
+    declarations: std::collections::BTreeMap<(String, String), Option<bool>>,
+}
+
+impl SessionVisionPolicy {
+    pub fn support_in(&self, cfg: &CliConfig, base_url: &str, model: &str) -> Option<bool> {
+        self.declarations
+            .get(&(
+                base_url.trim_end_matches('/').to_string(),
+                model.to_string(),
+            ))
+            .copied()
+            .unwrap_or_else(|| vision_support_in(cfg, base_url, model))
+    }
+
+    /// Apply explicit session overrides, including Unknown (which masks a saved declaration).
+    /// Do not persist this overlaid config: saving capability is a separate user action.
+    pub fn apply_to(&self, cfg: &mut CliConfig) {
+        for ((base_url, model), supported) in &self.declarations {
+            replace_vision_support(cfg, base_url, model, *supported);
+        }
+    }
+
+    /// Pure declaration helper so fixtures can test the policy without changing a live session.
+    pub fn declare(&mut self, base_url: &str, model: &str, supported: Option<bool>) -> Result<()> {
+        validate_vision_destination(base_url, model)?;
+        self.declarations.insert(
+            (
+                base_url.trim_end_matches('/').to_string(),
+                model.to_string(),
+            ),
+            supported,
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn clear(&mut self, base_url: &str, model: &str) {
+        self.declarations.remove(&(
+            base_url.trim_end_matches('/').to_string(),
+            model.to_string(),
+        ));
+    }
+}
+
+static SESSION_VISION: Lazy<RwLock<SessionVisionPolicy>> =
+    Lazy::new(|| RwLock::new(SessionVisionPolicy::default()));
+
+pub fn session_vision_policy() -> SessionVisionPolicy {
+    SESSION_VISION
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Only trusted controller/UI code may declare capability; model-selected tool arguments do not.
+/// Callers pass the already-resolved effective endpoint and wire model, not a role or model alias.
+pub fn declare_session_vision(base_url: &str, model: &str, supported: Option<bool>) -> Result<()> {
+    SESSION_VISION
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .declare(base_url, model, supported)
+}
+
+pub fn config_with_session_vision(mut cfg: CliConfig) -> CliConfig {
+    session_vision_policy().apply_to(&mut cfg);
+    cfg
+}
+
+pub fn vision_support_for(base_url: &str, model: &str) -> Option<bool> {
+    session_vision_policy().support_in(&load(), base_url, model)
+}
+
+fn validate_vision_destination(base_url: &str, model: &str) -> Result<()> {
+    let parsed = url::Url::parse(base_url).ok();
+    if base_url.chars().any(char::is_control)
+        || parsed
+            .as_ref()
+            .is_none_or(|url| !matches!(url.scheme(), "http" | "https") || url.host_str().is_none())
+    {
+        anyhow::bail!("vision capability needs a resolved http(s) endpoint");
+    }
+    if model.trim().is_empty() || model.chars().any(char::is_control) {
+        anyhow::bail!("vision capability needs an exact nonempty wire model");
+    }
+    Ok(())
+}
+
+fn replace_vision_support(
+    cfg: &mut CliConfig,
+    base_url: &str,
+    model: &str,
+    supported: Option<bool>,
+) {
+    let base_url = base_url.trim_end_matches('/');
+    let mut entries = cfg.vision_capabilities.take().unwrap_or_default();
+    entries
+        .retain(|entry| entry.base_url.trim_end_matches('/') != base_url || entry.model != model);
+    if let Some(supported) = supported {
+        entries.push(VisionCapability {
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            supported,
+        });
+    }
+    cfg.vision_capabilities = (!entries.is_empty()).then_some(entries);
+}
+
+/// Pure persisted-config edit, with exact destination matching and duplicate replacement.
+/// `None` explicitly resets to Unknown. This does not save or grant transmission permission.
+pub fn set_vision_support_in(
+    cfg: &mut CliConfig,
+    base_url: &str,
+    model: &str,
+    supported: Option<bool>,
+) -> Result<()> {
+    validate_vision_destination(base_url, model)?;
+    replace_vision_support(cfg, base_url, model, supported);
+    Ok(())
+}
+
+/// Called only after the separate explicit Save action. Merge just this capability into the latest
+/// persisted config under the store lock, never save a dispatch snapshot containing session policy.
+pub fn persist_vision_support(base_url: &str, model: &str, supported: Option<bool>) -> Result<()> {
+    validate_vision_destination(base_url, model)?;
+    let lock_path = crate::core::workspace_txn::store_lock("cli_config", "global");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    let mut cfg = load();
+    set_vision_support_in(&mut cfg, base_url, model, supported)?;
+    save_unlocked(&cfg, &config_path())
+}
+
 /// A specialist's normal provider assignment. `model=None` means use the selected provider's default
 /// model; `provider=None` means inherit the sub-agent default role.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -506,6 +692,12 @@ pub struct ModelEndpoint {
     /// `env:VAR` (preferred — the key never touches disk) or a literal key (masked in displays).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<String>,
+    /// Phase 3 (per-model concurrency budget): at most this many sub-agents run on this model at
+    /// once, machine-wide. Absent ⇒ only the global `SubagentGate` cap applies. Two gates, two
+    /// reasons: the global one protects the CLI from thread oversubscription; this one protects
+    /// a PROVIDER from rate-limit bursts when the same expensive model is fanned out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
 }
 
 /// Resolve the full endpoint a `model` should run on: if the model-endpoint registry has an entry
@@ -1263,9 +1455,11 @@ pub fn resolved_reasoning_effort(config_default: Option<String>) -> Option<Strin
 /// own `cfg.reasoning_effort` (exactly what the doc above promises for subagents), then restores the
 /// parent's override for the rest of the turn. Serial-by-construction: the guard is held across a
 /// blocking dispatch, so no concurrent parent turn can observe the disarmed window.
+#[cfg(test)]
 pub struct EffortOverrideSuppressed(Option<Option<String>>);
 
 /// Disarm the per-turn effort override until the returned guard drops. See `EffortOverrideSuppressed`.
+#[cfg(test)]
 #[must_use = "the override stays disarmed only while the guard is held"]
 pub fn suppress_effort_override() -> EffortOverrideSuppressed {
     let prior = effort_override();
@@ -1273,6 +1467,7 @@ pub fn suppress_effort_override() -> EffortOverrideSuppressed {
     EffortOverrideSuppressed(prior)
 }
 
+#[cfg(test)]
 impl Drop for EffortOverrideSuppressed {
     fn drop(&mut self) {
         // Restore the exact prior override state (outer None = disarmed, Some(inner) = armed).
@@ -1806,6 +2001,7 @@ mod tests {
                 model: "gpt-4o".into(),
                 base_url: Some("https://openai/v1".into()),
                 api_key_ref: Some("env:AIZEN_TEST_OAI_KEY".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })
@@ -1866,6 +2062,7 @@ mod tests {
                 model: "cheap-fast".into(),
                 base_url: Some("https://cheap/v1".into()),
                 api_key_ref: Some("cheap-literal-key".into()),
+                max_concurrent: None,
             }]),
             ..Default::default()
         })
@@ -2284,6 +2481,356 @@ mod tests {
 #[cfg(test)]
 mod effort_routing_tests {
     use super::*;
+
+    #[test]
+    fn role_effort_parallel_snapshot_keeps_role_overrides_independent() {
+        let cfg = std::sync::Arc::new(CliConfig {
+            reasoning_effort: Some("max".into()),
+            roles: Some(RolesConfig {
+                summarizer: Some(RoleModelConfig {
+                    reasoning_effort: Some(" medium ".into()),
+                    ..Default::default()
+                }),
+                subagent_default: Some(RoleModelConfig {
+                    reasoning_effort: Some("xhigh".into()),
+                    ..Default::default()
+                }),
+                oracle: Some(RoleModelConfig {
+                    reasoning_effort: Some("high".into()),
+                    ..Default::default()
+                }),
+                pantheon: Some(std::collections::BTreeMap::from([
+                    (
+                        "metis".into(),
+                        RoleModelConfig {
+                            reasoning_effort: Some(" high ".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "argus".into(),
+                        RoleModelConfig {
+                            reasoning_effort: Some("low".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let cases = [
+            ("metis", "high"),
+            ("planner", "high"),
+            ("argus", "low"),
+            ("summarizer", "medium"),
+            ("oracle", "high"),
+            ("unknown-role", "xhigh"),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(cases.len()));
+        let handles: Vec<_> = cases
+            .into_iter()
+            .map(|(role, expected)| {
+                let cfg = cfg.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..32 {
+                        let fallback = role_reasoning_effort_in(
+                            &cfg,
+                            "subagent_default",
+                            cfg.reasoning_effort.clone(),
+                        );
+                        assert_eq!(
+                            role_reasoning_effort_in(&cfg, role, fallback).as_deref(),
+                            Some(expected),
+                            "role {role} must not inherit another child's effort"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn role_effort_blank_absent_and_unknown_entries_use_only_supplied_fallback() {
+        let cfg = CliConfig {
+            reasoning_effort: Some("max".into()),
+            roles: Some(RolesConfig {
+                apply: Some(RoleModelConfig {
+                    reasoning_effort: Some(" \t\n ".into()),
+                    ..Default::default()
+                }),
+                oracle: Some(RoleModelConfig::default()),
+                pantheon: Some(std::collections::BTreeMap::from([(
+                    "planner".into(),
+                    RoleModelConfig {
+                        reasoning_effort: Some("low".into()),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for role in [
+            "apply",
+            "oracle",
+            "summarizer",
+            "subagent_default",
+            "unknown",
+        ] {
+            assert_eq!(role_reasoning_effort_in(&cfg, role, None), None);
+            assert_eq!(
+                role_reasoning_effort_in(&cfg, role, Some("medium".into())).as_deref(),
+                Some("medium")
+            );
+        }
+        assert_eq!(
+            role_reasoning_effort_in(&cfg, "metis", Some("high".into())).as_deref(),
+            Some("low"),
+            "an alias-keyed role override also applies to its canonical name"
+        );
+        assert_eq!(
+            role_reasoning_effort_in(&CliConfig::default(), "metis", None),
+            None
+        );
+    }
+
+    #[test]
+    fn vision_support_is_exact_endpoint_and_model_with_only_slash_normalization() {
+        let cfg = CliConfig {
+            vision_capabilities: Some(vec![
+                VisionCapability {
+                    base_url: "https://one.example/v1/".into(),
+                    model: "vision-alias".into(),
+                    supported: true,
+                },
+                VisionCapability {
+                    base_url: "https://two.example/v1".into(),
+                    model: "vision-alias".into(),
+                    supported: false,
+                },
+            ]),
+            ..Default::default()
+        };
+        for endpoint in ["https://one.example/v1", "https://one.example/v1/"] {
+            assert_eq!(
+                vision_support_in(&cfg, endpoint, "vision-alias"),
+                Some(true)
+            );
+        }
+        for endpoint in ["https://two.example/v1", "https://two.example/v1/"] {
+            assert_eq!(
+                vision_support_in(&cfg, endpoint, "vision-alias"),
+                Some(false)
+            );
+        }
+        for endpoint in [
+            "https://unknown.example/v1",
+            "http://one.example/v1",
+            "https://ONE.example/v1",
+            "https://one.example/v2",
+            "https://one.example/v1?key=other",
+            " https://one.example/v1",
+        ] {
+            assert_eq!(vision_support_in(&cfg, endpoint, "vision-alias"), None);
+        }
+        for model in ["other-model", "Vision-Alias", "vision-alias ", ""] {
+            assert_eq!(
+                vision_support_in(&cfg, "https://one.example/v1", model),
+                None
+            );
+        }
+        assert_eq!(
+            vision_support_in(
+                &CliConfig::default(),
+                "https://one.example/v1",
+                "vision-alias"
+            ),
+            None
+        );
+        let empty = CliConfig {
+            vision_capabilities: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vision_support_in(&empty, "https://one.example/v1", "vision-alias"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_vision_declarations_are_exact_and_freeze_into_dispatch_only() {
+        let endpoint = "https://one.example/v1";
+        let mut saved = CliConfig::default();
+        set_vision_support_in(&mut saved, endpoint, "alias", Some(false)).unwrap();
+        let saved_json = serde_json::to_string(&saved).unwrap();
+        let mut session = SessionVisionPolicy::default();
+        assert_eq!(session.support_in(&saved, endpoint, "alias"), Some(false));
+        session.declare(endpoint, "alias", Some(true)).unwrap();
+        assert_eq!(session.support_in(&saved, endpoint, "alias"), Some(true));
+        assert_eq!(
+            session.support_in(&saved, "https://other.example/v1", "alias"),
+            None
+        );
+        assert_eq!(session.support_in(&saved, endpoint, "other"), None);
+        let mut frozen = saved.clone();
+        session.apply_to(&mut frozen);
+        let serialized = serde_json::to_string(&frozen).unwrap();
+        let roundtrip: CliConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(vision_support_in(&roundtrip, endpoint, "alias"), Some(true));
+        session.declare(endpoint, "alias", None).unwrap();
+        assert_eq!(session.support_in(&saved, endpoint, "alias"), None);
+        assert_eq!(
+            vision_support_in(&frozen, endpoint, "alias"),
+            Some(true),
+            "a later declaration cannot mutate a dispatched snapshot"
+        );
+        let mut unknown = saved.clone();
+        session.apply_to(&mut unknown);
+        assert_eq!(vision_support_in(&unknown, endpoint, "alias"), None);
+        assert_eq!(
+            serde_json::to_string(&saved).unwrap(),
+            saved_json,
+            "session setup never edits persisted input"
+        );
+        session.clear(endpoint, "alias");
+        assert_eq!(session.support_in(&saved, endpoint, "alias"), Some(false));
+    }
+
+    #[test]
+    fn vision_edit_replaces_duplicates_and_unknown_removes_only_the_exact_pair() {
+        let endpoint = "https://one.example/v1";
+        let mut cfg = CliConfig {
+            vision_capabilities: Some(vec![
+                VisionCapability {
+                    base_url: format!("{endpoint}/"),
+                    model: "alias".into(),
+                    supported: false,
+                },
+                VisionCapability {
+                    base_url: endpoint.into(),
+                    model: "alias".into(),
+                    supported: true,
+                },
+                VisionCapability {
+                    base_url: "https://two.example/v1".into(),
+                    model: "alias".into(),
+                    supported: false,
+                },
+            ]),
+            ..Default::default()
+        };
+        set_vision_support_in(&mut cfg, endpoint, "alias", Some(true)).unwrap();
+        assert_eq!(cfg.vision_capabilities.as_ref().unwrap().len(), 2);
+        set_vision_support_in(&mut cfg, endpoint, "alias", None).unwrap();
+        assert_eq!(vision_support_in(&cfg, endpoint, "alias"), None);
+        assert_eq!(
+            vision_support_in(&cfg, "https://two.example/v1", "alias"),
+            Some(false)
+        );
+        let before = serde_json::to_string(&cfg).unwrap();
+        assert!(set_vision_support_in(&mut cfg, "invalid", "alias", Some(true)).is_err());
+        assert!(set_vision_support_in(&mut cfg, endpoint, "\n", Some(true)).is_err());
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), before);
+    }
+
+    #[test]
+    fn vision_persistence_fixture_does_not_implicitly_save_session_policy() {
+        let directory = std::env::temp_dir().join(format!(
+            "aizen-vision-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("cli-config.json");
+        let mut cfg = CliConfig::default();
+        let mut session = SessionVisionPolicy::default();
+        session
+            .declare("https://one.example/v1", "alias", Some(true))
+            .unwrap();
+        let mut frozen = cfg.clone();
+        session.apply_to(&mut frozen);
+        assert!(
+            !path.exists(),
+            "declaration and projection do not write a file"
+        );
+        set_vision_support_in(&mut cfg, "https://one.example/v1", "alias", Some(false)).unwrap();
+        save_unlocked(&cfg, &path).unwrap();
+        let saved: CliConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            vision_support_in(&saved, "https://one.example/v1", "alias"),
+            Some(false)
+        );
+        assert_eq!(
+            vision_support_in(&frozen, "https://one.example/v1", "alias"),
+            Some(true)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn role_effort_and_vision_fields_keep_legacy_config_serde_compatible() {
+        let legacy: CliConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://one.example/v1",
+            "model": "vision-alias",
+            "reasoning_effort": "medium",
+            "roles": {"oracle": {"model": "reviewer-model"}}
+        }))
+        .unwrap();
+        assert!(legacy.vision_capabilities.is_none());
+        assert_eq!(
+            vision_support_in(&legacy, "https://one.example/v1", "vision-alias"),
+            None,
+            "a legacy model name does not infer vision support"
+        );
+        assert_eq!(
+            role_reasoning_effort_in(&legacy, "oracle", legacy.reasoning_effort.clone()).as_deref(),
+            Some("medium")
+        );
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("vision_capabilities").is_none());
+        assert!(legacy_json["roles"]["oracle"]
+            .get("reasoning_effort")
+            .is_none());
+
+        let configured: CliConfig = serde_json::from_value(serde_json::json!({
+            "roles": {"oracle": {"reasoning_effort": "low"}},
+            "vision_capabilities": [
+                {"base_url": "https://one.example/v1/", "model": "alias", "supported": true},
+                {"base_url": "https://two.example/v1", "model": "alias", "supported": false}
+            ]
+        }))
+        .unwrap();
+        let back: CliConfig =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(back.vision_capabilities, configured.vision_capabilities);
+        assert_eq!(
+            role_reasoning_effort_in(&back, "oracle", None).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            vision_support_in(&back, "https://one.example/v1", "alias"),
+            Some(true)
+        );
+        assert_eq!(
+            vision_support_in(&back, "https://two.example/v1/", "alias"),
+            Some(false)
+        );
+        assert_eq!(
+            vision_support_in(&back, "https://three.example/v1", "alias"),
+            None
+        );
+    }
 
     #[test]
     fn lean_tools_is_on_for_first_party_apis_and_configurable_elsewhere() {

@@ -6,10 +6,10 @@
 //!
 //! - `fanout`: run tasks concurrently (you decide how many), then one synthesis pass
 //!   (mixture-of-agents). A task with `after` waits for those tasks and receives their reports,
-//!   so a chain (implement → verify → review) is ONE call. At most ONE writer per wave — parallel
-//!   writers in one repo race edits and build locks; the fan-out is for READS, and two writers
-//!   are legal only when `after` orders them (see `workflow::schedule`). The gate limits how many
-//!   run AT ONCE (machine-derived, see `task_tool::max_parallel_subagents_pub`).
+//!   so a chain (implement → verify → review) is ONE call. Frozen, disjoint exact `write_paths`
+//!   allow native editors to overlap. Same-file, shell/build and unrestricted dispatches remain
+//!   barriers; `after` orders dependencies. The parent consolidates and verifies actual edits.
+//!   Admission limits how many run AT ONCE (see `task_tool::max_parallel_subagents_pub`).
 //! - `implement`: that chain prebuilt from one `prompt` — daedalus, then themis with a
 //!   `VERDICT: PASS|FAIL` contract and one fix loop back to daedalus, then nemesis.
 //! - `verify`: the adversarial-refuter preset — each finding gets a read-only reviewer explicitly
@@ -20,11 +20,12 @@
 //! who prefer the smaller top-level schema can opt out with `workflow_tool: false`. Depth 0 only,
 //! like `task`; the tool itself is not concurrency-safe — it IS the parallelism.
 
-use crate::agent::tools::Tool;
+use crate::agent::tools::{PreparedToolCall, Tool, ToolObservation};
 #[cfg(test)]
 use crate::agent::workflow::task_is_writer;
 use crate::agent::workflow::{
-    enforce_singular_writer, run_workflow_collect, Synthesis, WorkflowSpec, WorkflowTask,
+    enforce_singular_writer, run_workflow_collect_observation, Synthesis, WorkflowSpec,
+    WorkflowTask,
 };
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -41,7 +42,19 @@ pub struct WorkflowTool {
     context_window: usize,
 }
 
+#[derive(Clone)]
+struct PreparedWorkflowDispatch {
+    spec: WorkflowSpec,
+    synthesize: bool,
+    read_only: bool,
+    parent_ctx: crate::core::exec_ctx::ExecutionContext,
+}
+
 impl WorkflowTool {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Constructor captures the existing endpoint, approval, scope and budget interface without a warning-only API redesign"
+    )]
     pub fn new(
         client: reqwest::Client,
         base_url: String,
@@ -128,6 +141,7 @@ pub(crate) fn implement_spec(prompt: &str) -> WorkflowSpec {
                     .into(),
             ),
         }),
+        prepared_synthesis: None,
     }
 }
 
@@ -171,6 +185,11 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         .map(str::to_string)
                 };
                 tasks.push(WorkflowTask {
+                    prepared: None,
+                    prepared_metis: None,
+                    attempt: None,
+                    overlay: None,
+                    execution: crate::agent::speculation::ExecutionMode::from_args(t)?,
                     id: t
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -194,6 +213,8 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                     },
                     model: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
                     boundaries: opt_str("boundaries"),
+                    write_paths: crate::agent::workflow::parse_workflow_paths(t.get("write_paths"), "write_paths")?,
+                    read_paths: crate::agent::workflow::parse_workflow_paths(t.get("read_paths"), "read_paths")?,
                     expected_output: opt_str("expected_output"),
                     max_steps: t
                         .get("max_steps")
@@ -219,6 +240,26 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                         _ => Vec::new(),
                     },
                     retry_on_fail: opt_str("retry_on_fail"),
+                    reference_ids: match t.get("reference_ids") {
+                        None => Vec::new(),
+                        Some(Value::Array(ids)) if ids.len() <= 4 => {
+                            let ids = ids.iter().map(|id| id.as_str().map(str::to_owned)
+                                .ok_or_else(|| anyhow::anyhow!("reference_ids requires scoped reference IDs")))
+                                .collect::<Result<Vec<_>>>()?;
+                            crate::core::reference_media::validate_reference_ids(&ids)?;
+                            ids
+                        }
+                        _ => bail!("reference_ids requires up to four unique scoped reference IDs"),
+                    },
+                    return_evidence: match t.get("return_evidence") {
+                        None => Vec::new(),
+                        Some(Value::Array(ids)) if ids.len() <= 4 => ids.iter().map(|id| {
+                            let id = id.as_str().filter(|s| !s.is_empty() && s.len() <= 128)
+                                .ok_or_else(|| anyhow::anyhow!("return_evidence requires up to four bounded evidence IDs"))?;
+                            Ok(id.to_string())
+                        }).collect::<Result<Vec<_>>>()?,
+                        _ => bail!("return_evidence requires up to four evidence IDs"),
+                    },
                 });
             }
             // Singular-writer invariant — shared with CLI `run_workflow` via
@@ -235,8 +276,22 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 name: "fanout".into(),
                 tasks,
                 synthesis,
+                prepared_synthesis: None,
             };
-            enforce_singular_writer(&spec)?;
+            // Validate the graph before resolving scopes; writer admission is checked again
+            // after preparation freezes the exact native resources.
+            crate::agent::workflow::waves(&spec.tasks)?;
+            if !crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED
+                || spec
+                    .tasks
+                    .iter()
+                    .filter(|task| {
+                        crate::agent::workflow::task_is_writer(&task.role, task.agent.as_deref())
+                    })
+                    .any(|task| task.write_paths.is_none() && task.read_paths.is_none())
+            {
+                enforce_singular_writer(&spec)?;
+            }
             Ok((spec, true))
         }
         "implement" => {
@@ -287,6 +342,7 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                     name: "verify".into(),
                     tasks,
                     synthesis: None,
+                    prepared_synthesis: None,
                 },
                 false,
             ))
@@ -295,101 +351,299 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
     }
 }
 
+fn workflow_has_no_outward_effects(spec: &WorkflowSpec) -> bool {
+    crate::agent::workflow::workflow_spec_synthesis_text_only(spec)
+        && spec.tasks.iter().all(|task| {
+            task.reference_ids.is_empty()
+                && task.return_evidence.is_empty()
+                && task.execution == crate::agent::speculation::ExecutionMode::Direct
+                && crate::agent::workflow::workflow_task_text_only_effect_free(task)
+        })
+}
+
 impl Tool for WorkflowTool {
     fn name(&self) -> &str {
         "workflow"
     }
     fn description(&self) -> &str {
-        "Run several sub-agents (the harness bounds how many run at once). fanout: tasks in \
-         parallel + one synthesized answer; `after` chains tasks (each gets its dependencies' \
-         reports; one writer per wave). implement: daedalus → themis → nemesis prebuilt from \
-         `prompt`, one fix loop on a themis FAIL. verify: a read-only refuter per finding. For \
-         one sub-task use `task`."
+        "Fanout tasks; after passes reports. Native exact scopes overlap; opaque work serializes. \
+         Parent verifies. implement: daedalus→themis→nemesis + one FAIL retry; \
+         verify: read-only refuter. One child→task; no restore/undo."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["fanout", "implement", "verify"], "description": "fanout · implement (prompt → daedalus, themis, nemesis) · verify (refute findings)"},
-                "prompt": {"type": "string", "description": "implement mode: the change to make"},
-                "tasks": {"type": "array", "maxItems": 32, "description": "fanout mode: the tasks", "items": {"type": "object", "properties": {
+                "mode": {"type": "string", "enum": ["fanout", "implement", "verify"], "description": "fanout=tasks; implement=prompt; verify=findings"},
+                "prompt": {"type": "string"},
+                "tasks": {"type": "array", "maxItems": 32, "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
-                    "prompt": {"type": "string", "description": "complete, self-contained task"},
-                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "default nemesis (read-only); daedalus/themis write — one writer per wave; legacy names accepted"},
-                    "agent": {"type": "string", "description": "optional specialist slug from <agents>"},
+                    "prompt": {"type": "string"},
+                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "nemesis=read(default); daedalus=edit; themis=test"},
+                    "agent": {"type": "string", "description": "<agents> slug"},
                     "model": {"type": "string"},
-                    "boundaries": {"type": "string", "description": "what this child must NOT do or touch"},
-                    "expected_output": {"type": "string", "description": "the shape/content of the answer wanted back"},
-                    "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
-                    "max_steps": {"type": "integer", "description": "total step budget (cap 80)"},
-                    "expects": {"type": "object", "description": "JSON Schema the child's answer must satisfy"},
-                    "after": {"type": "array", "items": {"type": "string"}, "description": "ids this task waits for; it receives their reports"},
-                    "retry_on_fail": {"type": "string", "description": "an `after` id to re-run once (then this task) when this report opens with VERDICT: FAIL"}
+                    "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Native text files only; private same-base edits, parent integrates/verifies; no hooks/shell/media."},
+                    "reference_ids": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","maxLength":128},"description":"Conversation refs; live grant."},
+                    "return_evidence": {"type":"array","maxItems":4,"items":{"type":"string","maxLength":128}},
+                    "boundaries": {"type": "string"},
+                    "read_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"reads; without write_paths read-only; union <=32 native files"},
+                    "write_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"read/write union; parent integrates"},
+                    "expected_output": {"type": "string"},
+                    "context": {"type": "array", "items": {"type": "string"}, "description":"known findings, <=10 lines"},
+                    "max_steps": {"type": "integer", "description": "steps; cap 80"},
+                    "expects": {"type": "object", "description": "JSON-only answer schema"},
+                    "after": {"type": "array", "items": {"type": "string"}, "description":"prerequisite task IDs"},
+                    "retry_on_fail": {"type": "string", "description":"after ID: retry+rereview on VERDICT: FAIL"}
                 }, "required": ["prompt"], "additionalProperties": false}},
-                "synthesis": {"type": "string", "description": "fanout mode: optional merge instruction"},
-                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description": "verify mode: claims to refute, with file:line evidence"}
+                "synthesis": {"type": "string"},
+                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description":"verify claims: file:line"}
             },
             "required": ["mode"],
             "additionalProperties": false
         })
     }
-    /// Never concurrency-safe: the tool IS the parallelism (its children are the concurrent part),
-    /// and its writer arm must keep barrier semantics.
+    fn result_is_error(&self, result: &str) -> Option<bool> {
+        Some(result.contains("[Workflow incomplete:") || result.starts_with("error:"))
+    }
+    /// Unknown/argument-only workflows remain barriers. Only frozen text-only effect-free readers
+    /// may join an outer parallel batch, and only after the Phase C validation gate is enabled.
     fn is_concurrency_safe(&self) -> bool {
         false
     }
-    fn recovery_effect(&self, _args: &Value) -> bool {
-        true
+    fn is_destructive_prepared(&self, call: &PreparedToolCall) -> bool {
+        self.delegation_read_only_prepared(call) != Some(true)
     }
-    fn execute(&self, args: &Value) -> Result<String> {
+    fn is_concurrency_safe_prepared(&self, call: &PreparedToolCall) -> bool {
+        crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED
+            && call
+                .delegation
+                .as_ref()
+                .and_then(|dispatch| dispatch.downcast_ref::<PreparedWorkflowDispatch>())
+                .is_some_and(|dispatch| {
+                    dispatch.read_only && workflow_has_no_outward_effects(&dispatch.spec)
+                })
+    }
+    fn plan_call(
+        &self,
+        args: &Value,
+        ctx: &crate::core::exec_ctx::ExecutionContext,
+    ) -> Result<PreparedToolCall> {
+        self.prepare_call(args, ctx)
+    }
+    fn prepare_call(
+        &self,
+        args: &Value,
+        ctx: &crate::core::exec_ctx::ExecutionContext,
+    ) -> Result<PreparedToolCall> {
         if self.depth >= 1 {
             bail!(
                 "workflow is depth-capped at 1 — a sub-agent cannot orchestrate further fan-outs"
             );
         }
-        let (spec, synthesize) = build_spec(args)?;
-        // Sub-agent gate is acquired INSIDE run_workflow_collect — one slot per concurrent child
-        // (see SubagentSlot::acquire_up_to), so the fan-out is counted against the global cap at its
-        // real width rather than as a single slot for the whole call. Over-limit → soft error there.
+        let (mut spec, synthesize) = build_spec(args)?;
+        crate::agent::workflow::prepare_workflow_spec_in_context(
+            &mut spec,
+            &self.root,
+            &self.base_url,
+            &self.api_key,
+            &self.model,
+            ctx,
+        )?;
+        let read_only = spec
+            .tasks
+            .iter()
+            .all(crate::agent::workflow::workflow_task_read_only);
+        let mut call = PreparedToolCall::new(args.clone());
+        let changes = std::sync::Arc::new(crate::core::exec_ctx::WorkspaceChanges::default());
+        call.workspace_changes = Some(changes.clone());
+        call.delegation = Some(std::sync::Arc::new(PreparedWorkflowDispatch {
+            spec,
+            synthesize,
+            read_only,
+            parent_ctx: ctx.with_workspace_changes(changes),
+        }));
+        Ok(call)
+    }
+    fn delegation_read_only_prepared(&self, call: &PreparedToolCall) -> Option<bool> {
+        call.delegation
+            .as_ref()?
+            .downcast_ref::<PreparedWorkflowDispatch>()
+            .map(|d| d.read_only)
+    }
+    fn workspace_effect_prepared(&self, call: &PreparedToolCall) -> super::tools::WorkspaceEffect {
+        match self.delegation_read_only_prepared(call) {
+            Some(false) => super::tools::WorkspaceEffect::OpaqueWorkspace,
+            _ => super::tools::WorkspaceEffect::None,
+        }
+    }
+    fn workspace_target_prepared(&self, call: &PreparedToolCall) -> Option<PathBuf> {
+        self.workspace_effect_prepared(call)
+            .needs_checkpoint()
+            .then(|| self.root.clone())
+    }
+    fn execute_prepared(&self, call: &PreparedToolCall) -> Result<ToolObservation> {
+        let dispatch = call
+            .delegation
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<PreparedWorkflowDispatch>())
+            .ok_or_else(|| anyhow::anyhow!("workflow requires its internally prepared dispatch"))?;
+        self.execute_dispatch(dispatch)
+    }
+    fn recovery_effect(&self, _args: &Value) -> bool {
+        true
+    }
+    fn may_return_images(&self, args: &Value) -> bool {
+        args.get("tasks")
+            .and_then(Value::as_array)
+            .is_some_and(|tasks| {
+                tasks.iter().any(|t| {
+                    t.get("return_evidence")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| !ids.is_empty())
+                })
+            })
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        self.execute_observation(args)
+            .map(|observation| observation.text)
+    }
+    fn execute_observation(&self, args: &Value) -> Result<ToolObservation> {
+        let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        let call = self.prepare_call(args, &ctx)?;
+        self.execute_prepared(&call)
+    }
+}
+
+impl WorkflowTool {
+    fn execute_dispatch(&self, dispatch: &PreparedWorkflowDispatch) -> Result<ToolObservation> {
+        let spec = &dispatch.spec;
+        let synthesize = dispatch.synthesize;
+        // Each physical attempt is admitted by the scheduler, including its model quota.
+        // The workflow wrapper does not reserve an unbudgeted batch of child slots.
         let client = self.client.clone();
         let base = self.base_url.clone();
         let key = self.api_key.clone();
         let model = self.model.clone();
         let approval = self.approval_mode;
         let cancel = crate::core::cancel::current().unwrap_or_default();
-        // Inherit the parent turn's conversation identity so a fanned-out child's tool body scopes
-        // per-conversation resources (the browser session) to the SAME conversation the parent serves.
-        // Read by `run_one_task` when it builds each child's `AgentConfig` (both run on this thread's
-        // `block_on`, so the thread-local is visible there).
-        let exec_ctx = crate::core::exec_ctx::current().unwrap_or_default();
-        tokio::task::block_in_place(|| {
+        // Keep the actual preparation carrier through the async driver; driver TLS cannot narrow or
+        // silently add authority to this already-approved workflow.
+        let exec_ctx = dispatch.parent_ctx.clone();
+        finish_workflow_dispatch(tokio::task::block_in_place(|| {
             crate::core::cancel::with_current(cancel, || {
                 crate::core::exec_ctx::with_current(exec_ctx, || {
-                    // EFFORT ISOLATION (same as the `task` tool): disarm the parent's process-global effort
-                    // override for this synchronous fan-out so every fanned-out child + the synthesis pass
-                    // resolves its own `cfg.reasoning_effort` instead of inheriting the parent's pinned tier.
-                    // Restored on drop before control returns to the parent turn.
-                    let _effort = crate::core::cli_config::suppress_effort_override();
-                    tokio::runtime::Handle::current().block_on(run_workflow_collect(
+                    // Every child and synthesis captures its own wire effort without touching a
+                    // process-global override shared with concurrent runs.
+                    tokio::runtime::Handle::current().block_on(run_workflow_collect_observation(
                         &client,
                         &base,
                         &key,
                         &model,
                         approval,
-                        &spec,
+                        spec,
                         synthesize,
                         &self.root,
                         self.context_window,
                     ))
                 })
             })
-        })
+        }))
+    }
+}
+
+/// Never turn unsettled physical effects into an ordinary partial observation. The driver keeps
+/// completed summaries as error context, while the marker remains available to central classification.
+fn finish_workflow_dispatch(result: Result<ToolObservation>) -> Result<ToolObservation> {
+    match result {
+        Err(error)
+            if crate::agent::tool_error_effect_state(&error)
+                != crate::agent::tools::ToolEffectState::Settled =>
+        {
+            Err(error.context(
+                "Workflow incomplete: physical child effects are unsettled; retained child reports",
+            ))
+        }
+        other => other,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_workflow_uncertainty_remains_typed_with_completed_reports() {
+        let retained = "── completed-child ──\nretained completed child summary";
+        let error =
+            anyhow::Error::new(crate::agent::task_tool::TaskWorkerStillRunning).context(retained);
+        let error = finish_workflow_dispatch(Err(error)).unwrap_err();
+        assert!(error.is::<crate::agent::task_tool::TaskWorkerStillRunning>());
+        let report = format!("{error:#}");
+        assert!(report.contains(retained));
+        assert!(report.contains("physical child effects are unsettled"));
+        let partial = anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+            crate::agent::tools::ToolEffectState::PossiblyApplied(Some(42)),
+        ))
+        .context(retained);
+        let partial = finish_workflow_dispatch(Err(partial)).unwrap_err();
+        assert_eq!(
+            crate::agent::tool_error_effect_state(&partial),
+            crate::agent::tools::ToolEffectState::PossiblyApplied(Some(42))
+        );
+        assert!(format!("{partial:#}").contains(retained));
+        let observation =
+            finish_workflow_dispatch(Ok(ToolObservation::from("completed".to_owned()))).unwrap();
+        assert_eq!(observation.text, "completed");
+        let ordinary =
+            finish_workflow_dispatch(Err(anyhow::anyhow!("ordinary preparation refusal")))
+                .unwrap_err();
+        assert!(!ordinary.is::<crate::agent::task_tool::TaskWorkerStillRunning>());
+    }
+
+    #[test]
+    fn outer_unknown_workflow_is_neither_safe_nor_a_hidden_reader() {
+        let tool = WorkflowTool::new(
+            reqwest::Client::new(),
+            "https://unused.example".into(),
+            "unused".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            0,
+            std::env::temp_dir(),
+            0,
+        );
+        let call = PreparedToolCall::new(
+            serde_json::json!({"mode": "verify", "findings": ["reader-looking JSON is not authority"]}),
+        );
+        assert!(!tool.is_concurrency_safe_prepared(&call));
+        assert!(tool.is_destructive_prepared(&call));
+        assert!(tool.parallel_write_keys_prepared(&call).is_none());
+    }
+
+    #[test]
+    fn incomplete_workflow_observations_are_explicit_tool_failures() {
+        let tool = WorkflowTool::new(
+            reqwest::Client::new(),
+            "https://unused.example".into(),
+            "unused".into(),
+            "m".into(),
+            crate::core::approval::ApprovalMode::Ask,
+            0,
+            std::env::temp_dir(),
+            0,
+        );
+        for body in [
+            "raw partial report\n[Workflow incomplete: cancelled; reports retained]",
+            "merged partial report\n[Workflow incomplete: tasks unresolved]",
+            "error: upstream failed",
+        ] {
+            assert_eq!(tool.result_is_error(body), Some(true));
+        }
+        assert_eq!(
+            tool.result_is_error("VERDICT: PASS\nscoped findings"),
+            Some(false)
+        );
+    }
 
     #[test]
     fn verify_mode_builds_refuter_tasks_no_synthesis() {
@@ -450,6 +704,59 @@ mod tests {
         .to_string();
         assert!(err.contains("unknown role"), "{err}");
         assert!(err.contains("argus"), "the real list is named: {err}");
+    }
+
+    #[test]
+    fn fanout_write_paths_are_bounded_exact_strings_and_owned_by_the_spec() {
+        let mut args = serde_json::json!({"mode": "fanout", "tasks": [{
+            "role": "daedalus", "prompt": "edit the parser implementation in src/parser.rs", "write_paths": ["src/parser.rs"]
+        }]});
+        let (spec, _) = build_spec(&args).unwrap();
+        args["tasks"][0]["write_paths"] = serde_json::json!(["outside.rs"]);
+        assert_eq!(
+            spec.tasks[0].write_paths.as_deref(),
+            Some(&["src/parser.rs".to_owned()][..])
+        );
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("a.rs"),
+            serde_json::json!([]),
+            serde_json::json!([true]),
+            serde_json::json!([""]),
+            serde_json::json!([" a.rs"]),
+            serde_json::json!(["a".repeat(4097)]),
+            serde_json::json!((0..33).map(|n| format!("{n}.rs")).collect::<Vec<_>>()),
+        ] {
+            args["tasks"][0]["write_paths"] = invalid;
+            assert!(build_spec(&args).is_err());
+        }
+        args["tasks"][0]["write_paths"] =
+            serde_json::json!((0..32).map(|n| format!("{n}.rs")).collect::<Vec<_>>());
+        assert_eq!(
+            build_spec(&args).unwrap().0.tasks[0]
+                .write_paths
+                .as_ref()
+                .unwrap()
+                .len(),
+            32
+        );
+    }
+
+    #[test]
+    fn scoped_fanout_still_refuses_parallel_writers() {
+        if crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED {
+            // Preparation, not the declaration parser, proves disjoint filesystem authority.
+            assert!(build_spec(&serde_json::json!({"mode": "fanout", "tasks": [
+                {"role": "daedalus", "prompt": "edit the first parser implementation in a.rs", "write_paths": ["a.rs"]},
+                {"role": "daedalus", "prompt": "edit the second parser implementation in b.rs", "write_paths": ["b.rs"]}
+            ]})).is_ok());
+            return;
+        }
+        let err = build_spec(&serde_json::json!({"mode": "fanout", "tasks": [
+            {"role": "daedalus", "prompt": "edit the first parser implementation in a.rs", "write_paths": ["a.rs"]},
+            {"role": "daedalus", "prompt": "edit the second parser implementation in b.rs", "write_paths": ["b.rs"]}
+        ]})).unwrap_err().to_string();
+        assert!(err.contains("write-capable"), "{err}");
     }
 
     #[test]

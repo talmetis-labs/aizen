@@ -310,7 +310,7 @@ pub fn list() -> Vec<AgentDef> {
         by_slug.extend(dir_map(&dir, source)); // ascending → later overwrites
     }
     let mut out: Vec<AgentDef> = by_slug.into_values().collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -1025,7 +1025,7 @@ mod tests {
             );
             // desc clipped to INDEX_DESC_CHARS
             let sample = idx.lines().find(|l| l.starts_with("- agent-00:")).unwrap();
-            let desc = sample.splitn(2, ": ").nth(1).unwrap();
+            let desc = sample.split_once(": ").unwrap().1;
             assert!(
                 desc.len() <= INDEX_DESC_CHARS,
                 "desc clipped: {} chars",

@@ -11,9 +11,11 @@
 //! `tsconfig.json` → `npx tsc --noEmit`; else `None`. Commands run through the platform shell
 //! (`cmd /C` / `sh -c`) so the npm/npx `.cmd` shims resolve on Windows.
 
+use crate::core::exec_ctx::ExecutionContext;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -146,6 +148,15 @@ pub struct VerifyGateResult {
     pub output: String,
     pub duration_ms: u128,
     pub stable: bool,
+    pub effect_state: crate::agent::tools::ToolEffectState,
+}
+
+impl VerifyGateResult {
+    pub fn accepted(&self) -> bool {
+        self.passed
+            && self.stable
+            && self.effect_state == crate::agent::tools::ToolEffectState::Settled
+    }
 }
 
 /// Keep only the LAST `MAX_OUTPUT_CHARS` of combined output — compiler error stacks live at the
@@ -349,7 +360,9 @@ fn custom_verify_timeout(cwd: &Path) -> Option<u64> {
 }
 
 /// The verify budget the REPL and `/init` run under when no loop config names one.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 90;
+/// 180s covers cold compile of a large Rust workspace on Windows (linking dominates);
+/// warm runs finish in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
 /// How a timed-out command reports itself (the ladder reads it back to tell a slow suite from a
 /// broken one).
@@ -846,12 +859,27 @@ fn record_duration(root: &Path, command: &str, ms: u64) {
 /// could run. Each finished step's duration is recorded for the next plan. A suite that exceeds
 /// the budget is not a failure — it is noted, recorded as over budget so it is not retried
 /// blindly, and the ladder's earlier passes stand.
+#[cfg(test)]
 pub async fn run_verify_ladder(
     root: &Path,
     timeout_secs: u64,
     edited: &[PathBuf],
     quiet: bool,
 ) -> Option<VerifyGateResult> {
+    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    run_verify_ladder_in_context(root, timeout_secs, edited, quiet, &ctx).await
+}
+
+/// Driver entry point: its context is not installed in the synchronous tool thread-local.
+/// No writer or physical lease is held between ladder rungs or across the model's fix turn.
+pub async fn run_verify_ladder_in_context(
+    root: &Path,
+    timeout_secs: u64,
+    edited: &[PathBuf],
+    quiet: bool,
+    ctx: &ExecutionContext,
+) -> Option<VerifyGateResult> {
+    let baseline = source_fingerprint(root);
     let record = load_record(root);
     let ladder = plan_ladder(root, edited, timeout_secs, &record.measured_ms);
     if !quiet {
@@ -862,7 +890,6 @@ pub async fn run_verify_ladder(
     if ladder.steps.is_empty() {
         return None;
     }
-    let baseline = source_fingerprint(root);
     let custom_timeout = custom_verify_timeout(root);
     let mut last_pass: Option<VerifyGateResult> = None;
     for step in ladder.steps {
@@ -883,9 +910,12 @@ pub async fn run_verify_ladder(
             }
             _ => timeout_secs,
         };
-        let Some(mut r) = run_one_verify(root, &step.cmd, secs).await else {
+        let Some(mut r) = run_one_verify(root, &step.cmd, secs, ctx).await else {
             continue;
         };
+        if r.effect_state != crate::agent::tools::ToolEffectState::Settled {
+            return Some(r);
+        }
         let timed_out = r.output.starts_with(TIMED_OUT_PREFIX);
         record_duration(
             root,
@@ -896,10 +926,8 @@ pub async fn run_verify_ladder(
                 r.duration_ms as u64
             },
         );
-        r.stable = baseline.is_some() && baseline == source_fingerprint(root);
+        validate_source_result(&mut r, root, baseline);
         if !r.stable {
-            r.passed = false;
-            r.output = "verification result ignored: the source workspace changed while the command was running. No success was reported; retry after the other writer finishes".to_string();
             return Some(r);
         }
         if !r.passed {
@@ -918,12 +946,14 @@ pub async fn run_verify_ladder(
         }
         last_pass = Some(r);
     }
-    last_pass
+    validate_final_result(last_pass, root, baseline)
 }
 
 /// `/init`'s share of verification: detect the commands and the suite, time the fast rung once,
 /// and keep the result in HOME. Returns the lines to show the user.
 pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
+    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    let baseline = source_fingerprint(root);
     let cmds = detect_verify_commands(root);
     let suite = suite_command(root);
     let mut record = load_record(root);
@@ -931,6 +961,7 @@ pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
     record.commands = cmds.iter().map(|c| c.command_line()).collect();
     record.suite = suite.as_ref().map(|s| s.command_line());
     let mut lines = Vec::new();
+    let mut last_observed = None;
     if cmds.is_empty() && suite.is_none() {
         lines.push(
             "verify: no build or test command recognised here — a trusted .aizen/verify.json with \
@@ -941,8 +972,19 @@ pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
         return lines;
     }
     for cmd in &cmds {
-        match run_one_verify(root, cmd, timeout_secs).await {
-            Some(r) => {
+        match run_one_verify(root, cmd, timeout_secs, &ctx).await {
+            Some(mut r) => {
+                if r.effect_state != crate::agent::tools::ToolEffectState::Settled {
+                    lines.clear();
+                    lines.push(format!("verify: `{}` incomplete: {}", r.command, r.output));
+                    return lines;
+                }
+                validate_source_result(&mut r, root, baseline);
+                if !r.stable {
+                    lines.clear();
+                    lines.push(format!("verify: `{}` discarded: {}", r.command, r.output));
+                    return lines;
+                }
                 let timed_out = r.output.starts_with(TIMED_OUT_PREFIX);
                 record.measured_ms.insert(
                     r.command.clone(),
@@ -964,11 +1006,24 @@ pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
                     },
                     r.duration_ms as f64 / 1000.0
                 ));
+                last_observed = Some(r);
             }
             None => lines.push(format!(
                 "verify: `{}` could not run here (toolchain not installed?)",
                 cmd.command_line()
             )),
+        }
+    }
+    if let Some(result) = validate_final_result(last_observed, root, baseline) {
+        if !result.stable {
+            // A later skipped rung can still observe filesystem drift. Do not publish earlier
+            // pass/baseline lines as current-tree evidence or persist their measurements.
+            lines.clear();
+            lines.push(format!(
+                "verify: `{}` discarded: {}",
+                result.command, result.output
+            ));
+            return lines;
         }
     }
     if let Some(s) = &suite {
@@ -1000,7 +1055,7 @@ fn sandboxed_verify(
     cwd: &Path,
     command_line: &str,
     timeout_secs: u64,
-) -> Option<crate::sandbox::runner::Sandboxed<Command>> {
+) -> anyhow::Result<crate::sandbox::runner::Sandboxed<Command>> {
     crate::sandbox::runner::prepare_tokio(
         crate::sandbox::request::SandboxRequest::shell(
             crate::sandbox::CommandOrigin::VerifyGate,
@@ -1010,18 +1065,28 @@ fn sandboxed_verify(
         )
         .wall_timeout(Duration::from_secs(timeout_secs.max(1))),
     )
-    .ok() // a policy refusal degrades to "no verify ran" — the gate is best-effort by contract
 }
 
 /// Run the project's verify command LIST in order, stopping at the first failure (its result is
 /// the gate result); all-pass returns the last pass. Returns `None` when there is nothing to run
 /// (unknown project) or nothing could even be spawned (best-effort no-op).
 pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGateResult> {
+    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    run_verify_gate_in_context(cwd, timeout_secs, &ctx).await
+}
+
+/// Pass the driver's `cfg.exec_ctx` explicitly: a default scope cannot borrow its ancestor's
+/// workspace lease and would instead wait on the very dispatch invoking verification.
+pub async fn run_verify_gate_in_context(
+    cwd: &Path,
+    timeout_secs: u64,
+    ctx: &ExecutionContext,
+) -> Option<VerifyGateResult> {
+    let baseline = source_fingerprint(cwd);
     let cmds = detect_verify_commands(cwd);
     if cmds.is_empty() {
         return None;
     }
-    let baseline = source_fingerprint(cwd);
     let custom_timeout = custom_verify_timeout(cwd);
     let mut last_pass: Option<VerifyGateResult> = None;
     for cmd in cmds {
@@ -1035,13 +1100,14 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
             VerifyCommand::Custom(_) => custom_timeout.unwrap_or(timeout_secs),
             _ => timeout_secs,
         };
-        match run_one_verify(cwd, &cmd, secs).await {
+        match run_one_verify(cwd, &cmd, secs, ctx).await {
             None => continue,
             Some(mut r) => {
-                r.stable = baseline.is_some() && baseline == source_fingerprint(cwd);
+                if r.effect_state != crate::agent::tools::ToolEffectState::Settled {
+                    return Some(r);
+                }
+                validate_source_result(&mut r, cwd, baseline);
                 if !r.stable {
-                    r.passed = false;
-                    r.output = "verification result ignored: the source workspace changed while the command was running. No success was reported; retry after the other writer finishes".to_string();
                     return Some(r);
                 }
                 if !r.passed {
@@ -1051,7 +1117,61 @@ pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGate
             }
         }
     }
-    last_pass
+    validate_final_result(last_pass, cwd, baseline)
+}
+
+/// Strict-mode ownership follows the actual wait/pipe future, not the observing ladder. Keeping
+/// containment and the sandbox guard here also preserves their cleanup resources on unknown exit.
+struct VerifyOwnership {
+    _writer: crate::core::workspace_txn::WorkspaceWriterLease,
+    _physical: crate::core::workspace_txn::PhysicalEffectLease,
+    _context: ExecutionContext,
+    _activity: Arc<crate::core::workspace_txn::WorkspaceActivity>,
+    _containment: Arc<crate::core::proctree::Containment>,
+    _sandbox: Arc<Mutex<crate::sandbox::runner::SpawnGuard>>,
+}
+
+fn quarantine_verify(ownership: VerifyOwnership) {
+    // Deliberate process-long quarantine: neither wrapper exit nor an abandoned Tokio future
+    // proves that descendants stopped touching the workspace. Never silently unlock that body.
+    std::mem::forget(ownership);
+}
+
+fn verify_failed(command: &str, start: Instant, output: String) -> Option<VerifyGateResult> {
+    Some(VerifyGateResult {
+        passed: false,
+        command: command.to_string(),
+        output,
+        duration_ms: start.elapsed().as_millis(),
+        stable: true,
+        effect_state: crate::agent::tools::ToolEffectState::Settled,
+    })
+}
+
+fn verify_unsettled(command: &str, start: Instant, output: String) -> Option<VerifyGateResult> {
+    let mut result = verify_failed(command, start, output)?;
+    result.effect_state = crate::agent::tools::ToolEffectState::UnknownWorker;
+    Some(result)
+}
+
+/// Job accounting may lag wrapper exit. Only affirmative tree proof releases ownership; missing
+/// containment and query errors remain unknown. Cleanup has its own bound even after cancellation.
+async fn await_verify_tree(
+    deadline: tokio::time::Instant,
+    mut query: impl FnMut() -> std::io::Result<Option<bool>>,
+) -> bool {
+    loop {
+        match query() {
+            Ok(Some(true)) => return true,
+            Ok(Some(false)) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+                )
+                .await;
+            }
+            Ok(Some(false) | None) | Err(_) => return false,
+        }
+    }
 }
 
 /// Run ONE verify command in `cwd` with a wall-clock timeout.
@@ -1059,58 +1179,163 @@ async fn run_one_verify(
     cwd: &Path,
     cmd: &VerifyCommand,
     timeout_secs: u64,
+    ctx: &ExecutionContext,
 ) -> Option<VerifyGateResult> {
     let command_line = cmd.command_line();
     let start = Instant::now();
-
-    let mut sbx = sandboxed_verify(cwd, &command_line, timeout_secs)?;
+    let cancel = crate::core::cancel::current();
+    let strict = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
+    let mut sbx = match sandboxed_verify(cwd, &command_line, timeout_secs) {
+        Ok(sbx) => sbx,
+        Err(error) => {
+            return verify_failed(
+                &command_line,
+                start,
+                format!("verify admission refused: {error}"),
+            )
+        }
+    };
+    // OFF deliberately retains the legacy unsupported-platform lifecycle. ON admits each opaque
+    // physical body independently; no ancestor/sidecar physical handle may authorize this spawn.
+    let admission = if strict {
+        let scope = ctx.resource_scope();
+        let admitted = (|| -> anyhow::Result<_> {
+            let writer = crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                cwd,
+                Duration::from_secs(15),
+                cancel.as_ref(),
+                "verify command",
+                &scope,
+            )?;
+            let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                Duration::from_secs(15),
+                cancel.as_ref(),
+                "verify command body",
+                &scope,
+            )?;
+            let activity = crate::core::workspace_txn::WorkspaceActivity::begin(cwd, &scope)?;
+            Ok((writer, physical, activity))
+        })();
+        match admitted {
+            Ok(admission) => Some(admission),
+            Err(error) => {
+                return verify_failed(
+                    &command_line,
+                    start,
+                    format!("verify admission refused: {error}"),
+                )
+            }
+        }
+    } else {
+        None
+    };
     sbx.command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true); // a dropped (timed-out) future kills the child.
-                             // `kill_on_drop` alone reaches only the `cmd.exe`/`sh` wrapper. The verify command is a BUILD
-                             // (`cargo check`, `tsc`, `npm test`), so the surviving grandchild is a compiler holding a lock on
-                             // `target/` — the next verify then blocks on that lock and times out too, and the timeouts
-                             // compound instead of clearing. Containment makes the timeout actually stop the work.
-
-    let child = match sbx.command.spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
-            return None; // spawn failure (no toolchain) → silent no-op.
+        .kill_on_drop(true);
+    let (child, containment) = match sbx.spawn_contained_tokio() {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if !error.cleanup_verified() {
+                let note = error.to_string();
+                // Do not let a missing-toolchain skip or an earlier passing ladder result erase
+                // unproven cleanup of an actual owned child. Preserve admission until CLI exit.
+                std::mem::forget((error, admission, ctx.clone(), sbx));
+                return verify_unsettled(
+                    &command_line,
+                    start,
+                    format!("verification incomplete: {note}; physical ownership quarantined until CLI exit"),
+                );
+            }
+            return None; // No remaining physical body; missing toolchain remains a skip.
         }
     };
-    let containment = sbx.contain_tokio(&child);
+    let containment = Arc::new(containment);
+    let sandbox = Arc::new(Mutex::new(sbx.into_guard()));
+    let lifetime = admission.map(|(writer, physical, activity)| {
+        Arc::new(crate::agent::process::SettlementLifetime::new(
+            VerifyOwnership {
+                _writer: writer,
+                _physical: physical,
+                _context: ctx.clone(),
+                _activity: activity,
+                _containment: Arc::clone(&containment),
+                _sandbox: Arc::clone(&sandbox),
+            },
+            quarantine_verify,
+        ))
+    });
+    // One token covers wait_with_output's child wait AND both pipe drains. Seat it before any
+    // polling/proof, and leave it inside the actual future across timeout/cancel cleanup.
+    let drain = lifetime.as_ref().map(|lifetime| lifetime.drain());
+    let mut waited = Box::pin(async move {
+        let _drain = drain;
+        child.wait_with_output().await
+    });
     let dur = Duration::from_secs(timeout_secs.max(1));
-    // `wait_with_output` consumes the child, so the tree is killed through the containment handle
-    // rather than a `&mut Child` we no longer have. The wait is ALSO raced against the turn's
-    // cancel token: a verify command can hold the turn for minutes, and this used to be the one
-    // long region Esc could not reach — the user watched a `cargo check` they had already
-    // abandoned run to completion.
-    let cancel = crate::core::cancel::current();
-    let waited = timeout(dur, child.wait_with_output());
     let outcome = match &cancel {
         Some(c) => {
             tokio::select! {
-                o = waited => Some(o),
+                o = timeout(dur, waited.as_mut()) => Some(o),
                 _ = c.cancelled() => None,
             }
         }
-        None => Some(waited.await),
+        None => Some(timeout(dur, waited.as_mut()).await),
     };
-    let Some(outcome) = outcome else {
+    let mut pipes_settled = matches!(&outcome, Some(Ok(Ok(_))));
+    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    if !pipes_settled {
         crate::core::proctree::terminate_tree(&containment);
-        sbx.finish(crate::sandbox::runner::Outcome::Cancelled);
-        return None; // best-effort: the loop's own cancel check ends the run right after
-    };
-    if outcome.is_err() {
-        crate::core::proctree::terminate_tree(&containment);
+        if strict && !matches!(&outcome, Some(Ok(_))) {
+            // Poll only a pending wait future, never one that already returned Output or an error.
+            // Its drain token and ownership remain seated throughout this cleanup interval.
+            pipes_settled = matches!(
+                tokio::time::timeout_at(cleanup_deadline, waited.as_mut()).await,
+                Ok(Ok(_))
+            );
+        }
     }
-    sbx.finish(match &outcome {
-        Ok(Ok(output)) => crate::sandbox::runner::Outcome::Exit(output.status.code()),
-        Ok(Err(_)) => crate::sandbox::runner::Outcome::SpawnFailed,
-        Err(_) => crate::sandbox::runner::Outcome::Timeout,
-    });
+    let mut forced_cleanup = false;
+    let tree_settled = if strict && pipes_settled {
+        let natural_deadline = if matches!(&outcome, Some(Ok(Ok(_)))) {
+            (tokio::time::Instant::now() + Duration::from_secs(1)).min(cleanup_deadline)
+        } else {
+            cleanup_deadline
+        };
+        let natural = await_verify_tree(natural_deadline, || containment.known_quiescent()).await;
+        if !natural && matches!(containment.known_quiescent(), Ok(Some(false))) {
+            forced_cleanup = true;
+            crate::core::proctree::terminate_tree(&containment);
+            await_verify_tree(cleanup_deadline, || containment.known_quiescent()).await
+        } else {
+            natural
+        }
+    } else {
+        false
+    };
+    let audit = match &outcome {
+        Some(Ok(Ok(output))) => crate::sandbox::runner::Outcome::Exit(output.status.code()),
+        Some(Ok(Err(_))) => crate::sandbox::runner::Outcome::SpawnFailed,
+        Some(Err(_)) => crate::sandbox::runner::Outcome::Timeout,
+        None => crate::sandbox::runner::Outcome::Cancelled,
+    };
+    sandbox
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish(audit);
+    if let Some(lifetime) = &lifetime {
+        if pipes_settled && tree_settled {
+            lifetime.prove_tree_settled();
+        } else {
+            // Unix groups, absent containment, errors, or live descendants are NOT a proof.
+            // Do not let a suite timeout become an earlier-pass success in the ladder either.
+            return verify_unsettled(&command_line, start,
+                "verification incomplete: process-tree settlement is unproven; physical ownership quarantined until CLI exit".to_string());
+        }
+    }
+    let Some(outcome) = outcome else {
+        return None; // The loop's own cancel check ends the turn.
+    };
     match outcome {
         Ok(Ok(output)) => {
             let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1121,10 +1346,13 @@ async fn run_one_verify(
                 }
                 combined.push_str(&stderr);
             }
-            // A toolchain that is not installed is "nothing ran", not "the check failed": the
-            // shell wrapper turns a missing `cargo`/`go`/`python` into exit 127 with a one-line
-            // message, and reporting that as a verify FAILURE sent the model chasing a build
-            // error that does not exist.
+            if forced_cleanup {
+                return verify_failed(
+                    &command_line,
+                    start,
+                    format!("verification failed: wrapper exited with live descendants requiring tree termination; cleanup settled\n{}", tail_chars(combined.trim_end(), MAX_OUTPUT_CHARS)),
+                );
+            }
             if !output.status.success() && looks_like_missing_tool(output.status.code(), &combined)
             {
                 return None;
@@ -1135,78 +1363,51 @@ async fn run_one_verify(
                 output: tail_chars(combined.trim_end(), MAX_OUTPUT_CHARS),
                 duration_ms: start.elapsed().as_millis(),
                 stable: true,
+                effect_state: crate::agent::tools::ToolEffectState::Settled,
             })
         }
-        Ok(Err(_)) => None, // io error draining output → no-op.
-        Err(_) => Some(VerifyGateResult {
-            passed: false,
-            command: command_line,
-            output: format!("{TIMED_OUT_PREFIX}{timeout_secs}s (killed)"),
-            duration_ms: start.elapsed().as_millis(),
-            stable: true,
-        }),
+        Ok(Err(error)) => verify_failed(
+            &command_line,
+            start,
+            format!("verify output could not be drained: {error}"),
+        ),
+        Err(_) => verify_failed(
+            &command_line,
+            start,
+            format!("{TIMED_OUT_PREFIX}{timeout_secs}s (tree termination requested)"),
+        ),
     }
 }
 
-fn source_fingerprint(cwd: &Path) -> Option<u64> {
-    let mut files = Vec::new();
-    collect_source_files(cwd, &mut files, 0);
-    files.sort();
-    if files.is_empty() {
-        return None;
-    }
-    let mut data = Vec::new();
-    for path in files {
-        data.extend_from_slice(path.to_string_lossy().as_bytes());
-        data.push(0);
-        data.extend_from_slice(&std::fs::read(&path).ok()?);
-        data.push(0xff);
-    }
-    let digest = ring::digest::digest(&ring::digest::SHA256, &data);
-    Some(u64::from_le_bytes(digest.as_ref()[..8].try_into().ok()?))
+#[path = "verify_identity.rs"]
+mod local_identity;
+
+pub(crate) fn source_fingerprint(cwd: &Path) -> Option<[u8; 32]> {
+    local_identity::capture(cwd)
 }
 
-fn collect_source_files(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
-    if depth > 32 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name == ".git" || name == "target" || name == "node_modules" || name == ".aizen" {
-            continue;
-        }
-        if path.is_dir() {
-            collect_source_files(&path, out, depth + 1);
-        } else if path.is_file() && is_source_or_manifest(&path) {
-            out.push(path);
-        }
+/// Revalidate even after a skipped/unavailable final command. A live-tree digest is only a
+/// drift check; unavailable, stale or unsettled observations cannot certify success.
+fn validate_source_result(result: &mut VerifyGateResult, root: &Path, baseline: Option<[u8; 32]>) {
+    result.stable = result.stable
+        && result.effect_state == crate::agent::tools::ToolEffectState::Settled
+        && baseline.is_some()
+        && baseline == source_fingerprint(root);
+    if !result.stable {
+        result.passed = false;
+        result.output = "verification result ignored: local source identity changed or could not be captured completely within its limits. No success was reported; retry after the other writer finishes".to_string();
     }
 }
 
-fn is_source_or_manifest(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some(
-            "rs" | "toml"
-                | "lock"
-                | "json"
-                | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "go"
-                | "java"
-                | "cs"
-                | "cpp"
-                | "h"
-                | "hpp"
-        )
-    )
+fn validate_final_result(
+    mut result: Option<VerifyGateResult>,
+    root: &Path,
+    baseline: Option<[u8; 32]>,
+) -> Option<VerifyGateResult> {
+    if let Some(result) = result.as_mut() {
+        validate_source_result(result, root, baseline);
+    }
+    result
 }
 
 /// output is SHAPED first: deduped error blocks, capped counts — a 400-line wall of repeated
@@ -1218,21 +1419,12 @@ pub fn format_gate_failure(r: &VerifyGateResult) -> String {
             r.command, r.output
         );
     }
-    let mut msg = format!(
+    format!(
         "[aizen verify] `{}` FAILED ({} ms). Fix these errors before reporting the task done:\n\n{}",
         r.command,
         r.duration_ms,
         shape_failure_output(&r.output)
-    );
-    if let Some(hint) = crate::features::timemachine::recovery_hint() {
-        msg.push_str("\n\n");
-        msg.push_str(&hint);
-        msg.push_str(
-            " Prefer a surgical fix when the error is local; rewind when the approach itself is wrong \
-             (wrong design, cascading breakage). After a rewind, re-read files — disk contents changed.",
-        );
-    }
-    msg
+    )
 }
 
 /// Max distinct error blocks/rows surfaced to the model (the rest are counted, not quoted).
@@ -1344,8 +1536,12 @@ fn parse_cargo_diagnostics(raw: &str) -> Option<Vec<Diagnostic>> {
 pub fn baseline_from_result(result: &VerifyGateResult) -> VerifyBaseline {
     VerifyBaseline {
         command: result.command.clone(),
-        passed: result.passed,
-        diagnostics: (!result.passed)
+        passed: result.passed
+            && result.stable
+            && result.effect_state == crate::agent::tools::ToolEffectState::Settled,
+        diagnostics: (!result.passed
+            && result.stable
+            && result.effect_state == crate::agent::tools::ToolEffectState::Settled)
             .then(|| parse_diagnostics(&result.output))
             .flatten(),
     }
@@ -1357,6 +1553,14 @@ pub fn baseline_from_result(result: &VerifyGateResult) -> VerifyBaseline {
 /// baseline, unparseable failing output, command mismatch, timeout, or unstable result stays
 /// conservative and requires a clean exit.
 pub fn compare_to_baseline(baseline: &VerifyBaseline, current: &VerifyGateResult) -> VerifyDelta {
+    if !current.stable || current.effect_state != crate::agent::tools::ToolEffectState::Settled {
+        return VerifyDelta {
+            passed: false,
+            preexisting: 0,
+            new_diagnostics: Vec::new(),
+            note: None,
+        };
+    }
     if current.passed {
         return VerifyDelta {
             passed: true,
@@ -1541,6 +1745,10 @@ fn tail_chars(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+#[path = "verify_settlement_tests.rs"]
+mod settlement_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -1550,6 +1758,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn verify_wait_drain_retains_holder_after_observer_drop() {
+        struct Holder(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = Arc::new(crate::agent::process::SettlementLifetime::new(
+            Holder(Arc::clone(&released)),
+            |_| panic!("proven fixture must not quarantine"),
+        ));
+        let wait_and_pipes = observer.drain();
+        observer.prove_tree_settled(); // Synthetic fixture proof, not a wrapper-exit inference.
+        drop(observer);
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+        drop(wait_and_pipes);
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn verify_abandoned_wait_quarantines_unproven_holder() {
+        struct Holder {
+            released: Arc<std::sync::atomic::AtomicBool>,
+            quarantined: std::sync::mpsc::Sender<()>,
+        }
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                self.released
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn quarantine(holder: Holder) {
+            holder.quarantined.send(()).unwrap();
+            std::mem::forget(holder);
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (quarantined, seen) = std::sync::mpsc::channel();
+        let observer = Arc::new(crate::agent::process::SettlementLifetime::new(
+            Holder {
+                released: Arc::clone(&released),
+                quarantined,
+            },
+            quarantine,
+        ));
+        let wait_and_pipes = observer.drain();
+        drop(observer);
+        assert!(matches!(
+            seen.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(wait_and_pipes); // Dropping a future does not assert EOF or physical tree exit.
+        assert_eq!(seen.try_recv(), Ok(()));
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn verify_admission_refusal_is_an_explicit_failure() {
+        let result = verify_failed(
+            "cargo check",
+            Instant::now(),
+            "verify admission refused".into(),
+        )
+        .expect("admission failure must not pretend no toolchain was detected");
+        assert!(!result.passed);
+        assert_eq!(result.command, "cargo check");
+        assert!(result.output.contains("admission refused"));
     }
 
     #[test]
@@ -1825,6 +2103,150 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     }
 
     #[test]
+    fn accepted_verification_requires_pass_stability_and_actual_settlement() {
+        use crate::agent::tools::ToolEffectState;
+
+        let mut result = VerifyGateResult {
+            passed: true,
+            command: "owned verify".into(),
+            output: String::new(),
+            duration_ms: 1,
+            stable: true,
+            effect_state: ToolEffectState::Settled,
+        };
+        assert!(result.accepted());
+        result.passed = false;
+        assert!(!result.accepted());
+        result.passed = true;
+        result.stable = false;
+        assert!(!result.accepted());
+        result.stable = true;
+        for state in [
+            ToolEffectState::UnknownWorker,
+            ToolEffectState::PossiblyApplied(None),
+        ] {
+            result.effect_state = state;
+            assert!(!result.accepted(), "a pass bit cannot dominate {state:?}");
+        }
+    }
+
+    #[test]
+    fn unproven_verify_effects_cannot_match_a_red_or_green_baseline() {
+        let mut result = verify_unsettled(
+            "cargo check",
+            Instant::now(),
+            "error[E0308]: unchanged diagnostic".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.effect_state,
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
+        let baseline = baseline_from_result(&result);
+        assert!(!compare_to_baseline(&baseline, &result).passed);
+        // Even an erroneous pass bit must not dominate actual-worker uncertainty.
+        result.passed = true;
+        assert!(!compare_to_baseline(&baseline, &result).passed);
+    }
+
+    #[test]
+    fn stale_pass_and_stale_red_baseline_are_never_reused() {
+        let mut result = VerifyGateResult {
+            passed: true,
+            command: "cargo check".into(),
+            output: "error[E0308]: old error\n --> src/a.rs:1:1".into(),
+            duration_ms: 1,
+            stable: false,
+            effect_state: crate::agent::tools::ToolEffectState::Settled,
+        };
+        assert!(!baseline_from_result(&result).passed);
+        assert!(!compare_to_baseline(&baseline_from_result(&result), &result).passed);
+        result.passed = false;
+        assert!(baseline_from_result(&result).diagnostics.is_none());
+        result.stable = true;
+        let red = baseline_from_result(&result);
+        assert!(red.diagnostics.is_some());
+        assert!(compare_to_baseline(&red, &result).passed);
+        result.effect_state = crate::agent::tools::ToolEffectState::UnknownWorker;
+        assert!(baseline_from_result(&result).diagnostics.is_none());
+        assert!(!compare_to_baseline(&red, &result).passed);
+    }
+
+    #[test]
+    fn final_source_validation_rejects_drift_after_a_skipped_rung() {
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let root = temp.path();
+        std::fs::write(root.join("input.bin"), "before").unwrap();
+        let baseline = source_fingerprint(root);
+        assert!(baseline.is_some());
+        let pass = VerifyGateResult {
+            passed: true,
+            command: "owned verify".into(),
+            output: String::new(),
+            duration_ms: 1,
+            stable: true,
+            effect_state: crate::agent::tools::ToolEffectState::Settled,
+        };
+        assert!(
+            validate_final_result(Some(pass.clone()), root, baseline)
+                .unwrap()
+                .passed
+        );
+        std::fs::write(root.join("new-input.sh"), "exit 0").unwrap();
+        let stale = validate_final_result(Some(pass.clone()), root, baseline).unwrap();
+        assert!(!stale.passed && !stale.stable);
+        assert!(
+            !validate_final_result(Some(pass), root, None)
+                .unwrap()
+                .passed
+        );
+        assert!(validate_final_result(None, root, baseline).is_none());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Fixture HOME and trust stay pinned until owned verification commands settle"
+    )]
+    async fn init_verify_discards_earlier_passes_when_a_later_command_changes_inputs() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(root.join(".aizen")).unwrap();
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.as_os_str()),
+            ("AIZEN_PROJECT_ROOT", root.as_os_str()),
+        ]);
+        std::fs::write(root.join("input.txt"), "before").unwrap();
+        let change = if cfg!(windows) {
+            "echo after> input.txt"
+        } else {
+            "printf 'after' > input.txt"
+        };
+        std::fs::write(
+            root.join(".aizen/verify.json"),
+            serde_json::json!({"commands": ["echo owned pass", change]}).to_string(),
+        )
+        .unwrap();
+        crate::agent::mcp::trust_project().unwrap();
+        let lines = tokio::time::timeout(Duration::from_secs(15), init_verify(&root, 5))
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("discarded"), "{lines:?}");
+        assert!(!lines[0].contains("passed"), "{lines:?}");
+        assert!(
+            load_record(&root).measured_ms.is_empty(),
+            "invalidated measurements must not be persisted as a current baseline"
+        );
+    }
+
+    #[test]
     fn format_failure_includes_command_and_output() {
         let r = VerifyGateResult {
             passed: false,
@@ -1832,6 +2254,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
             output: "error[E0308]: mismatched types".into(),
             duration_ms: 1234,
             stable: true,
+            effect_state: crate::agent::tools::ToolEffectState::Settled,
         };
         let msg = format_gate_failure(&r);
         assert!(msg.contains("cargo check"));
@@ -2023,6 +2446,27 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         );
     }
 
+    #[tokio::test]
+    async fn verify_tree_accounting_lag_requires_affirmative_proof() {
+        let mut polls = 0;
+        assert!(
+            await_verify_tree(tokio::time::Instant::now() + Duration::from_secs(1), || {
+                polls += 1;
+                Ok(Some(polls >= 3))
+            })
+            .await
+        );
+        assert_eq!(polls, 3);
+        assert!(!await_verify_tree(tokio::time::Instant::now(), || Ok(Some(false))).await);
+        assert!(!await_verify_tree(tokio::time::Instant::now(), || Ok(None)).await);
+        assert!(
+            !await_verify_tree(tokio::time::Instant::now(), || Err(std::io::Error::other(
+                "owned query failure"
+            )))
+            .await
+        );
+    }
+
     /// The done-when of E0.7: a Python edit whose sibling test fails cannot pass the ladder. The
     /// fixture uses unittest (pytest is not a given on a dev machine); an interpreter that cannot
     /// run at all skips the assertion rather than faking it.
@@ -2052,8 +2496,11 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         };
         assert!(
             r.command.contains("-m unittest"),
-            "the narrow rung ran and is the gate result: {}",
-            r.command
+            "the narrow rung ran and is the gate result: {}; passed={}; effect={:?}; output={}",
+            r.command,
+            r.passed,
+            r.effect_state,
+            r.output
         );
         assert!(
             !r.passed,

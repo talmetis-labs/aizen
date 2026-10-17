@@ -8,7 +8,14 @@
 //! on disk (a relative path still resolves under `root`; `../` and absolute paths escape freely).
 //! SECURITY trade-off: agent-read web/tool content can now steer a write to an arbitrary path.
 
-use crate::agent::tools::{Tool, ToolRegistry, WorkspaceEffect};
+use crate::agent::tools::{
+    FilePreparation, PreparedFootprint, PreparedToolCall, Tool, ToolObservation, ToolRegistry,
+    WorkspaceEffect,
+};
+use crate::core::exec_ctx::ExecutionContext;
+use crate::core::file_placement::{prepare_destination, FilePurpose, ResolvedDestination};
+use crate::core::repo_lock::LockMode;
+use crate::core::workspace_txn::NativeResource;
 use anyhow::{bail, Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use once_cell::sync::Lazy;
@@ -19,6 +26,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "speculative_native_tools.rs"]
+mod speculative_native_tools;
+pub(crate) use speculative_native_tools::prepared_native_worker;
 
 /// Default wall-clock cap for `shell_run` (a hung command must never freeze the agent loop).
 const SHELL_TIMEOUT_SECS: u64 = 120;
@@ -276,6 +287,16 @@ fn resolve_root() -> Result<PathBuf> {
 /// sub-agent role, and by the task suite (`bench tasks`), which wants the real surface minus the
 /// `task`/`workflow` dispatchers.
 pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
+    #[cfg(feature = "browser")]
+    let browser_configured = crate::agent::browser::is_configured();
+    #[cfg(not(feature = "browser"))]
+    let browser_configured = false;
+    default_registry_for_browser(root, browser_configured)
+}
+
+fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRegistry {
+    #[cfg(not(feature = "browser"))]
+    let _ = browser_configured;
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
     // Registry construction happens exactly once per fresh top-level user turn. Apply any deferred
     // MCP `tools/list_changed` notification here — never from inside an agent run — so the model's
@@ -283,6 +304,14 @@ pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
     crate::agent::mcp::prepare_fresh_turn();
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
+    r.register(Box::new(crate::agent::design::DesignBriefTool));
+    r.register(Box::new(crate::agent::design::DesignGuideTool));
+    r.register(Box::new(crate::agent::design::DesignReviewTool));
+    r.register(Box::new(crate::agent::design::ReferenceCompareTool));
+    r.register(Box::new(crate::agent::design::ReferenceTraceTool));
+    r.register(Box::new(crate::agent::image_read::ReferenceRead::new(
+        root.to_path_buf(),
+    )));
     r.register(Box::new(MemoryList));
     r.register(Box::new(MemoryProfile));
     r.register(Box::new(MemoryAsk));
@@ -311,8 +340,16 @@ pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
     // `checkpoint_view` the read-only ones (diff/list). The split is on `is_destructive`, which the
     // trait defines per TYPE rather than per args — folding the reads in would make listing a
     // timeline ask the user for approval.
-    r.register(Box::new(crate::features::timemachine::Checkpoint));
-    r.register(Box::new(crate::features::timemachine::CheckpointView));
+    r.register(Box::new(crate::features::timemachine::Checkpoint::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(crate::features::timemachine::CheckpointView::new(
+        root.to_path_buf(),
+    )));
+    // Explicit per-owner undo belongs only to the coordinating parent's full registry.
+    r.register(Box::new(crate::agent::native_undo::NativeOwnerUndo::new(
+        root.to_path_buf(),
+    )));
     // Who else is editing this repository right now. Top-level only, and not because it is unsafe
     // (it is read-only): a sub-agent's writes are attributed to the SESSION that spawned it, so the
     // overlap warning it would need already surfaces on this window's turn. Registering it in
@@ -401,11 +438,15 @@ pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
             r.register(d.tool);
         }
     }
-    install_tool_search(&mut r);
-    // CDP browser tools (OPT-IN: `--features browser`, default OFF). Top-level only; they connect
-    // lazily to a local Chrome/Edge/Brave and return an actionable error if none is running.
+    r.register(Box::new(crate::agent::image_read::ImageRead::new(
+        root.to_path_buf(),
+    )));
+    // Lazy attach-only CDP client. No dead schemas without an explicitly configured target.
     #[cfg(feature = "browser")]
-    crate::agent::browser::register_browser_tools(&mut r);
+    if browser_configured {
+        crate::agent::browser::register_browser_tools(&mut r);
+    }
+    install_tool_search(&mut r);
     r
 }
 
@@ -421,7 +462,7 @@ fn register_skill_load(r: &mut ToolRegistry) {
 /// so it'd be pure schema-token cost on a fresh install. Destructive (rewrites + archives a skill),
 /// so it rides only the AUTHORING scopes (top-level + coder/specialist), never the read-only base.
 fn register_skill_refine(r: &mut ToolRegistry) {
-    if crate::skills::has_any() {
+    if r.get("skill_load").is_some() {
         r.register(Box::new(SkillRefine));
     }
 }
@@ -430,7 +471,7 @@ fn register_skill_refine(r: &mut ToolRegistry) {
 /// posture as `memory_forget`: retiring a procedure is a curation decision about the user's own
 /// curriculum, which a focused sub-agent has no business making mid-task.
 fn register_skill_forget(r: &mut ToolRegistry) {
-    if crate::skills::has_any() {
+    if r.get("skill_load").is_some() {
         r.register(Box::new(SkillForget));
     }
 }
@@ -571,6 +612,18 @@ const DEFERRED_ALWAYS: &[&str] = &[
     "symbol_insert",
     "codebase_search",
     "session_recall",
+    "design_guide",
+    "image_read",
+    "reference_read",
+    "reference_compare",
+    "reference_trace",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_eval",
+    "browser_set_viewport",
+    "browser_screenshot",
 ];
 
 /// Deferred on top of [`DEFERRED_ALWAYS`] when the conversation is a pure question: nothing is
@@ -660,6 +713,14 @@ fn should_register_workflow() -> bool {
 fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     let mut r = ToolRegistry::new();
     r.register(Box::new(MemorySearch));
+    r.register(Box::new(crate::agent::design::DesignBriefTool));
+    r.register(Box::new(crate::agent::design::DesignGuideTool));
+    r.register(Box::new(crate::agent::design::DesignReviewTool));
+    r.register(Box::new(crate::agent::design::ReferenceCompareTool));
+    r.register(Box::new(crate::agent::design::ReferenceTraceTool));
+    r.register(Box::new(crate::agent::image_read::ReferenceRead::new(
+        root.to_path_buf(),
+    )));
     // `memory_list` is read-only, so a sub-agent may inventory what is stored (that's what stops it
     // guessing) — but the WRITE trio (save/update/forget) is top-level only, registered in
     // `default_registry_in` and deliberately absent here.
@@ -780,6 +841,13 @@ pub fn role_registry(role: &str, root: &Path) -> ToolRegistry {
         r.register(Box::new(crate::agent::process::Process::new(
             root.to_path_buf(),
         )));
+        r.register(Box::new(crate::agent::image_read::ImageRead::new(
+            root.to_path_buf(),
+        )));
+        #[cfg(feature = "browser")]
+        if crate::agent::browser::is_configured() {
+            crate::agent::browser::register_browser_tools(&mut r);
+        }
     }
     if p.edit {
         r.register(Box::new(FileEdit::new(root.to_path_buf())));
@@ -845,6 +913,15 @@ pub fn agent_registry(def: &crate::agents::AgentDef, root: &Path) -> ToolRegistr
                     root.to_path_buf(),
                 )));
             }
+            "image_read" => r.register(Box::new(crate::agent::image_read::ImageRead::new(
+                root.to_path_buf(),
+            ))),
+            #[cfg(feature = "browser")]
+            "browser" => {
+                if crate::agent::browser::is_configured() {
+                    crate::agent::browser::register_browser_tools(&mut r);
+                }
+            }
             "skill_save" => {
                 // A persona granted skill authoring gets the refine companion too (gated on any
                 // skill existing — see register_skill_refine), so it can evolve, not just mint.
@@ -884,6 +961,9 @@ fn canonical_subagent_tool(raw: &str) -> Option<&'static str> {
         "bash" | "shell" | "shell_run" | "shellrun" | "run" | "run_command" | "terminal" => {
             Some("shell_run")
         }
+        "image_read" | "imageread" => Some("image_read"),
+        #[cfg(feature = "browser")]
+        "browser" => Some("browser"),
         // skill authoring
         "skill_save" | "skillsave" => Some("skill_save"),
         // read-only (already in base) / forbidden / unknown → not grantable.
@@ -903,15 +983,21 @@ fn write_effect(root: &Path, raw: Option<&str>) -> WorkspaceEffect {
     } else {
         root.join(path)
     };
-    let parent = if joined.exists() {
-        joined.as_path()
-    } else {
-        joined.parent().unwrap_or(root)
-    };
-    match parent.canonicalize() {
-        Ok(canon) if canon.starts_with(root) => WorkspaceEffect::Paths,
-        _ => WorkspaceEffect::External,
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut ancestor = Some(joined.as_path());
+    while let Some(path) = ancestor {
+        match path.canonicalize() {
+            Ok(canon) => {
+                return if canon.starts_with(&canonical_root) {
+                    WorkspaceEffect::Paths
+                } else {
+                    WorkspaceEffect::External
+                }
+            }
+            Err(_) => ancestor = path.parent(),
+        }
     }
+    WorkspaceEffect::OpaqueWorkspace
 }
 
 /// The DIRECTORY a write will land in — what [`Tool::workspace_target`] hands the checkpoint gate so
@@ -930,17 +1016,220 @@ fn write_target_dir(root: &Path, raw: Option<&str>) -> Option<std::path::PathBuf
     if joined.is_dir() {
         return Some(joined);
     }
-    joined.parent().map(|p| p.to_path_buf())
+    let mut parent = joined.parent();
+    while let Some(directory) = parent {
+        if directory.is_dir() {
+            return Some(directory.to_path_buf());
+        }
+        parent = directory.parent();
+    }
+    None
+}
+
+fn current_managed_path(root: &Path, raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let Some(ctx) = crate::core::exec_ctx::current() else {
+        return false;
+    };
+    let Some(placement) = ctx.placement() else {
+        return false;
+    };
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    joined.starts_with(crate::core::file_placement::artifact_workspace_root(
+        placement.workspace_root(),
+        placement.home_root(),
+    )) || joined.starts_with(placement.scratch_root())
 }
 
 fn move_effect(root: &Path, args: &Value) -> WorkspaceEffect {
-    let from = write_effect(root, args.get("from").and_then(|v| v.as_str()));
-    let to = write_effect(root, args.get("to").and_then(|v| v.as_str()));
-    if matches!(from, WorkspaceEffect::External) || matches!(to, WorkspaceEffect::External) {
+    let from_raw = args.get("from").and_then(Value::as_str);
+    let from = if current_managed_path(root, from_raw) {
         WorkspaceEffect::External
     } else {
+        write_effect(root, from_raw)
+    };
+    let to = if matches!(
+        args.get("purpose").and_then(Value::as_str),
+        Some("artifact" | "scratch")
+    ) {
+        WorkspaceEffect::External
+    } else {
+        write_effect(root, args.get("to").and_then(Value::as_str))
+    };
+    if matches!(from, WorkspaceEffect::Paths) || matches!(to, WorkspaceEffect::Paths) {
+        // A move removes its source even when the output is managed outside the checkout.
         WorkspaceEffect::Paths
+    } else if matches!(from, WorkspaceEffect::External) && matches!(to, WorkspaceEffect::External) {
+        WorkspaceEffect::External
+    } else {
+        WorkspaceEffect::OpaqueWorkspace
     }
+}
+
+fn validate_managed_source_ancestry(source: &Path) -> Result<()> {
+    for path in source.ancestors() {
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("checking managed source ancestry {}", path.display()))?;
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            meta.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = false;
+        if meta.file_type().is_symlink() || reparse {
+            bail!(
+                "managed source refuses symlink/reparse ancestry {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn placement_name(root: &Path, raw: &str, purpose: Option<FilePurpose>) -> String {
+    if matches!(purpose, Some(FilePurpose::Artifact | FilePurpose::Scratch)) {
+        raw.to_string()
+    } else {
+        let path = Path::new(raw);
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let mut ancestor = absolute.parent();
+        let mut resolved = absolute.clone();
+        while let Some(parent) = ancestor {
+            if let Ok(canonical) = parent.canonicalize() {
+                if let Ok(suffix) = absolute.strip_prefix(parent) {
+                    resolved = canonical.join(suffix);
+                }
+                break;
+            }
+            ancestor = parent.parent();
+        }
+        resolved.to_string_lossy().into_owned()
+    }
+}
+
+fn placement_preview(
+    raw: &str,
+    purpose: Option<FilePurpose>,
+    destination: &ResolvedDestination,
+) -> Vec<String> {
+    let purpose = match purpose {
+        Some(FilePurpose::Project) => "project",
+        Some(FilePurpose::Artifact) => "artifact",
+        Some(FilePurpose::Scratch) => "scratch",
+        None => "existing destination",
+    };
+    vec![format!(
+        "{purpose}: {raw} → {}",
+        destination.actual_path().display()
+    )]
+}
+
+fn require_existing_parent(target: &Path) -> Result<()> {
+    let parent = target
+        .parent()
+        .context("destination has no parent directory")?;
+    if !parent.is_dir() {
+        bail!("parent directory {} must exist", parent.display());
+    }
+    Ok(())
+}
+
+/// No git spawn during read-only preparation. A .git directory or worktree pointer identifies
+/// repository ownership; workspace-root membership handles a checkout with no Git metadata too.
+fn move_owner(root: &Path, target: &Path) -> Option<PathBuf> {
+    let mut ancestor = target.parent();
+    while let Some(dir) = ancestor {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        ancestor = dir.parent();
+    }
+    target.starts_with(root).then(|| root.to_path_buf())
+}
+
+/// Managed imports must not acquire symlink/reparse descendants or unsupported special files.
+/// Refuse an unprovable oversized tree instead of following it or silently weakening placement.
+fn managed_move_tree_snapshot(
+    source: &Path,
+) -> Result<Vec<(PathBuf, crate::core::persist::FileFingerprint)>> {
+    let mut pending = vec![(source.to_path_buf(), 0usize)];
+    let mut snapshot = Vec::new();
+    let mut bytes = 0u64;
+    while let Some((path, depth)) = pending.pop() {
+        if crate::core::cancel::current().is_some_and(|token| token.is_cancelled()) {
+            bail!("managed directory move cancelled during preflight");
+        }
+        if snapshot.len() >= 1024 || depth > 32 {
+            bail!("managed directory move exceeds preflight limit (1024 entries, depth 32)");
+        }
+        if let Ok(relative) = path.strip_prefix(source) {
+            if !relative.as_os_str().is_empty() {
+                crate::core::file_placement::validate_managed_name(&relative.to_string_lossy())?;
+            }
+        }
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("checking managed move source {}", path.display()))?;
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            meta.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = false;
+        if meta.file_type().is_symlink() || reparse {
+            bail!(
+                "managed directory move refuses symlink/reparse entry {}",
+                path.display()
+            );
+        }
+        let fingerprint = if meta.is_dir() {
+            let stamp = format!("directory:{}:{:?}", meta.len(), meta.modified()?);
+            for entry in std::fs::read_dir(&path)? {
+                if pending.len() + snapshot.len() >= 1024 {
+                    bail!("managed directory move exceeds preflight limit (1024 entries)");
+                }
+                pending.push((entry?.path(), depth + 1));
+            }
+            crate::core::persist::FileFingerprint::for_bytes(stamp.as_bytes())
+        } else if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            if bytes > 32 * 1024 * 1024 {
+                bail!("managed directory move exceeds preflight limit (32 MiB content)");
+            }
+            let file = std::fs::File::open(&path)?;
+            let mut contents = Vec::new();
+            use std::io::Read as _;
+            file.take(32 * 1024 * 1024 + 1).read_to_end(&mut contents)?;
+            if contents.len() as u64 != meta.len() {
+                bail!(
+                    "managed directory move source changed during preflight: {}",
+                    path.display()
+                );
+            }
+            crate::core::persist::FileFingerprint::for_bytes(&contents)
+        } else {
+            bail!(
+                "managed directory move refuses special file {}",
+                path.display()
+            );
+        };
+        snapshot.push((path, fingerprint));
+    }
+    snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(snapshot)
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -1457,10 +1746,8 @@ impl Tool for MemorySearch {
         "memory_search"
     }
     fn description(&self) -> &str {
-        "Find a stored fact about the user or project by lexical/semantic match — project \
-         knowledge lives HERE, not in the always-on <user_memory> block (STYLE + global prefs \
-         only). Not for the user's overall preferences → memory_profile. Searches the current \
-         workspace + global facts by default. Read-only."
+        "Find user/project facts by lexical/semantic match; default workspace + global. \
+         <user_memory> holds style/global prefs only; overall preferences -> memory_profile. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1468,8 +1755,8 @@ impl Tool for MemorySearch {
             "properties": {
                 "query": {"type": "string", "description": "what to recall"},
                 "limit": {"type": "integer", "description": "max hits (default 5)"},
-                "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "zones to search: current project + global (default), all zones, or global-only"},
-                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "restrict to one KIND of project knowledge — e.g. only past bugs, or only what previously FAILED"}
+                "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "current project + global (default), all zones, or global only"},
+                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "filter project knowledge by kind"}
             },
             "required": ["query"],
             "additionalProperties": false
@@ -1581,9 +1868,8 @@ impl Tool for MemoryProfile {
         "memory_profile"
     }
     fn description(&self) -> &str {
-        "The user's aggregated working profile (verbosity / autonomy / tooling / stack / \
-         language / frustrations) with per-dimension confidence + cited facts. Use to decide \
-         defaults. Not a single-fact lookup → use memory_search. Read-only."
+        "Read the user's working profile: verbosity/autonomy/tools/stack/language/frustrations, \
+         per-dimension confidence and cited facts. Use for defaults; fact lookup -> memory_search. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
@@ -1602,9 +1888,8 @@ impl Tool for MemoryAsk {
         "memory_ask"
     }
     fn description(&self) -> &str {
-        "Answer ONE specific question about the user from memory; ABSTAINS (says it can't tell) \
-         rather than guessing. Use for 'what would the user prefer here' decisions. Not a general \
-         fact search → use memory_search. Read-only."
+        "Answer one question about the user from memory; abstain rather than guess. \
+         General fact lookup -> memory_search. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -1641,16 +1926,14 @@ impl Tool for SessionRecall {
         "session_recall"
     }
     fn description(&self) -> &str {
-        "Digest of a previously saved conversation: opening request + latest exchanges. Use when \
-         the user asks to continue earlier/previous/most-recent work. Default is the newest \
-         conversation for this project; pass name from the <sessions> block for another. \
-         Read-only; the full transcript is only restored by the user typing /resume."
+        "Read a saved session's opening/latest exchanges to continue prior work. Default newest \
+         project session; name from <sessions> selects another. Only user /resume restores full history. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "saved conversation name (optional; default = most recent for this project)"}
+                "name": {"type": "string", "description": "optional saved session name; default newest for this project"}
             },
             "additionalProperties": false
         })
@@ -1666,19 +1949,17 @@ impl Tool for MemoryList {
         "memory_list"
     }
     fn description(&self) -> &str {
-        "Inventory the stored facts (id · type · zone · category · summary) with NO query — for \
-         'what do you remember?', an audit before editing/forgetting, or the exact id \
-         memory_update / memory_forget needs. Not for one fact by topic → memory_search. \
-         Read-only."
+        "List fact id/type/zone/category/summary without a query; audit or obtain \
+         memory_update/memory_forget ids. Topic search -> memory_search. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["current", "all", "global", "project"], "description": "zones to list: current project + global (default), every zone, global-only, or this project only"},
-                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "restrict to one memory type (optional)"},
+                "scope": {"type": "string", "enum": ["current", "all", "global", "project"], "description": "current project + global (default), all zones, global only, or project only"},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "optional memory type filter"},
                 "limit": {"type": "integer", "description": "max entries (default 50, max 200)"},
-                "include_archived": {"type": "boolean", "description": "list the recoverable archive instead of the live store (default false)"}
+                "include_archived": {"type": "boolean", "description": "recoverable archive, not live store (default false)"}
             },
             "additionalProperties": false
         })
@@ -1725,7 +2006,7 @@ impl Tool for MemoryList {
                 ))
             }
         };
-        Ok(crate::memory::inventory(&sel, mtype, limit, archived)?)
+        crate::memory::inventory(&sel, mtype, limit, archived)
     }
 }
 
@@ -1740,21 +2021,18 @@ impl Tool for MemorySave {
         "memory_save"
     }
     fn description(&self) -> &str {
-        "Store ONE durable fact the user asked you to remember, or a project fact worth keeping \
-         across sessions. Check memory_list/memory_search FIRST — if a fact on this topic already \
-         exists, use memory_update instead of adding a near-duplicate. Not for scratch notes within \
-         one turn. Defaults to the current project zone; set scope:'global' for a fact true \
-         everywhere."
+        "Save durable user-requested/project fact, not turn notes. Check memory_list/memory_search; \
+         existing topic -> memory_update. Default project; global for universal facts."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "short, unique, kebab-case-ish title — becomes the id"},
-                "body": {"type": "string", "description": "the fact itself, self-contained (a reader with no chat context must understand it); use absolute dates, not 'yesterday'"},
-                "description": {"type": "string", "description": "one-line summary used for recall ranking (optional)"},
-                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "user = who they are; feedback = how they want you to work; project = this codebase's state/goals; reference = external pointers. Default project."},
-                "scope": {"type": "string", "description": "'global' for a fact true in every workspace; omit (or 'project') to scope it to the current project"}
+                "name": {"type": "string", "description": "short unique kebab-case title; becomes id"},
+                "body": {"type": "string", "description": "self-contained fact; absolute dates, not relative dates"},
+                "description": {"type": "string", "description": "optional one-line recall-ranking summary"},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "user=identity; feedback=work preferences; project=codebase state/goals (default); reference=external pointers"},
+                "scope": {"type": "string", "description": "global=all workspaces; omitted/project=current project"}
             },
             "required": ["name", "body"],
             "additionalProperties": false
@@ -1819,21 +2097,19 @@ impl Tool for MemoryUpdate {
         "memory_update"
     }
     fn description(&self) -> &str {
-        "Revise a stored fact in place by id — correct it, sharpen the wording, retype it, or move \
-         it between global/project scope. Only the fields you pass change; the id and every other \
-         field stay put. Use this instead of saving a second, contradictory fact on the same topic. \
-         Get ids from memory_list."
+        "Revise fact by memory_list id; only supplied fields change, id stays fixed. \
+         Correct wording/type/global-project scope here, not with duplicate memory_save."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "the fact's id (or exact name) from memory_list"},
-                "body": {"type": "string", "description": "replacement body — the corrected fact, in full"},
-                "description": {"type": "string", "description": "replacement one-liner (empty string clears it)"},
-                "name": {"type": "string", "description": "replacement display title (the id does NOT change)"},
+                "id": {"type": "string", "description": "id or exact name from memory_list"},
+                "body": {"type": "string", "description": "full replacement fact"},
+                "description": {"type": "string", "description": "replacement summary; empty clears"},
+                "name": {"type": "string", "description": "replacement title; id unchanged"},
                 "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
-                "scope": {"type": "string", "description": "'global' to make it apply everywhere, or 'project' to scope it to the current workspace"}
+                "scope": {"type": "string", "description": "global=everywhere; project=current workspace"}
             },
             "required": ["id"],
             "additionalProperties": false
@@ -1920,16 +2196,15 @@ impl Tool for MemoryForget {
         "memory_forget"
     }
     fn description(&self) -> &str {
-        "Retire a stored fact the user says is wrong or obsolete. Moves it to a recoverable archive \
-         (the user can restore it) — it is NOT erased. Prefer memory_update when the fact is merely \
-         out of date, and only forget when it should stop applying entirely. Get ids from memory_list."
+        "Retire a user-identified wrong/obsolete fact to a user-restorable archive, not erase. \
+         Prefer memory_update if outdated; forget only if it should stop applying. Ids from memory_list."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "the fact's id (or exact name) from memory_list"},
-                "reason": {"type": "string", "description": "why it should stop applying (shown to the user in the approval prompt)"}
+                "id": {"type": "string", "description": "id or exact name from memory_list"},
+                "reason": {"type": "string", "description": "why it should stop applying; shown at approval"}
             },
             "required": ["id"],
             "additionalProperties": false
@@ -1969,11 +2244,182 @@ impl FileRead {
 /// call again.
 const MULTI_READ_MAX_FILES: usize = 8;
 
+/// Bound argument cloning as well as file bytes, including otherwise ignored model keys.
+fn bounded_native_arguments(args: &Value, tool: &str) -> Result<()> {
+    struct InputLimit(usize);
+    impl std::io::Write for InputLimit {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 > PREPARED_EDIT_MAX_BYTES {
+                return Err(std::io::Error::other("4 MiB native argument limit"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(InputLimit(0), args)
+        .with_context(|| format!("{tool} arguments exceed the 4 MiB preparation limit"))
+}
+
+/// An unprovable identity may use the legacy global lane, never a narrowed native lane.
+fn prepared_native_resource(
+    target: &Path,
+    ctx: Option<&ExecutionContext>,
+) -> Result<Option<NativeResource>> {
+    match NativeResource::resolve(target) {
+        Ok(resource) => Ok(Some(resource)),
+        Err(error) if ctx.is_some_and(|ctx| ctx.native_scope().is_some()) => Err(error)
+            .context("native-scoped call requires an unambiguous file resource; nothing executed"),
+        Err(_) => Ok(None),
+    }
+}
+
+fn check_native_path(
+    ctx: Option<&ExecutionContext>,
+    root: &Path,
+    name: &str,
+    writable: bool,
+) -> Result<()> {
+    let Some(scope) = ctx.and_then(ExecutionContext::native_scope) else {
+        return Ok(());
+    };
+    let path = Path::new(name);
+    NativeResource::validate_spelling(path)?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.canonicalize()?.join(path)
+    };
+    let resource = NativeResource::resolve(&absolute)?;
+    if writable {
+        scope.check_resource(&resource)
+    } else {
+        scope.check_read(&resource)
+    }
+}
+
+/// Frozen execution state cannot be transplanted into a narrower or differently owned lane.
+/// Ordinary direct calls keep their legacy compatibility; any ambient native scope fails closed.
+fn verify_frozen_native_context(frozen: Option<&ExecutionContext>) -> Result<()> {
+    let ambient = crate::core::exec_ctx::current();
+    match (
+        frozen.and_then(ExecutionContext::overlay),
+        ambient.as_ref().and_then(ExecutionContext::overlay),
+    ) {
+        (Some(frozen_overlay), Some(ambient_overlay))
+            if frozen_overlay.same_handle(ambient_overlay) => {}
+        (None, None) => {}
+        _ => bail!("prepared file call cannot cross live/private overlay or owner/base boundaries; prepare again"),
+    }
+    let frozen_scope = frozen.and_then(ExecutionContext::native_scope);
+    let ambient_scope = ambient.as_ref().and_then(ExecutionContext::native_scope);
+    match (frozen_scope, ambient_scope) {
+        (None, Some(_)) => {
+            bail!("unscoped prepared file call cannot execute under an ambient native scope; prepare again");
+        }
+        (Some(frozen_scope), Some(ambient_scope)) => {
+            if frozen.unwrap().resource_scope() != ambient.as_ref().unwrap().resource_scope()
+                || !frozen_scope.same_authority(ambient_scope)
+            {
+                bail!("prepared native file scope or owner differs from the ambient execution context; prepare again");
+            }
+        }
+        (Some(_), None) => {
+            bail!("prepared native file call lost its scoped ambient execution context; prepare again");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A read freezes the leaf identity, unlike a resource lease which names a replaceable file slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FrozenReadIdentity(u64, u64);
+
+impl FrozenReadIdentity {
+    fn capture(path: &Path) -> Result<Option<Self>> {
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Some(Self(metadata.dev(), metadata.ino())))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            };
+            let name: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error())
+                    .context("opening frozen read identity");
+            }
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+            let error = (ok == 0).then(std::io::Error::last_os_error);
+            unsafe {
+                CloseHandle(handle);
+            }
+            if let Some(error) = error {
+                return Err(error).context("checking frozen read identity");
+            }
+            Ok(Some(Self(
+                info.dwVolumeSerialNumber as u64,
+                ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            )))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            bail!("frozen native read identity is unavailable on this platform")
+        }
+    }
+}
+
+struct FrozenReadEntry {
+    label: String,
+    start: Option<u64>,
+    end: Option<u64>,
+    alias: PathBuf,
+    target: Option<PathBuf>,
+    identity: Option<FrozenReadIdentity>,
+    resource: Option<NativeResource>,
+    error: Option<String>,
+}
+
+struct FrozenFileRead {
+    entries: Vec<FrozenReadEntry>,
+    number: bool,
+    batch: bool,
+    omitted: usize,
+    ctx: Option<ExecutionContext>,
+}
+
 impl FileRead {
-    /// One file (or slice of it) — the shared body behind both the single `path` form and each
-    /// `files:[…]` entry. `max_lines`/`max_bytes` bound a WHOLE-file read (a batch splits the
-    /// single-call budget across its entries); `symbol_hint` gates the LSP advisory, which only
-    /// the single form emits (once per batch would be spam).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn read_one(
         &self,
@@ -1983,89 +2429,300 @@ impl FileRead {
         number: bool,
         max_lines: usize,
         max_bytes: usize,
-        symbol_hint: bool,
+        _symbol_hint: bool,
     ) -> Result<String> {
-        let resolved = confine(&self.root, path, true)?;
-        let content = std::fs::read_to_string(&resolved)
-            .with_context(|| format!("reading {}", resolved.display()))?;
-        // Record WHAT THIS SESSION SAW, so a later whole-file overwrite can tell "I know this
-        // content" from "the ground moved under me". Noted even for a partial (start/end) read: the
-        // fingerprint describes the state of the file on disk at the moment we looked, which is
-        // exactly the question `read_ledger::overwrite_conflict` asks later.
-        crate::core::read_ledger::note(
-            &resolved,
-            &crate::core::persist::FileFingerprint::for_bytes(content.as_bytes()),
-        );
-        // The whole file — verbatim under budget (the common case; keeps old_string round-trips
-        // byte-exact), or a clearly-marked head+tail preview when it's pathologically large.
-        if start.is_none() && end.is_none() && !number {
-            let view = budget_view(&content, path, max_lines, max_bytes);
-            // Retrieval-first nudge (mức 2): a long whole-file SOURCE read the model likely needs
-            // one item from. Advisory — the full `view` still follows — and only when the symbol
-            // tools it names are actually available (`is_code` + LSP on). Prepended so the model
-            // sees it before committing to re-reading the same file next turn.
-            if symbol_hint {
-                let is_code = crate::agent::lsp::discovery::server_for_path(&resolved).is_some();
+        let prepared = self.prepare_read(
+            &serde_json::json!({"path":path,"start":start,"end":end,"number":number}),
+            None,
+        )?;
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<FrozenFileRead>()
+            .unwrap();
+        self.read_entry(&frozen.entries[0], frozen, max_lines, max_bytes)
+    }
+
+    fn prepare_read(
+        &self,
+        args: &Value,
+        ctx: Option<&ExecutionContext>,
+    ) -> Result<PreparedToolCall> {
+        if let Some(ctx) = ctx {
+            if ctx.overlay().is_some() {
+                return speculative_native_tools::prepare_read_overlay(self, args, ctx);
+            }
+        }
+        bounded_native_arguments(args, "file_read")?;
+        let list = args.get("files").and_then(Value::as_array);
+        if list.is_some_and(Vec::is_empty) {
+            bail!("files[] is empty — pass at least one {{path,start,end}} entry, or use `path`");
+        }
+        let single;
+        let shown = if let Some(list) = list {
+            &list[..list.len().min(MULTI_READ_MAX_FILES)]
+        } else {
+            str_arg(args, "path")?;
+            single = vec![args.clone()];
+            &single[..]
+        };
+        let mut entries = Vec::with_capacity(shown.len());
+        let mut resources = Vec::with_capacity(shown.len());
+        let mut global = false;
+        let scoped = ctx.is_some_and(|ctx| ctx.native_scope().is_some());
+        if scoped {
+            // Validate the whole declaration before any entry can read metadata or content.
+            for entry in list.map_or(shown, |entries| entries.as_slice()) {
+                let path = entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .context("native-scoped file_read entry requires an exact path")?;
+                check_native_path(ctx, &self.root, path, false)?;
+            }
+        }
+        for entry in shown {
+            let Some(label) = entry.get("path").and_then(Value::as_str) else {
+                if scoped {
+                    bail!("native-scoped file_read entry requires an exact path");
+                }
+                global = true;
+                entries.push(FrozenReadEntry {
+                    label: String::new(),
+                    start: None,
+                    end: None,
+                    alias: PathBuf::new(),
+                    target: None,
+                    identity: None,
+                    resource: None,
+                    error: Some("entry missing `path`".to_string()),
+                });
+                continue;
+            };
+            let raw = Path::new(label);
+            let alias = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                self.root.canonicalize()?.join(raw)
+            };
+            let target = match confine(&self.root, label, true) {
+                Ok(target) => Some(target),
+                Err(error) if list.is_some() && !scoped => {
+                    global = true;
+                    entries.push(FrozenReadEntry {
+                        label: label.to_string(),
+                        start: entry.get("start").and_then(Value::as_u64),
+                        end: entry.get("end").and_then(Value::as_u64),
+                        alias,
+                        target: None,
+                        identity: None,
+                        resource: None,
+                        error: Some(format!("{error:#}")),
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let identity = FrozenReadIdentity::capture(target.as_deref().unwrap())?;
+            let resource = prepared_native_resource(target.as_deref().unwrap(), ctx)?;
+            if let Some(resource) = &resource {
+                resources.push((resource.clone(), LockMode::Shared));
+            } else {
+                global = true;
+            }
+            entries.push(FrozenReadEntry {
+                label: label.to_string(),
+                start: entry.get("start").and_then(Value::as_u64),
+                end: entry.get("end").and_then(Value::as_u64),
+                alias,
+                target,
+                identity,
+                resource,
+                error: None,
+            });
+        }
+        let mut prepared = PreparedToolCall::new(args.clone());
+        if let Some(placement) = ctx.and_then(ExecutionContext::placement) {
+            prepared.display_paths = entries
+                .iter()
+                .filter_map(|entry| {
+                    placement
+                        .scratch_display(&entry.alias)
+                        .map(|display| display.with_argument(PathBuf::from(&entry.label)))
+                })
+                .collect();
+        }
+        prepared.footprint = Some(if global {
+            PreparedFootprint::Global
+        } else {
+            PreparedFootprint::Native(resources)
+        });
+        prepared.delegation = Some(std::sync::Arc::new(FrozenFileRead {
+            entries,
+            number: args.get("number").and_then(Value::as_bool).unwrap_or(false),
+            batch: list.is_some(),
+            omitted: list.map_or(0, |list| list.len().saturating_sub(MULTI_READ_MAX_FILES)),
+            ctx: ctx.cloned(),
+        }));
+        Ok(prepared)
+    }
+
+    fn read_entry(
+        &self,
+        entry: &FrozenReadEntry,
+        frozen: &FrozenFileRead,
+        max_lines: usize,
+        max_bytes: usize,
+    ) -> Result<String> {
+        if let Some(error) = &entry.error {
+            bail!("{error}");
+        }
+        let resolved = entry
+            .target
+            .as_deref()
+            .context("file_read needs a frozen target")?;
+        if let Some(resource) = &entry.resource {
+            resource.verify()?;
+        }
+        if entry.alias.canonicalize()? != resolved {
+            bail!("file_read alias changed after preparation; prepare again");
+        }
+        if FrozenReadIdentity::capture(resolved)? != entry.identity {
+            bail!("file_read target identity changed after preparation; prepare again");
+        }
+        // Metadata and opened-handle length are checked before allocating or reading disk bytes.
+        #[cfg(test)]
+        tests::native_body_rendezvous("file_read", resolved);
+        let (content, observed) = FileEdit::read_bounded(resolved).with_context(|| {
+            format!(
+                "file_read requires a regular UTF-8 file at most 4 MiB: {}",
+                resolved.display()
+            )
+        })?;
+        if let Some(resource) = &entry.resource {
+            resource.verify()?;
+        }
+        if entry.alias.canonicalize()? != resolved {
+            bail!("file_read alias changed while reading; prepare again");
+        }
+        if FrozenReadIdentity::capture(resolved)? != entry.identity {
+            bail!("file_read target identity changed while reading; prepare again");
+        }
+        crate::core::read_ledger::note(resolved, &observed);
+        if entry.start.is_none() && entry.end.is_none() && !frozen.number {
+            let view = budget_view(&content, &entry.label, max_lines, max_bytes);
+            // No advisory discovery/RPC inside any exact native resource-locked body.
+            if !frozen.batch
+                && entry.resource.is_none()
+                && frozen
+                    .ctx
+                    .as_ref()
+                    .is_none_or(|ctx| ctx.native_scope().is_none())
+            {
+                let is_code = crate::agent::lsp::discovery::server_for_path(resolved).is_some();
                 let lsp_on = crate::agent::lsp::LSP.is_enabled();
-                let line_count = content.lines().count();
-                if let Some(hint) = whole_file_symbol_hint(is_code, lsp_on, line_count) {
+                if let Some(hint) = whole_file_symbol_hint(is_code, lsp_on, content.lines().count())
+                {
                     return Ok(format!("{hint}\n{view}"));
                 }
             }
             return Ok(view);
         }
         let lines: Vec<&str> = content.lines().collect();
-        let s = start.unwrap_or(1).max(1) as usize;
-        let e = (end.unwrap_or(lines.len() as u64) as usize).min(lines.len());
+        let s = entry.start.unwrap_or(1).max(1) as usize;
+        let e = (entry.end.unwrap_or(lines.len() as u64) as usize).min(lines.len());
         if s > e {
             return Ok(String::new());
         }
-        Ok(range_view(&lines, s, e, number, path, max_lines, max_bytes))
+        Ok(range_view(
+            &lines,
+            s,
+            e,
+            frozen.number,
+            &entry.label,
+            max_lines,
+            max_bytes,
+        ))
     }
 
-    /// The `files:[…]` batch form: N files/slices in ONE call — one round-trip instead of a
-    /// read-per-turn dribble. Per-entry errors are reported INLINE (a missing file must not void
-    /// the seven good reads next to it), and whole-file entries split the single-call budget so a
-    /// batch cannot admit N× the bytes one call may return.
-    fn read_many(&self, list: &[Value], args: &Value) -> Result<String> {
-        if list.is_empty() {
-            bail!("files[] is empty — pass at least one {{path,start,end}} entry, or use `path`");
+    fn read_prepared(&self, prepared: &PreparedToolCall) -> Result<String> {
+        if speculative_native_tools::is_overlay_read(prepared) {
+            return speculative_native_tools::execute_read_overlay(prepared)
+                .expect("overlay read delegation");
         }
-        let number = args
-            .get("number")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let shown = &list[..list.len().min(MULTI_READ_MAX_FILES)];
-        let per_lines = (FILE_READ_MAX_LINES / shown.len()).max(200);
-        let per_bytes = (FILE_READ_MAX_BYTES / shown.len()).max(4_000);
-        let mut out: Vec<String> = Vec::with_capacity(shown.len() + 1);
-        for entry in shown {
-            let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
-                out.push("── (entry missing `path`) ──".to_string());
-                continue;
-            };
-            let start = entry.get("start").and_then(|v| v.as_u64());
-            let end = entry.get("end").and_then(|v| v.as_u64());
-            let header = match (start, end) {
-                (None, None) => format!("── {path} ──"),
-                (s, e) => format!(
-                    "── {path}:{}-{} ──",
-                    s.map_or("1".to_string(), |v| v.to_string()),
-                    e.map_or("end".to_string(), |v| v.to_string()),
-                ),
-            };
-            match self.read_one(path, start, end, number, per_lines, per_bytes, false) {
-                Ok(body) => out.push(format!("{header}\n{body}")),
-                Err(err) => out.push(format!("{header}\nerror: {err:#}")),
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileRead>())
+            .context("file_read requires internally prepared paths and options")?;
+        verify_frozen_native_context(frozen.ctx.as_ref())?;
+        if let Some(scope) = frozen.ctx.as_ref().and_then(ExecutionContext::native_scope) {
+            for entry in &frozen.entries {
+                scope.check_read(
+                    entry
+                        .resource
+                        .as_ref()
+                        .context("scoped read lost its exact resource")?,
+                )?;
             }
         }
-        if list.len() > MULTI_READ_MAX_FILES {
-            out.push(format!(
-                "…[{} more file(s) not read — {MULTI_READ_MAX_FILES} per call max; call again for the rest]",
-                list.len() - MULTI_READ_MAX_FILES
-            ));
+        if !frozen.batch {
+            let output = self.read_entry(
+                &frozen.entries[0],
+                frozen,
+                FILE_READ_MAX_LINES,
+                FILE_READ_MAX_BYTES,
+            )?;
+            if output.len() > PREPARED_EDIT_MAX_BYTES {
+                bail!("file_read output exceeds the 4 MiB limit");
+            }
+            return Ok(output);
         }
-        Ok(out.join("\n"))
+        let per_lines = (FILE_READ_MAX_LINES / frozen.entries.len()).max(200);
+        let per_bytes = (FILE_READ_MAX_BYTES / frozen.entries.len()).max(4_000);
+        let mut output = String::new();
+        for entry in &frozen.entries {
+            let header = if entry.label.is_empty() {
+                "── (entry missing `path`) ──".to_string()
+            } else {
+                match (entry.start, entry.end) {
+                    (None, None) => format!("── {} ──", entry.label),
+                    (s, e) => format!(
+                        "── {}:{}-{} ──",
+                        entry.label,
+                        s.map_or("1".to_string(), |v| v.to_string()),
+                        e.map_or("end".to_string(), |v| v.to_string())
+                    ),
+                }
+            };
+            let body = match self.read_entry(entry, frozen, per_lines, per_bytes) {
+                Ok(body) => body,
+                Err(error) => format!("error: {error:#}"),
+            };
+            if output
+                .len()
+                .saturating_add(header.len())
+                .saturating_add(body.len())
+                .saturating_add(2)
+                > PREPARED_EDIT_MAX_BYTES
+            {
+                bail!("file_read output exceeds the 4 MiB limit");
+            }
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&header);
+            output.push('\n');
+            output.push_str(&body);
+        }
+        if frozen.omitted > 0 {
+            let note = format!("\n…[{} more file(s) not read — {MULTI_READ_MAX_FILES} per call max; call again for the rest]", frozen.omitted);
+            if output.len().saturating_add(note.len()) > PREPARED_EDIT_MAX_BYTES {
+                bail!("file_read output exceeds the 4 MiB limit");
+            }
+            output.push_str(&note);
+        }
+        Ok(output)
     }
 }
 
@@ -2074,21 +2731,18 @@ impl Tool for FileRead {
         "file_read"
     }
     fn description(&self) -> &str {
-        "Read a file, a 1-based start/end line range, or SEVERAL files in ONE call via \
-         files:[{path,start,end},…] — batch independent reads instead of one per turn. Use \
-         before editing. number:true prefixes each line with `N|`; leave it off when the text \
-         feeds file_edit's old_string. A relative path resolves under the working directory; \
-         absolute or `../` paths read elsewhere. For ONE named item prefer lsp_document_symbols \
-         + read_symbol over the whole file. Read-only."
+        "Read 1-based line ranges; batch files:[{path,start,end}] (max 8). Read before edits; \
+         number:false keeps raw old_string. Relative to cwd; absolute/../ allowed. \
+         For symbols use lsp_document_symbols + read_symbol. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "start": {"type": "integer", "description": "1-based first line (optional)"},
-                "end": {"type": "integer", "description": "1-based last line (optional)"},
-                "number": {"type": "boolean", "description": "prefix each line with `N|` (default false)"},
+                "start": {"type": "integer", "description": "optional 1-based first line"},
+                "end": {"type": "integer", "description": "optional 1-based last line"},
+                "number": {"type": "boolean", "description": "N| line prefixes (default false)"},
                 "files": {
                     "type": "array",
                     "items": {
@@ -2100,33 +2754,23 @@ impl Tool for FileRead {
                         },
                         "required": ["path"]
                     },
-                    "description": "batch form: several files/slices in one call (max 8); overrides path"
+                    "description": "batch files/ranges (max 8); overrides path"
                 }
             },
             "required": [],
             "additionalProperties": false
         })
     }
+    fn prepare_call(&self, args: &Value, ctx: &ExecutionContext) -> Result<PreparedToolCall> {
+        self.prepare_read(args, Some(ctx))
+    }
+    fn execute_prepared(&self, prepared: &PreparedToolCall) -> Result<ToolObservation> {
+        self.read_prepared(prepared).map(ToolObservation::text)
+    }
     fn execute(&self, args: &Value) -> Result<String> {
-        if let Some(list) = args.get("files").and_then(|v| v.as_array()) {
-            return self.read_many(list, args);
-        }
-        let path = str_arg(args, "path")?;
-        let start = args.get("start").and_then(|v| v.as_u64());
-        let end = args.get("end").and_then(|v| v.as_u64());
-        let number = args
-            .get("number")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        self.read_one(
-            path,
-            start,
-            end,
-            number,
-            FILE_READ_MAX_LINES,
-            FILE_READ_MAX_BYTES,
-            true,
-        )
+        let ctx = crate::core::exec_ctx::current();
+        let prepared = self.prepare_read(args, ctx.as_ref())?;
+        self.read_prepared(&prepared)
     }
 }
 
@@ -2291,12 +2935,9 @@ impl Tool for FileGlob {
     }
     fn description(&self) -> &str {
         concat!(
-            "Find files AND directories by name or glob (*, **, ?) — use this, not a shell command. \
-             A bare name (`Cargo.toml`) is a ranked, typo-tolerant search over the working dir, its \
-             parents, and Desktop/Documents/home; a glob (`src/**/*.rs`) or a `../`/absolute path \
-             targets one place. Case-insensitive unless the pattern has an uppercase letter. Sees \
-             dotfiles, target/, node_modules/ unless ignore:true; a bare-name search always skips \
-             heavy dirs. Read-only.",
+            "Find names by glob (*, **, ?) or fuzzy bare name. Bare names search cwd, ancestors, \
+             Desktop/Documents/home and skip heavy dirs; globs/../absolute target one place. \
+             Smart case; dotfiles/target included unless ignore:true. Read-only.",
             crate::search_routing!()
         )
     }
@@ -2304,8 +2945,8 @@ impl Tool for FileGlob {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "e.g. src/**/*.rs, ../sibling/**/*.py, or a bare name like 'confg.toml' for a fuzzy lookup"},
-                "ignore": {"type": "boolean", "description": "honour .gitignore and skip node_modules/target/.git like search_files (default false)"}
+                "pattern": {"type": "string", "description": "glob (src/**/*.rs, ../sibling/**/*.py) or bare name for fuzzy lookup"},
+                "ignore": {"type": "boolean", "description": "honour .gitignore; skip node_modules/target/.git (default false)"}
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -2324,6 +2965,29 @@ impl Tool for FileGlob {
         // (cwd → ancestors → Desktop/Documents/Downloads/home) so the file is found even when it
         // lives above the cwd — the whole reason a model no longer needs to shell out to `where`.
         let (anchor, sub) = glob_anchor(&self.root, pattern);
+        // STRUCTURED vs BARE-NAME (decided below) — but a fully LITERAL structured pattern (has a
+        // separator or absolute/`..` prefix, yet NO `*`/`?`) names ONE exact path, so a single
+        // stat answers it: no walk at all (this is the `ls that path` case — ripgrep-adjacent tools
+        // short-circuit the same way). `glob_anchor` already anchored a pure-literal pattern at its
+        // PARENT with the final segment in `sub`, so `anchor.join(sub)` is the literal target.
+        // Careful: (a) BARE names (`Cargo.toml`, `miniproject`) must NOT take this path — they are
+        // intentionally a broad ranked/fuzzy search across the familiar-location seeds; (b) on a
+        // MISS we fall through to the normal walk — stat can't answer smart-case and the walk would
+        // find `src/A.RS` for `src/a.rs` (mirrors file_read: a missing literal path reaches the same
+        // "not found" messaging, just slower); (c) the `?` exclusion matters — `?` is a glob char
+        // here, and on Windows it is also illegal in a real file name, so stat could never settle
+        // it either way.
+        {
+            let has_glob_char = sub.contains('*') || sub.contains('?');
+            let bare_name = sub == pattern.replace('\\', "/") && anchor == self.root;
+            if !has_glob_char && !bare_name {
+                let literal = anchor.join(&sub);
+                if std::fs::symlink_metadata(&literal).is_ok() {
+                    let s = display_path(&self.root, &literal);
+                    return Ok(if literal.is_dir() { format!("{s}/") } else { s });
+                }
+            }
+        }
         let sub_re = if sub.is_empty() {
             pattern.replace('\\', "/")
         } else {
@@ -2479,6 +3143,23 @@ impl Tool for FileGlob {
 
 // ── file_edit ────────────────────────────────────────────────────────────────
 
+const PREPARED_EDIT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Approval binds the computed bytes, not a replacement that could rematch changed content.
+struct FrozenFileEdit {
+    alias: ResolvedDestination,
+    destination: ResolvedDestination,
+    expected: crate::core::persist::FileFingerprint,
+    target: PathBuf,
+    resource: Option<NativeResource>,
+    ctx: Option<ExecutionContext>,
+    content: String,
+    output: String,
+    dry_run: bool,
+    no_op: bool,
+    managed: bool,
+}
+
 struct FileEdit {
     root: PathBuf,
 }
@@ -2487,172 +3168,397 @@ impl FileEdit {
         Self { root }
     }
 
-    /// Single exact-string replacement (or create-new when `old_string` is empty). The classic
-    /// one-shot form; the batch form lives in [`FileEdit::apply_edits`].
-    fn apply_single(&self, path: &str, args: &Value) -> Result<String> {
-        let new = str_arg(args, "new_string")?;
-        let old = args
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let replace_all = args
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let dry_run = dry_run_arg(args);
-
-        if old.is_empty() {
-            // create-new path
-            let target = confine(&self.root, path, false)?;
-            if target.exists() {
-                bail!("{path} exists; provide old_string to edit it, or use file_write to overwrite the whole file");
-            }
-            if dry_run {
-                return Ok(format!(
-                    "{DRY_RUN_PREFIX}: would create {path} ({} bytes); nothing written",
-                    new.len()
-                ));
-            }
-            crate::core::persist::create_if_absent(&target, new.as_bytes())
-                .with_context(|| format!("creating {}", target.display()))?;
-            return Ok(format!("created {path}"));
+    fn read_bounded(target: &Path) -> Result<(String, crate::core::persist::FileFingerprint)> {
+        use std::io::Read as _;
+        let metadata =
+            std::fs::metadata(target).with_context(|| format!("checking {}", target.display()))?;
+        if !metadata.is_file() || metadata.len() > PREPARED_EDIT_MAX_BYTES as u64 {
+            bail!("file_edit preparation requires a regular UTF-8 file at most 4 MiB; nothing written");
         }
-
-        let target = confine(&self.root, path, true)?;
-        let (content_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
-        let content = String::from_utf8(content_bytes.context("file disappeared while reading")?)
+        let file =
+            std::fs::File::open(target).with_context(|| format!("reading {}", target.display()))?;
+        let opened = file.metadata()?;
+        if !opened.is_file() || opened.len() > PREPARED_EDIT_MAX_BYTES as u64 {
+            bail!(
+                "file_edit input changed or exceeds the 4 MiB preparation limit; nothing written"
+            );
+        }
+        let mut bytes = Vec::with_capacity(opened.len() as usize);
+        file.take(PREPARED_EDIT_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > PREPARED_EDIT_MAX_BYTES {
+            bail!("file_edit input exceeds the 4 MiB preparation limit; nothing written");
+        }
+        let expected = crate::core::persist::FileFingerprint::for_bytes(&bytes);
+        let content = String::from_utf8(bytes)
             .with_context(|| format!("{} is not valid UTF-8", target.display()))?;
-        let applied = apply_one_edit(&content, old, new, replace_all, path)?;
-        // No-op guard: a match that produced byte-identical content (e.g. old_string == new_string)
-        // must not touch disk or arm the verify gate (W16).
-        if applied.content == content {
-            return Ok(format!(
-                "{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)"
-            ));
-        }
-        if dry_run {
-            return Ok(format!(
-                "{DRY_RUN_PREFIX}: would edit {path} ({}); nothing written\n{}",
-                applied.summary(),
-                diff_preview(&applied.before, &applied.after, applied.start_line)
-            ));
-        }
-        crate::core::persist::compare_and_atomic_write(
-            &target,
-            &expected,
-            applied.content.as_bytes(),
-        )
-        .with_context(|| format!("writing {}", target.display()))?;
-        // This edit read the file fresh and wrote it — the session now knows its content, so a later
-        // full overwrite in the same session is informed rather than blind.
-        crate::core::read_ledger::note(
-            &target,
-            &crate::core::persist::FileFingerprint::for_bytes(applied.content.as_bytes()),
-        );
-        let mut out = format!(
-            "edited {path} ({})\n{}",
-            applied.summary(),
-            diff_preview(&applied.before, &applied.after, applied.start_line)
-        );
-        // Post-edit LSP fold: NEW diagnostics land in THIS result (zero extra round-trips to
-        // discover breakage). Fail-soft + hard-capped inside; a no-op when LSP is off.
-        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
-            out.push('\n');
-            out.push_str(&fb);
-        }
-        Ok(out)
+        Ok((content, expected))
     }
 
-    /// Apply an ORDERED list of edits to ONE file in a single atomic write. Collapses what would be N
-    /// single `file_edit` round-trips (each invalidating the model's byte offsets) into one call /
-    /// one turn — this is the batch form the `edits` argument selects.
-    fn apply_edits(&self, path: &str, edits: &[Value], dry_run: bool) -> Result<String> {
-        if edits.is_empty() {
-            bail!("file_edit `edits` must be a non-empty array (or omit it and pass new_string for a single edit)");
+    fn bounded_edit(
+        content: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+        label: &str,
+    ) -> Result<EditApplied> {
+        let count = if old.is_empty() {
+            0
+        } else {
+            content.matches(old).count()
+        };
+        // Bound expansion BEFORE allocating the replacement, including replace_all amplification.
+        let projected = if count > 0 {
+            let replacements = if replace_all { count } else { 1 };
+            content
+                .len()
+                .saturating_sub(old.len().saturating_mul(replacements))
+                .saturating_add(new.len().saturating_mul(replacements))
+        } else {
+            // Fallback rungs may match one-byte spans and preserve line endings.
+            let replacements = if replace_all { content.len() } else { 1 };
+            content
+                .len()
+                .saturating_add(new.len().saturating_add(2).saturating_mul(replacements))
+        };
+        if old.len().saturating_add(new.len()) > PREPARED_EDIT_MAX_BYTES
+            || projected > PREPARED_EDIT_MAX_BYTES
+        {
+            bail!("file_edit replacement exceeds the 4 MiB preparation limit; use smaller edits; nothing written");
         }
+        let applied = apply_one_edit(content, old, new, replace_all, label)?;
+        if applied.content.len() > PREPARED_EDIT_MAX_BYTES {
+            bail!("file_edit output exceeds the 4 MiB preparation limit; nothing written");
+        }
+        Ok(applied)
+    }
+
+    fn prepare_edit(
+        &self,
+        args: &Value,
+        ctx: Option<&ExecutionContext>,
+    ) -> Result<PreparedToolCall> {
+        if let Some(ctx) = ctx {
+            if ctx.overlay().is_some() {
+                return speculative_native_tools::prepare_edit_overlay(self, args, ctx);
+            }
+        }
+        struct InputLimit(usize);
+        impl std::io::Write for InputLimit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                if self.0 > PREPARED_EDIT_MAX_BYTES {
+                    return Err(std::io::Error::other("4 MiB file_edit input limit"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Count serialized arguments without allocating an unbounded copy, including unknown keys.
+        serde_json::to_writer(InputLimit(0), args)
+            .context("file_edit arguments exceed the 4 MiB preparation limit; nothing written")?;
+        let path = str_arg(args, "path")?;
+        let edits = args.get("edits").and_then(Value::as_array);
+        if let Some(edits) = edits {
+            if edits.is_empty() {
+                bail!("file_edit `edits` must be a non-empty array (or omit it and pass new_string for a single edit)");
+            }
+            if edits.len() > 1024 {
+                bail!("file_edit preparation supports at most 1024 edits; nothing written");
+            }
+        } else if args.get("new_string").is_none() {
+            bail!("file_edit needs either `new_string` (single edit, with `old_string`) or a non-empty `edits` array (batch of {{old_string, new_string}} applied atomically to {path})");
+        } else if args
+            .get("old_string")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            bail!("file_edit requires non-empty old_string and an existing file; use file_write with purpose:project|artifact|scratch to create a file or replace its whole content");
+        }
+        let input_bytes = if let Some(edits) = edits {
+            edits.iter().fold(0usize, |total, edit| {
+                total
+                    .saturating_add(
+                        edit.get("old_string")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len),
+                    )
+                    .saturating_add(
+                        edit.get("new_string")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len),
+                    )
+            })
+        } else {
+            args.get("old_string")
+                .and_then(Value::as_str)
+                .map_or(0, str::len)
+                .saturating_add(str_arg(args, "new_string")?.len())
+        };
+        if input_bytes > PREPARED_EDIT_MAX_BYTES {
+            bail!("file_edit arguments exceed the 4 MiB preparation limit; nothing written");
+        }
+        let raw_path = Path::new(path);
+        check_native_path(ctx, &self.root, path, true)?;
+        let alias_path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            self.root.canonicalize()?.join(raw_path)
+        };
+        // Keep the caller's link/ancestor spelling as a second guard; the write target is canonical.
+        let alias = prepare_destination(
+            ctx.and_then(ExecutionContext::placement),
+            &alias_path.to_string_lossy(),
+            None,
+        )?;
         let target = confine(&self.root, path, true)?;
-        let (original_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
-        let original = String::from_utf8(original_bytes.context("file disappeared while reading")?)
-            .with_context(|| format!("{} is not valid UTF-8", target.display()))?;
-
-        // Compute the whole result in memory; write ONCE at the end. Any edit error returns before
-        // the write is reached → atomic ("nothing written"), no temp file / rollback needed. Each
-        // edit re-searches the EVOLVING buffer, so offsets can never go stale (string search, not
-        // byte offsets) and a later edit may target text an earlier one produced.
-        let mut buf = original.clone();
-        let mut summaries: Vec<String> = Vec::with_capacity(edits.len());
-        // Diff each edit's OWN before/after (the small changed region) rather than the whole file:
-        // precise per-hunk output, and it keeps `diff_preview`'s prefix/suffix trim on small inputs
-        // (a whole-file trim would merge far-apart edits into one giant spurious hunk).
-        let mut diffs: Vec<String> = Vec::with_capacity(edits.len());
-        for (i, e) in edits.iter().enumerate() {
-            let n = i + 1;
-            let old = e
-                .get("old_string")
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("edit #{n}: missing old_string"))?;
-            let new = e
-                .get("new_string")
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("edit #{n}: missing new_string"))?;
-            let replace_all = e
-                .get("replace_all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let applied =
-                apply_one_edit(&buf, old, new, replace_all, &format!("edit #{n} ({path})"))?;
-            let detail = match (applied.rung, applied.count) {
-                ("exact", n) if replace_all => format!("{n} replacement(s), replace_all"),
-                ("exact", n) => format!("{n} replacement(s)"),
-                ("indent", 1) => "1 replacement, indentation-tolerant".to_string(),
-                (other, 1) => format!("1 replacement, {other} match"),
-                (other, n) => format!("{n} replacements, {other} match, replace_all"),
+        crate::core::native_journal::validate_mutation_target(&target)?;
+        let destination = prepare_destination(
+            ctx.and_then(ExecutionContext::placement),
+            &target.to_string_lossy(),
+            None,
+        )?;
+        let (original, expected) = Self::read_bounded(&target)?;
+        alias.verify()?;
+        destination.verify()?;
+        if alias.actual_path().canonicalize()? != target {
+            bail!("file_edit destination alias changed during preparation; nothing written");
+        }
+        let dry_run = dry_run_arg(args);
+        let (content, output) = if let Some(edits) = edits {
+            let mut buf = original.clone();
+            let mut summaries = Vec::with_capacity(edits.len());
+            let mut diffs = Vec::with_capacity(edits.len());
+            let mut preview_bytes = 0usize;
+            for (i, edit) in edits.iter().enumerate() {
+                let n = i + 1;
+                let old = edit
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("edit #{n}: missing old_string"))?;
+                let new = edit
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("edit #{n}: missing new_string"))?;
+                let replace_all = edit
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let applied = Self::bounded_edit(
+                    &buf,
+                    old,
+                    new,
+                    replace_all,
+                    &format!("edit #{n} ({path})"),
+                )?;
+                let detail = match (applied.rung, applied.count) {
+                    ("exact", n) if replace_all => format!("{n} replacement(s), replace_all"),
+                    ("exact", n) => format!("{n} replacement(s)"),
+                    ("indent", 1) => "1 replacement, indentation-tolerant".to_string(),
+                    (other, 1) => format!("1 replacement, {other} match"),
+                    (other, n) => format!("{n} replacements, {other} match, replace_all"),
+                };
+                let summary = format!("  #{n}: {detail}");
+                let diff = diff_preview(&applied.before, &applied.after, applied.start_line);
+                preview_bytes = preview_bytes
+                    .saturating_add(summary.len())
+                    .saturating_add(diff.len());
+                if preview_bytes > PREPARED_EDIT_MAX_BYTES {
+                    bail!("file_edit preview exceeds the 4 MiB preparation limit; nothing written");
+                }
+                summaries.push(summary);
+                diffs.push(diff);
+                buf = applied.content;
+            }
+            let output = if buf == original {
+                format!(
+                    "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
+                    edits.len()
+                )
+            } else if dry_run {
+                format!(
+                    "{DRY_RUN_PREFIX}: would edit {path} ({} edits); nothing written\n{}\n{}",
+                    edits.len(),
+                    summaries.join("\n"),
+                    diffs.join("\n")
+                )
+            } else {
+                format!(
+                    "edited {path} ({} edits applied)\n{}\n{}",
+                    edits.len(),
+                    summaries.join("\n"),
+                    diffs.join("\n")
+                )
             };
-            summaries.push(format!("  #{n}: {detail}"));
-            diffs.push(diff_preview(
-                &applied.before,
-                &applied.after,
-                applied.start_line,
-            ));
-            buf = applied.content;
+            (buf, output)
+        } else {
+            let applied = Self::bounded_edit(
+                &original,
+                str_arg(args, "old_string")?,
+                str_arg(args, "new_string")?,
+                args.get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                path,
+            )?;
+            let output = if applied.content == original {
+                format!("{NOOP_WRITE_PREFIX}: {path} unchanged (old_string == new_string)")
+            } else if dry_run {
+                format!(
+                    "{DRY_RUN_PREFIX}: would edit {path} ({}); nothing written\n{}",
+                    applied.summary(),
+                    diff_preview(&applied.before, &applied.after, applied.start_line)
+                )
+            } else {
+                format!(
+                    "edited {path} ({})\n{}",
+                    applied.summary(),
+                    diff_preview(&applied.before, &applied.after, applied.start_line)
+                )
+            };
+            (applied.content, output)
+        };
+        if output.len() > PREPARED_EDIT_MAX_BYTES {
+            bail!("file_edit preview exceeds the 4 MiB preparation limit; nothing written");
         }
+        let no_op = content == original;
+        let actual = target.to_string_lossy().into_owned();
+        let (first, rest) = output.split_once('\n').unwrap_or((&output, ""));
+        let preview = crate::agent::tools::ApprovalPreview {
+            title: actual.clone(),
+            diff: (!rest.is_empty()).then(|| rest.to_string()),
+            lines: vec![first.to_string()],
+        };
+        let target_managed = destination.is_managed()
+            || ctx
+                .and_then(ExecutionContext::placement)
+                .is_some_and(|placement| {
+                    target.starts_with(crate::core::file_placement::artifact_workspace_root(
+                        placement.workspace_root(),
+                        placement.home_root(),
+                    )) || target.starts_with(placement.scratch_root())
+                });
+        let resource = prepared_native_resource(&target, ctx)?;
+        let frozen_destination = destination.clone();
+        let frozen_expected = expected.clone();
+        let mut prepared = PreparedToolCall::new(args.clone());
+        prepared.display_paths = ctx
+            .and_then(ExecutionContext::placement)
+            .and_then(|placement| placement.scratch_display(&target))
+            .into_iter()
+            .collect();
+        prepared.footprint = Some(match &resource {
+            Some(resource) => {
+                PreparedFootprint::Native(vec![(resource.clone(), LockMode::Exclusive)])
+            }
+            None => PreparedFootprint::Global,
+        });
+        prepared.args["path"] = Value::String(actual);
+        prepared.preview = Some(preview);
+        prepared.preview_lines = placement_preview(path, None, &destination);
+        prepared.file = Some(FilePreparation {
+            destination,
+            source: None,
+            source_managed: target_managed,
+            expected: Some(expected),
+            source_expected: None,
+            source_tree: None,
+            destination_tree: None,
+        });
+        prepared.delegation = Some(std::sync::Arc::new(FrozenFileEdit {
+            alias,
+            destination: frozen_destination,
+            expected: frozen_expected,
+            target,
+            resource,
+            ctx: ctx.cloned(),
+            content,
+            output,
+            dry_run,
+            no_op,
+            managed: target_managed,
+        }));
+        Ok(prepared)
+    }
 
-        // No-op guard: every edit is individually valid (else apply_one_edit already bailed above),
-        // but a sequence that nets out to the original content (e.g. a change immediately undone by
-        // a later edit) must not touch disk or arm the verify gate (W16).
-        if buf == original {
-            return Ok(format!(
-                "{NOOP_WRITE_PREFIX}: {path} unchanged after {} edit(s) net to nothing",
-                edits.len()
-            ));
+    fn edit_prepared(
+        &self,
+        prepared: &PreparedToolCall,
+        check_read_ledger: bool,
+    ) -> Result<String> {
+        if let Some(result) = speculative_native_tools::execute_edit_overlay(prepared) {
+            return result;
         }
-        if dry_run {
-            return Ok(format!(
-                "{DRY_RUN_PREFIX}: would edit {path} ({} edits); nothing written\n{}\n{}",
-                edits.len(),
-                summaries.join("\n"),
-                diffs.join("\n")
-            ));
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileEdit>())
+            .context("file_edit requires internally prepared replacement bytes")?;
+        verify_frozen_native_context(frozen.ctx.as_ref())?;
+        crate::core::native_journal::validate_mutation_target(&frozen.target)?;
+        if let Some(resource) = &frozen.resource {
+            resource.verify()?;
         }
-        crate::core::persist::compare_and_atomic_write(&target, &expected, buf.as_bytes())
-            .with_context(|| format!("writing {}", target.display()))?;
-        // Same as the single form: record what this session now knows is on disk.
-        crate::core::read_ledger::note(
-            &target,
-            &crate::core::persist::FileFingerprint::for_bytes(buf.as_bytes()),
-        );
-        let mut out = format!(
-            "edited {path} ({} edits applied)\n{}\n{}",
-            edits.len(),
-            summaries.join("\n"),
-            diffs.join("\n")
-        );
-        // One fold after the single atomic write (same as the single form).
-        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
-            out.push('\n');
-            out.push_str(&fb);
+        frozen.alias.verify()?;
+        frozen.destination.verify()?;
+        if frozen.alias.actual_path().canonicalize()? != frozen.target {
+            bail!(
+                "file_edit destination alias changed; prepare and approve again; nothing written"
+            );
         }
-        Ok(out)
+        let (_, current) = Self::read_bounded(&frozen.target)?;
+        if frozen.expected != current {
+            bail!("file_edit target changed after preparation; prepare and approve again; nothing written");
+        }
+        // A preview/no-op must not refresh the ledger or pretend the session read current content.
+        if frozen.dry_run || frozen.no_op {
+            return Ok(frozen.output.clone());
+        }
+        if check_read_ledger {
+            if let Some(stale) =
+                crate::core::read_ledger::overwrite_conflict(&frozen.target, &current)
+            {
+                bail!(crate::core::read_ledger::conflict_message(
+                    &frozen.target.to_string_lossy(),
+                    &stale
+                ));
+            }
+        }
+        frozen.alias.verify()?;
+        frozen.destination.verify()?;
+        crate::core::native_journal::validate_mutation_target(&frozen.target)?;
+        let scoped = frozen
+            .ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.native_scope().is_some());
+        let written = if scoped {
+            let ctx = frozen.ctx.as_ref().unwrap();
+            let resource = frozen
+                .resource
+                .as_ref()
+                .context("native-scoped file_edit requires a frozen resource")?;
+            ctx.native_scope().unwrap().check_resource(resource)?;
+            #[cfg(test)]
+            tests::native_body_rendezvous("file_edit", &frozen.target);
+            crate::core::native_journal::apply(
+                resource,
+                &frozen.expected,
+                frozen.content.as_bytes(),
+                &ctx.resource_scope(),
+            )?
+        } else {
+            crate::core::persist::compare_and_atomic_write(
+                &frozen.target,
+                &frozen.expected,
+                frozen.content.as_bytes(),
+            )
+            .with_context(|| format!("writing {}", frozen.target.display()))?
+        };
+        crate::core::read_ledger::note(&frozen.target, &written);
+        // Advisory LSP work is deferred until the executor releases physical/resource locks.
+        Ok(frozen.output.clone())
     }
 }
 impl Tool for FileEdit {
@@ -2685,26 +3591,23 @@ impl Tool for FileEdit {
         })
     }
     fn description(&self) -> &str {
-        "Edit a file by exact string replacement. ONE edit → old_string + new_string; SEVERAL \
-         edits to the same file → `edits`, one atomic call (all or nothing) — always prefer \
-         that over repeat calls. old_string must be unique unless replace_all; an \
-         indentation-tolerant retry runs when the exact text misses. dry_run shows the diff and \
-         writes nothing. To create or fully rewrite a file use file_write. Read the file first. \
-         Absolute or `../` paths may write outside the working directory."
+        "Replace exact text; unique match unless replace_all. edits[] apply in order atomically; \
+         dry_run previews. On exact miss try indentation tolerance. Use file_write to create or \
+         replace a whole file. Absolute/../ paths may write outside cwd."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "old_string": {"type": "string", "description": "exact text to replace; empty = create new file"},
+                "old_string": {"type": "string", "description": "non-empty exact text to replace"},
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean"},
                 "dry_run": {"type": "boolean", "description": "preview the diff, write nothing"},
                 "edits": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "several edits to this one file, applied in order; use instead of old_string/new_string",
+                    "description": "ordered edits to this file; alternative to old_string/new_string",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -2733,21 +3636,47 @@ impl Tool for FileEdit {
     fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
         write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let path = str_arg(args, "path")?;
-        // An `edits` array selects the batch form; otherwise it's a single old_string/new_string
-        // replacement. Batch wins if both are somehow present (a caller that filled `edits` meant it).
-        match args.get("edits").and_then(|v| v.as_array()) {
-            Some(edits) => self.apply_edits(&path, edits, dry_run_arg(args)),
-            // Name BOTH forms when neither is present. `str_arg` alone would say only "missing
-            // new_string", which reads as "this tool cannot batch" — the one wrong lesson to teach a
-            // model that merely reached for the batch form and mis-spelled the key.
-            None if args.get("new_string").is_none() => bail!(
-                "file_edit needs either `new_string` (single edit, with `old_string`) or a non-empty \
-                 `edits` array (batch of {{old_string, new_string}} applied atomically to {path})"
-            ),
-            None => self.apply_single(&path, args),
+    fn workspace_effect_prepared(&self, prepared: &PreparedToolCall) -> WorkspaceEffect {
+        if let Some(effect) = speculative_native_tools::workspace_effect_prepared(prepared) {
+            return effect;
         }
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileEdit>());
+        if frozen.is_some_and(|edit| edit.dry_run || edit.no_op) {
+            WorkspaceEffect::None
+        } else if frozen.is_some_and(|edit| edit.managed) {
+            WorkspaceEffect::External
+        } else if let Some(edit) = frozen {
+            write_effect(&self.root, Some(&edit.target.to_string_lossy()))
+        } else {
+            self.workspace_effect(&prepared.args)
+        }
+    }
+    fn workspace_target_prepared(&self, prepared: &PreparedToolCall) -> Option<PathBuf> {
+        if speculative_native_tools::is_overlay_edit(prepared) {
+            return None;
+        }
+        prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileEdit>())
+            .and_then(|edit| edit.target.parent())
+            .map(Path::to_path_buf)
+    }
+    fn prepare_call(&self, args: &Value, ctx: &ExecutionContext) -> Result<PreparedToolCall> {
+        self.prepare_edit(args, Some(ctx))
+    }
+    fn execute_prepared(&self, prepared: &PreparedToolCall) -> Result<ToolObservation> {
+        self.edit_prepared(prepared, true)
+            .map(ToolObservation::text)
+    }
+    fn execute(&self, args: &Value) -> Result<String> {
+        let ctx = crate::core::exec_ctx::current();
+        let prepared = self.prepare_edit(args, ctx.as_ref())?;
+        // Legacy direct calls still match a fresh read; admitted calls retain the prior read ledger.
+        self.edit_prepared(&prepared, false)
     }
 }
 
@@ -2758,12 +3687,280 @@ impl Tool for FileEdit {
 /// shelling out (`type NUL > f` to blank the file, then a heredoc to refill it) — which destroys the
 /// file and then fails, the exact thrash this tool removes. `file_edit` stays the right tool for a
 /// localized change; `file_write` is for whole-file create/replace.
+struct FrozenFileWrite {
+    destination: ResolvedDestination,
+    expected: crate::core::persist::FileFingerprint,
+    target: PathBuf,
+    resource: Option<NativeResource>,
+    ctx: Option<ExecutionContext>,
+    content: String,
+    output: String,
+    no_op: bool,
+    managed: bool,
+}
+
+/// Preflight the exact lines diff_preview may render before allocating a large write preview.
+fn bounded_write_diff(before: &str, after: &str) -> Result<String> {
+    let b: Vec<&str> = before.lines().collect();
+    let a: Vec<&str> = after.lines().collect();
+    let mut prefix = 0;
+    while prefix < b.len() && prefix < a.len() && b[prefix] == a[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < b.len().saturating_sub(prefix)
+        && suffix < a.len().saturating_sub(prefix)
+        && b[b.len() - 1 - suffix] == a[a.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let mut projected = 1024usize; // hunk header, elision notes and line prefixes
+    for lines in [
+        &b[prefix.saturating_sub(2)..prefix],
+        &b[prefix..(b.len() - suffix).min(prefix.saturating_add(40))],
+        &a[prefix..(a.len() - suffix).min(prefix.saturating_add(40))],
+        &b[b.len() - suffix..(b.len() - suffix + 2).min(b.len())],
+    ] {
+        for line in lines {
+            projected = projected.saturating_add(line.len()).saturating_add(2);
+            if projected > PREPARED_EDIT_MAX_BYTES {
+                bail!("file_write preview exceeds the 4 MiB preparation limit; nothing written");
+            }
+        }
+    }
+    Ok(diff_preview(before, after, 1))
+}
+
 struct FileWrite {
     root: PathBuf,
 }
 impl FileWrite {
     fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    fn read_bounded(
+        target: &Path,
+    ) -> Result<(Option<String>, crate::core::persist::FileFingerprint)> {
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => {
+                FileEdit::read_bounded(target).map(|(content, expected)| (Some(content), expected))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok((None, crate::core::persist::FileFingerprint::missing()))
+            }
+            Err(error) => Err(error).with_context(|| format!("checking {}", target.display())),
+        }
+    }
+
+    fn prepare_write(
+        &self,
+        args: &Value,
+        ctx: Option<&ExecutionContext>,
+    ) -> Result<PreparedToolCall> {
+        if let Some(ctx) = ctx {
+            if ctx.overlay().is_some() {
+                return speculative_native_tools::prepare_write_overlay(self, args, ctx);
+            }
+        }
+        bounded_native_arguments(args, "file_write")?;
+        let path = str_arg(args, "path")?;
+        let content = str_arg(args, "content")?;
+        if content.len() > PREPARED_EDIT_MAX_BYTES {
+            bail!("file_write content exceeds the 4 MiB preparation limit; nothing written");
+        }
+        let purpose = FilePurpose::parse_optional(args.get("purpose"))?;
+        if ctx.is_some_and(|ctx| ctx.native_scope().is_some()) {
+            if matches!(purpose, Some(FilePurpose::Artifact | FilePurpose::Scratch)) {
+                bail!(
+                    "native scope permits only its exact project files, not managed destinations"
+                );
+            }
+            check_native_path(ctx, &self.root, path, true)?;
+        }
+        let raw = placement_name(&self.root, path, purpose);
+        let destination =
+            prepare_destination(ctx.and_then(ExecutionContext::placement), &raw, purpose)?;
+        if !destination.exists_at_preparation() && purpose.is_none() {
+            bail!("new file_write target requires purpose:project|artifact|scratch (e.g. {{\"path\":\"src/main.rs\",\"content\":\"...\",\"purpose\":\"project\"}})");
+        }
+        if !destination.is_managed() {
+            require_existing_parent(destination.actual_path())?;
+        }
+        let (before, expected) = Self::read_bounded(destination.actual_path())
+            .context("file_write preparation requires an existing file at most 4 MiB")?;
+        destination.verify()?;
+        let target = destination.actual_path().to_path_buf();
+        crate::core::native_journal::validate_mutation_target(&target)?;
+        let resource = prepared_native_resource(&target, ctx)?;
+        let actual = target.to_string_lossy().into_owned();
+        let no_op = before.as_deref() == Some(content);
+        let diff = before
+            .as_deref()
+            .filter(|before| *before != content)
+            .map(|before| bounded_write_diff(before, content))
+            .transpose()?;
+        if diff
+            .as_ref()
+            .is_some_and(|diff| diff.len() > PREPARED_EDIT_MAX_BYTES)
+        {
+            bail!("file_write preview exceeds the 4 MiB preparation limit; nothing written");
+        }
+        let lines = vec![if no_op {
+            format!("{actual} unchanged (identical content)")
+        } else if let Some(before) = &before {
+            format!(
+                "overwrite {actual}: {} → {} bytes",
+                before.len(),
+                content.len()
+            )
+        } else {
+            format!(
+                "create {actual} ({} bytes, {} line(s))",
+                content.len(),
+                content.lines().count()
+            )
+        }];
+        let preview = crate::agent::tools::ApprovalPreview {
+            title: actual.clone(),
+            diff: diff.clone(),
+            lines,
+        };
+        let output = if no_op {
+            format!("{NOOP_WRITE_PREFIX}: {actual} already holds this exact content")
+        } else {
+            let verb = if expected.exists {
+                "overwrote"
+            } else {
+                "created"
+            };
+            let mut output = format!("{verb} {actual} ({} line(s))", content.lines().count());
+            if let Some(diff) = &diff {
+                output.push('\n');
+                output.push_str(diff);
+            }
+            output
+        };
+        if output.len() > PREPARED_EDIT_MAX_BYTES {
+            bail!("file_write output exceeds the 4 MiB preparation limit; nothing written");
+        }
+        let frozen_destination = destination.clone();
+        let frozen_expected = expected.clone();
+        let mut prepared = PreparedToolCall::new(args.clone());
+        prepared.display_paths = ctx
+            .and_then(ExecutionContext::placement)
+            .and_then(|placement| placement.scratch_display(&target))
+            .into_iter()
+            .collect();
+        prepared.footprint = Some(match &resource {
+            Some(resource) => {
+                PreparedFootprint::Native(vec![(resource.clone(), LockMode::Exclusive)])
+            }
+            None => PreparedFootprint::Global,
+        });
+        prepared.args["path"] = Value::String(actual);
+        prepared.preview = Some(preview);
+        prepared.preview_lines = placement_preview(path, purpose, &destination);
+        let target_managed = destination.is_managed()
+            || ctx
+                .and_then(ExecutionContext::placement)
+                .is_some_and(|placement| {
+                    destination.actual_path().starts_with(
+                        crate::core::file_placement::artifact_workspace_root(
+                            placement.workspace_root(),
+                            placement.home_root(),
+                        ),
+                    ) || destination
+                        .actual_path()
+                        .starts_with(placement.scratch_root())
+                });
+        prepared.file = Some(FilePreparation {
+            destination,
+            source: None,
+            source_managed: target_managed,
+            expected: Some(expected),
+            source_expected: None,
+            source_tree: None,
+            destination_tree: None,
+        });
+        prepared.delegation = Some(std::sync::Arc::new(FrozenFileWrite {
+            destination: frozen_destination,
+            expected: frozen_expected,
+            target,
+            resource,
+            ctx: ctx.cloned(),
+            content: content.to_string(),
+            output,
+            no_op,
+            managed: target_managed,
+        }));
+        Ok(prepared)
+    }
+
+    fn write_prepared(&self, prepared: &PreparedToolCall) -> Result<String> {
+        if let Some(result) = speculative_native_tools::execute_write_overlay(prepared) {
+            return result;
+        }
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileWrite>())
+            .context("file_write requires internally prepared destination and bytes")?;
+        verify_frozen_native_context(frozen.ctx.as_ref())?;
+        crate::core::native_journal::validate_mutation_target(&frozen.target)?;
+        if let Some(resource) = &frozen.resource {
+            resource.verify()?;
+        }
+        frozen.destination.verify()?;
+        let (_, expected) = Self::read_bounded(&frozen.target)?;
+        if frozen.expected != expected {
+            bail!("file_write target {} changed after preparation; prepare and approve again; nothing written", frozen.target.display());
+        }
+        // No-op approval does not claim a new read or consult LSP.
+        if frozen.no_op {
+            return Ok(frozen.output.clone());
+        }
+        if let Some(stale) = crate::core::read_ledger::overwrite_conflict(&frozen.target, &expected)
+        {
+            bail!(crate::core::read_ledger::conflict_message(
+                &frozen.target.to_string_lossy(),
+                &stale
+            ));
+        }
+        let scoped = frozen
+            .ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.native_scope().is_some());
+        // Approval and resource leases are executor-owned. Preparation never creates parents.
+        let written = if scoped {
+            let ctx = frozen.ctx.as_ref().unwrap();
+            let resource = frozen
+                .resource
+                .as_ref()
+                .context("native-scoped file_write requires a frozen resource")?;
+            ctx.native_scope().unwrap().check_resource(resource)?;
+            #[cfg(test)]
+            tests::native_body_rendezvous("file_write", &frozen.target);
+            crate::core::native_journal::apply(
+                resource,
+                &frozen.expected,
+                frozen.content.as_bytes(),
+                &ctx.resource_scope(),
+            )?
+        } else {
+            frozen.destination.ensure()?;
+            frozen.destination.verify()?;
+            crate::core::native_journal::validate_mutation_target(&frozen.target)?;
+            crate::core::persist::compare_and_atomic_write(
+                &frozen.target,
+                &frozen.expected,
+                frozen.content.as_bytes(),
+            )
+            .with_context(|| format!("writing {}", frozen.target.display()))?
+        };
+        crate::core::read_ledger::note(&frozen.target, &written);
+        // Advisory LSP work is deferred until the executor releases physical/resource locks.
+        Ok(frozen.output.clone())
     }
 }
 impl Tool for FileWrite {
@@ -2772,26 +3969,33 @@ impl Tool for FileWrite {
     }
     /// Create vs overwrite, with the patch against the current content when overwriting.
     fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
+        bounded_native_arguments(args, "file_write").ok()?;
         let path = args.get("path")?.as_str()?;
         let content = args.get("content")?.as_str()?;
-        let target = confine(&self.root, path, false).ok()?;
+        let raw = Path::new(path);
+        let target = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.root.join(raw)
+        };
         let title = path.to_string();
-        Some(match std::fs::read_to_string(&target) {
-            Ok(before) if before != content => crate::agent::tools::ApprovalPreview {
+        let (before, _) = Self::read_bounded(&target).ok()?;
+        let preview = match before {
+            Some(before) if before != content => crate::agent::tools::ApprovalPreview {
                 title,
-                diff: Some(diff_preview(&before, content, 1)),
+                diff: Some(bounded_write_diff(&before, content).ok()?),
                 lines: vec![format!(
                     "overwrite {path}: {} → {} bytes",
                     before.len(),
                     content.len()
                 )],
             },
-            Ok(_) => crate::agent::tools::ApprovalPreview {
+            Some(_) => crate::agent::tools::ApprovalPreview {
                 title,
                 diff: None,
                 lines: vec![format!("{path} unchanged (identical content)")],
             },
-            Err(_) => crate::agent::tools::ApprovalPreview {
+            None => crate::agent::tools::ApprovalPreview {
                 title,
                 diff: None,
                 lines: vec![format!(
@@ -2800,21 +4004,29 @@ impl Tool for FileWrite {
                     content.lines().count()
                 )],
             },
-        })
+        };
+        (preview
+            .diff
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(preview.title.len())
+            .saturating_add(preview.lines.iter().map(String::len).sum::<usize>())
+            <= PREPARED_EDIT_MAX_BYTES)
+            .then_some(preview)
     }
     fn description(&self) -> &str {
-        "Create a file, or COMPLETELY overwrite an existing one, with the whole content in one \
-         call. NEVER blank or build files with shell (`> f`, `echo >`, heredocs) — use this \
-         tool. For a small change to an existing file prefer file_edit. The parent directory \
-         must exist. A relative path resolves under the working directory; absolute or `../` \
-         paths may write ANYWHERE on disk."
+        "Create/full overwrite; small edits -> file_edit. New targets require purpose: project keeps \
+         explicit path/existing parent; artifact/scratch use safe relative names outside checkout and \
+         create managed parents after approval. Existing overwrites may omit purpose. Never bypass \
+         placement via shell. Reports actual path."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "content": {"type": "string", "description": "the full file content to write"}
+                "content": {"type": "string", "description": "the full file content to write"},
+                "purpose": {"type": "string", "enum": ["project", "artifact", "scratch"]}
             },
             "required": ["path", "content"],
             "additionalProperties": false
@@ -2827,66 +4039,57 @@ impl Tool for FileWrite {
         false
     }
     fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
-        write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+        if matches!(
+            args.get("purpose").and_then(Value::as_str),
+            Some("artifact" | "scratch")
+        ) {
+            WorkspaceEffect::External
+        } else {
+            write_effect(&self.root, args.get("path").and_then(|v| v.as_str()))
+        }
     }
     fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
         write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
+    fn workspace_effect_prepared(&self, prepared: &PreparedToolCall) -> WorkspaceEffect {
+        if let Some(effect) = speculative_native_tools::workspace_effect_prepared(prepared) {
+            return effect;
+        }
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileWrite>());
+        if frozen.is_some_and(|write| write.no_op) {
+            WorkspaceEffect::None
+        } else if frozen.is_some_and(|write| write.managed) {
+            WorkspaceEffect::External
+        } else if let Some(write) = frozen {
+            write_effect(&self.root, Some(&write.target.to_string_lossy()))
+        } else {
+            self.workspace_effect(&prepared.args)
+        }
+    }
+    fn workspace_target_prepared(&self, prepared: &PreparedToolCall) -> Option<PathBuf> {
+        if speculative_native_tools::is_overlay_write(prepared) {
+            return None;
+        }
+        prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileWrite>())
+            .and_then(|write| write.target.parent())
+            .map(Path::to_path_buf)
+    }
+    fn prepare_call(&self, args: &Value, ctx: &ExecutionContext) -> Result<PreparedToolCall> {
+        self.prepare_write(args, Some(ctx))
+    }
+    fn execute_prepared(&self, prepared: &PreparedToolCall) -> Result<ToolObservation> {
+        self.write_prepared(prepared).map(ToolObservation::text)
+    }
     fn execute(&self, args: &Value) -> Result<String> {
-        let path = str_arg(args, "path")?;
-        let content = str_arg(args, "content")?;
-        // must_exist = false → create-or-overwrite; `confine` still keeps the target inside root and
-        // requires the PARENT dir to exist (a clear error the model can act on if it doesn't).
-        let target = confine(&self.root, path, false)?;
-        let (before_bytes, expected) = crate::core::persist::read_with_fingerprint(&target)?;
-        let existed = expected.exists;
-        let before = match before_bytes {
-            Some(bytes) => String::from_utf8(bytes)
-                .with_context(|| format!("{} is not valid UTF-8", target.display()))?,
-            None => String::new(),
-        };
-        // No-op guard: an overwrite that changes nothing must not touch disk (no mtime churn, no
-        // needless git-diff noise) and must not arm the verify gate (W16). A create with empty
-        // content is a real op (the file did not exist), so gate on `existed`.
-        if existed && before == content {
-            // A no-op rewrite still teaches us what is on disk — record it before returning, or the
-            // very next overwrite would look uninformed and be refused for no reason.
-            crate::core::read_ledger::note(&target, &expected);
-            return Ok(format!(
-                "{NOOP_WRITE_PREFIX}: {path} already holds this exact content"
-            ));
-        }
-        // CROSS-SESSION CLOBBER GUARD. The CAS below only compares against the fingerprint read two
-        // lines up, so it passes happily when another aizen window rewrote this file three turns ago:
-        // that window's work would vanish with no error. Both `file_edit` forms are safe on their
-        // own (`old_string` is matched against a fresh read, so a rewritten region fails to match);
-        // a whole-file write has no such anchor, which is why the check lives here.
-        if let Some(stale) = crate::core::read_ledger::overwrite_conflict(&target, &expected) {
-            bail!(crate::core::read_ledger::conflict_message(path, &stale));
-        }
-        crate::core::persist::compare_and_atomic_write(&target, &expected, content.as_bytes())
-            .with_context(|| format!("writing {}", target.display()))?;
-        // What we just wrote is now what this session knows to be there — otherwise a second write in
-        // the same turn would see its own change as someone else's interference.
-        crate::core::read_ledger::note(
-            &target,
-            &crate::core::persist::FileFingerprint::for_bytes(content.as_bytes()),
-        );
-        let n = content.lines().count();
-        let verb = if existed { "overwrote" } else { "created" };
-        let mut out = format!("{verb} {path} ({n} line(s))");
-        // On an overwrite, show what changed so the human (and the model) sees the diff. Skipped for
-        // a brand-new file or a no-op rewrite.
-        if existed && before != content {
-            out.push('\n');
-            out.push_str(&diff_preview(&before, content, 1));
-        }
-        // Same post-write LSP fold as file_edit — surface new diagnostics in this result.
-        if let Some(fb) = crate::agent::lsp::LSP.edit_feedback(&target) {
-            out.push('\n');
-            out.push_str(&fb);
-        }
-        Ok(out)
+        let ctx = crate::core::exec_ctx::current();
+        let prepared = self.prepare_write(args, ctx.as_ref())?;
+        self.write_prepared(&prepared)
     }
 }
 
@@ -2903,6 +4106,188 @@ struct FileMove {
 impl FileMove {
     fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    fn prepare_move(
+        &self,
+        args: &Value,
+        ctx: Option<&ExecutionContext>,
+    ) -> Result<PreparedToolCall> {
+        let from = str_arg(args, "from")?;
+        let to = str_arg(args, "to")?;
+        let purpose = FilePurpose::parse_optional(args.get("purpose"))?;
+        for key in ["overwrite", "create_dirs"] {
+            if args.get(key).is_some_and(|value| !value.is_boolean()) {
+                bail!("file_move {key} must be a boolean");
+            }
+        }
+        let placement = ctx.and_then(ExecutionContext::placement);
+        let from_path = Path::new(from);
+        let joined_source = if from_path.is_absolute() {
+            from_path.to_path_buf()
+        } else {
+            self.root.join(from_path)
+        };
+        let requested_source_managed = placement.is_some_and(|placement| {
+            joined_source.starts_with(crate::core::file_placement::artifact_workspace_root(
+                placement.workspace_root(),
+                placement.home_root(),
+            )) || joined_source.starts_with(placement.scratch_root())
+        });
+        if requested_source_managed {
+            validate_managed_source_ancestry(&joined_source)?;
+        }
+        if matches!(purpose, Some(FilePurpose::Artifact | FilePurpose::Scratch)) {
+            let from_path = Path::new(from);
+            let joined_source = if from_path.is_absolute() {
+                from_path.to_path_buf()
+            } else {
+                self.root.join(from_path)
+            };
+            let meta = std::fs::symlink_metadata(&joined_source)
+                .with_context(|| format!("source {from} not found"))?;
+            #[cfg(windows)]
+            let reparse = {
+                use std::os::windows::fs::MetadataExt;
+                meta.file_attributes() & 0x400 != 0
+            };
+            #[cfg(not(windows))]
+            let reparse = false;
+            if meta.file_type().is_symlink() || reparse || (!meta.is_file() && !meta.is_dir()) {
+                bail!(
+                    "managed file_move refuses symlink/reparse or special source {}",
+                    joined_source.display()
+                );
+            }
+        }
+        let raw_source = if matches!(purpose, Some(FilePurpose::Artifact | FilePurpose::Scratch)) {
+            placement_name(&self.root, from, Some(FilePurpose::Project))
+        } else {
+            confine(&self.root, from, true)
+                .with_context(|| format!("source {from} not found"))?
+                .to_string_lossy()
+                .into_owned()
+        };
+        let source = prepare_destination(placement, &raw_source, Some(FilePurpose::Project))?;
+        if !source.exists_at_preparation() {
+            bail!("source {from} not found");
+        }
+        let raw_to = placement_name(&self.root, to, purpose);
+        let destination = prepare_destination(placement, &raw_to, purpose)?;
+        let same_path = source.actual_path() == destination.actual_path();
+        // No-follow proof of an arbitrary directory replacement is deliberately not inferred.
+        if purpose.is_none()
+            && !same_path
+            && (!destination.exists_at_preparation() || source.actual_path().is_dir())
+        {
+            bail!("new file_move destination or directory move requires purpose:project|artifact|scratch (e.g. {{\"from\":\"tmp.txt\",\"to\":\"report.txt\",\"purpose\":\"artifact\"}})");
+        }
+        if !destination.is_managed()
+            && !args
+                .get("create_dirs")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            require_existing_parent(destination.actual_path())?;
+        }
+        let source_managed = requested_source_managed
+            || placement.is_some_and(|placement| {
+                source.actual_path().starts_with(
+                    crate::core::file_placement::artifact_workspace_root(
+                        placement.workspace_root(),
+                        placement.home_root(),
+                    ),
+                ) || source.actual_path().starts_with(placement.scratch_root())
+            });
+        {
+            let root = self
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| self.root.clone());
+            let from_owner = if source_managed {
+                None
+            } else {
+                move_owner(&root, source.actual_path())
+            };
+            let to_owner = if destination.is_managed() {
+                None
+            } else {
+                move_owner(&root, destination.actual_path())
+            };
+            if matches!((&from_owner, &to_owner), (Some(a), Some(b)) if a != b) {
+                bail!("file_move between distinct repositories/workspaces is unsupported; protect and publish the two workspaces separately");
+            }
+            let workspace_owner = move_owner(&root, &root.join(".aizen-owner-probe"));
+            if [from_owner.as_ref(), to_owner.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|owner| Some(owner) != workspace_owner.as_ref())
+            {
+                bail!("file_move in a repository outside the current workspace is unsupported; run the move from that workspace");
+            }
+        }
+        let source_expected = if source.actual_path().is_file() {
+            Some(crate::core::persist::read_with_fingerprint(source.actual_path())?.1)
+        } else {
+            None
+        };
+        let expected = if destination.actual_path().is_dir() {
+            None
+        } else {
+            Some(crate::core::persist::read_with_fingerprint(destination.actual_path())?.1)
+        };
+        if source.actual_path().is_dir()
+            && destination.actual_path().starts_with(source.actual_path())
+            && !same_path
+        {
+            bail!("file_move cannot move a directory into its own subtree");
+        }
+        if !same_path
+            && destination.exists_at_preparation()
+            && !args
+                .get("overwrite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && destination.actual_path().canonicalize().ok()
+                != source.actual_path().canonicalize().ok()
+        {
+            bail!("destination {to} already exists; pass overwrite:true to replace it");
+        }
+        let source_tree =
+            if (source_managed || destination.is_managed()) && source.actual_path().is_dir() {
+                Some(managed_move_tree_snapshot(source.actual_path())?)
+            } else {
+                None
+            };
+        let destination_tree = if destination.is_managed() && destination.actual_path().is_dir() {
+            Some(managed_move_tree_snapshot(destination.actual_path())?)
+        } else {
+            None
+        };
+        source.verify()?;
+        destination.verify()?;
+        let mut prepared = PreparedToolCall::new(args.clone());
+        if let Some(placement) = ctx.and_then(ExecutionContext::placement) {
+            prepared.display_paths = [source.actual_path(), destination.actual_path()]
+                .into_iter()
+                .filter_map(|path| placement.scratch_display(path))
+                .collect();
+        }
+        prepared.args["from"] = Value::String(source.actual_path().to_string_lossy().into_owned());
+        prepared.args["to"] =
+            Value::String(destination.actual_path().to_string_lossy().into_owned());
+        prepared.preview_lines = placement_preview(to, purpose, &destination);
+        prepared.preview = self.preview(&prepared.args);
+        prepared.file = Some(FilePreparation {
+            destination,
+            source: Some(source),
+            source_managed,
+            expected,
+            source_expected,
+            source_tree,
+            destination_tree,
+        });
+        Ok(prepared)
     }
 }
 impl Tool for FileMove {
@@ -2926,20 +4311,21 @@ impl Tool for FileMove {
         })
     }
     fn description(&self) -> &str {
-        "Rename or move a file or directory (from → to) — use this, not mv / move / \
-         Rename-Item. An existing destination is an error unless `overwrite`; `create_dirs` \
-         creates missing parents. An OS-level rename on the same drive, metadata kept. Relative \
-         paths resolve under the working directory; absolute or `../` paths may move ANYWHERE \
-         on disk."
+        "Move/rename file or directory; never bypass placement via mv/move. New destinations/directory \
+         moves require purpose: project keeps explicit to; artifact/scratch use safe managed relative \
+         names. Existing file replacements may omit purpose. Source never routes. Collisions need \
+         overwrite; create_dirs creates project parents. Managed imports bounded/no symlinks. \
+         Reports actual paths; distinct-workspace moves refused."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "from": {"type": "string", "description": "existing source path (file or directory)"},
-                "to": {"type": "string", "description": "destination path"},
-                "overwrite": {"type": "boolean", "description": "replace the destination if it already exists (default false)"},
-                "create_dirs": {"type": "boolean", "description": "create missing parent directories of the destination (default false)"}
+                "from": {"type": "string", "description": "existing source file/directory"},
+                "to": {"type": "string", "description": "destination path or managed relative name"},
+                "purpose": {"type": "string", "enum": ["project", "artifact", "scratch"]},
+                "overwrite": {"type": "boolean", "description": "replace existing destination (default false)"},
+                "create_dirs": {"type": "boolean", "description": "create missing destination parents (default false)"}
             },
             "required": ["from", "to"],
             "additionalProperties": false
@@ -2954,13 +4340,117 @@ impl Tool for FileMove {
     fn workspace_effect(&self, args: &Value) -> WorkspaceEffect {
         move_effect(&self.root, args)
     }
-    /// `from`, not `to`: the preimage worth capturing is the source, since a move REMOVES it and
-    /// that is the part a rewind has to put back. (When both sides live in one repo — the common
-    /// case — either would find the same work tree anyway.)
+    fn workspace_effect_prepared(&self, prepared: &PreparedToolCall) -> WorkspaceEffect {
+        let Some(file) = prepared.file.as_ref() else {
+            return self.workspace_effect(&prepared.args);
+        };
+        let from = if file.source_managed {
+            WorkspaceEffect::External
+        } else {
+            write_effect(
+                &self.root,
+                prepared.args.get("from").and_then(Value::as_str),
+            )
+        };
+        let to = if file.destination.is_managed() {
+            WorkspaceEffect::External
+        } else {
+            write_effect(&self.root, prepared.args.get("to").and_then(Value::as_str))
+        };
+        if from == WorkspaceEffect::Paths || to == WorkspaceEffect::Paths {
+            WorkspaceEffect::Paths
+        } else if from == WorkspaceEffect::External && to == WorkspaceEffect::External {
+            WorkspaceEffect::External
+        } else {
+            WorkspaceEffect::OpaqueWorkspace
+        }
+    }
+    fn workspace_target_prepared(&self, prepared: &PreparedToolCall) -> Option<PathBuf> {
+        let Some(file) = prepared.file.as_ref() else {
+            return self.workspace_target(&prepared.args);
+        };
+        let from = prepared.args.get("from").and_then(Value::as_str);
+        let to = prepared.args.get("to").and_then(Value::as_str);
+        if !file.source_managed && write_effect(&self.root, from) == WorkspaceEffect::Paths {
+            write_target_dir(&self.root, from)
+        } else if !file.destination.is_managed()
+            && write_effect(&self.root, to) == WorkspaceEffect::Paths
+        {
+            write_target_dir(&self.root, to)
+        } else {
+            write_target_dir(&self.root, from)
+        }
+    }
+    /// Protect the source when removing project content, or the destination when publishing
+    /// managed output into the project. Two distinct repositories are rejected at preparation.
     fn workspace_target(&self, args: &Value) -> Option<std::path::PathBuf> {
-        write_target_dir(&self.root, args.get("from").and_then(|v| v.as_str()))
+        let from = args.get("from").and_then(|v| v.as_str());
+        let to = args.get("to").and_then(|v| v.as_str());
+        if !current_managed_path(&self.root, from)
+            && write_effect(&self.root, from) == WorkspaceEffect::Paths
+        {
+            write_target_dir(&self.root, from)
+        } else if !matches!(
+            args.get("purpose").and_then(Value::as_str),
+            Some("artifact" | "scratch")
+        ) && write_effect(&self.root, to) == WorkspaceEffect::Paths
+        {
+            write_target_dir(&self.root, to)
+        } else {
+            write_target_dir(&self.root, from)
+        }
+    }
+    fn prepare_call(&self, args: &Value, ctx: &ExecutionContext) -> Result<PreparedToolCall> {
+        self.prepare_move(args, Some(ctx))
+    }
+    fn execute_prepared(&self, prepared: &PreparedToolCall) -> Result<ToolObservation> {
+        self.move_prepared(prepared).map(ToolObservation::text)
     }
     fn execute(&self, args: &Value) -> Result<String> {
+        let ctx = crate::core::exec_ctx::current();
+        let prepared = self.prepare_move(args, ctx.as_ref())?;
+        self.move_prepared(&prepared)
+    }
+}
+impl FileMove {
+    fn move_prepared(&self, prepared: &PreparedToolCall) -> Result<String> {
+        let args = &prepared.args;
+        let guard = prepared
+            .file
+            .as_ref()
+            .context("file_move requires internally prepared destination")?;
+        let source = guard
+            .source
+            .as_ref()
+            .context("file_move requires internally prepared source")?;
+        if guard.source_managed {
+            validate_managed_source_ancestry(source.actual_path())?;
+        }
+        source.verify()?;
+        guard.destination.verify()?;
+        for (path, expected) in [
+            (source.actual_path(), guard.source_expected.as_ref()),
+            (guard.destination.actual_path(), guard.expected.as_ref()),
+        ] {
+            if let Some(expected) = expected {
+                if &crate::core::persist::read_with_fingerprint(path)?.1 != expected {
+                    bail!("file_move path {} changed after preparation; prepare and approve again; nothing moved", path.display());
+                }
+            }
+        }
+        for (path, snapshot) in [
+            (source.actual_path(), guard.source_tree.as_ref()),
+            (
+                guard.destination.actual_path(),
+                guard.destination_tree.as_ref(),
+            ),
+        ] {
+            if let Some(snapshot) = snapshot {
+                if &managed_move_tree_snapshot(path)? != snapshot {
+                    bail!("managed file_move tree {} changed after preparation; prepare and approve again; nothing moved", path.display());
+                }
+            }
+        }
         let from = str_arg(args, "from")?;
         let to = str_arg(args, "to")?;
         let overwrite = args
@@ -2972,26 +4462,15 @@ impl Tool for FileMove {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Source MUST exist (must_exist=true canonicalizes the whole path → clear error if missing).
-        let src =
-            confine(&self.root, from, true).with_context(|| format!("source {from} not found"))?;
-        // Destination need only have an existing parent (must_exist=false), unless create_dirs asks
-        // us to make it. Resolve the parent ourselves so we can create it BEFORE confine() tries to
-        // canonicalize it (confine requires the parent to already exist).
-        let raw_to = Path::new(to);
-        let joined_to = if raw_to.is_absolute() {
-            raw_to.to_path_buf()
-        } else {
-            self.root.join(raw_to)
-        };
-        if create_dirs {
-            if let Some(parent) = joined_to.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating parent directories of {to}"))?;
-            }
+        let src = source.actual_path().to_path_buf();
+        let dst = guard.destination.actual_path().to_path_buf();
+        if guard.destination.is_managed() {
+            guard.destination.ensure()?;
+        } else if create_dirs {
+            guard.destination.ensure_project_parents()?;
         }
-        let dst = confine(&self.root, to, false)
-            .with_context(|| format!("resolving destination {to} (its parent directory must exist — pass create_dirs:true to create it)"))?;
+        source.verify()?;
+        guard.destination.verify()?;
 
         // Moving a path onto itself is a no-op (don't churn the FS or arm the verify gate).
         if src == dst {
@@ -3745,6 +5224,116 @@ fn diff_preview(before: &str, after: &str, base_line: usize) -> String {
 
 // ── shell_run ────────────────────────────────────────────────────────────────
 
+/// Restore detection is broader than target proof. Only a simple direct Git command without
+/// routing options has a cwd-bound target; wrappers/chains/alternate worktrees fail before spawn.
+fn shell_restore_preflight(command: &str, ctx: Option<&ExecutionContext>) -> Result<bool> {
+    if !crate::agent::cmd_guard::delegated_restore_command(command) {
+        return Ok(false);
+    }
+    if ctx.is_some_and(|ctx| !ctx.can_restore_workspace()) {
+        bail!("delegated shell_run cannot restore workspace state");
+    }
+    if command.len() > 64 * 1024 {
+        bail!("shell restore target exceeds the bounded preflight limit");
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let direct_git = words
+        .first()
+        .is_some_and(|word| matches!(*word, "git" | "git.exe"));
+    if !direct_git {
+        bail!("shell restore target cannot be frozen safely; nested aizen time restore/undo can self-lock; use the parent checkpoint/native owner undo tool");
+    }
+    if command.len() > 64 * 1024
+        || command.chars().any(|ch| {
+            matches!(
+                ch,
+                '\'' | '"'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '\r'
+                    | '\n'
+                    | '`'
+                    | '$'
+                    | '#'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+            )
+        })
+        || words.get(1).is_none_or(|word| word.starts_with('-'))
+        || words.iter().any(|word| {
+            word.starts_with("--work-tree")
+                || word.starts_with("--git-dir")
+                || word.starts_with("-C")
+        })
+    {
+        bail!("shell restore target is ambiguous (routing options, quoting or command chain); use the parent checkpoint/native owner undo tool");
+    }
+    Ok(true)
+}
+
+/// Exclusion belongs to the physical tree and actual pipe readers, never the async observer.
+struct ShellOwnership {
+    _physical: crate::core::workspace_txn::PhysicalEffectLease,
+    _ctx: Option<ExecutionContext>,
+    _child: std::sync::Arc<Mutex<std::process::Child>>,
+    _containment: std::sync::Arc<crate::core::proctree::Containment>,
+}
+
+static SHELL_QUARANTINE: Lazy<Mutex<Vec<ShellOwnership>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn quarantine_shell(ownership: ShellOwnership) {
+    SHELL_QUARANTINE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(ownership);
+}
+
+type ShellLifetime = crate::agent::process::SettlementLifetime<ShellOwnership>;
+
+/// Also runs on early error/unwind. Unknown containment never becomes a fabricated exit proof.
+struct ShellSettlement {
+    lifetime: Option<std::sync::Arc<ShellLifetime>>,
+    child: std::sync::Arc<Mutex<std::process::Child>>,
+    containment: std::sync::Arc<crate::core::proctree::Containment>,
+    waiter: Option<crate::agent::process::DrainLifetime<ShellOwnership>>,
+}
+
+impl Drop for ShellSettlement {
+    fn drop(&mut self) {
+        let Some(lifetime) = self.lifetime.clone() else {
+            // Gate OFF retains legacy serial cleanup, with no process-long exclusion claim.
+            let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+            crate::core::proctree::kill_tree(&mut child, &self.containment);
+            return;
+        };
+        let child = self.child.clone();
+        let containment = self.containment.clone();
+        let waiter = self.waiter.take();
+        let _ = std::thread::Builder::new()
+            .name("shell-settlement".into())
+            .spawn(move || {
+                let _waiter = waiter;
+                {
+                    let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
+                    crate::core::proctree::kill_tree(&mut child, &containment);
+                }
+                loop {
+                    match containment.known_quiescent() {
+                        Ok(Some(true)) => {
+                            lifetime.prove_tree_settled();
+                            break;
+                        }
+                        Ok(Some(false)) => std::thread::sleep(Duration::from_millis(40)),
+                        Ok(None) | Err(_) => break, // Final ownership drop quarantines unknown trees.
+                    }
+                }
+            });
+    }
+}
+
 struct ShellRun {
     root: PathBuf,
 }
@@ -3783,20 +5372,18 @@ impl Tool for ShellRun {
         })
     }
     fn description(&self) -> &str {
-        "Run a shell command in the working directory; returns stdout/stderr + exit code. \
-         Build, test, run tools, manage files. For content search use search_files, not grep \
-         here. Cap 120s by default (AIZEN_SHELL_TIMEOUT_SECS, 10..3600); on timeout the whole \
-         process tree is killed. For anything that should keep running (dev servers, watchers, \
-         long builds) use the process tool, which has no cap. Destructive — the user is asked \
-         to confirm."
+        "Run shell in working dir for build/test/tools/file management; returns stdout/stderr + exit \
+         code. Content search -> search_files, not grep. Timeout 120s (AIZEN_SHELL_TIMEOUT_SECS, \
+         10..3600) kills whole process tree. Long builds/servers/watchers -> process (uncapped). \
+         Destructive; user confirms."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "cwd": {"type": "string", "description": "optional working dir (a subdir, or a ../ or absolute path)"},
-                "network": {"type": "boolean", "description": "request network access (default false — the sandbox denies child sockets where it can). Approval-gated."},
+                "cwd": {"type": "string", "description": "optional working dir: subdir, ../ or absolute"},
+                "network": {"type": "boolean", "description": "request network (default false; sandbox denies sockets where supported). Approval-gated."},
                 "format": crate::agent::result_format::schema_property()
             },
             "required": ["command"],
@@ -3819,9 +5406,28 @@ impl Tool for ShellRun {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let command = str_arg(args, "command")?;
+        let ctx = crate::core::exec_ctx::current();
+        if ctx.as_ref().is_some_and(|ctx| ctx.native_scope().is_some()) {
+            bail!("shell_run is unavailable in a native-scoped execution context");
+        }
+        let scope = ctx
+            .as_ref()
+            .map(ExecutionContext::resource_scope)
+            .unwrap_or_else(|| "shell_run/direct".to_string());
+        let cancel = crate::core::cancel::current().or_else(crate::ui::tui::active_cancel_token);
+        let restore = shell_restore_preflight(command, ctx.as_ref())?;
         let dir = match args.get("cwd").and_then(|v| v.as_str()) {
             Some(c) => confine(&self.root, c, true)?,
             None => self.root.clone(),
+        };
+        // Resolve/warm repository identity before physical admission, never nested under that gate.
+        let restore_root = if restore {
+            let actual = crate::core::workspace_txn::WorkspaceIdentity::discover_cached(&dir)?
+                .canonical_root;
+            crate::core::workspace_txn::WorkspaceIdentity::discover_cached(&actual)?;
+            Some(actual)
+        } else {
+            None
         };
         let network = args
             .get("network")
@@ -3854,44 +5460,118 @@ impl Tool for ShellRun {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Fresh physical admission is never borrowed from inherited/scoped writer bookkeeping.
+        // The executor excludes shell_run from its central physical gate to avoid double admission.
+        let strict_lifetime = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
+        let physical = if strict_lifetime {
+            Some(crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                Duration::from_secs(15),
+                cancel.as_ref(),
+                "shell_run physical body",
+                &scope,
+            )?)
+        } else {
+            None
+        };
+        let _restore_guard = restore_root
+            .as_deref()
+            .map(crate::core::workspace_txn::WorkspaceRestoreGuard::acquire)
+            .transpose()?;
+        if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+            sbx.finish(crate::sandbox::runner::Outcome::Cancelled);
+            return Ok("error: command cancelled before shell spawn".to_string());
+        }
         // Contain the tree BEFORE anything can go wrong with it: on Windows we spawn a `cmd.exe`
         // wrapper, so killing our direct child leaves the real work (cargo, node, a dev server)
         // orphaned — still running, and still holding the write end of the pipes below.
-        let mut child = match sbx.command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
-                return Err(e).with_context(|| format!("spawning shell for `{command}`"));
+        let (mut child, containment) = match sbx.spawn_contained() {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                if !error.cleanup_verified() {
+                    let note = error.to_string();
+                    // An unproved protected-spawn cleanup retains actual child/job, sandbox and
+                    // physical/context ownership. Never convert it into a settled spawn failure.
+                    std::mem::forget((error, physical, ctx, sbx, _restore_guard));
+                    return Err(
+                        anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                            crate::agent::tools::ToolEffectState::UnknownWorker,
+                        ))
+                        .context(note),
+                    );
+                }
+                return Err(error).with_context(|| format!("spawning shell for `{command}`"));
             }
         };
-        let containment = sbx.contain(&child);
-
-        // Drain the pipes on threads so a chatty command can't deadlock on a full buffer,
-        // while we poll with a wall-clock timeout (kill the tree if it overruns).
+        let containment = std::sync::Arc::new(containment);
         let out_pipe = child.stdout.take();
         let err_pipe = child.stderr.take();
-        let oh = std::thread::spawn(move || drain(out_pipe));
-        let eh = std::thread::spawn(move || drain(err_pipe));
+        let child = std::sync::Arc::new(Mutex::new(child));
+        let lifetime = physical.map(|physical| {
+            std::sync::Arc::new(ShellLifetime::new(
+                ShellOwnership {
+                    _physical: physical,
+                    _ctx: ctx,
+                    _child: child.clone(),
+                    _containment: containment.clone(),
+                },
+                quarantine_shell,
+            ))
+        });
+        // Gate OFF never seats long-lived writer/context ownership or permanent quarantine.
+        // Gate ON registers every actual worker before any can publish settlement.
+        let out_lifetime = lifetime.as_ref().map(|lifetime| lifetime.drain());
+        let err_lifetime = lifetime.as_ref().map(|lifetime| lifetime.drain());
+        let _settlement = ShellSettlement {
+            waiter: lifetime.as_ref().map(|lifetime| lifetime.drain()),
+            lifetime,
+            child: child.clone(),
+            containment: containment.clone(),
+        };
+        // Drain tokens outlive bounded observer joins, including detached pipe workers.
+        let oh = std::thread::Builder::new()
+            .name("shell-stdout".into())
+            .spawn(move || {
+                let _lifetime = out_lifetime;
+                drain(out_pipe)
+            })?;
+        let eh = std::thread::Builder::new()
+            .name("shell-stderr".into())
+            .spawn(move || {
+                let _lifetime = err_lifetime;
+                drain(err_pipe)
+            })?;
 
         let start = Instant::now();
         let mut next_note = SLOW_NOTE_EVERY_SECS;
         let mut cancelled = false;
+        let mut wait_error = None;
         let status = loop {
-            match child.try_wait()? {
-                Some(st) => break Some(st),
-                None => {
+            let waited = child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .try_wait();
+            match waited {
+                Ok(Some(st)) => break Some(st),
+                Err(error) => {
+                    wait_error = Some(error);
+                    let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
+                    crate::core::proctree::kill_tree(&mut child, &containment);
+                    break None;
+                }
+                Ok(None) => {
                     // User pressed Esc (cooperative cancel) — kill the tree now instead of blocking
                     // the whole turn up to the timeout. This is what makes Esc responsive during a
                     // long command (the confirmed "can't cancel while a tool runs" bug).
-                    let cancel_requested = crate::core::cancel::current()
-                        .or_else(crate::ui::tui::active_cancel_token)
-                        .is_some_and(|token| token.is_cancelled());
+                    let cancel_requested =
+                        cancel.as_ref().is_some_and(|token| token.is_cancelled());
                     if cancel_requested {
+                        let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
                         crate::core::proctree::kill_tree(&mut child, &containment);
                         cancelled = true;
                         break None;
                     }
                     if start.elapsed() >= timeout {
+                        let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
                         crate::core::proctree::kill_tree(&mut child, &containment);
                         break None;
                     }
@@ -3908,6 +5588,9 @@ impl Tool for ShellRun {
                 }
             }
         };
+        // Wrapper completion is not tree completion; terminate remaining contained descendants.
+        // The detached settlement monitor owns the proof and retains all gates on uncertainty.
+        crate::core::proctree::terminate_tree(&containment);
         // Never join a pipe reader unbounded. If containment failed (or a descendant escaped the job
         // via its own detached wrapper) an orphan can still hold the write end, and `read_to_end`
         // only returns on EOF = last writer closed — a wait that a wedged process never ends. A
@@ -3929,6 +5612,13 @@ impl Tool for ShellRun {
             None => crate::sandbox::runner::Outcome::Timeout,
             Some(st) => crate::sandbox::runner::Outcome::Exit(st.code()),
         });
+        if let Some(error) = wait_error {
+            return Err(error).with_context(|| {
+                format!(
+                    "waiting for shell `{command}`; physical ownership retained until settlement"
+                )
+            });
+        }
         match status {
             None if cancelled => Ok("error: command cancelled by the user (Esc)".to_string()),
             None => {
@@ -4084,20 +5774,17 @@ impl Tool for GitInspect {
         "git_inspect"
     }
     fn description(&self) -> &str {
-        "Inspect the git repository, read-only: working-tree status, commit log, a diff, one \
-         commit, or line-by-line blame. Use it to see WHAT changed and WHEN — a reviewer reading \
-         the actual diff, a planner checking recent history, a tester finding the commit that \
-         broke a build. Never mutates anything (no add/commit/push/checkout — those are not \
-         offered). diff with no rev shows uncommitted changes; blame requires a path."
+        "Read-only git status/log/diff/commit/blame to see what changed and when. No \
+         add/commit/push/checkout. diff without rev shows uncommitted changes; blame needs path."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["status", "log", "diff", "show", "blame"]},
-                "path": {"type": "string", "description": "optional file/dir to narrow to (required for blame)"},
-                "rev": {"type": "string", "description": "optional revision or range, e.g. HEAD~3, main..HEAD, a1b2c3 (status ignores it; show defaults to HEAD)"},
-                "limit": {"type": "integer", "description": "log only: max commits (default 20, cap 100)"}
+                "path": {"type": "string", "description": "optional file/dir filter; required for blame"},
+                "rev": {"type": "string", "description": "revision/range (HEAD~3, main..HEAD, a1b2c3); status ignores; show defaults HEAD"},
+                "limit": {"type": "integer", "description": "log max commits (default 20, cap 100)"}
             },
             "required": ["action"],
             "additionalProperties": false
@@ -4278,9 +5965,8 @@ impl Tool for SkillLoad {
         "skill_load"
     }
     fn description(&self) -> &str {
-        "Load a saved skill (a reusable step-by-step procedure) by name and return its steps to \
-         follow. The available skills are listed in <skills>. Use when the task matches a skill's \
-         trigger. Not for recalling facts → use memory_search. Read-only."
+        "Load/follow reusable steps by name from <skills> when its trigger matches. \
+         Facts -> memory_search. Read-only."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -4292,22 +5978,24 @@ impl Tool for SkillLoad {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         let name = str_arg(args, "name")?;
-        match crate::skills::load(name) {
+        match crate::skills::load_checked(name)? {
             Some(sk) => {
                 // Voyager reinforcement: a real load is organic reuse — bump `uses` so a repeatedly
                 // useful skill floats to the top of the always-on index and survives its line cap.
                 // Best-effort: a bump failure (repo-shipped skill, or I/O) must never break the load.
-                let _ = crate::skills::record_use(name);
+                let _ = crate::skills::record_use_loaded(&sk);
                 // Hebbian cross-kind link: this procedure fired alongside the facts recalled for the
                 // turn, so wire them together. That is what later lets the facts of a NEW turn name
                 // the skills that mattered last time — the "used together" signal is not derivable
                 // from either store's contents, exactly like the fact-to-fact edges.
-                crate::skills::note_skill_cofire(name);
+                crate::skills::note_skill_cofire(sk.key());
                 Ok(crate::skills::render_loaded(&sk))
             }
             None => {
-                let avail: Vec<String> =
-                    crate::skills::list().into_iter().map(|s| s.name).collect();
+                let avail: Vec<String> = crate::skills::list()
+                    .into_iter()
+                    .map(|s| s.key().to_string())
+                    .collect();
                 Ok(format!(
                     "(no skill named '{name}'; available: {})",
                     avail.join(", ")
@@ -4325,9 +6013,8 @@ impl Tool for SkillSave {
         "skill_save"
     }
     fn description(&self) -> &str {
-        "Save a reusable procedure as a named skill (so it can be loaded later with skill_load). \
-         Use when the user asks to remember HOW to do a recurring task. For facts/preferences \
-         (WHAT is true) use memory instead. Writes to ~/.aizen/skills — the user is asked to confirm."
+        "Save a named reusable procedure for skill_load when user asks to remember HOW. \
+         Facts/preferences -> memory. Writes ~/.aizen/skills; user confirms."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -4335,9 +6022,9 @@ impl Tool for SkillSave {
             "properties": {
                 "name": {"type": "string"},
                 "description": {"type": "string", "description": "one-line summary"},
-                "when": {"type": "string", "description": "when this skill applies (trigger hint)"},
-                "body": {"type": "string", "description": "the steps / procedure (markdown)"},
-                "scope": {"type": "string", "enum": ["global", "project"], "description": "global (default) = usable everywhere; project = only this workspace"}
+                "when": {"type": "string", "description": "trigger hint"},
+                "body": {"type": "string", "description": "procedure (markdown)"},
+                "scope": {"type": "string", "enum": ["global", "project"], "description": "global=everywhere (default); project=this workspace"}
             },
             "required": ["name", "body"],
             "additionalProperties": false
@@ -4378,19 +6065,17 @@ impl Tool for SkillRefine {
         "skill_refine"
     }
     fn description(&self) -> &str {
-        "Improve an EXISTING skill's steps after you found a better way — e.g. a step failed and a \
-         corrected sequence worked. Rewrites the skill's body, bumps its version, archives the old \
-         copy (nothing is lost), and preserves its usage count. Use this instead of skill_save when \
-         the skill already exists. The new steps replace the old ones, so include the whole procedure."
+        "Improve an existing skill after a better sequence works; use instead of skill_save. \
+         Supply the whole replacement procedure. Bumps version, archives old copy, preserves usage."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "the existing skill's name (from <skills>)"},
-                "body": {"type": "string", "description": "the improved full steps / procedure (replaces the old body)"},
-                "description": {"type": "string", "description": "optional new one-line summary (kept if omitted)"},
-                "when": {"type": "string", "description": "optional new trigger hint (kept if omitted)"}
+                "name": {"type": "string", "description": "existing skill name from <skills>"},
+                "body": {"type": "string", "description": "full replacement procedure"},
+                "description": {"type": "string", "description": "optional summary; omitted keeps old"},
+                "when": {"type": "string", "description": "optional trigger; omitted keeps old"}
             },
             "required": ["name", "body"],
             "additionalProperties": false
@@ -4427,9 +6112,8 @@ impl Tool for SkillForget {
         "skill_forget"
     }
     fn description(&self) -> &str {
-        "Retire a saved skill that is wrong, obsolete, or superseded by another one — it leaves the \
-         <skills> index and stops being loadable. Reversible: the copy is archived, not erased. Use \
-         skill_refine instead when the procedure is still right but its steps need improving."
+        "Retire wrong/obsolete/superseded skill from <skills> and loading; archived, reversible. \
+         Still valid but needs better steps -> skill_refine."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -4472,24 +6156,20 @@ impl Tool for PersonaCreate {
         "persona_create"
     }
     fn description(&self) -> &str {
-        "Create a character persona (a role-play identity: name + role + voice + backstory) and, by \
-         default, switch to it. Call this — do NOT just reply in prose — whenever the user asks you \
-         to BE / become / invent a character, OR PASTES a character card / system prompt / persona \
-         description and says make/create/save/turn-this-into a character. In the paste case, EXTRACT \
-         the name (invent a fitting one if none) and rewrite the pasted text into `body` (values, \
-         manner, how they speak, boundaries); don't ask for details you can infer from the paste. A \
-         switch takes full effect from the user's next message. Not for facts about the user → use \
-         memory. Writes to ~/.aizen/personas (the user confirms)."
+        "Create role-play persona and switch by default. CALL, not prose, for become/invent-character \
+         requests or pasted card/system prompt to make/save as character. Extract/invent name; rewrite \
+         paste into body (backstory/values/manner/voice/boundaries), inferring details without asking. \
+         Switch fully applies next user message. User facts -> memory. Writes ~/.aizen/personas; user confirms."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "the character's name"},
-                "role": {"type": "string", "description": "one line — who they are (e.g. 'a grumpy noir detective')"},
-                "voice": {"type": "string", "description": "how they speak (e.g. 'terse, sardonic, clipped')"},
-                "body": {"type": "string", "description": "backstory / values / manner / boundaries (markdown)"},
-                "activate": {"type": "boolean", "description": "switch to this persona now (default true)"}
+                "name": {"type": "string", "description": "character name"},
+                "role": {"type": "string", "description": "one-line identity"},
+                "voice": {"type": "string", "description": "speaking style"},
+                "body": {"type": "string", "description": "backstory/values/manner/boundaries (markdown)"},
+                "activate": {"type": "boolean", "description": "switch now (default true)"}
             },
             "required": ["name", "body"],
             "additionalProperties": false
@@ -4528,8 +6208,76 @@ impl Tool for PersonaCreate {
 }
 
 #[cfg(test)]
+pub(crate) fn file_registry_for_test(root: &Path) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FileWrite::new(root.to_path_buf())));
+    registry.register(Box::new(FileMove::new(root.to_path_buf())));
+    registry.register(Box::new(FileEdit::new(root.to_path_buf())));
+    registry.register(Box::new(FileRead::new(root.to_path_buf())));
+    registry
+}
+
+#[cfg(test)]
+type NativeBodyProbeFn = dyn Fn(&str, &Path) + Send + Sync;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct NativeBodyTestProbe(std::sync::Arc<NativeBodyProbeFn>);
+
+#[cfg(test)]
+impl NativeBodyTestProbe {
+    pub(crate) fn new(probe: impl Fn(&str, &Path) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(probe))
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for NativeBodyTestProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeBodyTestProbe")
+    }
+}
+
+#[cfg(test)]
+type NativeBodyHook = Box<dyn FnOnce(&str, &Path) + Send>;
+
+#[cfg(test)]
+pub(crate) fn with_native_body_hook_for_test<T>(hook: NativeBodyHook, f: impl FnOnce() -> T) -> T {
+    tests::with_native_body_hook(hook, f)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        // Opt-in only on the worker executing this test's real body; never a global scheduler hook.
+        static NATIVE_BODY_HOOK: std::cell::RefCell<Option<NativeBodyHook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn native_body_rendezvous(tool: &str, target: &Path) {
+        let hook = NATIVE_BODY_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(tool, target);
+        }
+        if let Some(ctx) = crate::core::exec_ctx::current() {
+            if let Some(probe) = ctx.native_body_probe() {
+                (probe.0)(tool, target);
+            }
+        }
+    }
+
+    pub(super) fn with_native_body_hook<T>(hook: NativeBodyHook, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<NativeBodyHook>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                NATIVE_BODY_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let old = NATIVE_BODY_HOOK.with(|slot| slot.replace(Some(hook)));
+        let _restore = Restore(old);
+        f()
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir =
@@ -4620,6 +6368,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "browser")]
+    #[test]
+    fn browser_schema_requires_explicit_configuration_without_losing_dispatch() {
+        let root = temp_root("browser-availability");
+        let absent = default_registry_for_browser(&root, false);
+        let configured = default_registry_for_browser(&root, true);
+        for name in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_eval",
+            "browser_set_viewport",
+            "browser_screenshot",
+        ] {
+            assert!(absent.get(name).is_none());
+            assert!(configured.get(name).is_some());
+            assert!(configured.defs().iter().any(|d| d.function.name == name));
+        }
+    }
+
     #[test]
     fn tool_schema_stays_within_budget() {
         // The default registry is the CORE top-level surface. Delegation and persona tools are
@@ -4629,7 +6398,7 @@ mod tests {
         const PER_TOOL_CEILING: usize = 1_400; // no single tool should dwarf the rest
 
         let root = temp_root("schema-budget");
-        let defs = default_registry_in(&root).defs();
+        let defs = default_registry_for_browser(&root, false).defs();
         let mut rows: Vec<(String, usize)> = defs
             .iter()
             .map(|d| {
@@ -4639,7 +6408,7 @@ mod tests {
                 )
             })
             .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
 
         let total: usize = rows.iter().map(|r| r.1).sum();
         // A readable dump on failure so the diff that tripped the ratchet is obvious.
@@ -4679,7 +6448,8 @@ mod tests {
         const TOTAL_CEILING: usize = 45_000;
         const PER_TOOL_CEILING: usize = 2_400;
         let root = temp_root("schema-top-level");
-        let mut registry = default_registry_in(&root);
+        // Include configured browser support even on hosts without a live browser profile.
+        let mut registry = default_registry_for_browser(&root, true);
         registry.register(Box::new(PersonaCreate));
         registry.register(Box::new(crate::agent::task_tool::TaskTool::new(
             reqwest::Client::new(),
@@ -4715,7 +6485,7 @@ mod tests {
                 )
             })
             .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
         let total: usize = rows.iter().map(|(_, n)| *n).sum();
         let dump = || {
             rows.iter()
@@ -4728,11 +6498,16 @@ mod tests {
             "top-level tool schema {total} B exceeds {TOTAL_CEILING} B:\n{}",
             dump()
         );
-        // Every row (not just the largest) — same reason as the core ratchet above.
+        // Every row (not just the largest) — keep browser rows at the tighter core-tool ceiling.
         for (name, bytes) in &rows {
+            let ceiling = if name.starts_with("browser_") {
+                1_400
+            } else {
+                PER_TOOL_CEILING
+            };
             assert!(
-                *bytes <= PER_TOOL_CEILING,
-                "top-level tool `{name}` is {bytes} B (ceiling {PER_TOOL_CEILING}):\n{}",
+                *bytes <= ceiling,
+                "top-level tool `{name}` is {bytes} B (ceiling {ceiling}):\n{}",
                 dump()
             );
         }
@@ -4936,6 +6711,96 @@ mod tests {
         assert!(out.contains("src/a.rs"));
         assert!(out.contains("src/sub/b.rs"));
         assert!(!out.contains("c.ts"));
+    }
+
+    #[test]
+    fn file_glob_literal_path_short_circuits_the_walk() {
+        // A structured pattern that names ONE literal path (separator present, no `*`/`?`) is
+        // answered by a single stat — the same output line as the exact-walk would produce, without
+        // walking anything.
+        let root = temp_root("glob-literal");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        let t = FileGlob::new(root);
+
+        let file = t
+            .execute(&serde_json::json!({"pattern":"src/a.rs"}))
+            .unwrap();
+        assert_eq!(file, "src/a.rs", "exact file, one clean line: {file}");
+
+        let dir = t.execute(&serde_json::json!({"pattern":"./src"})).unwrap();
+        assert_eq!(dir, "src/", "directories keep the trailing slash: {dir}");
+
+        // A `..`-anchored literal reaches a real sibling file above the root exactly like the walk
+        // would — deterministic stat hit, no deep walk of the whole temp parent.
+        let base = temp_root("glob-literal-parent");
+        let child = base.join("proj");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(base.join("sibling.rs"), "").unwrap();
+        let t = FileGlob::new(child.canonicalize().unwrap());
+        let out = t
+            .execute(&serde_json::json!({"pattern":"../sibling.rs"}))
+            .unwrap();
+        assert!(
+            out.ends_with("sibling.rs") && !out.contains("…["),
+            "single absolute answer, no walk trailers: {out}"
+        );
+    }
+
+    #[test]
+    fn file_glob_literal_miss_falls_through_to_the_walk() {
+        // A literal structured pattern that does NOT exist must NOT return empty-handed from the
+        // short-circuit: it falls through so the walk can answer smart-case (`src/A.RS` for
+        // `src/a.rs`) — and, failing that, the fuzzy fallback suggests near names exactly as before.
+        let root = temp_root("glob-literal-miss");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/A.RS"), "").unwrap();
+        let t = FileGlob::new(root);
+        let out = t
+            .execute(&serde_json::json!({"pattern":"src/a.rs"}))
+            .unwrap();
+        if cfg!(any(windows, target_os = "macos")) {
+            // Case-insensitive filesystems: the stat itself hits `A.RS`, so the short-circuit
+            // answers with the queried casing — the fall-through only runs on Linux.
+            assert_eq!(
+                out, "src/a.rs",
+                "stat resolves case-insensitively on this platform: {out}"
+            );
+        } else {
+            assert!(
+                out.contains("A.RS"),
+                "smart-case hit via the walk, not a stat miss: {out}"
+            );
+        }
+
+        let out = t
+            .execute(&serde_json::json!({"pattern":"src/totally-missing.txt"}))
+            .unwrap();
+        assert!(
+            !out.contains("A.RS") || out.contains("closest matches"),
+            "true miss reaches the usual not-found messaging: {out}"
+        );
+    }
+
+    #[test]
+    fn file_glob_bare_name_never_short_circuits() {
+        // A BARE name (`Cargo.toml`) is deliberately a broad ranked search, NOT a stat of
+        // root.join(name) — a file sitting ABOVE the cwd must still be found. Guard that the
+        // short-circuit only fires for structured patterns.
+        let base = temp_root("glob-bare");
+        let ws = base.join("sub").join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        // The needle lives at `base/Cargo.toml` — outside the walk anchor's direct stat reach
+        // (root is the workspace), reachable only by the broad seed walk over ancestors.
+        std::fs::write(base.join("Cargo.toml"), "").unwrap();
+        let t = FileGlob::new(ws.canonicalize().unwrap());
+        let out = t
+            .execute(&serde_json::json!({"pattern":"Cargo.toml"}))
+            .unwrap();
+        assert!(
+            out.contains("Cargo.toml"),
+            "bare name still searched broadly above the cwd: {out}"
+        );
     }
 
     #[test]
@@ -5593,7 +7458,7 @@ mod tests {
             original,
             "nothing written"
         );
-        // The batch form and the create-new form honour it too.
+        // The batch form honours dry_run too; the old create-new form is now refused.
         let r = t
             .execute(&serde_json::json!({
                 "path": "f.txt", "dry_run": true,
@@ -5612,8 +7477,8 @@ mod tests {
             .execute(&serde_json::json!({
                 "path": "new.txt", "old_string": "", "new_string": "hello", "dry_run": true
             }))
-            .unwrap();
-        assert!(r.starts_with("dry-run: would create new.txt"), "{r}");
+            .unwrap_err();
+        assert!(r.to_string().contains("file_write"), "{r}");
         assert!(!root.join("new.txt").exists());
     }
 
@@ -5639,13 +7504,29 @@ mod tests {
     }
 
     #[test]
-    fn file_edit_creates_new_when_old_empty() {
+    fn file_edit_rejects_new_when_old_empty_or_omitted() {
         let root = temp_root("edit-new");
         let t = FileEdit::new(root.clone());
-        let r = t
-            .execute(&serde_json::json!({"path":"new.txt","old_string":"","new_string":"content"}))
+        let ctx = ExecutionContext::new(crate::core::convo::ConversationId::new("test:edit-new"));
+        for args in [
+            serde_json::json!({"path":"new.txt","old_string":"","new_string":"content"}),
+            serde_json::json!({"path":"new.txt","new_string":"content"}),
+        ] {
+            assert!(t
+                .prepare_call(&args, &ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("file_write"));
+            assert!(t
+                .execute(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("file_write"));
+            assert!(!root.join("new.txt").exists());
+        }
+        FileWrite::new(root.clone())
+            .execute(&serde_json::json!({"path":"new.txt","content":"content","purpose":"project"}))
             .unwrap();
-        assert!(r.contains("created"));
         assert_eq!(
             std::fs::read_to_string(root.join("new.txt")).unwrap(),
             "content"
@@ -5711,15 +7592,394 @@ mod tests {
         );
     }
 
+    fn placement_fixture(root: &Path) -> ExecutionContext {
+        static FIXTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let workspace = root.canonicalize().unwrap();
+        let base = workspace.parent().unwrap();
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            workspace.clone(),
+            base.join(format!(
+                "{}-home-{sequence}",
+                workspace.file_name().unwrap().to_string_lossy()
+            )),
+            base.join(format!(
+                "{}-scratch-{sequence}",
+                workspace.file_name().unwrap().to_string_lossy()
+            )),
+            "native-test-run",
+        )
+        .unwrap();
+        ExecutionContext::new(crate::core::convo::ConversationId::new("test:placement"))
+            .with_placement(placement)
+    }
+
+    #[test]
+    fn file_placement_new_targets_require_purpose_before_any_effects() {
+        let root = temp_root("purpose-required");
+        let ctx = placement_fixture(&root);
+        let write = FileWrite::new(root.clone());
+        for args in [
+            serde_json::json!({"path":"new.txt","content":"x"}),
+            serde_json::json!({"path":"nested/new.txt","content":"x"}),
+            serde_json::json!({"path":"new.txt","content":"x","purpose":"unknown"}),
+            serde_json::json!({"path":"new.txt","content":"x","purpose":null}),
+            serde_json::json!({"path":"new.txt","content":"x","purpose":7}),
+        ] {
+            assert!(write.prepare_call(&args, &ctx).is_err(), "{args}");
+            assert!(write.execute(&args).is_err(), "{args}");
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let placement = ctx.placement().unwrap();
+        assert!(!placement.home_root().exists());
+        assert!(!placement.scratch_root().exists());
+        std::fs::write(root.join("source.txt"), "source").unwrap();
+        let mv = FileMove::new(root.clone());
+        let args = serde_json::json!({"from":"source.txt","to":"missing/nested/dest.txt","create_dirs":true});
+        assert!(mv
+            .prepare_call(&args, &ctx)
+            .unwrap_err()
+            .to_string()
+            .contains("purpose"));
+        assert!(mv.execute(&args).is_err());
+        assert!(!root.join("missing").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("source.txt")).unwrap(),
+            "source"
+        );
+    }
+
+    #[test]
+    fn file_placement_managed_writes_use_pinned_roots_and_direct_calls_validate() {
+        let root = temp_root("purpose-managed");
+        let ctx = placement_fixture(&root);
+        let write = FileWrite::new(root.clone());
+        for purpose in ["artifact", "scratch"] {
+            let args =
+                serde_json::json!({"path":"nested/output.txt","content":purpose,"purpose":purpose});
+            assert!(write
+                .execute(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("pinned"));
+            let prepared = write.prepare_call(&args, &ctx).unwrap();
+            let actual = PathBuf::from(prepared.args["path"].as_str().unwrap());
+            assert!(!actual.exists());
+            assert!(!root.join("nested").exists());
+            assert!(
+                !actual.parent().unwrap().exists(),
+                "preparation must not create directories"
+            );
+            let cached = prepared.preview.as_ref().unwrap();
+            assert!(cached.lines[0].contains("create"));
+            let out = write.execute_prepared(&prepared).unwrap();
+            assert!(out.text.contains(&actual.to_string_lossy().to_string()));
+            assert_eq!(std::fs::read_to_string(&actual).unwrap(), purpose);
+            let second =
+                serde_json::json!({"path":"direct.txt","content":"direct","purpose":purpose});
+            let out = crate::core::exec_ctx::with_current(ctx.clone(), || write.execute(&second))
+                .unwrap();
+            assert!(out.contains("direct.txt"));
+            assert!(!root.join("direct.txt").exists());
+        }
+        for name in [
+            "../escape.txt",
+            "/absolute.txt",
+            "C:relative.txt",
+            "nested//bad.txt",
+            "file:stream",
+        ] {
+            assert!(
+                write
+                    .prepare_call(
+                        &serde_json::json!({"path":name,"content":"x","purpose":"artifact"}),
+                        &ctx
+                    )
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_placement_prepared_write_binds_creation_and_overwrite_snapshot() {
+        let root = temp_root("purpose-cas");
+        let ctx = placement_fixture(&root);
+        let write = FileWrite::new(root.clone());
+        let args = serde_json::json!({"path":"new.txt","content":"approved","purpose":"project"});
+        let prepared = write.prepare_call(&args, &ctx).unwrap();
+        std::fs::write(root.join("new.txt"), "created elsewhere").unwrap();
+        assert!(write.execute_prepared(&prepared).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "created elsewhere"
+        );
+        let args = serde_json::json!({"path":"new.txt","content":"approved"});
+        let prepared = write.prepare_call(&args, &ctx).unwrap();
+        let cached_preview = prepared.preview.as_ref().unwrap().clone();
+        std::fs::write(root.join("new.txt"), "changed after approval").unwrap();
+        assert_eq!(
+            prepared.preview.as_ref().unwrap().lines,
+            cached_preview.lines
+        );
+        assert_eq!(prepared.preview.as_ref().unwrap().diff, cached_preview.diff);
+        assert!(write.execute_prepared(&prepared).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "changed after approval"
+        );
+        let prepared = write.prepare_call(&args, &ctx).unwrap();
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(write.execute_prepared(&prepared).is_err());
+        assert!(!root.join("new.txt").exists());
+    }
+
+    #[test]
+    fn file_placement_moves_protect_workspace_source_and_publish_destination() {
+        let root = temp_root("purpose-move");
+        let ctx = placement_fixture(&root);
+        let mv = FileMove::new(root.clone());
+        std::fs::write(root.join("source.txt"), "source").unwrap();
+        let prepared = mv
+            .prepare_call(
+                &serde_json::json!({"from":"source.txt","to":"report.txt","purpose":"artifact"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(mv.workspace_effect(&prepared.args), WorkspaceEffect::Paths);
+        assert_eq!(
+            mv.workspace_target(&prepared.args),
+            Some(root.canonicalize().unwrap())
+        );
+        let artifact = PathBuf::from(prepared.args["to"].as_str().unwrap());
+        let out = mv.execute_prepared(&prepared).unwrap();
+        assert!(out.text.contains(&artifact.to_string_lossy().to_string()));
+        assert!(!root.join("source.txt").exists());
+        let publish = mv
+            .prepare_call(
+                &serde_json::json!({"from":artifact,"to":"published.txt","purpose":"project"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(mv.workspace_effect(&publish.args), WorkspaceEffect::Paths);
+        assert_eq!(
+            mv.workspace_target(&publish.args),
+            Some(root.canonicalize().unwrap())
+        );
+        mv.execute_prepared(&publish).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("published.txt")).unwrap(),
+            "source"
+        );
+        assert!(!root.join("report.txt").exists());
+    }
+
+    #[test]
+    fn file_placement_managed_roots_inside_workspace_do_not_mark_code_edited() {
+        let root = temp_root("purpose-home-inside");
+        let workspace = root.canonicalize().unwrap();
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            workspace.clone(),
+            workspace.join("internal-home"),
+            workspace.join("internal-scratch"),
+            "internal-home-run",
+        )
+        .unwrap();
+        let ctx =
+            ExecutionContext::new(crate::core::convo::ConversationId::new("test:home-inside"))
+                .with_placement(placement);
+        let write = FileWrite::new(root.clone());
+        let prepared = write
+            .prepare_call(
+                &serde_json::json!({"path":"a.txt","content":"A","purpose":"artifact"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            write.workspace_effect(&prepared.args),
+            WorkspaceEffect::External
+        );
+        write.execute_prepared(&prepared).unwrap();
+        let artifact = PathBuf::from(prepared.args["path"].as_str().unwrap());
+        let followup = write
+            .prepare_call(&serde_json::json!({"path":artifact,"content":"B"}), &ctx)
+            .unwrap();
+        assert_eq!(
+            write.workspace_effect_prepared(&followup),
+            WorkspaceEffect::External
+        );
+        write.execute_prepared(&followup).unwrap();
+        let mv = FileMove::new(root.clone());
+        let managed = mv
+            .prepare_call(
+                &serde_json::json!({"from":artifact,"to":"b.txt","purpose":"scratch"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            mv.workspace_effect_prepared(&managed),
+            WorkspaceEffect::External
+        );
+        mv.execute_prepared(&managed).unwrap();
+        let scratch = PathBuf::from(managed.args["to"].as_str().unwrap());
+        let publish = mv
+            .prepare_call(
+                &serde_json::json!({"from":scratch,"to":"published.txt","purpose":"project"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            mv.workspace_effect_prepared(&publish),
+            WorkspaceEffect::Paths
+        );
+        assert_eq!(
+            mv.workspace_target_prepared(&publish),
+            Some(workspace.clone())
+        );
+        mv.execute_prepared(&publish).unwrap();
+        let external = temp_root("purpose-source-outside");
+        std::fs::write(external.join("outside.txt"), "outside").unwrap();
+        let out_to_managed = mv.prepare_call(&serde_json::json!({"from":external.join("outside.txt"),"to":"outside.txt","purpose":"artifact"}), &ctx).unwrap();
+        assert_eq!(
+            mv.workspace_effect(&out_to_managed.args),
+            WorkspaceEffect::External
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("published.txt")).unwrap(),
+            "B"
+        );
+    }
+
+    #[test]
+    fn file_placement_moves_bind_source_and_legacy_existing_destination() {
+        let root = temp_root("purpose-move-drift");
+        let ctx = placement_fixture(&root);
+        let mv = FileMove::new(root.clone());
+        std::fs::write(root.join("a.txt"), "A").unwrap();
+        std::fs::write(root.join("b.txt"), "B").unwrap();
+        let args = serde_json::json!({"from":"a.txt","to":"b.txt","overwrite":true});
+        let prepared = mv.prepare_call(&args, &ctx).unwrap();
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        assert!(mv.execute_prepared(&prepared).is_err());
+        assert!(root.join("a.txt").exists());
+        std::fs::write(root.join("b.txt"), "B").unwrap();
+        let prepared = mv.prepare_call(&args, &ctx).unwrap();
+        std::fs::write(root.join("a.txt"), "changed source").unwrap();
+        assert!(mv.execute_prepared(&prepared).is_err());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "B");
+        let prepared = mv.prepare_call(&args, &ctx).unwrap();
+        mv.execute_prepared(&prepared).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "changed source"
+        );
+    }
+
+    #[test]
+    fn file_placement_managed_directory_move_is_bounded_and_detects_descendant_drift() {
+        let root = temp_root("purpose-move-tree");
+        let ctx = placement_fixture(&root);
+        std::fs::create_dir_all(root.join("tree/deep")).unwrap();
+        std::fs::write(root.join("tree/deep/a.txt"), "A").unwrap();
+        let mv = FileMove::new(root.clone());
+        let args = serde_json::json!({"from":"tree","to":"tree","purpose":"artifact"});
+        let prepared = mv.prepare_call(&args, &ctx).unwrap();
+        std::fs::write(root.join("tree/deep/a.txt"), "B").unwrap();
+        assert!(mv.execute_prepared(&prepared).is_err());
+        assert!(root.join("tree").is_dir());
+        let prepared = mv.prepare_call(&args, &ctx).unwrap();
+        let dst = PathBuf::from(prepared.args["to"].as_str().unwrap());
+        mv.execute_prepared(&prepared).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.join("deep/a.txt")).unwrap(),
+            "B"
+        );
+        let big = root.join("big");
+        std::fs::create_dir(&big).unwrap();
+        for n in 0..1024 {
+            std::fs::write(big.join(format!("{n}.txt")), "").unwrap();
+        }
+        assert!(mv
+            .prepare_call(
+                &serde_json::json!({"from":"big","to":"big","purpose":"scratch"}),
+                &ctx
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("limit"));
+        assert!(!ctx.placement().unwrap().scratch_root().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_placement_managed_directory_move_refuses_symlinks() {
+        let root = temp_root("purpose-move-links");
+        let ctx = placement_fixture(&root);
+        std::fs::create_dir(root.join("tree")).unwrap();
+        std::os::unix::fs::symlink(root.parent().unwrap(), root.join("tree/escape")).unwrap();
+        let mv = FileMove::new(root.clone());
+        assert!(mv
+            .prepare_call(
+                &serde_json::json!({"from":"tree","to":"tree","purpose":"artifact"}),
+                &ctx
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("symlink"));
+        assert!(!ctx.placement().unwrap().home_root().exists());
+        let write = FileWrite::new(root.clone());
+        let prepared = write
+            .prepare_call(
+                &serde_json::json!({"path":"tree/a.txt","content":"A","purpose":"artifact"}),
+                &ctx,
+            )
+            .unwrap();
+        write.execute_prepared(&prepared).unwrap();
+        let managed_tree = ctx.placement().unwrap().artifact_root().join("tree");
+        std::os::unix::fs::symlink(root.parent().unwrap(), managed_tree.join("escape")).unwrap();
+        assert!(mv
+            .prepare_call(
+                &serde_json::json!({"from":managed_tree,"to":"published","purpose":"project"}),
+                &ctx
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("symlink"));
+        assert!(!root.join("published").exists());
+    }
+
+    #[test]
+    fn file_placement_move_refuses_distinct_workspace_owners() {
+        let root = temp_root("purpose-move-owners");
+        let outside = temp_root("purpose-move-owner-other");
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(outside.join(".git")).unwrap();
+        std::fs::write(root.join("a.txt"), "A").unwrap();
+        let ctx = placement_fixture(&root);
+        let mv = FileMove::new(root.clone());
+        assert!(mv
+            .prepare_call(
+                &serde_json::json!({"from":"a.txt","to":outside.join("b.txt"),"purpose":"project"}),
+                &ctx
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("distinct"));
+        assert!(root.join("a.txt").exists());
+        assert!(!outside.join("b.txt").exists());
+    }
+
     #[test]
     fn file_write_creates_and_overwrites() {
         let root = temp_root("write");
         let t = FileWrite::new(root.clone());
         // create
         let r = t
-            .execute(&serde_json::json!({"path":"a.txt","content":"one\ntwo\n"}))
+            .execute(
+                &serde_json::json!({"path":"a.txt","content":"one\ntwo\n","purpose":"project"}),
+            )
             .unwrap();
-        assert!(r.starts_with("created a.txt"), "{r:?}");
+        assert!(r.starts_with("created ") && r.contains("a.txt"), "{r:?}");
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "one\ntwo\n"
@@ -5728,7 +7988,10 @@ mod tests {
         let r2 = t
             .execute(&serde_json::json!({"path":"a.txt","content":"brand new\n"}))
             .unwrap();
-        assert!(r2.starts_with("overwrote a.txt"), "{r2:?}");
+        assert!(
+            r2.starts_with("overwrote ") && r2.contains("a.txt"),
+            "{r2:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "brand new\n"
@@ -5745,13 +8008,13 @@ mod tests {
         let outside = root.parent().unwrap().join("evil.txt");
         let _ = std::fs::remove_file(&outside);
         assert!(t
-            .execute(&serde_json::json!({"path":"../evil.txt","content":"x"}))
+            .execute(&serde_json::json!({"path":"../evil.txt","content":"x","purpose":"project"}))
             .is_ok());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "x");
         let _ = std::fs::remove_file(&outside);
         // The one remaining guard: writing into a non-existent subdir still errors (parent must exist).
         assert!(t
-            .execute(&serde_json::json!({"path":"nope/deep.txt","content":"x"}))
+            .execute(&serde_json::json!({"path":"nope/deep.txt","content":"x","purpose":"project"}))
             .is_err());
     }
 
@@ -5933,10 +8196,12 @@ mod tests {
     #[test]
     fn multi_edit_nonexistent_file_errs() {
         let root = temp_root("medit-nofile");
-        let t = FileEdit::new(root);
-        assert!(t
-            .execute(&serde_json::json!({"path": "nope.txt", "edits": [{"old_string": "a", "new_string": "b"}]}))
-            .is_err());
+        let t = FileEdit::new(root.clone());
+        let args = serde_json::json!({"path": "nope.txt", "edits": [{"old_string": "a", "new_string": "b"}]});
+        let ctx = placement_fixture(&root);
+        assert!(t.prepare_call(&args, &ctx).is_err());
+        assert!(t.execute(&args).is_err());
+        assert!(!root.join("nope.txt").exists());
     }
 
     #[test]
@@ -5982,6 +8247,1694 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "ONE TWO");
+    }
+
+    /// Every new native-preparation test owns all workspace, home and process roots.
+    fn native_preparation_fixture() -> (
+        crate::core::file_placement::tests::TestDir,
+        ExecutionContext,
+    ) {
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            workspace,
+            temp.path().join("home"),
+            temp.path().join("process"),
+            "bounded-native-test",
+        )
+        .unwrap();
+        let ctx = ExecutionContext::new(crate::core::convo::ConversationId::new(
+            "test:bounded-native",
+        ))
+        .with_placement(placement);
+        (temp, ctx)
+    }
+
+    struct NativeBodyCall {
+        tool: Box<dyn Tool>,
+        prepared: PreparedToolCall,
+        args: Value,
+        ctx: ExecutionContext,
+        root: PathBuf,
+        target: PathBuf,
+    }
+
+    fn native_child_body(
+        parent: &ExecutionContext,
+        owner: &str,
+        name: &str,
+        args: Value,
+    ) -> NativeBodyCall {
+        let root = parent.placement().unwrap().workspace_root().to_path_buf();
+        let path = args["path"].as_str().unwrap();
+        let target = root.join(path);
+        // Derive each child independently from the parent, not by cloning a sibling's identity.
+        let ctx = crate::agent::task_tool::child_execution_context(parent, owner, &root, name)
+            .with_native_scope(
+                crate::core::native_scope::NativeWriteScope::resolve(&root, &[path.into()])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!ctx.can_restore_workspace());
+        assert!(!ctx.recovery().can_restore_workspace());
+        let tool: Box<dyn Tool> = match name {
+            "file_read" => Box::new(FileRead::new(root.clone())),
+            "file_edit" => Box::new(FileEdit::new(root.clone())),
+            "file_write" => Box::new(FileWrite::new(root.clone())),
+            _ => panic!("unexpected native test tool"),
+        };
+        let prepared = tool.prepare_call(&args, &ctx).unwrap();
+        NativeBodyCall {
+            tool,
+            prepared,
+            args,
+            ctx,
+            root,
+            target,
+        }
+    }
+
+    impl NativeBodyCall {
+        fn resources(&self) -> &[(NativeResource, LockMode)] {
+            match self.prepared.footprint.as_ref().unwrap() {
+                PreparedFootprint::Native(resources) => resources,
+                _ => panic!("test must admit the actual frozen exact footprint"),
+            }
+        }
+
+        fn acquire(&self) -> Result<crate::core::workspace_txn::NativeResourceLease> {
+            crate::core::workspace_txn::NativeResourceLease::acquire(
+                &self.root,
+                self.resources(),
+                Duration::ZERO,
+                None,
+                &self.ctx.resource_scope(),
+            )
+        }
+
+        fn execute(&self) -> String {
+            let _lease = self.acquire().unwrap();
+            let output = self.tool.execute_prepared(&self.prepared).unwrap().text;
+            if self.tool.name() != "file_read" {
+                // Still inside the same final lease. Successful settlement leaves no pending intent.
+                assert!(
+                    crate::core::native_journal::reconcile(&self.resources()[0].0)
+                        .unwrap()
+                        .is_empty()
+                );
+                let error = crate::core::native_journal::undo_owner(
+                    &self.ctx,
+                    &self.resources()[0].0,
+                    &self.ctx.resource_scope(),
+                )
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("delegated execution cannot undo"));
+            }
+            output
+        }
+    }
+
+    struct NativeBodyWorker {
+        entered: std::sync::mpsc::Receiver<(String, PathBuf)>,
+        release: std::sync::mpsc::Sender<()>,
+        handle: std::thread::JoinHandle<String>,
+    }
+
+    fn native_body_channels(
+        call: &NativeBodyCall,
+    ) -> (
+        NativeBodyHook,
+        std::sync::mpsc::Receiver<(String, PathBuf)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let expected_tool = call.tool.name().to_string();
+        let expected_target = call.target.clone();
+        let hook: NativeBodyHook = Box::new(move |tool, target| {
+            assert_eq!(tool, expected_tool);
+            assert_eq!(target, expected_target);
+            entered_tx
+                .send((tool.to_string(), target.to_path_buf()))
+                .unwrap();
+            // Timeout is only a deadlock watchdog, never evidence of exclusion or overlap.
+            release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+        (hook, entered, release)
+    }
+
+    fn spawn_native_body(call: NativeBodyCall, home: &Path) -> NativeBodyWorker {
+        let (hook, entered, release) = native_body_channels(&call);
+        let home = home.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            crate::core::workspace_txn::with_test_lock_home(&home, || {
+                crate::core::native_journal::with_test_storage(&home, || {
+                    crate::core::exec_ctx::with_current(call.ctx.clone(), || {
+                        with_native_body_hook(hook, || call.execute())
+                    })
+                })
+            })
+        });
+        NativeBodyWorker {
+            entered,
+            release,
+            handle,
+        }
+    }
+
+    fn actual_native_bodies_overlap(
+        first_name: &str,
+        first_args: Value,
+        second_name: &str,
+        second_args: Value,
+    ) {
+        let (temp, parent) = native_preparation_fixture();
+        let root = parent.placement().unwrap().workspace_root().to_path_buf();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
+        let first = native_child_body(&parent, "test:native/first", first_name, first_args);
+        let second = native_child_body(&parent, "test:native/second", second_name, second_args);
+        assert_ne!(first.ctx.resource_scope(), second.ctx.resource_scope());
+        let first_target = first.target.clone();
+        let second_target = second.target.clone();
+        let first = spawn_native_body(first, temp.path());
+        assert_eq!(
+            first.entered.recv_timeout(Duration::from_secs(15)).unwrap(),
+            (first_name.into(), first_target)
+        );
+        let second = spawn_native_body(second, temp.path());
+        // Neither body is released until BOTH actual bodies have reported arrival. The writer
+        // rendezvous is before Storage::open: journal serialization must not fake a body conflict.
+        assert_eq!(
+            second
+                .entered
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap(),
+            (second_name.into(), second_target)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "beta\n"
+        );
+        first.release.send(()).unwrap();
+        second.release.send(()).unwrap();
+        let first_output = first.handle.join().unwrap();
+        let second_output = second.handle.join().unwrap();
+        if first_name == "file_read" && second_name == "file_read" {
+            assert_eq!(first_output, "alpha\n");
+            assert_eq!(second_output, "alpha\n");
+            assert!(!temp.path().join("native-journal-v1/records.bin").exists());
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                "ALPHA\n"
+            );
+            assert!(temp.path().join("native-journal-v1/records.bin").is_file());
+            if second_name == "file_read" {
+                assert_eq!(second_output, "beta\n");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("b.txt")).unwrap(),
+                    "beta\n"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("b.txt")).unwrap(),
+                    "BETA\n"
+                );
+                // Parent can select the exact owner; a sibling owns no records for this file.
+                crate::core::workspace_txn::with_test_lock_home(temp.path(), || {
+                    crate::core::native_journal::with_test_storage(temp.path(), || {
+                        crate::core::exec_ctx::with_current(parent.clone(), || {
+                            let resource = NativeResource::resolve(&root.join("a.txt")).unwrap();
+                            let _lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                                &root,
+                                &[(resource.clone(), LockMode::Exclusive)],
+                                Duration::ZERO,
+                                None,
+                                &parent.resource_scope(),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                crate::core::native_journal::undo_owner(
+                                    &parent,
+                                    &resource,
+                                    "test:native/second",
+                                )
+                                .unwrap(),
+                                0
+                            );
+                            assert_eq!(
+                                crate::core::native_journal::undo_owner(
+                                    &parent,
+                                    &resource,
+                                    "test:native/first",
+                                )
+                                .unwrap(),
+                                1
+                            );
+                            assert_eq!(
+                                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                                "alpha\n"
+                            );
+                            assert_eq!(
+                                std::fs::read_to_string(root.join("b.txt")).unwrap(),
+                                "BETA\n"
+                            );
+                        })
+                    })
+                });
+            }
+        }
+        crate::core::read_ledger::forget(&root.join("a.txt"));
+        crate::core::read_ledger::forget(&root.join("b.txt"));
+    }
+
+    #[test]
+    fn native_child_disjoint_file_write_and_edit_bodies_overlap_and_settle() {
+        actual_native_bodies_overlap(
+            "file_write",
+            serde_json::json!({"path":"a.txt","content":"ALPHA\n"}),
+            "file_edit",
+            serde_json::json!({"path":"b.txt","old_string":"beta","new_string":"BETA"}),
+        );
+    }
+
+    #[test]
+    fn native_child_disjoint_file_edit_and_read_bodies_overlap() {
+        actual_native_bodies_overlap(
+            "file_edit",
+            serde_json::json!({"path":"a.txt","old_string":"alpha","new_string":"ALPHA"}),
+            "file_read",
+            serde_json::json!({"path":"b.txt"}),
+        );
+    }
+
+    #[test]
+    fn native_child_disjoint_file_write_and_read_bodies_overlap() {
+        actual_native_bodies_overlap(
+            "file_write",
+            serde_json::json!({"path":"a.txt","content":"ALPHA\n"}),
+            "file_read",
+            serde_json::json!({"path":"b.txt"}),
+        );
+    }
+
+    #[test]
+    fn native_child_same_file_read_bodies_overlap() {
+        actual_native_bodies_overlap(
+            "file_read",
+            serde_json::json!({"path":"a.txt"}),
+            "file_read",
+            serde_json::json!({"path":"a.txt"}),
+        );
+    }
+
+    fn actual_native_second_body_is_excluded(
+        first_name: &str,
+        first_args: Value,
+        second_name: &str,
+        second_args: Value,
+        expected: &str,
+    ) {
+        let (temp, parent) = native_preparation_fixture();
+        let root = parent.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("a.txt");
+        std::fs::write(&target, "alpha\n").unwrap();
+        let first = native_child_body(&parent, "test:excluded/first", first_name, first_args);
+        let mut second =
+            native_child_body(&parent, "test:excluded/second", second_name, second_args);
+        assert_ne!(first.ctx.resource_scope(), second.ctx.resource_scope());
+        let resource_key = second.resources()[0].0.key().to_string();
+        let (hook, entered, release) = native_body_channels(&second);
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        let first = spawn_native_body(first, temp.path());
+        first.entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        let home = temp.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            crate::core::workspace_txn::with_test_lock_home(&home, || {
+                crate::core::native_journal::with_test_storage(&home, || {
+                    crate::core::exec_ctx::with_current(second.ctx.clone(), || {
+                        with_native_body_hook(hook, || {
+                            match second.acquire() {
+                                Ok(lease) => {
+                                    // Regression must enter the REAL second body, not a fake closure.
+                                    second.tool.execute_prepared(&second.prepared).unwrap();
+                                    drop(lease);
+                                    panic!("same-file conflicting body was admitted");
+                                }
+                                Err(error) => {
+                                    let busy = error.downcast_ref::<crate::core::repo_lock::LockBusy>()
+                                        .expect("expected typed exact-resource exclusion, not a body/preparation error");
+                                    assert_eq!(
+                                        busy.path,
+                                        crate::core::workspace_txn::resource_lock(
+                                            "native-file",
+                                            &resource_key
+                                        )
+                                    );
+                                    busy_tx.send(()).unwrap();
+                                }
+                            }
+                            retry_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+                            // A preceding writer changes identity/content. Explicit fresh preparation
+                            // is required after releasing it, rather than silently refreshing approval.
+                            second.prepared =
+                                second.tool.prepare_call(&second.args, &second.ctx).unwrap();
+                            second.execute()
+                        })
+                    })
+                })
+            })
+        });
+        busy_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(matches!(
+            entered.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha\n");
+        first.release.send(()).unwrap();
+        first.handle.join().unwrap();
+        retry_tx.send(()).unwrap();
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(15)).unwrap(),
+            (second_name.into(), target.clone())
+        );
+        release.send(()).unwrap();
+        let output = handle.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), expected);
+        if second_name == "file_read" {
+            assert_eq!(output, expected);
+        }
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn native_child_same_file_write_blocks_edit_body_until_release() {
+        actual_native_second_body_is_excluded(
+            "file_write",
+            serde_json::json!({"path":"a.txt","content":"alpha changed\n"}),
+            "file_edit",
+            serde_json::json!({"path":"a.txt","old_string":"alpha","new_string":"final"}),
+            "final changed\n",
+        );
+    }
+
+    #[test]
+    fn native_child_same_file_read_blocks_write_body_until_release() {
+        actual_native_second_body_is_excluded(
+            "file_read",
+            serde_json::json!({"path":"a.txt"}),
+            "file_write",
+            serde_json::json!({"path":"a.txt","content":"ALPHA\n"}),
+            "ALPHA\n",
+        );
+    }
+
+    #[test]
+    fn native_child_same_file_write_blocks_read_body_until_release() {
+        actual_native_second_body_is_excluded(
+            "file_write",
+            serde_json::json!({"path":"a.txt","content":"ALPHA\n"}),
+            "file_read",
+            serde_json::json!({"path":"a.txt"}),
+            "ALPHA\n",
+        );
+    }
+
+    #[test]
+    fn prepared_file_write_freezes_bytes_destination_output_and_footprint() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let write = FileWrite::new(root.clone());
+        for existing in [false, true] {
+            let target = root.join(if existing { "existing.txt" } else { "new.txt" });
+            if existing {
+                std::fs::write(&target, "before\n").unwrap();
+            }
+            let mut prepared = write
+                .prepare_call(
+                    &serde_json::json!({
+                        "path":target,"content":"approved\n","purpose":"project"
+                    }),
+                    &ctx,
+                )
+                .unwrap();
+            let frozen = prepared
+                .delegation
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<FrozenFileWrite>()
+                .unwrap();
+            let expected_output = frozen.output.clone();
+            assert_eq!(frozen.content, "approved\n");
+            match prepared.footprint.as_ref().unwrap() {
+                PreparedFootprint::Native(resources) => {
+                    assert_eq!(resources.len(), 1);
+                    assert_eq!(resources[0].0.path(), target);
+                    assert_eq!(resources[0].1, LockMode::Exclusive);
+                }
+                PreparedFootprint::Global => {
+                    panic!("ordinary regular target should resolve exactly")
+                }
+                PreparedFootprint::Overlay { .. } => {
+                    panic!("overlay footprint is not valid in live fixture")
+                }
+            }
+            prepared.args["path"] = serde_json::json!(root.join("unapproved.txt"));
+            prepared.args["content"] = serde_json::json!("UNAPPROVED".repeat(1024));
+            prepared.args["purpose"] = serde_json::json!("scratch");
+            let output = write.execute_prepared(&prepared).unwrap();
+            assert!(output.text.starts_with(&expected_output));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "approved\n");
+            assert!(!root.join("unapproved.txt").exists());
+            crate::core::read_ledger::forget(&target);
+        }
+    }
+
+    #[test]
+    fn prepared_file_write_refuses_drift_and_rechecks_ledger_without_refreshing_preview() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        let write = FileWrite::new(root.clone());
+        std::fs::write(&target, "baseline\n").unwrap();
+        let prepared = write
+            .prepare_call(
+                &serde_json::json!({"path":"f.txt","content":"approved\n"}),
+                &ctx,
+            )
+            .unwrap();
+        std::fs::write(&target, "peer\n").unwrap();
+        FileRead::new(root.clone())
+            .execute(&serde_json::json!({"path":"f.txt"}))
+            .unwrap();
+        assert!(write.execute_prepared(&prepared).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "peer\n");
+        let prepared = write
+            .prepare_call(
+                &serde_json::json!({"path":"f.txt","content":"approved\n"}),
+                &ctx,
+            )
+            .unwrap();
+        let stale = crate::core::persist::FileFingerprint::for_bytes(b"different observation");
+        crate::core::read_ledger::note(&target, &stale);
+        assert!(write
+            .preview(&serde_json::json!({"path":"f.txt","content":"approved\n"}))
+            .is_some());
+        assert_eq!(
+            crate::core::read_ledger::observed(&target),
+            Some(stale.clone())
+        );
+        assert!(write
+            .execute_prepared(&prepared)
+            .unwrap_err()
+            .to_string()
+            .contains("overwrite conflict"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "peer\n");
+        assert_eq!(crate::core::read_ledger::observed(&target), Some(stale));
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_write_noop_is_frozen_and_does_not_refresh_ledger() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        std::fs::write(&target, "same\n").unwrap();
+        let modified = std::fs::metadata(&target).unwrap().modified().unwrap();
+        let stale = crate::core::persist::FileFingerprint::for_bytes(b"prior read");
+        crate::core::read_ledger::note(&target, &stale);
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.txt".into()]).unwrap();
+        let ctx = ctx.with_native_scope(scope).unwrap();
+        let write = FileWrite::new(root.clone());
+        let mut prepared = write
+            .prepare_call(
+                &serde_json::json!({"path":"f.txt","content":"same\n"}),
+                &ctx,
+            )
+            .unwrap();
+        prepared.args["content"] = serde_json::json!("unapproved");
+        assert_eq!(
+            write.workspace_effect_prepared(&prepared),
+            WorkspaceEffect::None
+        );
+        assert!(crate::core::exec_ctx::with_current(ctx.clone(), || write
+            .execute_prepared(&prepared))
+        .unwrap()
+        .text
+        .starts_with(NOOP_WRITE_PREFIX));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(crate::core::read_ledger::observed(&target), Some(stale));
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_write_bounds_arguments_file_and_diff() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        let write = FileWrite::new(root.clone());
+        std::fs::write(&target, "small").unwrap();
+        let oversized = "x".repeat(PREPARED_EDIT_MAX_BYTES + 1);
+        for args in [
+            serde_json::json!({"path":"f.txt","content":oversized}),
+            serde_json::json!({"path":"f.txt","content":"small","ignored":oversized}),
+        ] {
+            assert!(
+                format!("{:#}", write.prepare_call(&args, &ctx).unwrap_err()).contains("4 MiB")
+            );
+        }
+        std::fs::write(&target, &oversized).unwrap();
+        assert!(write
+            .prepare_call(&serde_json::json!({"path":"f.txt","content":"small"}), &ctx)
+            .is_err());
+        assert!(write
+            .preview(&serde_json::json!({"path":"f.txt","content":"small"}))
+            .is_none());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().len(),
+            oversized.len() as u64
+        );
+        // Both source and replacement fit individually; their minified-line diff does not.
+        std::fs::write(&target, "a".repeat(PREPARED_EDIT_MAX_BYTES * 3 / 4)).unwrap();
+        assert!(format!(
+            "{:#}",
+            write
+                .prepare_call(
+                    &serde_json::json!({
+                        "path":"f.txt","content":"b".repeat(PREPARED_EDIT_MAX_BYTES * 3 / 4)
+                    }),
+                    &ctx
+                )
+                .unwrap_err()
+        )
+        .contains("4 MiB"));
+    }
+
+    #[test]
+    fn prepared_file_read_freezes_options_targets_and_reads_new_content() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        std::fs::write(&target, "old one\nold two\n").unwrap();
+        std::fs::write(root.join("other.txt"), "UNAPPROVED").unwrap();
+        let read = FileRead::new(root.clone());
+        let mut prepared = read
+            .prepare_call(
+                &serde_json::json!({"path":"f.txt","start":2,"end":2,"number":true}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(crate::core::read_ledger::observed(&target).is_none());
+        match prepared.footprint.as_ref().unwrap() {
+            PreparedFootprint::Native(resources) => {
+                assert_eq!(resources.len(), 1);
+                assert_eq!(resources[0].0.path(), target);
+                assert_eq!(resources[0].1, LockMode::Shared);
+            }
+            PreparedFootprint::Global => panic!("regular read target should resolve exactly"),
+            PreparedFootprint::Overlay { .. } => {
+                panic!("overlay footprint is not valid in live fixture")
+            }
+        }
+        std::fs::write(&target, "new one\nnew two\n").unwrap();
+        prepared.args = serde_json::json!({"path":"other.txt","files":[{"path":"other.txt"}],"start":1,"number":false});
+        assert_eq!(read.execute_prepared(&prepared).unwrap().text, "2|new two");
+        assert_eq!(
+            crate::core::read_ledger::observed(&target),
+            Some(crate::core::persist::FileFingerprint::for_bytes(
+                b"new one\nnew two\n"
+            ))
+        );
+        assert!(crate::core::read_ledger::observed(&root.join("other.txt")).is_none());
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_read_batch_footprint_is_exact_first_eight_actual_targets() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let mut files = Vec::new();
+        for n in 0..9 {
+            std::fs::write(root.join(format!("{n}.txt")), format!("body-{n}\n")).unwrap();
+            files.push(serde_json::json!({"path":format!("{n}.txt")}));
+        }
+        let read = FileRead::new(root.clone());
+        let mut prepared = read
+            .prepare_call(
+                &serde_json::json!({"path":"ignored-missing.txt","files":files}),
+                &ctx,
+            )
+            .unwrap();
+        match prepared.footprint.as_ref().unwrap() {
+            PreparedFootprint::Native(resources) => {
+                assert_eq!(resources.len(), MULTI_READ_MAX_FILES);
+                for (n, (resource, mode)) in resources.iter().enumerate() {
+                    assert_eq!(resource.path(), root.join(format!("{n}.txt")));
+                    assert_eq!(*mode, LockMode::Shared);
+                }
+            }
+            PreparedFootprint::Global => panic!("valid batch should resolve exact read footprint"),
+            PreparedFootprint::Overlay { .. } => {
+                panic!("overlay footprint is not valid in live fixture")
+            }
+        }
+        prepared.args["files"] = serde_json::json!([{"path":"8.txt"}]);
+        let output = read.execute_prepared(&prepared).unwrap().text;
+        assert!(output.contains("body-0") && output.contains("body-7"));
+        assert!(!output.contains("body-8"));
+        assert!(output.contains("1 more file(s) not read"));
+        for n in 0..8 {
+            crate::core::read_ledger::forget(&root.join(format!("{n}.txt")));
+        }
+        assert!(crate::core::read_ledger::observed(&root.join("8.txt")).is_none());
+    }
+
+    #[test]
+    fn prepared_file_read_refuses_identity_drift_and_bounds_disk_read() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        std::fs::write(&target, "original").unwrap();
+        let read = FileRead::new(root.clone());
+        let prepared = read
+            .prepare_call(&serde_json::json!({"path":"f.txt"}), &ctx)
+            .unwrap();
+        std::fs::rename(&target, root.join("old.txt")).unwrap();
+        std::fs::write(&target, "different identity").unwrap();
+        assert!(read.execute_prepared(&prepared).is_err());
+        assert!(crate::core::read_ledger::observed(&target).is_none());
+        let prepared = read
+            .prepare_call(&serde_json::json!({"path":"f.txt","start":1,"end":1}), &ctx)
+            .unwrap();
+        std::fs::write(&target, vec![b'x'; PREPARED_EDIT_MAX_BYTES + 1]).unwrap();
+        assert!(format!("{:#}", read.execute_prepared(&prepared).unwrap_err()).contains("4 MiB"));
+        assert!(crate::core::read_ledger::observed(&target).is_none());
+    }
+
+    #[test]
+    fn prepared_native_read_and_write_refuse_ambiguous_scoped_footprints() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.txt".into()]).unwrap();
+        let scoped = ctx.with_native_scope(scope).unwrap();
+        let read = FileRead::new(root.clone());
+        let args = serde_json::json!({"files":[{"path":"missing.txt"}]});
+        assert!(matches!(
+            read.prepare_call(&args, &ctx).unwrap().footprint,
+            Some(PreparedFootprint::Global)
+        ));
+        assert!(read.prepare_call(&args, &scoped).is_err());
+        std::fs::create_dir(root.join("directory")).unwrap();
+        let args = serde_json::json!({"path":"directory"});
+        assert!(matches!(
+            read.prepare_call(&args, &ctx).unwrap().footprint,
+            Some(PreparedFootprint::Global)
+        ));
+        assert!(read.prepare_call(&args, &scoped).is_err());
+        assert!(FileWrite::new(root)
+            .prepare_call(
+                &serde_json::json!({
+                    "path":"directory","content":"forbidden","purpose":"project"
+                }),
+                &scoped
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn prepared_scoped_read_skips_lsp_hint_and_scoped_write_rechecks_authority() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.rs");
+        let body = "fn item() {}\n".repeat(150);
+        std::fs::write(&target, &body).unwrap();
+        std::fs::write(root.join("outside.rs"), "outside\n").unwrap();
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.rs".into()]).unwrap();
+        let unscoped = ctx.clone();
+        let ctx = ctx.with_native_scope(scope).unwrap();
+        let read = FileRead::new(root.clone());
+        let prepared = read
+            .prepare_call(&serde_json::json!({"path":"f.rs"}), &ctx)
+            .unwrap();
+        assert_eq!(
+            crate::core::exec_ctx::with_current(ctx.clone(), || read.execute_prepared(&prepared))
+                .unwrap()
+                .text,
+            body
+        );
+        let write = FileWrite::new(root.clone());
+        let write_args = serde_json::json!({"path":"outside.rs","content":"forbidden\n"});
+        assert!(write.prepare_call(&write_args, &ctx).is_err());
+        let prepared = write.prepare_call(&write_args, &unscoped).unwrap();
+        assert!(crate::core::exec_ctx::with_current(ctx.clone(), || write
+            .execute_prepared(&prepared))
+        .unwrap_err()
+        .to_string()
+        .contains("scope"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("outside.rs")).unwrap(),
+            "outside\n"
+        );
+        let edit = FileEdit::new(root.clone());
+        let edit_args = serde_json::json!({"path":"outside.rs","old_string":"outside","new_string":"forbidden"});
+        assert!(edit.prepare_call(&edit_args, &ctx).is_err());
+        let prepared = edit.prepare_call(&edit_args, &unscoped).unwrap();
+        assert!(crate::core::exec_ctx::with_current(ctx.clone(), || edit
+            .execute_prepared(&prepared))
+        .unwrap_err()
+        .to_string()
+        .contains("scope"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("outside.rs")).unwrap(),
+            "outside\n"
+        );
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn ordinary_prepared_writes_and_edits_cannot_mutate_reserved_native_journal() {
+        let (temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let storage = home.join("native-journal-v1");
+        std::fs::create_dir(&storage).unwrap();
+        let target = storage.join("records.bin");
+        std::fs::write(&target, "reserved journal\n").unwrap();
+        let write = FileWrite::new(root.clone());
+        let edit = FileEdit::new(root.clone());
+        let write_args = serde_json::json!({"path":target,"content":"overwrite\n"});
+        let edit_args =
+            serde_json::json!({"path":target,"old_string":"reserved","new_string":"overwrite"});
+        // Freeze before this fixture storage becomes reserved; execution must revalidate, not
+        // trust a previously authorized destination or an exposed footprint changed to Global.
+        let preparation_home = temp.path().join("other-home");
+        let (mut write_call, mut edit_call) =
+            crate::core::native_journal::with_test_storage(&preparation_home, || {
+                (
+                    write.prepare_call(&write_args, &ctx).unwrap(),
+                    edit.prepare_call(&edit_args, &ctx).unwrap(),
+                )
+            });
+        write_call.footprint = Some(PreparedFootprint::Global);
+        edit_call.footprint = Some(PreparedFootprint::Global);
+        crate::core::native_journal::with_test_storage(&home, || {
+            assert!(write
+                .prepare_call(&write_args, &ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("journal storage"));
+            assert!(edit
+                .prepare_call(&edit_args, &ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("journal storage"));
+            assert!(write
+                .execute_prepared(&write_call)
+                .unwrap_err()
+                .to_string()
+                .contains("journal storage"));
+            assert!(edit
+                .execute_prepared(&edit_call)
+                .unwrap_err()
+                .to_string()
+                .contains("journal storage"));
+            assert!(write.prepare_call(&serde_json::json!({
+                "path":storage.join("storage.lock"),"content":"forbidden","purpose":"project"
+            }), &ctx).is_err());
+            let scoped = ctx
+                .clone()
+                .with_native_scope(
+                    crate::core::native_scope::NativeWriteScope::resolve(
+                        &root,
+                        &[target.to_string_lossy().into_owned()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(write.prepare_call(&write_args, &scoped).is_err());
+            assert!(edit.prepare_call(&edit_args, &scoped).is_err());
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "reserved journal\n"
+            );
+            assert!(!storage.join("storage.lock").exists());
+            assert_eq!(std::fs::read_dir(&storage).unwrap().count(), 1);
+            assert!(crate::core::read_ledger::observed(&target).is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_global_write_link_to_reserved_journal_is_refused_without_storage_effects() {
+        use std::os::unix::fs::symlink;
+        let (temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let storage = home.join("native-journal-v1");
+        std::fs::create_dir(&storage).unwrap();
+        let target = storage.join("records.bin");
+        std::fs::write(&target, "reserved\n").unwrap();
+        let alias = root.join("journal-alias");
+        symlink(&target, &alias).unwrap();
+        let write = FileWrite::new(root.clone());
+        let edit = FileEdit::new(root);
+        let write_args = serde_json::json!({"path":alias,"content":"forbidden"});
+        let edit_args =
+            serde_json::json!({"path":alias,"old_string":"reserved","new_string":"forbidden"});
+        let preparation_home = temp.path().join("other-home");
+        let write_call = crate::core::native_journal::with_test_storage(&preparation_home, || {
+            write.prepare_call(&write_args, &ctx).unwrap()
+        });
+        assert!(matches!(
+            write_call.footprint,
+            Some(PreparedFootprint::Global)
+        ));
+        crate::core::native_journal::with_test_storage(&home, || {
+            assert!(write.prepare_call(&write_args, &ctx).is_err());
+            assert!(edit.prepare_call(&edit_args, &ctx).is_err());
+            assert!(write.execute_prepared(&write_call).is_err());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "reserved\n");
+            assert!(std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!storage.join("storage.lock").exists());
+        });
+    }
+
+    #[test]
+    fn shell_restore_preflight_denies_nested_ambiguous_and_delegated_before_effects() {
+        let parent = ExecutionContext::new(crate::core::convo::ConversationId::new(
+            "shell-restore-parent",
+        ));
+        assert!(shell_restore_preflight("git restore .", Some(&parent)).unwrap());
+        assert!(shell_restore_preflight("git reset --hard HEAD", Some(&parent)).unwrap());
+        assert!(!shell_restore_preflight("git status", Some(&parent)).unwrap());
+        for command in [
+            "aizen time restore checkpoint",
+            "aizen time undo",
+            "git -C elsewhere restore .",
+            "git --work-tree=elsewhere reset --hard",
+            "git restore . && git status",
+            "cd elsewhere; git restore .",
+            "git 'restore' .",
+        ] {
+            assert!(
+                shell_restore_preflight(command, Some(&parent)).is_err(),
+                "{command}"
+            );
+        }
+        let child = parent.without_workspace_restore();
+        assert!(shell_restore_preflight("git restore .", Some(&child)).is_err());
+        assert!(!shell_restore_preflight("echo 'git restore .'", Some(&child)).unwrap());
+    }
+
+    #[test]
+    fn shell_lifetime_retains_exclusion_after_observer_drop_until_tree_and_pipe_settle() {
+        struct Owner(std::sync::Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn quarantine(_: Owner) {
+            panic!("proven fixture should not quarantine");
+        }
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let observer = std::sync::Arc::new(crate::agent::process::SettlementLifetime::new(
+            Owner(released.clone()),
+            quarantine,
+        ));
+        let pipe = observer.drain();
+        let tree_waiter = observer.drain();
+        let actual_worker = observer.clone();
+        drop(observer); // Models async observer select cancellation/drop, not actual process exit.
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        actual_worker.prove_tree_settled();
+        drop(tree_waiter);
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            0,
+            "unsettled actual pipe keeps admission"
+        );
+        drop(pipe);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        drop(actual_worker);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shell_lifetime_unknown_settlement_quarantines_instead_of_releasing() {
+        static QUARANTINED: AtomicUsize = AtomicUsize::new(0);
+        struct Owner(std::sync::Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn quarantine(owner: Owner) {
+            QUARANTINED.fetch_add(1, Ordering::SeqCst);
+            std::mem::forget(owner); // Test-only generic quarantine; no process/OS lock was created.
+        }
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let lifetime = std::sync::Arc::new(crate::agent::process::SettlementLifetime::new(
+            Owner(released.clone()),
+            quarantine,
+        ));
+        let pipe = lifetime.drain();
+        drop(lifetime);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(pipe); // EOF alone is deliberately not tree-quiescence proof.
+        assert_eq!(QUARANTINED.load(Ordering::SeqCst), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_unscoped_native_bodies_skip_lsp_even_if_visible_footprint_changes() {
+        let (temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.rs");
+        let body = "fn old() {}\n".repeat(150);
+        std::fs::write(&target, &body).unwrap();
+        crate::core::workspace_txn::with_test_lock_home(temp.path(), || {
+            crate::core::exec_ctx::with_current(ctx.clone(), || {
+                let read = FileRead::new(root.clone());
+                let mut prepared = read
+                    .prepare_call(&serde_json::json!({"path":"f.rs"}), &ctx)
+                    .unwrap();
+                let resources = match prepared.footprint.as_ref().unwrap() {
+                    PreparedFootprint::Native(resources) => resources.clone(),
+                    _ => panic!("native read footprint expected"),
+                };
+                let lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                    &root,
+                    &resources,
+                    Duration::from_secs(15),
+                    None,
+                    &ctx.resource_scope(),
+                )
+                .unwrap();
+                prepared.footprint = Some(PreparedFootprint::Global);
+                assert_eq!(read.execute_prepared(&prepared).unwrap().text, body);
+                drop(lease);
+                let write = FileWrite::new(root.clone());
+                let mut prepared = write
+                    .prepare_call(
+                        &serde_json::json!({"path":"f.rs","content":"fn approved() {}\n"}),
+                        &ctx,
+                    )
+                    .unwrap();
+                let resources = match prepared.footprint.as_ref().unwrap() {
+                    PreparedFootprint::Native(resources) => resources.clone(),
+                    _ => panic!("native write footprint expected"),
+                };
+                let expected = prepared
+                    .delegation
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<FrozenFileWrite>()
+                    .unwrap()
+                    .output
+                    .clone();
+                let lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                    &root,
+                    &resources,
+                    Duration::from_secs(15),
+                    None,
+                    &ctx.resource_scope(),
+                )
+                .unwrap();
+                prepared.footprint = Some(PreparedFootprint::Global);
+                assert_eq!(write.execute_prepared(&prepared).unwrap().text, expected);
+                drop(lease);
+                let edit = FileEdit::new(root.clone());
+                let mut prepared = edit.prepare_call(&serde_json::json!({"path":"f.rs","old_string":"approved","new_string":"edited"}), &ctx).unwrap();
+                let resources = match prepared.footprint.as_ref().unwrap() {
+                    PreparedFootprint::Native(resources) => resources.clone(),
+                    _ => panic!("native edit footprint expected"),
+                };
+                let expected = prepared
+                    .delegation
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<FrozenFileEdit>()
+                    .unwrap()
+                    .output
+                    .clone();
+                let _lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                    &root,
+                    &resources,
+                    Duration::from_secs(15),
+                    None,
+                    &ctx.resource_scope(),
+                )
+                .unwrap();
+                prepared.footprint = Some(PreparedFootprint::Global);
+                assert_eq!(edit.execute_prepared(&prepared).unwrap().text, expected);
+                assert_eq!(
+                    std::fs::read_to_string(&target).unwrap(),
+                    "fn edited() {}\n"
+                );
+            })
+        });
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_write_context_cannot_be_reused_under_changed_native_scope_or_owner() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        std::fs::write(&target, "before\n").unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.txt".into()]).unwrap();
+        let scoped = ctx.clone().with_native_scope(scope).unwrap();
+        let other_scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["other.txt".into()])
+                .unwrap();
+        let other_scoped = ctx.clone().with_native_scope(other_scope).unwrap();
+        let other_owner = ExecutionContext::new(crate::core::convo::ConversationId::new(
+            "test:other-native-owner",
+        ))
+        .with_placement(ctx.placement().unwrap().clone())
+        .with_native_scope(
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.txt".into()]).unwrap(),
+        )
+        .unwrap();
+        let write = FileWrite::new(root.clone());
+        let edit = FileEdit::new(root.clone());
+        for preparation_ctx in [&ctx, &scoped] {
+            let mut write_call = write
+                .prepare_call(
+                    &serde_json::json!({"path":"f.txt","content":"after\n"}),
+                    preparation_ctx,
+                )
+                .unwrap();
+            let mut edit_call = edit
+                .prepare_call(
+                    &serde_json::json!({"path":"f.txt","old_string":"before","new_string":"after"}),
+                    preparation_ctx,
+                )
+                .unwrap();
+            write_call.footprint = Some(PreparedFootprint::Global);
+            edit_call.footprint = Some(PreparedFootprint::Global);
+            let ambient_contexts = if preparation_ctx.native_scope().is_some() {
+                vec![&ctx, &other_scoped, &other_owner]
+            } else {
+                vec![&scoped]
+            };
+            for ambient in &ambient_contexts {
+                for result in [
+                    crate::core::exec_ctx::with_current((*ambient).clone(), || {
+                        write.execute_prepared(&write_call)
+                    }),
+                    crate::core::exec_ctx::with_current((*ambient).clone(), || {
+                        edit.execute_prepared(&edit_call)
+                    }),
+                ] {
+                    assert!(result.unwrap_err().to_string().contains("scope"));
+                }
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            }
+            if preparation_ctx.native_scope().is_some() {
+                assert!(write.execute_prepared(&write_call).is_err());
+                assert!(edit.execute_prepared(&edit_call).is_err());
+            }
+        }
+        assert!(crate::core::read_ledger::observed(&target).is_none());
+    }
+
+    #[test]
+    fn native_scope_read_only_enforces_all_entries_and_frozen_modes() {
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        std::fs::write(root.join("allowed.txt"), "owned read\n").unwrap();
+        std::fs::write(root.join("outside.txt"), "private outside\n").unwrap();
+        let scope = crate::core::native_scope::NativeWriteScope::resolve_access(
+            &root,
+            &["allowed.txt".into()],
+            &[],
+        )
+        .unwrap();
+        let read_ctx = ctx.clone().with_native_scope(scope).unwrap();
+        let write_ctx = ctx
+            .clone()
+            .with_native_scope(
+                crate::core::native_scope::NativeWriteScope::resolve(
+                    &root,
+                    &["allowed.txt".into()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(read_ctx
+            .with_native_scope(write_ctx.native_scope().unwrap().clone())
+            .is_err());
+        let read = FileRead::new(root.clone());
+        assert!(read
+            .prepare_call(&serde_json::json!({"path":"outside.txt"}), &read_ctx)
+            .is_err());
+        let mut files = vec![serde_json::json!({"path":"allowed.txt"}); 8];
+        files.push(serde_json::json!({"path":"outside.txt"}));
+        assert!(
+            read.prepare_call(&serde_json::json!({"files":files}), &read_ctx)
+                .is_err(),
+            "even the omitted ninth entry must be authorized"
+        );
+        assert!(FileWrite::new(root.clone())
+            .prepare_call(
+                &serde_json::json!({"path":"allowed.txt","content":"changed"}),
+                &read_ctx
+            )
+            .is_err());
+        assert!(FileEdit::new(root.clone()).prepare_call(&serde_json::json!({"path":"allowed.txt","old_string":"owned","new_string":"changed"}), &read_ctx).is_err());
+        let call = read
+            .prepare_call(&serde_json::json!({"path":"allowed.txt"}), &read_ctx)
+            .unwrap();
+        assert!(
+            crate::core::exec_ctx::with_current(write_ctx, || read.execute_prepared(&call))
+                .is_err(),
+            "same file union is not the same authority"
+        );
+        let result =
+            crate::core::exec_ctx::with_current(read_ctx, || read.execute_prepared(&call)).unwrap();
+        assert!(result.text.contains("owned read"));
+        assert!(!result.text.contains("private outside"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("allowed.txt")).unwrap(),
+            "owned read\n"
+        );
+    }
+
+    #[test]
+    fn prepared_scoped_file_writes_apply_exact_frozen_bytes_via_journal() {
+        let (temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.rs");
+        std::fs::write(&target, "fn old() {}\n").unwrap();
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.rs".into()]).unwrap();
+        let ctx = ctx.with_native_scope(scope).unwrap();
+        crate::core::workspace_txn::with_test_lock_home(temp.path(), || {
+            crate::core::native_journal::with_test_storage(temp.path(), || {
+                crate::core::exec_ctx::with_current(ctx.clone(), || {
+                    let write = FileWrite::new(root.clone());
+                    let mut prepared = write
+                        .prepare_call(
+                            &serde_json::json!({"path":"f.rs","content":"fn approved() {}\n"}),
+                            &ctx,
+                        )
+                        .unwrap();
+                    let resources = match prepared.footprint.as_ref().unwrap() {
+                        PreparedFootprint::Native(resources) => resources.clone(),
+                        _ => panic!("exact resource required"),
+                    };
+                    let lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                        &root,
+                        &resources,
+                        Duration::from_secs(15),
+                        None,
+                        &ctx.resource_scope(),
+                    )
+                    .unwrap();
+                    let frozen_output = prepared
+                        .delegation
+                        .as_ref()
+                        .unwrap()
+                        .downcast_ref::<FrozenFileWrite>()
+                        .unwrap()
+                        .output
+                        .clone();
+                    prepared.args["content"] = serde_json::json!("unapproved");
+                    assert_eq!(
+                        write.execute_prepared(&prepared).unwrap().text,
+                        frozen_output
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&target).unwrap(),
+                        "fn approved() {}\n"
+                    );
+                    drop(lease);
+                    let edit = FileEdit::new(root.clone());
+                    let mut prepared = edit.prepare_call(&serde_json::json!({"path":"f.rs","old_string":"approved","new_string":"edited"}), &ctx).unwrap();
+                    let resources = match prepared.footprint.as_ref().unwrap() {
+                        PreparedFootprint::Native(resources) => resources.clone(),
+                        _ => panic!("exact resource required"),
+                    };
+                    let lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                        &root,
+                        &resources,
+                        Duration::from_secs(15),
+                        None,
+                        &ctx.resource_scope(),
+                    )
+                    .unwrap();
+                    let frozen_output = prepared
+                        .delegation
+                        .as_ref()
+                        .unwrap()
+                        .downcast_ref::<FrozenFileEdit>()
+                        .unwrap()
+                        .output
+                        .clone();
+                    prepared.args["new_string"] = serde_json::json!("unapproved");
+                    // Exact frozen output proves no post-write LSP feedback was appended in this lane.
+                    assert_eq!(
+                        edit.execute_prepared(&prepared).unwrap().text,
+                        frozen_output
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&target).unwrap(),
+                        "fn edited() {}\n"
+                    );
+                    assert_eq!(
+                        crate::core::read_ledger::observed(&target),
+                        Some(crate::core::persist::FileFingerprint::for_bytes(
+                            b"fn edited() {}\n"
+                        ))
+                    );
+                    // Caller retains the same exclusive resource lease during reconciliation.
+                    assert!(!crate::core::native_journal::reconcile(&resources[0].0)
+                        .unwrap()
+                        .iter()
+                        .any(|entry| matches!(
+                            entry,
+                            crate::core::native_journal::Reconciliation::Conflict { .. }
+                        )));
+                    drop(lease);
+                })
+            })
+        });
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_scoped_write_after_apply_failure_retains_journal_and_prior_ledger() {
+        let (temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        let target = root.join("f.txt");
+        std::fs::write(&target, "before\n").unwrap();
+        let observed = crate::core::persist::FileFingerprint::for_bytes(b"before\n");
+        crate::core::read_ledger::note(&target, &observed);
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(&root, &["f.txt".into()]).unwrap();
+        let ctx = ctx.with_native_scope(scope).unwrap();
+        crate::core::workspace_txn::with_test_lock_home(temp.path(), || {
+            crate::core::native_journal::with_test_storage(temp.path(), || {
+                crate::core::exec_ctx::with_current(ctx.clone(), || {
+                    let write = FileWrite::new(root.clone());
+                    let prepared = write
+                        .prepare_call(
+                            &serde_json::json!({"path":"f.txt","content":"after\n"}),
+                            &ctx,
+                        )
+                        .unwrap();
+                    let resources = match prepared.footprint.as_ref().unwrap() {
+                        PreparedFootprint::Native(resources) => resources.clone(),
+                        _ => panic!("exact resource required"),
+                    };
+                    let _lease = crate::core::workspace_txn::NativeResourceLease::acquire(
+                        &root,
+                        &resources,
+                        Duration::from_secs(15),
+                        None,
+                        &ctx.resource_scope(),
+                    )
+                    .unwrap();
+                    let error = crate::core::native_journal::with_test_after_write_failure(|| {
+                        write.execute_prepared(&prepared)
+                    })
+                    .unwrap_err();
+                    assert!(error
+                        .downcast_ref::<crate::core::native_journal::PossiblyApplied>()
+                        .is_some());
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+                    // A possibly-applied tool does not report successful fresh observation.
+                    assert_eq!(
+                        crate::core::read_ledger::observed(&target),
+                        Some(observed.clone())
+                    );
+                    let reconciled =
+                        crate::core::native_journal::reconcile(&resources[0].0).unwrap();
+                    assert!(reconciled.iter().any(|entry| matches!(
+                        entry,
+                        crate::core::native_journal::Reconciliation::After { .. }
+                    )));
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+                    assert!(write.execute_prepared(&prepared).is_err());
+                })
+            })
+        });
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_file_read_alias_retarget_cannot_widen_read_path() {
+        use std::os::unix::fs::symlink;
+        let (_temp, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        std::fs::write(root.join("a.txt"), "approved").unwrap();
+        std::fs::write(root.join("b.txt"), "unapproved").unwrap();
+        symlink(root.join("a.txt"), root.join("alias.txt")).unwrap();
+        let read = FileRead::new(root.clone());
+        let prepared = read
+            .prepare_call(&serde_json::json!({"path":"alias.txt"}), &ctx)
+            .unwrap();
+        std::fs::remove_file(root.join("alias.txt")).unwrap();
+        symlink(root.join("b.txt"), root.join("alias.txt")).unwrap();
+        assert!(read.execute_prepared(&prepared).is_err());
+        assert!(crate::core::read_ledger::observed(&root.join("a.txt")).is_none());
+        assert!(crate::core::read_ledger::observed(&root.join("b.txt")).is_none());
+    }
+
+    #[test]
+    fn prepared_file_edit_freezes_single_and_batch_bytes_and_preview() {
+        let root = temp_root("fe-prepared-bytes");
+        let ctx = placement_fixture(&root);
+        let edit = FileEdit::new(root.clone());
+        let target = root.join("f.txt");
+        for args in [
+            serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"ALPHA"}),
+            serde_json::json!({"path":"f.txt","edits":[
+                {"old_string":"alpha","new_string":"A"},
+                {"old_string":"A","new_string":"ALPHA"}
+            ]}),
+        ] {
+            std::fs::write(&target, "alpha beta\n").unwrap();
+            crate::core::read_ledger::forget(&target);
+            let mut prepared = edit.prepare_call(&args, &ctx).unwrap();
+            let preview = prepared.preview.as_ref().unwrap().clone();
+            let frozen = prepared
+                .delegation
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<FrozenFileEdit>()
+                .unwrap();
+            let expected_output = frozen.output.clone();
+            assert_eq!(frozen.content, "ALPHA beta\n");
+            assert!(preview.diff.as_deref().unwrap().contains("ALPHA"));
+            // Original arguments are not the authority once approved replacement bytes are frozen.
+            prepared.args["path"] = serde_json::json!(root.join("unapproved.txt"));
+            prepared.args["new_string"] = serde_json::json!("UNAPPROVED");
+            prepared.args["edits"] =
+                serde_json::json!([{"old_string":"beta","new_string":"UNAPPROVED"}]);
+            prepared.args["dry_run"] = serde_json::json!(true);
+            let output = edit.execute_prepared(&prepared).unwrap();
+            assert!(output.text.starts_with(&expected_output));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "ALPHA beta\n");
+            assert!(!root.join("unapproved.txt").exists());
+            assert_eq!(prepared.preview.as_ref().unwrap().diff, preview.diff);
+        }
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_edit_refuses_drift_even_when_old_text_still_matches() {
+        let root = temp_root("fe-prepared-drift");
+        let ctx = placement_fixture(&root);
+        let edit = FileEdit::new(root.clone());
+        let target = root.join("f.txt");
+        for args in [
+            serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"ALPHA"}),
+            serde_json::json!({"path":"f.txt","edits":[{"old_string":"alpha","new_string":"ALPHA"}]}),
+        ] {
+            std::fs::write(&target, "alpha beta\n").unwrap();
+            let prepared = edit.prepare_call(&args, &ctx).unwrap();
+            let preview = prepared.preview.as_ref().unwrap().clone();
+            let expected = prepared.file.as_ref().unwrap().expected.clone();
+            std::fs::write(&target, "alpha peer\n").unwrap();
+            // Even refreshing the session ledger cannot authorize re-matching a stale approval.
+            FileRead::new(root.clone())
+                .execute(&serde_json::json!({"path":"f.txt"}))
+                .unwrap();
+            assert!(edit.execute_prepared(&prepared).is_err());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha peer\n");
+            assert_eq!(prepared.preview.as_ref().unwrap().diff, preview.diff);
+            assert_eq!(prepared.file.as_ref().unwrap().expected, expected);
+        }
+        std::fs::remove_file(&target).unwrap();
+        assert!(edit
+            .prepare_call(
+                &serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"A"}),
+                &ctx
+            )
+            .is_err());
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_edit_rechecks_read_ledger_without_refreshing_it_in_preview() {
+        let root = temp_root("fe-prepared-ledger");
+        let ctx = placement_fixture(&root);
+        let edit = FileEdit::new(root.clone());
+        let target = root.join("f.txt");
+        std::fs::write(&target, "alpha original\n").unwrap();
+        FileRead::new(root.clone())
+            .execute(&serde_json::json!({"path":"f.txt"}))
+            .unwrap();
+        let seen = crate::core::read_ledger::observed(&target).unwrap();
+        std::fs::write(&target, "alpha peer\n").unwrap();
+        let args = serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"ALPHA"});
+        let prepared = edit.prepare_call(&args, &ctx).unwrap();
+        assert_eq!(crate::core::read_ledger::observed(&target), Some(seen));
+        let error = edit.execute_prepared(&prepared).unwrap_err();
+        assert!(format!("{error:#}").contains("overwrite conflict"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha peer\n");
+        FileRead::new(root.clone())
+            .execute(&serde_json::json!({"path":"f.txt"}))
+            .unwrap();
+        edit.execute_prepared(&prepared).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ALPHA peer\n");
+        assert_eq!(
+            crate::core::read_ledger::observed(&target),
+            Some(crate::core::persist::FileFingerprint::for_bytes(
+                b"ALPHA peer\n"
+            ))
+        );
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_edit_rechecks_ledger_at_execution_after_successful_preparation() {
+        let root = temp_root("fe-prepared-ledger-after");
+        let ctx = placement_fixture(&root);
+        let target = root.join("f.txt");
+        std::fs::write(&target, "alpha\n").unwrap();
+        FileRead::new(root.clone())
+            .execute(&serde_json::json!({"path":"f.txt"}))
+            .unwrap();
+        let edit = FileEdit::new(root.clone());
+        let prepared = edit
+            .prepare_call(
+                &serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"A"}),
+                &ctx,
+            )
+            .unwrap();
+        crate::core::read_ledger::note(
+            &target,
+            &crate::core::persist::FileFingerprint::for_bytes(b"different observation"),
+        );
+        assert!(edit
+            .execute_prepared(&prepared)
+            .unwrap_err()
+            .to_string()
+            .contains("overwrite conflict"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha\n");
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_edit_noop_and_dry_run_do_not_write_or_refresh_ledger() {
+        let root = temp_root("fe-prepared-noop");
+        let ctx = placement_fixture(&root);
+        let target = root.join("f.txt");
+        std::fs::write(&target, "alpha beta\n").unwrap();
+        let edit = FileEdit::new(root.clone());
+        let modified = std::fs::metadata(&target).unwrap().modified().unwrap();
+        let seen = crate::core::persist::FileFingerprint::for_bytes(b"prior observation");
+        crate::core::read_ledger::note(&target, &seen);
+        for (args, prefix) in [
+            (
+                serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"alpha"}),
+                NOOP_WRITE_PREFIX,
+            ),
+            (
+                serde_json::json!({"path":"f.txt","edits":[{"old_string":"alpha","new_string":"A"},{"old_string":"A","new_string":"alpha"}]}),
+                NOOP_WRITE_PREFIX,
+            ),
+            (
+                serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"A","dry_run":true}),
+                DRY_RUN_PREFIX,
+            ),
+            (
+                serde_json::json!({"path":"f.txt","edits":[{"old_string":"alpha","new_string":"A"}],"dry_run":true}),
+                DRY_RUN_PREFIX,
+            ),
+        ] {
+            let prepared = edit.prepare_call(&args, &ctx).unwrap();
+            assert_eq!(
+                edit.workspace_effect_prepared(&prepared),
+                WorkspaceEffect::None
+            );
+            let output = edit.execute_prepared(&prepared).unwrap();
+            assert!(output.text.starts_with(prefix));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha beta\n");
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_eq!(
+                crate::core::read_ledger::observed(&target),
+                Some(seen.clone())
+            );
+        }
+        crate::core::read_ledger::forget(&target);
+    }
+
+    #[test]
+    fn prepared_file_edit_bounds_input_and_replace_all_expansion_before_write() {
+        let root = temp_root("fe-prepared-size");
+        let ctx = placement_fixture(&root);
+        let target = root.join("f.txt");
+        let edit = FileEdit::new(root.clone());
+        std::fs::write(&target, vec![b'a'; PREPARED_EDIT_MAX_BYTES + 1]).unwrap();
+        let args = serde_json::json!({"path":"f.txt","old_string":"a","new_string":"b","replace_all":true});
+        assert!(edit
+            .prepare_call(&args, &ctx)
+            .unwrap_err()
+            .to_string()
+            .contains("4 MiB"));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().len(),
+            PREPARED_EDIT_MAX_BYTES as u64 + 1
+        );
+        std::fs::write(&target, "aa").unwrap();
+        let args = serde_json::json!({"path":"f.txt","old_string":"a","new_string":"b".repeat(PREPARED_EDIT_MAX_BYTES / 2 + 1),"replace_all":true});
+        assert!(edit
+            .prepare_call(&args, &ctx)
+            .unwrap_err()
+            .to_string()
+            .contains("4 MiB"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "aa");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn prepared_file_edit_existing_managed_absolute_paths_keep_external_provenance() {
+        let root = temp_root("fe-prepared-managed");
+        let workspace = root.canonicalize().unwrap();
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            workspace.clone(),
+            workspace.join("owned-home"),
+            workspace.join("owned-scratch"),
+            "edit-managed",
+        )
+        .unwrap();
+        let ctx =
+            ExecutionContext::new(crate::core::convo::ConversationId::new("test:edit-managed"))
+                .with_placement(placement);
+        let write = FileWrite::new(root.clone());
+        let created = write.prepare_call(&serde_json::json!({"path":"existing.txt","content":"alpha\n","purpose":"artifact"}), &ctx).unwrap();
+        write.execute_prepared(&created).unwrap();
+        let actual = created
+            .file
+            .as_ref()
+            .unwrap()
+            .destination
+            .actual_path()
+            .to_path_buf();
+        let edit = FileEdit::new(root.clone());
+        let prepared = edit
+            .prepare_call(
+                &serde_json::json!({"path":actual,"old_string":"alpha","new_string":"ALPHA"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(prepared.file.as_ref().unwrap().source_managed);
+        assert_eq!(
+            edit.workspace_effect_prepared(&prepared),
+            WorkspaceEffect::External
+        );
+        assert_eq!(
+            edit.workspace_target_prepared(&prepared),
+            actual.parent().map(Path::to_path_buf)
+        );
+        edit.execute_prepared(&prepared).unwrap();
+        assert_eq!(std::fs::read_to_string(&actual).unwrap(), "ALPHA\n");
+        assert!(!root.join("existing.txt").exists());
+        crate::core::read_ledger::forget(&actual);
+    }
+
+    #[test]
+    fn prepared_file_edit_rejects_same_bytes_retargeted_ancestor_alias() {
+        let root = temp_root("fe-prepared-alias");
+        let ctx = placement_fixture(&root);
+        let parent = root.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("f.txt"), "alpha\n").unwrap();
+        let edit = FileEdit::new(root.clone());
+        let prepared = edit
+            .prepare_call(
+                &serde_json::json!({"path":"parent/f.txt","old_string":"alpha","new_string":"A"}),
+                &ctx,
+            )
+            .unwrap();
+        std::fs::rename(&parent, root.join("original-parent")).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("f.txt"), "alpha\n").unwrap();
+        assert!(edit.execute_prepared(&prepared).is_err());
+        assert_eq!(
+            std::fs::read_to_string(parent.join("f.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("original-parent/f.txt")).unwrap(),
+            "alpha\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_file_edit_rejects_symlink_alias_retargeting_without_touching_either_target() {
+        let root = temp_root("fe-prepared-symlink");
+        let ctx = placement_fixture(&root);
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "alpha\n").unwrap();
+        std::fs::write(&b, "alpha\n").unwrap();
+        let alias = root.join("alias.txt");
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let edit = FileEdit::new(root.clone());
+        let prepared = edit
+            .prepare_call(
+                &serde_json::json!({"path":"alias.txt","old_string":"alpha","new_string":"A"}),
+                &ctx,
+            )
+            .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&b, &alias).unwrap();
+        assert!(edit.execute_prepared(&prepared).is_err());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "alpha\n");
     }
 
     #[test]
@@ -6071,7 +10024,7 @@ mod tests {
         let root = temp_root("fw-newempty");
         let t = FileWrite::new(root.clone());
         let r = t
-            .execute(&serde_json::json!({"path": "new.txt", "content": ""}))
+            .execute(&serde_json::json!({"path": "new.txt", "content": "", "purpose": "project"}))
             .unwrap();
         assert!(
             !r.starts_with(NOOP_WRITE_PREFIX),
@@ -6133,7 +10086,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hello\n").unwrap();
         let t = FileMove::new(root.clone());
         let r = t
-            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"}))
+            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt", "purpose": "project"}))
             .unwrap();
         assert!(r.starts_with("moved file"), "got: {r}");
         assert!(!root.join("a.txt").exists(), "source is gone after a move");
@@ -6164,7 +10117,7 @@ mod tests {
         let t = FileMove::new(root.clone());
         // Default: refuse to overwrite an existing destination.
         let err = t
-            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt"}))
+            .execute(&serde_json::json!({"from": "a.txt", "to": "b.txt", "purpose": "project"}))
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("already exists"),
@@ -6199,14 +10152,16 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hi\n").unwrap();
         let t = FileMove::new(root.clone());
         // Destination parent (`nested/deep/`) does not exist yet.
-        let no_parent = t.execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt"}));
+        let no_parent = t.execute(
+            &serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt", "purpose": "project"}),
+        );
         assert!(
             no_parent.is_err(),
             "missing parent errors without create_dirs"
         );
         // With create_dirs it makes the parents and moves.
         let r = t
-            .execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt", "create_dirs": true}))
+            .execute(&serde_json::json!({"from": "a.txt", "to": "nested/deep/b.txt", "create_dirs": true, "purpose": "project"}))
             .unwrap();
         assert!(r.starts_with("moved file"), "got: {r}");
         assert_eq!(
@@ -6222,7 +10177,7 @@ mod tests {
         std::fs::write(root.join("src/f.txt"), "x\n").unwrap();
         let t = FileMove::new(root.clone());
         let r = t
-            .execute(&serde_json::json!({"from": "src", "to": "dst"}))
+            .execute(&serde_json::json!({"from": "src", "to": "dst", "purpose": "project"}))
             .unwrap();
         assert!(r.starts_with("moved directory"), "got: {r}");
         assert!(!root.join("src").exists());
@@ -6351,7 +10306,7 @@ mod tests {
         std::fs::create_dir_all(root.join("dst")).unwrap();
         std::fs::write(root.join("dst/old.txt"), "old\n").unwrap();
         let t = FileMove::new(root.clone());
-        t.execute(&serde_json::json!({"from": "src", "to": "dst", "overwrite": true}))
+        t.execute(&serde_json::json!({"from": "src", "to": "dst", "overwrite": true, "purpose": "project"}))
             .unwrap();
         assert!(
             root.join("dst/new.txt").exists(),

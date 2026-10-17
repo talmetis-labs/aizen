@@ -144,11 +144,21 @@ pub async fn search(query: &str, limit: usize) -> Result<Vec<RegistrySkill>> {
         Ok(hits) => return Ok(hits),
         Err(e) => e,
     };
-    // Nothing found by hand does not disprove the index — say what actually went wrong instead of
-    // reporting an empty catalogue.
+    // Nothing found by hand does not disprove the index — but the index being down is not the
+    // whole story either. The catalogue only serves its most recent entries (observed 2026-10-09:
+    // `total` is a single running count and `totalPages` shifts between pages, so old skills fall
+    // out of the window), and a skill that was there last month can be unfindable today. Saying
+    // just "HTTP 500" reads as "the marketplace is down, give up" when the truth is "the index is
+    // down AND the recent catalogue holds no match" — the difference decides whether retrying
+    // later or falling back to local skills is the right move.
     match browse_match(query, limit).await {
         Ok(hits) if !hits.is_empty() => Ok(hits),
-        _ => Err(indexed),
+        Ok(_) => bail!(
+            "{indexed:#}; the browse fallback found no match for '{query}' in the recent \
+             catalogue (it only serves the registry's most recent entries, so an older skill may \
+             exist but be unreachable until the search index recovers)"
+        ),
+        Err(_) => Err(indexed),
     }
 }
 
@@ -253,7 +263,75 @@ pub async fn fetch_body(sk: &RegistrySkill) -> Result<String> {
     if !f.is_success() {
         bail!("GitHub returned HTTP {} for {url}", f.status);
     }
-    Ok(f.text())
+    Ok(raw_document(&f.body)?.to_string())
+}
+
+/// Decode downloaded skill documents without silently changing invalid UTF-8 bytes.
+/// Both marketplace and direct URL imports use this before their raw-document write path.
+pub(crate) fn raw_document(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).context("skill document must be valid UTF-8")
+}
+
+/// Preserve the entire document, including unknown YAML and guards. The install identity is
+/// separate from the upstream name, and imports refuse an existing flat or bundled destination.
+pub(crate) fn import_raw_document(
+    fallback: &str,
+    document: &str,
+    name_override: Option<&str>,
+    provenance: crate::skills::SkillProvenance,
+) -> Result<crate::skills::Skill> {
+    let parsed = crate::skills::parse_markdown(document, fallback);
+    let name = name_override
+        .unwrap_or_else(|| {
+            if parsed.name.trim().is_empty() {
+                fallback
+            } else {
+                &parsed.name
+            }
+        })
+        .trim();
+    if name.is_empty() {
+        bail!("a skill install name is required");
+    }
+    crate::skills::import_document(name, document, provenance)
+}
+
+/// Shared CLI/menu/tool report: use the final entry and lookup alias, not a guessed flat path.
+/// Installing globally does not make a copy active when a zone/repo copy has precedence.
+pub(crate) fn install_report(sk: &crate::skills::Skill) -> String {
+    let clean =
+        |s: &str| crate::agent::task_tool::sanitize_agent_body(s).replace(['\r', '\n'], " ");
+    let mut report = format!("installed '{}'", clean(sk.key()));
+    if sk.name != sk.key() {
+        report.push_str(&format!(" (upstream name: '{}')", clean(&sk.name)));
+    }
+    if let Some(location) = &sk.location {
+        report.push_str(&format!(" → {}", clean(&location.entry.to_string_lossy())));
+        report.push_str(&format!(
+            "\nRelative resources resolve under {}. Scripts and dependencies are not run automatically.",
+            clean(&location.resource_root.to_string_lossy())
+        ));
+        match crate::skills::load(sk.key()).and_then(|active| active.location) {
+            Some(active_location) if active_location.entry != location.entry => {
+                report.push_str(&format!(
+                    "\nWarning: this copy is shadowed by {} ({}); the installed copy is not active here.",
+                    clean(&active_location.entry.to_string_lossy()),
+                    match active_location.origin {
+                        crate::skills::SkillOrigin::Repo => "repo",
+                        crate::skills::SkillOrigin::Project => "project zone",
+                        crate::skills::SkillOrigin::Global => "global",
+                    }
+                ));
+            }
+            None => report.push_str(
+                "\nWarning: the active copy could not be determined (missing or ambiguous skill location).",
+            ),
+            Some(_) => {}
+        }
+    } else {
+        report.push_str("\nWarning: the final entry and active copy could not be determined.");
+    }
+    report
 }
 
 /// The URL that serves one skill by its `owner/name`. Built through `path_segments_mut` so the
@@ -282,34 +360,27 @@ async fn by_slug(slug: &str) -> Result<Option<DirectSkill>> {
     if !f.is_success() {
         return Ok(None);
     }
-    let got: DirectSkill = match serde_json::from_slice(&f.body) {
+    // Invalid UTF-8 is not a route miss: do not hide corrupt source bytes behind search fallback.
+    let document = raw_document(&f.body)?;
+    let got: DirectSkill = match serde_json::from_str(document) {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
     Ok((!got.skill_md.trim().is_empty()).then_some(got))
 }
 
-/// Parse one skill's markdown and save it locally, under its own `name:` when it declares one.
-fn save_body(fallback: &str, body_md: &str) -> Result<crate::skills::Skill> {
-    let parsed = crate::skills::parse_markdown(body_md, &crate::skills::sanitize_name(fallback));
-    let name = if parsed.name.trim().is_empty() {
-        fallback.to_string()
-    } else {
-        parsed.name.clone()
-    };
-    crate::skills::save(&name, &parsed.description, &parsed.when, &parsed.body)?;
-    Ok(crate::skills::Skill { name, ..parsed })
-}
-
 /// Install one skill by name. An exact `owner/name` is fetched by slug; anything else is a search
 /// followed by the best match.
 ///
-/// The by-slug route first because an install by exact name never needed the search index, and
-/// borrowing it meant borrowing its outages: when agentskill.sh's index began answering HTTP 500
-/// (2026-08-18) every `skill install` failed too, though every skill on it was still being served.
-/// A dependency that only ever costs you is one to drop.
+/// The by-slug route first because an install by exact name should not borrow the search index's
+/// outages. One caveat, observed 2026-10-09: the route reads the same index search does, so it
+/// answers 404 for a slug that has fallen out of the catalogue's recent-entries window — it
+/// rescues installs while the index is down, not installs OF skills the index no longer lists.
 pub async fn install(query: &str) -> Result<crate::skills::Skill> {
     let q = query.trim();
+    if q.is_empty() {
+        bail!("a marketplace skill slug or query is required");
+    }
     if q.contains('/') {
         if let Some(saved) = install_by_slug(q, q).await? {
             return Ok(saved);
@@ -335,7 +406,15 @@ pub async fn install(query: &str) -> Result<crate::skills::Skill> {
         return Ok(saved);
     }
     let body_md = fetch_body(&chosen).await?;
-    save_body(&chosen.name, &body_md)
+    let provenance = crate::skills::SkillProvenance {
+        source: chosen
+            .raw_url()
+            .context("this skill has no GitHub source location")?,
+        repository: Some(format!("{}/{}", chosen.github_owner, chosen.github_repo)),
+        path: Some(chosen.github_path.clone()),
+        sha: (!chosen.github_sha.is_empty()).then_some(chosen.github_sha.clone()),
+    };
+    import_raw_document(&chosen.name, &body_md, None, provenance)
 }
 
 /// Fetch `slug` from the registry's by-slug route and save it. `Ok(None)` when that route has
@@ -355,7 +434,13 @@ async fn install_by_slug(slug: &str, name_hint: &str) -> Result<Option<crate::sk
         .find(|p| !p.is_empty())
         .unwrap_or(slug)
         .to_string();
-    save_body(&fallback, &direct.skill_md).map(Some)
+    let provenance = crate::skills::SkillProvenance {
+        source: by_slug_url(&registry_base(), slug)?.to_string(),
+        repository: None,
+        path: None,
+        sha: None,
+    };
+    import_raw_document(&fallback, &direct.skill_md, None, provenance).map(Some)
 }
 
 /// Bridge an async future to the sync `Tool::execute` path — the shared cancel-aware bridge
@@ -417,21 +502,92 @@ impl Tool for SkillSearch {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InstallSource<'a> {
+    Registry(&'a str),
+    GitHub {
+        repository: &'a str,
+        path: &'a str,
+        reference: Option<&'a str>,
+        name: Option<&'a str>,
+    },
+}
+
+/// Runtime validation complements JSON Schema: providers do not all enforce source exclusivity.
+/// Reject malformed requests before entering the async/network/store path.
+fn install_source(args: &Value) -> Result<InstallSource<'_>> {
+    let object = args
+        .as_object()
+        .context("skill_install expects an object")?;
+    for key in object.keys() {
+        if !["slug", "github", "path", "ref", "name"].contains(&key.as_str()) {
+            bail!("unknown skill_install argument '{key}'");
+        }
+    }
+    let string = |key: &str| -> Result<Option<&str>> {
+        let Some(value) = object.get(key) else {
+            return Ok(None);
+        };
+        let value = value
+            .as_str()
+            .with_context(|| format!("'{key}' must be a string"))?
+            .trim();
+        if value.is_empty() {
+            bail!("'{key}' must not be empty");
+        }
+        Ok(Some(value))
+    };
+    let slug = string("slug")?;
+    let github = string("github")?;
+    let path = string("path")?;
+    let reference = string("ref")?;
+    let name = string("name")?;
+    match (slug, github) {
+        (Some(slug), None) if path.is_none() && reference.is_none() && name.is_none() => {
+            Ok(InstallSource::Registry(slug))
+        }
+        (Some(_), _) => bail!("provide either 'slug' alone or 'github' with 'path', not both"),
+        (None, Some(repository)) => Ok(InstallSource::GitHub {
+            repository,
+            path: path
+                .context("GitHub installs require 'path' (the directory containing SKILL.md)")?,
+            reference,
+            name,
+        }),
+        (None, None) => {
+            bail!("provide 'slug' or 'github' with 'path'; 'ref' and 'name' require 'github'")
+        }
+    }
+}
+
 pub struct SkillInstall;
 impl Tool for SkillInstall {
     fn name(&self) -> &str {
         "skill_install"
     }
     fn description(&self) -> &str {
-        "Install a skill from agentskill.sh by its \"owner/name\" (or exact name) — fetches the \
-         procedure, saves it locally, and returns its steps so you can follow them now. The skill is \
-         third-party content, so this asks for approval."
+        "Install third-party instructions: marketplace slug OR public GitHub github+path \
+         (optional ref/name). Requires approval. GitHub ref resolves to SHA; resources kept. \
+         No replacement, script execution, or dependency installs. Returns entry/steps; \
+         repo/zone may shadow."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {"slug": {"type": "string", "description": "owner/name from skill_search, e.g. 'NousResearch/spike'"}},
-            "required": ["slug"],
+            "properties": {
+                "slug": {"type": "string", "minLength": 1, "description": "marketplace owner/name from skill_search"},
+                "github": {"type": "string", "minLength": 1, "description": "public GitHub OWNER/REPO"},
+                "path": {"type": "string", "minLength": 1, "description": "directory containing SKILL.md; . for root"},
+                "ref": {"type": "string", "minLength": 1, "description": "branch/tag/commit; defaults to default branch"},
+                "name": {"type": "string", "minLength": 1, "description": "local alias; preserves upstream name"}
+            },
+            "oneOf": [
+                {"required": ["slug"], "not": {"anyOf": [
+                    {"required": ["github"]}, {"required": ["path"]},
+                    {"required": ["ref"]}, {"required": ["name"]}
+                ]}},
+                {"required": ["github", "path"], "not": {"required": ["slug"]}}
+            ],
             "additionalProperties": false
         })
     }
@@ -442,14 +598,20 @@ impl Tool for SkillInstall {
         true // installs + persists third-party instructions the agent will then follow
     }
     fn execute(&self, args: &Value) -> Result<String> {
-        let slug = args
-            .get("slug")
-            .and_then(|v| v.as_str())
-            .context("missing required string arg 'slug'")?;
-        let sk = block(install(slug))?;
+        let sk = match install_source(args)? {
+            InstallSource::Registry(slug) => block(install(slug))?,
+            InstallSource::GitHub {
+                repository,
+                path,
+                reference,
+                name,
+            } => block(crate::skills::github::install(
+                repository, path, reference, name,
+            ))?,
+        };
         Ok(format!(
-            "installed '{}'.\n\n{}",
-            sk.name,
+            "{}\n\n{}",
+            install_report(&sk),
             crate::skills::render_loaded(&sk)
         ))
     }
@@ -458,6 +620,175 @@ impl Tool for SkillInstall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloaded_documents_require_utf8_without_lossy_replacement() {
+        let raw = b"---\r\nname: preserved\r\n---\r\nSteps\r\n";
+        assert_eq!(raw_document(raw).unwrap().as_bytes(), raw);
+        assert!(raw_document(b"steps\xff")
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
+    }
+
+    #[test]
+    fn install_tool_source_validation_keeps_slug_and_accepts_github() {
+        assert_eq!(
+            install_source(&json!({"slug": " owner/skill "})).unwrap(),
+            InstallSource::Registry("owner/skill")
+        );
+        assert_eq!(
+            install_source(&json!({"github": "owner/repo", "path": "skills/release"})).unwrap(),
+            InstallSource::GitHub {
+                repository: "owner/repo",
+                path: "skills/release",
+                reference: None,
+                name: None,
+            }
+        );
+        assert_eq!(
+            install_source(&json!({
+                "github": "owner/repo", "path": "skills/release", "ref": "v1", "name": "local",
+            }))
+            .unwrap(),
+            InstallSource::GitHub {
+                repository: "owner/repo",
+                path: "skills/release",
+                reference: Some("v1"),
+                name: Some("local"),
+            }
+        );
+    }
+
+    #[test]
+    fn install_tool_rejects_bad_sources_before_network_or_store_access() {
+        for args in [
+            json!({}),
+            json!({"github": "owner/repo"}),
+            json!({"path": "skills/release"}),
+            json!({"ref": "main"}),
+            json!({"name": "local"}),
+            json!({"slug": "owner/skill", "github": "owner/repo", "path": "skills/release"}),
+            json!({"slug": "owner/skill", "path": "skills/release"}),
+            json!({"slug": "owner/skill", "ref": "main"}),
+            json!({"slug": "owner/skill", "name": "local"}),
+            json!({"slug": " "}),
+            json!({"github": "owner/repo", "path": ""}),
+            json!({"github": "owner/repo", "path": "skills/release", "ref": " "}),
+            json!({"github": "owner/repo", "path": "skills/release", "name": null}),
+            json!({"slug": 7}),
+            json!({"slug": "owner/skill", "replace": true}),
+            json!([]),
+        ] {
+            assert!(install_source(&args).is_err(), "must reject {args}");
+            assert!(
+                SkillInstall.execute(&args).is_err(),
+                "runtime must reject {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_schema_requires_exactly_one_complete_source() {
+        let schema = SkillInstall.parameters();
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"].get("replace").is_none());
+        assert_eq!(schema["oneOf"][0]["required"], json!(["slug"]));
+        assert_eq!(
+            schema["oneOf"][0]["not"]["anyOf"],
+            json!([
+                {"required": ["github"]}, {"required": ["path"]},
+                {"required": ["ref"]}, {"required": ["name"]},
+            ])
+        );
+        assert_eq!(schema["oneOf"][1]["required"], json!(["github", "path"]));
+        assert_eq!(schema["oneOf"][1]["not"], json!({"required": ["slug"]}));
+    }
+
+    #[test]
+    fn raw_import_keeps_metadata_alias_provenance_and_refuses_replacement() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Fixture {
+            path: std::path::PathBuf,
+            previous_home: Option<std::ffi::OsString>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                match &self.previous_home {
+                    Some(value) => std::env::set_var("AIZEN_HOME", value),
+                    None => std::env::remove_var("AIZEN_HOME"),
+                }
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture {
+            path: std::env::temp_dir()
+                .join(format!("aizen-raw-skill-{}-{nonce}", std::process::id())),
+            previous_home: std::env::var_os("AIZEN_HOME"),
+        };
+        std::fs::create_dir(&fixture.path).unwrap();
+        std::env::set_var("AIZEN_HOME", &fixture.path);
+        let alias = format!("import-alias-{nonce}");
+        let raw = "---\r\nname: Upstream title\r\ndescription: >-\r\n  Folded summary\r\n  preserved\r\nrequires: [file_read]\r\nplatforms: [windows, unix]\r\nextra:\r\n  retained: true\r\n---\r\nRead references/guide.md.\r\n";
+        let provenance = || crate::skills::SkillProvenance {
+            source: "https://example.com/original.md".to_string(),
+            repository: None,
+            path: None,
+            sha: None,
+        };
+        let installed = import_raw_document("fallback", raw, Some(&alias), provenance()).unwrap();
+        assert_eq!(installed.key(), alias);
+        assert_eq!(installed.name, "Upstream title");
+        assert_eq!(installed.requires, ["file_read"]);
+        assert_eq!(installed.platforms, ["windows", "unix"]);
+        let entry = &installed.location.as_ref().unwrap().entry;
+        assert_eq!(std::fs::read(entry).unwrap(), raw.as_bytes());
+        let state = crate::skills::skills_dir()
+            .join(".state")
+            .join(format!("{alias}.json"));
+        let state_before = std::fs::read(&state).unwrap();
+        assert!(String::from_utf8(state_before.clone())
+            .unwrap()
+            .contains("https://example.com/original.md"));
+        assert!(
+            import_raw_document("fallback", "Replacement steps", Some(&alias), provenance())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(entry).unwrap(), raw.as_bytes());
+        assert_eq!(std::fs::read(&state).unwrap(), state_before);
+        let report = install_report(&installed);
+        assert!(report.contains(&alias));
+        assert!(report.contains(&entry.to_string_lossy().to_string()));
+        assert!(report.contains("not run automatically"));
+
+        let zone = crate::skills::project_zone_dir();
+        std::fs::create_dir_all(&zone).unwrap();
+        std::fs::write(zone.join(format!("{alias}.md")), "Zone override steps").unwrap();
+        let shadowed = install_report(&installed);
+        assert!(shadowed.contains("shadowed") && shadowed.contains("project zone"));
+        assert!(shadowed.contains("not active here"));
+        std::fs::create_dir(zone.join(&alias)).unwrap();
+        std::fs::write(zone.join(&alias).join("SKILL.md"), "Ambiguous bundle steps").unwrap();
+        let ambiguous = install_report(&installed);
+        assert!(ambiguous.contains("active copy could not be determined"));
+
+        for (index, invalid) in ["---\nname: Empty\n---\n", "---\nname: [invalid\n---\nSteps"]
+            .into_iter()
+            .enumerate()
+        {
+            let key = format!("invalid-{nonce}-{index}");
+            assert!(import_raw_document("fallback", invalid, Some(&key), provenance()).is_err());
+            assert!(!crate::skills::skills_dir()
+                .join(format!("{key}.md"))
+                .exists());
+        }
+    }
 
     fn skill(owner: &str, repo: &str, sha: &str, path: &str) -> RegistrySkill {
         RegistrySkill {

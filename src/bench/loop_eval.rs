@@ -31,15 +31,15 @@ struct ScriptedStats {
     model_calls: AtomicUsize,
 }
 
+type ScriptedReply = std::future::Ready<Result<ChatTurn>>;
+type ScriptedModel<F> = (F, Arc<ScriptedStats>);
+
 /// A scripted fake model: pops the next turn each call; empties → a final "stop". It ignores the
 /// messages it receives by design, so the existing fixtures remain deterministic. The call counter
 /// is real instrumentation: the old report claimed loop metrics but never counted model calls.
 fn scripted(
     turns: Vec<ChatTurn>,
-) -> (
-    impl Fn(Vec<Message>, Vec<ToolDef>) -> std::future::Ready<Result<ChatTurn>>,
-    Arc<ScriptedStats>,
-) {
+) -> ScriptedModel<impl Fn(Vec<Message>, Vec<ToolDef>) -> ScriptedReply> {
     let q = Mutex::new(VecDeque::from(turns));
     let stats = Arc::new(ScriptedStats::default());
     let seen = Arc::clone(&stats);
@@ -68,6 +68,8 @@ fn tool_turn(name: &str, args: &str) -> ChatTurn {
         }],
         finish_reason: Some("stop".into()),
         usage: None,
+        empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -78,6 +80,8 @@ fn final_turn(text: &str) -> ChatTurn {
         tool_calls: vec![],
         finish_reason: Some("stop".into()),
         usage: None,
+        empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -101,6 +105,8 @@ fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
             .collect(),
         finish_reason: Some("stop".into()),
         usage: None,
+        empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     }
 }
@@ -591,8 +597,16 @@ fn eval_cfg() -> AgentConfig {
 }
 
 /// Run one scenario against the REAL loop, return its health verdict, outcome, and measurements.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "Sequential offline scenarios must isolate global todos through the entire scripted loop"
+)]
 async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) {
-    // Serialize process-global todo mutations across scenarios.
+    // Serialize process-global todo mutations through seed, execution, assertions and cleanup.
+    // `run` awaits scenarios sequentially on main's multi-thread runtime (this future is not spawned).
+    // The scripted model returns Ready; fixture tools and todo helpers never acquire TEST_LOCK,
+    // including tool bodies awaited on the blocking pool. They use their own short-lived locks.
+    // Dropping this guard before await would let another fixture overwrite the scenario's todos.
     let _g = crate::agent::todo::TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -690,6 +704,8 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
             tool_calls: t.tool_calls.clone(),
             finish_reason: t.finish_reason.clone(),
             usage: t.usage.clone(),
+            empty_wire_note: t.empty_wire_note.clone(),
+            empty_wire_raw: t.empty_wire_raw.clone(),
             eager: Vec::new(),
         })
         .collect()

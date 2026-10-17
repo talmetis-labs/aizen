@@ -61,16 +61,23 @@ const COMMAND_COUNT: usize = 18;
 
 // ── block-art title ────────────────────────────────────────────────────────────
 
-/// 5-row block glyphs (each exactly 5 columns) for the letters in AIZEN — the only wordmark
-/// [`push_title`] is ever called with. Anything else renders as blanks by design.
-fn glyph(c: char) -> [&'static str; 5] {
+/// 2-row half-block glyphs for the letters in AIZEN — the only wordmark [`push_title`] is ever
+/// called with. ▀/▄/█ pack 4 pixel rows into 2 text rows, so the mark stays crisp at a size that
+/// doesn't overwhelm the panel flank it docks under (the old 5-row full-block art was wider than
+/// the flank and visually heavier than the sun above it). Anything else renders as blanks by design.
+///
+/// ```text
+/// ▄▀▀▄ ▀█▀ ▀▀█ █▀▀ █▄ █
+/// █▀▀█ ▄█▄ █▄▄ ██▄ █ ▀█
+/// ```
+fn glyph(c: char) -> [&'static str; 2] {
     match c {
-        'A' => [" ███ ", "█   █", "█████", "█   █", "█   █"],
-        'I' => ["█████", "  █  ", "  █  ", "  █  ", "█████"],
-        'Z' => ["█████", "   █ ", "  █  ", " █   ", "█████"],
-        'E' => ["█████", "█    ", "████ ", "█    ", "█████"],
-        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
-        _ => ["     ", "     ", "     ", "     ", "     "],
+        'A' => ["▄▀▀▄", "█▀▀█"],
+        'I' => ["▀█▀", "▄█▄"],
+        'Z' => ["▀▀█", "█▄▄"],
+        'E' => ["█▀▀", "██▄"],
+        'N' => ["█▄ █", "█ ▀█"],
+        _ => [" ", " "],
     }
 }
 
@@ -363,11 +370,16 @@ fn sun_rows(width: usize) -> Vec<String> {
         .collect()
 }
 
-/// The block-art wordmark (silver gradient) + tagline as styled rows centred over `width`.
+/// The half-block wordmark (silver gradient) + tagline as styled rows centred over `width`.
 fn wordmark_rows(word: &str, width: usize) -> Vec<String> {
-    let w = word.chars().count() * 6 - 1; // 5-col glyphs joined by 1-col gaps
+    // Glyphs are variable-width (A/N 4 cols, I/Z/E 3) joined by 1-col gaps.
+    let w: usize = word
+        .chars()
+        .map(|c| glyph(c)[0].chars().count())
+        .sum::<usize>()
+        + word.chars().count().saturating_sub(1);
     let ind = " ".repeat(width.saturating_sub(w) / 2);
-    let mut rows: Vec<String> = (0..5)
+    let mut rows: Vec<String> = (0..2)
         .map(|row| {
             let line: String = word
                 .chars()
@@ -411,28 +423,32 @@ fn rule(out: &mut String, left: &str, right: &str, inner: usize) {
     );
 }
 
-/// Border the body rows into the moonlit panel. With `sun`, the raw braille mark (32-glyph rows
-/// from [`sun_lines`]) docks INSIDE the frame on its right flank, vertically centred against the
-/// body — the text column keeps its full `INNER` width, so the panel is content wall-to-wall
-/// instead of a narrow card floating in a wide window. Content is padded ANSI-aware
-/// (`measure_text_width`) so colour codes never throw off the right border.
-fn frame(rows: &[String], sun: Option<&[String]>) -> String {
-    let extra = if sun.is_some() { 2 + SUN_W } else { 0 };
+/// Border the body rows into the moonlit panel. With `flank`, a pre-styled right-hand column
+/// (the braille sun with the block-art wordmark beneath it) docks INSIDE the frame on its right
+/// flank, vertically centred against the body — the text column keeps its full `INNER` width, so
+/// the panel is content wall-to-wall instead of a narrow card floating in a wide window. Both the
+/// body rows and the flank rows are padded ANSI-aware (`measure_text_width`) so colour codes
+/// never throw off the right border.
+fn frame(rows: &[String], flank: Option<&[String]>) -> String {
+    let extra = if flank.is_some() { 2 + SUN_W } else { 0 };
     let mut out = String::new();
     rule(&mut out, "╭", "╮", INNER + extra);
-    let total = rows.len().max(sun.map_or(0, |s| s.len()));
-    let off = sun.map_or(0, |s| total.saturating_sub(s.len()) / 2);
+    let total = rows.len().max(flank.map_or(0, |s| s.len()));
+    let off = flank.map_or(0, |s| total.saturating_sub(s.len()) / 2);
     let b = style("│").color256(crate::ui::theme::ACCENT_DIM);
     for i in 0..total {
         let row = rows.get(i).map(String::as_str).unwrap_or("");
         let pad = " ".repeat(INNER.saturating_sub(measure_text_width(row)));
-        match sun {
+        match flank {
             Some(s) => {
-                let flank = match i.checked_sub(off).and_then(|j| s.get(j)) {
-                    Some(l) => style(l).color256(ACCENT).bold().to_string(),
+                let cell = match i.checked_sub(off).and_then(|j| s.get(j)) {
+                    Some(l) => {
+                        let w = measure_text_width(l);
+                        format!("{l}{}", " ".repeat(SUN_W.saturating_sub(w)))
+                    }
                     None => " ".repeat(SUN_W),
                 };
-                let _ = writeln!(out, "{b} {row}{pad}  {flank} {b}");
+                let _ = writeln!(out, "{b} {row}{pad}  {cell} {b}");
             }
             None => {
                 let _ = writeln!(out, "{b} {row}{pad} {b}");
@@ -490,18 +506,30 @@ pub fn render_text_only() -> String {
 fn render_inner(allow_sixel: bool, avail: usize) -> String {
     let mut out = String::new();
     out.push('\n');
-    // The wordmark sits OUTSIDE the panel, centred over its full width; the braille sun docks
-    // INSIDE the panel on its right flank when `avail` can hold the wide layout. Two suns cannot
-    // take that flank: a sixel sun is a raster DCS (pixels, not columns — it cannot be merged into
-    // a character frame) and stays stacked above; and a pane below WIDE_TOTAL stacks the braille
-    // sun above the wordmark rather than letting the flank clip off the pane's right edge.
+    // Wide layout: the braille sun docks INSIDE the panel on its right flank with the block-art
+    // wordmark directly beneath it (the flank is 32 cols, the wordmark 29 — it fits). A sixel sun
+    // is a raster DCS (pixels, not columns — it cannot be merged into a character frame) so it
+    // stays stacked above with the wordmark under it; and a pane below WIDE_TOTAL stacks the
+    // braille sun above the wordmark rather than letting the flank clip off the pane's right edge.
     let sixel_sun = allow_sixel && logo_is_sixel();
     let sun_right = !sixel_sun && avail >= WIDE_TOTAL;
     let frame_w = if sun_right { WIDE_TOTAL } else { INNER + 4 };
+    if sun_right {
+        // The flank column: sun on top, one blank row, then the wordmark + tagline — all inside
+        // the frame. Pre-styled: the sun in the brand accent, the wordmark in its silver gradient.
+        let mut flank: Vec<String> = sun_lines()
+            .iter()
+            .map(|l| style(l).color256(ACCENT).bold().to_string())
+            .collect();
+        flank.push(String::new());
+        flank.extend(wordmark_rows("AIZEN", SUN_W));
+        out.push_str(&frame(&body_rows(), Some(&flank)));
+        return out;
+    }
     if sixel_sun {
         push_sun(&mut out, true, frame_w);
         out.push('\n');
-    } else if !sun_right {
+    } else {
         for line in sun_rows(frame_w) {
             let _ = writeln!(out, "{line}");
         }
@@ -512,8 +540,7 @@ fn render_inner(allow_sixel: bool, avail: usize) -> String {
     }
     out.push('\n');
 
-    let sun = sun_right.then(sun_lines);
-    out.push_str(&frame(&body_rows(), sun.as_deref()));
+    out.push_str(&frame(&body_rows(), None));
     out
 }
 
@@ -837,12 +864,13 @@ mod tests {
         }
     }
 
-    /// The wide layout: wordmark ABOVE the frame centred over its full width, and the braille sun
-    /// INSIDE the frame on its right flank — never past the pane's width (the "hidden text" bug —
-    /// the old docked layout sized itself against the full terminal while the retained transcript
-    /// pane is narrower once the sidebar docks; the layout now receives the pane's width).
+    /// The wide layout: the braille sun docks INSIDE the frame on its right flank with the
+    /// block-art wordmark + tagline directly beneath it — never past the pane's width (the
+    /// "hidden text" bug — the old docked layout sized itself against the full terminal while the
+    /// retained transcript pane is narrower once the sidebar docks; the layout now receives the
+    /// pane's width).
     #[test]
-    fn wide_layout_centres_wordmark_above_and_docks_sun_right() {
+    fn wide_layout_docks_sun_then_wordmark_on_the_right_flank() {
         let _home = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -859,22 +887,6 @@ mod tests {
             .iter()
             .position(|l| l.contains('╰'))
             .expect("bottom rule");
-        // Wordmark above the frame, centred over WIDE_TOTAL columns.
-        let word = plain
-            .iter()
-            .position(|l| l.contains("█████"))
-            .expect("wordmark row");
-        assert!(word < top, "wordmark must sit above the frame");
-        let tag = plain
-            .iter()
-            .position(|l| l.contains("ARTIFICIAL INTELLIGENCE AGENT"))
-            .expect("tagline row");
-        let ind = plain[tag].chars().take_while(|c| *c == ' ').count();
-        let want = (WIDE_TOTAL - 29) / 2; // tagline is 29 cols wide
-        assert!(
-            ind.abs_diff(want) <= 1,
-            "tagline off-centre: indent {ind}, want ~{want}"
-        );
         // Braille sun: inside the borders, on the RIGHT of the text column.
         let sun: Vec<(usize, usize)> = plain
             .iter()
@@ -894,6 +906,30 @@ mod tests {
             sun.iter().all(|&(_, p)| p > INNER),
             "sun must dock on the right flank, not in the text column"
         );
+        // Wordmark: inside the frame, BELOW the sun, also on the right flank.
+        let word = plain
+            .iter()
+            .position(|l| l.contains("▄▀▀▄"))
+            .expect("wordmark row");
+        assert!(
+            top < word && word < bottom,
+            "wordmark must sit inside the frame"
+        );
+        let sun_last = sun.iter().map(|&(i, _)| i).max().unwrap();
+        assert!(sun_last < word, "wordmark sits below the sun");
+        let wind = plain[word].chars().position(|c| c == '▄').unwrap();
+        assert!(wind > INNER, "wordmark must sit on the right flank: {wind}");
+        // Tagline: inside the frame on the flank, under the wordmark.
+        let tag = plain
+            .iter()
+            .position(|l| l.contains("ARTIFICIAL INTELLIGENCE AGENT"))
+            .expect("tagline row");
+        assert!(
+            top < tag && tag < bottom,
+            "tagline must sit inside the frame"
+        );
+        let tind = plain[tag].chars().position(|c| c == 'A').unwrap();
+        assert!(tind > INNER, "tagline must sit on the right flank: {tind}");
     }
 
     /// A pane too narrow for the right flank stacks sun and wordmark ABOVE the frame instead of
@@ -918,7 +954,7 @@ mod tests {
             .expect("no braille sun on the narrow landing screen");
         let word = plain
             .iter()
-            .position(|l| l.contains("█████"))
+            .position(|l| l.contains("▄▀▀▄"))
             .expect("wordmark row");
         assert!(sun_last < word, "sun stacks above the wordmark");
         assert!(word < top, "wordmark sits above the frame");

@@ -94,16 +94,22 @@ pub fn tip() -> &'static str {
 }
 
 /// Icon for an agent tool group (splash panel).
+///
+/// The default tier here is deliberately NOT a Nerd Font PUA glyph: the splash is the first thing
+/// a new user sees, and a plain console font (unpatched Cascadia/Consolas) renders PUA codepoints
+/// as tofu boxes. These are universal geometric glyphs every console font (or the terminal's font
+/// fallback) renders crisply, keeping the calm monochrome palette. The emoji tier still swaps in
+/// colour emoji when explicitly requested.
 pub fn tool_group(label: &str) -> &'static str {
     match label {
-        "memory" => pick("🧠", "\u{f1c0}"),   // database
-        "skills" => pick("📘", "\u{f02d}"),   // book
-        "files" => pick("📂", "\u{f07b}"),    // folder
-        "shell" => pick("💻", "\u{f120}"),    // terminal
-        "web" => pick("🌐", "\u{f0ac}"),      // globe
-        "tasks" => pick("📋", "\u{f0ae}"),    // tasks / list-check
-        "persona" => pick("🎭", "\u{f007}"),  // persona / user
-        "delegate" => pick("🤝", "\u{f0c0}"), // users
+        "memory" => pick("🧠", "◉"),
+        "skills" => pick("📘", "✦"),
+        "files" => pick("📂", "▤"),
+        "shell" => pick("💻", "❯"),
+        "web" => pick("🌐", "◎"),
+        "tasks" => pick("📋", "☰"),
+        "persona" => pick("🎭", "◐"),
+        "delegate" => pick("🤝", "⇄"),
         _ => "•",
     }
 }
@@ -140,12 +146,13 @@ pub fn slash(name: &str) -> &'static str {
     }
 }
 
-/// Section header icons for the splash panel.
+/// Section header icons for the splash panel — universal geometric glyphs (see [`tool_group`]
+/// for why these are not PUA).
 pub fn hdr_tools() -> &'static str {
-    pick("🧰", "\u{f0ad}") // wrench
+    pick("🧰", "❖")
 }
 pub fn hdr_commands() -> &'static str {
-    pick("⌨", "\u{f11c}") // keyboard
+    pick("⌨", "⌘")
 }
 
 #[cfg(test)]
@@ -154,11 +161,12 @@ mod tests {
 
     #[test]
     fn known_labels_map_else_bullet() {
-        // default (nerd) tier — no AIZEN_EMOJI / AIZEN_NO_ICONS in the test env, so `pick` returns
-        // the nerd glyph. The `•` fallback is tier-independent (returned directly, not via `pick`),
-        // so an unknown label is a bullet regardless of tier.
-        assert_eq!(tool_group("skills"), "\u{f02d}"); // book
-        assert_eq!(tool_group("memory"), "\u{f1c0}"); // database
+        // default tier — no AIZEN_EMOJI / AIZEN_NO_ICONS in the test env, so `pick` returns the
+        // default glyph. Tool-group icons are universal geometric glyphs (NOT PUA — a plain font
+        // must render the splash panel); slash icons stay Nerd Font PUA. The `•` fallback is
+        // tier-independent (returned directly, not via `pick`).
+        assert_eq!(tool_group("skills"), "✦");
+        assert_eq!(tool_group("memory"), "◉");
         assert_eq!(tool_group("nope"), "•");
         assert_eq!(slash("telegram"), "\u{f2c6}");
         assert_eq!(slash("quit"), "\u{f08b}");

@@ -40,7 +40,12 @@ commercial use is allowed.
     possible. It is a broader ask than Apache-2.0 §5, so user-facing text must say so plainly rather
     than describing the CLA as a formality.
 - Trademark: Apache §6 grants no rights to the "Aizen" name or logo. Forks may use the code, not the
-  brand.
+  brand. `TRADEMARK.md` is the policy a fork reads, including the per-file rename checklist.
+  **Do not rename the product, the `aizen` binary, or the `~/.aizen` home path as part of unrelated
+  work.** A rename is a deliberate product decision the maintainer makes, never a side effect of a
+  refactor, a "cleanup", or a fork's rebranding pass: it breaks the update channel
+  (`features/update.rs`), every install script, saved sessions, and the desktop plugin's contract.
+  If a task seems to require it, stop and ask — do not `sed` the name across the tree.
 - Releases **up to and including v0.5.5** went out under PolyForm Noncommercial. That is history and
   cannot be retracted; everything from the relicensing commit onward is Apache-2.0. If you find a
   file still saying PolyForm, it is a leftover — fix it.

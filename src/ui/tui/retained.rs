@@ -17,23 +17,18 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block as FrameBlock, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block as FrameBlock, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::{HealthKind, SessionFacts};
-
-mod metrics;
+use super::{HealthKind, JobsStatus, SessionFacts};
 
 // The backend split by concern; `retained.rs` keeps the state, the command enum and the render
 // loop that ties them together. Re-exported at this level because callers outside (`ui::tui`) have
@@ -68,6 +63,12 @@ const BLOCK_LIMIT: usize = 2048;
 /// repaint fires (see `resize_settle` in the render loop). Long enough to sit out a ConPTY resize
 /// storm, short enough that the user never catches the screen dirty.
 const RESIZE_SETTLE: Duration = Duration::from_millis(400);
+/// Smallest gap between two stream-driven repaints. 33 fps is past the flicker-fusion threshold for
+/// text and matches what a terminal can absorb; slower looks steppy, faster just re-parses the same
+/// markdown for deltas nobody can read. Only coalesced commands are capped (the output stream, plus
+/// high-rate view changes like wheel scroll and mouse selection) — keystrokes and menus draw on
+/// arrival (see `interactive_dirty` and [`is_coalesced_command`]).
+const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(30);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Milliseconds since process start at which transcript output last landed (a block pushed,
@@ -133,6 +134,10 @@ enum BlockKind {
     Diff,
     /// A green verify-gate success line (`✓ <cmd> — <detail>`).
     Verify,
+    /// The collapsible sub-agents panel (`▸ sub-agents (N) — … · X running`), replacing the per-call
+    /// `task(coder · fix parser)` tool rows with one block that refreshes in place as runs start and
+    /// finish. One stable block per session; `Ctrl-E` toggles it open.
+    SubAgents,
 }
 
 /// Outcome state for a [`ToolEvent`] — drives the digest colour (running = dim, ok = green,
@@ -153,6 +158,7 @@ pub(super) struct ToolEvent {
     pub icon: String,
     pub name: String,
     pub target: String,
+    pub display: crate::ui::links::DisplayTarget,
     pub digest: String,
     pub state: ToolState,
     /// Wall-clock run time of the tool call in milliseconds, appended to the result line (`· 1.2s`).
@@ -171,9 +177,11 @@ pub(super) struct PlanRow {
     pub text: String,
 }
 
-/// A boxed diff preview: the edited path plus the parsed hunks (see [`super::DiffHunk`]).
-/// `adds`/`dels` are the full counts for the header even when the hunks are truncated.
+/// A boxed diff preview: the parsed hunks (see [`super::DiffHunk`]). The header shows only the
+/// `+A −D` counts — the tool row right above already names the path, so repeating it would
+/// double-print. `path` is kept on the payload for callers/logging, not for the box header.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(super) struct DiffPayload {
     pub path: String,
     pub adds: usize,
@@ -188,6 +196,29 @@ pub(super) struct VerifyPayload {
     pub detail: String,
 }
 
+/// One row of the sub-agents panel: a phase mark, the `name · label` the orchestration registry
+/// shows, the live detail (`step 7 · file_edit`, `12 step(s)`), and the run's elapsed text.
+/// `running` splits ✓/✗ (history) from ⋯/✦ (live) so the renderer can tint without re-parsing
+/// the mark.
+#[derive(Clone)]
+pub(super) struct SubAgentRow {
+    pub mark: String,
+    pub label: String,
+    pub detail: String,
+    pub elapsed: String,
+    pub running: bool,
+}
+
+/// The collapsible sub-agents block. `rows` is the registry's live set (finished-at-snapshot rows
+/// may linger briefly, marked ✓/✗); `summary` carries the collapsed tail — recent done labels plus
+/// the `N running` counter. `expanded` is owned by the UI (Ctrl-E), never by the publisher.
+#[derive(Clone)]
+pub(super) struct SubAgentsPayload {
+    pub rows: Vec<SubAgentRow>,
+    pub summary: String,
+    pub expanded: bool,
+}
+
 /// The body of a transcript block. Text kinds (intro/generic/assistant) keep a raw string that is
 /// re-wrapped per width; the structured kinds carry typed data the renderer lays out by width.
 #[derive(Clone)]
@@ -197,49 +228,7 @@ enum Payload {
     Plan(Vec<PlanRow>),
     Diff(DiffPayload),
     Verify(VerifyPayload),
-}
-
-impl Payload {
-    /// A stable hash of the payload for the render cache + frame metrics.
-    fn content_hash(&self) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        match self {
-            Payload::Text(s) => s.hash(&mut h),
-            Payload::Tool(t) => {
-                t.name.hash(&mut h);
-                t.target.hash(&mut h);
-                t.digest.hash(&mut h);
-                (t.state as u8).hash(&mut h);
-                t.elapsed_ms.hash(&mut h);
-                // The tail is painted under a failed row, so it is part of what the cache keys on.
-                t.body.hash(&mut h);
-            }
-            Payload::Plan(rows) => {
-                for r in rows {
-                    r.status.hash(&mut h);
-                    r.text.hash(&mut h);
-                }
-            }
-            Payload::Diff(d) => {
-                d.path.hash(&mut h);
-                d.adds.hash(&mut h);
-                d.dels.hash(&mut h);
-                for hunk in &d.hunks {
-                    hunk.start_old.hash(&mut h);
-                    hunk.start_new.hash(&mut h);
-                    for (kind, line) in &hunk.rows {
-                        kind.hash(&mut h);
-                        line.hash(&mut h);
-                    }
-                }
-            }
-            Payload::Verify(v) => {
-                v.cmd.hash(&mut h);
-                v.detail.hash(&mut h);
-            }
-        }
-        h.finish()
-    }
+    SubAgents(SubAgentsPayload),
 }
 
 #[derive(Clone)]
@@ -248,18 +237,60 @@ struct UiBlock {
     kind: BlockKind,
     payload: Payload,
     complete: bool,
+    /// Revision counter, bumped by EVERY payload mutation (a streamed delta, a tool result, a plan
+    /// refresh). The render cache keys on it, which is what makes a changed block a cache miss
+    /// without hashing the payload — a failed tool's body alone can be 12 KB, and the key is
+    /// computed for every block on every frame. The contract is on the mutation sites in
+    /// [`AppState`]: mutate the payload, bump the rev. (`payload_mutations_bump_the_revision`
+    /// in tests guards it.)
+    rev: u64,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct CacheKey {
     id: u64,
     width: u16,
-    hash: u64,
+    /// `UiBlock::rev` at render time — see the field's contract on [`UiBlock`].
+    rev: u64,
     complete: bool,
     /// `theme::theme_generation()` at render time. A `/theme` switch changes how the same payload
-    /// paints without changing its content hash — folding the generation in makes every cached row
+    /// paints without bumping its revision — folding the generation in makes every cached row
     /// from the old theme a miss instead of a stale hit.
     theme_gen: u32,
+}
+
+/// One block rendered at one width, in the three forms a frame consumes: the raw SGR rows the
+/// hyperlink injector scans, their stripped plain text the mouse hit-test maps, and the styled
+/// ratatui lines the painter draws. All three are derived ONCE at render time and shared behind an
+/// `Rc` — a cache hit used to hand back a deep clone of every row, which the painter then re-parsed
+/// span by span, for every visible block on every frame.
+struct BlockRows {
+    sgr: Vec<String>,
+    plain: Vec<String>,
+    paths: Vec<Vec<crate::ui::links::PathFragment>>,
+    /// Index-aligned with `sgr`/`plain`: `lines[i]` is `sgr[i]` parsed into styled spans.
+    lines: Vec<Line<'static>>,
+}
+
+/// The one block still streaming (an incomplete assistant block): when its rows were last rendered
+/// and the rendered rows themselves. A streaming delta bumps the block's revision, so without this
+/// slot EVERY token would re-parse the block's whole markdown — the frame cap coalesces paints, but
+/// the render itself still ran per delta. Deltas arriving inside [`stream_render_interval`] reuse
+/// these (slightly stale) rows instead. The `complete` flip bypasses the slot, so the final state
+/// always renders exactly once, immediately.
+struct StreamSlot {
+    id: u64,
+    width: u16,
+    rendered_at: Instant,
+    rows: Rc<BlockRows>,
+}
+
+/// How long a streaming block's last render stays fresh: every frame while small, stretching
+/// toward 200ms as the block grows. The markdown reparse is O(block length), and any intermediate
+/// frame is superseded by the next delta anyway — only the final (complete) render must be exact.
+fn stream_render_interval(payload_len: usize) -> Duration {
+    let ms = FRAME_MIN_INTERVAL.as_millis() as u64 + (payload_len / 4096) as u64 * 15;
+    Duration::from_millis(ms.min(200))
 }
 
 #[derive(Default)]
@@ -267,7 +298,7 @@ struct RenderCache {
     /// Rendered rows per key with the tick of their last use — an LRU bounded by `CACHE_LIMIT`.
     /// It used to be cleared outright when full, which past 512 blocks re-rendered the whole
     /// transcript on every frame (110 ms at 3,000 blocks).
-    rows: HashMap<CacheKey, (Vec<String>, u64)>,
+    rows: HashMap<CacheKey, (Rc<BlockRows>, u64)>,
     /// Row COUNT per key for every block rendered at that width: the prefix sums that place the
     /// viewport without rendering anything. Follows the session's blocks (`forget_before`), not
     /// `CACHE_LIMIT`.
@@ -275,6 +306,7 @@ struct RenderCache {
     tick: u64,
     hits: u64,
     misses: u64,
+    stream: Option<StreamSlot>,
 }
 
 impl RenderCache {
@@ -282,23 +314,61 @@ impl RenderCache {
         CacheKey {
             id: block.id,
             width,
-            hash: block.payload.content_hash(),
+            rev: block.rev,
             complete: block.complete,
             theme_gen: crate::ui::theme::theme_generation(),
         }
     }
 
-    fn get_or_render(&mut self, block: &UiBlock, width: u16) -> Vec<String> {
+    fn get_or_render(&mut self, block: &UiBlock, width: u16) -> Rc<BlockRows> {
         let key = Self::key(block, width);
         self.tick += 1;
+        if !key.complete && block.kind == BlockKind::Assistant {
+            return self.streaming_rows(block, key);
+        }
         if let Some((rows, last)) = self.rows.get_mut(&key) {
             *last = self.tick;
             self.hits += 1;
             return rows.clone();
         }
+        self.render_and_store(key, block)
+    }
+
+    /// Render path for the streaming block (see [`StreamSlot`]): reuse the slot's rows while the
+    /// adaptive interval holds, otherwise render, cache, and re-arm the slot.
+    fn streaming_rows(&mut self, block: &UiBlock, key: CacheKey) -> Rc<BlockRows> {
+        let now = Instant::now();
+        let len = match &block.payload {
+            Payload::Text(s) => s.len(),
+            _ => 0,
+        };
+        if let Some(slot) = &self.stream {
+            if slot.id == key.id
+                && slot.width == key.width
+                && now.duration_since(slot.rendered_at) < stream_render_interval(len)
+            {
+                // Counted as a hit: no render ran. The painted frame shows the previous delta's
+                // rows — superseded by the next interval's render, exactly like the frames the
+                // frame cap coalesces away.
+                self.hits += 1;
+                return slot.rows.clone();
+            }
+        }
+        let rows = self.render_and_store(key, block);
+        self.stream = Some(StreamSlot {
+            id: key.id,
+            width: key.width,
+            rendered_at: now,
+            rows: rows.clone(),
+        });
+        rows
+    }
+
+    /// Miss path: render, record the height, LRU-store the rows.
+    fn render_and_store(&mut self, key: CacheKey, block: &UiBlock) -> Rc<BlockRows> {
         self.misses += 1;
-        let rows = render_block_rows(block, width);
-        self.heights.insert(key, rows.len());
+        let rows = Rc::new(render_block_rows(block, key.width));
+        self.heights.insert(key, rows.plain.len());
         if self.rows.len() >= CACHE_LIMIT {
             self.evict_cold();
         }
@@ -315,11 +385,11 @@ impl RenderCache {
             return *h;
         }
         if let Some((rows, _)) = self.rows.get(&key) {
-            let h = rows.len();
+            let h = rows.plain.len();
             self.heights.insert(key, h);
             return h;
         }
-        self.get_or_render(block, width).len()
+        self.get_or_render(block, width).plain.len()
     }
 
     /// Drop the coldest quarter of the row cache — one sort per `CACHE_LIMIT / 4` misses.
@@ -340,10 +410,12 @@ impl RenderCache {
     }
 }
 
-/// Render one block's wrapped rows at `width` — the one place a payload becomes text rows.
-fn render_block_rows(block: &UiBlock, width: u16) -> Vec<String> {
+/// Render one block's wrapped rows at `width` — the one place a payload becomes text rows. The
+/// three row forms (raw SGR, stripped plain, styled lines) are derived here ONCE per render; the
+/// painter used to re-strip and re-parse every row of every visible block on every frame.
+fn render_block_rows(block: &UiBlock, width: u16) -> BlockRows {
     let w = width as usize;
-    match &block.payload {
+    let sgr: Vec<String> = match &block.payload {
         Payload::Text(s) => match block.kind {
             BlockKind::Assistant => render_assistant_rows(s, w),
             // Intro/Generic (boot notes, warnings, the `❯` echo): wrap to the pane instead of
@@ -360,6 +432,52 @@ fn render_block_rows(block: &UiBlock, width: u16) -> Vec<String> {
         Payload::Plan(rows) => render_plan_box(rows, w),
         Payload::Diff(d) => render_diff_box(d, w),
         Payload::Verify(v) => vec![render_verify_line(v, w)],
+        Payload::SubAgents(s) => render_subagents_block(s, w),
+    };
+    // Index-aligned with `sgr`: `plain[i]` is `sgr[i]` stripped (what mouse hit-tests read) and
+    // `lines[i]` is it parsed into styled spans (what the frame paints). Intro rows are sanitised
+    // plain — no SGR to parse — so their line is one flat dim string; every other kind carries its
+    // palette as SGR (the moonlight `▌` gutter, tool tints, diff colours) and takes the span path
+    // over a grey base.
+    let plain: Vec<String> = sgr
+        .iter()
+        .map(|r| console::strip_ansi_codes(r).into_owned())
+        .collect();
+    let lines: Vec<Line<'static>> = match block.kind {
+        BlockKind::Intro => plain
+            .iter()
+            .map(|r| Line::styled(r.clone(), Style::default().fg(Color::DarkGray)))
+            .collect(),
+        _ => sgr
+            .iter()
+            .map(|r| Line::from(ansi_spans(r, Style::default().fg(Color::Gray))))
+            .collect(),
+    };
+    let paths = match &block.payload {
+        Payload::Tool(t) if !t.display.paths.is_empty() && w > 1 => {
+            let prefix = format!(
+                "{}{}   ",
+                if t.icon.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", t.icon)
+                },
+                t.name
+            );
+            crate::ui::links::wrap_path_fragments(
+                &plain,
+                sanitize_text(&prefix).len(),
+                &t.display,
+                t.seq,
+            )
+        }
+        _ => vec![Vec::new(); plain.len()],
+    };
+    BlockRows {
+        sgr,
+        plain,
+        lines,
+        paths,
     }
 }
 
@@ -380,6 +498,8 @@ struct AppState {
     health: HealthKind,
     /// Typed session facts for the sidebar (fed by `Command::Facts`).
     facts: SessionFacts,
+    /// Live background work for the sidebar section + jobs strip (fed by `Command::Jobs`).
+    jobs: JobsStatus,
     /// Transcript scroll offset measured in wrapped lines UP from the bottom. `0` means "follow the
     /// tail" — the newest output stays pinned to the bottom as it streams. Any positive value means
     /// the user scrolled up to read; while scrolled up, new content arriving at the bottom must NOT
@@ -389,6 +509,9 @@ struct AppState {
     /// the same content while the user is scrolled up and new lines stream in at the bottom: the
     /// offset is bumped by however many lines were appended, so what you're reading doesn't move.
     last_total: usize,
+    /// Physical transcript budget at the last paint. Wrapped-row selections are invalid after
+    /// this changes; reflow is not appended output and must not trigger scroll anchoring.
+    transcript_width: Option<u16>,
     /// Scroll offset (in lines from the top) for the informational overlay, when one is open. Kept
     /// separate from `scroll_from_tail` so PageUp/PageDown over an overlay never disturb the
     /// transcript behind it; reset on open/close and clamped to the overlay's own content height.
@@ -398,10 +521,16 @@ struct AppState {
     /// that block's payload instead of appending a new one, so the checklist updates in place rather
     /// than stacking a fresh copy on every call. Cleared when the list is emptied.
     plan_id: Option<u64>,
+    /// Block id of the collapsible sub-agents panel, if one has been shown this session. The
+    /// orchestration registry publishes a fresh snapshot on every run start/finish/step; the panel
+    /// replaces THAT block's payload in place instead of one tool row per dispatch.
+    subagents_id: Option<u64>,
+    /// `Ctrl-E` on the sub-agents panel: collapsed (`▸ …` header + counts) or expanded (one row per
+    /// run). Owned by the UI — the registry's snapshots never touch it.
+    subagents_expanded: bool,
     /// Absolute (line, col) selection in the flat wrapped-line space. Drawn reversed; cleared on a
     /// plain click outside the range / Esc.
     selection: Option<SelectionRange>,
-    metrics: metrics::FrameMetrics,
     cache: RenderCache,
     /// When `Some(idx)`, the idle screensaver is up: the render thread cover-encodes card `idx` to its
     /// current pixel size, blits that sixel over the whole alt-screen, and skips the normal ratatui
@@ -439,6 +568,10 @@ struct AppState {
     /// Re-deriving it from the caret every frame would pin the caret to the bottom row, so scrolling
     /// back up through a long paste would snap away on the next repaint.
     input_row_scroll: usize,
+    /// One-slot cache of the composer layout — re-derived only when an input the layout reads
+    /// actually moved, instead of re-wrapping the whole draft on every painted frame. See
+    /// [`paint::cached_input_layout`].
+    input_layout_cache: Option<InputLayoutCache>,
 }
 
 /// Absolute character selection over the flat list of wrapped transcript rows.
@@ -459,6 +592,7 @@ impl AppState {
                 kind: BlockKind::Intro,
                 payload: Payload::Text(sanitize_text(intro)),
                 complete: true,
+                rev: 0,
             }],
             next_id: 2,
             active_assistant: None,
@@ -473,13 +607,16 @@ impl AppState {
             sent_tok: 0,
             health: HealthKind::Unknown,
             facts: SessionFacts::default(),
+            jobs: JobsStatus::default(),
             scroll_from_tail: 0,
             last_total: 0,
+            transcript_width: None,
             overlay_scroll: 0,
             focused: true,
             plan_id: None,
+            subagents_id: None,
+            subagents_expanded: false,
             selection: None,
-            metrics: metrics::FrameMetrics::default(),
             cache: RenderCache::default(),
             screensaver: None,
             screensaver_cache: None,
@@ -489,6 +626,7 @@ impl AppState {
             work_tint: None,
             work_reveal: 0,
             input_row_scroll: 0,
+            input_layout_cache: None,
         }
     }
 
@@ -514,6 +652,7 @@ impl AppState {
             kind,
             payload,
             complete,
+            rev: 0,
         });
         if self.blocks.len() > BLOCK_LIMIT {
             let excess = self.blocks.len() - BLOCK_LIMIT;
@@ -548,6 +687,7 @@ impl AppState {
                 s.push_str(delta);
             }
             block.complete = false;
+            block.rev += 1;
         }
         // Deliberately no `scroll_from_tail = 0`: a streaming token must not fight a user who has
         // scrolled up to read. Follow-at-bottom vs pinned-while-scrolled-up is handled at draw time.
@@ -563,6 +703,7 @@ impl AppState {
                 if let Payload::Text(s) = &mut block.payload {
                     if !s.ends_with('\n') {
                         s.push('\n');
+                        block.rev += 1;
                     }
                 }
             }
@@ -580,6 +721,7 @@ impl AppState {
         }) {
             block.complete = ev.state != ToolState::Running;
             block.payload = Payload::Tool(ev);
+            block.rev += 1;
             return;
         }
         let complete = ev.state != ToolState::Running;
@@ -601,11 +743,51 @@ impl AppState {
             if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
                 block.payload = Payload::Plan(rows);
                 block.complete = true;
+                block.rev += 1;
                 return;
             }
             // The id was pruned out of the ring — fall through and push a fresh panel.
         }
         self.plan_id = Some(self.push_block(BlockKind::Plan, Payload::Plan(rows), true));
+    }
+
+    /// Replace the single sub-agents panel with a fresh registry snapshot — the `apply_plan` pattern:
+    /// the first dispatch pushes the block, later snapshots replace THAT block's payload in place
+    /// (rev bumped so the render cache misses) instead of stacking one tool row per spawn. The
+    /// expand/collapse flag is UI-owned: a snapshot never resets what the user opened with Ctrl-E.
+    fn apply_subagents(&mut self, p: SubAgentsPayload) {
+        note_output();
+        SUBAGENTS_PANEL_SEEN.store(true, Ordering::Relaxed);
+        if let Some(id) = self.subagents_id {
+            if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
+                let expanded = self.subagents_expanded;
+                block.payload = Payload::SubAgents(SubAgentsPayload { expanded, ..p });
+                block.rev += 1;
+                return;
+            }
+            // The id was pruned out of the ring — fall through and push a fresh panel.
+        }
+        let expanded = self.subagents_expanded;
+        self.subagents_id = Some(self.push_block(
+            BlockKind::SubAgents,
+            Payload::SubAgents(SubAgentsPayload { expanded, ..p }),
+            true,
+        ));
+    }
+
+    /// Flip the sub-agents panel between the one-line collapsed form and the per-row expanded form
+    /// (Ctrl-E). A no-op when no panel exists.
+    fn toggle_subagents(&mut self) {
+        self.subagents_expanded = !self.subagents_expanded;
+        let expanded = self.subagents_expanded;
+        if let Some(id) = self.subagents_id {
+            if let Some(block) = self.blocks.iter_mut().find(|b| b.id == id) {
+                if let Payload::SubAgents(p) = &mut block.payload {
+                    p.expanded = expanded;
+                    block.rev += 1;
+                }
+            }
+        }
     }
 }
 
@@ -620,6 +802,10 @@ enum Command {
     Tool(ToolEvent),
     /// Replace the in-place plan checklist box with a fresh snapshot (`todo_write`).
     Plan(Vec<PlanRow>),
+    /// Replace the in-place sub-agents panel with a fresh registry snapshot.
+    SubAgents(SubAgentsPayload),
+    /// `Ctrl-E` toggled the sub-agents panel open/closed.
+    ToggleSubAgents,
     /// Push a boxed diff preview under the most recent edit.
     Diff(DiffPayload),
     /// Push a green verify-gate success line.
@@ -644,6 +830,9 @@ enum Command {
     /// Typed session facts for the sidebar (model, effort, persona, tokens, …) — published from
     /// the same call sites that set the HUD status string, so the two can never disagree.
     Facts(SessionFacts),
+    /// Live background work (processes + monitor runs) for the sidebar section and the jobs strip.
+    /// Published by a background poller so the view stays current while a turn is idle.
+    Jobs(JobsStatus),
     Tick,
     OpenOverlay(OverlaySnapshot),
     /// Replace the OPEN overlay's body while preserving the reader's scroll position. Distinct from
@@ -788,6 +977,16 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     // leaks back through as ↑/↓ and the transcript stops scrolling. Re-emitting the mode setters is
     // idempotent and cheap; doing it on the true→false edge restores scroll without a per-frame cost.
     let mut was_working = false;
+    // P0 stream coalescing: the last moment a frame was actually drawn. Streaming deltas arrive per
+    // token (5–10/s, bursty), and each one re-parses the whole assistant block's markdown — drawing
+    // per command is the visible jitter. Capping coalesced repaints at FRAME_MIN_INTERVAL makes the
+    // token flow paint at a steady ~33fps instead of following the burst. Interactive commands
+    // (typing, menus, overlays) bypass the cap via `interactive_dirty`: keystroke latency is a
+    // responsiveness contract and must never wait on a stream budget.
+    let mut last_draw = Instant::now() - Duration::from_millis(1000);
+    // True when this iteration applied at least one interactive command (drawn immediately) vs only
+    // coalesced ones (capped) — see `is_coalesced_command`.
+    let mut interactive_dirty = false;
     // Set by `Command::Redraw`: clear the terminal before the next draw so ratatui's cell diff starts
     // from a blank slate instead of its stale belief about the screen.
     let mut force_clear = false;
@@ -799,11 +998,17 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
     // shredded the frame" report). One late full repaint reconciles screen and model.
     let mut resize_settle: Option<Instant> = None;
     loop {
-        let wait = if state.working && state.focused {
+        let mut wait = if state.working && state.focused {
             Duration::from_millis(110)
         } else {
             Duration::from_millis(250)
         };
+        // A capped stream frame is owed a paint the moment the budget reopens — wait exactly that
+        // long rather than a full tick, so coalesced output lands at ~33fps instead of being held
+        // to the 110ms animation tick. Anything arriving sooner interrupts the wait as usual.
+        if dirty && !interactive_dirty && !force_clear {
+            wait = wait.min(FRAME_MIN_INTERVAL.saturating_sub(last_draw.elapsed()));
+        }
         match rx.recv_timeout(wait) {
             Ok(Command::Shutdown(ack)) => {
                 shutdown_ack = Some(ack);
@@ -816,6 +1021,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 session.take();
                 let _ = ack.send(());
                 dirty = false;
+                // NOTE: no stdin drain here — a blocking read on the render thread wedges the
+                // suspend/resume handshake (the 0.7.1 Linux freeze). Stale menu-session bytes are
+                // drained by the input thread at its unpark edge instead (see tui.rs input_loop).
             }
             Ok(Command::Resume { status, ack }) => {
                 state.input.status = status;
@@ -834,12 +1042,21 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 // later frames — the "/config corrupted the layout" report.
                 force_clear = ok;
                 dirty = ok;
+                // Re-assert mouse capture explicitly: `TerminalSession::enter()` already enables it,
+                // but some terminals (especially on Linux after alternateScroll was active while the
+                // menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓ keys.
+                if ok {
+                    let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+                }
             }
             Ok(Command::Redraw) => {
                 force_clear = true;
                 dirty = true;
             }
             Ok(cmd) => {
+                if !is_coalesced_command(&cmd) {
+                    interactive_dirty = true;
+                }
                 apply_command(&mut state, cmd);
                 dirty = true;
             }
@@ -852,7 +1069,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     if state.work_reveal < len {
                         state.work_reveal += 1;
                     }
-                    dirty = true;
+                    dirty = true; // animation tick — stream-capped, the spinner can wait 30ms
                 }
                 // Idle resize: the render below only runs when `dirty`, so a terminal resized while
                 // nothing is happening (no command) would otherwise never be repainted until the next
@@ -880,6 +1097,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     session.take();
                     let _ = ack.send(());
                     dirty = false;
+                    // NOTE: no stdin drain here — see the blocking-recv Suspend arm above.
                 }
                 Command::Resume { status, ack } => {
                     state.input.status = status;
@@ -893,12 +1111,23 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     let _ = ack.send(ok);
                     force_clear = ok; // see the blocking-recv arm above
                     dirty = ok;
+                    // Re-assert mouse capture explicitly: `TerminalSession::enter()` already enables
+                    // it, but some terminals (especially on Linux after alternateScroll was active
+                    // while the menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓
+                    // keys.
+                    if ok {
+                        let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+                    }
                 }
                 Command::Redraw => {
                     force_clear = true;
                     dirty = true;
+                    interactive_dirty = true; // Ctrl-L is a user keystroke — never wait on the cap
                 }
                 other => {
+                    if !is_coalesced_command(&other) {
+                        interactive_dirty = true;
+                    }
                     apply_command(&mut state, other);
                     dirty = true;
                 }
@@ -928,11 +1157,20 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
             force_clear = true;
             dirty = true;
         }
+        // P0: coalesced work repaints at most once per FRAME_MIN_INTERVAL so a token burst paints
+        // at a steady cadence instead of per-command (each delta re-parses the streaming block's
+        // markdown — per-command drawing is the visible jitter). Interactive state (typing, menus,
+        // overlays, Ctrl-L) always draws on arrival; `force_clear` implies an interactive recovery
+        // or a resize settle, both of which bypass the cap too. Skipped coalesced state is not
+        // lost: `dirty` stays set and the next tick (≤110ms) or the cap expiring paints it.
+        if dirty && !interactive_dirty && !force_clear && last_draw.elapsed() < FRAME_MIN_INTERVAL {
+            continue;
+        }
         if dirty {
+            last_draw = Instant::now();
             if let Some(s) = session.as_mut() {
                 let _ = s.terminal.autoresize();
                 let after = s.terminal.size().ok();
-                let mut resized = false;
                 if let Some(area) = after {
                     let (w, h) = (area.width.max(20), area.height.max(8));
                     // `swap` (not `store`) so a size change seen HERE — mid-scroll, when the idle
@@ -940,8 +1178,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     // settle repaint. Both swaps must run: no short-circuit between them.
                     let pw = COLS.swap(w, Ordering::Relaxed);
                     let ph = ROWS.swap(h, Ordering::Relaxed);
-                    resized = pw != w || ph != h;
-                    if resized {
+                    if pw != w || ph != h {
                         resize_settle = Some(Instant::now());
                     }
                 }
@@ -970,41 +1207,62 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                         let _ = s.terminal.clear();
                         force_clear = false;
                     }
-                    let started = Instant::now();
                     let _ = s.terminal.draw(|frame| draw(frame, &mut state));
                     // Inject OSC 8 hyperlinks AFTER terminal.draw() — post-draw so ratatui's cell
                     // diff never sees the escape sequences and can't overwrite them next frame.
                     // Pattern is identical to the screensaver sixel blitter (`blit_screensaver`).
-                    {
-                        // Snapshot occluders + caret BEFORE taking the geometry lock, so all four
-                        // pieces describe the frame that was just drawn.
-                        let occluders = last_occluders();
-                        let caret = last_caret();
+                    // Cheap presence gate first: most streamed frames carry no link at all, and the
+                    // scan ends in a filesystem probe per path candidate — running it per frame
+                    // during a burst is pure cost. `://` (URLs) or a path separator (file links)
+                    // are the only two shapes `scan_row_shapes` can match, so a row without either
+                    // contributes nothing and the whole pass is skipped.
+                    let link_hint = {
                         let g = transcript_geom_slot()
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        let ctx = crate::ui::links::InjectCtx {
-                            start: g.start,
-                            visible: g.visible,
-                            area: g.area,
-                            occluders,
-                            caret,
-                            rows_offset: g.rows_offset,
+                        g.plain_rows
+                            .iter()
+                            .any(|r| r.contains("://") || r.contains('/') || r.contains('\\'))
+                    };
+                    if link_hint {
+                        // Snapshot everything the injector needs and DROP the geometry lock before
+                        // running it: injection stats every path candidate on the filesystem, and
+                        // this lock is what mouse hit-tests on the input thread read — holding it
+                        // across the probes stalled clicks behind slow stat calls.
+                        let occluders = last_occluders();
+                        let caret = last_caret();
+                        let (ctx, sgr_rows, plain_rows, paths) = {
+                            let g = transcript_geom_slot()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let ctx = crate::ui::links::InjectCtx {
+                                start: g.start,
+                                visible: g.visible,
+                                area: g.area,
+                                occluders,
+                                caret,
+                                rows_offset: g.rows_offset,
+                            };
+                            (
+                                ctx,
+                                g.sgr_rows.clone(),
+                                g.plain_rows.clone(),
+                                g.paths.clone(),
+                            )
                         };
                         let out = s.terminal.backend_mut();
-                        crate::ui::links::inject_hyperlinks(out, &g.sgr_rows, &g.plain_rows, &ctx);
+                        crate::ui::links::inject_hyperlinks_with_paths(
+                            out,
+                            &sgr_rows,
+                            &plain_rows,
+                            &ctx,
+                            &paths,
+                        );
                     }
-                    let rows = state
-                        .blocks
-                        .iter()
-                        .map(|b| format!("{}:{:x}:{}", b.id, b.payload.content_hash(), b.complete))
-                        .collect::<Vec<_>>();
-                    state
-                        .metrics
-                        .record(started.elapsed(), metrics::hash_rows(&rows), resized);
                 }
             }
             dirty = false;
+            interactive_dirty = false; // frame painted — the next iteration classifies fresh
         }
     }
     session.take();
@@ -1028,6 +1286,8 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::AssistantFinish { interrupted } => state.finish_assistant(interrupted),
         Command::Tool(ev) => state.apply_tool_event(ev),
         Command::Plan(rows) => state.apply_plan(rows),
+        Command::SubAgents(p) => state.apply_subagents(p),
+        Command::ToggleSubAgents => state.toggle_subagents(),
         Command::Diff(d) => {
             state.push_block(BlockKind::Diff, Payload::Diff(d), true);
         }
@@ -1079,6 +1339,7 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         Command::SentTokens(n) => state.sent_tok = n,
         Command::Health(h) => state.health = h,
         Command::Facts(f) => state.facts = f,
+        Command::Jobs(j) => state.jobs = j,
         Command::Tick => {
             state.frame = state.frame.wrapping_add(1);
             // Type one more character of the working caption per tick (the typewriter). Clamped to the
@@ -1164,4 +1425,32 @@ fn apply_command(state: &mut AppState, cmd: Command) {
         // Listed explicitly rather than via `_` so a new command can't silently become a no-op here.
         Command::Suspend(_) | Command::Resume { .. } | Command::Shutdown(_) | Command::Redraw => {}
     }
+}
+
+/// Does this command ride the frame cap (coalesced at ~33fps) or must it paint on arrival?
+/// Two classes ride the cap: the model/tool output stream (a token burst must never out-draw the
+/// terminal), and high-rate VIEW changes — wheel scroll, scrollbar drags, mouse selection — which
+/// are just as bursty, and whose intermediate states are superseded by the next event. Genuine
+/// interactive edges (typing, menus, overlays, focus, Ctrl-L) still paint on arrival: keystroke
+/// latency is a responsiveness contract. A coalesced scroll on an IDLE screen is still instant —
+/// the cap only defers a frame when one was painted within the last `FRAME_MIN_INTERVAL`.
+fn is_coalesced_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::AssistantDelta(_)
+            | Command::AssistantFinish { .. }
+            | Command::Tool(_)
+            | Command::Plan(_)
+            | Command::Diff(_)
+            | Command::Verify(_)
+            | Command::Emit(_)
+            | Command::WorkCaption(..)
+            | Command::SentTokens(_)
+            | Command::Tick
+            | Command::Scroll(_)
+            | Command::ScrollTo(_)
+            | Command::ScrollEnd
+            | Command::SetSelection(_)
+            | Command::ClearSelection
+    )
 }

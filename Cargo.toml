@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.6.8"
+version = "0.7.2"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "Apache-2.0"
@@ -51,6 +51,8 @@ console = "0.15"
 # must work on every sixel-capable platform (incl. Linux), not just Windows/macOS. Also backs the
 # clipboard image encode in `image_input`. Pure-Rust → single static binary preserved.
 png = "0.17"
+# Bounded user-reference JPEG previews; codecs and resize are pure Rust. Keep defaults off.
+image = { version = "=0.25.10", default-features = false, features = ["jpeg"] }
 # Retained full-frame TUI — the only interactive backend (the classic ANSI/console renderer is gone).
 # Both crates are pure Rust; the non-TTY path falls back to the plain line-REPL and never starts it.
 # Ratatui owns layout/cell diffing; crossterm owns raw input, alternate-screen lifecycle, focus and
@@ -69,6 +71,11 @@ url = "2"
 # with the `regex` crate already in the tree for line matching. This is the exact pure-Rust walker rg
 # is built on — no C/C++ → single static binary preserved. Removes the "rg must be on PATH" footgun.
 ignore = "0.4"
+# ripgrep's other matcher-side speed secret, already in the dependency tree (memchr ← aho-corasick
+# ← regex), so declaring it direct is ZERO marginal binary cost and pure-Rust. SIMD byte search —
+# the search_files literal prefilter skips a file that can't possibly match before any regex runs.
+memchr = "2"
+
 # MCP remote-app OAuth 2.1 (PKCE S256) — lets `aizen apps` sign into Linear/Notion/Slack/Gmail/Atlassian
 # the way Hermes does (the apps people actually want, all OAuth-only). `ring` (SHA-256 for the PKCE
 # challenge + a CSPRNG) and `getrandom` are BOTH already in the dependency tree via reqwest→rustls
@@ -118,12 +125,20 @@ tower-layer = "0.3"
 # has no C toolchain, and the single-static-binary posture must hold). flate2 + miniz_oxide are
 # ALREADY in the dependency tree (verified vs Cargo.lock 2026-07-05) → zero marginal binary cost.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Skill bundles: ZIP Stored/Deflate only. flate2's Rust backend above is shared; no zlib/C,
+# zopfli, encryption, or other archive codecs. YAML is scoped to skill documents, UTF-8 only.
+zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2"] }
+yaml-rust2 = { version = "0.10.4", default-features = false }
+# Already used by ratatui; keep whole graphemes when wrapping/slicing styled tool paths.
+unicode-segmentation = "1.13"
 
 [features]
+# CDP client only: lazy, attach-only, never bundles or launches a browser engine.
+default = ["browser"]
 # Enable the model2vec semantic embedder. Build: `cargo build --features dense`.
 dense = ["dep:model2vec-rs", "dep:tokenizers"]
-# Enable the CDP browser tools (browser_navigate/snapshot/click/type/eval). Build: `cargo build --features browser`.
-# (`tokio-tungstenite` is now a base dep — the Discord bot needs it — so this just gates the tools.)
+# CDP tools are shipped by default; `--no-default-features` excludes them.
+# tokio-tungstenite is a base dependency for Discord too, so this only gates browser code.
 browser = []
 
 # Release profile is tuned for a small, hard-to-reverse binary (the CI runners build this; the local
@@ -136,6 +151,21 @@ lto = "fat"          # aggressive cross-crate inlining dissolves function bounda
 codegen-units = 1    # one unit → more inlining, smaller output (slower link; CI absorbs it)
 strip = true         # drop the symbol table + debug info (no function names for a disassembler)
 debug = false
+
+# Dev profile tuned for the code→verify loop, not for debugging: no debuginfo (the verify harness
+# and `cargo check`/`cargo test` never read it, and writing + linking it is the single biggest cost
+# of a cold dev build of this crate), and incremental ON (the default, stated explicitly so a future
+# "turn it off for reproducibility" edit doesn't silently double every verify run). This is what
+# keeps `cargo test` under the verify gate's timeout after a source edit.
+[profile.dev]
+debug = false
+incremental = true
+
+# Test builds inherit the same posture: tests assert on behaviour, not on debug symbols, and the
+# 180s verify cap is hit in the LINK step of the test binary — exactly what `debug = false` removes.
+[profile.test]
+debug = false
+incremental = true
 
 # Image (vision) input — encode a pasted clipboard image into a data URL for OpenAI-compatible
 # vision models (paste a screenshot straight into the chat box with Ctrl-V). Clipboard access is
@@ -156,7 +186,8 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 # prebuilt import libs and builds everywhere.
 [target.'cfg(windows)'.dependencies]
 # Features cover: Job Objects (LSP tree-kill), console mode restore (TUI), atomic MoveFileEx +
-# ACL owner-only writes (persist), exclusive file locks (repo_lock), reparse-point checks (TM).
+# ACL owner-only writes (persist), exclusive file locks (repo_lock), reparse-point checks (TM),
+# PID-liveness probes (orchestration manifest sweep — OpenProcess/GetExitCodeProcess).
 # PINNED to 0.59 — see comment above. Do NOT promote this to a target-agnostic dep.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -164,7 +195,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Registry",
+    "Win32_System_Threading",
 ] }

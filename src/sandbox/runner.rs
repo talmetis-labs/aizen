@@ -60,13 +60,16 @@ impl AuditState {
     }
 }
 
-/// A ready-to-spawn sandboxed command. Spawn `command`, contain the child through
-/// [`Sandboxed::contain`] (which carries the policy's Job-Object limits on Windows), then report
-/// the outcome with [`Sandboxed::finish`] — or move the bookkeeping out via
-/// [`Sandboxed::into_guard`] for background processes and servers.
+/// A ready-to-spawn sandboxed command. Use the protected spawn methods when complete-tree proof is
+/// required; legacy `command.spawn()` + containment remains best-effort. Report the outcome with
+/// [`Sandboxed::finish`] or move bookkeeping via [`Sandboxed::into_guard`] for background processes
+/// and servers. Unverified protected-spawn errors must retain their owned child/containment AND this
+/// bookkeeping guard alongside physical/workspace admission, not ordinary-drop them as settled.
 pub struct Sandboxed<C> {
     pub command: C,
     state: AuditState,
+    bounded_root: PathBuf,
+    bounded_scope: String,
     #[cfg(windows)]
     job_limits: Option<crate::core::proctree::windows_job::JobLimits>,
     /// Degradations worth surfacing to the caller (already in the audit record too).
@@ -92,8 +95,219 @@ impl<C> Sandboxed<C> {
     }
 }
 
+struct BoundedAdmission {
+    _context: Option<crate::core::exec_ctx::ExecutionContext>,
+    _activity: std::sync::Arc<crate::core::workspace_txn::WorkspaceActivity>,
+    _writer: crate::core::workspace_txn::WorkspaceWriterLease,
+    _physical: crate::core::workspace_txn::PhysicalEffectLease,
+}
+
 impl Sandboxed<std::process::Command> {
-    /// Contain a just-spawned child with the policy's resource ceilings.
+    /// Consumes sandbox bookkeeping into the actual body, including all detached pipe workers.
+    pub(crate) fn output_bounded(
+        self,
+        timeout: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Result<crate::core::proctree::BoundedOutput, crate::core::proctree::BoundedExecutionError>
+    {
+        self.output_bounded_bytes(timeout, grace).map(bounded_text)
+    }
+
+    pub(crate) fn output_bounded_bytes(
+        self,
+        timeout: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Result<crate::core::proctree::BoundedBytes, crate::core::proctree::BoundedExecutionError>
+    {
+        self.output_bounded_owned(None, timeout, grace, None)
+    }
+
+    pub(crate) fn output_bounded_with_input(
+        self,
+        input: &[u8],
+        timeout: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Result<crate::core::proctree::BoundedOutput, crate::core::proctree::BoundedExecutionError>
+    {
+        self.output_bounded_owned(Some(input.to_vec()), timeout, grace, None)
+            .map(bounded_text)
+    }
+
+    /// Optional owners are retained with the body, not used as admission for a second body. Do not
+    /// call the fresh-admission runner API from native/TM plumbing already holding a physical gate.
+    pub(crate) fn output_bounded_owned(
+        self,
+        input: Option<Vec<u8>>,
+        timeout: std::time::Duration,
+        grace: std::time::Duration,
+        owner: Option<crate::core::proctree::BoundedOwner>,
+    ) -> Result<crate::core::proctree::BoundedBytes, crate::core::proctree::BoundedExecutionError>
+    {
+        self.output_bounded_policy(
+            input,
+            timeout,
+            grace,
+            owner,
+            crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED,
+            0,
+        )
+    }
+
+    fn output_bounded_policy(
+        mut self,
+        input: Option<Vec<u8>>,
+        timeout: std::time::Duration,
+        grace: std::time::Duration,
+        owner: Option<crate::core::proctree::BoundedOwner>,
+        strict: bool,
+        flags: u32,
+    ) -> Result<crate::core::proctree::BoundedBytes, crate::core::proctree::BoundedExecutionError>
+    {
+        use crate::core::proctree::{self, BoundedExecutionError, BoundedSettlement};
+        if let Err(error) = proctree::check_bounded_effects() {
+            self.finish(Outcome::SpawnFailed);
+            return Err(error);
+        }
+        let admission = if strict {
+            let admitted = (|| -> anyhow::Result<BoundedAdmission> {
+                proctree::check_bounded_effects()?;
+                let context = crate::core::exec_ctx::current();
+                anyhow::ensure!(
+                    context
+                        .as_ref()
+                        .is_none_or(|ctx| ctx.native_scope().is_none()),
+                    "opaque bounded execution is unavailable inside native scope"
+                );
+                let cancel = crate::core::cancel::current();
+                let writer = crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                    &self.bounded_root,
+                    std::time::Duration::from_secs(15),
+                    cancel.as_ref(),
+                    "bounded opaque body",
+                    &self.bounded_scope,
+                )?;
+                let activity = crate::core::workspace_txn::WorkspaceActivity::begin(
+                    &self.bounded_root,
+                    &self.bounded_scope,
+                )?;
+                // Always fresh physical admission; ancestry/reentrant writer metadata is not proof.
+                let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                    std::time::Duration::from_secs(15),
+                    cancel.as_ref(),
+                    "bounded opaque physical body",
+                    &self.bounded_scope,
+                )?;
+                Ok(BoundedAdmission {
+                    _context: context,
+                    _activity: activity,
+                    _writer: writer,
+                    _physical: physical,
+                })
+            })();
+            match admitted {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    self.finish(Outcome::SpawnFailed);
+                    return Err(BoundedExecutionError {
+                        cause: std::io::Error::other(error.to_string()),
+                        settlement: if proctree::check_bounded_effects().is_err() {
+                            BoundedSettlement::Unknown
+                        } else {
+                            BoundedSettlement::Proven
+                        },
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        proctree::configure_bounded_stdio(&mut self.command, input.is_some());
+        let spawned = self.spawn_contained_with_flags(flags);
+        let (child, containment) = match spawned {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let settled = error.cleanup_verified();
+                let cause = std::io::Error::other(error.to_string());
+                if !settled {
+                    proctree::latch_bounded_unknown(true);
+                    // Keep the entire typed error, including just-created child/job, and temp guard.
+                    proctree::quarantine_bounded_owner(Box::new((
+                        error,
+                        self.into_guard(),
+                        admission,
+                        owner,
+                    )));
+                }
+                return Err(BoundedExecutionError {
+                    cause,
+                    settlement: if settled {
+                        BoundedSettlement::Proven
+                    } else {
+                        BoundedSettlement::Unknown
+                    },
+                });
+            }
+        };
+        let guard = std::sync::Arc::new(std::sync::Mutex::new(self.into_guard()));
+        let caller: proctree::BoundedOwner = Box::new((guard.clone(), admission, owner));
+        // Runner output is bounded; generic git/native byte helpers keep their legacy full capture.
+        let result = proctree::output_bounded_spawned(
+            child,
+            containment,
+            input,
+            timeout,
+            grace,
+            Some(caller),
+            strict,
+            Some(16 * 1024 * 1024),
+        );
+        let outcome = match &result {
+            Ok(output) if output.timed_out => Outcome::Timeout,
+            Ok(output) => Outcome::Exit(output.code),
+            Err(_) => Outcome::SpawnFailed,
+        };
+        guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(outcome);
+        result
+    }
+
+    /// Protected spawn for callers retaining physical/workspace ownership. On Windows the initial
+    /// thread cannot execute before checked Job assignment. Late `command.spawn()` + `contain()`
+    /// remains supported for legacy callers, but supplies UNKNOWN complete-tree proof.
+    pub(crate) fn spawn_contained(
+        &mut self,
+    ) -> Result<
+        (std::process::Child, crate::core::proctree::Containment),
+        crate::core::proctree::ContainedSpawnError<std::process::Child>,
+    > {
+        self.spawn_contained_with_flags(0)
+    }
+
+    /// Stable Command has no flags getter. Callers setting custom flags MUST supply them here;
+    /// runner flags are preserved and CREATE_SUSPENDED is added only for this spawn interval.
+    pub(crate) fn spawn_contained_with_flags(
+        &mut self,
+        flags: u32,
+    ) -> Result<
+        (std::process::Child, crate::core::proctree::Containment),
+        crate::core::proctree::ContainedSpawnError<std::process::Child>,
+    > {
+        let result = crate::core::proctree::spawn_contained_std(
+            &mut self.command,
+            flags,
+            #[cfg(windows)]
+            self.job_limits.as_ref(),
+        );
+        if result.is_err() {
+            self.finish(Outcome::SpawnFailed);
+        }
+        result
+    }
+
+    /// Contain a just-spawned child with the policy's resource ceilings. Late attachment cannot
+    /// prove all descendants were assigned before execution; use `spawn_contained` for that proof.
     pub fn contain(&self, child: &std::process::Child) -> crate::core::proctree::Containment {
         #[cfg(windows)]
         {
@@ -105,18 +319,45 @@ impl Sandboxed<std::process::Command> {
     }
 }
 
+fn bounded_text(raw: crate::core::proctree::BoundedBytes) -> crate::core::proctree::BoundedOutput {
+    crate::core::proctree::BoundedOutput {
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+        code: raw.code,
+        timed_out: raw.timed_out,
+        output_truncated: raw.output_truncated,
+        settlement: raw.settlement,
+    }
+}
+
 impl Sandboxed<tokio::process::Command> {
-    pub fn contain_tokio(
-        &self,
-        child: &tokio::process::Child,
-    ) -> crate::core::proctree::Containment {
-        #[cfg(windows)]
-        {
-            if let Some(l) = &self.job_limits {
-                return crate::core::proctree::windows_job::contain_tokio_with_limits(child, l);
-            }
+    /// Protected Tokio spawn; retains the same sandbox policy and resource ceilings as std spawn.
+    pub(crate) fn spawn_contained_tokio(
+        &mut self,
+    ) -> Result<
+        (tokio::process::Child, crate::core::proctree::Containment),
+        crate::core::proctree::ContainedSpawnError<tokio::process::Child>,
+    > {
+        self.spawn_contained_tokio_with_flags(0)
+    }
+
+    pub(crate) fn spawn_contained_tokio_with_flags(
+        &mut self,
+        flags: u32,
+    ) -> Result<
+        (tokio::process::Child, crate::core::proctree::Containment),
+        crate::core::proctree::ContainedSpawnError<tokio::process::Child>,
+    > {
+        let result = crate::core::proctree::spawn_contained_tokio(
+            &mut self.command,
+            flags,
+            #[cfg(windows)]
+            self.job_limits.as_ref(),
+        );
+        if result.is_err() {
+            self.finish(Outcome::SpawnFailed);
         }
-        crate::core::proctree::contain_tokio(child)
+        result
     }
 }
 
@@ -249,7 +490,10 @@ fn resolve(req: &SandboxRequest, settings: &SandboxSettings) -> Result<Resolutio
                 });
             }
             // No kernel sandbox on this host. Unattended origins fail closed unless the user
-            // opted into the software fallback; interactive sessions degrade with one warning.
+            // opted into the software fallback; interactive sessions degrade to guarded. The
+            // degradation is recorded in `degraded` (surfaced by `aizen sandbox status`) but not
+            // announced as a boot line: on Windows the kernel backend never exists, so the warning
+            // is permanent noise at every startup rather than a signal.
             if (req.origin.unattended() || super::process_unattended())
                 && !settings.allow_guarded_fallback.unwrap_or(false)
             {
@@ -262,10 +506,6 @@ fn resolve(req: &SandboxRequest, settings: &SandboxSettings) -> Result<Resolutio
                      unattended runs",
                 ));
             }
-            warn_once(
-                "no kernel sandbox backend on this platform — commands run with software guards \
-                 only (guarded). `aizen sandbox status` shows exactly what is and is not enforced",
-            );
             Ok(Resolution {
                 effective: "guarded",
                 backend: report.backend.as_str(),
@@ -486,6 +726,8 @@ macro_rules! build_prepared {
                     started: Instant::now(),
                     tmp,
                 },
+                bounded_root: req.workspace_root.clone(),
+                bounded_scope: req.scope.clone(),
                 #[cfg(windows)]
                 job_limits,
                 degraded,
@@ -533,6 +775,308 @@ mod tests {
     fn req(origin: CommandOrigin) -> SandboxRequest {
         let cwd = std::env::current_dir().unwrap();
         SandboxRequest::shell(origin, "echo sandboxed", cwd.clone(), cwd)
+    }
+
+    #[test]
+    fn contained_spawn_errors_can_carry_owned_children_through_anyhow() {
+        fn assert_error<T: std::error::Error + Send + Sync + 'static>() {}
+        assert_error::<crate::core::proctree::ContainedSpawnError<std::process::Child>>();
+        assert_error::<crate::core::proctree::ContainedSpawnError<tokio::process::Child>>();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_spawn_helper() -> anyhow::Result<()> {
+        use std::io::Write;
+        if !std::env::args().any(|arg| arg == "sandbox::runner::tests::protected_spawn_helper") {
+            return Ok(());
+        }
+        let Some(root) = std::env::var_os("AIZEN_PROTECTED_SPAWN_TEST_ROOT") else {
+            return Ok(());
+        };
+        let root = std::fs::canonicalize(root)?;
+        let temp = std::fs::canonicalize(std::env::temp_dir())?;
+        anyhow::ensure!(
+            root.starts_with(&temp) && root != temp,
+            "helper requires owned fixture root"
+        );
+        std::fs::write(root.join("protected-child-ran"), b"ran")?;
+        println!("PROTECTED_CHILD_RAN");
+        std::io::stdout().flush()?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_spawn_certifies_pre_execution_assignment_and_cleans_failure() -> anyhow::Result<()>
+    {
+        use crate::core::proctree;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        let _mode_lock = lock();
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home)?;
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let request = || -> anyhow::Result<SandboxRequest> {
+            Ok(SandboxRequest::exec(
+                CommandOrigin::InternalTrusted("protected spawn fixture"),
+                std::env::current_exe()?,
+                vec![
+                    "--exact".into(),
+                    "sandbox::runner::tests::protected_spawn_helper".into(),
+                    "--nocapture".into(),
+                ],
+                fixture.path().to_path_buf(),
+                fixture.path().to_path_buf(),
+            )
+            .private_tmp(false)
+            .background(false)
+            .extra_env(vec![
+                ("AIZEN_HOME".into(), home.to_str().unwrap().into()),
+                (
+                    "AIZEN_PROTECTED_SPAWN_TEST_ROOT".into(),
+                    fixture.path().to_str().unwrap().into(),
+                ),
+            ]))
+        };
+        let mut prepared = prepare_std(request()?)?;
+        prepared
+            .command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let (mut child, containment) = prepared.spawn_contained()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                // Only this fixture-owned helper is terminated, never a user process.
+                proctree::kill_tree(&mut child, &containment);
+                prepared.finish(Outcome::Timeout);
+                anyhow::bail!("protected fixture child exceeded deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        prepared.finish(Outcome::Exit(status.code()));
+        anyhow::ensure!(status.success(), "protected helper failed: {status}");
+        while containment.known_quiescent()? != Some(true) {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "protected helper Job did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let marker = fixture.path().join("protected-child-ran");
+        anyhow::ensure!(
+            marker.is_file(),
+            "successful protected helper never executed"
+        );
+        std::fs::remove_file(&marker)?;
+        let mut rejected = prepare_std(request()?)?;
+        rejected
+            .command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let error = proctree::windows_job::with_test_resume_failure(|| rejected.spawn_contained())
+            .expect_err("injected resume refusal must reject protected spawn");
+        anyhow::ensure!(
+            error.cleanup_verified(),
+            "fixture cleanup unverified: {error}"
+        );
+        anyhow::ensure!(
+            error.child.is_none() && error.containment.is_none(),
+            "verified failure retained child ownership"
+        );
+        anyhow::ensure!(
+            !marker.exists(),
+            "refused suspended helper executed before admission"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_tokio_spawn_certifies_completion_with_owned_fixture() -> anyhow::Result<()> {
+        use crate::core::proctree;
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let _mode_lock = lock();
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home)?;
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let request = SandboxRequest::exec(
+            CommandOrigin::InternalTrusted("protected Tokio spawn fixture"),
+            std::env::current_exe()?,
+            vec![
+                "--exact".into(),
+                "sandbox::runner::tests::protected_spawn_helper".into(),
+                "--nocapture".into(),
+            ],
+            fixture.path().to_path_buf(),
+            fixture.path().to_path_buf(),
+        )
+        .private_tmp(false)
+        .background(false)
+        .extra_env(vec![
+            ("AIZEN_HOME".into(), home.to_str().unwrap().into()),
+            (
+                "AIZEN_PROTECTED_SPAWN_TEST_ROOT".into(),
+                fixture.path().to_str().unwrap().into(),
+            ),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let mut prepared = prepare_tokio(request)?;
+            prepared
+                .command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let (child, containment) = prepared.spawn_contained_tokio()?;
+            let output = match tokio::time::timeout(
+                Duration::from_secs(5),
+                child.wait_with_output(),
+            )
+            .await
+            {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    // The consumed child's kill_on_drop and this owned Job contain only our helper.
+                    proctree::terminate_tree(&containment);
+                    prepared.finish(Outcome::SpawnFailed);
+                    return Err(error.into());
+                }
+                Err(_) => {
+                    proctree::terminate_tree(&containment);
+                    prepared.finish(Outcome::Timeout);
+                    anyhow::bail!("protected Tokio fixture child exceeded deadline");
+                }
+            };
+            prepared.finish(Outcome::Exit(output.status.code()));
+            anyhow::ensure!(
+                output.status.success(),
+                "protected Tokio helper failed: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(
+                String::from_utf8_lossy(&output.stdout).contains("PROTECTED_CHILD_RAN"),
+                "protected Tokio helper never reported execution"
+            );
+            anyhow::ensure!(
+                fixture.path().join("protected-child-ran").is_file(),
+                "protected Tokio helper did not write its owned fixture marker"
+            );
+            // Wrapper exit/output alone is not proof. Query the actual protected Job, yielding only
+            // to bound retries rather than inferring completion from a sleep duration.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match containment.known_quiescent()? {
+                        Some(true) => return Ok::<(), anyhow::Error>(()),
+                        Some(false) => tokio::task::yield_now().await,
+                        None => anyhow::bail!("protected Tokio spawn returned UNKNOWN tree proof"),
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow!("protected Tokio fixture Job did not settle within deadline"))??;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_runner_retains_owned_admission_until_protected_body_settles() -> anyhow::Result<()> {
+        use crate::core::{proctree, workspace_txn};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct Owner(mpsc::Sender<()>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _mode_lock = lock();
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home)?;
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        workspace_txn::with_test_lock_home(&home, || -> anyhow::Result<()> {
+            let request = SandboxRequest::exec(
+                CommandOrigin::InternalTrusted("bounded owned fixture"),
+                std::env::current_exe()?,
+                vec![
+                    "--exact".into(),
+                    "sandbox::runner::tests::protected_spawn_helper".into(),
+                    "--nocapture".into(),
+                ],
+                fixture.path().to_path_buf(),
+                fixture.path().to_path_buf(),
+            )
+            .private_tmp(false)
+            .background(false)
+            .extra_env(vec![
+                ("AIZEN_HOME".into(), home.to_str().unwrap().into()),
+                (
+                    "AIZEN_PROTECTED_SPAWN_TEST_ROOT".into(),
+                    fixture.path().to_str().unwrap().into(),
+                ),
+            ]);
+            let (released, observed) = mpsc::channel();
+            let output = prepare_std(request)?.output_bounded_policy(
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                Some(Box::new(Owner(released))),
+                true,
+                0,
+            )?;
+            anyhow::ensure!(
+                output.code == Some(0),
+                "bounded helper failed: {:?}",
+                output.code
+            );
+            anyhow::ensure!(!output.output_truncated, "bounded fixture output truncated");
+            anyhow::ensure!(
+                output.settlement == proctree::BoundedSettlement::Proven,
+                "bounded protected body lacked actual tree/worker proof"
+            );
+            anyhow::ensure!(
+                output
+                    .stdout
+                    .windows(b"PROTECTED_CHILD_RAN".len())
+                    .any(|bytes| bytes == b"PROTECTED_CHILD_RAN"),
+                "bounded helper did not execute"
+            );
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("proven actual body drops caller owner");
+            let _after = workspace_txn::PhysicalEffectLease::exclusive(
+                Duration::ZERO,
+                None,
+                "bounded fixture after settlement",
+                "bounded-fixture/after",
+            )?;
+            Ok(())
+        })
     }
 
     /// The shell line must reach `cmd` as written. `Command::arg` used to escape its quotes as

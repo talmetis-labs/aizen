@@ -12,6 +12,7 @@
 //! for any endpoint, can be driven non-streaming/quiet from the loop, and is unit-testable with a
 //! fake summarizer.
 
+use crate::agent::design::DesignContext;
 use crate::core::types::Message;
 use anyhow::{anyhow, Result};
 use std::future::Future;
@@ -42,9 +43,64 @@ pub const HANDOFF_MARKER_PREFIX: &str = "[handoff context from the previous sess
 const SUMMARIZE_SYS: &str = "You compress a coding-assistant conversation to conserve context. \
     Write a DENSE summary that preserves: the user's goals and explicit requests, decisions made, \
     files/paths touched, commands run and their outcomes, important code/config, and any OPEN or \
-    UNFINISHED tasks. Also preserve a REFLECTION section: approaches that were TRIED and FAILED and \
+    UNFINISHED tasks. Keep any docs/plans/*.md path and its current phase; distinguish a saved plan \
+    from an unsaved draft or a denied write, and tell the continuation to re-read a saved plan. \
+    Also preserve a REFLECTION section: approaches that were TRIED and FAILED and \
     WHY (errors hit, dead ends, things that did not work) — so the continuation does not repeat \
     them. Use terse bullet points. Do NOT invent anything not in the transcript.";
+
+/// The `/clear` carry-over instruction. Compaction keeps a verbatim tail; a REFRESH does not — it
+/// starts a BRAND-NEW thread, so the whole prior conversation is distilled into one seed note that
+/// becomes the fresh thread's only memory of it. This is the Amp lesson kept rather than dropped: a
+/// fresh thread that still REMEMBERS what the last one was doing beats one that wakes up blank.
+/// Goal-free (a plain refresh carries no new objective) and dense enough that the next turn can
+/// continue the SAME work without re-deriving it.
+const CARRYOVER_SYS: &str = "You write a HANDOFF NOTE for a coding assistant that is starting a \
+    fresh thread to CONTINUE the same work. Preserve densely: the user's goals and explicit \
+    requests, decisions made, files/paths touched, commands run and their outcomes, important \
+    code/config, the CURRENT state of the work, and any OPEN or UNFINISHED task with its obvious \
+    next step. Keep any docs/plans/*.md path and current phase, distinguish saved plans from unsaved \
+    drafts or denied writes, and tell the next thread to re-read saved plans. \
+    Include a REFLECTION of approaches TRIED and FAILED and WHY, so the fresh thread \
+    does not repeat them. Terse bullet points. Do NOT invent anything not in the transcript.";
+
+/// Smart `/clear` carry-over: distill ONLY the recent tail (the last `keep_turns` user turns) plus a
+/// ledger of what the conversation touched — files read/edited, skills loaded, todos — so the fresh
+/// thread inherits the *signal* without re-reading the whole transcript. The ledger is built from
+/// [`context_touchpoints`] and the todo summary, both cheap in-memory scans, and is folded into the
+/// distillation prompt so the model can reference them without seeing the full history.
+pub fn carryover_prompt(history: &[Message]) -> Vec<Message> {
+    let lead = leading_system_count(history);
+    let tail = history.get(lead..).unwrap_or_default();
+    // Smart seed: only distill the recent tail (last 6 user turns) plus a ledger of what was
+    // touched — files, skills, todos — so the fresh thread inherits the signal without re-reading
+    // the whole transcript. The ledger is built from context_touchpoints and the todo summary,
+    // both cheap in-memory scans, and is folded into the distillation prompt so the model can
+    // reference them without seeing the full history.
+    let keep_turns = 6;
+    let tail_start = plan_compact_cut(tail, keep_turns).unwrap_or(0);
+    let recent = tail.get(tail_start..).unwrap_or_default();
+    let transcript = render_transcript(recent);
+    let tp = context_touchpoints(history);
+    let todos = crate::agent::todo::incomplete_summary(600);
+    let mut ledger = String::new();
+    if !tp.files.is_empty() {
+        ledger.push_str(&format!("Files touched: {}\n", tp.files.join(", ")));
+    }
+    if !tp.skills.is_empty() {
+        ledger.push_str(&format!("Skills loaded: {}\n", tp.skills.join(", ")));
+    }
+    if let Some(t) = todos {
+        ledger.push_str(&format!("Open todos:\n{t}\n"));
+    }
+    let mut prompt = String::from("Conversation tail to carry forward:\n\n");
+    prompt.push_str(&transcript);
+    if !ledger.is_empty() {
+        prompt.push_str("\n\nContext ledger (from the full thread):\n");
+        prompt.push_str(&ledger);
+    }
+    vec![Message::system(CARRYOVER_SYS), Message::user(prompt)]
+}
 
 /// Truncate to `max` chars with a `…[+N chars]` marker (char-safe, never splits a codepoint).
 pub fn truncate_chars(s: &str, max: usize) -> String {
@@ -324,6 +380,21 @@ where
     S: Fn(Vec<Message>) -> Fut,
     Fut: Future<Output = Result<String>>,
 {
+    compact_history_with_design(history, summarize, keep_turns, None).await
+}
+
+/// Design state is typed and scoped, not reconstructed from the summarizer's prose. Compaction
+/// leaves that handle intact; request projection re-seats its bounded capsule on a user turn.
+pub async fn compact_history_with_design<S, Fut>(
+    history: &mut Vec<Message>,
+    summarize: S,
+    keep_turns: usize,
+    design: Option<&DesignContext>,
+) -> Result<(usize, usize)>
+where
+    S: Fn(Vec<Message>) -> Fut,
+    Fut: Future<Output = Result<String>>,
+{
     // The prefix cache is about to be invalidated anyway, so this is the one free moment to drop
     // the stale recall blocks the REPL folded onto older user turns (a no-op elsewhere).
     crate::agent::prompt_lanes::strip_recall_blocks(history);
@@ -355,6 +426,9 @@ where
         anyhow::bail!("the model returned an empty summary");
     }
     let summary = format!("{}{}", touchpoints_preamble(&tp), summary.trim());
+    // Do not graft volatile design evidence onto stable system lanes or ask the prose summary to
+    // carry typed state. Keep the owning handle untouched; request projection re-seats its capsule.
+    let _design_capsule = design.map(DesignContext::snapshot);
     splice_compacted_keeping(history, cut, &summary, keep_prompt);
     Ok((before, approx_tokens(history)))
 }
@@ -369,6 +443,33 @@ mod tests {
     }
     fn asst(s: &str) -> Message {
         Message::assistant(s.to_string())
+    }
+
+    #[tokio::test]
+    async fn typed_design_snapshot_survives_compaction_without_prose_or_system_capsule() {
+        let design = DesignContext::new("owner", "workspace", crate::agent::design::DesignMode::On);
+        let before = serde_json::to_value(design.snapshot()).unwrap();
+        let mut history = vec![
+            Message::system("SYS"),
+            user("first"),
+            asst("a"),
+            user("second"),
+            asst("b"),
+        ];
+        compact_history_with_design(
+            &mut history,
+            |_| async { Ok("Summary omits all design fields".into()) },
+            1,
+            Some(&design),
+        )
+        .await
+        .unwrap();
+        assert_eq!(before, serde_json::to_value(design.snapshot()).unwrap());
+        assert!(history.iter().filter(|m| m.role == "system").all(|m| !m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("<design")));
     }
 
     #[test]
@@ -503,6 +604,16 @@ mod tests {
             sys.contains("FAILED"),
             "…and specifically failed approaches: {sys}"
         );
+    }
+
+    #[test]
+    fn planning_handoffs_distinguish_saved_specs_from_drafts() {
+        for prompt in [SUMMARIZE_SYS, CARRYOVER_SYS] {
+            assert!(prompt.contains("docs/plans/*.md"));
+            assert!(prompt.contains("unsaved"));
+            assert!(prompt.contains("denied"));
+            assert!(prompt.contains("re-read"));
+        }
     }
 
     #[tokio::test]

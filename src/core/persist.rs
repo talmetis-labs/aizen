@@ -197,6 +197,7 @@ pub fn compare_and_atomic_write(
     Ok(FileFingerprint::for_bytes(bytes))
 }
 
+#[cfg(test)]
 pub fn create_if_absent(path: &Path, bytes: &[u8]) -> Result<FileFingerprint> {
     compare_and_atomic_write(path, &FileFingerprint::missing(), bytes)
 }

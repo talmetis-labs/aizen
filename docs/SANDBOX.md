@@ -116,6 +116,57 @@ Consequences worth spelling out:
 - macOS is probed at runtime (`/usr/bin/sandbox-exec` present and executable); a host without it
   reports `guarded`.
 
+## Native concurrency is not build isolation
+
+In the default direct lane, exact native `read_paths`/`write_paths` capabilities coordinate
+cooperating Aizen file tools. Read/read pairs can overlap; a pair containing a writer can overlap
+only without write/read or write/write intersections. Capability checks and native resource locks
+do not confine arbitrary processes, hooks, external editors or repository build scripts.
+
+The explicit native speculative lane implemented in source uses a coherent immutable base and
+per-child private overlays, not concurrent live same-file writes. Only bounded native file tools
+are eligible; configured lifecycle hooks that could run cause refusal. Parent integration follows
+physical settlement and revalidates live base/read fingerprints. Conflicts and uncertain effects
+are retained without automatic retry or rollback. Combined-tree command verification is not semantic
+serializability or isolated-build proof. Verifier intent is durable before the opaque gate, and
+finish evidence links the exact start with an explicit physical-effect state; start-only, nonsettled
+or legacy evidence cannot certify accepted verification. Workflow summaries are strictly versioned
+provenance, not execution authority or complete crash/effect coverage. Parent-only restart reports are available through
+`checkpoint_view action=recovery_report` and `aizen time doctor --cohort ... --prepared ...
+--resource ...`. Caller-selected exact resources, fresh admission and checked existing journal IDs
+are required; stored paths/IDs grant no execution authority. New integrations bind prepared/receipt
+evidence to a v2 journal epoch and complete changed-intent fence; restart inspection rejects missing
+records or incomplete claims, even when no claims are supplied. Legacy selected-ID proof is not
+upgraded to complete coverage. This historical accounting does not prove physical-worker closure;
+a durable worker roster/closure chain remains unfinished. Default reports do not append or settle
+pending guards, though metadata admission bookkeeping may be created. The CLI's explicit
+`--record-observation` flag appends only historical nonterminal inspection data under fresh parent
+admission and an existing exclusive cohort owner; it never changes source/native journal bytes,
+accepts verification or clears pending guards. Publication failures retain evidence without automatic
+cleanup/retry. Safe terminal reconciliation, selective inverse and checkpoint/authorship linkage are
+unfinished. This does not change the process capability matrix or imply release/install verification.
+
+Live shell/build/process work stays an opaque exclusive barrier. In particular, Windows Job
+Objects provide containment and resource limits, **not filesystem/network isolation**; shell
+and build commands do not overlap live native editors. Copying the checkout or changing `cwd`
+does not prevent absolute-path access, inherited handles, daemon/cache access or IPC escapes.
+The ordinary Linux profile retains local IPC and writable host caches; the ordinary macOS
+profile permits broad reads. Neither is an isolated-build profile.
+
+No concurrent snapshot-build capability is advertised on any backend. Activating one requires
+an owned coherent capture of dirty inputs, complete invocation/environment/toolchain provenance,
+private outputs/temp/caches, a dedicated read-denying and escape-resistant policy, and actual
+backend/kernel tests before child code runs. Unsupported or unproven enforcement stays exclusive;
+`off`, `guarded`, extra user roots or approval cannot authorize unsandboxed overlap. AppContainer
+and source ACL changes are not implemented for this purpose.
+
+The parent verifies settled combined edits at the phase boundary rather than treating each
+child's report as build evidence. A bounded local source identity rejects detected membership,
+content or permission drift, and stale/unsettled passes cannot clear verification. It excludes
+output/dependency stores, lacks external/environment/toolchain provenance and uses cooperative
+elapsed-time checks, not a hard deadline for blocking filesystem calls. It is live-tree drift
+detection, not a coherent snapshot, hostile-race isolation or a reusable build cache key.
+
 ## Filesystem policy
 
 Default profile: **workspace-write**.

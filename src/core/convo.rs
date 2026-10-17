@@ -21,7 +21,7 @@ impl ConversationId {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
-    #[cfg(any(feature = "browser", test))]
+    #[cfg(test)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -40,7 +40,7 @@ static ACTIVE: std::sync::RwLock<Option<ConversationId>> = std::sync::RwLock::ne
 ///
 /// NOT for the concurrent `serve` lanes: a process-global written by several lanes would name
 /// whichever turn started last. Those pass the id on their turn's context instead.
-#[cfg(any(feature = "browser", test))]
+#[cfg(test)]
 pub fn set_active(id: Option<ConversationId>) {
     *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = id;
 }

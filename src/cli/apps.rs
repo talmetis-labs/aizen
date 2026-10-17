@@ -135,10 +135,8 @@ pub(crate) async fn apps_add(name: &str) -> Result<()> {
         None => (None, name.to_string(), name.to_string(), name.to_string()),
     };
     let hits = app_catalog::dedupe_latest(app_catalog::search(&query, 50).await?);
-    let viable: Vec<app_catalog::RegistryServer> = hits
-        .into_iter()
-        .filter(|s| app_catalog::is_viable(s))
-        .collect();
+    let viable: Vec<app_catalog::RegistryServer> =
+        hits.into_iter().filter(app_catalog::is_viable).collect();
     if viable.is_empty() {
         return Err(anyhow!(
             "no connectable '{label}' server found on the registry (only legacy sse-only entries, which aizen's client doesn't speak). Run `aizen apps search {query}` to explore."

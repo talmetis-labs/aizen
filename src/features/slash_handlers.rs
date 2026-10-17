@@ -137,9 +137,18 @@ pub(crate) enum SlashOutcome {
 /// Bare `/` → an arrow-key picker over the slash commands; runs the chosen one (default args).
 /// Built-ins and user-defined custom commands both come from the shared [`crate::features::slash`]
 /// catalog, so the picker, the live palette, and `/help` can never drift apart.
-pub(crate) async fn slash_menu(
+pub(crate) async fn slash_menu_with_design(
     history: &mut Vec<Message>,
     model_label: &mut String,
+    design: &crate::agent::design::DesignContext,
+) -> SlashOutcome {
+    slash_menu_scoped(history, model_label, Some(design)).await
+}
+
+async fn slash_menu_scoped(
+    history: &mut Vec<Message>,
+    model_label: &mut String,
+    design: Option<&crate::agent::design::DesignContext>,
 ) -> SlashOutcome {
     let catalog = crate::features::slash::list();
     let items: Vec<String> = catalog
@@ -163,7 +172,7 @@ pub(crate) async fn slash_menu(
         .interact_opt()
     {
         // Every entry (built-in or custom) dispatches by name through the one `handle_slash` path.
-        Ok(Some(i)) => handle_slash(&catalog[i].name, history, model_label).await,
+        Ok(Some(i)) => handle_slash_scoped(&catalog[i].name, history, model_label, design).await,
         _ => SlashOutcome::Continue, // Esc / error → back to the prompt
     }
 }
@@ -200,6 +209,17 @@ async fn slash_workflows(arg: &str) {
     if !tui::retained_overlay_open_live("Activity", agent::orchestration::format_status) {
         tui::emit_line(&agent::orchestration::format_status());
     }
+}
+
+/// `/jobs` — the background-work panel: long-running `process` handles plus live monitor runs, in one
+/// self-refreshing overlay (the same surface the footer strip and a click on it open). Falls back to
+/// printing the text when the retained overlay is unavailable (a suspended menu, a non-retained edge).
+/// `/jobs` — the background-work panel: long-running `process` handles plus live monitor runs. Under
+/// the retained UI this is a selectable, stop-able overlay (↑↓ pick, Enter/x stop, Esc close); the same
+/// surface the footer strip and a click on it open. Falls back to printing the text where that overlay
+/// cannot be driven (a pipe, a suspended menu).
+fn slash_jobs() {
+    tui::open_jobs_panel();
 }
 
 /// `/init` — build (or incrementally refresh) the per-repo codebase index that powers
@@ -341,7 +361,9 @@ async fn slash_init(arg: &str) {
                 tui::emit_line(&style(summary).dim().to_string());
             }
             // The verify ladder's knowledge: which commands this project has and how long the
-            // fast rung takes, kept in HOME beside the index (never in the checkout).
+            // fast rung takes, kept in HOME beside the index (never in the checkout). The
+            // headless twin (`aizen init`) runs this only on an explicit --verify — see
+            // cli/init_cmd.rs.
             let root = crate::core::config::project_root();
             tui::emit_line(&style("  measuring verify commands…").dim().to_string());
             for line in crate::agent::verify_gate::init_verify(
@@ -856,7 +878,7 @@ async fn slash_team_commit(rest: &str) {
                     .dim()
                     .to_string(),
             ),
-            Some(r) if r.passed => tui::emit_line(
+            Some(r) if r.accepted() => tui::emit_line(
                 &style(format!("verify: {} passed", r.command))
                     .color256(theme::OK)
                     .to_string(),
@@ -1029,10 +1051,20 @@ fn slash_work(arg: &str) {
     }
 }
 
-pub(crate) async fn handle_slash(
+pub(crate) async fn handle_slash_with_design(
     input: &str,
     history: &mut Vec<Message>,
     model_label: &mut String,
+    design: &crate::agent::design::DesignContext,
+) -> SlashOutcome {
+    handle_slash_scoped(input, history, model_label, Some(design)).await
+}
+
+async fn handle_slash_scoped(
+    input: &str,
+    history: &mut Vec<Message>,
+    model_label: &mut String,
+    design: Option<&crate::agent::design::DesignContext>,
 ) -> SlashOutcome {
     let mut parts = input.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim();
@@ -1050,13 +1082,42 @@ pub(crate) async fn handle_slash(
         SlashId::Help => tui::emit_line(&style(slash::help_page()).dim().to_string()),
         SlashId::Quit => return SlashOutcome::Quit,
         SlashId::Clear => {
-            rebuild_system(history, model_label);
-            reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
-            set_session_slug(None); // the next turn names + autosaves a brand-new session file
-            update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
-                                          // immediate window-close after /clear doesn't re-save it
-            tui::emit_line(&style("(new conversation)").dim().to_string());
+            // `new`/`reset` are aliases of `/clear` (same identity) — they refresh too. To wipe
+            // without carrying a memory of this thread, spell it `/clear hard` (see the help).
+            let hard = matches!(arg.trim().to_ascii_lowercase().as_str(), "hard" | "fresh" | "wipe" | "blank");
+            if hard {
+                if let Some(design) = design { design.reset(); }
+                rebuild_system(history, model_label);
+                reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
+                set_session_slug(None); // the next turn names + autosaves a brand-new session file
+                update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                              // immediate window-close after /clear doesn't re-save it
+                tui::emit_line(&style("(new conversation — nothing carried over)").dim().to_string());
+            } else {
+                match crate::repl::postturn::refresh_distill_now(history).await {
+                    Ok(seed) => {
+                        if let Some(design) = design { design.reset(); }
+                        rebuild_system(history, model_label);
+                        history.push(Message::system(format!(
+                            "{}{seed}",
+                            crate::agent::compact::HANDOFF_MARKER_PREFIX
+                        )));
+                        reset_per_session_state(); // fresh todos/cost/grants/@refs for the new conversation
+                        set_session_slug(None); // the next turn names + autosaves a brand-new session file
+                        update_live_history(history); // drop the old chat from the exit-flush snapshot too, so an
+                                                      // immediate window-close after /clear doesn't re-save it
+                        tui::emit_line(&style("(new conversation — carried over a memory of this one)").dim().to_string());
+                    }
+                    Err(e) => {
+                        tui::emit_line(&style(format!("carry-over failed ({e}) — conversation left as-is; retry or /clear hard to wipe")).dim().to_string());
+                    }
+                }
+            }
         }
+        SlashId::Files => match crate::cli::files_cmd::parse_kind(arg) {
+            Ok(kind) => tui::emit_line(&crate::cli::files_cmd::files_report(kind)),
+            Err(e) => tui::emit_line(&e.to_string()),
+        },
         SlashId::Where => {
             tui::emit_line(&where_report());
             // In the REPL, "where" includes WHICH FILE this conversation is being written to.
@@ -1074,12 +1135,20 @@ pub(crate) async fn handle_slash(
             tui::emit_line(&style("→ use /sessions — restore / save / delete are all there now").dim().to_string());
         }
         SlashId::Sessions => {
-            if let Err(e) = sessions_menu(history, model_label).await {
+            let result = match design {
+                Some(design) => crate::cli::sessions::sessions_menu_with_design(history, model_label, design).await,
+                None => sessions_menu(history, model_label).await,
+            };
+            if let Err(e) = result {
                 tui::note_line(&format!("{} {e}", style("sessions:").red()));
             }
         }
         SlashId::Import => {
-            if let Err(e) = import_menu(history, model_label).await {
+            let result = match design {
+                Some(design) => crate::cli::sessions::import_menu_with_design(history, model_label, design).await,
+                None => import_menu(history, model_label).await,
+            };
+            if let Err(e) = result {
                 tui::note_line(&format!("{} {e}", style("import:").red()));
             }
         }
@@ -1100,8 +1169,17 @@ pub(crate) async fn handle_slash(
             };
             match target {
                 None => tui::emit_line(&style("no saved conversation to resume yet").dim().to_string()),
-                Some(name) => match load_session(history, &name, model_label) {
-                    Ok(n) => {
+                Some(name) => match load_session_with_design(history, &name, model_label) {
+                    Ok((n, saved_design)) => {
+                        if let Some(design) = design {
+                            design.reset();
+                            if let Some(saved) = saved_design {
+                                if let Err(error) = design.restore_session(saved) {
+                                    tui::emit_line(&format!("design state not restored: {error}"));
+                                }
+                            }
+                            update_live_history_with_design(history, Some(&design.snapshot()));
+                        }
                         // A restore is a thread switch — the restored thread must not inherit the
                         // previous one's todos/cost/grants. Only on success: a failed load leaves
                         // the live thread (and its state) untouched.
@@ -1124,6 +1202,7 @@ pub(crate) async fn handle_slash(
             }
         }
         SlashId::Workflows => slash_workflows(arg).await,
+        SlashId::Jobs => slash_jobs(),
         // Multi-window cooperation: who else is in this repo, what they changed, and committing one
         // window's work. `/work` manages the isolated-worktree mode.
         SlashId::Team => slash_team(arg).await,
@@ -1142,9 +1221,19 @@ pub(crate) async fn handle_slash(
             } else {
                 // Restore the newest offer. Side effects are never auto-replayed — only history + draft.
                 let offer = &offers[0];
-                match crate::core::recovery::accept(offer) {
-                    Ok((restored, draft)) => {
+                match crate::core::recovery::accept_with_design(offer) {
+                    Ok((restored, draft, saved_design)) => {
                         *history = restored;
+                        set_session_slug(offer.manifest.session_name.clone());
+                        if let Some(design) = design {
+                            design.reset();
+                            if let Some(saved) = saved_design {
+                                if let Err(error) = design.restore_session(saved) {
+                                    tui::emit_line(&format!("design recovery state not restored: {error}"));
+                                }
+                            }
+                            update_live_history_with_design(history, Some(&design.snapshot()));
+                        }
                         migrate_legacy_prompt_lanes(history, model_label);
                         refresh_prompt_lanes_for_thread_switch(history, model_label);
                         // Same thread-switch contract as /resume: the crashed thread's todos/cost/
@@ -1332,6 +1421,23 @@ pub(crate) async fn handle_slash(
                 }
             } else {
                 tui::emit_line(&style("usage: /approval ask|smart|yolo [--persist]").dim().to_string());
+            }
+        }
+        SlashId::Design => {
+            if let Some(design) = design {
+                if arg.is_empty() {
+                    tui::emit_line(&theme::muted(design.status()).to_string());
+                } else {
+                    match arg.parse::<crate::agent::design::DesignMode>() {
+                        Ok(mode) => {
+                            design.set_mode(mode);
+                            tui::emit_line(&theme::muted(design.status()).to_string());
+                        }
+                        Err(_) => tui::emit_line("usage: /design auto|on|off (bare: status)"),
+                    }
+                }
+            } else {
+                tui::emit_line("design: no scoped session is attached; automatic mode is not process-global");
             }
         }
         SlashId::Sandbox => {
@@ -1845,6 +1951,8 @@ SlashId::Yolo => {
             if let Err(e) = timemachine_menu(history, model_label).await {
                 tui::note_line(&format!("{} {e}", style("time:").red()));
             }
+            // The legacy picker does not report whether it restored; invalidate conservatively.
+            if let Some(design) = design { design.mark_render_changed(); }
         }
         // Capture the conversation alongside the tree so a pick in `/timemachine` can rewind chat as
         // well as code — a `/checkpoint` is a deliberate save point where the chat is worth keeping,
@@ -1921,6 +2029,7 @@ SlashId::Yolo => {
                     } else {
                         match timemachine::undo_with_report() {
                             Ok((s, removed)) => {
+                                if let Some(design) = design { design.mark_render_changed(); }
                                 let named = if files.is_empty() { String::new() } else {
                                     let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
                                     let more = files.len().saturating_sub(shown.len());
@@ -1939,7 +2048,10 @@ SlashId::Yolo => {
             }
         }
         SlashId::Redo => match timemachine::redo() {
-            Ok(s) => tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id)),
+            Ok(s) => {
+                if let Some(design) = design { design.mark_render_changed(); }
+                tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id));
+            }
             Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
         },
         // Codebase index: scan the repo into a semantic chunk index for `codebase_search` +
@@ -1948,6 +2060,9 @@ SlashId::Yolo => {
         SlashId::Init => {
             slash_init(arg).await;
         }
+    }
+    if let Some(design) = design {
+        update_live_history_with_design(history, Some(&design.snapshot()));
     }
     SlashOutcome::Continue
 }
@@ -1974,4 +2089,145 @@ fn slash_custom_or_unknown(name: &str, arg: &str) -> SlashOutcome {
         ),
     }
     SlashOutcome::Continue
+}
+
+#[cfg(test)]
+mod recovery_session_tests {
+    use super::*;
+    use crate::agent::design::{DesignContext, DesignMode};
+    use crate::core::config::EnvGuard;
+    use crate::core::recovery::{RecoveryManifest, RecoveryPhase};
+    use std::path::PathBuf;
+
+    struct RecoveryHome {
+        root: PathBuf,
+        env: Option<EnvGuard>,
+        previous_slug: Option<String>,
+    }
+
+    impl RecoveryHome {
+        // Caller retains HOME -> TAPE -> TODO locks until this fixture has restored its globals.
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "aizen-recover-session-{}-{}",
+                std::process::id(),
+                crate::core::persist::unique_sequence()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let previous_slug = current_session_slug();
+            let env = EnvGuard::set([
+                ("AIZEN_HOME", root.as_os_str()),
+                ("AIZEN_PROJECT_ROOT", root.as_os_str()),
+            ]);
+            Self {
+                root,
+                env: Some(env),
+                previous_slug,
+            }
+        }
+    }
+
+    impl Drop for RecoveryHome {
+        fn drop(&mut self) {
+            set_session_slug(self.previous_slug.take());
+            drop(self.env.take());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "hermetic recovery fixture retains HOME, tape and todo isolation for the awaited handler"
+    )]
+    async fn recover_adopts_manifest_session_slug_before_next_autosave() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tape = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _todo = crate::agent::todo::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = RecoveryHome::new();
+        let mut history = vec![Message::user("previous conversation must survive")];
+        save_session(&history, "previous-conversation", Some("fixture-model")).unwrap();
+        set_session_slug(Some("previous-conversation".into()));
+        let previous_path = sessions_dir().join("previous-conversation.json");
+        let previous_bytes = std::fs::read(&previous_path).unwrap();
+
+        let scope = crate::core::recovery::current_repo_scope();
+        let saved_design = DesignContext::new("crashed-owner", &scope, DesignMode::On).snapshot();
+        let recovered_history = vec![Message::user("recovered conversation")];
+        let lease = fixture.root.join("recovery").join("fixture-abandoned");
+        std::fs::create_dir_all(&lease).unwrap();
+        let manifest = RecoveryManifest {
+            schema: 2,
+            binary_version: env!("CARGO_PKG_VERSION").into(),
+            pid: 0,
+            run_id: "fixture-abandoned".into(),
+            repo: "fixture".into(),
+            repo_scope: scope.clone(),
+            phase: RecoveryPhase::WaitingModel,
+            session_name: Some("recovered-conversation".into()),
+            safe_history_len: recovered_history.len(),
+            checkpoint_id: None,
+            sidecar_generation: 1,
+            has_design_state: true,
+            turn_id: Some(1),
+            side_effects_possible: false,
+            effects_unsettled: false,
+            updated_unix: 1,
+        };
+        // Publish the authoritative history/state generation before its manifest, as real recovery
+        // does. No ACTIVE lease or copied RecoveryOffer preview is involved in this fixture.
+        let generation = serde_json::json!({
+            "generation": 1,
+            "design_state": saved_design,
+            "messages": recovered_history,
+        });
+        crate::core::persist::atomic_write_owner_only(
+            &lease.join("history.1.json"),
+            &serde_json::to_vec(&generation).unwrap(),
+        )
+        .unwrap();
+        crate::core::persist::atomic_write_owner_only(
+            &lease.join("manifest.json"),
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let design = DesignContext::new("previous-owner", scope, DesignMode::On);
+        let mut model = "fixture-model".to_string();
+        let outcome =
+            handle_slash_with_design("recover restore", &mut history, &mut model, &design).await;
+        assert!(matches!(outcome, SlashOutcome::Continue));
+        assert_eq!(
+            current_session_slug().as_deref(),
+            Some("recovered-conversation")
+        );
+        assert_eq!(design.snapshot().owner_id, "crashed-owner");
+        assert!(history
+            .iter()
+            .any(|m| m.content.as_deref() == Some("recovered conversation")));
+        assert!(
+            !lease.exists(),
+            "successful acceptance consumes the authoritative lease"
+        );
+
+        autosave_last_with_design(&history, Some(&model), Some(&design.snapshot()));
+        assert_eq!(
+            std::fs::read(&previous_path).unwrap(),
+            previous_bytes,
+            "the recovered turn must not overwrite the previously open conversation"
+        );
+        let (saved, _, state) =
+            read_session_path_with_design(&sessions_dir().join("recovered-conversation.json"))
+                .unwrap();
+        assert!(saved
+            .iter()
+            .any(|m| m.content.as_deref() == Some("recovered conversation")));
+        assert_eq!(state.unwrap().owner_id, "crashed-owner");
+    }
 }

@@ -83,8 +83,8 @@ fn show(data: &Value) {
         println!("(no endpoints)");
     } else {
         println!(
-            "{:<10} {:<16} {:<10} {:<34} {:<6} {:<9} {}",
-            "ID", "NAME", "PREFIX", "BASE URL", "KEY", "STATUS", "CALLS/30d"
+            "{:<10} {:<16} {:<10} {:<34} {:<6} {:<9} CALLS/30d",
+            "ID", "NAME", "PREFIX", "BASE URL", "KEY", "STATUS"
         );
         for e in &eps {
             println!(

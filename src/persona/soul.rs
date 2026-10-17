@@ -148,7 +148,7 @@ mod tests {
         with_home("absent", || {
             assert!(prompt_block().is_none(), "no SOUL → no block");
             assert!(!exists());
-            write("   \n  ").err().expect("empty body errors");
+            write("   \n  ").expect_err("empty body errors");
             assert!(prompt_block().is_none());
         });
     }

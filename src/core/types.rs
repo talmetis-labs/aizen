@@ -72,6 +72,12 @@ pub struct Usage {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    /// Provider-specific usage extensions (per-model splits, cost fields, …): unknown keys land here
+    /// so a diagnostic dump can name them instead of the shape gap being invisible.
+    /// Deserialized from the wire; read on demand when a usage anomaly needs its extra keys named.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
     /// Anthropic-compatible gateways: cache WRITE tokens this call (the breakpoint-creation cost).
@@ -163,6 +169,9 @@ pub struct Message {
     /// `Serialize` below as parts inside `content`, and recovered back OUT of those parts by the
     /// custom `Deserialize` — see [`ContentField`].
     pub images: Vec<String>,
+    /// Storage-only tool observations. Actual request builders clear these and project validated
+    /// images into a synthetic user turn AFTER the entire matching tool-result group.
+    pub tool_images: Vec<crate::core::tool_media::ToolImage>,
     /// Anthropic prompt-cache breakpoint, set on a stable message just before the volatile turn so
     /// the provider caches the prefix up to here. Write-only: emitted by the custom `Serialize`,
     /// never read from the wire (a stale breakpoint from a saved transcript must not be replayed).
@@ -183,6 +192,31 @@ pub struct Message {
 enum ContentField {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl ContentField {
+    /// The joined text of the `text` parts (one `\n` between parts), `None` when there are none.
+    /// `Text` — the ordinary wire spelling — passes through unchanged.
+    fn into_plain_text(self) -> Option<String> {
+        match self {
+            ContentField::Text(s) => Some(s),
+            ContentField::Parts(parts) => {
+                let text = parts
+                    .into_iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+        }
+    }
 }
 
 /// One element of a multimodal `content` array. Unknown part types deserialize to `Other` and are
@@ -216,6 +250,8 @@ struct MessageWire {
     tool_calls: Vec<ToolCall>,
     #[serde(default)]
     tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_images: Vec<crate::core::tool_media::ToolImage>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -254,6 +290,7 @@ impl<'de> Deserialize<'de> for Message {
             tool_calls: wire.tool_calls,
             tool_call_id: wire.tool_call_id,
             images,
+            tool_images: wire.tool_images,
             cache_control: None,
         })
     }
@@ -287,6 +324,9 @@ impl Serialize for Message {
         if let Some(id) = &self.tool_call_id {
             map.serialize_entry("tool_call_id", id)?;
         }
+        if !self.tool_images.is_empty() {
+            map.serialize_entry("tool_images", &self.tool_images)?;
+        }
         // Prompt-cache breakpoint (omitted entirely when None → byte-identical for non-cache providers).
         if let Some(cc) = &self.cache_control {
             map.serialize_entry("cache_control", cc)?;
@@ -303,6 +343,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }
@@ -313,6 +354,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }
@@ -324,6 +366,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images,
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }
@@ -335,6 +378,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }
@@ -349,8 +393,20 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
+    }
+    /// A durable tool observation. Request-only image user messages are built by llm::media,
+    /// never inserted into the session history.
+    pub fn tool_observation(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<crate::core::tool_media::ToolImage>,
+    ) -> Self {
+        let mut message = Self::tool_result(tool_call_id, content);
+        message.tool_images = images;
+        message
     }
     /// A tool-result turn, linked back to the call by `tool_call_id`.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -360,6 +416,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }
@@ -449,19 +506,20 @@ pub struct RespChoice {
     pub message: RespMessage,
     #[serde(default)]
     pub finish_reason: Option<String>,
+    /// Provider-specific choice-level keys (`logprobs`, `native_finish_reason`, …) — see
+    /// [`RespMessage::extra`].
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct RespMessage {
-    #[serde(default)]
     #[allow(dead_code)]
     pub role: Option<String>,
-    #[serde(default)]
     pub content: Option<String>,
     /// The signal that the model wants tools — trust THIS, not `finish_reason` (some
     /// gateways emit `stop`/`end_turn` alongside tool calls).
-    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     /// Dedicated reasoning channel some providers return INSTEAD of `content` (DeepSeek spells it
     /// `reasoning_content`) — the same channel the streaming [`Delta`] has always read.
@@ -475,14 +533,70 @@ pub struct RespMessage {
     ///
     /// Read it through [`RespMessage::reasoning_text`], never directly — the same channel arrives
     /// under two spellings and either one may be the populated one.
-    #[serde(default)]
     pub reasoning_content: Option<String>,
     /// The OpenRouter spelling of [`Self::reasoning_content`]. A SEPARATE field on purpose: as a
     /// `#[serde(alias)]` on the one above, a provider that sends BOTH keys in a single object
     /// (OpenRouter-shaped gateways mirror the text into both) is a serde `duplicate field` error
     /// that rejects the whole message. Two fields cannot collide.
-    #[serde(default)]
     pub reasoning: Option<String>,
+    /// Every other key the provider sent on the message (provider-specific reply channels,
+    /// annotations, …). Collected so an "empty response" diagnosis can NAME what was actually on
+    /// the wire — the gap is otherwise invisible because serde silently drops unknown fields.
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for RespMessage {
+    /// Hand-rolled because `content` must accept BOTH spellings: the OpenAI string AND the
+    /// Anthropic-style parts array (`[{"type":"text","text":…}]`) that a growing number of
+    /// gateways emit on NON-streaming replies. A derived `Option<String>` did not "fall back" on
+    /// the array — it FAILED THE WHOLE MESSAGE, which is strictly worse than the parts array it
+    /// was meant to survive. Text parts are joined into `content` here (one `\n` between them), so
+    /// the wire gap is closed AT THE BOUNDARY and no caller ever sees it.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let Some(obj) = value.as_object_mut() else {
+            return Err(serde::de::Error::custom(
+                "assistant message must be an object",
+            ));
+        };
+        let content = match obj.remove("content") {
+            Some(v) => serde_json::from_value::<ContentField>(v)
+                .ok()
+                .and_then(ContentField::into_plain_text),
+            None => None,
+        };
+        Ok(RespMessage {
+            role: take_string(obj, "role"),
+            content,
+            tool_calls: take_value(obj, "tool_calls")?,
+            reasoning_content: take_string(obj, "reasoning_content"),
+            reasoning: take_string(obj, "reasoning"),
+            extra: std::mem::take(obj)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        })
+    }
+}
+
+fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.remove(key).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+fn take_value<T, E>(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned + Default,
+    E: serde::de::Error,
+{
+    match obj.remove(key) {
+        Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom),
+        None => Ok(T::default()),
+    }
 }
 
 impl RespMessage {
@@ -551,6 +665,13 @@ pub struct Delta {
 
 impl Delta {
     /// The reasoning channel under whichever spelling the provider used, blank treated as absent.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "provider reasoning accessor is retained for wire compatibility and tests"
+        )
+    )]
     pub fn reasoning_text(&self) -> Option<&str> {
         [self.reasoning_content.as_deref(), self.reasoning.as_deref()]
             .into_iter()
@@ -605,6 +726,43 @@ mod tests {
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content.as_deref(), Some("all done"));
         assert!(resp.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parts_array_content_parses_into_plain_string() {
+        // The sub-agent killer: a gateway answers NON-streaming with Anthropic-style parts. The
+        // manual `Deserialize` for `RespMessage` joins text parts at the boundary, so the turn
+        // NEVER reads as empty-200 and the retry loop is never re-asked an answered question.
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]},"finish_reason":"stop"}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.choices[0].message;
+        assert_eq!(m.content.as_deref(), Some("hello\nworld"));
+        assert!(
+            !m.extra.contains_key("content"),
+            "content is consumed, not extra"
+        );
+    }
+
+    #[test]
+    fn parts_array_with_tool_calls_keeps_text() {
+        // A model that reasons out loud before calling a tool sends BOTH; the text is kept
+        // alongside the calls, not dropped and not treated as an empty turn.
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"thinking"}],"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.choices[0].message;
+        assert_eq!(m.content.as_deref(), Some("thinking"));
+        assert_eq!(m.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn non_text_parts_parse_to_no_content() {
+        // content parts we do not read (e.g. image_url) must NOT produce text and must NOT fail
+        // the message — the reply parses with `content: None` and the tool-less-empty retry
+        // classification takes over from there.
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:x"}}]},"finish_reason":"stop"}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.choices[0].message;
+        assert!(m.content.is_none());
     }
 
     #[test]
@@ -695,6 +853,38 @@ mod tests {
         let parts = v["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1, "no empty text part");
         assert_eq!(parts[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn typed_tool_image_round_trips_on_disk_but_projected_wire_has_only_user_parts() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let bytes = encode_rgba_png(&[9, 8, 7, 255], 1, 1).unwrap();
+        let image =
+            ToolImage::from_bytes(&bytes, "image/png", ImageProvenance::new("test", None)).unwrap();
+        let tool = Message::tool_observation("c", "result", vec![image]);
+        let stored = serde_json::to_string(&tool).unwrap();
+        assert!(stored.contains("tool_images"));
+        let restored: Message = serde_json::from_str(&stored).unwrap();
+        assert_eq!(restored.tool_images[0].bytes().unwrap(), bytes);
+        assert!(restored.images.is_empty());
+        let request = crate::llm::media::project_messages(
+            &[
+                Message::assistant_tool_calls(vec![ToolCall {
+                    id: "c".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "capture".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                restored,
+            ],
+            crate::llm::media::VisionPolicy::Supported,
+        );
+        let wire = serde_json::to_string(&request.messages).unwrap();
+        assert!(!wire.contains("tool_images"));
+        assert!(!wire.contains("metadata"));
+        assert!(wire.contains("image_url"));
     }
 
     #[test]

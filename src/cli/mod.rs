@@ -6,6 +6,8 @@ pub mod agents_cmd;
 pub mod apps;
 pub mod coop_cmd;
 pub mod custom_cmd;
+pub mod files_cmd;
+pub mod init_cmd;
 pub mod key_cmd;
 pub mod memory_cmd;
 pub mod persona_cmd;

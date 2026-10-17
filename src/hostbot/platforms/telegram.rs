@@ -1661,10 +1661,12 @@ mod tests {
         // One or two 409s are normal while a restarting daemon's old long-poll drains. Declaring a
         // conflict on the first would cry wolf on every restart; the threshold is what makes the
         // `/bots` warning trustworthy. Backoff must also stay bounded.
-        assert!(
-            CONFLICT_WARN_AFTER >= 2,
-            "a single 409 during a restart must not be called a conflict"
-        );
+        const {
+            assert!(
+                CONFLICT_WARN_AFTER >= 2,
+                "a single 409 during a restart must not be called a conflict"
+            );
+        }
         let at = |n: u32| {
             CONFLICT_BACKOFF_BASE_SECS
                 .saturating_mul(n.min(10) as u64)

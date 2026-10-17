@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Study Dashboard Fixture</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <p class="fixture-banner">Synthetic offline fixture. All numbers are invented test data, not real telemetry or visual-review evidence.</p>
+  <div class="shell">
+    <header class="topbar"><span class="wordmark">Practice / workspace</span><a href="#data">Data table</a></header>
+    <main>
+      <section class="dashboard-heading section" aria-labelledby="heading">
+        <p class="eyebrow">Fixed test sample / one week</p>
+        <h1 id="heading">Work completed, at a glance.</h1>
+        <p>Compare completed tasks by group. One measure, one shared zero baseline, one series color. Values are also available without hovering.</p>
+      </section>
+      <section class="grid" aria-label="Summary of the fixed sample">
+        <article class="card"><p class="stat-label">Completed tasks</p><p class="stat-value hero-value">90</p><p>Across all four groups</p></article>
+        <article class="card"><p class="stat-label">Groups</p><p class="stat-value">4</p><p>Same scope as the chart</p></article>
+        <article class="card"><p class="stat-label">Largest group total</p><p class="stat-value">36</p><p>Orchard group</p></article>
+      </section>
+      <section class="card chart" aria-labelledby="chart-heading">
+        <h2 id="chart-heading">Completed tasks by group</h2>
+        <p>Synthetic counts. Bar length encodes magnitude; names and values encode identity independently of color.</p>
+        <div role="group" aria-label="Bar chart, scale zero to forty completed tasks">
+          <div class="bar-row" tabindex="0" aria-label="Orchard, 36 completed tasks">
+            <span>Orchard</span><div class="bar-track" aria-hidden="true"><div class="bar" style="--value:90%"></div></div><span class="bar-value">36</span>
+            <span class="tooltip" aria-hidden="true"><strong>36</strong> completed / Orchard</span>
+          </div>
+          <div class="bar-row" tabindex="0" aria-label="Meadow, 24 completed tasks">
+            <span>Meadow</span><div class="bar-track" aria-hidden="true"><div class="bar" style="--value:60%"></div></div><span class="bar-value">24</span>
+            <span class="tooltip" aria-hidden="true"><strong>24</strong> completed / Meadow</span>
+          </div>
+          <div class="bar-row" tabindex="0" aria-label="Grove, 18 completed tasks">
+            <span>Grove</span><div class="bar-track" aria-hidden="true"><div class="bar" style="--value:45%"></div></div><span class="bar-value">18</span>
+            <span class="tooltip" aria-hidden="true"><strong>18</strong> completed / Grove</span>
+          </div>
+          <div class="bar-row" tabindex="0" aria-label="Pond, 12 completed tasks">
+            <span>Pond</span><div class="bar-track" aria-hidden="true"><div class="bar" style="--value:30%"></div></div><span class="bar-value">12</span>
+            <span class="tooltip" aria-hidden="true"><strong>12</strong> completed / Pond</span>
+          </div>
+          <div class="axis" aria-hidden="true"><span>0</span><span>20</span><span>40 tasks</span></div>
+        </div>
+        <table id="data">
+          <caption>Exact data for the same fixed sample</caption>
+          <thead><tr><th scope="col">Group</th><th scope="col">Completed tasks</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Orchard</th><td>36</td></tr>
+            <tr><th scope="row">Meadow</th><td>24</td></tr>
+            <tr><th scope="row">Grove</th><td>18</td></tr>
+            <tr><th scope="row">Pond</th><td>12</td></tr>
+          </tbody>
+          <tfoot><tr><th scope="row">Total</th><td>90</td></tr></tfoot>
+        </table>
+      </section>
+    </main>
+    <footer>No live queries, time filter, analytics, credentials or remote assets. Add controls only with a functioning shared data scope.</footer>
+  </div>
+</body>
+</html>

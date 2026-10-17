@@ -365,6 +365,10 @@ async fn a_total_deadline_truncates_a_healthy_stream_but_the_shared_client_has_n
 /// awaiting a byte that never comes. `AIZEN_SUBAGENT_CALL_SECS=1` shrinks the ceiling so the test
 /// finishes in ~1s; the env lock keeps it from racing the other env-touching tests.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "The env fixture lock must cover the awaited request; the loopback server does not acquire it"
+)]
 async fn a_chore_call_against_a_silent_gateway_returns_err_not_a_permanent_park() {
     use tokio::io::AsyncReadExt;
 
@@ -475,6 +479,10 @@ fn the_steer_guard_closes_the_mailbox_and_requeues_what_the_turn_never_took() {
 /// wrapper must (a) report in-flight so Esc routes to cancel, (b) actually return on cancel
 /// rather than waiting out the call, and (c) leave the slot clean for the next turn.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "Serialize the global cancel fixture for the full request; the presser only uses the cancel slot"
+)]
 async fn cancellable_slash_lets_esc_abort_a_hung_model_call() {
     let _g = tui::TEST_CANCEL_LOCK
         .lock()
@@ -1603,7 +1611,7 @@ fn suggested_name_drops_credential_shaped_tokens() {
         "ghp_abcdefghijklmnopqrstuvwxyz0123",
     ];
     for k in keyish {
-        let name = suggest_session_name(&[Message::user(&format!("{k}"))]);
+        let name = suggest_session_name(&[Message::user(k)]);
         assert!(
             name.starts_with("chat-"),
             "a lone key must fall back to the generic stem, got {name}"
@@ -1614,7 +1622,7 @@ fn suggested_name_drops_credential_shaped_tokens() {
             "key material reached the name: {name}"
         );
         // With surrounding prose the topic survives and only the key is dropped.
-        let mixed = suggest_session_name(&[Message::user(&format!("set my api key to {k}"))]);
+        let mixed = suggest_session_name(&[Message::user(format!("set my api key to {k}"))]);
         assert!(mixed.starts_with("set-my-api-key"), "topic lost: {mixed}");
         assert!(
             !mixed.contains(&core.to_lowercase()),
@@ -1745,4 +1753,28 @@ fn exit_flush_persists_the_live_conversation_for_sessions() {
     set_session_slug(None);
     std::env::remove_var("AIZEN_HOME");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The product name is part of the software's contract, not decoration: the binary name, the home
+/// directory every saved session lives under, and the update channel all derive from it. A rename
+/// that lands here by accident — a "consistency" pass, a fork's find-and-replace — would silently
+/// strand existing installs, so the identity is pinned where the test suite runs.
+///
+/// A fork that deliberately rebrands is expected to change these assertions along with everything
+/// in `TRADEMARK.md`'s checklist. That is the point: the change becomes a decision someone made,
+/// visible in the diff, rather than a side effect.
+#[test]
+fn the_product_identity_is_pinned() {
+    assert_eq!(
+        env!("CARGO_PKG_NAME"),
+        "aizen",
+        "the package/binary name is the update channel's and every installer's contract"
+    );
+    // The data root is `<home>/.aizen`. Checked through the resolver rather than by reading the
+    // environment, so this holds in a test process with any HOME/AIZEN_HOME.
+    let probe = std::path::Path::new("/tmp/identity-probe");
+    assert!(
+        crate::core::config::resolve_default_home_for_test(probe).ends_with(".aizen"),
+        "the home directory holds every saved session; renaming it strands them"
+    );
 }

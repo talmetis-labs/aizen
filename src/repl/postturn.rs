@@ -234,41 +234,24 @@ pub(crate) async fn maybe_run_secretary(
     // resembles an existing one gets routed to `refine` instead of spawning a duplicate.
     if let Some(sk) = out.skill.as_ref() {
         if auto_skill_learn_enabled() {
-            use crate::memory::learning::match_text;
-            let slug = skill::sanitize_name(&sk.name);
             let all_skills = skill::list();
-            let exact_exists = all_skills
-                .iter()
-                .any(|s| skill::sanitize_name(&s.name) == slug);
-            // Check if any existing skill has a semantically similar trigger.
-            let similar_skill = if !exact_exists {
-                all_skills.iter().find(|s| {
-                    let trigger_sim = match_text::match_similarity(&sk.when, &s.when);
-                    let body_sim = match_text::match_similarity(&sk.steps, &s.body);
-                    // Both trigger AND body must resemble — trigger alone would merge skills that
-                    // fire in the same situation but do different things.
-                    trigger_sim >= 0.45 && body_sim >= 0.35
-                })
-            } else {
-                None
-            };
-            let done = if exact_exists {
-                // Only fold when the model MEANT to; otherwise a same-named skill is a collision to
-                // leave alone, not a licence to overwrite the user's procedure.
-                sk.refine && skill::refine(&sk.name, &sk.steps, None, Some(&sk.when)).is_ok()
-            } else if let Some(existing) = similar_skill {
-                // Similar enough to refine rather than duplicate. Route to the existing skill.
-                skill::refine(&existing.name, &sk.steps, None, Some(&sk.when)).is_ok()
-            } else {
-                skill::save_scoped(&sk.name, "", &sk.when, &sk.steps, true).is_ok()
+            let target = auto_learn_skill_target(&all_skills, &sk.name, &sk.when, &sk.steps);
+            let done = match target {
+                // Only fold an exact collision when the model MEANT to; a same-named skill alone
+                // is not a licence to overwrite the user's procedure.
+                Some((key, true)) => {
+                    sk.refine && skill::refine(key, &sk.steps, None, Some(&sk.when)).is_ok()
+                }
+                Some((key, false)) => skill::refine(key, &sk.steps, None, Some(&sk.when)).is_ok(),
+                None => skill::save_scoped(&sk.name, "", &sk.when, &sk.steps, true).is_ok(),
             };
             if done {
-                let label = if exact_exists || similar_skill.is_some() {
+                let label = if target.is_some() {
                     "refined"
                 } else {
                     "learned"
                 };
-                let display_name = similar_skill.map(|s| s.name.as_str()).unwrap_or(&sk.name);
+                let display_name = target.map(|(key, _)| key).unwrap_or(&sk.name);
                 tui::emit_line(
                     &style(format!(
                         "{}{label} skill '{display_name}' — /skills to view",
@@ -306,6 +289,30 @@ pub(crate) async fn maybe_run_secretary(
             .to_string(),
         );
     }
+}
+
+/// Return the install key and whether it is an exact identity match; upstream names are display
+/// metadata, so they must not choose the filesystem target of automatic refinement.
+fn auto_learn_skill_target<'a>(
+    skills: &'a [skill::Skill],
+    name: &str,
+    when: &str,
+    steps: &str,
+) -> Option<(&'a str, bool)> {
+    use crate::memory::learning::match_text;
+    let slug = skill::sanitize_name(name);
+    if let Some(existing) = skills.iter().find(|s| s.key() == slug) {
+        return Some((existing.key(), true));
+    }
+    skills
+        .iter()
+        .find(|s| {
+            // Both trigger AND body must resemble — trigger alone would merge skills that fire in
+            // the same situation but do different things.
+            match_text::match_similarity(when, &s.when) >= 0.45
+                && match_text::match_similarity(steps, &s.body) >= 0.35
+        })
+        .map(|s| (s.key(), false))
 }
 
 /// Did this turn RECOVER from a dead end — a tool result errored, then a LATER tool result in the
@@ -540,6 +547,29 @@ pub(crate) async fn compact_now(history: &mut Vec<Message>) -> Result<(usize, us
     compact_history(history, &http, &base, &key, &model).await
 }
 
+/// `/clear` carry-over — distill the WHOLE current conversation into one dense seed note (routed
+/// through the summarizer role, like compaction) so a refresh starts a fresh thread that still
+/// REMEMBERS what the previous one was doing. Returns the distilled text; the caller rebuilds the
+/// thread and seeds it behind [`agent::compact::HANDOFF_MARKER_PREFIX`]. `Err` when there is nothing
+/// worth carrying or the model returns nothing — the caller then falls back to a plain wipe.
+pub(crate) async fn refresh_distill_now(history: &[Message]) -> Result<String> {
+    let (base, key, model) = resolve_endpoint(None, None, None)?;
+    let http = http_client()?;
+    if history.len() < 2 {
+        anyhow::bail!("nothing to carry forward — the conversation is empty");
+    }
+    let ep = summarizer_endpoint(&base, &key, &model);
+    let prompt = agent::compact::carryover_prompt(history);
+    let summary = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &prompt, &[])
+        .await?
+        .content
+        .unwrap_or_default();
+    if summary.trim().is_empty() {
+        anyhow::bail!("the model returned an empty carry-over summary");
+    }
+    Ok(summary.trim().to_string())
+}
+
 #[cfg(test)]
 mod learning_tests {
     use super::*;
@@ -557,6 +587,34 @@ mod learning_tests {
         assert_eq!(t[0].content.as_deref(), Some("two"));
         assert!(last_turn_slice(&[]).is_empty());
         assert!(last_turn_slice(&[Message::assistant("x".to_string())]).is_empty());
+    }
+
+    #[test]
+    fn auto_learn_refines_install_keys_not_upstream_display_names() {
+        let mut aliased = skill::parse_markdown(
+            "---\nname: upstream\nwhen: verify the build\n---\nRun cargo test before release.\n",
+            "local-alias",
+        );
+        aliased.slug = "local-alias".into();
+        let mut other = skill::parse_markdown(
+            "---\nname: local-alias\nwhen: deploy documentation\n---\nPublish the documentation site.\n",
+            "another-copy",
+        );
+        other.slug = "another-copy".into();
+        let skills = [other, aliased];
+        assert_eq!(
+            auto_learn_skill_target(&skills, "local-alias", "", ""),
+            Some(("local-alias", true))
+        );
+        assert_eq!(
+            auto_learn_skill_target(&skills, "upstream", &skills[1].when, &skills[1].body),
+            Some(("local-alias", false))
+        );
+        assert_eq!(
+            auto_learn_skill_target(&skills, "another-copy", "", ""),
+            Some(("another-copy", true))
+        );
+        assert_eq!(auto_learn_skill_target(&skills, "upstream", "", ""), None);
     }
 
     #[test]

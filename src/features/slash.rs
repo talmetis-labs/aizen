@@ -30,6 +30,7 @@ pub enum SlashId {
     Help,
     Init,
     Where,
+    Files,
     Goal,
     Model,
     Provider,
@@ -49,6 +50,7 @@ pub enum SlashId {
     Import,
     Resume,
     Workflows,
+    Jobs,
     Work,
     Agents,
     Recover,
@@ -60,6 +62,7 @@ pub enum SlashId {
     Reach,
     Approval,
     Sandbox,
+    Design,
     Effort,
     Ultimate,
     Clear,
@@ -169,7 +172,18 @@ pub const BUILTINS: &[Builtin] = &[
         hidden: false,
         description: "show project root, zone slug, git, and data locations",
         argument_hint: "",
-        help: "show THIS project's identity: root · zone slug · git executable · where memory/skills/sessions live (also `aizen where`, `aizen zone migrate`)",
+        help: "show THIS project's identity: root · zone slug · git executable · memory/skills/sessions and managed artifact/scratch roots (also `aizen where`, `/files`)",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Files,
+        name: "files",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "list managed artifacts and current-process scratch (read-only)",
+        argument_hint: "[artifacts|scratch]",
+        help: "[artifacts|scratch] list paths/sizes only, across artifact runs and this process's scratch; bounded, no link traversal, no creation or deletion (also `aizen files`)",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -392,6 +406,17 @@ pub const BUILTINS: &[Builtin] = &[
         stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Jobs,
+        name: "jobs",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "show background work (long-running processes + live monitor runs)",
+        argument_hint: "",
+        help: "background jobs — `process` handles and monitor runs, self-refreshing (the footer strip opens this on click)",
+        stdin: Stdin::Never,
+    },
+    Builtin {
         id: SlashId::Work,
         name: "work",
         aliases: &[],
@@ -519,6 +544,17 @@ pub const BUILTINS: &[Builtin] = &[
         stdin: Stdin::Never,
     },
     Builtin {
+        id: SlashId::Design,
+        name: "design",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "visual design guidance and evidence (this session only)",
+        argument_hint: "[auto|on|off]",
+        help: "bare: scoped status; auto activates on semantic visual briefs, on enables guidance, off disables automatic guidance/gates but leaves manual tools available. No saved config change",
+        stdin: Stdin::Never,
+    },
+    Builtin {
         id: SlashId::Effort,
         name: "effort",
         aliases: &[],
@@ -546,9 +582,11 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[("new", "alias for /clear"), ("reset", "alias for /clear")],
         hidden_aliases: &[],
         hidden: false,
-        description: "start a fresh conversation",
-        argument_hint: "",
-        help: "start a fresh conversation",
+        description: "start a fresh conversation (distills a memory of this one)",
+        argument_hint: "[hard]",
+        help: "start a fresh conversation that REMEMBERS this one: the thread is distilled into one \
+               dense seed note (goals, decisions, files, open tasks) that the new thread starts with; \
+               /clear hard wipes with nothing carried over",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -1036,6 +1074,7 @@ mod tests {
             "autocopy",
             "login",
             "logout",
+            "design",
         ] {
             assert!(names.contains(name), "slash catalog must include /{name}");
         }

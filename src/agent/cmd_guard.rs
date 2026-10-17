@@ -349,6 +349,207 @@ pub fn classify(command: &str) -> Verdict {
     Verdict::Ask
 }
 
+/// Recognise direct workspace-restore primitives denied to delegated executors.
+///
+/// Separate from `classify`: a parent may approve these commands, but a child without the
+/// workspace-restore capability must not regain it via approval or yolo. This is a policy check,
+/// NOT shell/program/kernel confinement: scripts, aliases, substitutions, wrappers and arbitrary
+/// programs are not interpreted. Conventional quotes, escaped separators, command chains, executable
+/// paths and Git global options are recognised. Oversized (>64 KiB / 4096 words) or unterminated
+/// quoted input fails closed; memory and scanning work are bounded. Inspectors and literal mentions
+/// such as `echo 'git restore .'` are not workspace-restore requests.
+pub fn delegated_restore_command(command: &str) -> bool {
+    const MAX_BYTES: usize = 64 * 1024;
+    const MAX_WORDS: usize = 4096;
+    if command.len() > MAX_BYTES {
+        return true;
+    }
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+    let mut word = String::new();
+    let mut started = false;
+    let mut words = Vec::new();
+    let mut total_words = 0;
+    while let Some(ch) = chars.next() {
+        if quote != Some('\'')
+            && (ch == '\\' || ch == '`')
+            && chars.peek().is_some_and(|next| {
+                (ch == '`' || quote.is_none()) && (next.is_whitespace() || "\"';&|".contains(*next))
+                    || (quote == Some('"') && *next == '"')
+            })
+        {
+            let next = chars.next().unwrap();
+            // Shell line continuations are not word separators.
+            if next == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            } else if next != '\n' && next != '\r' {
+                word.push(next);
+                started = true;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            started = true;
+            continue;
+        }
+        // A comment is data inside quotes or a word; otherwise skip through the line boundary.
+        if ch == '#' && !started {
+            while chars
+                .peek()
+                .is_some_and(|next| *next != '\n' && *next != '\r')
+            {
+                chars.next();
+            }
+            continue;
+        }
+        let separator = matches!(ch, ';' | '&' | '|' | '\r' | '\n');
+        if separator || ch.is_whitespace() {
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
+                total_words += 1;
+                if total_words > MAX_WORDS {
+                    return true;
+                }
+            }
+            if separator {
+                if restore_segment(&words) {
+                    return true;
+                }
+                words.clear();
+            }
+        } else {
+            word.push(ch);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return true;
+    }
+    if started {
+        words.push(word);
+        total_words += 1;
+    }
+    total_words > MAX_WORDS || restore_segment(&words)
+}
+
+fn restore_segment(words: &[String]) -> bool {
+    // POSIX environment assignments do not change which direct executable is invoked.
+    let start = words.iter().position(|word| {
+        !word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(i, byte)| {
+                    byte == b'_' || byte.is_ascii_alphabetic() || (i > 0 && byte.is_ascii_digit())
+                })
+        })
+    });
+    let Some(start) = start else { return false };
+    let args = &words[start + 1..];
+    match program_name(words[start].trim_start_matches('@')).trim_end_matches(".exe") {
+        "git" => git_restore_request(args),
+        "aizen" if args.first().is_some_and(|arg| arg == "time") => {
+            match args.get(1).map(String::as_str) {
+                Some("restore" | "undo" | "redo") => true,
+                Some("doctor") => args[2..]
+                    .iter()
+                    .take_while(|arg| arg.as_str() != "--")
+                    .any(|arg| arg == "--repair" || arg.starts_with("--repair=")),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn git_restore_request(args: &[String]) -> bool {
+    let mut pos = 0;
+    while let Some(arg) = args.get(pos) {
+        match arg.as_str() {
+            "--help" | "--version" | "-h" => return false,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+            | "--exec-path" | "--super-prefix" => pos += 2,
+            "--" => {
+                pos += 1;
+                break;
+            }
+            flag if flag.starts_with('-') => pos += 1,
+            _ => break,
+        }
+    }
+    let Some(sub) = args.get(pos) else {
+        return false;
+    };
+    let options: Vec<&str> = args[pos + 1..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+        .collect();
+    if options.contains(&"--help") || options.contains(&"-h") {
+        return false;
+    }
+    match sub.as_str() {
+        "restore" => {
+            let mut staged = false;
+            let mut worktree = false;
+            let mut pos = 0;
+            while let Some(option) = options.get(pos) {
+                match *option {
+                    "--staged" => staged = true,
+                    "--no-staged" => staged = false,
+                    // Git accepts unique long-option abbreviations; do not let a staged-only
+                    // exception hide an explicit (or abbreviated) worktree request.
+                    long if long.starts_with("--work")
+                        || long == "--wor"
+                        || long == "--wo"
+                        || long == "--w" =>
+                    {
+                        worktree = true
+                    }
+                    "--source" | "--pathspec-from-file" => pos += 1,
+                    short if short.starts_with('-') && !short.starts_with("--") => {
+                        let mut flags = short[1..].chars().peekable();
+                        while let Some(flag) = flags.next() {
+                            match flag {
+                                'S' => staged = true,
+                                'W' => worktree = true,
+                                's' => {
+                                    if flags.peek().is_none() {
+                                        pos += 1;
+                                    }
+                                    break; // The remaining short-option suffix is the source value.
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+            !staged || worktree
+        }
+        "reset" => options
+            .iter()
+            .any(|arg| matches!(*arg, "--hard" | "--merge" | "--keep")),
+        // Branch checkout/switch also changes the worktree; do not try to infer a harmless target.
+        "checkout" | "switch" | "checkout-index" => true,
+        "read-tree" => options.iter().any(|arg| {
+            *arg == "--reset"
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('u'))
+        }),
+        _ => false,
+    }
+}
+
 /// Collapse runs of whitespace to single spaces (so patterns don't need `\s+` everywhere).
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -537,6 +738,120 @@ fn program_name(tok: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_restore_recognises_direct_workspace_primitives() {
+        for command in [
+            "git restore .",
+            "git restore --source=HEAD --worktree src/main.rs",
+            "git restore --staged --worktree .",
+            "git restore -SW .",
+            "git restore --staged --work .",
+            "git restore --staged --no-staged .",
+            "git restore --staged -W .",
+            "git restore -SWsHEAD .",
+            "git reset --hard HEAD",
+            "git reset --merge HEAD~1",
+            "git reset --keep HEAD",
+            "git checkout -- src/main.rs",
+            "git checkout main",
+            "git switch -c feature",
+            "git checkout-index -af",
+            "git read-tree -u HEAD",
+            "git read-tree -mu HEAD",
+            "git read-tree --reset HEAD",
+            "aizen time restore checkpoint",
+            "aizen time undo",
+            "aizen time redo",
+            "aizen time doctor --repair",
+        ] {
+            assert!(delegated_restore_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn delegated_restore_handles_chains_quotes_and_global_options() {
+        for command in [
+            "git status && git restore .",
+            "echo ok;git reset --hard",
+            "false || git checkout -- .",
+            "git status | git read-tree -u HEAD",
+            "git diff & git restore .",
+            "git status\ngit restore .",
+            "git status\r\ngit restore .",
+            "git -C 'repo with spaces' -c advice.detachedHead=false restore .",
+            "git -Crepo -cadvice.detachedHead=false --no-pager reset --hard",
+            "git --git-dir='repo/.git' --work-tree repo restore .",
+            "git --namespace test --config-env advice.detachedHead=VALUE switch main",
+            "git --literal-pathspecs restore .",
+            "GIT_CONFIG_NOSYSTEM=1 git restore .",
+            "git re\"sto\"re .",
+            "git \\\nrestore .",
+            "git \\\r\nrestore .",
+            "git `\nrestore .",
+            "& 'C:\\Program Files\\Git\\cmd\\git.exe' restore .",
+            "\"C:\\Program Files\\Git\\cmd\\git.EXE\" -C repo restore .",
+            "'/usr/bin/git' checkout -- .",
+            "\"C:\\tools\\aizen.exe\" time undo",
+            "echo 'not a separator ;'; git restore .",
+            "echo ok # ignored ; git status\ngit restore .",
+        ] {
+            assert!(delegated_restore_command(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn delegated_restore_leaves_inspection_and_index_only_commands_alone() {
+        for command in [
+            "",
+            "git status",
+            "git diff -- src/main.rs",
+            "git show HEAD:restore",
+            "git log --all",
+            "git -C repo diff",
+            "git -c alias.restore=status status",
+            "git restore --help",
+            "git checkout -h",
+            "git restore --staged .",
+            "git restore -S .",
+            "git restore -qS .",
+            "git restore --staged --source=HEAD .",
+            "git restore --staged --source --worktree .",
+            "git restore -SsHEAD .",
+            "git restore -S -s SW .",
+            "git restore --staged --pathspec-from-file --worktree",
+            "git restore --staged -- --worktree",
+            "git reset --soft HEAD~1",
+            "git reset --mixed HEAD",
+            "git reset HEAD -- --hard",
+            "git read-tree HEAD",
+            "aizen time doctor",
+            "aizen time doctor -- --repair",
+            "aizen time list",
+            "aizen time diff checkpoint",
+            "echo 'git restore .'",
+            "echo \"git reset --hard; git checkout -- .\"",
+            "printf '%s' 'git restore .'",
+            "echo git restore .",
+            "echo git\\ restore\\ .",
+            "echo ok\\;git restore .",
+            "echo ok # git restore .",
+            "git status && echo 'git restore .'",
+            "git diff -- 'a; git restore .'",
+        ] {
+            assert!(!delegated_restore_command(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn delegated_restore_bounds_input_and_fails_closed_on_unterminated_quotes() {
+        assert!(delegated_restore_command(&"x".repeat(64 * 1024 + 1)));
+        assert!(delegated_restore_command(&"echo ".repeat(4097)));
+        assert!(!delegated_restore_command(&"echo ".repeat(4096)));
+        assert!(!delegated_restore_command(&"x".repeat(64 * 1024)));
+        assert!(delegated_restore_command("git 'restore ."));
+        assert!(delegated_restore_command("echo \"unterminated"));
+    }
 
     fn blocked(cmd: &str) -> bool {
         matches!(classify(cmd), Verdict::Blocked(_))

@@ -1207,9 +1207,11 @@ pub fn adopt(profile: &str, ready: &Ready, activate: bool) -> Result<Adopted> {
         // Turned into an absolute moment at the one instant both clocks agree — the answer just
         // arrived — because a stored duration is only readable next to the timestamp it counts
         // from, and that second field is a second thing to get wrong.
-        token_expires_at: (ready.expires_in > 0)
-            .then(|| now_secs() + ready.expires_in)
-            .unwrap_or(0),
+        token_expires_at: if ready.expires_in > 0 {
+            now_secs() + ready.expires_in
+        } else {
+            0
+        },
         label: if ready.label.trim().is_empty() {
             cfg.map(|c| c.key.label.clone()).unwrap_or_default()
         } else {

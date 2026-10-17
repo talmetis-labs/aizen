@@ -278,8 +278,7 @@ impl MarkdownStream {
     fn fence_width(&self) -> usize {
         self.cols
             .saturating_sub(measure_text_width(&gutter()))
-            .min(80)
-            .max(16)
+            .clamp(16, 80)
     }
 
     /// The writable span between the `│ ` left rule and the ` │` right rule.

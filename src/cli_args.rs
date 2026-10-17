@@ -24,6 +24,10 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Parsed once per invocation; keep the clap command schema and dispatch types unboxed"
+)]
 pub(crate) enum Commands {
     /// Stream a chat completion from an OpenAI-compatible endpoint.
     Chat(ChatArgs),
@@ -33,6 +37,30 @@ pub(crate) enum Commands {
     /// Run a workflow: fan out a set of role-scoped sub-agents (from a JSON spec), then
     /// synthesize their results into one answer (mixture-of-agents).
     Workflow(WorkflowArgs),
+    /// Read a run's event log (JSONL) and report its state: which events completed, which are
+    /// unresolved (failed tool calls), and the next sequence number a resume would start from.
+    /// Read-only — never writes. Alias of `run-status` (the name the Phase-1 design doc uses).
+    #[command(alias = "run-status")]
+    Status {
+        /// The run id (as passed to `aizen status <id>`). Matches the JSONL filename under
+        /// the run's scratch dir, without the `.jsonl` extension.
+        run_id: String,
+    },
+    /// Resume an interrupted workflow run: read the run's event log, skip the tasks already
+    /// recorded as done, and re-run only the rest (zero LLM tokens re-spent on finished work).
+    /// Without `--spec` this is a dry-run. Alias of `run-resume`.
+    #[command(alias = "run-resume")]
+    Resume {
+        /// The run id (as passed to `aizen resume <id>`; also printed by `workflow` at start).
+        run_id: String,
+        /// Path to the workflow spec (JSON or YAML). Required for a real resume: the log holds
+        /// outcomes, not prompts, so re-running the surviving tasks needs the original spec.
+        #[arg(long, value_name = "path")]
+        spec: Option<String>,
+        /// Skip the confirmation prompt before a real resume.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Manage the CLI's memory brain.
     Memory {
         #[command(subcommand)]
@@ -183,6 +211,12 @@ pub(crate) enum Commands {
     },
     /// Show where aizen keeps THIS project's state: root, zone slug, git executable, home dirs.
     Where,
+    /// List this workspace's durable artifacts and this process's managed scratch (read-only).
+    Files {
+        /// Omit to list both roots; never reads file contents or deletes files.
+        #[arg(value_enum)]
+        kind: Option<crate::cli::files_cmd::FilesKind>,
+    },
     /// The OS sandbox around model/repo-influenced commands: status · doctor · explain · run.
     Sandbox {
         #[command(subcommand)]
@@ -226,6 +260,23 @@ pub(crate) enum Commands {
     /// (newer or older). The running terminal keeps the version it started with; the next terminal
     /// picks up the installed one.
     Update,
+    /// Build (or refresh) the codebase index non-interactively — the engine behind `/init`, for
+    /// scripts and the desktop app's Codebase map tab.
+    Init {
+        /// Only report the existing index's state, don't build.
+        #[arg(long)]
+        status: bool,
+        /// Rebuild from scratch, ignoring the stored chunk cache.
+        #[arg(long)]
+        force: bool,
+        /// Machine-readable progress: `PROGRESS {json}` lines on stdout.
+        #[arg(long)]
+        progress: bool,
+        /// After indexing, detect + run the fast verify commands once (same as `/init`).
+        /// Off by default here: a headless run must not surprise-launch builds.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Show a byte breakdown of what every turn resends: the system prompt (static base +
     /// environment + memory lanes) and the JSON tool schemas. Runs offline — no request is made.
     #[command(name = "prompt-size")]
@@ -450,7 +501,7 @@ pub(crate) enum SkillCmd {
     Fetch {
         /// Absolute http(s) URL to a markdown skill file (e.g. a gist/raw GitHub link).
         url: String,
-        /// Override the skill name (else taken from frontmatter, else the URL filename).
+        /// Local lookup alias (else frontmatter name, else the URL filename); preserves the source name.
         #[arg(short, long)]
         name: Option<String>,
     },
@@ -462,10 +513,24 @@ pub(crate) enum SkillCmd {
         #[arg(short, long)]
         limit: Option<usize>,
     },
-    /// Install a skill from agentskill.sh by "owner/name" (or exact name) and save it locally.
+    /// Install a marketplace skill or a public GitHub skill directory (never replaces a copy).
+    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false).args(["slug", "github"])))]
     Install {
-        /// The skill id, e.g. `NousResearch/spike` (from `aizen skill search`).
-        slug: String,
+        /// Marketplace id, e.g. `NousResearch/spike` (from `aizen skill search`).
+        #[arg(conflicts_with_all = ["github", "path", "reference", "name"])]
+        slug: Option<String>,
+        /// Public GitHub repository, in OWNER/REPO form.
+        #[arg(long, value_name = "OWNER/REPO", requires = "path")]
+        github: Option<String>,
+        /// Directory containing SKILL.md, relative to the GitHub repository root.
+        #[arg(long, value_name = "PATH", requires = "github")]
+        path: Option<String>,
+        /// Branch, tag, or commit (default: the repository's default branch; resolved to a SHA).
+        #[arg(long = "ref", value_name = "REF", requires = "github")]
+        reference: Option<String>,
+        /// Local lookup alias; the upstream name and document stay unchanged.
+        #[arg(long, value_name = "NAME", requires = "github")]
+        name: Option<String>,
     },
 }
 
@@ -639,8 +704,20 @@ pub(crate) enum TimeCmd {
         #[arg(long)]
         json: bool,
         /// Recover/rollback a valid interrupted transaction before reporting.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["cohort", "prepared", "resources", "record_observation"])]
         repair: bool,
+        /// Select one speculative cohort; inspection is read-only unless --record-observation is set.
+        #[arg(long, requires = "prepared")]
+        cohort: Option<String>,
+        /// Exact immutable integration-prepared record ID for --cohort.
+        #[arg(long, requires = "cohort")]
+        prepared: Option<String>,
+        /// Caller-selected exact file; repeat for every prepared file. Never inferred from evidence.
+        #[arg(long = "resource", value_name = "PATH", requires_all = ["cohort", "prepared"])]
+        resources: Vec<String>,
+        /// Append a nonterminal inspection observation only; never settles, replays or changes source.
+        #[arg(long, requires_all = ["cohort", "prepared"], conflicts_with = "repair")]
+        record_observation: bool,
     },
     /// Remove orphan Time Machine refs/sidecars after validating the authoritative ledger.
     ///
@@ -1136,6 +1213,10 @@ pub(crate) enum AuthCmd {
 }
 
 #[derive(Subcommand, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "One-shot config parsing; preserve flag and dispatch types instead of boxing only for lint"
+)]
 pub(crate) enum ConfigCmd {
     /// Set one or more config fields (only the flags you pass are changed).
     Set {
@@ -1475,6 +1556,9 @@ pub(crate) struct ChatArgs {
 pub(crate) struct AgentArgs {
     /// The task for the agent to accomplish.
     pub(crate) task: String,
+    /// Session-scoped visual design guidance: auto | on | off. Never writes saved configuration.
+    #[arg(long, value_name = "MODE", default_value = "auto")]
+    pub(crate) design: crate::agent::design::DesignMode,
     /// OpenAI-compatible base URL (else AIZEN_BASE_URL / saved config).
     #[arg(long, env = "AIZEN_BASE_URL")]
     pub(crate) base_url: Option<String>,
@@ -1495,6 +1579,13 @@ pub(crate) struct AgentArgs {
     /// invocation would bury the pool the picker reads.
     #[arg(long)]
     pub(crate) save_session: bool,
+    /// Resume a saved session by slug: the stored transcript is loaded in place of a fresh
+    /// conversation (prompt lanes rebuilt for the current project/model, the same contract as
+    /// /resume in the REPL) and the task is appended as the next user turn. With --save-session
+    /// the run keeps saving back into that same slug, so a front-end can chain runs into one
+    /// continuous conversation.
+    #[arg(long, value_name = "SLUG")]
+    pub(crate) resume: Option<String>,
     /// Reasoning effort for this run: auto | low | medium | high | xhigh | max. `auto` classifies
     /// the task the way the REPL classifies a typed turn. Omitted ⇒ the configured
     /// `reasoning_effort` is used, exactly as before. This flag never writes the config.
@@ -1506,6 +1597,10 @@ pub(crate) struct AgentArgs {
     /// attach produce. A path that is not a readable image fails the run rather than being dropped.
     #[arg(long = "image", value_name = "PATH")]
     pub(crate) image: Vec<String>,
+    /// Authorize current --image attachments as exact references for this task and same-route
+    /// delegates. Does not grant another provider/account or declare vision capability.
+    #[arg(long, requires = "image")]
+    pub(crate) reference_images: bool,
     /// Output format. `text`: the human transcript (answer on stdout, trace on stderr).
     /// `stream-json`: one JSON record per line on stdout in Claude Code's stream-json shape —
     /// `system`/`init`, `stream_event` deltas, `assistant` and `user` messages with `tool_use` /
@@ -1536,6 +1631,10 @@ pub(crate) struct WorkflowArgs {
     /// Write a JSON audit trace of the fan-out (per-task model + outcome + synthesis model) here.
     #[arg(long)]
     pub(crate) trace: Option<String>,
+    /// Resume an interrupted workflow run: reuse its run id so tasks already logged as done
+    /// are skipped instead of re-run. Pass the same id shown in `run-list`.
+    #[arg(long, value_name = "run_id")]
+    pub(crate) resume: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1776,4 +1875,270 @@ pub(crate) enum ZoneCmd {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[cfg(test)]
+mod time_recovery_report_args_tests {
+    use super::*;
+
+    #[test]
+    fn observation_append_is_explicit_requires_selection_and_conflicts_with_repair() {
+        for args in [
+            vec!["--record-observation"],
+            vec!["--record-observation", "--cohort", "cohort"],
+            vec!["--record-observation", "--prepared", "prepared"],
+            vec![
+                "--record-observation",
+                "--cohort",
+                "cohort",
+                "--prepared",
+                "prepared",
+                "--repair",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared",
+            "--record-observation",
+            "--resource",
+            "a.txt",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Time {
+                cmd:
+                    TimeCmd::Doctor {
+                        json,
+                        repair,
+                        cohort,
+                        prepared,
+                        resources,
+                        record_observation,
+                    },
+            }) => {
+                assert!(record_observation && json && !repair);
+                assert_eq!(cohort.as_deref(), Some("cohort"));
+                assert_eq!(prepared.as_deref(), Some("prepared"));
+                assert_eq!(resources, ["a.txt"]);
+            }
+            _ => panic!("expected explicit recovery observation selection"),
+        }
+    }
+
+    #[test]
+    fn report_selection_is_explicit_and_cannot_run_repair() {
+        for args in [
+            vec!["--cohort", "cohort"],
+            vec!["--prepared", "prepared"],
+            vec!["--resource", "a.txt"],
+            vec!["--cohort", "cohort", "--prepared", "prepared", "--repair"],
+            vec![
+                "--cohort",
+                "cohort",
+                "--prepared",
+                "prepared",
+                "--resource",
+                "a.txt",
+                "--repair",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared",
+            "--resource",
+            "a.txt",
+            "--resource",
+            "b.txt",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Time {
+                cmd:
+                    TimeCmd::Doctor {
+                        json,
+                        repair,
+                        cohort,
+                        prepared,
+                        resources,
+                        record_observation,
+                    },
+            }) => {
+                assert!(!record_observation);
+                assert!(json);
+                assert!(!repair);
+                assert_eq!(cohort.as_deref(), Some("cohort"));
+                assert_eq!(prepared.as_deref(), Some("prepared"));
+                assert_eq!(resources, ["a.txt", "b.txt"]);
+            }
+            _ => panic!("expected exact recovery report doctor selection"),
+        }
+        assert!(Cli::try_parse_from([
+            "aizen",
+            "time",
+            "doctor",
+            "--cohort",
+            "cohort",
+            "--prepared",
+            "prepared"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["aizen", "time", "doctor"]).is_ok());
+        assert!(Cli::try_parse_from(["aizen", "time", "doctor", "--repair"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod agent_reference_args_tests {
+    use super::*;
+
+    fn parse_agent(args: &[&str]) -> Result<AgentArgs, clap::Error> {
+        let cli = Cli::try_parse_from(["aizen", "agent"].into_iter().chain(args.iter().copied()))?;
+        match cli.command {
+            Some(Commands::Agent(args)) => Ok(args),
+            _ => unreachable!("agent arguments must parse as an agent command"),
+        }
+    }
+
+    #[test]
+    fn images_alone_do_not_grant_reference_purpose() {
+        let args = parse_agent(&["--image", "ref.png", "inspect the image"]).unwrap();
+        assert!(!args.reference_images);
+        assert_eq!(args.image, ["ref.png"]);
+    }
+
+    #[test]
+    fn reference_images_is_explicit_and_requires_current_attachments() {
+        assert!(parse_agent(&["--reference-images", "match the reference"]).is_err());
+        let args = parse_agent(&[
+            "--reference-images",
+            "--image",
+            "ref.png",
+            "match the reference",
+        ])
+        .unwrap();
+        assert!(args.reference_images);
+        assert_eq!(args.image, ["ref.png"]);
+    }
+}
+
+#[cfg(test)]
+mod skill_install_args_tests {
+    use super::*;
+
+    fn parse_install(args: &[&str]) -> Result<SkillCmd, clap::Error> {
+        let cli = Cli::try_parse_from(
+            ["aizen", "skill", "install"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )?;
+        match cli.command {
+            Some(Commands::Skill { cmd }) => Ok(cmd),
+            _ => unreachable!("skill install must parse as a skill command"),
+        }
+    }
+
+    #[test]
+    fn skill_install_keeps_registry_slug_syntax() {
+        let SkillCmd::Install {
+            slug,
+            github,
+            path,
+            reference,
+            name,
+        } = parse_install(&["NousResearch/spike"]).unwrap()
+        else {
+            panic!("expected install");
+        };
+        assert_eq!(slug.as_deref(), Some("NousResearch/spike"));
+        assert!(github.is_none() && path.is_none() && reference.is_none() && name.is_none());
+    }
+
+    #[test]
+    fn skill_install_accepts_github_default_and_explicit_ref_alias() {
+        let SkillCmd::Install {
+            slug,
+            github,
+            path,
+            reference,
+            name,
+        } = parse_install(&["--github", "owner/repo", "--path", "skills/release"]).unwrap()
+        else {
+            panic!("expected install");
+        };
+        assert!(slug.is_none());
+        assert_eq!(github.as_deref(), Some("owner/repo"));
+        assert_eq!(path.as_deref(), Some("skills/release"));
+        assert!(reference.is_none() && name.is_none());
+
+        let SkillCmd::Install {
+            reference, name, ..
+        } = parse_install(&[
+            "--github",
+            "owner/repo",
+            "--path",
+            "skills/release",
+            "--ref",
+            "v1.2",
+            "--name",
+            "my-release",
+        ])
+        .unwrap()
+        else {
+            panic!("expected install");
+        };
+        assert_eq!(reference.as_deref(), Some("v1.2"));
+        assert_eq!(name.as_deref(), Some("my-release"));
+    }
+
+    #[test]
+    fn skill_install_rejects_missing_or_conflicting_sources_and_replace() {
+        for args in [
+            vec![],
+            vec!["--github", "owner/repo"],
+            vec!["--path", "skills/release"],
+            vec!["--ref", "main"],
+            vec!["--name", "local"],
+            vec![
+                "owner/skill",
+                "--github",
+                "owner/repo",
+                "--path",
+                "skills/release",
+            ],
+            vec!["owner/skill", "--path", "skills/release"],
+            vec!["owner/skill", "--ref", "main"],
+            vec!["owner/skill", "--name", "local"],
+            vec!["--github", "owner/repo", "--path"],
+            vec!["owner/skill", "--replace"],
+            vec![
+                "--github",
+                "owner/repo",
+                "--path",
+                "skills/release",
+                "--replace",
+            ],
+        ] {
+            assert!(parse_install(&args).is_err(), "must reject {args:?}");
+        }
+    }
 }

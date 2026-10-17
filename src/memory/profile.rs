@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn thin_evidence_lowers_confidence() {
         // one weak inferred fact → low confidence (not a settled preference)
-        let weak = vec![fact("f1", "terse", ProvenanceKind::Inferred, 0)];
+        let weak = [fact("f1", "terse", ProvenanceKind::Inferred, 0)];
         let strong = vec![
             fact("f1", "terse", ProvenanceKind::Manual, 5),
             fact("f2", "concise and brief", ProvenanceKind::Manual, 5),

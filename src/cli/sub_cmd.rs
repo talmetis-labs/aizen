@@ -192,8 +192,8 @@ async fn plan_ls(json: bool) -> Result<()> {
         println!("(no plans)");
     } else {
         println!(
-            "{:<18} {:>7} {:>8} {:>8} {:<7} {:>9} {:>5} {:>5}  {}",
-            "ID", "USD/mo", "KARMA", "GRANT", "UNIT", "QUOTA", "RPM", "CONC", ""
+            "{:<18} {:>7} {:>8} {:>8} {:<7} {:>9} {:>5} {:>5}  ",
+            "ID", "USD/mo", "KARMA", "GRANT", "UNIT", "QUOTA", "RPM", "CONC"
         );
         for p in &plans {
             println!(
@@ -313,7 +313,7 @@ async fn combo_ls(json: bool) -> Result<()> {
     if combos.is_empty() {
         println!("(no combos)");
     } else {
-        println!("{:<22} {:<24} {:<26} {}", "NAME", "LISTING", "PRICE", "");
+        println!("{:<22} {:<24} {:<26} ", "NAME", "LISTING", "PRICE");
         for c in &combos {
             // `subscribed` and `usable` are different questions: a combo you have bought can still
             // be uncallable because your plan sells a different unit. Show the wall, not the sale.
@@ -383,8 +383,8 @@ async fn model_ls(all: bool, json: bool) -> Result<()> {
         println!("(no subscriptions)");
     } else {
         println!(
-            "{:<24} {:<18} {:<10} {:<8} {}",
-            "LISTING", "NAME", "STATUS", "PRICE", ""
+            "{:<24} {:<18} {:<10} {:<8} ",
+            "LISTING", "NAME", "STATUS", "PRICE"
         );
         for x in &shown {
             let change = s(x, "price_change");
@@ -532,8 +532,8 @@ async fn plugin_ls(json: bool) -> Result<()> {
         println!("(no plugins)");
     } else {
         println!(
-            "{:<20} {:>7} {:>9} {:<9} {:<12} {}",
-            "SLUG", "USD", "KARMA", "OWNED", "EXPIRES", ""
+            "{:<20} {:>7} {:>9} {:<9} {:<12} ",
+            "SLUG", "USD", "KARMA", "OWNED", "EXPIRES"
         );
         for p in &plugins {
             // No approved version means the download is empty even after paying — say so on the

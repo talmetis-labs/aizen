@@ -20,6 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Cap on finished entries retained for `/workflows` history.
 const HISTORY_CAP: usize = 16;
+/// How many of those the panel prints. Smaller than the retained cap on purpose: the store keeps
+/// the tail for forensics, the overlay is a glance surface and long histories bury the live rows.
+const RECENT_DISPLAY: usize = 6;
 /// Cap on concurrent live entries (workflow + children + tasks). Soft — over-cap still records.
 const LIVE_SOFT_CAP: usize = 32;
 
@@ -167,6 +170,37 @@ fn safe_text(value: &str, max: usize) -> String {
         .collect()
 }
 
+/// Board label cap, in CHARS. The `/workflows` overlay is informational and wraps, so it can afford
+/// a whole brief; the sidebar's expanded rows get ONE line (they hard-clip), so anything past it is
+/// wasted — and a model that front-loads a 400-char prompt would otherwise drown the role that leads
+/// the label. Sized so a realistic brief survives intact: the panel is wide now, and a task name cut
+/// mid-sentence was the complaint that produced the old 44-char clip.
+pub(crate) const BOARD_SUBJECT_MAX: usize = 400;
+
+/// Detail strings are free text — a provider error sentence can run 200+ chars. The overlay wraps
+/// and is wide, so the detail is shown whole up to this generous bound; the hard cap only exists so
+/// a pathological string cannot push a row to hundreds of wrapped lines. The full text still stays
+/// in the manifest / transcript.
+const ROW_DETAIL_MAX: usize = 400;
+
+fn elide_detail(detail: &str, max: usize) -> String {
+    let flat = safe_text(detail, usize::MAX);
+    let mut chars = flat.chars();
+    let mut taken = String::with_capacity(max + 1);
+    for _ in 0..max {
+        match chars.next() {
+            Some(c) => taken.push(c),
+            None => return taken, // fits — no ellipsis
+        }
+    }
+    if chars.next().is_some() {
+        // Truncated mid-way: swap the last char for the ellipsis so the width stays at `max`.
+        taken.pop();
+        taken.push('…');
+    }
+    taken
+}
+
 fn persist_manifest(e: &Entry) {
     let path = manifest_path(e.id);
     let bytes = match serde_json::to_vec_pretty(&RunManifest {
@@ -214,6 +248,62 @@ fn remove_manifest(id: u64) {
 /// during a load. Generous so a long legitimate fan-out is never pruned out from under itself.
 const MANIFEST_STALE_SECS: u64 = 6 * 3600;
 
+/// Is the process that published a manifest still alive? A crashed aizen leaves its "running"
+/// manifests behind (only a live process deletes its own files on finish), so age alone used to be
+/// the only signal — and a fan-out killed mid-flight haunted the panel for the whole 6-hour stale
+/// window. A dead PID is conclusive NOW, so it sweeps regardless of age. Any probe doubt (access
+/// denied, unsupported platform) keeps the manifest — a false sweep is a lost live row, a false
+/// keep is only clutter the age window eventually clears.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: `pid` is a plain integer; the returned handle is checked for null, only queried
+        // for its exit code, and closed on every path.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                // Null is usually "no such process", but a higher-integrity peer denies the open
+                // too — and that peer is very much alive. Doubt means keep.
+                return true;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(unix)]
+    {
+        // No libc in the dependency tree (the pure-Rust posture), so probe via /proc instead of
+        // kill(pid, 0). A present directory means alive. An UNREADABLE /proc (hidepid mounts) makes
+        // every pid look dead, so the sweeper skips the probe entirely on doubt — never sweep on a
+        // maybe, only on a conclusive dead.
+        if fs::read_dir("/proc").is_err() {
+            return true;
+        }
+        fs::read_dir(format!("/proc/{pid}")).is_ok()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Sweep verdict for one manifest — separated from [`pid_is_alive`] so the age logic is testable
+/// without depending on a particular pid being absent on the CI host (a pid the probe cannot open
+/// reads as alive-by-doubt, by design, and there is no portable "definitely dead" pid constant).
+fn manifest_is_debris(m: &RunManifest, now: u64) -> bool {
+    !pid_is_alive(m.pid) || now.saturating_sub(m.updated_unix) > MANIFEST_STALE_SECS
+}
+
 fn load_remote_manifests() -> Vec<RunManifest> {
     let Ok(entries) = fs::read_dir(manifest_root()) else {
         return Vec::new();
@@ -235,8 +325,9 @@ fn load_remote_manifests() -> Vec<RunManifest> {
             continue;
         };
         // A crashed process leaves a "running" manifest forever; the owning process deletes its own
-        // file on finish. Sweep anything that hasn't been touched within the stale window.
-        if now.saturating_sub(m.updated_unix) > MANIFEST_STALE_SECS {
+        // file on finish. Sweep anything whose pid is conclusively dead — no waiting on the age
+        // window — then anything that hasn't been touched within the stale window.
+        if manifest_is_debris(&m, now) {
             let _ = crate::core::persist::remove_if_exists(&path);
             continue;
         }
@@ -265,7 +356,7 @@ fn remote_row(m: &RunManifest) -> String {
     let detail = if m.detail.is_empty() {
         String::new()
     } else {
-        format!(" — {}", m.detail)
+        format!(" — {}", elide_detail(&m.detail, ROW_DETAIL_MAX))
     };
     format!(
         "  {mark} [{}] {}{}  · {}{} · pid {}\n",
@@ -385,6 +476,7 @@ impl Track {
             remove_manifest(self.id);
         }
         self.finished = true;
+        publish_panel();
     }
 
     /// Mark failure / error.
@@ -398,6 +490,7 @@ impl Track {
             remove_manifest(self.id);
         }
         self.finished = true;
+        publish_panel();
     }
 
     /// Update phase without finishing (e.g. workflow → synthesizing).
@@ -409,6 +502,7 @@ impl Track {
         if let Some(e) = snapshot {
             persist_manifest(&e); // outside the lock — see `Store::set_phase`
         }
+        publish_panel();
     }
 
     /// Publish a stop handle for this run, so `/workflows stop <id>` can cancel it alone.
@@ -434,6 +528,7 @@ impl Drop for Track {
             if found {
                 remove_manifest(self.id);
             }
+            publish_panel();
         }
     }
 }
@@ -467,6 +562,7 @@ fn start(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_live(e);
+    publish_panel();
     Track {
         id,
         finished: false,
@@ -481,6 +577,83 @@ pub fn note_step(id: u64, step: usize, tool: &str) {
         if e.phase == Phase::Running {
             e.detail = format!("step {step} · {tool}");
         }
+    }
+    drop(g);
+    publish_panel();
+}
+
+/// Transport status is not an agent step. The caller throttles progress notifications; this
+/// updates only the in-memory panel, never a manifest write for every streamed fragment.
+pub(crate) fn note_transport(id: u64, sends: usize, stage: &str) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.live.iter_mut().find(|e| e.id == id) {
+        if e.phase == Phase::Running {
+            e.detail = format!("HTTP {sends}/3 · {stage}");
+        }
+    }
+    drop(g);
+    publish_panel();
+}
+
+/// Non-draining totals and a separate publication watermark for one physical dispatch.
+#[derive(Clone, Default)]
+pub(crate) struct DispatchUsage(std::sync::Arc<std::sync::Mutex<DispatchUsageState>>);
+
+#[derive(Default)]
+struct DispatchUsageState {
+    total: (u64, u64),
+    published: (u64, u64),
+    row: Option<u64>,
+}
+
+impl DispatchUsage {
+    pub(crate) fn bind(&self, row: u64) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.row.is_some_and(|bound| bound != row) {
+            return;
+        }
+        state.row = Some(row);
+        Self::publish(&mut state);
+    }
+
+    pub(crate) fn add(&self, input: u64, output: u64) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.total.0 = state.total.0.saturating_add(input);
+        state.total.1 = state.total.1.saturating_add(output);
+        Self::publish(&mut state);
+    }
+
+    fn publish(state: &mut DispatchUsageState) {
+        if let Some(row) = state.row {
+            add_usage(
+                row,
+                state.total.0.saturating_sub(state.published.0),
+                state.total.1.saturating_sub(state.published.1),
+            );
+            state.published = state.total;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn totals(&self) -> (u64, u64) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).total
+    }
+
+    pub(crate) fn finish(&self) -> (u64, u64) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Self::publish(&mut state);
+        state.total
+    }
+}
+
+/// Fold one finished model call's usage into the row — live, while the child is still running.
+/// Callers publish deltas; dispatch totals are kept separately and never drained.
+#[cfg(test)]
+pub fn note_usage(id: u64, tokens_in: u64, tokens_out: u64) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.live.iter_mut().find(|e| e.id == id) {
+        e.tokens_in += tokens_in;
+        e.tokens_out += tokens_out;
     }
 }
 
@@ -545,6 +718,32 @@ pub fn gate_cap() -> usize {
 /// Number of live (not-yet-finished) orchestration entries.
 pub fn live_count() -> usize {
     store().lock().unwrap_or_else(|e| e.into_inner()).live.len()
+}
+
+/// Compact `(handle, label, elapsed)` rows for every live run, for the sidebar's monitor section and
+/// the jobs panel. The handle is the typeable short form so `/workflows stop #3` works from what the
+/// panel shows. Ordered newest-last (the store's own order), which matches how runs start.
+///
+/// The label is elided to [`BOARD_SUBJECT_MAX`]+~48 chars of prefix: these surfaces print one row per
+/// line with no wrap, so an unelided full brief would push elapsed/handle off the right edge, while
+/// 160 chars still swallows any realistic task name whole.
+pub fn live_rows() -> Vec<(String, String, String)> {
+    let g = store().lock().unwrap_or_else(|e| e.into_inner());
+    g.live
+        .iter()
+        .map(|e| {
+            let label = if e.label.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{} · {}", e.name, e.label)
+            };
+            (
+                short_handle(e.id),
+                elide_detail(&label, BOARD_SUBJECT_MAX + 48),
+                fmt_elapsed(e.started, e.finished),
+            )
+        })
+        .collect()
 }
 
 /// Format a run duration for a status row. Three tiers so the unit is always meaningful at a glance:
@@ -624,14 +823,22 @@ pub fn cancel_matching(needle: &str) -> CancelReport {
     }
 }
 
-/// Names that open the status panel. One source of truth: the REPL's slash dispatch matches on this,
-/// and the input thread uses it to recognise a mid-turn stop request before the command is queued.
+/// Names that open a live status panel while a turn is in flight. One source of truth: the REPL's
+/// slash dispatch matches on this, and the input thread uses it to recognise a mid-turn status request
+/// before the command is queued (a queued `/jobs` only surfaces after the turn ENDS — exactly when
+/// watching a background process has stopped being useful).
+///
+/// `jobs` lives here even though its data comes from `agent::process` + this registry: the panel reads
+/// both through `tui`'s snapshot path, so the routing decision is what needs one shared list.
 pub fn is_status_command(name: &str) -> bool {
-    matches!(name, "workflows" | "workflow" | "wf" | "agents-status")
+    matches!(
+        name,
+        "workflows" | "workflow" | "wf" | "agents-status" | "jobs"
+    )
 }
 
-/// Interpret a `/workflows` argument as a stop request and carry it out, returning the line to show.
-/// `None` means it wasn't a stop request and the caller should open the panel instead.
+/// Interpret a status command's argument as a stop request and carry it out, returning the line to
+/// show. `None` means it wasn't a stop request and the caller should open the panel instead.
 ///
 /// Parsing AND execution live here together so the two call sites — the REPL's slash handler (idle)
 /// and the input thread (mid-turn, where the submission queue is not being drained) — cannot drift
@@ -680,6 +887,77 @@ fn kind_tag(k: Kind) -> &'static str {
     }
 }
 
+/// One row of the retained sub-agents panel, as PLAIN data — the panel's payload type lives behind
+/// `pub(super)` in `tui::retained`, so this registry hands tuples across and a `tui`-side glue fn
+/// builds the payload.
+pub struct PanelRow {
+    pub mark: &'static str,
+    pub label: String,
+    pub detail: String,
+    pub elapsed: String,
+    pub running: bool,
+}
+
+/// Snapshot the collapsible sub-agents panel renders: one row per LIVE registry entry (newest-last,
+/// the store's own order) plus the collapsed tail — recent done labels and the done/running counts.
+/// Workflow parents are kept (their `N task(s)` label is the fan-out's own summary line).
+pub fn panel_snapshot() -> (Vec<PanelRow>, String) {
+    let (rows, done_names, done_count, running_count) = {
+        let g = store().lock().unwrap_or_else(|e| e.into_inner());
+        let rows = g
+            .live
+            .iter()
+            .map(|e| PanelRow {
+                mark: phase_mark(e.phase),
+                label: if e.label.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{} · {}", e.name, e.label)
+                },
+                // The sidebar cell is one line; an unelided provider error wrapped the row and
+                // shoved the label out of view.
+                detail: elide_detail(&e.detail, ROW_DETAIL_MAX),
+                elapsed: fmt_elapsed(e.started, e.finished),
+                running: matches!(e.phase, Phase::Running | Phase::Synthesizing),
+            })
+            .collect::<Vec<_>>();
+        let mut done_names = Vec::new();
+        for e in g.history.iter().rev() {
+            if done_names.len() >= 3 {
+                break;
+            }
+            let n = match e.kind {
+                Kind::Task => e.name.clone(),
+                Kind::Workflow => format!("workflow:{}", e.name),
+                Kind::WorkflowChild => format!("{} · {}", e.name, e.label),
+            };
+            done_names.push(n);
+        }
+        (
+            rows,
+            done_names,
+            g.history.len(),
+            g.live
+                .iter()
+                .filter(|e| matches!(e.phase, Phase::Running | Phase::Synthesizing))
+                .count(),
+        )
+    };
+    let mut summary = String::new();
+    if !done_names.is_empty() {
+        summary.push_str(&done_names.join(", "));
+        summary.push_str(" — ");
+    }
+    summary.push_str(&format!("{done_count} done · {running_count} running"));
+    (rows, summary)
+}
+
+/// Push a fresh panel snapshot to the retained UI, when one is live. Called by every registry
+/// mutation point — outside the store lock, like the manifest IO.
+pub fn publish_panel() {
+    crate::ui::tui::publish_subagents_panel();
+}
+
 /// Human-readable multi-agent status for `/workflows` (and pure-print overlays).
 pub fn format_status() -> String {
     let g = store().lock().unwrap_or_else(|e| e.into_inner());
@@ -725,8 +1003,10 @@ pub fn format_status() -> String {
 
     if !g.history.is_empty() {
         out.push_str("\n· recent\n");
-        // Newest last in history vec → show newest first.
-        for e in g.history.iter().rev().take(HISTORY_CAP) {
+        // Newest last in history vec → show newest first. HISTORY_CAP bounds what we RETAIN, not
+        // what we show: the store keeps 16 for forensics (`/workflows` full dump), the panel shows
+        // a short tail or nothing fits on screen next to the running rows.
+        for e in g.history.iter().rev().take(RECENT_DISPLAY) {
             out.push_str(&format_row(e));
         }
     }
@@ -751,7 +1031,7 @@ fn format_row(e: &Entry) -> String {
     let detail = if e.detail.is_empty() {
         String::new()
     } else {
-        format!(" — {}", e.detail)
+        format!(" — {}", elide_detail(&e.detail, ROW_DETAIL_MAX))
     };
     let tokens = if e.tokens_in > 0 || e.tokens_out > 0 {
         format!(
@@ -795,6 +1075,19 @@ pub fn hud_chip() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn isolated_home() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::core::file_placement::tests::TestDir,
+        crate::core::config::EnvGuard,
+    ) {
+        let lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let env = crate::core::config::EnvGuard::set([("AIZEN_HOME", temp.path())]);
+        (lock, temp, env)
+    }
+
     /* The origin field must be invisible to everything that existed before it.
     Two directions, both load-bearing: a manifest written by an older aizen (or by any ordinary
     run today) has no `origin` key and must still parse, and a run with no origin must still
@@ -826,6 +1119,7 @@ mod tests {
 
     #[test]
     fn track_lifecycle_and_format() {
+        let (_home, _temp, _env) = isolated_home();
         // Isolate: this process may already have history from other tests; just assert our rows appear.
         let w = start_workflow("review", 2);
         let wid = w.id();
@@ -847,6 +1141,7 @@ mod tests {
 
     #[test]
     fn step_notes_and_usage_reach_the_row() {
+        let (_home, _temp, _env) = isolated_home();
         let t = start_task("daedalus · fix parser");
         let id = t.id();
         note_step(id, 7, "file_edit+shell_run");
@@ -869,7 +1164,109 @@ mod tests {
     }
 
     #[test]
+    fn transport_progress_reports_sends_without_claiming_an_agent_step() {
+        let (_home, _temp, _env) = isolated_home();
+        let t = start_task("daedalus · fix parser");
+        let id = t.id();
+        note_transport(id, 2, "retry backoff");
+        let live = format_status();
+        assert!(live.contains("HTTP 2/3 · retry backoff"), "{live}");
+        assert!(!live.contains("step 2"), "{live}");
+        t.finish_ok("done");
+        // A terminal row is never rewritten by a late transport note.
+        note_transport(id, 3, "streaming");
+        assert!(!format_status().contains("HTTP 3/3"), "{}", format_status());
+    }
+
+    #[test]
+    fn dispatch_usage_keeps_totals_and_publishes_each_call_once() {
+        let (_home, _temp, _env) = isolated_home();
+        let track = start_task("usage parity");
+        let id = track.id();
+        let usage = DispatchUsage::default();
+        usage.add(100, 10);
+        usage.bind(id);
+        let retry = usage.clone();
+        retry.add(200, 20);
+        assert_eq!(usage.totals(), (300, 30));
+        assert_eq!(usage.finish(), (300, 30));
+        assert_eq!(usage.finish(), (300, 30));
+        usage.bind(id);
+        usage.add(40, 4); // output-contract repair is billed to the same physical dispatch
+        assert_eq!(usage.finish(), (340, 34));
+        {
+            let state = store().lock().unwrap_or_else(|e| e.into_inner());
+            let row = state.live.iter().find(|row| row.id == id).unwrap();
+            assert_eq!((row.tokens_in, row.tokens_out), (340, 34));
+        }
+        track.finish_ok("complete");
+        assert_eq!(usage.finish(), (340, 34));
+        let state = store().lock().unwrap_or_else(|e| e.into_inner());
+        let row = state.history.iter().find(|row| row.id == id).unwrap();
+        assert_eq!((row.tokens_in, row.tokens_out), (340, 34));
+        assert_eq!(DispatchUsage::default().finish(), (0, 0));
+    }
+
+    #[test]
+    fn note_usage_grows_a_live_row_without_a_finish() {
+        let (_home, _temp, _env) = isolated_home();
+        // The "what is it doing" number: a child mid-run must show its tokens climbing, not a row
+        // that reads 0 until the loop returns and `add_usage` lands.
+        let t = start_task("daedalus · live tokens");
+        let id = t.id();
+        note_usage(id, 4_000, 300);
+        let live = format_status();
+        assert!(live.contains("4000→300 tok"), "{live}");
+        // The fold ACCUMULATES — the chat closure zeroes its own tally at hand-over, so two calls
+        // add up rather than the second replacing the first.
+        note_usage(id, 4_000, 300);
+        let live = format_status();
+        assert!(live.contains("8000→600 tok"), "{live}");
+        t.finish_ok("done");
+        // Live rows only: a late live-note on a finished entry is dropped (the runner's final
+        // `add_usage` is the one that still lands on history).
+        note_usage(id, 9_999, 9_999);
+        let recent = format_status();
+        assert!(recent.contains("8000→600 tok"), "{recent}");
+        assert!(!recent.contains("17.9k"), "{recent}");
+    }
+
+    #[test]
+    fn the_board_label_carries_a_full_task_brief() {
+        let (_home, _temp, _env) = isolated_home();
+        // The complaint: a 44-char clip cut the task name mid-sentence, so `/workflows` showed
+        // `reviewer · Check src/agent/mod.rs for …` and nothing more. The panel wraps — give the
+        // row the whole brief (bounded by BOARD_SUBJECT_MAX against a model that front-loads a
+        // whole file into the prompt's first line).
+        let long_prompt = "Review the orchestration registry in src/agent/orchestration.rs and the \
+                           workflow runner in src/agent/workflow.rs for races between the store lock \
+                           and manifest persistence, then report each finding with a file:line";
+        let subject = crate::agent::subagent_subject(
+            &serde_json::json!({"prompt": long_prompt}),
+            BOARD_SUBJECT_MAX,
+        );
+        let t = start_workflow_child(None, "t1", format!("reviewer · {subject}"));
+        let live = format_status();
+        assert!(
+            live.contains("races between the store lock"),
+            "the middle of the brief survives: {live}"
+        );
+        t.finish_ok("done");
+        // And the clip is still bounded: a giant first line cannot produce a giant row.
+        let giant = "x".repeat(BOARD_SUBJECT_MAX * 3);
+        let clipped = crate::agent::subagent_subject(
+            &serde_json::json!({"prompt": giant}),
+            BOARD_SUBJECT_MAX,
+        );
+        // `first_line_clip` takes `max` chars and then appends the ellipsis (its convention at
+        // every call site), so a clipped brief is BOARD_SUBJECT_MAX + 1 chars, never more.
+        assert_eq!(clipped.chars().count(), BOARD_SUBJECT_MAX + 1);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
     fn drop_marks_aborted() {
+        let (_home, _temp, _env) = isolated_home();
         let id = {
             let t = start_task("planner");
             t.id()
@@ -902,6 +1299,7 @@ mod tests {
 
     #[test]
     fn a_row_shows_the_handle_you_would_type_to_stop_it() {
+        let (_home, _temp, _env) = isolated_home();
         let t = start_task("coder · rewrite the parser");
         let handle = short_handle(t.id());
         let s = format_status();
@@ -917,6 +1315,7 @@ mod tests {
 
     #[test]
     fn stop_by_handle_cancels_only_that_row() {
+        let (_home, _temp, _env) = isolated_home();
         let turn = crate::core::cancel::TurnCancel::new();
         let a = start_task("coder · task A");
         let b = start_task("coder · task B");
@@ -937,6 +1336,7 @@ mod tests {
 
     #[test]
     fn a_numeric_handle_never_matches_by_prefix() {
+        let (_home, _temp, _env) = isolated_home();
         // `#3` must not also stop `#30`: ids are exact, only names are substring-matched.
         let t = start_task("coder · exact match check");
         let armed = crate::core::cancel::TurnCancel::new();
@@ -950,6 +1350,7 @@ mod tests {
 
     #[test]
     fn a_matched_row_with_no_handle_is_reported_separately() {
+        let (_home, _temp, _env) = isolated_home();
         // Otherwise "0 cancelled" reads as "you typed the id wrong".
         let t = start_task("planner · unarmed row");
         let report = cancel_matching(&short_handle(t.id()));
@@ -976,7 +1377,7 @@ mod tests {
     fn status_command_aliases_match_the_repl_dispatch() {
         // Both surfaces route on this one predicate; a drift here would make the mid-turn panel open
         // for `/workflows` but not for `/wf`.
-        for name in ["workflows", "workflow", "wf", "agents-status"] {
+        for name in ["workflows", "workflow", "wf", "agents-status", "jobs"] {
             assert!(is_status_command(name), "{name} must be recognised");
         }
         assert!(!is_status_command("work"), "/work is a different command");
@@ -985,9 +1386,101 @@ mod tests {
 
     #[test]
     fn empty_status_is_helpful() {
+        let (_home, _temp, _env) = isolated_home();
         // Can't guarantee empty process-wide, but format_status must always be non-empty & mention multi-agent.
         let s = format_status();
         assert!(s.contains("Multi-agent"));
         assert!(s.contains("slots"));
+    }
+
+    #[test]
+    fn a_real_error_detail_is_shown_whole_and_only_a_pathological_one_is_bounded() {
+        let (_home, _temp, _env) = isolated_home();
+        // The old panel cut details at 72 chars and the row then clipped the rest, so a provider
+        // error read as a fragment. The overlay is wide and wraps now, so the real sentence — this
+        // exact one, ~180 chars — must survive intact.
+        let long = "error: provider returned 7 empty response(s) in a row (HTTP 200 with no text \
+                    and no tool call); the gateway answered but never said anything — check the \
+                    wire log for the raw bytes";
+        assert!(long.chars().count() < ROW_DETAIL_MAX);
+        assert_eq!(elide_detail(long, ROW_DETAIL_MAX), long);
+
+        let t = start_task("coder · elide check");
+        let id = t.id();
+        t.finish_err(long);
+        let s = format_status();
+        let row = s
+            .lines()
+            .find(|l| l.contains("elide check"))
+            .expect("row present");
+        assert!(row.contains("wire log"), "the detail is shown whole: {row}");
+        assert!(!row.contains('…'), "nothing was cut: {row}");
+        let _ = id;
+
+        // The bound still exists so one absurd string cannot produce hundreds of wrapped rows.
+        let giant = "y".repeat(ROW_DETAIL_MAX * 2);
+        let elided = elide_detail(&giant, ROW_DETAIL_MAX);
+        assert_eq!(elided.chars().count(), ROW_DETAIL_MAX);
+        assert!(elided.ends_with('…'));
+    }
+
+    #[test]
+    fn a_short_detail_is_shown_verbatim() {
+        assert_eq!(
+            elide_detail("done [3 step(s)]", ROW_DETAIL_MAX),
+            "done [3 step(s)]"
+        );
+        assert_eq!(elide_detail("", ROW_DETAIL_MAX), "");
+        // Newlines flatten to spaces — a multi-line provider error stays one panel line.
+        assert_eq!(
+            elide_detail("line one\nline two", ROW_DETAIL_MAX),
+            "line one line two"
+        );
+    }
+
+    #[test]
+    fn this_process_is_always_alive_to_itself() {
+        // The self-check guard: a sweep that took out the current process's own manifests would
+        // blank the remote view of every honest panel.
+        assert!(pid_is_alive(std::process::id()));
+    }
+
+    fn fake_manifest(pid: u32, updated_unix: u64) -> RunManifest {
+        RunManifest {
+            schema: RUN_SCHEMA,
+            run_id: "1".into(),
+            pid,
+            kind: "task".into(),
+            name: "n".into(),
+            label: String::new(),
+            phase: "running".into(),
+            detail: String::new(),
+            parent: None,
+            started_unix: updated_unix,
+            finished_unix: None,
+            updated_unix,
+            origin: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_manifest_from_a_live_process_is_kept() {
+        let now = unix_now();
+        assert!(!manifest_is_debris(
+            &fake_manifest(std::process::id(), now),
+            now
+        ));
+    }
+
+    #[test]
+    fn a_stale_manifest_is_swept_even_from_a_live_process() {
+        // The age window still applies when the pid probe cannot convict (e.g. an access-denied
+        // peer that reads as alive-by-doubt) — 6h of silence is its own evidence.
+        let now = unix_now();
+        let old = now - MANIFEST_STALE_SECS - 60;
+        assert!(manifest_is_debris(
+            &fake_manifest(std::process::id(), old),
+            now
+        ));
     }
 }

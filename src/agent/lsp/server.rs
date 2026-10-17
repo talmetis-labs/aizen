@@ -12,9 +12,10 @@
 //! MainLoop via async-lsp's strict default), answers the server→client requests real servers make
 //! (`workspace/configuration`, `client/registerCapability`, `window/workDoneProgress/create`), and
 //! is wrapped in async-lsp's `CatchUnwind` layer so a panic in a handler becomes an error response
-//! instead of killing the loop. `kill_on_drop` + the mainloop task being `abort()`ed on [`Drop`]
-//! always reaps the child — on Windows a Job Object (see `jobobject`) extends that to the whole
-//! `cmd.exe`→`node` tree the node-based servers spawn. Every query is wrapped in a timeout by the
+//! instead of killing the loop. `Drop` aborts the mainloop and asks a separate child monitor to
+//! terminate/reap the tree. Sidecar admission lasts until verified tree exit and IO-worker exit;
+//! missing containment, detached descendants, and interrupted teardown quarantine it until CLI exit.
+//! Every query is wrapped in a timeout by the
 //! manager; a dead server surfaces as an `Err` (the tool degrades to "unavailable", never crashes
 //! the turn).
 //!
@@ -249,8 +250,8 @@ pub struct LspServer {
     diags: Arc<StdMutex<HashMap<String, PushDiags>>>,
     /// Documents we've synced (`didOpen`/`didChange`), keyed by normalized URI.
     opened: AsyncMutex<HashMap<String, OpenDoc>>,
-    /// The `run_buffered` task; `abort()`ed on drop → its owned `Child` (+ Job Object on Windows)
-    /// drops → the server process (tree) is reaped.
+    /// Observer task; its drain token and captured stop sender keep admission until actual IO stops
+    /// and request verified teardown from a separate monitor that owns the child.
     mainloop_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -263,6 +264,7 @@ impl LspServer {
         bin: &Path,
         root: &Path,
         init_timeout: Duration,
+        unsettled: &Arc<crate::agent::process::UnsettledOwnership>,
     ) -> Result<Self> {
         let indexed = Arc::new(AtomicBool::new(false));
         let diags: Arc<StdMutex<HashMap<String, PushDiags>>> =
@@ -280,6 +282,12 @@ impl LspServer {
         // Through the sandbox runner: a language server's INPUT is repository content, so it runs
         // env-scrubbed and (where the platform enforces it) without network — no LSP server we
         // launch needs a socket. The runner also applies `CREATE_NO_WINDOW`/`setsid`.
+        let sidecar = crate::core::workspace_txn::SidecarEffectLease::acquire(
+            crate::core::workspace_txn::SidecarKind::LanguageServer,
+            Duration::ZERO,
+            crate::core::cancel::current().as_ref(),
+        )
+        .context("LSP startup refused while an MCP sidecar owns sidecar admission")?;
         let mut sbx =
             crate::sandbox::runner::prepare_tokio(crate::sandbox::request::SandboxRequest::exec(
                 crate::sandbox::CommandOrigin::Lsp,
@@ -294,41 +302,61 @@ impl LspServer {
             .stderr(Stdio::null()) // the server's own logs aren't useful to the agent
             .kill_on_drop(true);
 
-        let mut child = match sbx.command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
-                return Err(e)
-                    .with_context(|| format!("spawning language server {}", bin.display()));
+        // Protected spawn carries sandbox JobLimits before resume, never late attachment.
+        let (mut child, containment) = match sbx.spawn_contained_tokio() {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Err(crate::agent::mcp::local_sidecar_spawn_failure(
+                    error,
+                    sidecar,
+                    sbx.into_guard(),
+                ))
+                .with_context(|| format!("spawning language server {}", bin.display()));
             }
         };
+        let containment = Arc::new(containment);
         let mut sandbox_guard = sbx.into_guard();
         sandbox_guard.finish(crate::sandbox::runner::Outcome::Spawned);
-        let stdout = child.stdout.take().context("child has no stdout")?.compat();
-        let stdin = child
-            .stdin
-            .take()
-            .context("child has no stdin")?
+        let lifetime = crate::agent::mcp::local_sidecar_lifetime(
+            sidecar,
+            Arc::clone(&containment),
+            sandbox_guard,
+            format!("LSP {}", spec.lang),
+        );
+        // Charge this child as it starts. While startup is IN FLIGHT nobody is blocked (this caller is
+        // awaiting it), so a slow cold index cannot wedge the session. The moment startup FAILS we mark
+        // the charge failed — from then on only this monitor's proven tree exit retires it, and it
+        // clears by itself. A successful start releases the charge as a live owner takes over.
+        let charge = unsettled.track(&lifetime);
+        let io_lifetime = lifetime.drain();
+        let stdout = child.stdout.take();
+        let stdin = child.stdin.take();
+        // Install the monitor before any fallible post-spawn setup. Dropping `stop` after a missing
+        // pipe/init error requests teardown without releasing an admitted, potentially live child.
+        let stop = crate::agent::mcp::monitor_local_sidecar(child, containment, lifetime);
+        let stdout = stdout
+            .context("child has no stdout")
+            .map_err(|error| {
+                charge.mark_failed();
+                crate::agent::mcp::startup_failure_without_settlement(error, true)
+            })?
+            .compat();
+        let stdin = stdin
+            .context("child has no stdin")
+            .map_err(|error| {
+                charge.mark_failed();
+                crate::agent::mcp::startup_failure_without_settlement(error, true)
+            })?
             .compat_write();
 
-        // Node servers are `.cmd` shims: the direct child is cmd.exe and the real node.exe is a
-        // grandchild `kill_on_drop` can't reach. A kill-on-close Job Object reaps the whole tree;
-        // best-effort — `None` just means Phase-1 direct-child kill semantics.
-        #[cfg(windows)]
-        let job = super::jobobject::contain(&child);
-
-        // The mainloop task OWNS the child (and its Job Object): when it ends (graceful Stop or
-        // `abort()`), both drop and the server process tree is reaped. A transport error just ends
-        // the loop → the next query sees a dead server (`is_alive`) and the manager respawns or
-        // degrades cleanly. The sandbox guard rides along so the server's private temp lives
-        // exactly as long as the server does.
         let mainloop_handle = tokio::spawn(async move {
-            #[cfg(windows)]
-            let _job = job;
-            let _child = child;
-            let _sandbox = sandbox_guard;
+            let _io_lifetime = io_lifetime;
             let _ = mainloop.run_buffered(stdout, stdin).await;
+            // Transport completion requests teardown, but never itself proves the tree settled.
+            drop(stop);
         });
+        // Dropping the observer also needs to stop a mainloop that is still waiting on IO. A second
+        // sender is unnecessary: aborting that task drops its captured `stop` and wakes the monitor.
 
         let mut server = LspServer {
             spec,
@@ -340,7 +368,19 @@ impl LspServer {
             opened: AsyncMutex::new(HashMap::new()),
             mainloop_handle,
         };
-        server.caps = server.initialize(root, init_timeout).await?;
+        // The handshake is the last fallible startup step: past it a live owner holds the child, so the
+        // charge retires. Before it, a failure marks the child unowned and it stays charged until the
+        // monitor proves the tree exited.
+        server.caps = match server.initialize(root, init_timeout).await {
+            Ok(caps) => caps,
+            Err(error) => {
+                charge.mark_failed();
+                return Err(crate::agent::mcp::startup_failure_without_settlement(
+                    error, true,
+                ));
+            }
+        };
+        charge.release();
         // tsserver-style servers only build a project once a file is open; seed one so project-wide
         // queries (workspace/symbol) work even before any file-anchored query happens.
         if !server.has_indexing_signal() {
@@ -982,7 +1022,7 @@ impl LspServer {
 
 impl Drop for LspServer {
     fn drop(&mut self) {
-        // Abort the mainloop task → its owned Child (+ Job Object) drops → the server tree is reaped.
+        // Abort requests cleanup; the child monitor retains admission until verified settlement.
         self.mainloop_handle.abort();
     }
 }
@@ -1355,6 +1395,7 @@ fn flatten_symbols(resp: Option<WorkspaceSymbolResponse>) -> Vec<SymCand> {
 ///      (case-insensitive; the last path segment is enough, so `a/b/leaf` matches container `b`),
 ///   3. among the survivors, prefer one whose file matches `file_hint`,
 ///   4. else the first exact match, then the first fuzzy one.
+///
 /// A bare `symbol` (no `/`) behaves exactly as before. When a server omits `container_name` the
 /// container filter simply finds nothing and falls through to the file-hint / first-match path.
 fn pick_symbol(candidates: Vec<SymCand>, symbol: &str, file_hint: Option<&Path>) -> Option<SymHit> {

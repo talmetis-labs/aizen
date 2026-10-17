@@ -18,14 +18,13 @@ pub(crate) async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 println!(
                     "(no skills — add one with `aizen skill add <name>`, or /skills in the REPL)"
                 );
-                return Ok(());
             }
             // Aligned columns, and the usage count as the triage signal: a skill the agent has never
             // loaded is either mis-triggered (`when:` doesn't match how the task gets phrased) or not
             // needed. Unaligned `name — description` gave no way to compare that across rows.
             let namew = skills
                 .iter()
-                .map(|s| s.name.chars().count())
+                .map(|s| s.key().chars().count())
                 .max()
                 .unwrap_or(0)
                 .min(38);
@@ -45,10 +44,10 @@ pub(crate) async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 } else {
                     "cold".to_string()
                 };
-                let pad = namew.saturating_sub(s.name.chars().count());
+                let pad = namew.saturating_sub(s.key().chars().count());
                 println!(
                     "  {}{}  {:<5} {}{tag}",
-                    s.name,
+                    s.key(),
                     " ".repeat(pad),
                     uses,
                     elide(d, 92)
@@ -79,13 +78,13 @@ pub(crate) async fn run_skill(cmd: SkillCmd) -> Result<()> {
                 if !others.is_empty() {
                     println!("\nother workspaces' zones (invisible here):");
                     for (zone, s) in &others {
-                        println!("  {}  [p:{zone}]  {}", s.name, elide(&s.description, 80));
+                        println!("  {}  [p:{zone}]  {}", s.key(), elide(&s.description, 80));
                     }
                 }
             }
             let retired = skill::list_archive();
             if !retired.is_empty() {
-                let names: Vec<&str> = retired.iter().map(|s| s.name.as_str()).collect();
+                let names: Vec<&str> = retired.iter().map(|s| s.key()).collect();
                 println!(
                     "\nretired: {} — `aizen skill restore <name>` brings one back",
                     names.join(", ")
@@ -93,7 +92,7 @@ pub(crate) async fn run_skill(cmd: SkillCmd) -> Result<()> {
             }
             Ok(())
         }
-        SkillCmd::Show { name } => match skill::load(&name) {
+        SkillCmd::Show { name } => match skill::load_checked(&name)? {
             Some(sk) => {
                 println!("{}", skill::render_loaded(&sk));
                 Ok(())
@@ -187,16 +186,30 @@ pub(crate) async fn run_skill(cmd: SkillCmd) -> Result<()> {
             }
             Ok(())
         }
-        SkillCmd::Install { slug } => {
-            let sk = skill_registry::install(&slug).await?;
-            println!(
-                "{} '{}' → {}",
-                style("installed").color256(splash::ACCENT),
-                sk.name,
-                skill::skills_dir()
-                    .join(format!("{}.md", skill::sanitize_name(&sk.name)))
-                    .display()
-            );
+        SkillCmd::Install {
+            slug,
+            github,
+            path,
+            reference,
+            name,
+        } => {
+            let sk = match (slug, github) {
+                (Some(slug), None) if path.is_none() && reference.is_none() && name.is_none() => {
+                    skill_registry::install(&slug).await?
+                }
+                (None, Some(repository)) => {
+                    let path = path.context("GitHub installs require --path")?;
+                    crate::skills::github::install(
+                        &repository,
+                        &path,
+                        reference.as_deref(),
+                        name.as_deref(),
+                    )
+                    .await?
+                }
+                _ => anyhow::bail!("provide a marketplace slug OR --github OWNER/REPO --path PATH"),
+            };
+            println!("{}", skill_registry::install_report(&sk));
             Ok(())
         }
     }
@@ -217,7 +230,7 @@ pub(crate) async fn run_skill_fetch(url: &str, name_override: Option<&str>) -> R
     if !resp.is_success() {
         anyhow::bail!("upstream returned HTTP {}", resp.status);
     }
-    let text = resp.text();
+    let text = skill_registry::raw_document(&resp.body)?;
     // Fallback name from the URL's filename (strip a trailing .md).
     let stem = url
         .trim_end_matches('/')
@@ -229,9 +242,17 @@ pub(crate) async fn run_skill_fetch(url: &str, name_override: Option<&str>) -> R
         .next()
         .unwrap_or(stem)
         .trim_end_matches(".md");
-    let sk = skill::parse_markdown(&text, stem);
-    let name = name_override.unwrap_or(&sk.name);
-    let path = skill::save(name, &sk.description, &sk.when, &sk.body)?;
-    println!("fetched skill '{name}' → {}", path.display());
+    let sk = skill_registry::import_raw_document(
+        stem,
+        text,
+        name_override,
+        skill::SkillProvenance {
+            source: url.to_string(),
+            repository: None,
+            path: None,
+            sha: None,
+        },
+    )?;
+    println!("{}", skill_registry::install_report(&sk));
     Ok(())
 }

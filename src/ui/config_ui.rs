@@ -65,6 +65,7 @@ fn apply_model_endpoint(cfg: &mut cli_config::CliConfig, spec: &str) -> Result<(
             model,
             base_url,
             api_key_ref,
+            max_concurrent: None,
         });
     }
     cfg.model_endpoints = (!list.is_empty()).then_some(list);
@@ -870,6 +871,24 @@ fn print_config(cfg: &cli_config::CliConfig) {
         ),
     }
 
+    if let (Some(base_url), Some(model)) = (cfg.base_url.as_deref(), cfg.model.as_deref()) {
+        let (base_url, model) = crate::llm::media::effective_image_destination(base_url, model);
+        row(
+            "vision",
+            format!(
+                "{} · {}",
+                vision_status(
+                    cli_config::session_vision_policy().support_in(cfg, &base_url, &model)
+                ),
+                vision_destination_label(&base_url, &model)
+            ),
+        );
+        row(
+            "setup",
+            " /config → Vision · capability only, disclosure approved separately".into(),
+        );
+    }
+
     // ── Sub-agents & roles ──
     // Printed even when nothing is configured: the whole point of this section is that `config set
     // --subagent-model …` used to write into a file NOTHING displayed, so there was no way to confirm
@@ -1233,6 +1252,260 @@ pub(crate) async fn config_wizard() -> Result<()> {
         return config_setup_full(&mut cfg).await;
     }
     config_menu(cfg).await
+}
+
+fn vision_status(supported: Option<bool>) -> &'static str {
+    match supported {
+        Some(true) => "Supported",
+        Some(false) => "Unsupported",
+        None => "Unknown",
+    }
+}
+
+/// Capability display has no userinfo, query, fragment or terminal control characters. Identity
+/// matching still uses the original exact endpoint/model, not this deliberately sanitized label.
+pub(crate) fn vision_destination_label(base_url: &str, model: &str) -> String {
+    let endpoint = url::Url::parse(base_url)
+        .ok()
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|| "(invalid endpoint)".into());
+    let model: String = model
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(160)
+        .collect();
+    format!("{endpoint} · {model}")
+}
+
+fn show_vision_destination(
+    cfg: &cli_config::CliConfig,
+    base_url: &str,
+    model: &str,
+) -> Option<bool> {
+    let supported = cli_config::session_vision_policy().support_in(cfg, base_url, model);
+    line_dim(&format!(
+        "Vision: {}",
+        vision_destination_label(base_url, model)
+    ));
+    line_dim(&format!(
+        "Status: {} (explicit declaration, not a provider probe)",
+        vision_status(supported)
+    ));
+    line_dim("Capability does not approve sending any particular image. Disclosure is approved separately.");
+    supported
+}
+
+/// Select a capability statement, with a safe cancel default. Nothing contacts a provider.
+fn prompt_vision_declaration(current: Option<bool>) -> Result<Option<Option<bool>>> {
+    let items = [
+        "Declare Supported for this exact destination — this session only",
+        "Declare Unsupported for this exact destination — this session only",
+        "Declare Unknown for this exact destination — this session only",
+        "Cancel — leave declaration unchanged",
+    ];
+    if current == Some(false) {
+        line_warn("Configured Unsupported: sending stays blocked unless you explicitly change the declaration.");
+    }
+    let pick = Select::with_theme(&ui_theme())
+        .with_prompt("Vision capability")
+        .report(false)
+        .items(&items)
+        .default(3)
+        .interact_opt()?;
+    Ok(vision_declaration_choice(pick))
+}
+
+fn vision_declaration_choice(pick: Option<usize>) -> Option<Option<bool>> {
+    match pick {
+        Some(0) => Some(Some(true)),
+        Some(1) => Some(Some(false)),
+        Some(2) => Some(None),
+        _ => None,
+    }
+}
+
+/// The persist decision is separate from declaring capability for the running session.
+fn prompt_vision_persistence(supported: Option<bool>) -> Result<bool> {
+    line_dim(&format!(
+        "Session declaration: {}. No image has been sent by setup.",
+        vision_status(supported)
+    ));
+    Ok(Select::with_theme(&ui_theme())
+        .with_prompt("Save for future sessions?")
+        .report(false)
+        .items(&[
+            "Keep session only (do not save)",
+            "Save this exact declaration in user config",
+        ])
+        .default(0)
+        .interact_opt()?
+        == Some(1))
+}
+
+/// Reachable from the config hub, including exact child destinations returned by worker errors.
+/// Existing role/model resolution is used; this screen never chooses a replacement provider.
+fn config_edit_vision(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let mut destinations = Vec::<(String, String, String)>::new();
+    if let Ok((base_url, _, model)) = crate::resolve_endpoint(None, None, None) {
+        destinations.push(("Current main route".into(), base_url.clone(), model.clone()));
+        let main = cli_config::ResolvedEndpoint {
+            base_url,
+            api_key: String::new(),
+            model,
+        };
+        if let Some(models) = &cfg.models_by_effort {
+            for (tier, model) in models {
+                let endpoint = cli_config::endpoint_for_model(model, &main);
+                destinations.push((format!("Effort: {tier}"), endpoint.base_url, endpoint.model));
+            }
+        }
+        let subagent = cli_config::subagent_endpoint(&main);
+        destinations.push((
+            "Sub-agent default".into(),
+            subagent.base_url.clone(),
+            subagent.model.clone(),
+        ));
+        for role in ["summarizer", "oracle", "apply"] {
+            let endpoint = cli_config::resolve_role(role, &main);
+            let endpoint = cli_config::endpoint_for_model(&endpoint.model, &endpoint);
+            destinations.push((format!("Role: {role}"), endpoint.base_url, endpoint.model));
+        }
+        for role in crate::agent::roles::ROLES {
+            let endpoint = cli_config::pantheon_endpoint(role.name, &subagent);
+            destinations.push((
+                format!("Role: {}", role.name),
+                endpoint.base_url,
+                endpoint.model,
+            ));
+        }
+        if let Some(routes) = &cfg.agent_routes {
+            for route in routes {
+                if let Some((_, endpoint)) = cli_config::resolve_agent_route(cfg, &route.agent) {
+                    destinations.push((
+                        format!("Specialist: {}", route.agent),
+                        endpoint.base_url,
+                        endpoint.model,
+                    ));
+                }
+            }
+        }
+    }
+    for provider in cfg.providers.iter().flatten() {
+        destinations.push((
+            format!("Provider: {}", provider.name),
+            provider.base_url.clone(),
+            provider.model.clone(),
+        ));
+    }
+    let destinations: Vec<_> = destinations
+        .into_iter()
+        .map(|(name, base_url, model)| {
+            let (base_url, model) =
+                crate::llm::media::effective_image_destination(&base_url, &model);
+            (name, base_url, model)
+        })
+        .collect();
+    let mut items: Vec<String> = destinations
+        .iter()
+        .map(|(name, base_url, model)| {
+            format!(
+                "{name} · {} · {}",
+                vision_status(cli_config::session_vision_policy().support_in(cfg, base_url, model)),
+                vision_destination_label(base_url, model)
+            )
+        })
+        .collect();
+    items.push("Exact endpoint/model from a setup requirement (manual, no probe)".into());
+    items.push("Back".into());
+    let Some(pick) = Select::with_theme(&ui_theme())
+        .with_prompt("Vision — choose a destination")
+        .report(false)
+        .items(&items)
+        .default(0)
+        .interact_opt()?
+    else {
+        return Ok(());
+    };
+    if pick == items.len() - 1 {
+        return Ok(());
+    }
+    let (base_url, model) = match destinations.get(pick) {
+        Some((_, base_url, model)) => (base_url.clone(), model.clone()),
+        None => {
+            line_dim("Paste the exact endpoint and wire model named in the setup requirement. No test request is sent.");
+            let base_url = Input::<String>::with_theme(&ui_theme())
+                .with_prompt("Endpoint")
+                .report(false)
+                .allow_empty(true)
+                .interact_text()?;
+            if base_url.trim().is_empty() {
+                return Ok(());
+            }
+            let model = Input::<String>::with_theme(&ui_theme())
+                .with_prompt("Wire model")
+                .report(false)
+                .allow_empty(true)
+                .interact_text()?;
+            if model.trim().is_empty() {
+                return Ok(());
+            }
+            crate::llm::media::effective_image_destination(base_url.trim(), model.trim())
+        }
+    };
+    let supported = show_vision_destination(cfg, &base_url, &model);
+    let Some(declaration) = prompt_vision_declaration(supported)? else {
+        return Ok(());
+    };
+    cli_config::declare_session_vision(&base_url, &model, declaration)?;
+    if prompt_vision_persistence(declaration)? {
+        cli_config::persist_vision_support(&base_url, &model, declaration)?;
+        cli_config::set_vision_support_in(cfg, &base_url, &model, declaration)?;
+        line_ok("Saved the exact vision declaration for future sessions");
+    } else {
+        line_ok("Vision declaration applies to this session only");
+    }
+    Ok(())
+}
+
+/// Guided top-level preflight. Workers never call this: a missing child capability is returned
+/// to its controller as an actionable setup requirement. This is not an image disclosure grant.
+/// The controller must build a NEW immutable request/config snapshot after this returns true.
+///
+/// An UNDECLARED destination defaults to vision-capable instead of opening a menu on every
+/// attachment. The menu asked a question whose answer never varied, and it interrupted the turn
+/// that was already carrying the image; a capability statement is not a disclosure approval, so
+/// defaulting it adds no transmission authority. An explicitly configured `Unsupported` is a real
+/// answer and is still honoured — `/config → Vision` remains the way to change either.
+pub(crate) fn guided_vision_setup(base_url: &str, model: &str) -> Result<bool> {
+    let (base_url, model) = crate::llm::media::effective_image_destination(base_url, model);
+    let cfg = cli_config::load();
+    let supported = cli_config::session_vision_policy().support_in(&cfg, &base_url, &model);
+    if supported == Some(true) {
+        return Ok(true);
+    }
+    if supported == Some(false) {
+        line_warn(&format!(
+            "Vision is configured Unsupported for {}. Attachments are not sent; \
+             change it in /config → Vision.",
+            vision_destination_label(&base_url, &model)
+        ));
+        return Ok(false);
+    }
+    // Undeclared: state the default once, remember it, and get out of the way.
+    cli_config::declare_session_vision(&base_url, &model, Some(true))?;
+    cli_config::persist_vision_support(&base_url, &model, Some(true))?;
+    line_dim(&format!(
+        "Vision: {} · Supported by default (explicit declaration, not a provider probe). \
+         Change it in /config → Vision.",
+        vision_destination_label(&base_url, &model)
+    ));
+    Ok(true)
 }
 
 /// A yes/no toggle with the shared gold theme (used by the section editors below).
@@ -1802,6 +2075,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Reasoning       · {effort_h}"),
             format!("Approval        · {approval_h}"),
             format!("Display         · icons {icons_h} · visuals {visuals_h}"),
+            "Vision          · exact endpoint/model declarations (no probe)".to_string(),
             "Show full config".to_string(),
             "Done".to_string(),
         ];
@@ -1815,7 +2089,13 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             Some(i) => i,
             None => break,
         };
-        // Sections 0..=8 edit + save; 9 shows the panel; 10 (or Esc) exits.
+        // Vision saves only on its separate explicit persistence action, never the hub auto-save.
+        if pick == 9 {
+            if let Err(e) = config_edit_vision(&mut cfg) {
+                tui::note_line(&format!("vision setup: {e}"));
+            }
+            continue;
+        }
         let edited = match pick {
             0 => config_edit_providers(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
@@ -1826,7 +2106,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             6 => config_edit_reasoning(&mut cfg),
             7 => config_edit_approval(&mut cfg),
             8 => config_edit_display(&mut cfg),
-            9 => {
+            10 => {
                 print_config(&cfg);
                 continue;
             }
@@ -3129,6 +3409,7 @@ async fn config_edit_model_registry(cfg: &mut cli_config::CliConfig) -> Result<(
                 model: model.clone(),
                 base_url,
                 api_key_ref,
+                max_concurrent: None,
             });
             line_ok(&format!("mapped {model}"));
         } else {
@@ -3986,6 +4267,63 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
             .color256(crate::ui::theme::FAINT)
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_declaration_choices_keep_cancel_distinct_from_unknown() {
+        assert_eq!(vision_declaration_choice(Some(0)), Some(Some(true)));
+        assert_eq!(vision_declaration_choice(Some(1)), Some(Some(false)));
+        assert_eq!(vision_declaration_choice(Some(2)), Some(None));
+        assert_eq!(vision_declaration_choice(Some(3)), None);
+        assert_eq!(vision_declaration_choice(None), None);
+        assert_eq!(vision_status(None), "Unknown");
+        assert_eq!(vision_status(Some(true)), "Supported");
+        assert_eq!(vision_status(Some(false)), "Unsupported");
+    }
+
+    #[test]
+    fn vision_destination_display_never_exposes_url_credentials_or_controls() {
+        let label = vision_destination_label(
+            "https://user:secret@example.test:8443/v1?api_key=secret#token",
+            "alias\n\u{1b}[31m",
+        );
+        assert!(!label.contains("secret"));
+        assert!(!label.contains("user"));
+        assert!(!label.contains("token"));
+        assert!(!label.contains('?'));
+        assert!(!label.chars().any(char::is_control));
+        assert!(label.contains("example.test:8443/v1"));
+    }
+
+    #[test]
+    fn codex_setup_uses_fixed_wire_destination_and_effort_stripped_model() {
+        let (endpoint, model) = crate::llm::media::effective_image_destination(
+            crate::llm::oauth_codex::CODEX_BASE_URL,
+            "gpt-5.4-mini-high",
+        );
+        assert_eq!(endpoint, crate::llm::oauth_codex::CODEX_RESPONSES_URL);
+        let (expected_model, _) =
+            crate::llm::codex_models::strip_effort_suffix("gpt-5.4-mini-high");
+        assert_eq!(model, expected_model);
+        let mut cfg = cli_config::CliConfig::default();
+        cli_config::set_vision_support_in(&mut cfg, &endpoint, &model, Some(true)).unwrap();
+        assert_eq!(
+            cli_config::vision_support_in(&cfg, &endpoint, &model),
+            Some(true)
+        );
+        assert_eq!(
+            cli_config::vision_support_in(
+                &cfg,
+                crate::llm::oauth_codex::CODEX_BASE_URL,
+                "gpt-5.4-mini-high"
+            ),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

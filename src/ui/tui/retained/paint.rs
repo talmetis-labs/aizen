@@ -5,6 +5,7 @@
 //! it is handed — which is what makes the window/caret arithmetic testable without a terminal.
 
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
@@ -24,16 +25,50 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     // The composer GROWS DOWNWARD with the draft instead of scrolling one row sideways, so the
     // footer's height is decided here — before the split — from the wrapped draft. `input_layout` is
     // pure over `AppState`, so the same call that sizes the box is the one handed to `draw_footer`
-    // to paint it: the two cannot disagree by a row.
-    let layout = input_layout(state, main.width as usize, max_input_rows(main.height));
+    // to paint it: the two cannot disagree by a row. During a streamed answer the composer usually
+    // sits unchanged for hundreds of frames, so the layout rides a one-slot cache keyed on a
+    // fingerprint of everything it reads (see `cached_input_layout`).
+    let mut layout_cache = state.input_layout_cache.take();
+    let layout = cached_input_layout(
+        &mut layout_cache,
+        state,
+        main.width as usize,
+        max_input_rows(main.height),
+    );
+    state.input_layout_cache = layout_cache;
     state.input_row_scroll = layout.scroll; // sticky across frames — see `AppState::input_row_scroll`
-    let footer_rows = FOOTER_CHROME_ROWS.saturating_add(layout.rows.len() as u16);
+                                            // The jobs strip: when the sidebar is NOT docked (a narrow terminal) there is nowhere else to
+                                            // show background work, so it rides one row UNDER the composer — a one-line clickable summary of
+                                            // running processes + monitor runs. Wide terminals get the full sidebar section instead and the
+                                            // strip stays off (duplication the sidebar already avoids elsewhere).
+    let show_jobs_strip = side.is_none() && state.jobs.has_live();
+    let strip_rows = u16::from(show_jobs_strip);
+    let footer_rows = FOOTER_CHROME_ROWS
+        .saturating_add(layout.rows.len() as u16)
+        .saturating_add(strip_rows);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(footer_rows)])
         .split(main);
     draw_transcript(frame, chunks[0], state);
-    draw_footer(frame, chunks[1], state, &layout);
+    // Split the footer band so the strip gets its own row beneath the composer, and hand the composer
+    // only the rows it asked for.
+    let (footer_area, strip_area) = if show_jobs_strip {
+        let f = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(chunks[1]);
+        (f[0], Some(f[1]))
+    } else {
+        (chunks[1], None)
+    };
+    draw_footer(frame, footer_area, state, &layout);
+    match strip_area {
+        Some(strip) => draw_jobs_strip(frame, strip, state),
+        // No strip this frame (a docked sidebar, or no live jobs) → retire the click geometry, so a stale
+        // rect can never keep answering hit-tests for a row that is no longer on screen.
+        None => set_jobs_strip(None),
+    }
     if let Some(side) = side {
         draw_sidebar(frame, side, state);
     }
@@ -41,11 +76,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     // because only the draw pass knows what was actually painted — the post-draw hyperlink injector
     // writes at absolute coordinates and would otherwise print over them.
     let mut occluders: Vec<Rect> = Vec::new();
-    if let Some(overlay) = state.input.overlay.clone() {
+    if let Some(overlay) = state.input.overlay.as_ref() {
         // draw_overlay clamps the requested scroll against the overlay's own visible height and
         // returns the value actually used, so a stored offset past the end snaps back next frame.
         // It also publishes the menu hit-test geometry (selectable overlays only).
-        let (scroll, rect) = draw_overlay(frame, area, &overlay, state.overlay_scroll);
+        let (scroll, rect) = draw_overlay(frame, area, overlay, state.overlay_scroll);
         state.overlay_scroll = scroll;
         occluders.push(rect);
     } else {
@@ -244,6 +279,53 @@ fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
         body.push(Line::default());
     }
 
+    // Live background work only: running processes lead the live monitor runs (sub-agent /
+    // workflow). Completed processes stay in /jobs, never occupying the sidebar's limited space.
+    if state.jobs.has_live() {
+        let running = state.jobs.running_processes();
+        let live = state.jobs.live_monitor();
+        let head = match (running, live) {
+            (r, 0) => format!("{r} running"),
+            (0, m) => format!("monitor {m}"),
+            (r, m) => format!("{r} proc · {m} monitor"),
+        };
+        body.push(Line::from(vec![
+            Span::styled("Jobs ", bold),
+            Span::styled(head, muted),
+        ]));
+        let avail = (rect.height as usize)
+            .saturating_sub(body.len())
+            .saturating_sub(2);
+        let mut used = 0usize;
+        let mut shown = 0usize;
+        // Cap only the live rows so completed processes cannot consume the section's budget.
+        let all: Vec<_> = state.jobs.live_rows().take(6).collect();
+        for row in &all {
+            let text = format!("{}  {}", row.elapsed, row.detail);
+            let wrapped = wrap_plain(&text, inner.saturating_sub(2), 2);
+            if used + wrapped.len() > avail {
+                break;
+            }
+            used += wrapped.len();
+            shown += 1;
+            for (i, l) in wrapped.into_iter().enumerate() {
+                let lead = if i == 0 {
+                    Span::styled("▸ ", accent)
+                } else {
+                    Span::styled("  ".to_string(), faint)
+                };
+                body.push(Line::from(vec![lead, Span::styled(l, muted)]));
+            }
+        }
+        if shown < all.len() {
+            body.push(Line::styled(
+                format!("… +{} more — /jobs", all.len() - shown),
+                faint,
+            ));
+        }
+        body.push(Line::default());
+    }
+
     // Where this conversation lives and what else is plugged in.
     if !state.facts.session.is_empty() {
         body.push(Line::from(vec![
@@ -370,6 +452,63 @@ fn sidebar_cwd(width: usize) -> String {
     format!("…{cut}")
 }
 
+/// One row under the composer (narrow terminals only) summarising background work:
+/// `▸ 3 running · monitor 2   npm run dev · …   /jobs ↵`. Paints the row, and publishes its rect so a
+/// left-click on it opens the jobs panel. Kept to ONE row: it must never eat the composer's room.
+fn draw_jobs_strip(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
+    if !state.jobs.has_live() || rect.width < 6 || rect.height == 0 {
+        set_jobs_strip(None);
+        return;
+    }
+    let accent = Style::default().fg(Color::Indexed(crate::ui::theme::ACCENT));
+    let muted = Style::default().fg(Color::Indexed(crate::ui::theme::MUTED));
+    let faint = Style::default().fg(Color::Indexed(crate::ui::theme::FAINT));
+    let running = state.jobs.running_processes();
+    let live = state.jobs.live_monitor();
+    // Name the first live job, preferring a running command to a monitor run.
+    let sample = state
+        .jobs
+        .live_rows()
+        .next()
+        .map(|r| r.detail.clone())
+        .unwrap_or_default();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if running > 0 {
+        spans.push(Span::styled(format!("▸ {running} running"), accent));
+    }
+    if live > 0 {
+        if running > 0 {
+            spans.push(Span::styled("  ·  ", faint));
+        }
+        spans.push(Span::styled(format!("monitor {live}"), accent));
+    }
+    if !sample.is_empty() {
+        spans.push(Span::styled("   ", faint));
+        let used: usize = spans
+            .iter()
+            .map(|s| console::measure_text_width(s.content.as_ref()))
+            .sum();
+        // Leave room for the trailing hint; clip the sample so the hint always fits.
+        let budget = (rect.width as usize).saturating_sub(used + 12);
+        let clipped = clip_to(&sample, budget);
+        spans.push(Span::styled(clipped, muted));
+    }
+    // Right-align the affordance.
+    let hint = "/jobs ↵";
+    let used: usize = spans
+        .iter()
+        .map(|s| console::measure_text_width(s.content.as_ref()))
+        .sum();
+    let hint_w = console::measure_text_width(hint);
+    let gap = (rect.width as usize).saturating_sub(used + hint_w);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.push(Span::styled(hint.to_string(), faint));
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    set_jobs_strip(Some(rect));
+}
+
 /// Resolve the transcript scroll for one frame. Pure so it can be unit-tested without a backend.
 ///
 /// `offset` is the current `scroll_from_tail` (wrapped lines up from the bottom; `0` = follow tail).
@@ -402,11 +541,21 @@ pub(super) const RENDER_MARGIN_ROWS: usize = 8;
 
 pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
+        if let Ok(mut slot) = transcript_geom_slot().lock() {
+            *slot = TranscriptGeom::default();
+        }
         return;
     }
-    // Leave 1 cell on the right for the scrollbar track when content overflows — content already
-    // reserves `width-2` so the thumb never paints over text.
-    let content_width = area.width.saturating_sub(2).max(8);
+    // Reserve the rightmost column for the scrollbar. This is also the injector's physical
+    // budget: a minimum like max(8) must never invent cells outside a tiny pane.
+    let content_width = crate::ui::links::transcript_content_width(area.width);
+    let reflowed = state
+        .transcript_width
+        .is_some_and(|last| last != content_width);
+    state.transcript_width = Some(content_width);
+    if reflowed {
+        state.selection = None;
+    }
     // 1. Heights only: the prefix sums place the viewport without rendering a single row.
     let mut heights: Vec<usize> = Vec::with_capacity(state.blocks.len());
     let mut blocks_total = 0usize;
@@ -427,8 +576,9 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     };
     let total = blocks_total + working.len();
     let visible = area.height as usize;
+    let last_total = if reflowed { total } else { state.last_total };
     let (start, scroll, last) =
-        resolve_transcript_scroll(state.scroll_from_tail, state.last_total, total, visible);
+        resolve_transcript_scroll(state.scroll_from_tail, last_total, total, visible);
     state.scroll_from_tail = scroll;
     state.last_total = last;
     // 2. Render only the blocks that intersect the viewport plus a margin — a page each side for a
@@ -443,6 +593,7 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut plain_rows: Vec<String> = Vec::new();
     let mut sgr_rows: Vec<String> = Vec::new();
+    let mut paths = Vec::new();
     let mut row_tool_seq: Vec<Option<u64>> = Vec::new();
     let mut rows_offset: Option<usize> = None;
     let mut cursor = 0usize;
@@ -454,11 +605,15 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
                 Payload::Tool(t) => Some(t.seq),
                 _ => None,
             };
-            for row in state.cache.get_or_render(block, content_width) {
-                plain_rows.push(console::strip_ansi_codes(&row).into_owned());
-                sgr_rows.push(row.clone());
+            // A cache hit shares the block's rendered rows (Rc bump) — the per-row copies below are
+            // only for the rows actually on screen, not the whole block.
+            let rendered = state.cache.get_or_render(block, content_width);
+            for i in 0..rendered.plain.len() {
+                plain_rows.push(rendered.plain[i].clone());
+                sgr_rows.push(rendered.sgr[i].clone());
+                paths.push(rendered.paths[i].clone());
                 row_tool_seq.push(seq);
-                lines.push(styled_row(block.kind, row));
+                lines.push(rendered.lines[i].clone());
             }
         }
         cursor = end;
@@ -471,7 +626,9 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     let rows_offset = rows_offset.unwrap_or(blocks_total.min(lo));
     if !working.is_empty() && hi > blocks_total {
         for (plain, styled) in working {
-            plain_rows.push(plain);
+            plain_rows.push(plain.clone());
+            sgr_rows.push(plain);
+            paths.push(Vec::new());
             row_tool_seq.push(None);
             lines.push(styled);
         }
@@ -491,19 +648,42 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
         ));
     frame.render_widget(paragraph, area);
 
-    // Dim vertical scrollbar when content overflows the viewport. Style is quiet (FAINT track,
-    // MUTED thumb) so it doesn't compete with the transcript. Positioned on the right edge of
-    // `area` — content_width already left a 2-cell gutter so text is never covered.
-    if total > visible {
-        let mut sb_state = ScrollbarState::new(total.saturating_sub(visible)).position(start);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("│"))
-            .thumb_symbol("█")
-            .style(Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)))
-            .track_style(Style::default().fg(Color::Indexed(crate::ui::theme::FAINT)));
-        frame.render_stateful_widget(scrollbar, area, &mut sb_state);
+    // Minimal scrollbar: no full-height track, just a small thumb that appears when content overflows.
+    // The thumb is a short `█` bar, its height proportional to visible/total (min 1 cell), positioned
+    // to reflect the viewport's place in the transcript. Cleaner than a persistent track because the
+    // gutter stays empty when there's nothing to scroll, and the eye isn't drawn to a static line.
+    //
+    // Auto-hide: when at the live tail (`start == tail_start`) the thumb is suppressed entirely, so
+    // streaming output doesn't carry a scrollbar artifact on its right edge.
+    let tail_start = total.saturating_sub(visible);
+    if total > visible && start < tail_start {
+        let track_height = area.height as usize;
+        if track_height > 0 {
+            let thumb_height = ((visible * track_height) / total).max(1).min(track_height);
+            let max_offset = total.saturating_sub(visible);
+            let thumb_pos = (start * (track_height - thumb_height))
+                .checked_div(max_offset)
+                .unwrap_or(0);
+            let thumb_top = area.y + thumb_pos as u16;
+            let thumb_height_u16 = thumb_height as u16;
+            let scrollbar_area = Rect::new(
+                area.x + area.width.saturating_sub(1),
+                thumb_top,
+                1,
+                thumb_height_u16,
+            );
+            let thumb_text = Text::from(
+                (0..thumb_height_u16)
+                    .map(|_| {
+                        Line::from(Span::styled(
+                            "█",
+                            Style::default().fg(Color::Indexed(crate::ui::theme::MUTED)),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            frame.render_widget(Paragraph::new(thumb_text), scrollbar_area);
+        }
     }
 
     // Floating "jump to bottom" button — only while scrolled up off the tail (`start` below the
@@ -514,7 +694,7 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
     let jump_button = if total > visible && start < tail_start {
         const LABEL: &str = " ↓ bottom ";
         let label_w = console::measure_text_width(LABEL) as u16;
-        // Keep the button inside the content gutter (1 cell reserved on the right for the scrollbar).
+        // Keep the button inside the content area (scrollbar overlays the right edge now).
         if area.width > label_w + 1 && area.height >= 1 {
             let bx = area.x + area.width - 1 - label_w;
             let by = area.y + area.height - 1;
@@ -544,6 +724,7 @@ pub(super) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut App
             area,
             plain_rows,
             sgr_rows,
+            paths,
             rows_offset,
             row_tool_seq,
             jump_button,
@@ -568,14 +749,14 @@ fn apply_selection_highlight(lines: &mut [Line<'static>], sel: SelectionRange) {
     }
     let a_line = a_line.min(lines.len().saturating_sub(1));
     let b_line = b_line.min(lines.len().saturating_sub(1));
-    for i in a_line..=b_line {
+    for (i, line) in lines.iter_mut().enumerate().take(b_line + 1).skip(a_line) {
         let start_col = if i == a_line { a_col } else { 0 };
         // end_col exclusive; for mid-range lines reverse the whole row (large end_col).
         let end_col = if i == b_line { b_col } else { usize::MAX };
         if end_col <= start_col {
             continue;
         }
-        reverse_line_cols(&mut lines[i], start_col, end_col);
+        reverse_line_cols(line, start_col, end_col);
     }
 }
 
@@ -590,19 +771,20 @@ fn reverse_line_cols(line: &mut Line<'static>, start_col: usize, end_col: usize)
         if text.is_empty() {
             continue;
         }
-        // Walk chars, grouping into before / inside / after the selection window.
+        // Walk whole graphemes so a combining mark or ZWJ never moves into a different
+        // selection segment from its base glyph.
         let mut before = String::new();
         let mut mid = String::new();
         let mut after = String::new();
-        for ch in text.chars() {
-            let w = console::measure_text_width(&ch.to_string()).max(1);
+        for glyph in text.graphemes(true) {
+            let w = console::measure_text_width(glyph);
             let next = col.saturating_add(w);
             if next <= start_col {
-                before.push(ch);
+                before.push_str(glyph);
             } else if col >= end_col {
-                after.push(ch);
+                after.push_str(glyph);
             } else {
-                mid.push(ch);
+                mid.push_str(glyph);
             }
             col = next;
         }
@@ -619,21 +801,63 @@ fn reverse_line_cols(line: &mut Line<'static>, start_col: usize, end_col: usize)
     line.spans = new_spans;
 }
 
-fn styled_row(kind: BlockKind, row: String) -> Line<'static> {
-    match kind {
-        // Intro is sanitised plain (no SGR) → one flat dim line, as before.
-        BlockKind::Intro => Line::styled(row, Style::default().fg(Color::DarkGray)),
-        // Assistant + Generic carry SGR now: parse it into coloured spans over a grey base. The
-        // moonlight `▌` gutter keeps its own colour because it rode through as SGR; uncoloured text
-        // collapses to one grey span (unchanged look). The structured kinds (Tool/Plan/Diff/Verify)
-        // also emit their palette as SGR from their render fns, so they take the same span path.
-        BlockKind::Assistant
-        | BlockKind::Generic
-        | BlockKind::Tool
-        | BlockKind::Plan
-        | BlockKind::Diff
-        | BlockKind::Verify => Line::from(ansi_spans(&row, Style::default().fg(Color::Gray))),
+/// One-slot cache for the composer's layout: the fingerprint of the inputs it was computed from,
+/// plus the layout itself (shared by `Rc` so a hit costs a refcount bump, not a re-wrap).
+///
+/// During a streamed answer the composer usually sits unchanged for hundreds of frames while frames
+/// paint at ~33fps, and `input_layout` re-wrapped the whole draft — a `measure_text_width` per
+/// non-ASCII char plus a String per row — on every one of them. `draw` takes this out of
+/// [`AppState`] for the duration of the call (so the state borrow stays shared), and the
+/// fingerprint covers everything `input_layout` reads; a collision would paint one stale frame,
+/// not corrupt state.
+pub(super) struct InputLayoutCache {
+    key: u64,
+    layout: std::rc::Rc<InputLayout>,
+}
+
+pub(super) fn cached_input_layout(
+    cache: &mut Option<InputLayoutCache>,
+    state: &AppState,
+    width: usize,
+    max_rows: usize,
+) -> std::rc::Rc<InputLayout> {
+    let key = layout_fingerprint(state, width, max_rows);
+    if let Some(c) = cache {
+        if c.key == key {
+            return c.layout.clone();
+        }
     }
+    let layout = std::rc::Rc::new(input_layout(state, width, max_rows));
+    *cache = Some(InputLayoutCache {
+        key,
+        layout: layout.clone(),
+    });
+    layout
+}
+
+/// FNV-1a over everything [`input_layout`] reads: the draft chars, caret, attachments, the
+/// placeholder's inputs (queued count, working flag, pending steers, overlay presence), the sticky
+/// window offset, and the box geometry. `input_row_scroll` is written back from the layout each
+/// draw, so a clamped offset costs exactly one recompute before the key settles.
+fn layout_fingerprint(state: &AppState, width: usize, max_rows: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for &c in &state.input.draft {
+        mix(c as u64);
+    }
+    mix(state.input.cursor as u64);
+    mix(state.input.images as u64);
+    mix(state.input.queued_count as u64);
+    mix(state.input.overlay.is_some() as u64);
+    mix(state.input_row_scroll as u64);
+    mix(state.working as u64);
+    mix(crate::core::steer::pending() as u64);
+    mix(width as u64);
+    mix(max_rows as u64);
+    h
 }
 
 /// The brand-bloom spinner: the ✦ mark opening out through stars of growing radius and closing back.
@@ -806,7 +1030,7 @@ pub(super) fn draw_footer(
     let right_plain: String = right_spans.iter().map(|s| s.content.as_ref()).collect();
     let right_w = console::measure_text_width(&right_plain);
     let left_budget = width.saturating_sub(right_w + 1);
-    let left = console::truncate_str(&state.input.status, left_budget, "…").into_owned();
+    let left = clip_to(&state.input.status, left_budget);
     let gap = width.saturating_sub(console::measure_text_width(&left) + right_w);
     let mut hud_spans = vec![
         Span::styled(left, Style::default().fg(Color::DarkGray)),
@@ -1147,7 +1371,7 @@ pub(super) fn input_layout(state: &AppState, width: usize, max_rows: usize) -> I
         // placeholder resolves to caret 0 (which is where an empty draft's caret already is).
         return InputLayout {
             rows: vec![InputRowView {
-                shown: console::truncate_str(&placeholder_text(state), budget, "…").into_owned(),
+                shown: clip_to(&placeholder_text(state), budget),
                 start: 0,
                 cols: vec![0],
             }],

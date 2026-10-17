@@ -29,9 +29,9 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,333 @@ fn signal_done(notify: &(Mutex<bool>, Condvar)) {
     notify.1.notify_all();
 }
 
+/// Record the first completion time before publishing `done`. Completion may race between the
+/// monitor and a kill, but later observations must never extend the process's displayed run time.
+fn mark_finished(finished_at: &Mutex<Option<Instant>>, done: &AtomicBool, now: Instant) {
+    let mut finished = finished_at.lock().unwrap_or_else(|e| e.into_inner());
+    finished.get_or_insert(now);
+    done.store(true, Ordering::Release);
+}
+
+/// Running processes advance with `now`; completed processes retain their first completion time.
+fn elapsed_duration(started: Instant, finished_at: Option<Instant>, now: Instant) -> Duration {
+    finished_at
+        .unwrap_or(now)
+        .saturating_duration_since(started)
+}
+
+/// Actual workers, not observer/registry entries, own this lifetime. Unknown settlement is moved
+/// into a process-long quarantine on final drop; this intentionally fails closed until CLI exit.
+struct ProcessOwnership {
+    _workspace_activities: Vec<Arc<crate::core::workspace_txn::WorkspaceActivity>>,
+    _writer_leases: Vec<crate::core::workspace_txn::WorkspaceWriterLease>,
+    _physical_effect: Option<crate::core::workspace_txn::PhysicalEffectLease>,
+    strict_unknown: bool,
+    _containment: Arc<crate::core::proctree::Containment>,
+    _sandbox: Arc<Mutex<crate::sandbox::runner::SpawnGuard>>,
+    _child: Arc<Mutex<Child>>,
+}
+
+/// Bounded ownership coordinator for one opaque body. `drain` tokens cover actual pipe/wait
+/// workers; register all tokens before monitoring can publish tree settlement. Only a real tree
+/// proof may call `prove_tree_settled`. Final unproven drop invokes the caller's quarantine handler.
+/// This does not acquire admission or authorize a second body to clone an existing physical gate.
+pub(crate) struct SettlementLifetime<T> {
+    ownership: Mutex<Option<T>>,
+    tree_settled: AtomicBool,
+    drains: AtomicUsize,
+    /// Set exactly once, at the moment proven settlement actually drops `ownership`. Deliberately NOT
+    /// set when the ownership is quarantined instead — a retained owner must stay observable.
+    released: AtomicBool,
+    /// Run once, on that same proven release. This is how a startup that handed a child to a monitor
+    /// learns that the child is really gone (see [`UnsettledOwnership`]).
+    release_hooks: Mutex<Vec<Box<dyn FnOnce() + Send + Sync>>>,
+    quarantine: fn(T),
+}
+
+impl<T> SettlementLifetime<T> {
+    pub(crate) fn new(ownership: T, quarantine: fn(T)) -> Self {
+        Self {
+            ownership: Mutex::new(Some(ownership)),
+            tree_settled: AtomicBool::new(false),
+            drains: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
+            release_hooks: Mutex::new(Vec::new()),
+            quarantine,
+        }
+    }
+
+    pub(crate) fn prove_tree_settled(&self) {
+        self.tree_settled.store(true, Ordering::Release);
+        self.release_if_settled();
+    }
+
+    pub(crate) fn drain(self: &Arc<Self>) -> DrainLifetime<T> {
+        self.drains.fetch_add(1, Ordering::AcqRel);
+        DrainLifetime {
+            lifetime: Arc::clone(self),
+        }
+    }
+
+    /// Park `hook` to run when this lifetime PROVES release. Returns `true` when it was parked for a
+    /// later release, `false` when the ownership had already been released (the hook ran inline).
+    ///
+    /// A quarantined lifetime never releases, so its hook never runs — that is the fail-closed case,
+    /// and callers must keep whatever the hook was going to clear charged until process exit.
+    pub(crate) fn on_release(&self, hook: impl FnOnce() + Send + Sync + 'static) -> bool {
+        if self.released.load(Ordering::Acquire) {
+            hook();
+            return false;
+        }
+        self.release_hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(Box::new(hook));
+        // A release can complete between the check and the push; run whatever is still parked. When
+        // the release got there first it already drained this vector, so this is a no-op then.
+        if self.released.load(Ordering::Acquire) {
+            self.run_release_hooks();
+        }
+        true
+    }
+
+    fn release_if_settled(&self) {
+        if self.tree_settled.load(Ordering::Acquire) && self.drains.load(Ordering::Acquire) == 0 {
+            // Drop outside the ownership mutex. Completed registry rows keep output, not exclusion.
+            let ownership = self
+                .ownership
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(ownership) = ownership {
+                drop(ownership);
+                self.released.store(true, Ordering::Release);
+                self.run_release_hooks();
+            }
+        }
+    }
+
+    fn run_release_hooks(&self) {
+        let hooks: Vec<Box<dyn FnOnce() + Send + Sync>> = self
+            .release_hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain(..)
+            .collect();
+        for hook in hooks {
+            hook();
+        }
+    }
+}
+
+/// Count of local sidecar ownerships whose physical settlement is still unproven.
+///
+/// The rule this encodes: an admitted child blocks new work only once nobody is left to report its
+/// outcome. Every child is charged while it starts, but a start that is still IN FLIGHT is ignored —
+/// its own caller is awaiting it and will settle it, so a slow cold index must never block the
+/// session. A start that FAILS is promoted to blocking, and only [`SettlementLifetime`]'s PROVEN
+/// release (tree proof + every drain token returned) retires it.
+///
+/// A quarantined lifetime never releases, so its charge stands until process exit. That asymmetry is
+/// the whole point: a transient failed start stops blocking as soon as its teardown is proven, while
+/// a child nobody can account for keeps blocking.
+#[derive(Default)]
+pub(crate) struct UnsettledOwnership {
+    /// Every outstanding charge, in flight or failed.
+    outstanding: AtomicUsize,
+    /// The subset still being awaited by a live caller. `outstanding - in_flight` is what blocks.
+    in_flight: AtomicUsize,
+    /// Charges with no proof path at all (a quarantined spawn error, a lost observer task). These
+    /// block immediately and are never waited on — nothing is in flight to wait for.
+    permanent: AtomicUsize,
+    /// When the most recent failed charge was taken, so a caller can tell "teardown is probably still
+    /// running" from "this will never settle" and wait only in the first case.
+    last_failure: Mutex<Option<Instant>>,
+}
+
+/// One child's settlement charge. Held while the child starts; the holder either retires it (a live
+/// owner took over) or marks it failed (nobody owns it now). Dropping it unresolved marks it failed.
+///
+/// Two counters move independently, and each moves exactly once:
+/// * `settled` — this charge is done being outstanding. Set by a live owner's release OR by the
+///   lifetime's proven release, whichever lands first.
+/// * `resolved` — the holder has decided. Set by any of release / mark_failed / unresolved drop.
+///
+/// That split is what keeps a failed child BLOCKING (`outstanding` minus `in_flight` stays 1) until
+/// its monitor actually proves the tree exited, instead of the failure quietly cancelling the count.
+pub(crate) struct UnsettledCharge {
+    owner: Arc<UnsettledOwnership>,
+    settled: Arc<AtomicBool>,
+    resolved: Arc<AtomicBool>,
+}
+
+impl UnsettledCharge {
+    /// A live, verified owner now holds this child, so it no longer counts as unproven.
+    pub(crate) fn release(&self) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.settle();
+    }
+
+    /// Nobody owns this child now (startup failed or its observer went away). It must block new work
+    /// until its lifetime proves the tree exited.
+    pub(crate) fn mark_failed(&self) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            *self
+                .owner
+                .last_failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
+        }
+    }
+
+    fn settle(&self) {
+        if !self.settled.swap(true, Ordering::AcqRel) {
+            self.owner.decrement();
+        }
+    }
+}
+
+impl Drop for UnsettledCharge {
+    fn drop(&mut self) {
+        // Dropping an unresolved charge means the code path that held it went away without deciding —
+        // the conservative reading is "nobody owns this child", never "settled".
+        self.mark_failed();
+    }
+}
+
+impl UnsettledOwnership {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Does anything block new work right now? An in-flight start does not: its own caller is
+    /// awaiting it and will settle it, so a slow cold index must never block the session.
+    pub(crate) fn is_unsettled(&self) -> bool {
+        let outstanding = self.outstanding.load(Ordering::Acquire);
+        let in_flight = self.in_flight.load(Ordering::Acquire);
+        outstanding.saturating_sub(in_flight) > 0 || self.permanent.load(Ordering::Acquire) > 0
+    }
+
+    /// Charge a child as it starts. The returned charge is held by the starter: retire it with
+    /// [`UnsettledCharge::release`] once a live owner holds the child, or [`UnsettledCharge::mark_failed`]
+    /// when startup failed. Dropping it unresolved marks it failed.
+    pub(crate) fn track<T>(
+        self: &Arc<Self>,
+        lifetime: &Arc<SettlementLifetime<T>>,
+    ) -> UnsettledCharge {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let settled = Arc::new(AtomicBool::new(false));
+        let resolved = Arc::new(AtomicBool::new(false));
+        let hook_settled = Arc::clone(&settled);
+        let hook_owner = Arc::clone(self);
+        // A proven release settles the charge — unless a live owner already did, in which case the
+        // hook must not decrement a second time and cancel another child's charge.
+        //
+        // Both outcomes of `on_release` are already correct, so neither needs compensating here: when
+        // it parks the hook (true), the later release runs it; when it runs the hook inline (false),
+        // the child had already settled and the hook has just undone the increments above.
+        let _ = lifetime.on_release(move || {
+            if !hook_settled.swap(true, Ordering::AcqRel) {
+                hook_owner.decrement();
+            }
+        });
+        UnsettledCharge {
+            owner: Arc::clone(self),
+            settled,
+            resolved,
+        }
+    }
+
+    /// Count ownership with no proof path at all (a quarantined spawn error, a lost observer task).
+    /// Blocks immediately and is never waited on.
+    pub(crate) fn charge_permanent(self: &Arc<Self>) {
+        self.permanent.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn decrement(&self) {
+        // Saturating: a double release must never wrap the count back to "settled".
+        let _ = self
+            .outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+    }
+
+    /// Wait a BOUNDED time for outstanding FAILED charges to clear, but only while they are FRESH: a
+    /// start that just failed is usually mid-teardown, whereas an older charge means a quarantined
+    /// owner that will never settle. Returns whether nothing is blocking.
+    pub(crate) fn wait_for_recent_settlement(&self, budget: Duration) -> bool {
+        if !self.is_unsettled() {
+            return true;
+        }
+        if self.permanent.load(Ordering::Acquire) > 0 {
+            return false; // no proof path at all — waiting could only waste the budget
+        }
+        let failed_at = *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(failed_at) = failed_at else {
+            return false;
+        };
+        let age = failed_at.elapsed();
+        if age >= budget {
+            return false;
+        }
+        let deadline = Instant::now() + (budget - age);
+        while self.is_unsettled() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !self.is_unsettled()
+    }
+}
+
+pub(crate) struct DrainLifetime<T> {
+    lifetime: Arc<SettlementLifetime<T>>,
+}
+
+impl<T> Drop for DrainLifetime<T> {
+    fn drop(&mut self) {
+        self.lifetime.drains.fetch_sub(1, Ordering::AcqRel);
+        self.lifetime.release_if_settled();
+    }
+}
+
+impl<T> Drop for SettlementLifetime<T> {
+    fn drop(&mut self) {
+        if let Some(ownership) = self
+            .ownership
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            if self.tree_settled.load(Ordering::Acquire) {
+                drop(ownership);
+            } else {
+                (self.quarantine)(ownership);
+            }
+        }
+    }
+}
+
+type ProcessLifetime = SettlementLifetime<ProcessOwnership>;
+static QUARANTINE: Lazy<Mutex<Vec<ProcessOwnership>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn quarantine_process(ownership: ProcessOwnership) {
+    if ownership.strict_unknown {
+        QUARANTINE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(ownership);
+    }
+    // With scoped overlap disabled and no supported tree proof, retain legacy serial lifecycle
+    // instead of a permanent app-wide lock. This is NOT a claim of physical settlement.
+}
+
 struct ProcEntry {
     command: String,
     pid: u32,
@@ -152,11 +479,21 @@ struct ProcEntry {
     /// Sandbox bookkeeping: finishes the audit line on exit/kill and keeps the run's private temp
     /// directory alive for as long as the process may use it.
     sandbox: Arc<Mutex<crate::sandbox::runner::SpawnGuard>>,
+    /// Shared with monitor and every pipe worker. Registry pruning cannot release live workers,
+    /// and unknown tree settlement retains all exclusion in process-long quarantine.
+    _lifetime: Arc<ProcessLifetime>,
+    #[cfg(test)]
+    fixture_root: PathBuf,
 }
 
 impl ProcEntry {
+    fn elapsed(&self) -> Duration {
+        let finished_at = *self.finished_at.lock().unwrap_or_else(|e| e.into_inner());
+        elapsed_duration(self.started, finished_at, Instant::now())
+    }
+
     fn status_label(&self) -> String {
-        if self.done.load(Ordering::Relaxed) {
+        if self.done.load(Ordering::Acquire) {
             match *self.exit.lock().unwrap_or_else(|e| e.into_inner()) {
                 Some(code) => format!("exited({code})"),
                 None => "exited(?)".to_string(),
@@ -223,7 +560,7 @@ fn render_delta(id: &str, status: &str, cursor: u64, d: &LogDelta) -> String {
 /// Spawn `command` in the background, confined to `root` (optionally a `cwd` subdir), owned by
 /// `scope`. Returns the new `proc_<n>` id.
 fn start(
-    root: &PathBuf,
+    root: &Path,
     command: &str,
     cwd: Option<&str>,
     scope: &str,
@@ -231,7 +568,7 @@ fn start(
 ) -> Result<String> {
     let dir = match cwd {
         Some(c) => confine(root, c, true)?,
-        None => root.clone(),
+        None => root.to_path_buf(),
     };
 
     // Prune a finished slot if we're at the cap; refuse if everything is still running. Scope-blind
@@ -242,7 +579,7 @@ fn start(
         if reg.len() >= MAX_PROCESSES {
             let victim = reg
                 .iter()
-                .filter(|(_, e)| e.done.load(Ordering::Relaxed))
+                .filter(|(_, e)| e.done.load(Ordering::Acquire))
                 .min_by_key(|(_, e)| e.finished_at.lock().map(|g| *g).unwrap_or(None))
                 .map(|(k, _)| k.clone());
             match victim {
@@ -256,6 +593,43 @@ fn start(
         }
     }
 
+    // Strong lifetime admission is feature-gated until every platform can prove settlement.
+    // Gate OFF keeps legacy serial background behavior, not a false tree-proof claim.
+    let strict_unknown = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
+    let (workspace_activities, writer_leases, physical_effect) = if strict_unknown {
+        let context = crate::core::exec_ctx::current();
+        let mut activities = context
+            .as_ref()
+            .map(|ctx| ctx.workspace_activities())
+            .unwrap_or_default();
+        activities.push(crate::core::workspace_txn::WorkspaceActivity::begin(
+            root, scope,
+        )?);
+        let mut writers = context
+            .as_ref()
+            .map(|ctx| ctx.writer_leases())
+            .unwrap_or_default();
+        writers.push(
+            crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                root,
+                Duration::from_secs(15),
+                crate::core::cancel::current().as_ref(),
+                "background process lifetime",
+                scope,
+            )?,
+        );
+        // Always fresh admission for ONE physical body, never ancestor/scope reentry.
+        let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+            Duration::from_secs(15),
+            crate::core::cancel::current().as_ref(),
+            "background process body",
+            scope,
+        )?;
+        (activities, writers, Some(physical))
+    } else {
+        (Vec::new(), Vec::new(), None)
+    };
+
     // One construction path with `shell_run`: the sandbox runner wraps the shell, scrubs the
     // environment and applies policy — going background must never sidestep the sandbox.
     let mut sbx = crate::sandbox::runner::prepare_std(
@@ -263,7 +637,7 @@ fn start(
             crate::sandbox::CommandOrigin::ProcessStart,
             command,
             dir.clone(),
-            root.clone(),
+            root.to_path_buf(),
         )
         .network(network)
         .background(true),
@@ -275,14 +649,32 @@ fn start(
     // Contain the tree at spawn. A background command is the WORST case for the orphan problem this
     // guards: `process start` is what runs dev servers and watchers, i.e. exactly the processes that
     // spawn real children behind the `cmd.exe`/`sh` wrapper and keep holding a port after a kill.
-    let mut child = match sbx.command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
-            return Err(e).with_context(|| format!("spawning background `{command}`"));
+    let started = Instant::now();
+    let (mut child, containment) = match sbx.spawn_contained() {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if !error.cleanup_verified() {
+                let note = error.to_string();
+                // Cleanup intention is not settlement. Keep the just-created child/job and every
+                // admitted workspace/physical owner until CLI exit when cleanup is unproven.
+                std::mem::forget((
+                    error,
+                    workspace_activities,
+                    writer_leases,
+                    physical_effect,
+                    sbx,
+                ));
+                return Err(
+                    anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                        crate::agent::tools::ToolEffectState::UnknownWorker,
+                    ))
+                    .context(note),
+                );
+            }
+            return Err(error).with_context(|| format!("spawning background `{command}`"));
         }
     };
-    let containment = Arc::new(sbx.contain(&child));
+    let containment = Arc::new(containment);
     let sandbox = Arc::new(Mutex::new(sbx.into_guard()));
     let pid = child.id();
 
@@ -290,14 +682,30 @@ fn start(
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
     let stdin = child.stdin.take();
-    spawn_drain(out_pipe, Arc::clone(&out));
-    spawn_drain(err_pipe, Arc::clone(&out));
+    let child = Arc::new(Mutex::new(child));
+    let lifetime = Arc::new(ProcessLifetime::new(
+        ProcessOwnership {
+            _workspace_activities: workspace_activities,
+            _writer_leases: writer_leases,
+            _physical_effect: physical_effect,
+            strict_unknown,
+            _containment: Arc::clone(&containment),
+            _sandbox: Arc::clone(&sandbox),
+            _child: Arc::clone(&child),
+        },
+        quarantine_process,
+    ));
+    // Seat both drain tokens before starting either worker: one fast EOF must not cause early
+    // physical settlement before the other pipe has even been registered.
+    let stdout_lifetime = lifetime.drain();
+    let stderr_lifetime = lifetime.drain();
+    spawn_drain(out_pipe, Arc::clone(&out), stdout_lifetime);
+    spawn_drain(err_pipe, Arc::clone(&out), stderr_lifetime);
 
     let exit = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
     let notify = Arc::new((Mutex::new(false), Condvar::new()));
     let finished_at = Arc::new(Mutex::new(None));
-    let child = Arc::new(Mutex::new(child));
 
     // Monitor: reap the child when it exits, recording the code + done flag (no busy CPU), then wake
     // any `wait`. `done` is stored BEFORE the notify so a woken waiter always observes the exit.
@@ -308,30 +716,50 @@ fn start(
         let notify = Arc::clone(&notify);
         let finished_at = Arc::clone(&finished_at);
         let sandbox = Arc::clone(&sandbox);
-        std::thread::spawn(move || loop {
-            if done.load(Ordering::Relaxed) {
-                signal_done(&notify);
-                break;
-            }
-            let st = { child.lock().unwrap_or_else(|e| e.into_inner()).try_wait() };
-            match st {
-                Ok(Some(status)) => {
-                    *exit.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(status.code().unwrap_or(-1));
-                    *finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-                    done.store(true, Ordering::Relaxed);
-                    sandbox
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .finish(crate::sandbox::runner::Outcome::Exit(status.code()));
+        let containment = Arc::clone(&containment);
+        let lifetime = Arc::clone(&lifetime);
+        std::thread::spawn(move || {
+            loop {
+                if done.load(Ordering::Acquire) {
                     signal_done(&notify);
                     break;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(60)),
-                Err(_) => {
-                    done.store(true, Ordering::Relaxed);
-                    signal_done(&notify);
-                    break;
+                let st = { child.lock().unwrap_or_else(|e| e.into_inner()).try_wait() };
+                match st {
+                    Ok(Some(status)) => {
+                        *exit.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(status.code().unwrap_or(-1));
+                        mark_finished(&finished_at, &done, Instant::now());
+                        sandbox
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .finish(crate::sandbox::runner::Outcome::Exit(status.code()));
+                        signal_done(&notify);
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(60)),
+                    Err(_) => {
+                        // UI observer completion is not proof of physical completion.
+                        mark_finished(&finished_at, &done, Instant::now());
+                        signal_done(&notify);
+                        return;
+                    }
+                }
+            }
+            loop {
+                match containment.known_quiescent() {
+                    Ok(Some(true)) => {
+                        lifetime.prove_tree_settled();
+                        break;
+                    }
+                    Ok(Some(false)) if strict_unknown => {
+                        std::thread::sleep(Duration::from_millis(60))
+                    }
+                    // Gate-OFF observers retain legacy lifecycle without a permanent monitor.
+                    Ok(Some(false)) => break,
+                    // None/Unix detached descendants/errors cannot prove settlement. The final
+                    // lifetime drop quarantines exclusion instead of silently admitting natives.
+                    Ok(None) | Err(_) => break,
                 }
             }
         });
@@ -341,7 +769,7 @@ fn start(
     let entry = ProcEntry {
         command: command.to_string(),
         pid,
-        started: Instant::now(),
+        started,
         scope: scope.to_string(),
         out,
         exit,
@@ -352,6 +780,9 @@ fn start(
         finished_at,
         containment,
         sandbox,
+        _lifetime: lifetime,
+        #[cfg(test)]
+        fixture_root: root.to_path_buf(),
     };
     REGISTRY
         .lock()
@@ -361,9 +792,14 @@ fn start(
 }
 
 /// Read a pipe in chunks on a background thread, appending raw bytes to the shared ring buffer.
-fn spawn_drain<R: std::io::Read + Send + 'static>(pipe: Option<R>, out: Arc<Mutex<RingBuf>>) {
+fn spawn_drain<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    out: Arc<Mutex<RingBuf>>,
+    lifetime: DrainLifetime<ProcessOwnership>,
+) {
     if let Some(mut p) = pipe {
         std::thread::spawn(move || {
+            let _lifetime = lifetime;
             let mut buf = [0u8; 8192];
             loop {
                 match p.read(&mut buf) {
@@ -388,20 +824,12 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(pipe: Option<R>, out: Arc<Mute
 fn kill_tree(entry: &ProcEntry) {
     let mut child = entry.child.lock().unwrap_or_else(|e| e.into_inner());
     crate::core::proctree::kill_tree(&mut child, &entry.containment);
-    entry.done.store(true, Ordering::Relaxed);
+    mark_finished(&entry.finished_at, &entry.done, Instant::now());
     entry
         .sandbox
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .finish(crate::sandbox::runner::Outcome::Exit(None));
-    if entry
-        .finished_at
-        .lock()
-        .map(|g| g.is_none())
-        .unwrap_or(false)
-    {
-        *entry.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-    }
     // Wake a `wait` immediately rather than leaving it to sit out its remaining timeout.
     signal_done(&entry.notify);
 }
@@ -413,11 +841,100 @@ fn kill_tree(entry: &ProcEntry) {
 pub fn kill_all() {
     let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     for entry in reg.values() {
-        if !entry.done.load(Ordering::Relaxed) {
+        if !entry.done.load(Ordering::Acquire) {
             kill_tree(entry);
         }
     }
     reg.clear();
+}
+
+/// One background process, as the jobs panel shows it: the handle, whether it is still running, how
+/// long it has run, and the command. A pure snapshot — copied out under the registry lock so the UI
+/// never holds it.
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub id: String,
+    pub running: bool,
+    /// Human elapsed, e.g. `7m03s` (or `3s`). For a finished process this is its total run time.
+    pub elapsed: String,
+    pub command: String,
+}
+
+/// A snapshot of every background process this process has started, newest handle last. Scope-blind
+/// on purpose: the jobs panel is a whole-app view, so a sub-agent's dev server is visible from the top
+/// level (its output stays scope-gated — the panel only names it). Running processes sort first so the
+/// interesting rows are on top; the caller decides how many rows to show.
+pub fn snapshot() -> Vec<JobInfo> {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rows: Vec<JobInfo> = reg
+        .iter()
+        .map(|(id, e)| JobInfo {
+            id: id.clone(),
+            running: !e.done.load(Ordering::Acquire),
+            elapsed: elapsed_label(e.elapsed()),
+            command: e.command.clone(),
+        })
+        .collect();
+    // Running first, then by handle number (proc_2 before proc_10) so the order is stable.
+    rows.sort_by(|a, b| {
+        b.running
+            .cmp(&a.running)
+            .then_with(|| numeric_handle(&a.id).cmp(&numeric_handle(&b.id)))
+    });
+    rows
+}
+
+/// The numeric tail of a `proc_<n>` handle, for a stable sort. Unparseable → 0 (sorts first).
+fn numeric_handle(id: &str) -> u64 {
+    id.rsplit('_')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Kill one background process by handle from OUTSIDE the tool path — the jobs panel's stop key.
+/// SCOPE-BLIND on purpose (unlike the `process` tool's `kill`, which is scoped): the panel is a
+/// whole-app view, so it must be able to stop a dev server a sub-agent started, exactly as the panel
+/// shows it. Returns a short human note for the caller to display.
+pub fn kill_by_id(id: &str) -> String {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    match reg.get(id) {
+        Some(e) if !e.done.load(Ordering::Acquire) => {
+            kill_tree(e);
+            format!("✓ stopped {id}")
+        }
+        Some(_) => format!("{id} already exited"),
+        None => format!("no such process '{id}'"),
+    }
+}
+
+/// The retained output of one background process by handle, from OUTSIDE the tool path — the jobs
+/// panel's log key. SCOPE-BLIND for the same reason as [`kill_by_id`] (the panel is a whole-app view).
+/// Returns a `(status, body)` pair the panel renders; an unknown handle yields a short note as the
+/// body. The body is the reverse-chronological tail capped at `limit` lines, so a chatty dev server's
+/// log stays readable rather than dumping the whole 200 KiB ring.
+pub fn log_by_id(id: &str, limit: usize) -> Option<(String, String)> {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let e = reg.get(id)?;
+    let status = e.status_label();
+    let body = {
+        let buf = e.out.lock().unwrap_or_else(|e| e.into_inner());
+        buf.text()
+    };
+    Some((status, tail_lines(&body, limit)))
+}
+
+/// The last `limit` non-empty lines of `body`, with a leading note when earlier lines were dropped.
+/// Kept here (not in the UI) so the cap and the marker are one fact the panel cannot drift from.
+fn tail_lines(body: &str, limit: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= limit {
+        return body.to_string();
+    }
+    let skip = lines.len() - limit;
+    let mut out = format!("… {skip} earlier line(s) hidden (full log via process action=log)\n");
+    out.push_str(&lines[skip..].join("\n"));
+    out
 }
 
 /// `process` — manage long-running background commands (start/list/log/status/wait/kill/write).
@@ -435,10 +952,8 @@ impl Tool for Process {
         "process"
     }
     fn description(&self) -> &str {
-        "Run and manage LONG-RUNNING background commands (dev servers, watchers, long builds) that \
-         shell_run's cap would kill. action=start returns a proc_<n> handle; then wait (blocks \
-         until exit), log (cursor → only new output), status/kill/write. Use shell_run for \
-         quick commands."
+        "Background builds/servers beyond shell_run timeout. start returns proc_<n>; wait blocks \
+         to exit, log cursor reads new output; status/kill/write manage it. Quick commands: shell_run."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -446,14 +961,14 @@ impl Tool for Process {
             "additionalProperties": false,
             "properties": {
                 "action": {"type": "string", "enum": ["start", "list", "log", "status", "wait", "kill", "write"]},
-                "command": {"type": "string", "description": "the command (start)"},
+                "command": {"type": "string", "description": "command (start)"},
                 "cwd": {"type": "string", "description": "working dir (start)"},
-                "network": {"type": "boolean", "description": "network access, even to bind a port (start; approval-gated)"},
-                "id": {"type": "string", "description": "proc_<n> handle (all but start/list)"},
-                "cursor": {"type": "integer", "description": "a previous next_cursor: only newer output (log/wait)"},
+                "network": {"type": "boolean", "description": "network, including port binding (start; approval-gated)"},
+                "id": {"type": "string", "description": "proc_<n> (except start/list)"},
+                "cursor": {"type": "integer", "description": "prior next_cursor: new output only (log/wait)"},
                 "format": crate::agent::result_format::schema_property(),
-                "timeout_secs": {"type": "integer", "description": "seconds to block (wait; default 30)"},
-                "input": {"type": "string", "description": "stdin text (write)"},
+                "timeout_secs": {"type": "integer", "description": "wait seconds (default 30)"},
+                "input": {"type": "string", "description": "stdin (write)"},
                 "enter": {"type": "boolean", "description": "append newline (write; default true)"}
             },
             "required": ["action"]
@@ -531,7 +1046,7 @@ impl Tool for Process {
                     s.push_str(&format!(
                         "  {id}  {:<11}  {:>6}  {}\n",
                         e.status_label(),
-                        elapsed_label(e.started.elapsed()),
+                        elapsed_label(e.elapsed()),
                         e.command
                     ));
                 }
@@ -568,7 +1083,7 @@ impl Tool for Process {
                 Ok(format!(
                     "{id}: {} (elapsed {})",
                     e.status_label(),
-                    elapsed_label(e.started.elapsed())
+                    elapsed_label(e.elapsed())
                 ))
             }
             "wait" => {
@@ -607,7 +1122,7 @@ impl Tool for Process {
                 let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
                 let e = lookup(&reg, &id, &scope)?;
                 let buf = e.out.lock().unwrap_or_else(|e| e.into_inner());
-                let exited = done.load(Ordering::Relaxed);
+                let exited = done.load(Ordering::Acquire);
                 // Cursor support on BOTH branches: a wait that times out is the natural point to
                 // resume from, and re-sending the whole buffer each round is the cost this fixes.
                 if let Some(c) = cursor {
@@ -685,16 +1200,53 @@ impl Tool for Process {
 mod tests {
     use super::*;
 
-    /// The pool and `kill_all` are process-global, so these tests cannot run concurrently with each
-    /// other: one test's `kill_all` would reap another's live handle. Every test takes this first.
+    /// Lock order is HOME then pool. Keep the owned home/root alive until actual ownership drops,
+    /// not merely until the wrapper's `done` flag or a log observation is published.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    struct Fixture {
+        _home_lock: std::sync::MutexGuard<'static, ()>,
+        _serial: std::sync::MutexGuard<'static, ()>,
+        env: Option<crate::core::config::EnvGuard>,
+        directory: crate::core::file_placement::tests::TestDir,
+        root: PathBuf,
     }
 
-    fn root() -> PathBuf {
-        std::env::current_dir().unwrap().canonicalize().unwrap()
+    fn serial() -> Fixture {
+        let home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let directory = crate::core::file_placement::tests::TestDir::new();
+        let root = directory.path().join("workspace");
+        let home = directory.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        let env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        Fixture {
+            _home_lock: home_lock,
+            _serial: serial,
+            env: Some(env),
+            directory,
+            root,
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let owned: Vec<_> = REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(_, entry)| entry.fixture_root == self.root)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in owned {
+                forget(&id);
+            }
+            drop(self.env.take());
+            // The directory field is dropped after the environment is restored.
+            let _ = self.directory.path();
+        }
     }
 
     /// Run `f` with `scope` pinned as the execution scope, exactly as the executor does for a tool
@@ -705,6 +1257,18 @@ mod tests {
     }
 
     fn forget(id: &str) {
+        let lifetime = REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|entry| Arc::clone(&entry._lifetime));
+        if let Some(lifetime) = lifetime {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !lifetime.released.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(lifetime.released.load(Ordering::Acquire), "owned process {id} must prove tree/pipe settlement and release ownership before teardown");
+        }
         REGISTRY
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -712,35 +1276,218 @@ mod tests {
     }
 
     #[test]
+    fn physical_settlement_waits_for_both_pipe_workers_after_registry_drop() {
+        struct Owner(std::sync::mpsc::Sender<()>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        fn quarantine(_: Owner) {
+            panic!("proven fixture must not quarantine");
+        }
+        let (released, release_seen) = std::sync::mpsc::channel();
+        let lifetime = Arc::new(SettlementLifetime::new(Owner(released), quarantine));
+        let stdout = lifetime.drain();
+        let stderr = lifetime.drain();
+        let monitor = Arc::clone(&lifetime);
+        let (started, ready) = std::sync::mpsc::channel();
+        let (allow_exit, wait) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let stdout = stdout;
+            started.send(()).unwrap();
+            let allowed = wait.recv_timeout(Duration::from_secs(5));
+            drop(stdout);
+            allowed.unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        monitor.prove_tree_settled();
+        drop(lifetime); // Observer/registry detached; actual drain tokens retain exclusion.
+        drop(stderr);
+        assert!(matches!(
+            release_seen.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        allow_exit.send(()).unwrap();
+        worker.join().unwrap();
+        release_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Settled output history may retain the monitor Arc without retaining exclusion.
+        drop(monitor);
+    }
+
+    #[test]
+    fn unknown_tree_settlement_quarantines_ownership_on_final_worker_drop() {
+        struct Owner {
+            dropped: std::sync::mpsc::Sender<()>,
+            quarantined: std::sync::mpsc::Sender<()>,
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
+            }
+        }
+        fn quarantine(owner: Owner) {
+            owner.quarantined.send(()).unwrap();
+            // This fixture carries only channel senders, not real process/lease ownership.
+            std::mem::forget(owner);
+        }
+        let (dropped, seen_drop) = std::sync::mpsc::channel();
+        let (quarantined, seen_quarantine) = std::sync::mpsc::channel();
+        let lifetime = Arc::new(SettlementLifetime::new(
+            Owner {
+                dropped,
+                quarantined,
+            },
+            quarantine,
+        ));
+        let drain = lifetime.drain();
+        drop(lifetime);
+        assert!(matches!(
+            seen_quarantine.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(drain);
+        seen_quarantine
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            seen_drop.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn elapsed_duration_running_advances_with_now() {
+        let started = Instant::now();
+        assert_eq!(elapsed_duration(started, None, started), Duration::ZERO);
+        assert_eq!(
+            elapsed_duration(started, None, started + Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            elapsed_duration(started, None, started + Duration::from_secs(63)),
+            Duration::from_secs(63)
+        );
+    }
+
+    #[test]
+    fn elapsed_duration_finished_freezes_at_first_completion() {
+        let started = Instant::now();
+        let finished = started + Duration::from_secs(63);
+        for now in [finished, finished + Duration::from_secs(600)] {
+            assert_eq!(
+                elapsed_duration(started, Some(finished), now),
+                Duration::from_secs(63)
+            );
+        }
+    }
+
+    #[test]
+    fn elapsed_duration_saturates_when_end_precedes_start() {
+        let earlier = Instant::now();
+        let started = earlier + Duration::from_secs(1);
+        assert_eq!(elapsed_duration(started, None, earlier), Duration::ZERO);
+        assert_eq!(
+            elapsed_duration(started, Some(earlier), started + Duration::from_secs(60)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn mark_finished_records_first_timestamp_before_done() {
+        let finished_at = Mutex::new(None);
+        let done = AtomicBool::new(false);
+        let first = Instant::now();
+        mark_finished(&finished_at, &done, first);
+        assert!(done.load(Ordering::Acquire));
+        assert_eq!(*finished_at.lock().unwrap(), Some(first));
+
+        // A later exit/kill observation must not replace the first completion timestamp.
+        mark_finished(&finished_at, &done, first + Duration::from_secs(60));
+        assert!(done.load(Ordering::Acquire));
+        assert_eq!(*finished_at.lock().unwrap(), Some(first));
+    }
+
+    #[test]
     fn start_log_wait_lifecycle() {
         let _s = serial();
-        let t = Process::new(root());
-        let started = t
-            .execute(&serde_json::json!({"action":"start","command":"echo hello-bg"}))
-            .unwrap();
-        let id = started.split_whitespace().next().unwrap().to_string();
-        assert!(id.starts_with("proc_"));
+        scoped("duration-lifecycle", || {
+            let t = Process::new(_s.root.clone());
+            let started = t
+                .execute(&serde_json::json!({"action":"start","command":"echo hello-bg"}))
+                .unwrap();
+            let id = started.split_whitespace().next().unwrap().to_string();
+            assert!(id.starts_with("proc_"));
 
-        // Wait for it to finish, then the log must contain the output.
-        let waited = t
-            .execute(&serde_json::json!({"action":"wait","id":id,"timeout_secs":10}))
-            .unwrap();
-        assert!(waited.contains("hello-bg"), "got: {waited}");
-        assert!(
-            waited.contains("exited("),
-            "should be exited; got: {waited}"
-        );
+            // Wait for it to finish, then the log must contain the output.
+            let waited = t
+                .execute(&serde_json::json!({"action":"wait","id":id,"timeout_secs":10}))
+                .unwrap();
+            assert!(waited.contains("hello-bg"), "got: {waited}");
+            assert!(
+                waited.contains("exited("),
+                "should be exited; got: {waited}"
+            );
 
-        let listed = t.execute(&serde_json::json!({"action":"list"})).unwrap();
-        assert!(listed.contains(&id));
+            let duration = {
+                let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+                let e = lookup(&reg, &id, "duration-lifecycle").unwrap();
+                assert!(e.done.load(Ordering::Acquire));
+                let finished = e.finished_at.lock().unwrap().expect("completion timestamp");
+                assert!(
+                    finished >= e.started,
+                    "start must precede monitor completion"
+                );
+                let duration = elapsed_duration(e.started, Some(finished), finished);
+                assert_eq!(e.elapsed(), duration);
+                assert_eq!(
+                    elapsed_duration(
+                        e.started,
+                        Some(finished),
+                        finished + Duration::from_secs(600)
+                    ),
+                    duration
+                );
+                duration
+            };
+            let expected_elapsed = elapsed_label(duration);
 
-        forget(&id);
+            // Completion freezes duration, but retains this owned handle in history and its logs.
+            let row = snapshot().into_iter().find(|row| row.id == id).unwrap();
+            assert!(!row.running);
+            assert_eq!(row.elapsed, expected_elapsed);
+            let listed = t.execute(&serde_json::json!({"action":"list"})).unwrap();
+            assert!(
+                listed.contains(&id),
+                "completed handle lost from list: {listed}"
+            );
+            assert!(listed.contains(&expected_elapsed), "got: {listed}");
+            let status = t
+                .execute(&serde_json::json!({"action":"status","id":id}))
+                .unwrap();
+            assert!(
+                status.contains(&format!("elapsed {expected_elapsed}")),
+                "got: {status}"
+            );
+            let log = t
+                .execute(&serde_json::json!({"action":"log","id":id}))
+                .unwrap();
+            assert!(log.contains("hello-bg"), "completed log lost: {log}");
+            let (panel_status, panel_log) = log_by_id(&id, 20).unwrap();
+            assert!(panel_status.contains("exited("), "got: {panel_status}");
+            assert!(
+                panel_log.contains("hello-bg"),
+                "completed panel log lost: {panel_log}"
+            );
+
+            forget(&id);
+        });
     }
 
     #[test]
     fn unknown_id_errors() {
         let _s = serial();
-        let t = Process::new(root());
+        let t = Process::new(_s.root.clone());
         assert!(t
             .execute(&serde_json::json!({"action":"log","id":"proc_999999"}))
             .is_err());
@@ -749,9 +1496,55 @@ mod tests {
     }
 
     #[test]
+    fn out_of_band_log_and_kill_by_handle() {
+        let _s = serial();
+        // `log_by_id` is the jobs-panel reader: it must see a scope's process without the caller
+        // pinning that scope (the panel is a whole-app view).
+        let id = scoped("panel-scope", || {
+            Process::new(_s.root.clone())
+                .execute(&serde_json::json!({"action":"start","command":"echo panel-log"}))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string()
+        });
+        // Poll for the output to land (the drain thread is async).
+        let mut got = None;
+        for _ in 0..50 {
+            if let Some((status, body)) = log_by_id(&id, 200) {
+                if body.contains("panel-log") {
+                    got = Some(status);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(got.is_some(), "log_by_id must read another scope's output");
+        // Unknown handle → None (the panel says "already gone" rather than panicking).
+        assert!(log_by_id("proc_does_not_exist", 20).is_none());
+        // kill_by_id on an unknown handle is a note, not a panic.
+        assert!(kill_by_id("proc_does_not_exist").contains("no such process"));
+        forget(&id);
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_end_and_marks_what_was_hidden() {
+        assert_eq!(
+            tail_lines("a\nb\nc", 5),
+            "a\nb\nc",
+            "short bodies pass through"
+        );
+        let t = tail_lines("l1\nl2\nl3\nl4\nl5", 2);
+        assert!(t.contains("3 earlier line(s) hidden"), "{t}");
+        assert!(t.ends_with("l4\nl5"), "{t}");
+        assert!(!t.contains("l1"), "the tail must drop the oldest lines");
+    }
+
+    #[test]
     fn wait_returns_as_soon_as_the_process_exits() {
         let _s = serial();
-        let t = Process::new(root());
+        let t = Process::new(_s.root.clone());
         let started = t
             .execute(&serde_json::json!({"action":"start","command":"echo quick"}))
             .unwrap();
@@ -774,7 +1567,7 @@ mod tests {
     #[test]
     fn log_with_a_cursor_returns_only_new_output() {
         let _s = serial();
-        let t = Process::new(root());
+        let t = Process::new(_s.root.clone());
         let started = t
             .execute(&serde_json::json!({"action":"start","command":"echo first-line"}))
             .unwrap();
@@ -806,7 +1599,7 @@ mod tests {
     #[test]
     fn handles_are_private_to_their_execution_scope() {
         let _s = serial();
-        let t = Process::new(root());
+        let t = Process::new(_s.root.clone());
         let started = scoped("iso-owner", || {
             t.execute(&serde_json::json!({"action":"start","command":"echo owned"}))
                 .unwrap()
@@ -843,7 +1636,7 @@ mod tests {
     #[test]
     fn kill_all_reaps_every_scope() {
         let _s = serial();
-        let t = Process::new(root());
+        let t = Process::new(_s.root.clone());
         let a = scoped("reap-a", || {
             t.execute(&serde_json::json!({"action":"start","command":"echo a"}))
                 .unwrap()
@@ -856,7 +1649,24 @@ mod tests {
             a.split_whitespace().next().unwrap().to_string(),
             b.split_whitespace().next().unwrap().to_string(),
         );
+        let lifetimes: Vec<_> = {
+            let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            [&ia, &ib]
+                .iter()
+                .map(|id| Arc::clone(&reg[*id]._lifetime))
+                .collect()
+        };
         kill_all();
+        for lifetime in lifetimes {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !lifetime.released.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                lifetime.released.load(Ordering::Acquire),
+                "fixture-owned killed body must settle before teardown"
+            );
+        }
         let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             !reg.contains_key(&ia) && !reg.contains_key(&ib),
