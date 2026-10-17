@@ -97,11 +97,11 @@ pub fn prepare(cmd: &mut Command) {
         use std::os::unix::process::CommandExt;
         // SAFETY: `setsid` is async-signal-safe and is the documented way to detach a child into a
         // new session/group from the post-fork, pre-exec hook. It touches no allocator or lock.
+        // A failure fails the spawn: without a group of its own, `Containment::Group(child.id())`
+        // would name a group that does not exist, and settlement would read as proven while the
+        // child still runs.
         unsafe {
-            cmd.pre_exec(|| {
-                libc_setsid();
-                Ok(())
-            });
+            cmd.pre_exec(libc_setsid);
         }
     }
     #[cfg(windows)]
@@ -828,11 +828,10 @@ pub fn prepare_tokio(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     {
         // SAFETY: as `prepare` — `setsid` is async-signal-safe and touches no allocator or lock.
+        // A failed `setsid` fails the spawn rather than leaving an uncontained child that would
+        // later read as settled.
         unsafe {
-            cmd.pre_exec(|| {
-                libc_setsid();
-                Ok(())
-            });
+            cmd.pre_exec(libc_setsid);
         }
     }
     #[cfg(windows)]
@@ -892,9 +891,12 @@ fn group_is_empty(pgid: i32) -> bool {
 // pulled from `libc`: these two symbols are all we need, and the crate is not in the dependency
 // tree (single static binary posture — see Cargo.toml).
 #[cfg(unix)]
-fn libc_setsid() {
-    // SAFETY: no arguments, no memory touched; a failure (already a leader) is ignored by design.
-    unsafe { c_setsid() };
+fn libc_setsid() -> std::io::Result<()> {
+    // SAFETY: no arguments, no memory touched.
+    if unsafe { c_setsid() } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
