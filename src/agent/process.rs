@@ -42,6 +42,11 @@ const MAX_PROCESSES: usize = 16;
 /// Rolling merged stdout+stderr buffer per process (bytes); older output is dropped from the front.
 const OUTPUT_CAP: usize = 200 * 1024;
 
+/// How long a monitor waits for a contained tree to become provably empty after the wrapper exits.
+/// A killed tree empties immediately; a descendant that deliberately left the containment boundary
+/// never does, and that must leave the ownership charged rather than spin a thread for the session.
+const TREE_SETTLE_WINDOW: Duration = Duration::from_secs(30);
+
 /// A bounded byte buffer: appends keep only the most-recent `cap` bytes (a coarse ring).
 ///
 /// `start_offset` is the ABSOLUTE position of `bytes[0]` in the process's whole output stream, so it
@@ -746,19 +751,22 @@ fn start(
                     }
                 }
             }
+            let settle_deadline = Instant::now() + TREE_SETTLE_WINDOW;
             loop {
                 match containment.known_quiescent() {
                     Ok(Some(true)) => {
                         lifetime.prove_tree_settled();
                         break;
                     }
-                    Ok(Some(false)) if strict_unknown => {
+                    Ok(Some(false)) if strict_unknown && Instant::now() < settle_deadline => {
                         std::thread::sleep(Duration::from_millis(60))
                     }
                     // Gate-OFF observers retain legacy lifecycle without a permanent monitor.
+                    // Past the window a still-live descendant is unprovable: stop observing and let
+                    // the final lifetime drop quarantine exclusion instead of claiming settlement.
                     Ok(Some(false)) => break,
-                    // None/Unix detached descendants/errors cannot prove settlement. The final
-                    // lifetime drop quarantines exclusion instead of silently admitting natives.
+                    // None/errors cannot prove settlement. The final lifetime drop quarantines
+                    // exclusion instead of silently admitting natives.
                     Ok(None) | Err(_) => break,
                 }
             }

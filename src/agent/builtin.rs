@@ -5320,13 +5320,20 @@ impl Drop for ShellSettlement {
                     let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
                     crate::core::proctree::kill_tree(&mut child, &containment);
                 }
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 loop {
                     match containment.known_quiescent() {
                         Ok(Some(true)) => {
                             lifetime.prove_tree_settled();
                             break;
                         }
-                        Ok(Some(false)) => std::thread::sleep(Duration::from_millis(40)),
+                        // A killed tree empties at once. A descendant that left the containment
+                        // boundary never does; stop observing and let the final ownership drop
+                        // quarantine it rather than spin for the session.
+                        Ok(Some(false)) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(40))
+                        }
+                        Ok(Some(false)) => break,
                         Ok(None) | Err(_) => break, // Final ownership drop quarantines unknown trees.
                     }
                 }

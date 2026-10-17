@@ -3195,6 +3195,15 @@ impl RepoContext {
         let wt_canon = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
 
         let home = crate::core::config::aizen_home();
+        // Native admission refuses an alias whose canonical parent differs from its spelling, and
+        // `AIZEN_HOME` is taken verbatim (an 8.3 short name or mixed case is common on Windows).
+        // Bind one canonical spelling here so every metadata path derived below agrees with the
+        // guard instead of failing on the user's first checkpoint. `discover` already creates the
+        // store directories under this home.
+        fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        let home = fs::canonicalize(&home)
+            .map(|path| strip_windows_verbatim(&path))
+            .unwrap_or(home);
         // Stable identity via the home-level registry (survives repo moves; distinguishes clones).
         // Fails open to the legacy `repo-<fnv(path)>` ids if the registry is unavailable.
         let (repo_id, worktree_id) = resolve_identity(&home, &common_canon, &wt_canon, &root)?;
@@ -7908,11 +7917,37 @@ mod tests {
 
     /// Scratch dir for one test, following this crate's convention (no `tempfile` dependency — the
     /// shipped binary stays dependency-thin). Wiped first so a killed run cannot poison the next.
+    ///
+    /// Canonicalized on creation: native resource admission refuses an alias whose canonical parent
+    /// differs from its supplied spelling, and a CI temp root carrying an 8.3 short component
+    /// (`C:\Users\RUNNER~1\AppData\Local\Temp`) is exactly such an alias. Returning the canonical
+    /// path keeps the fixture honest instead of weakening that check. The Windows verbatim prefix is
+    /// dropped afterwards so git and the other fixtures see an ordinary drive path.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aizen-tm-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("creating scratch dir");
-        dir
+        let canonical = fs::canonicalize(&dir).expect("canonical scratch dir");
+        strip_windows_verbatim(&canonical)
+    }
+
+    /// Native admission requires one canonical spelling. A raw `temp_dir()` on a host whose profile
+    /// has an 8.3 short name (`RUNNER~1`) is an alias, and every fixture path derived from it is then
+    /// refused — this pins the fixture invariant, not a relaxation of the guard.
+    #[test]
+    fn scratch_fixtures_are_canonical_for_native_admission() {
+        let fixture = scratch("canonical-fixture");
+        let home = fixture.join("home");
+        fs::create_dir_all(&home).unwrap();
+        assert_eq!(
+            strip_windows_verbatim(&fs::canonicalize(&home).unwrap()),
+            home,
+            "fixture home must already be in canonical spelling"
+        );
+        let (planned, guard) = plan_metadata_directory(&home.join("timemachine")).unwrap();
+        assert_eq!(strip_windows_verbatim(&planned), home.join("timemachine"));
+        guard.verify().unwrap();
+        let _ = fs::remove_dir_all(&fixture);
     }
 
     #[test]
@@ -8019,6 +8054,12 @@ mod tests {
             eprintln!("skipping: no usable git on this machine");
             return;
         }
+        // `AIZEN_WORKSPACE_ROOT` is process-global: another test that pins its own workspace must
+        // not observe this override, and a concurrent test's removal must not make a later
+        // `RepoContext::current()` silently discover from the harness cwd instead of its fixture.
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tmp = scratch("repo-context-env");
         let repo = tmp.join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -8040,9 +8081,8 @@ mod tests {
             .expect("git commit failed");
 
         // Set the env var and verify current() picks it up.
-        std::env::set_var("AIZEN_WORKSPACE_ROOT", &repo);
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_WORKSPACE_ROOT", &repo)]);
         let ctx = RepoContext::current().unwrap();
-        std::env::remove_var("AIZEN_WORKSPACE_ROOT");
         assert_eq!(ctx.root, repo.canonicalize().unwrap());
 
         let _ = fs::remove_dir_all(&tmp);
@@ -8115,7 +8155,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let home = scratch("restore-home");
-        std::env::set_var("AIZEN_HOME", &home);
+        // EnvGuard, not set_var/remove_var: a panicking assertion must not leak AIZEN_HOME into the
+        // rest of the process, and a restored prior value must not depend on reaching the last line.
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", home.as_os_str())]);
         let root = scratch("restore-repo");
         let init = git_cmd()
             .current_dir(&root)
@@ -8149,7 +8191,6 @@ mod tests {
             "two",
             "the preimage checkpoint brought it back"
         );
-        std::env::remove_var("AIZEN_HOME");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&home);
     }

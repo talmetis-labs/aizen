@@ -69,13 +69,19 @@ impl Containment {
         !matches!(self, Self::None)
     }
 
-    /// Read-only proof that every contained process has exited. A Unix process group cannot prove
-    /// that detached descendants are gone, and absent containment is likewise unknown. Callers must
+    /// Read-only proof that the containment we created holds no live process. A Windows job object
+    /// accounts for every descendant; a Unix process group is the containment boundary we actually
+    /// establish (`setsid` at spawn), so an empty group is the strongest proof available there. A
+    /// descendant that deliberately leaves that group is outside the containment boundary — no
+    /// portable mechanism observes it — and absent containment is likewise unknown. Callers must
     /// retain physical-effect ownership for `None` or errors rather than trusting wrapper exit.
     pub(crate) fn known_quiescent(&self) -> std::io::Result<Option<bool>> {
         match self {
             #[cfg(windows)]
             Self::Job(job) => job.known_quiescent(),
+            #[cfg(unix)]
+            Self::Group(pgid) if *pgid > 0 => Ok(Some(group_is_empty(*pgid))),
+            // A non-positive group id cannot be one we created; never signal the caller's own group.
             #[cfg(unix)]
             Self::Group(_) => Ok(None),
             Self::None => Ok(None),
@@ -868,6 +874,20 @@ extern "C" {
     fn c_killpg(pgrp: i32, sig: i32) -> i32;
 }
 
+/// `ESRCH` is 3 on both Linux and Darwin. A process group we created with `setsid` reports it once
+/// its last member is gone; `EPERM` (or any other failure) means "may still exist" and keeps
+/// ownership charged.
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+/// Is the process group we created empty? Signal 0 performs only the existence/permission check.
+#[cfg(unix)]
+fn group_is_empty(pgid: i32) -> bool {
+    // SAFETY: signal 0 sends nothing; the only effect is the kernel's group lookup.
+    let result = unsafe { c_killpg(pgid, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH)
+}
+
 // Thin wrappers so the `unsafe` call sites above read as one operation each. Declared rather than
 // pulled from `libc`: these two symbols are all we need, and the crate is not in the dependency
 // tree (single static binary posture — see Cargo.toml).
@@ -1564,8 +1584,34 @@ mod tests {
     #[test]
     fn missing_containment_never_proves_physical_settlement() {
         assert_eq!(Containment::None.known_quiescent().unwrap(), None);
+        // A group id we could not have created must never be signalled.
         #[cfg(unix)]
         assert_eq!(Containment::Group(0).known_quiescent().unwrap(), None);
+    }
+
+    /// The Unix counterpart of the Job Object proof: settlement is reported only once the group we
+    /// created is empty, never on wrapper exit alone. Before this, every Unix strict body reported
+    /// UNKNOWN forever, so hooks discarded their verdicts and process fixtures aborted at teardown.
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_proves_settlement_only_after_its_members_exit() {
+        let mut cmd = shell("sleep 5");
+        prepare(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn shell");
+        let containment = contain(&child);
+        assert!(
+            matches!(containment.known_quiescent().unwrap(), Some(false)),
+            "a live group must not read as settled: {containment:?}"
+        );
+        kill_tree(&mut child, &containment);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while containment.known_quiescent().unwrap() != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed group never settled: {containment:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The shell wrapper Aizen actually uses, so the test exercises the real spawn shape.
