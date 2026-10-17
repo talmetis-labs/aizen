@@ -580,7 +580,7 @@ pub(crate) fn transact(root: &Path, staging: &Path, moves: Vec<Move>) -> Result<
             )?;
             intent.pending = true;
             save_intent(root, &intent)?;
-            fs::rename(&source, &destination).with_context(|| {
+            rename_preserving_modes(&source, &destination).with_context(|| {
                 format!("moving {} to {}", source.display(), destination.display())
             })?;
             sync_dirs(&source, &destination);
@@ -604,6 +604,34 @@ pub(crate) fn transact(root: &Path, staging: &Path, moves: Vec<Move>) -> Result<
             Err(error)
         }
     }
+}
+
+/// Rename a store entry, temporarily restoring owner-write on a directory that needs it.
+///
+/// Renaming a DIRECTORY rewrites its `..` entry, so both Linux and macOS refuse it while the
+/// directory itself is read-only. A skill bundle may legitimately be owner-read-only (0o500), and
+/// moving it into `.archive` — or rolling it back — must still work. The write bit is added only
+/// for the duration of the rename and the original mode is restored at the destination, so the
+/// live and archived trees keep the modes they arrived with.
+fn rename_preserving_modes(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.is_dir() {
+            let mode = metadata.permissions().mode();
+            if mode & 0o200 == 0 {
+                fs::set_permissions(source, fs::Permissions::from_mode(mode | 0o200))?;
+                let renamed = fs::rename(source, destination);
+                let restore = fs::set_permissions(destination, fs::Permissions::from_mode(mode));
+                renamed?;
+                restore?;
+                return Ok(());
+            }
+        }
+    }
+    fs::rename(source, destination)?;
+    Ok(())
 }
 
 fn sync_dirs(_source: &Path, _destination: &Path) {
@@ -674,7 +702,7 @@ pub(crate) fn recover(root: &Path) -> Result<()> {
                             .parent()
                             .context("skill rollback missing parent")?,
                     )?;
-                    fs::rename(&source, &destination)?;
+                    rename_preserving_modes(&source, &destination)?;
                     sync_dirs(&source, &destination);
                 }
                 // Recovery itself may have been killed after this rename but before decrementing.

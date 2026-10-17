@@ -545,9 +545,21 @@ fn existing_evidence_opener_refuses_symlinks_and_nonregular_descriptors() {
     assert!(open_existing_read_only(&link).is_err());
     assert!(existing_regular_stamp(&fs::File::open(fixture.path()).unwrap()).is_err());
     let socket = fixture.path().join("socket.bin");
-    let _listener = UnixListener::bind(&socket).unwrap();
+    drop(socket);
+    // A Unix socket address is capped near 104 bytes (SUN_LEN), and this fixture's path plus the
+    // macOS per-user temp root is longer than that. Bind a short-named socket directly in the temp
+    // root instead of relaxing the opener: the file under test only has to be a socket.
+    let socket_dir = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let socket = socket_dir.join(format!(
+        "aizsock-{}-{}",
+        std::process::id(),
+        crate::core::persist::unique_sequence()
+    ));
+    let listener = UnixListener::bind(&socket).unwrap();
     assert!(read_existing_regular(&socket, 4).is_err());
     assert!(open_existing_read_only(&socket).is_err());
+    drop(listener);
+    let _ = fs::remove_file(&socket);
     assert_eq!(fs::read(target).unwrap(), b"data");
 }
 

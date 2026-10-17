@@ -343,11 +343,47 @@ impl std::error::Error for BoundedExecutionError {
 
 pub(crate) type BoundedOwner = Box<dyn Send + Sync + 'static>;
 static BOUNDED_QUARANTINE: std::sync::Mutex<Vec<BoundedOwner>> = std::sync::Mutex::new(Vec::new());
+#[cfg(not(test))]
 static BOUNDED_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// In tests one process hosts many independent fixtures. A body that cannot prove settlement
+/// belongs to the fixture that spawned it, so the latch is kept per lock namespace — the same rule
+/// the lock registries follow. Otherwise one fixture's unprovable body makes every later test in
+/// the run refuse to start work ("tool effects are not settled"), which is cross-test interference,
+/// not the fail-closed behavior the latch exists for.
+#[cfg(test)]
+static BOUNDED_UNKNOWN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn bounded_unknown_latched() -> bool {
+    #[cfg(not(test))]
+    {
+        BOUNDED_UNKNOWN.load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(test)]
+    {
+        let namespace = crate::core::workspace_txn::test_namespace_key();
+        BOUNDED_UNKNOWN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|latched| latched.contains(&namespace))
+    }
+}
+
+fn latch_bounded_unknown_now() {
+    #[cfg(not(test))]
+    BOUNDED_UNKNOWN.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    BOUNDED_UNKNOWN
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(crate::core::workspace_txn::test_namespace_key());
+}
 
 /// Only strict bounded bodies latch this; legacy serial UNKNOWN results never block new work.
 pub(crate) fn check_bounded_effects() -> Result<(), BoundedExecutionError> {
-    if BOUNDED_UNKNOWN.load(std::sync::atomic::Ordering::Acquire) {
+    if bounded_unknown_latched() {
         Err(BoundedExecutionError {
             cause: std::io::Error::other(
                 "a bounded child has unverified physical effects until CLI exit",
@@ -361,7 +397,7 @@ pub(crate) fn check_bounded_effects() -> Result<(), BoundedExecutionError> {
 
 pub(crate) fn latch_bounded_unknown(strict: bool) {
     if strict {
-        BOUNDED_UNKNOWN.store(true, std::sync::atomic::Ordering::Release);
+        latch_bounded_unknown_now();
         crate::core::recovery::mark_effects_unsettled();
     }
 }
