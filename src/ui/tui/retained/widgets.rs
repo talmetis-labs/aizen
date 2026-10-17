@@ -15,11 +15,21 @@ pub(super) fn draw_overlay(
     overlay: &OverlaySnapshot,
     scroll: usize,
 ) -> (usize, Rect) {
-    // An informational overlay is READ, not clicked, so give it the room: a hard 84-column cap
-    // wrapped long child labels into three or four rows each and made the board much taller than the
-    // text it carried. Take almost the whole frame instead, and let the height follow the content up
-    // to the frame (the paragraph wraps, so nothing is clipped horizontally).
-    let width = area.width.saturating_sub(4).clamp(20, area.width.max(20));
+    // Two shapes, because the two kinds of overlay are read differently.
+    //
+    // A SELECTABLE overlay is a menu you answer: its rows are buttons and its content is short, so
+    // a full-width sheet would stretch one question and three options across the whole terminal and
+    // read as a stray line rather than a panel. Keep it a comfortable fixed measure.
+    //
+    // An informational overlay (the `/workflows` board) is READ: a hard 84-column cap wrapped long
+    // child labels into three or four rows each and made the board much taller than the text it
+    // carried, so it takes almost the whole frame and lets the paragraph wrap.
+    let selectable = overlay.selected.is_some();
+    let width = if selectable {
+        area.width.saturating_sub(4).clamp(20, 84)
+    } else {
+        area.width.saturating_sub(4).clamp(20, area.width.max(20))
+    };
     let height = (overlay.lines.len() as u16 + 5)
         .min(area.height.saturating_sub(1))
         .max(5);
@@ -66,8 +76,8 @@ pub(super) fn draw_overlay(
     // A SELECTABLE overlay is a menu: its rows must stay one screen row each so a mouse click can be
     // mapped back to a row index (`overlay_menu_hit`). Long rows are clipped at the panel edge, not
     // wrapped — wrapping would break the row↔line mapping the hit-test depends on. Informational
-    // overlays (no selection) keep wrapping and publish no geometry.
-    let selectable = overlay.selected.is_some();
+    // overlays (no selection) keep wrapping and publish no geometry. (`selectable` is decided above,
+    // with the width it implies.)
     let paragraph = if selectable {
         Paragraph::new(lines).scroll((clamped.min(u16::MAX as usize) as u16, 0))
     } else {
