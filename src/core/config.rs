@@ -123,6 +123,13 @@ fn resolve_default_home(base: &Path) -> PathBuf {
     base.join(".aizen")
 }
 
+/// [`resolve_default_home`] for the identity pin in the test suite, which must not depend on the
+/// process environment it happens to run under.
+#[cfg(test)]
+pub(crate) fn resolve_default_home_for_test(base: &Path) -> PathBuf {
+    resolve_default_home(base)
+}
+
 /// The project root for PROJECT-LOCAL customization (`./.aizen/`): the git repo top-level if we're
 /// in one, else the current dir. Repo-root-aware so launching `aizen` from a SUBDIR still finds the
 /// repo's `.aizen/` (R4 — fixes the cwd-relative footgun). `AIZEN_PROJECT_ROOT` overrides (tests + an
@@ -310,8 +317,9 @@ pub fn project_key() -> String {
 /// spawn `git rev-parse`, and stamping session provenance wants all three every autosave — three
 /// separate lookups would have meant three git spawns per turn.
 fn identity() -> (PathBuf, String, String) {
-    static CACHE: std::sync::Mutex<Option<(String, (PathBuf, String, String))>> =
-        std::sync::Mutex::new(None);
+    type WorkspaceIdentity = (PathBuf, String, String);
+    type CachedIdentity = Option<(String, WorkspaceIdentity)>;
+    static CACHE: std::sync::Mutex<CachedIdentity> = std::sync::Mutex::new(None);
     let cache_key = format!(
         "{}|{}",
         std::env::var("AIZEN_PROJECT_ROOT").unwrap_or_default(),

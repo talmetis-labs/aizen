@@ -195,6 +195,19 @@ pub(crate) fn where_report() -> String {
     );
     let _ = writeln!(s, "codebase idx : {}{}", idx.display(), exists(&idx));
     let _ = writeln!(s, "sessions     : {}", sessions_dir().display());
+    let (artifacts, scratch) = crate::cli::files_cmd::managed_roots(&root, &home);
+    for (label, path) in [("artifacts", &artifacts), ("scratch", &scratch)] {
+        let status = crate::cli::files_cmd::directory_status(path)
+            .err()
+            .map(|s| format!("   ({s})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            s,
+            "{label:<13}: {}{status}",
+            crate::cli::files_cmd::quoted_path(path)
+        );
+    }
+    let _ = writeln!(s, "               managed roots only; /files or aizen files lists paths/sizes without creating them");
     if let Some(n) = sessions_with_secrets() {
         let _ = writeln!(
             s,

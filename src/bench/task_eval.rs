@@ -21,12 +21,20 @@
 //! usage), the verify command's exit code, and the changed-file set. `bench-fixtures/loop-
 //! baseline.json` holds the steps/tokens each task took when its tape was recorded; a later run
 //! may use at most [`BASELINE_SLACK`] times either.
+//!
+//! Live/record preparation shares the production resolved endpoint/effort/design contract, without
+//! REPL memory retrieval or a paid planning/classifier pass. Replay keeps credential-free placeholders;
+//! final-model prompt/tool-surface changes deliberately show up as tape drift (Strict still rejects
+//! drift). These Rust fixtures measure functional correctness, not live aesthetic quality.
 
+use crate::agent::design::{DesignContext, DesignMode};
 use crate::agent::{self, AgentConfig, StopReason};
 use crate::core::approval::ApprovalMode;
+use crate::core::cli_config::{self, ResolvedEndpoint};
 use crate::core::types::{Message, ToolDef};
 use crate::llm::client;
 use crate::llm::replay::{self, Mode};
+use crate::repl::turn::ResolvedTurn;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -297,6 +305,91 @@ pub async fn run(opts: Options) -> Result<()> {
     Ok(())
 }
 
+/// Prepare one isolated single-loop task without REPL retrieval, history refresh or a planner call.
+/// Production routing/configuration is shared; benchmark step caps are deliberately NOT effort caps.
+fn prepare_task(
+    spec: &TaskSpec,
+    work: &Path,
+    endpoint: ResolvedEndpoint,
+    effort: Option<String>,
+    mode: Mode,
+) -> (ResolvedTurn, AgentConfig, bool) {
+    static SCOPES: AtomicUsize = AtomicUsize::new(0);
+    let owner = format!(
+        "bench:{}:{}:{}",
+        spec.id,
+        std::process::id(),
+        SCOPES.fetch_add(1, Ordering::Relaxed)
+    );
+    let workspace = work.display().to_string();
+    let design = DesignContext::new(owner, &workspace, DesignMode::Auto);
+    design.begin_turn(&spec.id, &workspace);
+    let mut cfg = AgentConfig {
+        max_iters: spec.max_steps,
+        auto_extend_to: spec.max_steps,
+        approval_mode: ApprovalMode::Yolo, // Existing opt-in benchmark policy, unchanged.
+        quiet: true,
+        enable_verify_gate: true,
+        auto_checkpoint: false,
+        checkpoint_each_edit: false,
+        workspace_root: Some(work.to_path_buf()),
+        ..AgentConfig::default()
+    };
+    let (resolved, lean) = if matches!(mode, Mode::Off | Mode::Record) {
+        let resolved = ResolvedTurn::new(&endpoint, effort.clone(), effort, design);
+        resolved.configure(&mut cfg, false);
+        let lean = cli_config::lean_tools_enabled(&resolved.endpoint.base_url);
+        (resolved, lean)
+    } else {
+        // Tape playback never consults saved endpoints, credentials, effort maps or vision claims.
+        let resolved = ResolvedTurn::from_frozen(
+            endpoint,
+            None,
+            None,
+            design,
+            cli_config::CliConfig::default(),
+        );
+        cfg.image_config = Some(std::sync::Arc::new(resolved.vision_config.clone()));
+        cfg.context_window = crate::ui::context_report::ctx_window_for(&resolved.endpoint.model);
+        cfg.nudge_role = agent::NudgeRole::for_base_url(&resolved.endpoint.base_url);
+        cfg.wire_reasoning_effort = Some(None);
+        cfg.tool_image_destination = Some(crate::llm::media::effective_destination_key(
+            &resolved.endpoint.base_url,
+            &resolved.endpoint.model,
+        ));
+        cfg.exec_ctx = crate::core::exec_ctx::ExecutionContext::new(
+            crate::core::convo::ConversationId::new(resolved.design.snapshot().owner_id),
+        )
+        .with_design(resolved.design.clone());
+        let lean = cli_config::lean_tools_enabled_in(
+            &cli_config::CliConfig::default(),
+            &resolved.endpoint.base_url,
+        );
+        (resolved, lean)
+    };
+    cfg.exec_ctx = cfg.exec_ctx.with_trace_visible(false);
+    (resolved, cfg, lean)
+}
+
+/// Seat the mutable design contract on an outgoing copy only; never store a capsule in the tape
+/// driver's durable history. Receipt indices refer to this exact fingerprinted/sent copy.
+fn prepare_request(messages: &[Message], design: &DesignContext) -> Vec<Message> {
+    let mut outgoing = messages.to_vec();
+    agent::design::prompt::seat_prompt(&mut outgoing, design);
+    outgoing
+}
+
+fn mark_task_delivery(
+    mode: Mode,
+    outgoing: &[Message],
+    receipt: &crate::llm::media::ImageDeliveryReceipt,
+    design: &DesignContext,
+) {
+    if matches!(mode, Mode::Off | Mode::Record) {
+        agent::mark_image_delivery(outgoing, receipt, design);
+    }
+}
+
 /// Run one task: copy the fixture, point the tape at it, drive the real loop, judge the files.
 ///
 /// The todo lock is a std mutex shared with the synchronous loop tests, and it has to stay held
@@ -334,6 +427,22 @@ pub async fn run_task(
             "tape".to_string(),
         ),
     };
+    let effort = if matches!(mode, Mode::Record | Mode::Off) {
+        cli_config::resolved_reasoning_effort(cli_config::load().reasoning_effort)
+    } else {
+        None
+    };
+    let (resolved, cfg, lean) = prepare_task(
+        spec,
+        &work,
+        ResolvedEndpoint {
+            base_url,
+            api_key,
+            model,
+        },
+        effort,
+        mode,
+    );
     replay::configure(mode, tape_path, Some(&work))?;
 
     // The loop's process-global state (todo list, read cache) is per run; serialize with the
@@ -347,44 +456,57 @@ pub async fn run_task(
     // generated from the published surface. `task`/`workflow` are left out — the suite measures
     // the single loop, and a fixture crate has nothing to delegate.
     let mut registry = agent::builtin::default_registry_in(&work);
-    // Same deferred set a real turn of this shape would get, so the suite measures the lean
-    // surface the user sees.
-    agent::builtin::defer_builtins_for_shape(
-        &mut registry,
-        Some(crate::core::turn_shape::classify(&spec.prompt)),
-    );
+    // Deferral is valid only for the final endpoint's tool protocol, just as in production.
+    // Replay has deterministic default policy; any old recorded surface difference is explicit drift.
+    if lean {
+        agent::builtin::defer_builtins_for_shape(
+            &mut registry,
+            Some(crate::core::turn_shape::classify(&spec.prompt)),
+        );
+    }
     agent::builtin::publish_active_tools(&registry);
     let system = agent::build_top_level_system_prompt(
         &work.display().to_string(),
         std::env::consts::OS,
         "2026-01-01",
-        &model,
+        &resolved.endpoint.model,
         None,
     );
-    let cfg = AgentConfig {
-        max_iters: spec.max_steps,
-        auto_extend_to: spec.max_steps,
-        approval_mode: ApprovalMode::Yolo,
-        quiet: true,
-        enable_verify_gate: true,
-        auto_checkpoint: false,
-        checkpoint_each_edit: false,
-        workspace_root: Some(work.clone()),
-        ..AgentConfig::default()
-    };
 
     let http = reqwest::Client::new();
     let calls = AtomicUsize::new(0);
     let chat = |msgs: Vec<Message>, defs: Vec<ToolDef>| {
         calls.fetch_add(1, Ordering::Relaxed);
-        let (http, base, key, model) = (&http, &base_url, &api_key, &model);
-        async move { client::chat_with_tools(http, base, key, model, &msgs, &defs).await }
+        let (http, resolved, cfg) = (&http, &resolved, &cfg);
+        async move {
+            let outgoing = prepare_request(&msgs, &resolved.design);
+            let (response, receipt) = crate::llm::media::with_image_delivery(
+                &cfg.exec_ctx,
+                &resolved.endpoint.base_url,
+                &resolved.endpoint.api_key,
+                &resolved.endpoint.model,
+                client::chat_with_tools_frozen(
+                    http,
+                    &resolved.endpoint.base_url,
+                    &resolved.endpoint.api_key,
+                    &resolved.endpoint.model,
+                    &outgoing,
+                    &defs,
+                    resolved.wire_effort.clone(),
+                    &resolved.vision_config,
+                ),
+            )
+            .await?;
+            mark_task_delivery(mode, &outgoing, &receipt, &resolved.design);
+            Ok(response)
+        }
     };
 
     let meter = client::cost_meter();
     let (in0, out0, _) = meter.snapshot();
     let mut messages = vec![Message::system(&system), Message::user(&spec.prompt)];
     let outcome = agent::run_agent_loop(chat, &cfg, &registry, &mut messages).await;
+    resolved.design.finalize();
     let (in1, out1, _) = meter.snapshot();
     let tape = replay::status();
     replay::disable();
@@ -717,6 +839,221 @@ mod tests {
     }
 
     #[test]
+    fn preparation_uses_final_endpoint_without_effort_expanding_task_budget() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("aizen-bench-preparation-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.as_os_str()),
+            ("AIZEN_PROJECT_ROOT", home.as_os_str()),
+        ]);
+        let _unset = crate::core::config::EnvGuard::unset([
+            "AIZEN_MODEL_BENCH_FINAL_BASE_URL",
+            "AIZEN_MODEL_BENCH_FINAL_API_KEY",
+        ]);
+        // Offline test fixture only: no saved personal config, network or endpoint resolution.
+        std::fs::write(
+            home.join("cli-config.json"),
+            serde_json::json!({
+                "model":"bench-final", "model_context_window":32123,
+                "models_by_effort":{"max":"bench-final", "low":"bench-cheap"},
+                "model_endpoints":[{"model":"bench-final",
+                    "base_url":"https://fixture.invalid/v1", "api_key_ref":"fixture-key"}],
+                "vision_capabilities":[{"base_url":"https://fixture.invalid/v1",
+                    "model":"bench-final", "supported":true}],
+                "lean_tools":false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let spec: TaskSpec = serde_json::from_value(serde_json::json!({
+            "id":"prepare", "prompt":"Create a page", "max_steps":7
+        }))
+        .unwrap();
+        let (resolved, cfg, lean) = prepare_task(
+            &spec,
+            &home,
+            ResolvedEndpoint {
+                base_url: "https://old.invalid/v1".into(),
+                api_key: "old".into(),
+                model: "original".into(),
+            },
+            Some("max".into()),
+            Mode::Record,
+        );
+        assert_eq!(resolved.endpoint.model, "bench-final");
+        assert_eq!(resolved.endpoint.base_url, "https://fixture.invalid/v1");
+        assert_eq!(resolved.endpoint.api_key, "fixture-key");
+        assert_eq!(resolved.harness_effort.as_deref(), Some("max"));
+        assert_eq!(resolved.wire_effort.as_deref(), Some("max"));
+        assert_eq!(cfg.wire_reasoning_effort, Some(Some("max".into())));
+        assert_eq!(cfg.context_window, 32123);
+        assert_eq!(cfg.nudge_role, agent::NudgeRole::User);
+        assert_eq!(
+            cfg.tool_image_policy,
+            crate::llm::media::VisionPolicy::Supported
+        );
+        assert_eq!(
+            cfg.tool_image_destination.as_deref(),
+            Some(
+                crate::llm::media::effective_destination_key(
+                    &resolved.endpoint.base_url,
+                    &resolved.endpoint.model
+                )
+                .as_str()
+            )
+        );
+        assert!(!lean);
+        assert_eq!((cfg.max_iters, cfg.auto_extend_to), (7, 7));
+        assert_eq!(cfg.workspace_root.as_deref(), Some(home.as_path()));
+        assert_eq!(cfg.approval_mode, ApprovalMode::Yolo);
+        assert!(!cfg.exec_ctx.trace_visible());
+        assert_eq!(
+            cfg.exec_ctx.design().unwrap().scope(),
+            resolved.design.scope()
+        );
+        assert_eq!(resolved.design.mode(), DesignMode::Auto);
+        // Both replay modes ignore even this fixture's routing and vision claims.
+        for mode in [Mode::Replay, Mode::Strict] {
+            let (taped, cfg, _) = prepare_task(
+                &spec,
+                &home,
+                ResolvedEndpoint {
+                    base_url: "http://tape.invalid".into(),
+                    api_key: "tape".into(),
+                    model: "tape".into(),
+                },
+                Some("max".into()),
+                mode,
+            );
+            assert_eq!(taped.endpoint.model, "tape");
+            assert_eq!(
+                cfg.tool_image_policy,
+                crate::llm::media::VisionPolicy::Unknown
+            );
+            assert_eq!(cfg.wire_reasoning_effort, Some(None));
+            assert_eq!((cfg.max_iters, cfg.auto_extend_to), (7, 7));
+            assert_ne!(taped.design.scope(), resolved.design.scope());
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn request_copy_and_live_receipt_do_not_claim_replayed_or_omitted_pixels() {
+        use crate::agent::design::{DesignBrief, DesignIntent, Viewport};
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        use crate::llm::media::{destination_key, ImageDeliveryReceipt, ProjectedToolImage};
+        let design = DesignContext::new("bench-test", "fixture", DesignMode::Auto);
+        design.begin_turn("request", "fixture");
+        design
+            .apply_brief(
+                DesignBrief {
+                    intent: DesignIntent::Create,
+                    brief: "Offline fixture".into(),
+                    acceptance: "Contract only; live quality unmeasured".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let destination = destination_key("https://fixture.invalid/v1", "vision");
+        let png = encode_rgba_png(&[0, 0, 0, 255], 1, 1).unwrap();
+        let image = |id: &str| {
+            design
+                .record_capture(
+                    id,
+                    None,
+                    "http://fixture.invalid/page",
+                    Viewport {
+                        width: 390,
+                        height: 844,
+                    },
+                    design.current_revision(),
+                    false,
+                    "Synthetic bytes; not rendered visual evidence",
+                )
+                .unwrap();
+            let mut provenance = ImageProvenance::new("browser_screenshot", None);
+            provenance.evidence_id = Some(id.into());
+            provenance.design_scope = Some(design.evidence_scope());
+            provenance.approved_destination = Some(destination.clone());
+            ToolImage::from_bytes(&png, "image/png", provenance).unwrap()
+        };
+        // Same pixels in an incomplete later group must not mark that group's evidence.
+        let messages = vec![
+            Message::system("frozen"),
+            Message::user("Create a page"),
+            assistant_call("browser_screenshot", "{}"),
+            Message::tool_observation("call_1", "captured", vec![image("selected")]),
+            assistant_call("browser_screenshot", "{}"),
+        ];
+        let unseen = image("unseen");
+        let mut durable = messages;
+        // Deliberately mismatched tool id leaves the last assistant group incomplete.
+        durable.push(Message::tool_observation(
+            "wrong-id",
+            "captured",
+            vec![unseen],
+        ));
+        let outgoing = prepare_request(&durable, &design);
+        assert_eq!(durable[1].content.as_deref(), Some("Create a page"));
+        assert_eq!(outgoing[0].content.as_deref(), Some("frozen"));
+        assert!(outgoing[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with(agent::design::prompt::MARKER));
+        // Synthetic successful-call receipt names the exact completed source occurrence. This
+        // fixture does not send pixels or rebuild projection after the response.
+        let receipt = ImageDeliveryReceipt {
+            tool_images: vec![ProjectedToolImage {
+                assistant_message_index: 2,
+                message_index: 3,
+                image_index: 0,
+                sha256: outgoing[3].tool_images[0].metadata().sha256.clone(),
+            }],
+            user_images: Vec::new(),
+        };
+        for mode in [Mode::Replay, Mode::Strict] {
+            mark_task_delivery(mode, &outgoing, &receipt, &design);
+            assert!(design.snapshot().evidence.iter().all(|e| !e.projected));
+        }
+        mark_task_delivery(
+            Mode::Record,
+            &outgoing,
+            &ImageDeliveryReceipt::default(),
+            &design,
+        );
+        assert!(design.snapshot().evidence.iter().all(|e| !e.projected));
+        mark_task_delivery(Mode::Off, &outgoing, &receipt, &design);
+        let evidence = design.snapshot().evidence;
+        assert!(
+            evidence
+                .iter()
+                .find(|e| e.id == "selected")
+                .unwrap()
+                .projected
+        );
+        assert!(
+            !evidence
+                .iter()
+                .find(|e| e.id == "unseen")
+                .unwrap()
+                .projected
+        );
+        // Record shares the same actual-receipt boundary, without elevating stale captures.
+        mark_task_delivery(Mode::Record, &outgoing, &receipt, &design);
+        assert!(design
+            .snapshot()
+            .evidence
+            .iter()
+            .all(|e| e.status != crate::agent::design::EvidenceStatus::Verified));
+    }
+
+    #[test]
     fn every_shipped_task_spec_parses_and_has_a_repo() {
         let specs = load_specs(&tasks_dir()).unwrap();
         let ids: Vec<&str> = specs.iter().map(|(_, s)| s.id.as_str()).collect();
@@ -864,6 +1201,9 @@ mod tests {
         let _home_lock = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
         let _tape_lock = crate::llm::replay::TAPE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -905,7 +1245,11 @@ mod tests {
             .await
             .unwrap();
         let _ = std::fs::remove_file(&tape);
-        assert_eq!(r.status, "pass", "{:?}", r.reasons);
+        assert_eq!(
+            r.status, "pass",
+            "reasons={:?}; changed_files={:?}",
+            r.reasons, r.changed_files
+        );
         assert_eq!(r.stop, "Done");
         assert_eq!(r.verify_exit, Some(0));
         assert_eq!(r.changed_files, vec!["src/lib.rs"]);

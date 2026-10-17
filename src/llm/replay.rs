@@ -91,7 +91,9 @@ pub struct TapedUsage {
     pub cache_write: u64,
 }
 
-/// The serializable half of a [`ChatTurn`] (no eager handles).
+/// The serializable half of a [`ChatTurn`] (no eager handles, no wire diagnostics: the raw-body
+/// capture is explicitly for the live error path and must never persist user/model text to a tape
+/// that travels).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TapedTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +137,7 @@ impl TapedTurn {
             finish_reason: self.finish_reason,
             usage,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
@@ -189,27 +192,32 @@ static STATE: Mutex<Option<TapeState>> = Mutex::new(None);
 static ENV_READ: Mutex<bool> = Mutex::new(false);
 
 fn with_state<R>(f: impl FnOnce(&mut Option<TapeState>) -> R) -> R {
+    with_state_for_call(false, f)
+}
+
+fn with_state_for_call<R>(quiet: bool, f: impl FnOnce(&mut Option<TapeState>) -> R) -> R {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let mut env_read = ENV_READ.lock().unwrap_or_else(|e| e.into_inner());
     if !*env_read {
         *env_read = true;
         if st.is_none() {
-            *st = state_from_env();
+            *st = state_from_env(quiet);
         }
     }
     drop(env_read);
     f(&mut st)
 }
 
-fn state_from_env() -> Option<TapeState> {
+fn state_from_env(quiet: bool) -> Option<TapeState> {
     let raw = std::env::var("AIZEN_TAPE").ok()?;
     let mode = match Mode::parse(&raw) {
         Some(Mode::Off) => return None,
         Some(m) => m,
         None => {
-            emit_note(&format!(
-                "AIZEN_TAPE={raw:?} is not one of record|replay|strict — tape is OFF"
-            ));
+            emit_note_for_call(
+                quiet,
+                &format!("AIZEN_TAPE={raw:?} is not one of record|replay|strict — tape is OFF"),
+            );
             return None;
         }
     };
@@ -225,7 +233,7 @@ fn state_from_env() -> Option<TapeState> {
     match build_state(mode, path, root.as_deref()) {
         Ok(s) => Some(s),
         Err(e) => {
-            emit_note(&format!("tape disabled: {e:#}"));
+            emit_note_for_call(quiet, &format!("tape disabled: {e:#}"));
             None
         }
     }
@@ -320,13 +328,21 @@ pub fn configure(mode: Mode, path: impl Into<PathBuf>, root: Option<&Path>) -> R
     } else {
         Some(build_state(mode, path, root)?)
     };
-    with_state(|st| *st = state);
+    replace_state(state);
     Ok(())
+}
+
+// Explicit configuration must not initialize/read an ambient tape before replacing it.
+fn replace_state(state: Option<TapeState>) {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut env_read = ENV_READ.lock().unwrap_or_else(|e| e.into_inner());
+    *env_read = true;
+    *st = state;
 }
 
 /// Turn the tape off (after a bench task, so the next one starts clean).
 pub fn disable() {
-    with_state(|st| *st = None);
+    replace_state(None);
 }
 
 pub fn mode() -> Mode {
@@ -352,7 +368,18 @@ pub fn replay_turn(
     messages: &[Message],
     tools: &[ToolDef],
 ) -> Result<Option<ChatTurn>> {
-    with_state(|st| {
+    replay_turn_with_quiet(model, messages, tools, false)
+}
+
+/// Child calls suppress only their own initialization/drift notes. Tape semantics, strict errors
+/// and usage accounting remain identical; no process-global rendering switch is changed.
+pub fn replay_turn_with_quiet(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    quiet: bool,
+) -> Result<Option<ChatTurn>> {
+    with_state_for_call(quiet, |st| {
         let Some(s) = st.as_mut() else {
             return Ok(None);
         };
@@ -397,7 +424,7 @@ pub fn replay_turn(
             if s.mode == Mode::Strict {
                 bail!("{note} — AIZEN_TAPE=strict");
             }
-            emit_note(&note);
+            emit_note_for_call(quiet, &note);
         }
         let turn = entry.turn.clone().into_turn();
         // Keep the cost meter (and so `/cost` and the session ledger) honest on a replayed run.
@@ -416,7 +443,18 @@ pub fn record_turn(
     tools: &[ToolDef],
     turn: &ChatTurn,
 ) -> Result<()> {
-    with_state(|st| {
+    record_turn_with_quiet(model, messages, tools, turn, false)
+}
+
+/// Per-call quiet variant; recording errors are still returned to the calling controller.
+pub fn record_turn_with_quiet(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    turn: &ChatTurn,
+    quiet: bool,
+) -> Result<()> {
+    with_state_for_call(quiet, |st| {
         let Some(s) = st.as_mut() else {
             return Ok(());
         };
@@ -456,6 +494,7 @@ pub fn record_text(model: &str, messages: &[Message], text: &str) -> Result<()> 
         finish_reason: Some("stop".into()),
         usage: None,
         empty_wire_note: None,
+        empty_wire_raw: None,
         eager: Vec::new(),
     };
     record_turn(model, messages, &[], &turn)
@@ -511,13 +550,32 @@ fn feed_message(buf: &mut String, m: &Message, roots: &[String]) {
         buf.push_str(&scrub(&tc.function.arguments, roots));
         buf.push(')');
     }
-    if !m.images.is_empty() {
-        // Base64 payloads are huge and stable; their count and size identify them well enough.
-        buf.push_str(&format!(
-            "\u{1f}images:{}:{}",
-            m.images.len(),
-            m.images.iter().map(String::len).sum::<usize>()
-        ));
+    for image in &m.images {
+        // Same-length images are not interchangeable evidence. Hash actual decoded bytes, not
+        // their envelope length; malformed legacy URLs still get a full-content fingerprint.
+        let hash = crate::core::tool_media::split_data_url(image)
+            .ok()
+            .and_then(|(_, data)| {
+                crate::core::tool_media::base64_decode_bounded(
+                    data,
+                    crate::core::tool_media::MAX_IMAGE_BYTES,
+                )
+                .ok()
+            })
+            .map(|bytes| crate::core::tool_media::sha256(&bytes))
+            .unwrap_or_else(|| crate::core::tool_media::sha256(image.as_bytes()));
+        buf.push_str("\u{1f}image:");
+        buf.push_str(&hash);
+    }
+    for image in &m.tool_images {
+        buf.push_str("\u{1f}tool-image:");
+        if let Ok(bytes) = image.bytes() {
+            buf.push_str(&crate::core::tool_media::sha256(&bytes));
+        } else {
+            buf.push_str("unavailable:");
+            buf.push_str(&image.metadata().sha256);
+            buf.push_str(&format!(":{:?}", image.unavailable_reason()));
+        }
     }
     buf.push('\u{1e}');
 }
@@ -543,7 +601,33 @@ pub fn fingerprints(messages: &[Message], tools: &[ToolDef], roots: &[String]) -
     )
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Test-only observation, scoped to the calling thread: never a production rendering toggle.
+    static TEST_NOTES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn emit_note_for_call(quiet: bool, note: &str) {
+    if !quiet {
+        emit_note(note);
+    }
+}
+
 fn emit_note(note: &str) {
+    #[cfg(test)]
+    {
+        if TEST_NOTES.with(|notes| {
+            let mut notes = notes.borrow_mut();
+            if let Some(notes) = notes.as_mut() {
+                notes.push(note.to_owned());
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+    }
     if crate::ui::tui::active() {
         crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
     } else {
@@ -589,12 +673,136 @@ mod tests {
                 ..Default::default()
             }),
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         }
     }
 
     fn tool(name: &str) -> ToolDef {
         ToolDef::function(name, "d", serde_json::json!({"type":"object"}))
+    }
+
+    struct NoteCapture;
+    impl NoteCapture {
+        fn new() -> Self {
+            TEST_NOTES.with(|notes| *notes.borrow_mut() = Some(Vec::new()));
+            Self
+        }
+        fn take(&self) -> Vec<String> {
+            TEST_NOTES.with(|notes| std::mem::take(notes.borrow_mut().as_mut().unwrap()))
+        }
+    }
+    impl Drop for NoteCapture {
+        fn drop(&mut self) {
+            TEST_NOTES.with(|notes| *notes.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn explicit_tape_configuration_skips_lazy_environment_initialization() {
+        let _guard = TAPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let notes = NoteCapture::new();
+        // A fresh explicit override must set the initialization marker without consulting any
+        // ambient path. Reset only owned test state; no environment variables or files change.
+        for configure_off in [false, true] {
+            {
+                let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut env_read = ENV_READ.lock().unwrap_or_else(|e| e.into_inner());
+                *state = None;
+                *env_read = false;
+            }
+            if configure_off {
+                configure(Mode::Off, PathBuf::new(), None).unwrap();
+            } else {
+                disable();
+            }
+            assert!(*ENV_READ.lock().unwrap_or_else(|e| e.into_inner()));
+            assert!(STATE.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+            assert_eq!(mode(), Mode::Off);
+            assert!(notes.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn quiet_replay_suppresses_own_drift_but_parent_still_reports_and_strict_errors() {
+        let _guard = TAPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let notes = NoteCapture::new();
+        let path = temp_tape("per-call-quiet-drift");
+        let messages = vec![Message::system("prompt v1"), Message::user("go")];
+        let turn = ChatTurn {
+            content: Some("recorded reply".into()),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".into()),
+            usage: None,
+            empty_wire_note: None,
+            empty_wire_raw: None,
+            eager: Vec::new(),
+        };
+        configure(Mode::Record, &path, None).unwrap();
+        record_turn_with_quiet("m", &messages, &[], &turn, true).unwrap();
+        record_turn("m", &messages, &[], &turn).unwrap();
+        record_turn_with_quiet("m", &messages, &[], &turn, true).unwrap();
+        assert!(notes.take().is_empty());
+        let changed = vec![Message::system("prompt v2"), Message::user("go")];
+        configure(Mode::Replay, &path, None).unwrap();
+        let child = replay_turn_with_quiet("m", &changed, &[], true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.content.as_deref(), Some("recorded reply"));
+        assert!(notes.take().is_empty());
+        let parent = replay_turn("m", &changed, &[]).unwrap().unwrap();
+        assert_eq!(parent.content, child.content);
+        let parent_notes = notes.take();
+        assert_eq!(parent_notes.len(), 1);
+        assert!(parent_notes[0].contains("system prompt"));
+        replay_turn_with_quiet("m", &changed, &[], true)
+            .unwrap()
+            .unwrap();
+        assert!(notes.take().is_empty());
+        assert_eq!(
+            status().unwrap().drift,
+            3,
+            "quiet suppresses notes, not drift accounting"
+        );
+        configure(Mode::Strict, &path, None).unwrap();
+        let error = replay_turn_with_quiet("m", &changed, &[], true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("strict"));
+        assert!(error.contains("system prompt"));
+        assert!(notes.take().is_empty());
+        disable();
+    }
+
+    #[test]
+    fn quiet_record_retains_usage_payload_and_per_call_note_filter() {
+        let _guard = TAPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let notes = NoteCapture::new();
+        let path = temp_tape("per-call-quiet-record");
+        let messages = vec![Message::user("read")];
+        configure(Mode::Record, &path, None).unwrap();
+        let turn = call_turn("file_read", "{}");
+        record_turn_with_quiet("quiet-model", &messages, &[], &turn, true).unwrap();
+        let entries = load_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "quiet-model");
+        let usage = entries[0].turn.usage.as_ref().unwrap();
+        assert_eq!(
+            (usage.prompt, usage.completion, usage.cached),
+            (120, 9, 100)
+        );
+        emit_note_for_call(true, "child initialization warning");
+        assert!(notes.take().is_empty());
+        emit_note_for_call(false, "parent initialization warning");
+        assert_eq!(notes.take(), vec!["parent initialization warning"]);
+        emit_note_for_call(true, "later child initialization warning");
+        assert!(notes.take().is_empty());
+        disable();
+        assert!(replay_turn_with_quiet("m", &messages, &[], true)
+            .unwrap()
+            .is_none());
+        record_turn_with_quiet("m", &messages, &[], &turn, true).unwrap();
     }
 
     #[test]
@@ -648,6 +856,34 @@ mod tests {
     }
 
     #[test]
+    fn image_fingerprints_use_bytes_not_equal_envelope_lengths() {
+        let a = Message::user_with_images("same", vec!["data:image/jpeg;base64,/9j/AQ==".into()]);
+        let b = Message::user_with_images("same", vec!["data:image/jpeg;base64,/9j/Ag==".into()]);
+        assert_eq!(a.images[0].len(), b.images[0].len());
+        assert_ne!(
+            fingerprints(&[a], &[], &[]).1,
+            fingerprints(&[b], &[], &[]).1
+        );
+        use crate::core::tool_media::{ImageProvenance, ToolImage};
+        let a = ToolImage::from_bytes(
+            &[255, 216, 255, 1],
+            "image/jpeg",
+            ImageProvenance::new("test", None),
+        )
+        .unwrap();
+        let b = ToolImage::from_bytes(
+            &[255, 216, 255, 2],
+            "image/jpeg",
+            ImageProvenance::new("test", None),
+        )
+        .unwrap();
+        assert_ne!(
+            fingerprints(&[Message::tool_observation("x", "same", vec![a])], &[], &[]).1,
+            fingerprints(&[Message::tool_observation("x", "same", vec![b])], &[], &[]).1
+        );
+    }
+
+    #[test]
     fn fnv1a64_matches_the_reference_vectors() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
@@ -683,6 +919,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             usage: None,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Vec::new(),
         };
         record_turn("m", &msgs2, &tools, &fin).unwrap();

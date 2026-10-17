@@ -479,12 +479,33 @@ impl Tool for SymbolReplace {
                 rel.display()
             ));
         }
-        crate::core::persist::compare_and_atomic_write(
-            &plan.path,
-            &plan.base_fingerprint,
-            plan.new_content.as_bytes(),
-        )
-        .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
+        {
+            // Planning used LSP before host-write admission: never hold physical exclusion while
+            // starting/querying a sidecar. Reuse a parent writer lease but acquire a fresh body.
+            let cancel = crate::core::cancel::current();
+            let scope = crate::core::exec_ctx::current()
+                .map(|context| context.resource_scope())
+                .unwrap_or_else(|| "default".to_string());
+            let _writer = crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                &self.root,
+                std::time::Duration::from_secs(15),
+                cancel.as_ref(),
+                "symbolic host write",
+                &scope,
+            )?;
+            let _physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                std::time::Duration::from_secs(15),
+                cancel.as_ref(),
+                "symbolic host write",
+                &scope,
+            )?;
+            crate::core::persist::compare_and_atomic_write(
+                &plan.path,
+                &plan.base_fingerprint,
+                plan.new_content.as_bytes(),
+            )
+            .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
+        } // Release host-write exclusion before requesting LSP edit feedback.
         let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
         let preview_old: String = plan.old_body.chars().take(400).collect();
         let preview_new: String = new_body.chars().take(400).collect();
@@ -586,12 +607,33 @@ impl Tool for SymbolInsert {
         };
         let anchor = anchor_from(&self.root, args)?;
         let plan = LSP.insert_at_symbol(&anchor, symbol, where_, text)?;
-        crate::core::persist::compare_and_atomic_write(
-            &plan.path,
-            &plan.base_fingerprint,
-            plan.new_content.as_bytes(),
-        )
-        .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
+        {
+            // Planning used LSP before host-write admission: never hold physical exclusion while
+            // starting/querying a sidecar. Reuse a parent writer lease but acquire a fresh body.
+            let cancel = crate::core::cancel::current();
+            let scope = crate::core::exec_ctx::current()
+                .map(|context| context.resource_scope())
+                .unwrap_or_else(|| "default".to_string());
+            let _writer = crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                &self.root,
+                std::time::Duration::from_secs(15),
+                cancel.as_ref(),
+                "symbolic host write",
+                &scope,
+            )?;
+            let _physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                std::time::Duration::from_secs(15),
+                cancel.as_ref(),
+                "symbolic host write",
+                &scope,
+            )?;
+            crate::core::persist::compare_and_atomic_write(
+                &plan.path,
+                &plan.base_fingerprint,
+                plan.new_content.as_bytes(),
+            )
+            .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
+        } // Release host-write exclusion before requesting LSP edit feedback.
         let rel = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
         let side = match where_ {
             InsertWhere::Before => "before",

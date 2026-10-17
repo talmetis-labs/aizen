@@ -4,7 +4,7 @@
 //! Not the OpenAI Platform Responses API — field allowlists and headers follow the Codex CLI
 //! compatibility surface and may change without notice.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -38,6 +38,7 @@ const ALLOWLIST: &[&str] = &[
 ];
 
 /// Build Codex Responses JSON body from Aizen messages/tools.
+#[cfg(test)]
 pub fn build_request_body(
     model: &str,
     messages: &[Message],
@@ -45,6 +46,56 @@ pub fn build_request_body(
     session_id: &str,
     instructions: Option<&str>,
 ) -> Value {
+    build_request_body_with_policy(
+        model,
+        messages,
+        tools,
+        session_id,
+        instructions,
+        crate::llm::media::VisionPolicy::Unknown,
+    )
+}
+
+#[cfg(test)]
+pub fn build_request_body_with_policy(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    session_id: &str,
+    instructions: Option<&str>,
+    policy: crate::llm::media::VisionPolicy,
+) -> Value {
+    build_request_body_projected(
+        model,
+        messages,
+        tools,
+        session_id,
+        instructions,
+        policy,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::option_option)]
+fn build_request_body_projected(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    session_id: &str,
+    instructions: Option<&str>,
+    policy: crate::llm::media::VisionPolicy,
+    effort_override: Option<Option<String>>,
+    destination: Option<&str>,
+) -> Value {
+    let (projected, receipt) = crate::llm::media::project_messages_for_send(
+        messages,
+        policy,
+        destination,
+        crate::llm::media::request_send_policy(),
+    );
+    crate::llm::media::stage_image_delivery(receipt);
+    let messages = &projected.messages;
     let (base_model, suffix_effort) = codex_models::strip_effort_suffix(model);
     let mut input: Vec<Value> = Vec::new();
     let mut sys_bits: Vec<String> = Vec::new();
@@ -167,10 +218,12 @@ pub fn build_request_body(
         let _ = names;
     }
 
-    let effort = suffix_effort.map(|s| s.to_string()).or_else(|| {
-        crate::core::cli_config::resolved_reasoning_effort(
-            crate::core::cli_config::load().reasoning_effort.clone(),
-        )
+    let effort = effort_override.unwrap_or_else(|| {
+        suffix_effort.map(|s| s.to_string()).or_else(|| {
+            crate::core::cli_config::resolved_reasoning_effort(
+                crate::core::cli_config::load().reasoning_effort.clone(),
+            )
+        })
     });
 
     if let Some(eff) = effort {
@@ -296,6 +349,9 @@ pub struct StreamSink<'a> {
     pub render: bool,
     /// Offered each tool call the moment its arguments close.
     pub eager: Option<EagerStartFn<'a>>,
+    /// Latest cumulative usage, once when an accepted response ends (including drop/error).
+    /// Internal accounting only: must not panic, block, render, or record into CostMeter again.
+    pub observed_usage: Option<&'a (dyn Fn(&Usage) + Send + Sync)>,
 }
 
 /// The two-phase stall deadline of one streamed turn — the same `AIZEN_STREAM_FIRST_FRAME_SECS`
@@ -320,6 +376,10 @@ impl StreamCaps {
 /// shared watchdog: text paints live, completed calls start eagerly, a stall ends the turn
 /// instead of parking it on the 300 s read timeout. This path used to buffer the whole body
 /// first, so a Codex turn showed nothing until it had finished (quality plan C4).
+#[expect(
+    dead_code,
+    reason = "compatibility Codex streaming entry point; production uses explicit-effort dispatch"
+)]
 pub async fn stream_turn(
     client: &reqwest::Client,
     model: &str,
@@ -345,6 +405,61 @@ pub async fn stream_turn(
     .await
 }
 
+/// Explicit per-call effort, without consulting another lane's process-global override.
+#[expect(
+    dead_code,
+    reason = "compatibility Codex API; dispatch uses the frozen configuration entry point"
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_turn_effort(
+    client: &reqwest::Client,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    session_id: &str,
+    sink: StreamSink<'_>,
+    effort: Option<String>,
+) -> Result<ChatTurn> {
+    let cfg = crate::core::cli_config::load();
+    stream_turn_effort_frozen(
+        client, model, messages, tools, session_id, sink, effort, &cfg,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_turn_effort_frozen(
+    client: &reqwest::Client,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    session_id: &str,
+    sink: StreamSink<'_>,
+    effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
+) -> Result<ChatTurn> {
+    if oauth_codex::codex_disabled() {
+        bail!("Codex OAuth disabled via AIZEN_DISABLE_CODEX");
+    }
+    let (base_model, _) = codex_models::strip_effort_suffix(model);
+    let policy =
+        crate::core::cli_config::vision_support_in(cfg, CODEX_RESPONSES_URL, base_model).into();
+    stream_turn_at_projected(
+        client,
+        CODEX_RESPONSES_URL,
+        &TokenStore,
+        model,
+        messages,
+        tools,
+        session_id,
+        sink,
+        StreamCaps::live(),
+        policy,
+        Some(effort),
+    )
+    .await
+}
+
 /// [`stream_turn`] against an explicit URL, token source and watchdog — the seam the tests use.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_turn_at(
@@ -358,9 +473,47 @@ pub(crate) async fn stream_turn_at(
     sink: StreamSink<'_>,
     caps: StreamCaps,
 ) -> Result<ChatTurn> {
-    let mut access_account = auth.bearer().await?;
-    let body = build_request_body(model, messages, tools, session_id, None);
+    let (base_model, _) = codex_models::strip_effort_suffix(model);
+    let policy = crate::core::cli_config::vision_support_for(url, base_model).into();
+    stream_turn_at_projected(
+        client, url, auth, model, messages, tools, session_id, sink, caps, policy, None,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments, clippy::option_option)]
+async fn stream_turn_at_projected(
+    client: &reqwest::Client,
+    url: &str,
+    auth: &impl CodexAuth,
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+    session_id: &str,
+    sink: StreamSink<'_>,
+    caps: StreamCaps,
+    policy: crate::llm::media::VisionPolicy,
+    effort_override: Option<Option<String>>,
+) -> Result<ChatTurn> {
+    let _request_memory = crate::llm::media::request_memory_lease(messages)?;
+    let mut access_account = auth.bearer().await?;
+    let (base_model, _) = codex_models::strip_effort_suffix(model);
+    let destination = crate::llm::media::destination_key(url, base_model);
+    crate::llm::media::validate_reference_vision(policy)?;
+    let body = build_request_body_projected(
+        model,
+        messages,
+        tools,
+        session_id,
+        None,
+        policy,
+        effort_override,
+        Some(&destination),
+    );
+
+    let body = serde_json::to_vec(&body)?;
+    let send_started = Instant::now();
+    let send_budget = Duration::from_secs(600);
     // Request-layer retries mirror `send_with_retry`: jittered backoff on 429/5xx, ONE token
     // refresh on 401. Stream-layer retries mirror the chat-completions path: a stream that died
     // before producing anything is replayed a bounded number of times; one that produced
@@ -372,13 +525,21 @@ pub(crate) async fn stream_turn_at(
     loop {
         let (access, account) = &access_account;
         let headers = build_headers(access, account.as_deref(), session_id);
-        let resp = client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .context("codex responses POST")?;
+        let remaining = send_budget.saturating_sub(send_started.elapsed());
+        crate::llm::media::validate_image_request()?;
+        super::delegated::before_send()?;
+        let resp = tokio::time::timeout(
+            remaining,
+            client
+                .post(url)
+                .headers(headers)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow!("Codex request timeout (stage=send)"))?
+        .map_err(|_| anyhow!("Codex request failed (stage=send)"))?;
 
         let status = resp.status();
         if status.as_u16() == 401 {
@@ -391,12 +552,16 @@ pub(crate) async fn stream_turn_at(
         }
         if !status.is_success() {
             let code = status.as_u16();
-            let text = resp.text().await.unwrap_or_default();
+            let correlation = client::response_correlation(&resp);
+            let text = client::bounded_error_body(
+                resp,
+                send_budget.saturating_sub(send_started.elapsed()),
+            )
+            .await;
+            let failure = client::transport_failure("http", Some(code), &text, correlation);
             // A spent QUOTA is permanent for this window — retrying burns nothing but time.
-            if code == 429 {
-                if let Some(msg) = parse_usage_limit(&text) {
-                    bail!("{msg}");
-                }
+            if code == 429 && parse_usage_limit(&text).is_some() {
+                bail!("Codex usage limit reached (HTTP 429): {failure}");
             }
             match classify_envelope(&body_envelope(&text)) {
                 Upstream::Capacity => {
@@ -405,7 +570,7 @@ pub(crate) async fn stream_turn_at(
                 Upstream::Overloaded if overload_attempt < OVERLOAD_RETRIES => {
                     let delay = client::backoff_ms(overload_attempt, 1_000, 15_000);
                     overload_attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    super::delegated::sleep(Duration::from_millis(delay)).await?;
                     continue;
                 }
                 Upstream::Overloaded => bail!("Codex upstream overloaded — retries exhausted"),
@@ -414,13 +579,10 @@ pub(crate) async fn stream_turn_at(
             if client::is_retryable_status(code) && transient_attempt < TRANSIENT_RETRIES {
                 let delay = client::backoff_ms(transient_attempt, 500, 15_000);
                 transient_attempt += 1;
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                super::delegated::sleep(Duration::from_millis(delay)).await?;
                 continue;
             }
-            if code == 429 {
-                bail!("Codex rate limited (HTTP 429): {}", truncate(&text, 300));
-            }
-            bail!("Codex HTTP {status}: {}", truncate(&text, 500));
+            return Err(failure.into());
         }
 
         let (acc, run) = consume_stream(resp, sink, caps).await;
@@ -429,7 +591,7 @@ pub(crate) async fn stream_turn_at(
             produced,
             eager,
         } = run;
-        let blank = !produced && acc.finish.is_none();
+        let blank = !produced && !acc.invalid && acc.finish.is_none();
 
         // Transport error or stall. Blank ⇒ replay (bounded); otherwise salvage the completed
         // calls, or fail the turn — partial text alone is never returned as a finished answer.
@@ -437,29 +599,35 @@ pub(crate) async fn stream_turn_at(
             if blank && blank_attempt < client::STREAM_BLANK_RETRIES {
                 blank_attempt += 1;
                 let delay = client::backoff_ms(blank_attempt - 1, 400, 4_000);
-                client::stream_retry_note(
-                    &e.to_string(),
-                    blank_attempt,
-                    client::STREAM_BLANK_RETRIES,
-                    delay,
-                );
+                if sink.render {
+                    client::stream_retry_note(
+                        &e.to_string(),
+                        blank_attempt,
+                        client::STREAM_BLANK_RETRIES,
+                        delay,
+                    );
+                }
                 abort_all(eager);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                super::delegated::sleep(Duration::from_millis(delay)).await?;
                 continue;
             }
             let calls = acc.completed_calls();
-            if calls.is_empty() {
+            if calls.is_empty() || acc.failure().is_some() || acc.invalid || acc.finish.is_some() {
                 abort_all(eager);
                 return Err(e);
             }
+            // Tool salvage does not certify successful delivery of this request's images.
+            crate::llm::media::stage_image_delivery(Default::default());
             let note = format!(
                 "⟳ stream dropped mid-turn — continuing with {} completed tool call(s)",
                 calls.len()
             );
-            if crate::ui::tui::active() {
-                crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
-            } else {
-                eprintln!("{note}");
+            if sink.render {
+                if crate::ui::tui::active() {
+                    crate::ui::tui::emit_line(&crate::ui::theme::faint(note).to_string());
+                } else {
+                    crate::ui::tui::note_line(&note);
+                }
             }
             let eager = eager_by_position(&calls, eager);
             return Ok(ChatTurn {
@@ -468,6 +636,7 @@ pub(crate) async fn stream_turn_at(
                 finish_reason: Some("tool_calls".into()),
                 usage: acc.usage.clone(),
                 empty_wire_note: None,
+                empty_wire_raw: None,
                 eager,
             });
         }
@@ -484,22 +653,28 @@ pub(crate) async fn stream_turn_at(
                 Upstream::Overloaded if !produced && overload_attempt < OVERLOAD_RETRIES => {
                     let delay = client::backoff_ms(overload_attempt, 1_000, 15_000);
                     overload_attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    super::delegated::sleep(Duration::from_millis(delay)).await?;
                     continue;
                 }
                 Upstream::Overloaded if !produced => {
                     bail!("Codex upstream overloaded — retries exhausted")
                 }
-                _ => bail!("Codex error: {}", env.message),
+                _ => {
+                    let body = serde_json::json!({"error": {"code": env.code}}).to_string();
+                    let mut failure = client::transport_failure(
+                        "sse",
+                        Some(200),
+                        &body,
+                        env.correlation_id.clone(),
+                    );
+                    failure.provider_status = env.provider_status;
+                    return Err(failure.into());
+                }
             }
         }
 
         let mut turn = acc.into_turn();
-        // Codex turns used to be invisible to `/cost` and the cache HUD — the one chat path that
-        // never recorded usage. Same meter as the OpenAI-dialect paths.
-        if let Some(u) = &turn.usage {
-            client::cost_meter().record(u);
-        }
+        // The stream tail records observed usage even on cancellation/error, once per response.
         turn.eager = eager_by_position(&turn.tool_calls, eager);
         return Ok(turn);
     }
@@ -512,7 +687,7 @@ struct StreamRun {
     /// Text, a completed call or a usage report reached the caller: a replay would duplicate it.
     produced: bool,
     /// Eager handles by call id.
-    eager: BTreeMap<String, tokio::task::JoinHandle<String>>,
+    eager: BTreeMap<String, crate::agent::tools::StartedSafeCall>,
 }
 
 /// Read one accepted response frame by frame on the two-phase watchdog, painting text and
@@ -523,7 +698,8 @@ async fn consume_stream(
     sink: StreamSink<'_>,
     caps: StreamCaps,
 ) -> (SseAccumulator, StreamRun) {
-    let mut stream = resp.bytes_stream().eventsource();
+    let correlation = client::response_correlation(&resp);
+    let mut stream = client::bounded_sse_bytes(resp.bytes_stream()).eventsource();
     let mut acc = SseAccumulator::default();
     let mut run = StreamRun {
         err: None,
@@ -540,13 +716,29 @@ async fn consume_stream(
     let decorate = sink.render
         && !retained
         && (crate::ui::tui::active() || std::io::IsTerminal::is_terminal(&std::io::stdout()));
-    let mut md = crate::ui::markdown::MarkdownStream::new(decorate, crate::ui::tui::width());
-    let mut painted = false;
+    let md = crate::ui::markdown::MarkdownStream::new(
+        decorate,
+        if sink.render {
+            crate::ui::tui::width()
+        } else {
+            80
+        },
+    );
+    let mut tail = client::StreamTail::new(
+        client::cost_meter(),
+        md,
+        crate::ui::tui::emit,
+        sink.render,
+        retained,
+        false,
+    )
+    .with_usage_observer(sink.observed_usage);
     // Until the first frame PARSES the generous first-frame deadline applies; after that the
     // inter-frame cap. Keepalive noise re-arms neither.
     let mut seen_frame = false;
     let mut last_useful = Instant::now();
     let mut slot = 0usize;
+    let mut payload_bytes = 0usize;
     loop {
         let cap = if seen_frame {
             caps.idle
@@ -556,8 +748,13 @@ async fn consume_stream(
         let remaining = cap.saturating_sub(last_useful.elapsed());
         let event = match tokio::time::timeout(remaining, stream.next()).await {
             Ok(Some(Ok(e))) => e,
-            Ok(Some(Err(e))) => {
-                run.err = Some(anyhow!("SSE stream error: {e}"));
+            Ok(Some(Err(error))) => {
+                let (failure, terminal) = client::sse_read_failure(error, correlation.clone());
+                if terminal {
+                    acc.invalid = true;
+                    run.produced = true; // malformed/oversized input is never a blank replay.
+                }
+                run.err = Some(failure.into());
                 break;
             }
             Ok(None) => break,
@@ -574,6 +771,22 @@ async fn consume_stream(
                 break;
             }
         };
+        payload_bytes = payload_bytes.saturating_add(event.data.len());
+        if payload_bytes > 16 * 1024 * 1024 {
+            acc.invalid = true;
+            run.err = Some(anyhow!("SSE stream error: response exceeds 16 MiB limit"));
+            break;
+        }
+        if event.event == "error" {
+            let failure =
+                client::transport_failure("sse", Some(200), &event.data, correlation.clone());
+            // This is a provider-declared failure, even if its data is plain text or a
+            // misleading [DONE]. It cannot be retried as blank or salvaged as completed tools.
+            acc.invalid = true;
+            run.produced = true;
+            run.err = Some(failure.into());
+            break;
+        }
         let data = event.data.trim();
         if data == "[DONE]" {
             break;
@@ -582,6 +795,14 @@ async fn consume_stream(
             continue;
         }
         let fx = acc.ingest(data);
+        if !acc.tools.is_empty() {
+            run.produced = true; // a partial tool fragment must never replay the generation.
+        }
+        if let Some(error) = acc.error.as_mut() {
+            if error.correlation_id.is_none() {
+                error.correlation_id = correlation.clone();
+            }
+        }
         if !fx.useful {
             continue;
         }
@@ -594,16 +815,8 @@ async fn consume_stream(
             spin.take();
             run.produced = true;
             if sink.render {
-                painted = true;
                 crate::ui::tui::add_stream_chars(fx.text.chars().count() as u64);
-                if retained {
-                    crate::ui::tui::assistant_stream_delta(&fx.text);
-                } else {
-                    let rendered = md.push(&fx.text);
-                    if !rendered.is_empty() {
-                        crate::ui::tui::emit(&rendered);
-                    }
-                }
+                tail.push(&fx.text);
             }
         }
         if !fx.completed.is_empty() {
@@ -620,28 +833,26 @@ async fn consume_stream(
         }
         if fx.usage {
             run.produced = true;
+            if let Some(usage) = &acc.usage {
+                tail.observe_usage(usage);
+            }
         }
+        // Error envelopes are terminal: a later completed event cannot erase a real failure.
+        if acc.error.is_some() || acc.invalid {
+            break;
+        }
+    }
+    if acc.error.is_none() && run.err.is_none() {
+        run.err = acc.validate().err();
     }
     spin.take();
-    if sink.render {
-        if retained {
-            crate::ui::tui::assistant_stream_finish(run.err.is_some());
-        } else {
-            let closing = md.finish();
-            if !closing.is_empty() {
-                crate::ui::tui::emit(&closing);
-            }
-            if painted {
-                crate::ui::tui::emit("\n");
-            }
-        }
-    }
+    tail.finish(run.err.is_some());
     (acc, run)
 }
 
-/// Stop the eager work of a turn that no longer exists. Read-only by policy, so cutting it short
-/// is safe; aborting rather than detaching stops it billing for an abandoned attempt.
-fn abort_all(eager: BTreeMap<String, tokio::task::JoinHandle<String>>) {
+/// Abandon observations from a turn that no longer exists. The calls are read-only by policy;
+/// aborting their watchers does not prove that a blocking worker or provider call has stopped.
+fn abort_all(eager: BTreeMap<String, crate::agent::tools::StartedSafeCall>) {
     for h in eager.into_values() {
         h.abort();
     }
@@ -651,8 +862,8 @@ fn abort_all(eager: BTreeMap<String, tokio::task::JoinHandle<String>>) {
 /// executor stitches by). A handle whose call did not make the turn is aborted.
 fn eager_by_position(
     calls: &[ToolCall],
-    mut eager: BTreeMap<String, tokio::task::JoinHandle<String>>,
-) -> Vec<(usize, tokio::task::JoinHandle<String>)> {
+    mut eager: BTreeMap<String, crate::agent::tools::StartedSafeCall>,
+) -> Vec<(usize, crate::agent::tools::StartedSafeCall)> {
     let out = calls
         .iter()
         .enumerate()
@@ -687,6 +898,8 @@ fn parse_usage_limit(text: &str) -> Option<String> {
 pub(crate) struct ErrorEnvelope {
     pub message: String,
     pub code: String,
+    pub correlation_id: Option<String>,
+    pub provider_status: Option<u16>,
 }
 
 /// What an error envelope says about the upstream.
@@ -722,6 +935,8 @@ fn body_envelope(text: &str) -> ErrorEnvelope {
         .unwrap_or_else(|| ErrorEnvelope {
             message: text.trim().to_string(),
             code: String::new(),
+            correlation_id: None,
+            provider_status: None,
         })
 }
 
@@ -738,6 +953,8 @@ fn error_envelope(v: &Value) -> Option<ErrorEnvelope> {
         return Some(ErrorEnvelope {
             message: s.to_string(),
             code: String::new(),
+            correlation_id: None,
+            provider_status: None,
         });
     }
     let message = obj
@@ -754,7 +971,13 @@ fn error_envelope(v: &Value) -> Option<ErrorEnvelope> {
     if message.is_empty() && code.is_empty() {
         return None;
     }
-    Some(ErrorEnvelope { message, code })
+    let evidence = client::transport_failure("sse", Some(200), &v.to_string(), None);
+    Some(ErrorEnvelope {
+        message,
+        code,
+        correlation_id: evidence.correlation_id,
+        provider_status: evidence.provider_status,
+    })
 }
 
 /// Codex SSE frames folded into one turn, frame by frame. `ingest` reports what each frame
@@ -771,6 +994,7 @@ pub(crate) struct SseAccumulator {
     finish: Option<String>,
     usage: Option<Usage>,
     error: Option<ErrorEnvelope>,
+    invalid: bool,
 }
 
 /// What one frame contributed.
@@ -789,6 +1013,20 @@ pub(crate) struct FrameEffect {
 }
 
 impl SseAccumulator {
+    fn validate(&self) -> Result<()> {
+        if self.invalid
+            || self.tools.iter().any(|(id, (name, args))| {
+                name.is_empty() || !self.done.contains(id) || !client::args_complete(args)
+            })
+        {
+            bail!("SSE stream error: incomplete tool arguments");
+        }
+        if self.finish.as_deref() != Some("stop") {
+            bail!("SSE stream error: partial EOF without response.completed");
+        }
+        Ok(())
+    }
+
     /// Fold one `data:` payload in and report what it contributed.
     pub(crate) fn ingest(&mut self, data: &str) -> FrameEffect {
         let mut fx = FrameEffect::default();
@@ -914,6 +1152,8 @@ impl SseAccumulator {
                     self.error = Some(ErrorEnvelope {
                         message: format!("codex {ty}"),
                         code: ty.to_string(),
+                        correlation_id: None,
+                        provider_status: None,
                     });
                 }
             }
@@ -932,7 +1172,7 @@ impl SseAccumulator {
                 continue;
             }
             if let Some((name, args)) = self.tools.get(&id) {
-                if !name.is_empty() {
+                if !name.is_empty() && client::args_complete(args) {
                     fx.completed.push(tool_call(&id, name, args));
                 }
             }
@@ -945,11 +1185,7 @@ impl SseAccumulator {
     /// recovered from is still fine, while a stream cut down mid-answer must not come back as
     /// a clean `stop` turn the caller cannot tell from a finished one.
     fn failure(&self) -> Option<&ErrorEnvelope> {
-        if self.finish.is_none() {
-            self.error.as_ref()
-        } else {
-            None
-        }
+        self.error.as_ref()
     }
 
     fn content(&self) -> Option<String> {
@@ -964,7 +1200,9 @@ impl SseAccumulator {
     fn completed_calls(&self) -> Vec<ToolCall> {
         self.tools
             .iter()
-            .filter(|(id, (name, _))| !name.is_empty() && self.done.contains(*id))
+            .filter(|(id, (name, args))| {
+                !name.is_empty() && self.done.contains(*id) && client::args_complete(args)
+            })
             .map(|(id, (name, args))| tool_call(id, name, args))
             .collect()
     }
@@ -990,6 +1228,7 @@ impl SseAccumulator {
             finish_reason,
             usage: self.usage,
             empty_wire_note: None,
+            empty_wire_raw: None,
             eager: Default::default(),
         }
     }
@@ -1028,6 +1267,7 @@ pub(crate) fn parse_sse_to_chat_turn(sse: &str) -> Result<ChatTurn> {
     if let Some(env) = acc.failure() {
         bail!("Codex error: {}", env.message);
     }
+    acc.validate()?;
     Ok(acc.into_turn())
 }
 
@@ -1099,41 +1339,255 @@ fn ingest_output_item(
 }
 
 fn parse_usage(u: &Value) -> Option<Usage> {
-    let mut usage = Usage::default();
-    usage.prompt_tokens = u
-        .get("input_tokens")
-        .or_else(|| u.get("prompt_tokens"))
-        .and_then(|x| x.as_u64());
-    usage.completion_tokens = u
-        .get("output_tokens")
-        .or_else(|| u.get("completion_tokens"))
-        .and_then(|x| x.as_u64());
-    usage.total_tokens = u.get("total_tokens").and_then(|x| x.as_u64());
-    // The Responses dialect reports cached prompt tokens under `input_tokens_details`; keep the
-    // flat spelling too for gateways that mirror the Anthropic shape.
-    usage.cache_read_input_tokens = u
-        .get("cache_read_input_tokens")
-        .and_then(|x| x.as_u64())
-        .or_else(|| {
-            u.pointer("/input_tokens_details/cached_tokens")
-                .and_then(|x| x.as_u64())
-        });
-    Some(usage)
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(n).collect();
-        format!("{t}…")
-    }
+    Some(Usage {
+        prompt_tokens: u
+            .get("input_tokens")
+            .or_else(|| u.get("prompt_tokens"))
+            .and_then(|x| x.as_u64()),
+        completion_tokens: u
+            .get("output_tokens")
+            .or_else(|| u.get("completion_tokens"))
+            .and_then(|x| x.as_u64()),
+        total_tokens: u.get("total_tokens").and_then(|x| x.as_u64()),
+        // Responses reports cached prompt tokens under input_tokens_details; retain the flat
+        // spelling too for gateways that mirror the Anthropic shape.
+        cache_read_input_tokens: u
+            .get("cache_read_input_tokens")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                u.pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|x| x.as_u64())
+            }),
+        ..Usage::default()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::types::{FunctionDef, ToolDef};
+
+    #[test]
+    fn completion_requires_valid_closed_tools_and_no_error_envelope() {
+        for sse in [
+            "data: [DONE]\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"failed\",\"message\":\"no\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+        ] {
+            assert!(parse_sse_to_chat_turn(sse).is_err(), "false Done: {sse}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_codex_usage_observer_reports_latest_once_on_success_and_failure() {
+        use crate::llm::client::tests::raw_sse_backend;
+        const PREFIX: &str = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n";
+        for (ending, success) in [
+            ("", true),
+            ("event: error\ndata: private failure\n\n", false),
+        ] {
+            let (base, hits, server) =
+                raw_sse_backend(format!("{PREFIX}{ending}").into_bytes()).await;
+            let url = format!("{base}/codex/responses");
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let auth = CountingAuth::default();
+            let dispatch = crate::agent::orchestration::DispatchUsage::default();
+            let calls = AtomicUsize::new(0);
+            let observer = |usage: &Usage| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                dispatch.add(usage.input_total(), usage.completion_tokens.unwrap_or(0));
+            };
+            let sink = StreamSink {
+                observed_usage: Some(&observer),
+                ..Default::default()
+            };
+            let caps = StreamCaps {
+                first_frame: Duration::from_secs(10),
+                idle: Duration::from_secs(10),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                stream_turn_at(
+                    &http,
+                    &url,
+                    &auth,
+                    "gpt-5.4-mini",
+                    &[Message::user("hi")],
+                    &[],
+                    "sess",
+                    sink,
+                    caps,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(dispatch.finish(), (11, 3));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_codex_partial_eof_and_invalid_arguments_are_not_done() {
+        const INCOMPLETE: &str = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n";
+        for reply in [SSE_FIRST_DELTA, INCOMPLETE] {
+            let (url, hits) = stub_backend(vec![(200, reply)]).await;
+            let auth = CountingAuth::default();
+            assert!(run(&url, &auth, StreamSink::default()).await.is_err());
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_codex_error_keeps_correlation_not_echoed_body() {
+        let (url, hits) = stub_backend(vec![(200, "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"UPSTREAM_BAD_RESPONSE\",\"status\":0,\"correlation_id\":\"req-codex-1\",\"message\":\"sk-secret data:image/png;base64,PRIVATE\"}}}\n\n")]).await;
+        let auth = CountingAuth::default();
+        let err = run(&url, &auth, StreamSink::default()).await.err().unwrap();
+        let failure = err.downcast_ref::<client::TransportFailure>().unwrap();
+        assert_eq!(failure.http_status, Some(200));
+        assert_eq!(failure.provider_status, Some(0));
+        assert_eq!(failure.correlation_id.as_deref(), Some("req-codex-1"));
+        assert!(!err.to_string().contains("sk-secret"));
+        assert!(!err.to_string().contains("PRIVATE"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_json_error_event_cannot_be_erased_by_later_completed_response() {
+        use crate::llm::media::with_image_delivery;
+        for reply in [
+            "event: error\ndata: sk-secret data:image/png;base64,PRIVATE\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\nevent: error\ndata: sk-secret data:image/png;base64,PRIVATE\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n\nevent: error\ndata: [DONE]\n\n",
+        ] {
+            let (url, hits) = stub_backend(vec![(200, reply)]).await;
+            let auth = CountingAuth::default();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let messages = vec![Message::user_with_images("inspect", vec!["data:legacy".into()])];
+            let ctx = crate::core::exec_ctx::ExecutionContext::default();
+            let error = with_image_delivery(&ctx, &url, "fixture-key", "gpt-5.4-mini", stream_turn_at(
+                &client, &url, &auth, "gpt-5.4-mini", &messages, &[], "sess", StreamSink::default(), fast_caps(),
+            )).await.err().unwrap();
+            assert!(error.downcast_ref::<client::TransportFailure>().is_some());
+            assert!(!error.to_string().contains("sk-secret"));
+            assert!(!error.to_string().contains("PRIVATE"));
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "declared errors cannot blank-retry");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_raw_limit_and_malformed_are_not_replayed_or_tool_salvaged() {
+        use crate::llm::{
+            client::tests::{raw_limit_reply, raw_sse_backend},
+            media::with_image_delivery,
+        };
+        const TOOL: &[u8] = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n\n";
+        const FINISH: &[u8] =
+            b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n";
+        for prefix in [b"".as_slice(), TOOL] {
+            for limit in [false, true] {
+                let reply = if limit {
+                    raw_limit_reply(prefix, FINISH)
+                } else {
+                    [
+                        prefix,
+                        b"data: \xffsk-secret PRIVATE\n\n".as_slice(),
+                        FINISH,
+                    ]
+                    .concat()
+                };
+                let (base, hits, server) = raw_sse_backend(reply).await;
+                let url = format!("{base}/codex/responses");
+                let http = reqwest::Client::builder().no_proxy().build().unwrap();
+                let auth = CountingAuth::default();
+                let ctx = crate::core::exec_ctx::ExecutionContext::default();
+                let messages = [Message::user_with_images(
+                    "inspect",
+                    vec!["data:legacy".into()],
+                )];
+                // These fixtures exercise the byte cap, not the 150 ms stall seam.
+                let caps = StreamCaps {
+                    first_frame: Duration::from_secs(20),
+                    idle: Duration::from_secs(20),
+                };
+                let result = with_image_delivery(
+                    &ctx,
+                    &url,
+                    "fixture-key",
+                    "gpt-5.4-mini",
+                    stream_turn_at(
+                        &http,
+                        &url,
+                        &auth,
+                        "gpt-5.4-mini",
+                        &messages,
+                        &[],
+                        "sess",
+                        StreamSink::default(),
+                        caps,
+                    ),
+                );
+                let error = tokio::time::timeout(Duration::from_secs(30), result)
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                let failure = error.downcast_ref::<client::TransportFailure>().unwrap();
+                assert_eq!(
+                    failure.provider_code.as_deref(),
+                    Some(if limit {
+                        "SSE_RAW_LIMIT"
+                    } else {
+                        "SSE_MALFORMED"
+                    })
+                );
+                assert_eq!(failure.correlation_id.as_deref(), Some("req-raw-bound"));
+                assert!(!error.to_string().contains("PRIVATE"));
+                assert!(!error.to_string().contains("sk-secret"));
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn salvaged_codex_tools_clear_live_image_receipt() {
+        use crate::llm::media::{with_image_delivery, ImageDeliveryReceipt};
+        const REPLY: &str = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n\n";
+        let (url, hits) = stub_backend(vec![(200, REPLY)]).await;
+        let auth = CountingAuth::default();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let messages = vec![Message::user_with_images(
+            "inspect",
+            vec!["data:legacy".into()],
+        )];
+        let ctx = crate::core::exec_ctx::ExecutionContext::default();
+        let (turn, receipt) = with_image_delivery(
+            &ctx,
+            &url,
+            "fixture-key",
+            "gpt-5.4-mini",
+            stream_turn_at(
+                &client,
+                &url,
+                &auth,
+                "gpt-5.4-mini",
+                &messages,
+                &[],
+                "sess",
+                StreamSink::default(),
+                fast_caps(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(receipt, ImageDeliveryReceipt::default());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn build_body_maps_tools_and_strips_disallowed() {
@@ -1198,6 +1652,56 @@ data: {"type":"response.completed","response":{"output":[]}}
         assert!(input
             .iter()
             .all(|i| i.get("role").and_then(|r| r.as_str()) != Some("system")));
+    }
+
+    #[tokio::test]
+    async fn actual_codex_receiver_gets_every_output_before_exact_image_bytes_without_metadata() {
+        use crate::llm::media::{destination_key, tests as media_tests, VisionPolicy};
+        const REPLY: &str = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"reviewed\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        let (base, receiver, server) =
+            media_tests::request_receiver(REPLY, "text/event-stream").await;
+        let url = format!("{base}/codex/responses");
+        let image =
+            media_tests::image(43).with_approved_destination(destination_key(&url, "vision-test"));
+        let expected = image.bytes().unwrap();
+        let messages = media_tests::observed_group(image);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let turn = stream_turn_at_projected(
+            &client,
+            &url,
+            &CountingAuth::default(),
+            "vision-test-high",
+            &messages,
+            &[],
+            "test-session",
+            StreamSink::default(),
+            fast_caps(),
+            VisionPolicy::Supported,
+            Some(Some("low".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.content.as_deref(), Some("reviewed"));
+        let wire = receiver.await.unwrap();
+        server.await.unwrap();
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(input.len(), 7);
+        for item in input.iter().take(3) {
+            assert_eq!(item["type"], "function_call");
+        }
+        for (position, text) in [(3, "image text"), (4, "other text"), (5, "last text")] {
+            assert_eq!(input[position]["type"], "function_call_output");
+            assert_eq!(input[position]["output"], text);
+        }
+        assert_eq!(input[6]["role"], "user");
+        let image_url = input[6]["content"][1]["image_url"].as_str().unwrap();
+        assert_eq!(media_tests::decode_url(image_url), expected);
+        assert_eq!(wire["model"], "vision-test");
+        assert_eq!(
+            wire["reasoning"]["effort"], "low",
+            "explicit per-call effort beats model suffix/global"
+        );
+        media_tests::assert_no_storage_metadata(&wire);
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1446,16 +1950,29 @@ data: {\"type\":\"response.completed\",\"response\":{\"error\":null,\"output\":[
         let auth = CountingAuth::default();
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen2 = seen.clone();
-        let hook = move |slot: usize, tc: &ToolCall| -> Option<tokio::task::JoinHandle<String>> {
-            seen2
-                .lock()
-                .unwrap()
-                .push(format!("{slot}:{}:{}", tc.id, tc.function.name));
-            Some(tokio::spawn(async { "ran".to_string() }))
-        };
+        let hook =
+            move |slot: usize, tc: &ToolCall| -> Option<crate::agent::tools::StartedSafeCall> {
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push(format!("{slot}:{}:{}", tc.id, tc.function.name));
+                Some(crate::agent::tools::StartedSafeCall::start(
+                    tc.id.clone(),
+                    crate::agent::tools::PreparedToolCall::new(serde_json::json!({})),
+                    crate::core::cancel::TurnCancel::new(),
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    None,
+                    || crate::agent::tools::ToolOutcome {
+                        observation: crate::agent::tools::ToolObservation::text("ran"),
+                        failure: None,
+                        effect_state: crate::agent::tools::ToolEffectState::Settled,
+                    },
+                ))
+            };
         let sink = StreamSink {
             render: false,
             eager: Some(&hook),
+            observed_usage: None,
         };
         let mut turn = run(&url, &auth, sink).await.unwrap();
         assert_eq!(
@@ -1471,7 +1988,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"error\":null,\"output\":[
         assert_eq!(turn.eager.len(), 1);
         let (pos, handle) = turn.eager.remove(0);
         assert_eq!(pos, 0);
-        assert_eq!(handle.await.unwrap(), "ran");
+        assert_eq!(handle.await.unwrap().text, "ran");
     }
 
     #[test]

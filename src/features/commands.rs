@@ -212,7 +212,7 @@ fn expand_shell(s: &str) -> Result<String> {
         out.push_str(&s[last..whole.start()]);
         match crate::agent::cmd_guard::classify(command) {
             crate::agent::cmd_guard::Verdict::Allow => {
-                let result = run_capture(command, &root);
+                let result = run_capture(command, &root)?;
                 out.push_str(&format!("\n```$ {command}\n{}\n```\n", result.trim_end()));
             }
             crate::agent::cmd_guard::Verdict::Blocked(reason) => {
@@ -252,11 +252,11 @@ const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// EOF on the pipes with no deadline, and a grandchild outliving its `cmd.exe` wrapper holds the write
 /// end open indefinitely. That hang would land on the REPL's own thread — the whole UI, not one tool
 /// call — so a `git log` on a repo with a wedged credential helper could freeze the session.
-fn run_capture(command: &str, dir: &Path) -> String {
+fn run_capture(command: &str, dir: &Path) -> Result<String> {
     // Through the sandbox runner: a custom command's `` !`cmd` `` body ships with the REPOSITORY
     // (./.aizen/commands/), so it is exactly the repo-influenced surface the sandbox exists for —
     // the read-only classify gate above stays, and the env scrub keeps secrets out of it.
-    let mut sbx = match crate::sandbox::runner::prepare_std(
+    let sbx = match crate::sandbox::runner::prepare_std(
         crate::sandbox::request::SandboxRequest::shell(
             crate::sandbox::CommandOrigin::CustomCommand,
             command,
@@ -266,25 +266,34 @@ fn run_capture(command: &str, dir: &Path) -> String {
         .wall_timeout(CAPTURE_TIMEOUT),
     ) {
         Ok(s) => s,
-        Err(e) => return format!("[refused: {e}]"),
+        Err(e) => return Ok(format!("[refused: {e}]")),
     };
-    let bounded = crate::core::proctree::output_bounded(
-        &mut sbx.command,
-        CAPTURE_TIMEOUT,
-        CAPTURE_DRAIN_GRACE,
-    );
-    sbx.finish(match &bounded {
-        Ok(o) if o.timed_out => crate::sandbox::runner::Outcome::Timeout,
-        Ok(o) => crate::sandbox::runner::Outcome::Exit(o.code),
-        Err(_) => crate::sandbox::runner::Outcome::SpawnFailed,
-    });
+    let bounded = sbx.output_bounded(CAPTURE_TIMEOUT, CAPTURE_DRAIN_GRACE);
+    let strict = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
     match bounded {
-        Ok(o) if o.timed_out => format!(
-            "[command timed out after {}s and was killed: {command}]",
-            CAPTURE_TIMEOUT.as_secs()
+        Ok(o) if strict && o.settlement == crate::core::proctree::BoundedSettlement::Unknown => Err(
+            anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                crate::agent::tools::ToolEffectState::UnknownWorker,
+            ))
+            .context(
+                "custom command effects remain unproven; output was not inserted into the prompt",
+            ),
         ),
-        Ok(o) => o.stdout,
-        Err(e) => format!("[command failed: {e}]"),
+        Ok(o) if o.timed_out => Ok(format!(
+            "[command timed out after {}s; termination requested: {command}]",
+            CAPTURE_TIMEOUT.as_secs()
+        )),
+        Ok(o) if o.output_truncated => {
+            bail!("custom command output incomplete; capture was not inserted into the prompt")
+        }
+        Ok(o) => Ok(o.stdout),
+        Err(e) if e.settlement == crate::core::proctree::BoundedSettlement::Unknown => Err(
+            anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                crate::agent::tools::ToolEffectState::UnknownWorker,
+            ))
+            .context(e.to_string()),
+        ),
+        Err(e) => Ok(format!("[command failed: {e}]")),
     }
 }
 

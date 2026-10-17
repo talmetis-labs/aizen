@@ -41,6 +41,229 @@ impl Drop for GeomLock {
     }
 }
 
+fn scratch_display_fixture() -> (
+    crate::core::file_placement::tests::TestDir,
+    crate::ui::links::DisplayTarget,
+) {
+    let temp = crate::core::file_placement::tests::TestDir::new();
+    let root = temp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let placement = crate::core::file_placement::PlacementContext::with_paths(
+        root,
+        temp.path().join("home"),
+        temp.path().join("process"),
+        "display-fixture",
+    )
+    .unwrap();
+    let mut display = crate::ui::links::DisplayTarget::default();
+    for name in ["báo cáo/結果 e\u{301} 👩‍💻.cjs", "nested/second file.txt"] {
+        if !display.text.is_empty() {
+            display.text.push_str(" → ");
+        }
+        let path = placement
+            .scratch_display(&placement.scratch_root().join(name))
+            .unwrap();
+        let start = display.text.len();
+        display.text.push_str(path.label());
+        display.paths.push((start..display.text.len(), path));
+    }
+    (temp, display)
+}
+
+#[test]
+fn scratch_display_wrap_copy_and_links_keep_typed_real_targets() {
+    let (_temp, display) = scratch_display_fixture();
+    let target = display
+        .paths
+        .iter()
+        .map(|(_, p)| p.actual().display().to_string())
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let event = ToolEvent {
+        seq: 190,
+        icon: "◆".into(),
+        name: "file_move".into(),
+        target: target.clone(),
+        display: display.clone(),
+        digest: "moved".into(),
+        state: ToolState::Ok,
+        elapsed_ms: Some(20),
+        body: format!("moved {target}"),
+    };
+    let block = UiBlock {
+        id: 1,
+        kind: BlockKind::Tool,
+        payload: Payload::Tool(event),
+        complete: true,
+        rev: 0,
+    };
+    for width in [0, 1, 2, 3, 7, 16, 40, 100] {
+        let rows = render_block_rows(&block, width);
+        assert_eq!(rows.plain.len(), rows.paths.len());
+        assert!(rows
+            .plain
+            .iter()
+            .all(|r| crate::ui::links::display_width(r) <= usize::from(width)));
+        if width <= 1 {
+            assert!(rows.paths.iter().all(Vec::is_empty));
+            continue;
+        }
+        for (index, (_, path)) in display.paths.iter().enumerate() {
+            let fragments: Vec<_> = rows
+                .paths
+                .iter()
+                .enumerate()
+                .flat_map(|(row, paths)| {
+                    paths
+                        .iter()
+                        .filter(move |p| p.id == (190, index))
+                        .map(move |p| (row, p))
+                })
+                .collect();
+            assert!(!fragments.is_empty(), "width {width}, alias {index}");
+            assert_eq!(
+                fragments
+                    .iter()
+                    .map(|(_, p)| p.span.text.as_str())
+                    .collect::<String>(),
+                path.label()
+            );
+            assert!(fragments.iter().all(|(_, p)| p.actual == path.actual()));
+            assert!(fragments.iter().all(|(_, p)| {
+                let linked = url::Url::parse(&p.span.url)
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap();
+                crate::core::config::normalize_path_key(&linked)
+                    == crate::core::config::normalize_path_key(path.actual())
+            }));
+            let (first_row, first) = fragments[0];
+            let (last_row, last) = *fragments.last().unwrap();
+            let selection = SelectionRange {
+                anchor_line: first_row,
+                anchor_col: first.span.col,
+                cursor_line: last_row,
+                cursor_col: last.span.col + last.span.width,
+            };
+            let copied = extract_from_path_rows(&rows.plain, &rows.paths, selection);
+            assert_eq!(copied, path.actual().to_string_lossy(), "width {width}");
+            assert_eq!(
+                extract_from_path_rows(
+                    &rows.plain,
+                    &rows.paths,
+                    SelectionRange {
+                        anchor_line: selection.cursor_line,
+                        anchor_col: selection.cursor_col,
+                        cursor_line: selection.anchor_line,
+                        cursor_col: selection.anchor_col
+                    }
+                ),
+                copied
+            );
+            let partial = SelectionRange {
+                cursor_line: first_row,
+                cursor_col: first.span.col + 1,
+                ..selection
+            };
+            assert_eq!(
+                extract_from_path_rows(&rows.plain, &rows.paths, partial),
+                "s"
+            );
+            if last_row > first_row {
+                let clipped = extract_from_path_rows(
+                    &rows.plain[first_row + 1..],
+                    &rows.paths[first_row + 1..],
+                    SelectionRange {
+                        anchor_line: 0,
+                        anchor_col: 0,
+                        cursor_line: last_row - first_row - 1,
+                        cursor_col: last.span.col + last.span.width,
+                    },
+                );
+                assert!(
+                    !clipped.contains(&path.actual().to_string_lossy().to_string()),
+                    "an incomplete viewport cannot invent the missing alias"
+                );
+            }
+        }
+        let mut output = Vec::new();
+        crate::ui::links::inject_hyperlinks_with_paths(
+            &mut output,
+            &rows.sgr,
+            &rows.plain,
+            &crate::ui::links::InjectCtx {
+                area: Rect::new(4, 3, width + 1, rows.plain.len() as u16),
+                visible: rows.plain.len(),
+                ..Default::default()
+            },
+            &rows.paths,
+        );
+        let links = crate::ui::links::captured_links(&output);
+        for (index, (_, path)) in display.paths.iter().enumerate() {
+            let uri = url::Url::from_file_path(path.actual()).unwrap().to_string();
+            assert_eq!(
+                links
+                    .iter()
+                    .filter(|(_, _, u, _)| u == &uri)
+                    .map(|(_, _, _, text)| plain(text))
+                    .collect::<String>(),
+                path.label(),
+                "width {width}, alias {index}"
+            );
+        }
+        assert!(links.iter().all(|(x, y, _, text)| *x >= 4
+            && *y >= 3
+            && *x + crate::ui::links::display_width(&plain(text)) <= usize::from(width) + 4));
+    }
+    let Payload::Tool(stored) = &block.payload else {
+        unreachable!()
+    };
+    assert_eq!(stored.target, target);
+    assert_eq!(stored.body, format!("moved {target}"));
+}
+
+#[test]
+fn scratch_display_geometry_resize_and_revision_are_frame_aligned() {
+    let _geom = GeomLock::acquire();
+    let (_temp, display) = scratch_display_fixture();
+    let mut state = AppState::new("intro", "status");
+    let mut event = ToolEvent {
+        seq: 191,
+        icon: "◆".into(),
+        name: "file_move".into(),
+        target: "raw target".into(),
+        display,
+        digest: String::new(),
+        state: ToolState::Running,
+        elapsed_ms: None,
+        body: String::new(),
+    };
+    apply_command(&mut state, Command::Tool(event.clone()));
+    for width in [20, 124, 125, 140, 3, 2, 1] {
+        let _ = painted_rows(&mut state, width, 80);
+        let g = transcript_geom_slot().lock().unwrap().clone();
+        assert_eq!(g.plain_rows.len(), g.paths.len());
+        assert_eq!(g.plain_rows.len(), g.sgr_rows.len());
+        assert_eq!(g.plain_rows.len(), g.row_tool_seq.len());
+        for (i, paths) in g.paths.iter().enumerate() {
+            for path in paths {
+                assert_eq!(g.row_tool_seq[i], Some(path.id.0));
+                assert!(g.plain_rows[i].contains(&path.span.text));
+            }
+        }
+    }
+    event.display = Default::default();
+    event.state = ToolState::Ok;
+    event.digest = "done".into();
+    apply_command(&mut state, Command::Tool(event));
+    let _ = painted_rows(&mut state, 124, 80);
+    let g = transcript_geom_slot().lock().unwrap().clone();
+    assert!(
+        g.paths.iter().all(Vec::is_empty),
+        "new revision must not retain stale aliases"
+    );
+}
+
 #[test]
 fn overlay_menu_hit_maps_rows_scroll_and_dead_zones() {
     let g = OverlayMenuGeom {
@@ -434,6 +657,7 @@ fn payload_mutations_bump_the_revision_so_the_cache_cannot_go_stale() {
         icon: "⚙".into(),
         name: "file_read".into(),
         target: "x.rs".into(),
+        display: Default::default(),
         digest: String::new(),
         state: state_flag,
         elapsed_ms: None,
@@ -944,12 +1168,13 @@ fn a_selection_is_rebased_onto_the_rendered_window() {
 }
 
 #[test]
-fn a_failed_tool_row_shows_its_tail_and_a_hint() {
+fn a_failed_tool_row_stays_one_line_and_points_at_ctrl_e() {
     let mut ev = ToolEvent {
         seq: 5,
         icon: "⚙".into(),
         name: "shell_run".into(),
         target: "cargo test".into(),
+        display: Default::default(),
         digest: "exit 101".into(),
         state: ToolState::Err,
         elapsed_ms: Some(900),
@@ -960,28 +1185,84 @@ fn a_failed_tool_row_shows_its_tail_and_a_hint() {
     };
     let rows = render_tool_row(&ev, 80);
     let plain = console::strip_ansi_codes(&rows).to_string();
+    // The failure digest is the whole error line; the body must NOT spill into the transcript,
+    // or a run with several failed calls buries everything under indented log rows.
+    assert!(plain.contains("exit 101"), "{plain}");
     assert!(
-        plain.contains("│ line 9") && plain.contains("│ line 4"),
-        "{plain}"
+        !plain.contains("│ line 9") && !plain.contains("│ line 4"),
+        "a failed call no longer auto-expands its tail: {plain}"
     );
-    assert!(
-        !plain.contains("│ line 3"),
-        "only the last {AUTO_EXPAND_LINES} lines: {plain}"
-    );
-    assert!(
-        plain.contains("… 3 more line(s) — Ctrl-E expands"),
-        "{plain}"
+    assert!(plain.contains("9 more line(s) — Ctrl-E expands"), "{plain}");
+    assert_eq!(
+        plain.lines().count(),
+        3,
+        "call line + digest line + one hint: {plain}"
     );
     ev.state = ToolState::Ok;
     let ok = console::strip_ansi_codes(&render_tool_row(&ev, 80)).to_string();
     assert!(
-        !ok.contains("│ line"),
+        !ok.contains("│ line") && !ok.contains("Ctrl-E"),
         "a successful call stays two rows: {ok}"
     );
     ev.state = ToolState::Err;
     ev.body.clear();
     let bare = console::strip_ansi_codes(&render_tool_row(&ev, 80)).to_string();
     assert_eq!(bare.lines().count(), 2, "no body, no tail: {bare}");
+}
+
+#[test]
+fn failed_tool_row_never_echoes_its_body_and_counts_what_ctrl_e_holds() {
+    let message = "error: provide exactly one of path, evidence_id or ref_id";
+    let mut ev = ToolEvent {
+        seq: 6,
+        icon: String::new(),
+        name: "image_read".into(),
+        target: String::new(),
+        display: Default::default(),
+        digest: message.into(),
+        state: ToolState::Err,
+        elapsed_ms: None,
+        body: format!(" \x1b[31m{message}\x1b[0m \r\n\n"),
+    };
+    let original = ev.body.clone();
+    let plain = sanitize_text(&render_tool_row(&ev, 120));
+    assert_eq!(plain.matches(message).count(), 1, "{plain}");
+    assert!(!plain.contains('│'), "{plain}");
+    assert_eq!(ev.body, original, "full details remain untouched");
+
+    // A body line that merely EXTENDS the digest is not a repeat of it, so it counts as detail
+    // held for Ctrl-E — but it is still not printed.
+    ev.body = format!("{message}: received both path and ref_id");
+    let plain = sanitize_text(&render_tool_row(&ev, 120));
+    assert!(!plain.contains("received both path and ref_id"), "{plain}");
+    assert!(plain.contains("1 more line(s) — Ctrl-E expands"), "{plain}");
+    ev.digest = "error: provide exactly one…".into();
+    let plain = sanitize_text(&render_tool_row(&ev, 120));
+    assert!(plain.contains("1 more line(s) — Ctrl-E expands"), "{plain}");
+
+    // Nine body lines, one of which is an exact repeat of the digest: the repeat is not counted
+    // as extra detail, and none of the rest reach the transcript.
+    ev.digest = message.into();
+    ev.body = format!(
+        "{message}\n{}\n{message}",
+        (1..=7)
+            .map(|i| format!("diagnostic {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let plain = sanitize_text(&render_tool_row(&ev, 120));
+    assert_eq!(plain.matches(message).count(), 1, "{plain}");
+    assert!(!plain.contains("diagnostic"), "{plain}");
+    assert!(plain.contains("7 more line(s) — Ctrl-E expands"), "{plain}");
+    assert_eq!(plain.lines().count(), 3, "{plain}");
+
+    ev.body = message.into();
+    let narrow = sanitize_text(&render_tool_row(&ev, 24));
+    assert!(!narrow.contains('│'), "{narrow}");
+    assert!(narrow
+        .lines()
+        .all(|line| console::measure_text_width(line) <= 24));
+    assert_eq!(ev.body, message);
 }
 
 #[test]
@@ -1172,6 +1453,7 @@ fn tool_row_puts_digest_and_time_on_the_line_below() {
         icon: "⚙".into(),
         name: "file_read".into(),
         target: "src/auth.rs".into(),
+        display: Default::default(),
         digest: "142 lines".into(),
         state: ToolState::Ok,
         elapsed_ms: Some(1200),
@@ -1197,6 +1479,7 @@ fn tool_row_shows_ms_for_subsecond_runs() {
         icon: "⚙".into(),
         name: "search_files".into(),
         target: "foo".into(),
+        display: Default::default(),
         digest: "3 match(es)".into(),
         state: ToolState::Ok,
         elapsed_ms: Some(940),
@@ -1217,6 +1500,7 @@ fn tool_row_omits_time_when_unknown() {
         icon: "⚙".into(),
         name: "file_read".into(),
         target: "x.rs".into(),
+        display: Default::default(),
         digest: "10 lines".into(),
         state: ToolState::Ok,
         elapsed_ms: None,
@@ -1235,6 +1519,7 @@ fn tool_row_omits_result_line_when_no_digest() {
         icon: "⚙".into(),
         name: "shell_run".into(),
         target: "cargo check".into(),
+        display: Default::default(),
         digest: String::new(),
         state: ToolState::Running,
         elapsed_ms: None,
@@ -1358,6 +1643,7 @@ fn tool_event_updates_the_same_line_by_seq() {
             icon: "⚙".into(),
             name: "file_read".into(),
             target: "x.rs".into(),
+            display: Default::default(),
             digest: String::new(),
             state: ToolState::Running,
             elapsed_ms: None,
@@ -1379,6 +1665,7 @@ fn tool_event_updates_the_same_line_by_seq() {
             icon: "⚙".into(),
             name: "file_read".into(),
             target: "x.rs".into(),
+            display: Default::default(),
             digest: "10 lines".into(),
             state: ToolState::Ok,
             elapsed_ms: Some(42),
@@ -1704,6 +1991,7 @@ fn a_wide_terminal_docks_the_sidebar_and_a_narrow_one_does_not() {
 #[test]
 fn sidebar_shows_jobs_and_the_narrow_strip_replaces_it() {
     use crate::ui::tui::{JobRow, JobsStatus};
+    let _geom = GeomLock::acquire();
     let mut state = AppState::new("intro", "status");
     state.jobs = JobsStatus {
         processes: vec![
@@ -1760,6 +2048,276 @@ fn sidebar_shows_jobs_and_the_narrow_strip_replaces_it() {
         jobs_strip_rect().is_none(),
         "stale strip rect must be cleared"
     );
+}
+
+#[test]
+fn sidebar_jobs_show_only_the_living() {
+    use crate::ui::tui::{JobRow, JobsStatus};
+    let _geom = GeomLock::acquire();
+    let proc_row = |id: &str, running: bool, detail: &str| JobRow {
+        id: id.to_string(),
+        running,
+        elapsed: "7m03s".to_string(),
+        detail: detail.to_string(),
+    };
+    let monitor_row = |id: &str, detail: &str| JobRow {
+        id: id.to_string(),
+        running: true,
+        elapsed: "12s".to_string(),
+        detail: detail.to_string(),
+    };
+
+    // Completed processes belong to /jobs, not an idle sidebar section.
+    let mut state = AppState::new("intro", "status");
+    state.jobs = JobsStatus {
+        processes: vec![
+            proc_row("proc_1", false, "old build"),
+            proc_row("proc_2", false, "old serve"),
+            proc_row("proc_3", false, "old node"),
+        ],
+        monitor: vec![],
+    };
+    let joined = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24).join("\n");
+    assert!(
+        !joined.contains("Jobs "),
+        "done-only header shown:\n{joined}"
+    );
+    assert!(!joined.contains("0 running"), "{joined}");
+    assert!(!joined.contains("old "), "done rows shown:\n{joined}");
+
+    // A monitor-only snapshot still shows its live work, without the completed process lane.
+    state.jobs = JobsStatus {
+        processes: vec![
+            proc_row("proc_1", false, "old build"),
+            proc_row("proc_2", false, "old serve"),
+            proc_row("proc_3", false, "old node"),
+            proc_row("proc_4", false, "old test"),
+        ],
+        monitor: vec![monitor_row("#4", "reviewer · t1")],
+    };
+    let joined = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24).join("\n");
+    assert!(joined.contains("Jobs monitor 1"), "{joined}");
+    assert!(
+        joined.contains("reviewer · t1"),
+        "live monitor missing:\n{joined}"
+    );
+    assert!(!joined.contains("done"), "done count shown:\n{joined}");
+    assert!(!joined.contains("old "), "done rows shown:\n{joined}");
+
+    // A running process still outranks the live monitor lane.
+    state.jobs = JobsStatus {
+        processes: vec![
+            proc_row("proc_1", false, "old build"),
+            proc_row("proc_9", true, "npm run dev"),
+        ],
+        monitor: vec![monitor_row("#4", "reviewer · t1")],
+    };
+    let joined = painted_rows(&mut state, SIDEBAR_MIN_TERM_W, 24).join("\n");
+    assert!(joined.contains("Jobs 1 proc · 1 monitor"), "{joined}");
+    let r = joined.find("npm run dev").unwrap();
+    let m = joined.find("reviewer · t1").unwrap();
+    assert!(r < m, "running process → monitor:\n{joined}");
+    assert!(!joined.contains("done"), "done count shown:\n{joined}");
+    assert!(!joined.contains("old build"), "done row shown:\n{joined}");
+}
+
+#[test]
+fn jobs_surfaces_clear_on_mixed_to_done_only_to_empty_at_sidebar_boundary() {
+    use crate::ui::tui::{JobRow, JobsStatus};
+    let _geom = GeomLock::acquire();
+    let read_rows = |term: &Terminal<ratatui::backend::TestBackend>| {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    for width in [125, 124] {
+        let mut state = AppState::new("intro", "status");
+        state.jobs = JobsStatus {
+            processes: vec![
+                JobRow {
+                    id: "proc_old".into(),
+                    running: false,
+                    elapsed: "3s".into(),
+                    detail: "finished build".into(),
+                },
+                JobRow {
+                    id: "proc_live".into(),
+                    running: true,
+                    elapsed: "7m03s".into(),
+                    detail: "npm run dev".into(),
+                },
+            ],
+            monitor: vec![JobRow {
+                id: "#4".into(),
+                running: true,
+                elapsed: "12s".into(),
+                detail: "reviewer · t1".into(),
+            }],
+        };
+        // Reuse the backend through all three frames: stale text must be erased, not just omitted.
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        term.draw(|frame| draw(frame, &mut state)).unwrap();
+        let mixed = read_rows(&term);
+        let joined = mixed.join("\n");
+        assert!(joined.contains("npm run dev"), "width {width}:\n{joined}");
+        assert!(joined.contains("monitor"), "width {width}:\n{joined}");
+        assert!(
+            !joined.contains("finished build"),
+            "width {width}:\n{joined}"
+        );
+        assert!(!joined.contains("done"), "width {width}:\n{joined}");
+        let strip = jobs_strip_rect();
+        let live_height = transcript_geom_slot().lock().unwrap().area.height;
+        if width == 125 {
+            assert!(joined.contains("Jobs 1 proc · 1 monitor"), "{joined}");
+            assert!(joined.contains("reviewer · t1"), "{joined}");
+            assert!(strip.is_none(), "docked sidebar must retire any strip rect");
+        } else {
+            let strip = strip.expect("live narrow strip must publish click geometry");
+            assert_eq!(strip, Rect::new(0, 23, width, 1));
+            assert!(mixed[strip.y as usize].contains("/jobs"), "{joined}");
+        }
+
+        for row in &mut state.jobs.processes {
+            row.running = false;
+        }
+        state.jobs.monitor.clear();
+        term.draw(|frame| draw(frame, &mut state)).unwrap();
+        let done_only = read_rows(&term);
+        let joined = done_only.join("\n");
+        for hidden in [
+            "Jobs ",
+            "/jobs",
+            "running",
+            "monitor",
+            "done",
+            "npm run dev",
+            "finished build",
+            "reviewer · t1",
+        ] {
+            assert!(
+                !joined.contains(hidden),
+                "done-only width {width}: {hidden} leaked:\n{joined}"
+            );
+        }
+        assert!(
+            jobs_strip_rect().is_none(),
+            "done-only must clear strip hit rect"
+        );
+        let done_height = transcript_geom_slot().lock().unwrap().area.height;
+        assert_eq!(done_height, live_height + u16::from(width == 124));
+
+        state.jobs = JobsStatus::default();
+        term.draw(|frame| draw(frame, &mut state)).unwrap();
+        let empty = read_rows(&term);
+        assert_eq!(
+            done_only, empty,
+            "done-only paints exactly like empty at width {width}"
+        );
+        assert!(
+            jobs_strip_rect().is_none(),
+            "empty must keep strip hit rect cleared"
+        );
+    }
+}
+
+#[test]
+fn jobs_live_monitors_show_without_running_processes() {
+    use crate::ui::tui::{JobRow, JobsStatus};
+    let _geom = GeomLock::acquire();
+    let mut state = AppState::new("intro", "status");
+    state.jobs = JobsStatus {
+        processes: vec![JobRow {
+            id: "proc_old".into(),
+            running: false,
+            elapsed: "3s".into(),
+            detail: "finished build".into(),
+        }],
+        // Membership in the monitor snapshot means live, even while the run is awaiting input.
+        monitor: vec![JobRow {
+            id: "#4".into(),
+            running: false,
+            elapsed: "12s".into(),
+            detail: "reviewer · t1".into(),
+        }],
+    };
+    for width in [124, 125] {
+        let joined = painted_rows(&mut state, width, 24).join("\n");
+        assert!(joined.contains("monitor 1"), "width {width}:\n{joined}");
+        assert!(
+            joined.contains("reviewer · t1"),
+            "live monitor missing at width {width}:\n{joined}"
+        );
+        assert!(!joined.contains("finished build"), "{joined}");
+        assert!(!joined.contains("done"), "{joined}");
+        assert!(!joined.contains("0 running"), "{joined}");
+        if width == 124 {
+            assert!(joined.contains("/jobs"), "{joined}");
+            assert!(jobs_strip_rect().is_some());
+        } else {
+            assert!(joined.contains("Jobs monitor 1"), "{joined}");
+            assert!(
+                jobs_strip_rect().is_none(),
+                "docking must clear the live strip hit rect"
+            );
+        }
+    }
+}
+
+#[test]
+fn completed_processes_do_not_consume_sidebar_jobs_six_row_cap() {
+    use crate::ui::tui::{JobRow, JobsStatus};
+    let _geom = GeomLock::acquire();
+    let mut processes: Vec<_> = (0..8)
+        .map(|i| JobRow {
+            id: format!("proc_old_{i}"),
+            running: false,
+            elapsed: "3s".into(),
+            detail: format!("finished build {i}"),
+        })
+        .collect();
+    processes.push(JobRow {
+        id: "proc_live".into(),
+        running: true,
+        elapsed: "7s".into(),
+        detail: "npm run dev".into(),
+    });
+    let mut state = AppState::new("intro", "status");
+    state.jobs = JobsStatus {
+        processes,
+        monitor: (1..=6)
+            .map(|i| JobRow {
+                id: format!("#{i}"),
+                running: true,
+                elapsed: "12s".into(),
+                detail: format!("live monitor {i}"),
+            })
+            .collect(),
+    };
+    let joined = painted_rows(&mut state, 125, 24).join("\n");
+    assert!(joined.contains("Jobs 1 proc · 6 monitor"), "{joined}");
+    let mut last = joined.find("npm run dev").expect("running process leads");
+    for i in 1..=5 {
+        let detail = format!("live monitor {i}");
+        let at = joined
+            .find(&detail)
+            .expect("six-row cap must contain only live rows");
+        assert!(last < at, "live row order changed:\n{joined}");
+        last = at;
+    }
+    assert!(
+        !joined.contains("live monitor 6"),
+        "seventh live row exceeds the cap:\n{joined}"
+    );
+    assert!(
+        !joined.contains("finished build"),
+        "completed rows consumed the cap:\n{joined}"
+    );
+    assert!(!joined.contains("done"), "{joined}");
 }
 
 #[test]
@@ -1928,4 +2486,398 @@ fn subagents_update_is_in_place_and_toggle_is_ui_owned() {
         })
         .unwrap();
     assert!(still_open, "a snapshot never resets the user's toggle");
+}
+
+#[test]
+fn tool_wrap_preserves_full_paths_ids_and_failure_preview_in_every_state() {
+    let source = format!("src/{}/source.rs", "nested_directory/".repeat(18));
+    let dest = format!("src/{}/destination.rs", "another_directory/".repeat(18));
+    let id = "session-0123456789abcdef".repeat(8);
+    for state in [ToolState::Running, ToolState::Ok, ToolState::Err] {
+        let event = ToolEvent {
+            seq: 77,
+            icon: "◆".into(),
+            name: "file_move".into(),
+            target: format!("{source} → {dest}"),
+            display: Default::default(),
+            digest: format!("moved {source} → {dest} · {id}"),
+            state,
+            elapsed_ms: Some(420),
+            body: format!("failure details 界e\u{301}👩‍💻 {}", "payload/".repeat(50)),
+        };
+        let full = plain(&render_tool_row(&event, 10000)).replace('\n', "");
+        for width in [2, 3, 18, 90, 105, 123, 124, 125, 139, 140] {
+            let out = render_tool_row(&event, width);
+            let rows: Vec<_> = out.split('\n').map(plain).collect();
+            assert!(
+                rows.iter()
+                    .all(|r| crate::ui::links::display_width(r) <= width),
+                "width {width}: {rows:?}"
+            );
+            assert_eq!(
+                rows.concat(),
+                full,
+                "wrapping loses no paths, IDs or preview text"
+            );
+        }
+        if state == ToolState::Running {
+            let mut running = event.clone();
+            running.digest.clear();
+            assert_eq!(
+                plain(&render_tool_row(&running, 21)).replace('\n', ""),
+                format!("◆ file_move   {source} → {dest}")
+            );
+        }
+        for width in 0..=1 {
+            assert!(render_tool_row(&event, width)
+                .split('\n')
+                .all(|r| console::measure_text_width(r) <= width));
+        }
+    }
+}
+
+#[test]
+fn sgr_wrap_sanitizes_control_strings_and_keeps_graphemes_and_style() {
+    use unicode_segmentation::UnicodeSegmentation;
+    let raw = "\x1b[31me\x1b[1m\u{301}界👩‍💻ab\x1b[0m";
+    let wanted = "e\u{301}界👩‍💻ab";
+    for width in 2..=8 {
+        let rows = wrap_keep_sgr(raw, width);
+        assert_eq!(rows.iter().map(|r| plain(r)).collect::<String>(), wanted);
+        for row in &rows {
+            assert!(
+                console::measure_text_width(row) <= width,
+                "{width}: {row:?}"
+            );
+            assert!(row.ends_with("\x1b[0m"));
+            let spans = ansi_spans(row, Style::default());
+            let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+            assert_eq!(text, plain(row));
+            for glyph in text.graphemes(true) {
+                assert!(wanted.contains(glyph));
+            }
+        }
+        for row in &rows[1..] {
+            assert!(row.starts_with("\x1b[31m"));
+        }
+    }
+    assert!(wrap_keep_sgr(raw, 0).iter().all(String::is_empty));
+    assert!(wrap_keep_sgr(raw, 1)
+        .iter()
+        .all(|r| console::measure_text_width(r) <= 1));
+    for dirty in [
+        "ok\x1b]0;hidden title\x07!",
+        "ok\x1b]8;;https://evil.invalid\x1b\\!",
+        "ok\x1b[?25l!",
+        "ok\x1bPsecret payload\x1b\\!",
+        "ok\u{009d}hidden\u{009c}!",
+    ] {
+        assert_eq!(sanitize_text(dirty), "ok!", "{dirty:?}");
+        assert_eq!(plain(&wrap_keep_sgr(dirty, 2).join("")), "ok!");
+    }
+    let spans = ansi_spans(raw, Style::default());
+    assert_eq!(
+        spans[0].content, "e\u{301}",
+        "SGR inside a grapheme cannot split its base"
+    );
+    assert_eq!(spans[0].style.fg, Some(Color::Red));
+}
+
+#[test]
+fn tiny_footer_and_jobs_draw_with_zero_truncation_budgets() {
+    let _geom = GeomLock::acquire();
+    let mut state = AppState::new("intro", "a status wider than the available HUD cells");
+    for width in 0..=3 {
+        let layout = input_layout(&state, width, 1);
+        assert!(
+            layout.rows[0].shown.is_empty(),
+            "no placeholder cells at width {width}"
+        );
+    }
+    state.jobs.processes.push(crate::ui::tui::JobRow {
+        id: "tiny-fixture".into(),
+        running: true,
+        elapsed: "1s".into(),
+        detail: "a command wider than the jobs sample budget".into(),
+    });
+    // These widths give zero budgets for the composer placeholder, HUD status and jobs sample.
+    // console::truncate_str(..., 0, "…") panics before ratatui has a chance to clip anything.
+    for width in 1..=20 {
+        let rows = painted_rows(&mut state, width, 10);
+        assert_eq!(rows.len(), 10);
+    }
+}
+
+#[test]
+fn wrapped_tool_cache_resize_seq_selection_and_painted_sidebar_stay_aligned() {
+    let _geom = GeomLock::acquire();
+    let mut state = AppState::new("intro", "status");
+    let path = format!("src/{}/file.rs", "directory/".repeat(32));
+    apply_command(
+        &mut state,
+        Command::Tool(ToolEvent {
+            seq: 81,
+            icon: "◆".into(),
+            name: "file_move".into(),
+            target: format!("{path} → {path}"),
+            display: Default::default(),
+            digest: path.clone(),
+            state: ToolState::Ok,
+            elapsed_ms: Some(30),
+            body: String::new(),
+        }),
+    );
+    for width in [124, 125, 140, 3, 2, 1] {
+        let _ = painted_rows(&mut state, width, 24);
+        let g = transcript_geom_slot().lock().unwrap().clone();
+        let budget = crate::ui::links::transcript_content_width(g.area.width);
+        assert!(g
+            .plain_rows
+            .iter()
+            .all(|row| crate::ui::links::display_width(row) <= budget as usize));
+        assert_eq!(g.plain_rows.len(), g.sgr_rows.len());
+        assert_eq!(g.plain_rows.len(), g.row_tool_seq.len());
+        let block = state
+            .blocks
+            .iter()
+            .find(|b| matches!(&b.payload, Payload::Tool(_)))
+            .unwrap()
+            .clone();
+        let rendered = state.cache.get_or_render(&block, budget);
+        assert_eq!(state.cache.height(&block, budget), rendered.plain.len());
+        for (i, seq) in g.row_tool_seq.iter().enumerate() {
+            if seq == &Some(81) {
+                assert_eq!(tool_seq_at_row(g.rows_offset + i), Some(81));
+            }
+        }
+        if width >= SIDEBAR_MIN_TERM_W {
+            let rows = painted_rows(&mut state, width, 24);
+            let side_x = (width - SIDEBAR_W) as usize;
+            assert!(rows.iter().all(|row| row.chars().nth(side_x) == Some('│')));
+        }
+    }
+    let _ = painted_rows(&mut state, 124, 24);
+    state.selection = Some(SelectionRange {
+        anchor_line: 1,
+        anchor_col: 0,
+        cursor_line: 2,
+        cursor_col: 4,
+    });
+    state.scroll_from_tail = 1;
+    let _ = painted_rows(&mut state, 125, 24);
+    assert!(
+        state.selection.is_none(),
+        "resize invalidates flat wrapped-row coordinates"
+    );
+    assert!(state.scroll_from_tail <= state.last_total);
+}
+
+#[test]
+fn file_move_raw_capture_keeps_full_dest_and_never_links_a_missing_source() {
+    let _geom = GeomLock::acquire();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // A relative root has no spaces on any host and keeps both source/dest scanner-shaped.
+    let root = std::env::current_dir()
+        .unwrap()
+        .join(format!(".aizen-link-test-{}-{nonce}", std::process::id()));
+    struct TempRoot(std::path::PathBuf);
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = TempRoot(root.clone());
+    let relative = format!(
+        ".aizen-link-test-{}-{nonce}/{}",
+        std::process::id(),
+        "nested_directory/".repeat(7)
+    );
+    let source = format!("{relative}source.rs");
+    let dest = format!("{relative}destination.rs");
+    std::fs::create_dir_all(std::path::Path::new(&dest).parent().unwrap()).unwrap();
+    std::fs::write(&source, "fixture").unwrap();
+    std::fs::rename(&source, &dest).unwrap();
+    let dest_uri = url::Url::from_file_path(std::env::current_dir().unwrap().join(&dest))
+        .unwrap()
+        .to_string();
+    let mut state = AppState::new("intro", "status");
+    apply_command(
+        &mut state,
+        Command::Tool(ToolEvent {
+            seq: 93,
+            icon: "◆".into(),
+            name: "file_move".into(),
+            target: format!("{source} → {dest}"),
+            display: Default::default(),
+            digest: format!("moved {source} → {dest}"),
+            state: ToolState::Ok,
+            elapsed_ms: Some(40),
+            body: String::new(),
+        }),
+    );
+    for width in [124, 125, 140] {
+        let _ = painted_rows(&mut state, width, 40);
+        let g = transcript_geom_slot().lock().unwrap().clone();
+        assert!(
+            g.plain_rows.concat().contains(&source),
+            "generation remains lossless after move"
+        );
+        let mut out = Vec::new();
+        crate::ui::links::inject_hyperlinks(
+            &mut out,
+            &g.sgr_rows,
+            &g.plain_rows,
+            &crate::ui::links::InjectCtx {
+                start: g.start,
+                visible: g.visible,
+                area: g.area,
+                rows_offset: g.rows_offset,
+                ..Default::default()
+            },
+        );
+        let links = crate::ui::links::captured_links(&out);
+        assert!(!links.is_empty(), "the real destination must link");
+        assert!(links.iter().all(|(_, _, uri, _)| uri == &dest_uri));
+        assert_eq!(
+            links
+                .iter()
+                .map(|(_, _, _, text)| plain(text))
+                .collect::<String>(),
+            format!("{dest}{dest}")
+        );
+        let right = g.area.x as usize + g.area.width as usize - 1;
+        assert!(links
+            .iter()
+            .all(|(x, _, _, text)| *x + crate::ui::links::display_width(&plain(text)) <= right));
+    }
+}
+
+#[test]
+fn transcript_tool_paint_and_raw_capture_respect_nonzero_origin_sentinels() {
+    let _geom = GeomLock::acquire();
+    let area = Rect::new(7, 3, 27, 6);
+    let uri = format!("https://example.com/{}", "x/".repeat(50));
+    let mut state = AppState::new("", "status");
+    apply_command(
+        &mut state,
+        Command::Tool(ToolEvent {
+            seq: 94,
+            icon: "◆".into(),
+            name: "http_fetch".into(),
+            target: uri.clone(),
+            display: Default::default(),
+            digest: String::new(),
+            state: ToolState::Running,
+            elapsed_ms: None,
+            body: String::new(),
+        }),
+    );
+    let mut term = Terminal::new(ratatui::backend::TestBackend::new(48, 14)).unwrap();
+    term.draw(|frame| {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from("S".repeat(48)); 14]),
+            frame.area(),
+        );
+        draw_transcript(frame, area, &mut state);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+    for y in 0..14 {
+        for x in 0..48 {
+            if x < area.x || x >= area.x + area.width || y < area.y || y >= area.y + area.height {
+                assert_eq!(buf[(x, y)].symbol(), "S", "off-pane sentinel ({x},{y})");
+            }
+        }
+    }
+    let g = transcript_geom_slot().lock().unwrap().clone();
+    let mut out = Vec::new();
+    crate::ui::links::inject_hyperlinks(
+        &mut out,
+        &g.sgr_rows,
+        &g.plain_rows,
+        &crate::ui::links::InjectCtx {
+            start: g.start,
+            visible: g.visible,
+            area,
+            rows_offset: g.rows_offset,
+            occluders: g.jump_button.into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let links = crate::ui::links::captured_links(&out);
+    assert!(!links.is_empty());
+    for (x, y, target, text) in links {
+        assert_eq!(target, uri);
+        assert!(x >= area.x as usize && y >= area.y as usize);
+        assert!(
+            x + crate::ui::links::display_width(&plain(&text)) < (area.x + area.width) as usize
+        );
+        assert!(y < (area.y + area.height) as usize);
+    }
+}
+
+#[test]
+fn painted_tool_rows_and_raw_links_share_sidebar_scrollbar_geometry() {
+    let _geom = GeomLock::acquire();
+    let uri = format!("https://example.com/{}", "界e\u{301}👩‍💻long/".repeat(45));
+    let mut state = AppState::new("intro", "status");
+    apply_command(
+        &mut state,
+        Command::Tool(ToolEvent {
+            seq: 92,
+            icon: "◆".into(),
+            name: "http_fetch".into(),
+            target: uri.clone(),
+            display: Default::default(),
+            digest: format!("downloaded {uri}"),
+            state: ToolState::Ok,
+            elapsed_ms: Some(50),
+            body: String::new(),
+        }),
+    );
+    for width in [124, 125, 140] {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(width, 16)).unwrap();
+        term.draw(|frame| draw(frame, &mut state)).unwrap();
+        state.scroll_from_tail = 3;
+        term.draw(|frame| draw(frame, &mut state)).unwrap();
+        let g = transcript_geom_slot().lock().unwrap().clone();
+        let caret = *caret_slot().lock().unwrap();
+        let mut out = Vec::new();
+        crate::ui::links::inject_hyperlinks(
+            &mut out,
+            &g.sgr_rows,
+            &g.plain_rows,
+            &crate::ui::links::InjectCtx {
+                start: g.start,
+                visible: g.visible,
+                area: g.area,
+                rows_offset: g.rows_offset,
+                occluders: g.jump_button.into_iter().collect(),
+                caret,
+            },
+        );
+        let links = crate::ui::links::captured_links(&out);
+        assert!(!links.is_empty(), "raw capture must exercise the injector");
+        let right = (g.area.x + g.area.width - 1) as usize;
+        for (x, y, target, raw) in links {
+            assert_eq!(target, uri, "all fragments carry a FULL URI");
+            assert!(x + crate::ui::links::display_width(&plain(&raw)) <= right);
+            assert!(y < g.area.y as usize + g.area.height as usize);
+            assert!(raw.ends_with("\x1b[0m"));
+        }
+        // The ratatui buffer is asserted separately: it cannot see these raw post-draw writes.
+        for y in 0..g.area.height {
+            let scrollbar_cell = term.backend().buffer()[(g.area.x + g.area.width - 1, y)].symbol();
+            assert!(matches!(scrollbar_cell, " " | "█"));
+            if width >= SIDEBAR_MIN_TERM_W {
+                assert_eq!(
+                    term.backend().buffer()[(width - SIDEBAR_W, y)].symbol(),
+                    "│"
+                );
+            }
+        }
+    }
 }

@@ -7,11 +7,10 @@
 //! `task` tool, so it physically cannot dispatch further sub-agents (recursion guard); a depth
 //! guard refuses `depth >= 1` as belt-and-suspenders.
 //!
-//! Isolation invariants: the sub-agent uses a NON-streaming chat call (it runs silently; only
-//! its final text returns to the parent, which streams its own synthesis), and a `quiet` config
-//! (no nested progress trace). It inherits the parent's `--yes` (an explicit autonomy opt-in is
-//! transitive) and runs its own verify gate so a write-capable sub-agent self-checks before
-//! returning.
+//! Isolation invariants: the sub-agent uses the SAME streaming chat transport with a per-call quiet
+//! sink (no tokens in the parent's renderer), and a `quiet` config. It inherits the parent's
+//! approval tier but NEVER workspace restore/undo authority. Write-capable unrestricted children
+//! run their own verify gate before returning.
 //!
 //! Async-from-sync: `Tool::execute` is synchronous but `run_agent` is async. We bridge with
 //! `block_in_place` + the CURRENT runtime's `block_on` — deliberately the same runtime the
@@ -20,10 +19,10 @@
 //! `spawn_blocking` threads where `block_in_place` is a verified pass-through (pinned by
 //! `tools::tests::bridge_works_inside_spawn_blocking`). Parallelism policy: READ-ONLY dispatches
 //! (argus/metis/nemesis/clio and read-only specialists) are concurrency-safe and fan out, capped
-//! by the sub-agent gate; WRITER dispatches (daedalus/themis) stay serial — parallelize reads,
-//! serialize writes.
+//! by the sub-agent gate. Frozen exact read/write scopes may overlap without conflicting access;
+//! unrestricted writers and opaque shell/build work retain exclusive admission.
 
-use crate::agent::tools::Tool;
+use crate::agent::tools::{PreparedToolCall, Tool, ToolObservation};
 use crate::agent::{build_system_prompt, AgentConfig};
 use crate::core::types::{Message, ToolDef};
 use anyhow::{bail, Context, Result};
@@ -44,6 +43,7 @@ You are a focused sub-agent dispatched to do ONE task and report back.
 - scope: do only the dispatched task; do not widen it. If you are genuinely blocked, state exactly what is done, what remains, and what blocks you.
 - capability: the tools listed under # Tool routing are ALL you have. A capability you lack is a boundary of this dispatch — report the gap; never work around it through another tool.
 - workspace: file/shell ops resolve relative paths against the working directory but may reach elsewhere on disk; you cannot dispatch further sub-agents.
+- recovery: you have NO workspace restore or undo authority, including on failure, cancellation or retry. Keep and report actual or possibly-applied edits; only the coordinating parent inspects and consolidates partial work.
 - effort_scaling: if your task names a model or effort tier, honour it exactly — a small lookup goes to the cheap model, a design critique goes to the strongest. Do not upgrade or downgrade the model yourself; the orchestrator set it.
 - contract: if a <contract> block follows, its boundaries, expected output, and step budget are BINDING.
 </subagent>";
@@ -62,11 +62,8 @@ const SUBAGENT_TRANSIENT_RETRIES: usize = 6;
 
 /// WALL-CLOCK deadline for ONE sub-agent model call. Override with `AIZEN_SUBAGENT_CALL_SECS`.
 ///
-/// Every other budget in this file counts STEPS; none of them counts time, so a single call that
-/// never returns is unbounded by all of them. That is not hypothetical: a sub-agent runs on the
-/// NON-streaming `chat_with_tools`, which has no inter-event stall watchdog (the streaming path's
-/// `stream_stall_timeout` does not apply), leaving only reqwest's `read_timeout` — and that fires
-/// only when the socket goes BYTE-silent, which a keepalive-warm gateway never does.
+/// Every other budget counts steps; this ceiling also bounds keepalive-warm or slowly progressing
+/// streams. The quiet streaming transport's stall watchdog is complementary, not a total deadline.
 ///
 /// The cost of no deadline is not one lost sub-agent: the whole run sits inside `block_in_place`
 /// while holding a `SubagentSlot`, whose ONLY release is `Drop`. A call that never returns never
@@ -134,6 +131,7 @@ pub(crate) const MAX_STEP_BUDGET: usize = 80;
 /// The dispatch CONTRACT the parent attaches to a spawn (the Anthropic multi-agent lesson:
 /// under-specified delegation is where sub-agents duplicate and drift — objective, boundaries,
 /// output shape, and an effort budget must travel WITH the task).
+#[derive(Clone)]
 pub(crate) struct TaskContract {
     pub boundaries: Option<String>,
     pub expected_output: Option<String>,
@@ -334,7 +332,7 @@ pub(crate) fn build_agent_subagent_prompt(
 /// (`<selfless>`, `Vec<String>`) — only a real structural tag opener is broken.
 static BREAKOUT_TAG_RE: Lazy<regex::Regex> = Lazy::new(|| {
     regex::Regex::new(
-        r"(?i)<\s*/?\s*(?:specialist|subagent|agent_identity|persona|self|role|environment|project_context|skills|user_memory|agents)\b",
+        r"(?i)<\s*/?\s*(?:specialist|subagent|agent_identity|persona|self|role|environment|project_context|skills|user_memory|agents|inherited_design_constraints)\b",
     )
     .expect("valid breakout-tag regex")
 });
@@ -375,10 +373,12 @@ pub(crate) fn sanitize_agent_attr(s: &str) -> String {
 /// Everything `execute` needs to run a dispatch, resolved from the args WITHOUT touching the network.
 /// Factored out so the agent-vs-role branch + prompt assembly are unit-testable without the
 /// sync→async bridge.
+#[derive(Clone)]
 pub(crate) struct Dispatch {
     /// Human label for logs / the return-header (the role name, or the specialist slug).
     pub label: String,
     pub registry: crate::agent::tools::ToolRegistry,
+    pub(crate) native_scope: Option<crate::core::native_scope::NativeWriteScope>,
     pub system: String,
     pub model: String,
     /// The endpoint the resolved `model` runs on. Routed through `endpoint_for_model` so a model
@@ -391,6 +391,528 @@ pub(crate) struct Dispatch {
     pub max_steps: usize,
     /// Optional JSON Schema the sub-agent's FINAL answer must satisfy (`expects` arg).
     pub expects: Option<Value>,
+    /// Resolved once per child; never consult or suppress the parent's global turn override.
+    pub reasoning_effort: Option<String>,
+}
+
+fn scope_paths(args: &Value, field: &str) -> Result<Option<Vec<String>>> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(Value::Array(paths)) if !paths.is_empty() && paths.len() <= 32 => paths
+            .iter()
+            .map(|p| {
+                p.as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("{field} requires exact file strings"))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        _ => bail!("{field} requires 1..=32 exact file strings"),
+    }
+}
+
+pub(crate) fn resolve_native_scope(
+    args: &Value,
+    root: &std::path::Path,
+    parent: &crate::core::exec_ctx::ExecutionContext,
+) -> Result<Option<crate::core::native_scope::NativeWriteScope>> {
+    let reads = scope_paths(args, "read_paths")?;
+    let writes = scope_paths(args, "write_paths")?;
+    let scope = if reads.is_none() && writes.is_some() {
+        Some(crate::core::native_scope::NativeWriteScope::resolve(
+            root,
+            writes.as_deref().unwrap(),
+        )?)
+    } else if reads.is_some() {
+        Some(crate::core::native_scope::NativeWriteScope::resolve_access(
+            root,
+            reads.as_deref().unwrap(),
+            writes.as_deref().unwrap_or(&[]),
+        )?)
+    } else {
+        parent.native_scope().cloned()
+    };
+    if let (Some(parent), Some(child)) = (parent.native_scope(), &scope) {
+        parent.check_narrowing(child)?;
+    }
+    Ok(scope)
+}
+
+pub(crate) fn seat_native_registry(
+    registry: &mut crate::agent::tools::ToolRegistry,
+    system: &mut String,
+    scope: &crate::core::native_scope::NativeWriteScope,
+) -> Result<()> {
+    if registry.get("file_read").is_none() {
+        bail!("native scope cannot grant file_read absent from the selected role/specialist");
+    }
+    if scope.has_writes()
+        && (registry.get("file_edit").is_none() || registry.get("file_write").is_none())
+    {
+        bail!("write_paths cannot grant editing tools absent from the selected role/specialist");
+    }
+    registry.retain(|name| {
+        name == "file_read" || scope.has_writes() && matches!(name, "file_edit" | "file_write")
+    });
+    // Rebuild the derived routing lane from the final registry, not the pre-narrowing surface.
+    let heading = crate::agent::tool_routing::ROUTING_HEADING;
+    let start = if system.starts_with(heading) && system[heading.len()..].starts_with('\n') {
+        Some(0)
+    } else {
+        system
+            .find(&format!("\n{heading}\n"))
+            .map(|offset| offset + 1)
+    };
+    if let Some(start) = start {
+        let end = system[start..]
+            .find("\n# ")
+            .map(|offset| start + offset)
+            .unwrap_or(system.len());
+        system.replace_range(start..end, "");
+    }
+    crate::agent::append_tool_routing(system, &registry.advertised_names());
+    system.push_str(&scope.prompt());
+    Ok(())
+}
+
+fn seat_native_dispatch(
+    dispatch: &mut Dispatch,
+    args: &Value,
+    root: &std::path::Path,
+    parent: &crate::core::exec_ctx::ExecutionContext,
+) -> Result<()> {
+    if let Some(scope) = resolve_native_scope(args, root, parent)? {
+        seat_native_registry(&mut dispatch.registry, &mut dispatch.system, &scope)?;
+        dispatch.native_scope = Some(scope);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct PreparedTaskDispatch {
+    dispatch: Dispatch,
+    execution: super::speculation::ExecutionMode,
+    speculative: Option<std::sync::Arc<SpeculativeTask>>,
+    image_config: crate::core::cli_config::CliConfig,
+    image_policy: crate::llm::media::VisionPolicy,
+    image_destination: String,
+    relay_allowed: bool,
+}
+
+/// The controller seats this descriptor only after the entire cohort has passed approval.
+struct SpeculativeTask {
+    cohort: std::sync::Arc<super::speculation::Cohort>,
+    child_scope: String,
+    overlay: crate::core::speculation::store::OverlayHandle,
+    logical_complete: std::sync::atomic::AtomicBool,
+    track: std::sync::Mutex<Option<crate::agent::orchestration::Track>>,
+    report: std::sync::Mutex<Option<SpeculativeTaskReport>>,
+    released: std::sync::Mutex<Option<crate::agent::speculative_attempt::ReleasedAttempt>>,
+}
+
+struct SpeculativeTaskReport {
+    parent_scope: String,
+    label: String,
+    body: String,
+}
+
+pub(crate) fn speculative_scope(
+    call: &PreparedToolCall,
+) -> Option<crate::core::native_scope::NativeWriteScope> {
+    let prepared = call
+        .delegation
+        .as_ref()?
+        .downcast_ref::<PreparedTaskDispatch>()?;
+    (prepared.execution == super::speculation::ExecutionMode::Speculative)
+        .then(|| prepared.dispatch.native_scope.clone())
+        .flatten()
+}
+
+pub(crate) fn seat_speculative(
+    call: &PreparedToolCall,
+    cohort: std::sync::Arc<super::speculation::Cohort>,
+    parent: &crate::core::exec_ctx::ExecutionContext,
+) -> Result<PreparedToolCall> {
+    let mut prepared = call
+        .delegation
+        .as_ref()
+        .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
+        .context("speculation requires a frozen task dispatch")?
+        .clone();
+    anyhow::ensure!(
+        prepared.execution == super::speculation::ExecutionMode::Speculative
+            && prepared.speculative.is_none(),
+        "speculative task is already seated or requested direct execution"
+    );
+    let scope = prepared
+        .dispatch
+        .native_scope
+        .as_ref()
+        .context("speculative task lost its exact scope")?;
+    let child_scope = format!(
+        "{}/task/{}",
+        parent.resource_scope(),
+        NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let owner = format!("{child_scope}/attempt/1");
+    let overlay = cohort.overlay(&owner, scope)?;
+    prepared.speculative = Some(std::sync::Arc::new(SpeculativeTask {
+        cohort,
+        child_scope,
+        overlay,
+        logical_complete: std::sync::atomic::AtomicBool::new(false),
+        track: std::sync::Mutex::new(None),
+        report: std::sync::Mutex::new(None),
+        released: std::sync::Mutex::new(None),
+    }));
+    let mut call = call.clone();
+    call.delegation = Some(std::sync::Arc::new(prepared));
+    Ok(call)
+}
+
+/// Called only after the outer driver body was joined, including its reporting and TLS cleanup.
+/// Consumes volatile native-attempt resource release proof; durable lifecycle is separate.
+pub(crate) fn seal_speculative_after_driver(
+    call: &PreparedToolCall,
+    parent: &crate::core::exec_ctx::ExecutionContext,
+) -> Result<super::speculation::ReleasedOverlay> {
+    let task = call
+        .delegation
+        .as_ref()
+        .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
+        .and_then(|prepared| prepared.speculative.as_ref())
+        .context("task has no controller-seated speculative attempt")?;
+    anyhow::ensure!(
+        task.logical_complete
+            .load(std::sync::atomic::Ordering::Acquire),
+        "speculative child did not complete its logical contract"
+    );
+    let released = task
+        .released
+        .lock()
+        .map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?
+        .take()
+        .context("speculative task has no unused resource-release token")?;
+    task.cohort.seal_released(parent, &task.overlay, released)
+}
+
+pub(crate) fn finish_speculative_status(call: &PreparedToolCall, verified: bool, detail: &str) {
+    if let Some(task) = call
+        .delegation
+        .as_ref()
+        .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
+        .and_then(|dispatch| dispatch.speculative.as_ref())
+    {
+        // Taking the deferred report makes accepted publication idempotent. Private findings
+        // remain tied to the captured base even after a command verifies the combined tree.
+        let report = task
+            .report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if verified {
+            if let Some(report) = report {
+                crate::agent::blackboard::note(
+                    &report.parent_scope,
+                    &crate::agent::blackboard::task_note_id(&report.label, &task.child_scope),
+                    &format!("[Integrated and command-verified: {detail}]\n[Findings are base-scoped to {}; peer edits may require semantic review, not a fresh live-tree review.]\n{}",
+                        task.cohort.base().id(), report.body),
+                );
+            }
+        }
+        if let Some(track) = task
+            .track
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            if verified {
+                track.finish_ok(format!("integrated and verified · {detail}"));
+            } else {
+                track.finish_err(format!(
+                    "cohort not verified; inspect retained evidence · {detail}"
+                ));
+            }
+        }
+    }
+}
+
+/// Resolve a delegated child's wire effort independently of the parent's adaptive turn tier.
+/// A role pin wins over the sub-agent default, which falls back to the fixed config tier.
+/// Specialists have no Pantheon role and use the shared sub-agent default.
+pub(crate) fn child_reasoning_effort(role: Option<&str>) -> Option<String> {
+    child_reasoning_effort_in(&crate::core::cli_config::load(), role)
+}
+
+fn child_reasoning_effort_in(
+    cfg: &crate::core::cli_config::CliConfig,
+    role: Option<&str>,
+) -> Option<String> {
+    let fallback = crate::core::cli_config::role_reasoning_effort_in(
+        cfg,
+        "subagent_default",
+        cfg.reasoning_effort.clone(),
+    );
+    match role {
+        Some(role) => crate::core::cli_config::role_reasoning_effort_in(cfg, role, fallback),
+        None => fallback,
+    }
+}
+
+/// A selected role provider binds the gateway; an explicit model changes only the model there.
+/// With no role destination, an explicit model still uses the model-to-endpoint registry.
+pub(crate) fn child_role_endpoint(
+    role: &str,
+    model: Option<&str>,
+    fallback: &crate::core::cli_config::ResolvedEndpoint,
+) -> crate::core::cli_config::ResolvedEndpoint {
+    let cfg = crate::core::cli_config::load();
+    let canonical = crate::agent::roles::canonical(role)
+        .map(|p| p.name)
+        .unwrap_or(role);
+    let up = canonical.to_ascii_uppercase();
+    let entry = cfg.roles.as_ref().and_then(|r| r.pantheon_entry(role));
+    let selected_destination = entry
+        .is_some_and(|r| r.provider.is_some() || r.base_url.is_some() || r.api_key_ref.is_some())
+        || ["BASE_URL", "API_KEY"].iter().any(|field| {
+            std::env::var(format!("AIZEN_{up}_{field}"))
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+        });
+    if selected_destination {
+        let mut ep = crate::core::cli_config::resolve_role(canonical, fallback);
+        if let Some(model) = model {
+            ep.model = model.to_string();
+        }
+        return ep;
+    }
+    match model {
+        Some(model) => crate::core::cli_config::endpoint_for_model(model, fallback),
+        None => crate::core::cli_config::pantheon_endpoint(role, fallback),
+    }
+}
+
+pub(crate) fn child_specialist_endpoint(
+    def: &crate::agents::AgentDef,
+    model: Option<&str>,
+    fallback: &crate::core::cli_config::ResolvedEndpoint,
+) -> crate::core::cli_config::ResolvedEndpoint {
+    if let Some((_, mut ep)) = crate::core::cli_config::agent_route(&def.slug()) {
+        if let Some(model) = model {
+            ep.model = model.to_string();
+        }
+        return ep;
+    }
+    let mut ep = match model.or(def.model.as_deref()) {
+        Some(model) => crate::core::cli_config::endpoint_for_model(model, fallback),
+        None => fallback.clone(),
+    };
+    TaskTool::apply_card_endpoint(&mut ep, def);
+    ep
+}
+
+/// No image payload crosses a provider boundary merely because a model selected evidence IDs.
+/// Until destination-specific relay consent exists, only the already-authorized endpoint is eligible.
+pub(crate) fn evidence_destination_matches(
+    parent: &crate::core::cli_config::ResolvedEndpoint,
+    child: &crate::core::cli_config::ResolvedEndpoint,
+) -> bool {
+    parent.base_url.trim_end_matches('/') == child.base_url.trim_end_matches('/')
+        && parent.api_key == child.api_key
+        && parent.model == child.model
+}
+
+pub(crate) fn image_destination_label(base_url: &str, model: &str) -> String {
+    let (endpoint, model) = crate::llm::media::effective_image_destination(base_url, model);
+    let endpoint = reqwest::Url::parse(&endpoint)
+        .ok()
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|| "[invalid endpoint]".into());
+    let model: String = model
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(128)
+        .collect();
+    format!("{endpoint} · {model}")
+}
+
+pub(crate) fn evidence_ids(args: &Value) -> Vec<String> {
+    args.get("return_evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+        .take(crate::core::tool_media::MAX_REQUEST_IMAGES)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Report omissions without echoing model-provided IDs, locators, image bytes or credentials.
+pub(crate) fn evidence_omission_diagnostic(
+    requested: &[String],
+    selected: &[crate::core::tool_media::ToolImage],
+) -> Option<String> {
+    let missing = requested
+        .iter()
+        .filter(|id| {
+            !selected.iter().any(|image| {
+                image.metadata().provenance.evidence_id.as_deref() == Some(id.as_str())
+            })
+        })
+        .count();
+    (missing > 0).then(|| format!(
+        "[Visual evidence omitted: {missing} of {} requested IDs were not attached. Evidence may be unavailable, unmatched, outside this attempt's scope, unapproved for this destination, over image limits, or from a failed/discarded attempt; no visual review is implied.]",
+        requested.len(),
+    ))
+}
+
+/// Stateful design evidence never inherits from a parent or sibling. Only the concise brief does.
+pub(crate) fn child_execution_context(
+    parent: &crate::core::exec_ctx::ExecutionContext,
+    scope: &str,
+    root: &std::path::Path,
+    label: &str,
+) -> crate::core::exec_ctx::ExecutionContext {
+    let design = parent
+        .design()
+        .map(|design| design.fork_child(scope, root.display().to_string()))
+        .unwrap_or_else(|| {
+            let design = crate::agent::design::DesignContext::new(
+                scope,
+                root.display().to_string(),
+                crate::agent::design::DesignMode::Auto,
+            );
+            design.begin_turn(scope, root.display().to_string());
+            design
+        });
+    let child = parent
+        .without_workspace_restore()
+        .with_resource_scope(scope)
+        .with_trace_visible(false)
+        .with_dispatch_label(Some(label.to_string()));
+    child
+        .with_design(design)
+        .without_references()
+        .fork_recovery()
+}
+
+pub(crate) fn reference_ids(args: &Value) -> Result<Vec<String>> {
+    let ids = match args.get("reference_ids") {
+        None => Vec::new(),
+        Some(value) => serde_json::from_value::<Vec<String>>(value.clone())
+            .context("reference_ids requires an array of scoped reference IDs")?,
+    };
+    crate::core::reference_media::validate_reference_ids(&ids)?;
+    Ok(ids)
+}
+
+/// A model selection restricts existing controller consent; it never creates consent. Child routes
+/// include the real credential/account key even when endpoint and model are the same.
+pub(crate) fn seat_child_references(
+    parent: &crate::core::exec_ctx::ExecutionContext,
+    child: crate::core::exec_ctx::ExecutionContext,
+    ids: &[String],
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    image_policy: crate::llm::media::VisionPolicy,
+) -> Result<crate::core::exec_ctx::ExecutionContext> {
+    crate::core::reference_media::validate_reference_ids(ids)?;
+    if ids.is_empty() {
+        return Ok(child.without_references());
+    }
+    crate::llm::media::require_reference_vision(image_policy)?;
+    parent.references_checked()?.context(
+        "reference setup required: selected references have no live controller purpose grant",
+    )?;
+    if crate::llm::oauth_codex::is_codex_base_url(base_url) {
+        anyhow::ensure!(
+            crate::llm::oauth_codex::load_token().is_some(),
+            "reference setup required: child account identity is unavailable"
+        );
+    }
+    let route = crate::core::reference_media::ReferenceRoute {
+        destination: crate::llm::media::effective_destination_key(base_url, model),
+        account: crate::llm::media::effective_image_route_key(base_url, model, api_key),
+    };
+    seat_child_references_for_route(parent, child, ids, &route, image_policy)
+}
+
+fn seat_child_references_for_route(
+    parent: &crate::core::exec_ctx::ExecutionContext,
+    child: crate::core::exec_ctx::ExecutionContext,
+    ids: &[String],
+    route: &crate::core::reference_media::ReferenceRoute,
+    image_policy: crate::llm::media::VisionPolicy,
+) -> Result<crate::core::exec_ctx::ExecutionContext> {
+    crate::core::reference_media::validate_reference_ids(ids)?;
+    if ids.is_empty() {
+        return Ok(child.without_references());
+    }
+    crate::llm::media::require_reference_vision(image_policy)?;
+    let grant = parent.references_checked()?.context(
+        "reference setup required: selected references have no live controller purpose grant",
+    )?;
+    let selected = grant.select_child(
+        ids,
+        &parent.conversation().to_string(),
+        &parent.resource_scope(),
+        &child.resource_scope(),
+        route,
+    )?;
+    let descriptors = selected.descriptors()?;
+    if let Some(design) = child.design() {
+        let mode = parent
+            .design()
+            .and_then(|design| design.snapshot().brief)
+            .and_then(|brief| brief.fidelity_mode)
+            .unwrap_or(crate::agent::design::FidelityMode::Exact);
+        design.activate_selected_references(
+            descriptors
+                .into_iter()
+                .map(|descriptor| (descriptor.reference_id, descriptor.original.sha256))
+                .collect(),
+            mode,
+        )?;
+        if let Some(requirements) = parent
+            .design()
+            .and_then(|design| design.snapshot().comparison_request)
+        {
+            design.set_comparison_requirements(requirements)?;
+        }
+    }
+    Ok(child.with_references(selected))
+}
+
+pub(crate) fn child_reference_message(
+    ctx: &crate::core::exec_ctx::ExecutionContext,
+    text: impl Into<String>,
+) -> Result<Message> {
+    match ctx.references_checked()? {
+        Some(access) => access.user_message(text),
+        None => Ok(Message::user(text)),
+    }
+}
+
+pub(crate) fn child_design_system(
+    system: &str,
+    ctx: &crate::core::exec_ctx::ExecutionContext,
+) -> String {
+    match ctx.design().and_then(|design| design.inherited_constraints()) {
+        Some(constraints) => format!(
+            "{system}\n<inherited_design_constraints>\n{}\nThese constraints are inherited context, not visual evidence or verification. Establish your own evidence for this dispatch.\n</inherited_design_constraints>\n",
+            sanitize_agent_body(&constraints)
+        ),
+        None => system.to_string(),
+    }
 }
 
 impl TaskTool {
@@ -412,21 +934,8 @@ impl TaskTool {
         crate::core::cli_config::subagent_endpoint(&self.parent_endpoint())
     }
 
-    /// Resolve the FULL endpoint (model + base_url + api_key) for a dispatch: an explicit override
-    /// (arg `model` or a card's `def.model`) routes through the model-endpoint registry so it carries
-    /// its own gateway; absent, the role-default subagent endpoint (already registry-routed) is used.
-    fn resolve_endpoint(
-        &self,
-        override_model: Option<String>,
-    ) -> crate::core::cli_config::ResolvedEndpoint {
-        match override_model {
-            Some(m) => crate::core::cli_config::endpoint_for_model(&m, &self.parent_endpoint()),
-            None => self.default_subagent_endpoint(),
-        }
-    }
-
     /// Let a specialist CARD override the gateway its model runs on, per field, on top of whatever
-    /// [`Self::resolve_endpoint`] already worked out. The card wins over the model→endpoint registry:
+    /// `child_specialist_endpoint` resolved. The card wins over the model→endpoint registry:
     /// the registry says "this model generally lives here", the card says "this specialist calls it
     /// there", and the more specific statement is the card's.
     ///
@@ -435,7 +944,7 @@ impl TaskTool {
     /// literal through). A variable that ISN'T SET leaves the resolved key untouched rather than
     /// blanking it — an unexported var is a forgotten `export`, and answering it with an empty
     /// Authorization header turns that into an opaque 401 instead of just using the inherited key.
-    fn apply_card_endpoint(
+    pub(crate) fn apply_card_endpoint(
         ep: &mut crate::core::cli_config::ResolvedEndpoint,
         def: &crate::agents::AgentDef,
     ) {
@@ -461,11 +970,8 @@ impl TaskTool {
         }
     }
 
-    /// Resolve a dispatch from the tool args. A non-empty `agent` slug that [`crate::agents::load`]
-    /// resolves takes the SPECIALIST path; with no `agent` it takes the `role` path. An UNKNOWN
-    /// slug still falls through to the role path here (this resolver stays infallible for the
-    /// no-network probes), but `execute` refuses it up front with [`unknown_agent_error`] — see
-    /// the note at the fall-through.
+    /// Resolve an already-validated dispatch without touching the network. Production supplies
+    /// the exact specialist card loaded by `prepare_dispatch`; the test wrapper probes resolution.
     ///
     /// Precedence, highest first:
     /// ```text
@@ -475,7 +981,20 @@ impl TaskTool {
     /// ```
     /// The model is resolved first and routed through the model-endpoint registry (so its gateway
     /// follows it), then the card's own endpoint fields override that result.
+    #[cfg(test)]
     pub(crate) fn resolve_dispatch(&self, args: &Value) -> Dispatch {
+        let agent = args
+            .get("agent")
+            .and_then(Value::as_str)
+            .and_then(crate::agents::load);
+        self.resolve_dispatch_with_agent(args, agent.as_ref())
+    }
+
+    fn resolve_dispatch_with_agent(
+        &self,
+        args: &Value,
+        agent: Option<&crate::agents::AgentDef>,
+    ) -> Dispatch {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let arg_model = args
             .get("model")
@@ -493,43 +1012,22 @@ impl TaskTool {
             .filter(|s| !s.is_empty());
 
         let mut d = 'resolved: {
-            if let Some(slug) = args
+            if let Some(_slug) = args
                 .get("agent")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                if let Some(def) = crate::agents::load(slug) {
-                    let local_route = crate::core::cli_config::agent_route(&def.slug());
-                    let has_local_route = local_route.is_some();
-                    let route_model = local_route
-                        .as_ref()
-                        .and_then(|(route, _)| route.model.clone());
-                    let mut ep = match (arg_model.clone(), local_route) {
-                        // An explicit task model changes only the model when the specialist has a
-                        // selected provider, so it never falls back to the parent's credentials.
-                        (Some(model), Some((_, mut route_ep))) => {
-                            route_ep.model = model;
-                            route_ep
-                        }
-                        (None, Some((_, route_ep))) => route_ep,
-                        (override_model, None) => {
-                            self.resolve_endpoint(override_model.or_else(|| def.model.clone()))
-                        }
+                if let Some(def) = agent {
+                    let fallback = if arg_model.is_some() || def.model.is_some() {
+                        self.parent_endpoint()
+                    } else {
+                        self.default_subagent_endpoint()
                     };
-                    // A local route is the user-facing source of truth. Legacy card endpoint fields
-                    // remain a fallback only when no local route was selected.
-                    if !has_local_route {
-                        Self::apply_card_endpoint(&mut ep, &def);
-                    }
-                    if arg_model.is_none() {
-                        if let Some(model) = route_model {
-                            ep.model = model;
-                        }
-                    }
-                    let registry = crate::agent::builtin::agent_registry(&def, &self.root);
+                    let ep = child_specialist_endpoint(def, arg_model.as_deref(), &fallback);
+                    let registry = crate::agent::builtin::agent_registry(def, &self.root);
                     let system = build_agent_subagent_prompt(
-                        &def,
+                        def,
                         &registry.names(),
                         &self.root,
                         &ep.model,
@@ -539,12 +1037,14 @@ impl TaskTool {
                     break 'resolved Dispatch {
                         label: def.slug(),
                         registry,
+                        native_scope: None,
                         system,
                         model: ep.model,
                         base_url: ep.base_url,
                         api_key: ep.api_key,
                         max_steps: contract.max_steps,
                         expects: None,
+                        reasoning_effort: child_reasoning_effort(None),
                     };
                 }
                 // Unknown agent → fall through to the role path. Reached only by the
@@ -574,13 +1074,12 @@ impl TaskTool {
             // No explicit model → the ROLE's own pin (`roles.pantheon.<role>`) sits above the
             // shared sub-agent default, so a reviewer can run on a stronger model than the
             // searcher in the same fan-out.
-            let ep = match arg_model {
-                Some(m) => self.resolve_endpoint(Some(m)),
-                None => crate::core::cli_config::pantheon_endpoint(
-                    &role,
-                    &self.default_subagent_endpoint(),
-                ),
+            let fallback = if arg_model.is_some() {
+                self.parent_endpoint()
+            } else {
+                self.default_subagent_endpoint()
             };
+            let ep = child_role_endpoint(&role, arg_model.as_deref(), &fallback);
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
             let system = build_subagent_prompt(
                 &role,
@@ -594,12 +1093,14 @@ impl TaskTool {
             Dispatch {
                 label,
                 registry,
+                native_scope: None,
                 system,
                 model: ep.model,
                 base_url: ep.base_url,
                 api_key: ep.api_key,
                 max_steps: contract.max_steps,
                 expects: None,
+                reasoning_effort: child_reasoning_effort(Some(&role)),
             }
         };
         // The output contract rides the SYSTEM prompt (an instruction, not a hope) — the harness
@@ -610,6 +1111,71 @@ impl TaskTool {
         }
         d
     }
+
+    fn prepare_dispatch(&self, args: &Value, validate_brief: bool) -> Result<PreparedTaskDispatch> {
+        if self.depth >= 1 {
+            bail!("task is depth-capped at 1 — a sub-agent cannot dispatch further sub-agents");
+        }
+        let named = args
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let agent = match named {
+            Some(slug) => Some(
+                crate::agents::load(slug)
+                    .ok_or_else(|| anyhow::anyhow!(unknown_agent_error(slug)))?,
+            ),
+            None => {
+                if let Some(role) = args
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if crate::agent::roles::canonical(role).is_none() {
+                        bail!(unknown_role_error(role));
+                    }
+                }
+                None
+            }
+        };
+        if validate_brief {
+            let prompt = args
+                .get("prompt")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .context("missing required string arg 'prompt'")?;
+            if let Some(why) = thin_brief(prompt) {
+                bail!(why);
+            }
+        }
+        reference_ids(args)?;
+        let dispatch = self.resolve_dispatch_with_agent(args, agent.as_ref());
+        let image_config =
+            crate::core::cli_config::config_with_session_vision(crate::core::cli_config::load());
+        let image_policy =
+            crate::llm::media::vision_policy_in(&image_config, &dispatch.base_url, &dispatch.model);
+        let image_destination =
+            crate::llm::media::effective_destination_key(&dispatch.base_url, &dispatch.model);
+        let relay_allowed = evidence_destination_matches(
+            &self.parent_endpoint(),
+            &crate::core::cli_config::ResolvedEndpoint {
+                base_url: dispatch.base_url.clone(),
+                api_key: dispatch.api_key.clone(),
+                model: dispatch.model.clone(),
+            },
+        );
+        Ok(PreparedTaskDispatch {
+            dispatch,
+            execution: super::speculation::ExecutionMode::from_args(args)?,
+            speculative: None,
+            image_config,
+            image_policy,
+            image_destination,
+            relay_allowed,
+        })
+    }
 }
 
 impl Tool for TaskTool {
@@ -617,149 +1183,290 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Dispatch ONE bounded sub-agent (fresh context) and return its result. Use for a \
-         focused investigation or a contained implementation with one clear scope; for \
-         independent angles or file groups use `workflow` (read-only children fan out; writers \
-         stay serial — never give two children the same files). The child cannot dispatch \
-         further sub-agents. Prefer a named specialist via `agent`; otherwise pick a `role`."
+        "One bounded child; independent tasks → workflow. Exact-scoped native children overlap; \
+         unrestricted writers serialize. No nested delegation or restore/undo. Prefer agent over role."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "the complete, self-contained task for the sub-agent"},
-                "agent": {"type": "string", "description": "optional specialist slug from <agents>; when it resolves it supersedes role and decides the tool scope"},
-                "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "role when no agent is given: argus=find code · metis=plan · daedalus=implement (the only editor) · nemesis=review · themis=test (shell, no edit) · clio=web research · mnemosyne=prior decisions/history. Default argus (read-only); legacy role names accepted"},
-                "model": {"type": "string", "description": "optional model override for the sub-agent"},
-                "label": {"type": "string", "description": "short tag echoed in the result header when dispatching several tasks"},
-                "boundaries": {"type": "string", "description": "what the sub-agent must NOT do or touch"},
-                "expected_output": {"type": "string", "description": "the shape/content of the answer you want back"},
-                "context": {"type": "array", "items": {"type": "string"}, "description": "established findings (up to 10 lines) the child need not re-derive"},
-                "max_steps": {"type": "integer", "description": "TOTAL model-step budget (default per role, 15-45; cap 80); prefer workflow over raising this for independent work"},
-                "expects": {"type": "object", "description": "JSON Schema the final answer must satisfy — the child replies with ONLY that JSON and the harness validates it (header shows json:ok|invalid)"}
+                "prompt": {"type": "string", "description": "self-contained task"},
+                "agent": {"type": "string", "description": "<agents> slug; overrides role/tools"},
+                "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "Without agent: argus=read (default), metis=plan, daedalus=edit, nemesis=review, themis=tests/no edit, clio=web, mnemosyne=history; legacy names valid."},
+                "model": {"type": "string", "description": "child model override"},
+                "label": {"type": "string", "description": "result-header tag"},
+                "boundaries": {"type": "string", "description": "forbidden actions/targets"},
+                "expected_output": {"type": "string", "description": "answer contract"},
+                "context": {"type": "array", "items": {"type": "string"}, "description": "known findings, <=10 lines; don't re-derive"},
+                "max_steps": {"type": "integer", "description": "total model steps; role default 15-45, cap 80"},
+                "read_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"Exact native reads; read-only without write_paths. Union <=32; no dirs/globs."},
+                "write_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"Exact native read/write files; read_paths union; parent verifies. No dirs/globs."},
+                "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Native exact scopes: private same-base edits, parent merges/verifies; default direct."},
+                "reference_ids": {"type":"array", "maxItems":4, "uniqueItems":true, "items":{"type":"string","maxLength":128}, "description":"Current-conversation user refs; live controller purpose/destination/account grant. No parent history/sibling evidence."},
+                "return_evidence": {"type": "array", "items": {"type": "string", "maxLength": 128}, "maxItems": 4, "description": "child-capture IDs (default none); final completed attempt only, no user/refs or unapproved provider boundaries"},
+                "expects": {"type": "object", "description": "final-answer JSON Schema; JSON only, validated json:ok|invalid"}
             },
             "required": ["prompt"],
             "additionalProperties": false
         })
     }
-    /// Statically `false` — writes (a `coder` dispatch) must stay serial. The ARGS-AWARE override
-    /// below is what unlocks parallelism for read-only dispatches. (The old "no runtime on the
-    /// parallel path" panic reason is gone: the executor's parallel path is `spawn_blocking`,
-    /// where this tool's `block_in_place` bridge is a verified pass-through.)
+    /// Statically `false`: concurrency requires a frozen dispatch. Read-only dispatches use the
+    /// read batch; exact-scoped editors expose resource keys for a separate native-write batch.
+    /// Unrestricted writers remain barriers.
     fn is_concurrency_safe(&self) -> bool {
         false
     }
 
-    /// PARALLELIZE READS, SERIALIZE WRITES — the 2026 multi-agent consensus, decided per dispatch:
-    /// a task call is concurrency-safe iff the RESOLVED sub-agent registry grants no destructive
-    /// tool (derived from the actual tool scoping, so it can never drift from `role_registry`/
-    /// `agent_registry`: planner/reviewer/read-only specialists parallelize; coder/tester stay
-    /// serial). Depth 0 only. Approval is handled inside the sub-agent per its own ops.
+    /// Read-batch admission requires a resolved registry with no destructive tools. Native editors
+    /// are still destructive: only frozen disjoint resource keys unlock their separate write batch.
+    /// Shell/build, images and unrestricted dispatches never gain that admission from a role name.
     fn is_concurrency_safe_for(&self, args: &Value) -> bool {
-        if self.depth != 0 {
-            return false;
+        self.prepare_dispatch(args, false).is_ok_and(|d| {
+            d.execution == super::speculation::ExecutionMode::Direct
+                && dispatch_is_read_only(&d.dispatch.registry)
+        })
+    }
+    fn plan_call(
+        &self,
+        args: &Value,
+        ctx: &crate::core::exec_ctx::ExecutionContext,
+    ) -> Result<PreparedToolCall> {
+        self.prepare_call(args, ctx)
+    }
+    fn prepare_call(
+        &self,
+        args: &Value,
+        ctx: &crate::core::exec_ctx::ExecutionContext,
+    ) -> Result<PreparedToolCall> {
+        let mut call = PreparedToolCall::new(args.clone());
+        let mut prepared = self.prepare_dispatch(args, true)?;
+        seat_native_dispatch(&mut prepared.dispatch, args, &self.root, ctx)?;
+        if prepared.execution == super::speculation::ExecutionMode::Speculative {
+            crate::agent::hooks::check_speculative_policy()?;
+            anyhow::ensure!(
+                ctx.overlay().is_none()
+                    && ctx.native_scope().is_none()
+                    && ctx.can_restore_workspace(),
+                "only the unrestricted coordinating parent may request speculative children"
+            );
+            anyhow::ensure!(
+                prepared.dispatch.native_scope.is_some(),
+                "speculative execution requires exact read_paths/write_paths"
+            );
+            anyhow::ensure!(
+                reference_ids(args)?.is_empty() && evidence_ids(args).is_empty(),
+                "speculative native execution does not accept or return media"
+            );
+            prepared.image_config.response_visuals =
+                Some(crate::core::cli_config::ResponseVisuals::Off);
+            prepared.image_policy = crate::llm::media::VisionPolicy::Unsupported;
+            prepared.relay_allowed = false;
+            prepared.dispatch.system.push_str("\n<private_overlay>All file reads and edits use your private immutable-base overlay. No live project file changes until the parent integrates the complete cohort. Read your own writes; do not claim builds, live integration or verification. This native-only lane returns text, not media. A failure retains only private work for parent inspection.</private_overlay>\n");
         }
-        let d = self.resolve_dispatch(args);
-        dispatch_is_read_only(&d.registry)
+        if let Some(scope) = &prepared.dispatch.native_scope {
+            call.preview = Some(crate::agent::tools::ApprovalPreview {
+                title: if prepared.execution == super::speculation::ExecutionMode::Speculative {
+                    "Private native overlay; parent integrates and verifies".into()
+                } else {
+                    "Native-only child file scope".into()
+                },
+                diff: None,
+                lines: scope.prompt().lines().map(str::to_owned).collect(),
+            });
+        }
+        call.workspace_changes = Some(std::sync::Arc::new(
+            crate::core::exec_ctx::WorkspaceChanges::default(),
+        ));
+        call.delegation = Some(std::sync::Arc::new(prepared));
+        Ok(call)
+    }
+    fn delegation_read_only_prepared(&self, call: &PreparedToolCall) -> Option<bool> {
+        call.delegation
+            .as_ref()?
+            .downcast_ref::<PreparedTaskDispatch>()
+            .map(|d| {
+                d.execution == super::speculation::ExecutionMode::Direct
+                    && dispatch_is_read_only(&d.dispatch.registry)
+            })
+    }
+    fn is_destructive_prepared(&self, call: &PreparedToolCall) -> bool {
+        self.delegation_read_only_prepared(call) != Some(true)
+    }
+    fn parallel_write_keys_prepared(&self, call: &PreparedToolCall) -> Option<Vec<String>> {
+        let scope = self.parallel_native_scope_prepared(call)?;
+        scope.has_writes().then(|| scope.write_keys().to_vec())
+    }
+    fn parallel_native_scope_prepared(
+        &self,
+        call: &PreparedToolCall,
+    ) -> Option<crate::core::native_scope::NativeWriteScope> {
+        // Report frozen capability; the central executor owns scheduling admission.
+        if self.may_return_images(&call.args) {
+            return None;
+        }
+        let frozen = call
+            .delegation
+            .as_ref()?
+            .downcast_ref::<PreparedTaskDispatch>()?;
+        if frozen.execution != super::speculation::ExecutionMode::Direct {
+            return None;
+        }
+        frozen.dispatch.native_scope.clone()
+    }
+    fn workspace_effect_prepared(&self, call: &PreparedToolCall) -> super::tools::WorkspaceEffect {
+        if speculative_scope(call).is_some() {
+            return super::tools::WorkspaceEffect::PrivateOverlay;
+        }
+        match self.delegation_read_only_prepared(call) {
+            Some(true) | None => super::tools::WorkspaceEffect::None,
+            Some(false) if self.parallel_write_keys_prepared(call).is_some() => {
+                super::tools::WorkspaceEffect::Paths
+            }
+            Some(false) => super::tools::WorkspaceEffect::OpaqueWorkspace,
+        }
+    }
+    fn workspace_target_prepared(&self, call: &PreparedToolCall) -> Option<PathBuf> {
+        self.workspace_effect_prepared(call)
+            .needs_checkpoint()
+            .then(|| self.root.clone())
+    }
+    fn is_concurrency_safe_prepared(&self, call: &PreparedToolCall) -> bool {
+        self.delegation_read_only_prepared(call) == Some(true)
+    }
+    fn execute_prepared(&self, call: &PreparedToolCall) -> Result<ToolObservation> {
+        let dispatch = call
+            .delegation
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<PreparedTaskDispatch>())
+            .context("task requires its internally prepared dispatch")?;
+        let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        let ctx = match &call.workspace_changes {
+            Some(changes) => ctx.with_workspace_changes(changes.clone()),
+            None => ctx,
+        };
+        crate::core::exec_ctx::with_current(ctx, || self.execute_dispatch(&call.args, dispatch))
     }
     fn recovery_effect(&self, _args: &Value) -> bool {
         true
     }
+    fn may_return_images(&self, args: &Value) -> bool {
+        !evidence_ids(args).is_empty()
+    }
     fn execute(&self, args: &Value) -> Result<String> {
-        // Depth guard (belt-and-suspenders; the sub-registry already excludes `task`).
-        if self.depth >= 1 {
-            bail!("task is depth-capped at 1 — a sub-agent cannot dispatch further sub-agents");
-        }
-        // An `agent` slug that does not resolve is a SOFT error, never a silent fallback: the old
-        // fall-through landed on the role path whose default is the WRITE-CAPABLE coder scope, so
-        // a typo in a specialist name quietly traded a scoped persona for full edit/shell. The
-        // model recovers by fixing the slug or dispatching a role instead. (Checked before the
-        // slot: no reason to hold concurrency capacity for a refusal.)
-        if let Some(slug) = args
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if crate::agents::load(slug).is_none() {
-                return Ok(unknown_agent_error(slug));
-            }
-        } else if let Some(role) = args
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            // Same discipline for roles: an unknown value is refused with the real list, not
-            // silently run under the read-only fallback registry — the caller asked for a
-            // specific worker and would mis-attribute the result.
-            if crate::agent::roles::canonical(role).is_none() {
-                return Ok(unknown_role_error(role));
-            }
-        }
-        // Phase 3 (per-model budget): resolve the model BEFORE acquiring the slot so the gate can
-        // charge the right per-model counter. `resolve_dispatch` is pure (no network), so this
-        // second call costs a config parse, not a request.
-        let dispatch_preview = self.resolve_dispatch(args);
-        let model_for_budget = dispatch_preview.model.as_str();
-        // Concurrency gate: each sub-agent is a whole model loop — cap how many run at once
-        // (below the tool-level MAX_PARALLEL: N loops × N tool threads oversubscribes a CLI).
-        // Phase 2d: over-limit no longer answers a soft error — the task PARKS here until a slot
-        // frees (the parent model cannot meaningfully "retry with fewer calls"; only the queue
-        // can). Bounded: polls every 200ms for up to 60s, then gives up so a deadlocked sibling
-        // cannot park a task forever. A broken gate (unwritable home) stays a hard error:
-        // waiting cannot fix it.
-        let mut _slot = None;
-        for _ in 0..300 {
-            // 300 × 200ms = 60s ceiling
-            match SubagentGate::global().try_acquire_for(Some(model_for_budget)) {
-                Ok(s) => {
-                    _slot = Some(s);
-                    break;
+        self.execute_observation(args)
+            .map(|observation| observation.text)
+    }
+
+    fn execute_observation(&self, args: &Value) -> Result<ToolObservation> {
+        let dispatch =
+            match self.prepare_call(args, &crate::core::exec_ctx::current().unwrap_or_default()) {
+                Ok(call) => call,
+                Err(error) if error.to_string().starts_with("error: unknown") => {
+                    return Ok(ToolObservation::text(error.to_string()));
                 }
-                Err(SlotDenied::Full) => std::thread::sleep(std::time::Duration::from_millis(200)),
-                Err(SlotDenied::Io(e)) => {
-                    return Ok(format!(
-                        "error: the sub-agent gate is unavailable on this machine ({e}) — this is NOT \
-                         a concurrency limit and retrying will not help; tell the user their aizen \
-                         home directory appears unwritable or locked"
-                    ));
-                }
-            }
+                Err(error) => return Err(error),
+            };
+        self.execute_prepared(&dispatch)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TaskWorkerStillRunning;
+impl std::fmt::Display for TaskWorkerStillRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("blocking worker still owns this attempt; no retry or rollback ran; reconcile eventual effects before new work")
+    }
+}
+impl std::error::Error for TaskWorkerStillRunning {}
+
+pub(crate) fn ensure_attempt_finished(slot: &std::sync::Arc<SubagentSlot>) -> Result<()> {
+    if std::sync::Arc::strong_count(slot) != 1 {
+        return Err(anyhow::Error::new(TaskWorkerStillRunning));
+    }
+    Ok(())
+}
+
+fn acquire_task_slot(
+    model: &str,
+    cancel: &crate::core::cancel::TurnCancel,
+    run_deadline: Option<std::time::Instant>,
+) -> Result<SubagentSlot> {
+    let now = std::time::Instant::now();
+    let deadline = run_deadline
+        .map(|d| d.min(now + Duration::from_secs(60)))
+        .unwrap_or(now + Duration::from_secs(60));
+    loop {
+        if cancel.is_cancelled() {
+            bail!("cancelled before sub-agent admission");
         }
-        let _slot = match _slot {
-            Some(s) => s,
-            None => {
-                return Ok(
-                    "error: waited 60s for a sub-agent slot and none freed — the gate is saturated"
-                        .to_string(),
-                );
+        if std::time::Instant::now() >= deadline {
+            bail!("sub-agent admission/run deadline expired; attempt not started");
+        }
+        match SubagentGate::global().try_acquire_for(Some(model)) {
+            Ok(slot) => return Ok(slot),
+            Err(SlotDenied::Io(error)) => {
+                bail!("sub-agent admission infrastructure failed: {error}; retrying does not help")
             }
-        };
+            Err(SlotDenied::Full) => std::thread::sleep(
+                Duration::from_millis(100)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            ),
+        }
+    }
+}
+
+impl TaskTool {
+    fn execute_dispatch(
+        &self,
+        args: &Value,
+        prepared: &PreparedTaskDispatch,
+    ) -> Result<ToolObservation> {
+        self.execute_dispatch_with_policy(
+            args,
+            prepared,
+            crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED,
+        )
+    }
+
+    fn execute_dispatch_with_policy(
+        &self,
+        args: &Value,
+        prepared: &PreparedTaskDispatch,
+        scoped_native_parallel: bool,
+    ) -> Result<ToolObservation> {
+        if prepared.execution == super::speculation::ExecutionMode::Speculative {
+            crate::agent::hooks::check_speculative_policy()?;
+            anyhow::ensure!(
+                prepared.speculative.is_some(),
+                "speculative task requires controller-seated cohort admission; no live fallback"
+            );
+        }
         let prompt = args
             .get("prompt")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .context("missing required string arg 'prompt'")?;
-        // A child starts with an empty context: a brief that names nothing to look at sends it
-        // searching for the parent's own question. Refused before a slot or a token is spent.
         if let Some(why) = thin_brief(prompt) {
             bail!(why);
         }
+        let model_for_budget = prepared.dispatch.model.as_str();
+        let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        let own_cancel = crate::core::cancel::current().unwrap_or_default().child();
 
-        // Agent-vs-role resolution (no network) — a resolvable `agent` slug supersedes `role`. The
-        // endpoint rides ALONG the model: `base`/`key` come from the dispatch (registry-routed), not
-        // from `self`, so a sub-agent pinned to another provider's model calls ITS gateway.
         let Dispatch {
             label,
             registry,
+            native_scope,
             system,
             model,
             base_url,
             api_key,
             max_steps,
             expects,
-        } = self.resolve_dispatch(args);
+            reasoning_effort,
+        } = prepared.dispatch.clone();
+        let requested_evidence = evidence_ids(args);
+        let relay_allowed = prepared.relay_allowed;
         let user_label = args
             .get("label")
             .and_then(|v| v.as_str())
@@ -768,7 +1475,8 @@ impl Tool for TaskTool {
             .map(|l| format!(" · {l}"));
         let header_label = format!("{label}{}", user_label.as_deref().unwrap_or(""));
 
-        // Non-streaming chat closure: the sub-agent runs silently; the parent streams synthesis.
+        // Share the parent's streaming protocol, but never render a child's tokens into its UI.
+        let frozen_chat_cfg = prepared.image_config.clone();
         let client = self.client.clone();
         let base = base_url.clone();
         let key = api_key.clone();
@@ -776,91 +1484,128 @@ impl Tool for TaskTool {
         // The repair call must hit the same endpoint the sub-agent ran on (not the parent's).
         let base_for_repair = base_url.clone();
         let key_for_repair = api_key.clone();
-        // Per-child token tally, summed from every call's usage into the report header and the
-        // `/workflows` row.
-        let tally = std::sync::Arc::new((
-            std::sync::atomic::AtomicU64::new(0),
-            std::sync::atomic::AtomicU64::new(0),
+        let usage = crate::agent::orchestration::DispatchUsage::default();
+        let usage_out = usage.clone();
+        let image_policy = prepared.image_policy;
+        let image_destination = prepared.image_destination.clone();
+        let chat_context = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::core::exec_ctx::ExecutionContext::default(),
         ));
-        let tally_out = tally.clone();
-        let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
+        let attempt_chat_context = chat_context.clone();
+        let effort_for_repair = reasoning_effort.clone();
+        let effort_for_chat = reasoning_effort.clone();
+        let chat = move |mut msgs: Vec<Message>, defs: Vec<ToolDef>| {
+            let frozen_cfg = frozen_chat_cfg.clone();
+            let effort = effort_for_chat.clone();
+            let ctx = chat_context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let client = client.clone();
             let base = base.clone();
             let key = key.clone();
             let model = model.clone();
-            let tally = tally.clone();
+            let usage = usage.clone();
             async move {
-                // DEADLINE, not just a step budget: see `SUBAGENT_CALL_TIMEOUT`. The timeout must
-                // wrap the call INSIDE this future — the whole loop runs under `block_in_place`
-                // below, and a timeout placed outside a blocking region cannot preempt it. An
-                // elapsed deadline becomes a normal `Err`, which releases the slot by unwinding
-                // through `Drop` and is eligible for the transient retry the loop already does.
-                let deadline = subagent_call_timeout();
-                match tokio::time::timeout(
-                    deadline,
-                    crate::llm::client::chat_with_tools(&client, &base, &key, &model, &msgs, &defs),
+                if let Some(design) = ctx.design() {
+                    crate::agent::design::prompt::seat_prompt(&mut msgs, &design);
+                }
+                // The agent loop owns one deadline/send allowance across all retries of this step.
+                let on_usage = |u: &crate::core::types::Usage| {
+                    usage.add(u.input_total(), u.completion_tokens.unwrap_or(0));
+                };
+                crate::llm::media::with_image_delivery(
+                    &ctx,
+                    &base,
+                    &key,
+                    &model,
+                    crate::llm::client::stream_chat_with_tools_sink_frozen(
+                        &client,
+                        &base,
+                        &key,
+                        &model,
+                        &msgs,
+                        &defs,
+                        crate::llm::client::StreamSink {
+                            observed_usage: Some(&on_usage),
+                            ..Default::default()
+                        },
+                        effort,
+                        &frozen_cfg,
+                    ),
                 )
                 .await
-                {
-                    Ok(result) => {
-                        if let Ok(turn) = &result {
-                            if let Some(u) = &turn.usage {
-                                tally.0.fetch_add(
-                                    u.input_total(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                tally.1.fetch_add(
-                                    u.completion_tokens.unwrap_or(0),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                        }
-                        result
+                .map(|(turn, receipt)| {
+                    if let Some(design) = ctx.design() {
+                        crate::agent::mark_image_delivery(&msgs, &receipt, &design);
                     }
-                    Err(_) => Err(anyhow::anyhow!(
-                        "model call exceeded {}s with no response (set AIZEN_SUBAGENT_CALL_SECS to \
-                         raise the limit)",
-                        deadline.as_secs()
-                    )),
-                }
+                    turn
+                })
             }
         };
 
-        // A WRITE-CAPABLE sub-agent (coder/tester) must run its OWN verify gate (W14): its edits
-        // happen inside its own loop and reach the parent only as a result summary, so the parent's
-        // gate — which arms on the PARENT's own edit turns — never re-checks them. A read-only role
-        // (planner/reviewer) makes no edits, so the gate would only spawn a needless `cargo check`.
+        // Unrestricted writers keep their child verify gate. Exact-scoped native editors cannot
+        // run builds: their durable mutation collector arms the coordinating parent's verification,
+        // even if a later child step fails. Read-only dispatches need neither child gate nor edits.
         let sub_verify_gate = !dispatch_is_read_only(&registry);
-        // A DERIVED token, not the parent's own: `/workflows stop #<id>` must be able to end this one
-        // dispatch while the orchestrating turn and any sibling dispatches carry on. Esc still reaches
-        // it, because cancellation flows down from the turn token (see `TurnCancel::child`).
-        let own_cancel = crate::core::cancel::current().unwrap_or_default().child();
-        // Inherit the parent's conversation identity, but isolate stateful child resources and hide
-        // tool-body progress from the parent transcript. The orchestration row remains the visible
-        // progress surface.
-        let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
+        // Inherit identity, but cancellation remains local to this dispatch and its descendants.
         // What the parent already knows, ahead of the brief: its reading list (from its
         // read-cache scope), the findings it passed as `context`, and its in-progress todo.
-        let pack = crate::agent::context_pack::gather(
+        let pack = crate::agent::context_pack::gather_with_design(
             &self.root,
             &parent_ctx.resource_scope(),
             &crate::agent::context_pack::findings_from_args(args),
+            parent_ctx.design().as_ref(),
         );
-        let child_scope = format!(
-            "{}/task/{}",
-            parent_ctx.resource_scope(),
-            NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let child_ctx = parent_ctx
-            .with_resource_scope(child_scope.clone())
-            .with_trace_visible(false)
-            .with_dispatch_label(Some(header_label.clone()));
+        let child_scope = match &prepared.speculative {
+            Some(task) => task.child_scope.clone(),
+            None => format!(
+                "{}/task/{}",
+                parent_ctx.resource_scope(),
+                NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        };
+        let selected_reference_ids = reference_ids(args)?;
+        let child_ctx = seat_child_references(
+            &parent_ctx,
+            child_execution_context(&parent_ctx, &child_scope, &self.root, &header_label),
+            &selected_reference_ids,
+            &base_url,
+            &model_for_repair,
+            &api_key,
+            prepared.image_policy,
+        )?;
+        let child_ctx = if let Some(scope) = native_scope {
+            child_ctx.with_native_scope(scope)?
+        } else {
+            child_ctx
+        };
+        let child_ctx = if prepared.speculative.is_some() {
+            child_ctx
+        } else {
+            child_ctx.with_workspace_activity(crate::core::workspace_txn::WorkspaceActivity::begin(
+                &self.root,
+                &child_scope,
+            )?)
+        };
+        let native_scoped = child_ctx.native_scope().is_some();
         let mut cfg = AgentConfig {
+            auto_checkpoint: !native_scoped,
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
             cancel: own_cancel.clone(),
             exec_ctx: child_ctx,
-            quiet: true,                         // suppress nested progress trace
-            enable_verify_gate: sub_verify_gate, // ON for write-capable roles; OFF for read-only (W14)
+            workspace_root: Some(self.root.clone()),
+            wire_reasoning_effort: Some(reasoning_effort),
+            image_config: Some(std::sync::Arc::new(prepared.image_config.clone())),
+            tool_image_policy: image_policy,
+            tool_image_destination: Some(image_destination),
+            tool_image_destination_label: Some(image_destination_label(
+                &base_url,
+                &model_for_repair,
+            )),
+            quiet: true, // suppress nested progress trace
+            delegated_call_cap: Some(subagent_call_timeout()),
+            enable_verify_gate: sub_verify_gate && !native_scoped,
             // `max_steps` is the TOTAL child budget. Start with a smaller soft cap so the core loop can
             // issue its one near-limit nudge, then extend only up to the exact requested total. There is
             // no outer continuation loop to reset this budget.
@@ -877,6 +1622,9 @@ impl Tool for TaskTool {
             // P0: sub-agent plan is ScopedTodo, not process-global — poke/confidence/hill-climb on
             // the global list would mis-fire against the parent's todos.
             enable_todo_poke: false,
+            // Same reason: the plan/todo artifacts belong to the top-level user's run, and a child
+            // cannot write into the parent's list or ask the user to review a plan file.
+            enable_plan_nudge: false,
             enable_confidence_gate: false,
             enable_hill_climb: false,
             // Survive a flaky gateway. Nobody watches a sub-agent loop, so a single transient error
@@ -896,6 +1644,9 @@ impl Tool for TaskTool {
             ..AgentConfig::default()
         };
 
+        cfg.exec_ctx = cfg.exec_ctx.with_deadline(cfg.deadline);
+        cfg.deadline = cfg.exec_ctx.deadline();
+
         // Make a transitive yolo grant visible: an unattended destructive sub-agent is easy to miss.
         // Route through the TUI funnel when it owns the screen — a raw `eprintln!` mid-turn writes
         // straight to the terminal, bypassing the retained render thread and corrupting the frame.
@@ -914,11 +1665,17 @@ impl Tool for TaskTool {
         // board a bare role — `coder`, for minutes, with nothing about what it went off to do. Fall
         // back to the prompt's opening line here (not in `header_label`: the result header should
         // not grow a clip of the prompt the model itself wrote). Same helper as the spawn line, so
-        // one run cannot appear under two different names on two surfaces.
+        // one run cannot appear under two different names on two surfaces. The board label carries
+        // the fuller subject clip: the `/workflows` panel wraps, so the user can read what the
+        // dispatch actually is (the old 44-char clip cut most briefs mid-sentence); the sidebar and
+        // the spawn line keep their own tighter one-line clips at their call sites.
         let board_label = match user_label {
             Some(_) => header_label.clone(),
             None => {
-                let subject = crate::agent::subagent_subject(args, 44);
+                let subject = crate::agent::subagent_subject(
+                    args,
+                    crate::agent::orchestration::BOARD_SUBJECT_MAX,
+                );
                 if subject.is_empty() {
                     header_label.clone()
                 } else {
@@ -929,8 +1686,24 @@ impl Tool for TaskTool {
         let track = crate::agent::orchestration::start_task(board_label);
         // Publish the stop handle only now that the row exists, so the panel never shows a row whose
         // advertised handle isn't wired up yet.
-        track.arm_stop(own_cancel);
+        track.arm_stop(own_cancel.clone());
         cfg.step_note = Some((track.id(), crate::agent::orchestration::note_step));
+        // Arm the live token fold — from here on every model call grows the row's tok count.
+        usage_out.bind(track.id());
+
+        // ADMISSION AFTER THE ROW EXISTS. Waiting for a slot used to happen before the board row
+        // was created, so a dispatch queued behind other children was invisible: the user saw a
+        // spawn line and then nothing, which reads exactly like a hung child. The row now says what
+        // it is waiting for, and the wait itself is bounded by the parent/dispatch deadline.
+        track.set_phase(
+            crate::agent::orchestration::Phase::Running,
+            "waiting for a sub-agent slot",
+        );
+        let initial_slot = std::cell::RefCell::new(Some(acquire_task_slot(
+            model_for_budget,
+            &own_cancel,
+            parent_ctx.deadline(),
+        )?));
 
         // Run-log: record this spawn so a crash mid-child leaves a durable trace of what was
         // dispatched (and with what prompt hash), enabling a future `resume` to find the child's
@@ -970,78 +1743,227 @@ impl Tool for TaskTool {
         // `msgs` while it still exists: it is the only continuation surface there is.
         // One run of the child over a fresh transcript. Called twice at most: a write-capable
         // child that runs out of time or fails verification gets ONE retry with a tightened
-        // brief (its own partial report attached), and if that also fails the tree goes back
-        // to the checkpoint taken before the dispatch, so half-done edits do not stay.
-        let run_once = |user_text: String| -> Result<(crate::agent::AgentOutcome, Vec<Message>)> {
-            tokio::task::block_in_place(|| {
-                let _effort = crate::core::cli_config::suppress_effort_override();
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut msgs = vec![Message::system(system.as_str()), Message::user(user_text)];
-                    let o = match crate::agent::run_agent_loop(&chat, &cfg, &registry, &mut msgs)
+        // brief (its own partial report attached). Both attempts retain their actual edits;
+        // only the coordinating parent may inspect and reconcile incomplete work.
+        //
+        let dispatch_lease = if sub_verify_gate
+            && prepared.speculative.is_none()
+            && !(native_scoped && scoped_native_parallel)
+        {
+            Some(
+                crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                    &self.root,
+                    std::time::Duration::from_secs(15),
+                    Some(&cfg.cancel),
+                    "task dispatch",
+                    &child_scope,
+                )?,
+            )
+        } else {
+            None
+        };
+        if let Some(lease) = &dispatch_lease {
+            cfg.exec_ctx = cfg.exec_ctx.with_writer_lease(lease.clone());
+        }
+        // Usage totals span both attempts; live publication has its own watermark.
+        let attempt = std::sync::atomic::AtomicUsize::new(0);
+        let final_slot = std::cell::RefCell::new(None);
+        let run_once =
+            |user_text: String| -> Result<(crate::agent::AgentOutcome, Vec<Message>, String)> {
+                let attempt_scope = format!(
+                    "{child_scope}/attempt/{}",
+                    attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                );
+                drop(final_slot.borrow_mut().take());
+                let slot = match initial_slot.borrow_mut().take() {
+                    Some(slot) => slot,
+                    None => {
+                        anyhow::ensure!(prepared.speculative.is_none(),
+                            "speculative attempt cannot reacquire admission or reuse a private overlay");
+                        acquire_task_slot(model_for_budget, &cfg.cancel, cfg.deadline)?
+                    }
+                };
+                let mut native_owner = None;
+                let mut direct_slot = None;
+                let mut attempt_cfg = cfg.clone();
+                attempt_cfg.exec_ctx = seat_child_references(
+                    &cfg.exec_ctx,
+                    child_execution_context(
+                        &cfg.exec_ctx,
+                        &attempt_scope,
+                        &self.root,
+                        &header_label,
+                    ),
+                    &selected_reference_ids,
+                    &base_url,
+                    &model_for_repair,
+                    &api_key,
+                    cfg.tool_image_policy,
+                )?
+                .with_recovery(cfg.exec_ctx.recovery().clone());
+                if let Some(task) = &prepared.speculative {
+                    crate::agent::hooks::check_speculative_policy()?;
+                    attempt_cfg.exec_ctx =
+                        attempt_cfg.exec_ctx.with_overlay(task.overlay.clone())?;
+                    let scope = attempt_cfg
+                        .exec_ctx
+                        .native_scope()
+                        .context("speculative task lost its complete exact scope")?;
+                    native_owner = Some(
+                        crate::agent::speculative_attempt::AttemptOwner::new_required(
+                            slot,
+                            &self.root,
+                            &attempt_scope,
+                            task.overlay.clone(),
+                            scope,
+                        )?,
+                    );
+                    attempt_cfg.exec_ctx = native_owner
+                        .as_ref()
+                        .context("speculative task owner unavailable")?
+                        .bind_context(&attempt_cfg.exec_ctx)?;
+                } else {
+                    let slot = std::sync::Arc::new(slot);
+                    attempt_cfg.exec_ctx = attempt_cfg.exec_ctx.with_attempt_slot(slot.clone());
+                    direct_slot = Some(slot);
+                }
+                *attempt_chat_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = attempt_cfg.exec_ctx.clone();
+                let evidence_scope = attempt_cfg
+                    .exec_ctx
+                    .design()
+                    .map(|design| design.evidence_scope())
+                    .unwrap_or_default();
+                let attempt_system = child_design_system(&system, &attempt_cfg.exec_ctx);
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let mut msgs = vec![
+                            Message::system(attempt_system.as_str()),
+                            child_reference_message(&attempt_cfg.exec_ctx, user_text)?,
+                        ];
+                        let o = match crate::agent::run_agent_loop(
+                            &chat,
+                            &attempt_cfg,
+                            &registry,
+                            &mut msgs,
+                        )
                         .await
-                    {
-                        Ok(o) => o,
-                        Err(e) => {
-                            let completed_tool_turns = msgs
-                                .iter()
-                                .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-                                .count();
-                            // The transcript dies with this return — salvage the same partial report
-                            // the Ok path gets. Without it, a child that completed 20 tool turns and
-                            // then hit a terminal API error handed the parent one line and no list of
-                            // what it had already touched.
-                            let partial = partial_report_from_messages(&msgs);
-                            return Err(e.context(format!(
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let completed_tool_turns = msgs
+                                    .iter()
+                                    .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+                                    .count();
+                                // The transcript dies with this return — salvage the same partial report
+                                // the Ok path gets. Without it, a child that completed 20 tool turns and
+                                // then hit a terminal API error handed the parent one line and no list of
+                                // what it had already touched.
+                                let partial = partial_report_from_messages(&msgs);
+                                return Err(e.context(format!(
                             "after {completed_tool_turns} completed tool turn(s) — the workspace \
                              may already contain partial edits from this sub-agent; inspect before \
                              retrying.\nPartial progress before the failure:\n{partial}"
                         )));
-                        }
-                    };
-                    Ok::<_, anyhow::Error>((o, msgs))
-                })
-            })
-        };
-        let pre_dispatch = if sub_verify_gate {
-            crate::features::timemachine::save(&format!("before {label}"), true)
-                .ok()
-                .map(|s| s.id)
+                            }
+                        };
+                        Ok::<_, anyhow::Error>((o, msgs, evidence_scope))
+                    })
+                });
+                *attempt_chat_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = cfg.exec_ctx.clone();
+                drop(attempt_cfg);
+                if let Some(owner) = native_owner {
+                    let driver = crate::agent::speculative_attempt::driver_result(
+                        result.as_ref().map(|(outcome, _, _)| outcome),
+                    );
+                    let released = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(owner.finish_with_driver(
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+                            driver,
+                        ))
+                    })?;
+                    let task = prepared
+                        .speculative
+                        .as_ref()
+                        .context("speculative task lost its controller")?;
+                    let mut destination = task
+                        .released
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?;
+                    anyhow::ensure!(
+                        destination.is_none(),
+                        "speculative task already released an attempt"
+                    );
+                    *destination = Some(released);
+                }
+                if let Some(slot) = direct_slot {
+                    if let Err(error) = ensure_attempt_finished(&slot) {
+                        let partial = match &result {
+                            Ok((_, msgs, _)) => partial_report_from_messages(msgs),
+                            Err(cause) => format!("{cause:#}"),
+                        };
+                        return Err(error.context(format!(
+                            "Partial progress before the observer returned:\n{partial}"
+                        )));
+                    }
+                    *final_slot.borrow_mut() = Some(slot);
+                }
+                result
+            };
+        // Retain the audit baseline through settlement; it grants the child no undo authority.
+        let _pre_dispatch = if sub_verify_gate && !native_scoped {
+            crate::features::timemachine::save_for_in_context(
+                cfg.exec_ctx.recovery(),
+                &self.root,
+                &format!("before {label}"),
+                true,
+                true,
+                &cfg.exec_ctx,
+            )
+            .with_context(|| {
+                format!("sub-agent ({label}) pre-dispatch checkpoint failed; dispatch not run")
+            })?
         } else {
             None
         };
         let first_text = crate::agent::context_pack::prepend(pack.as_deref(), prompt);
-        let mut retried = false;
-        let mut restored: Option<std::result::Result<u32, String>> = None;
-        let outcome = match run_once(first_text.clone()) {
-            Ok((o, msgs)) if sub_verify_gate && needs_retry(&o.stop) => {
-                retried = true;
+        let (outcome, retried) = run_task_attempts(
+            first_text,
+            sub_verify_gate && prepared.speculative.is_none(),
+            run_once,
+            |stop| {
                 track.set_phase(
                     crate::agent::orchestration::Phase::Running,
-                    format!("retry: {}", stop_phrase(&o.stop)),
-                );
-                let tightened =
-                    tightened_brief(&first_text, &o.stop, &partial_report_from_messages(&msgs));
-                match run_once(tightened) {
-                    Ok((o2, msgs2)) if needs_retry(&o2.stop) => {
-                        if let Some(id) = pre_dispatch {
-                            restored = Some(
-                                crate::features::timemachine::restore(id)
-                                    .map(|s| s.id)
-                                    .map_err(|e| format!("{e:#}")),
-                            );
-                        }
-                        Ok((o2, msgs2))
-                    }
-                    other => other,
-                }
-            }
-            other => other,
-        };
-        let (outcome, msgs) = match outcome {
+                    format!("retry: {}", stop_phrase(stop)),
+                )
+            },
+        );
+        let (outcome, msgs, final_scope) = match outcome {
             Ok(o) => o,
             Err(e) => {
-                track.finish_err(format!("error: {e}"));
-                return Err(e).with_context(|| format!("sub-agent ({label}) failed"));
+                let retained = if prepared.speculative.is_some() {
+                    "private overlay work is retained; no live integration started and no automatic retry or restore ran"
+                } else {
+                    "no automatic restore or undo ran; actual or possibly-applied child edits remain for the coordinating parent to inspect"
+                };
+                let (tokens_in, tokens_out) = usage_out.finish();
+                let detail = format!(
+                    "error: {e:#}\n{retained}\nObserved spend: {tokens_in}→{tokens_out} tok"
+                );
+                track.finish_err(detail.clone());
+                crate::agent::blackboard::note(
+                    &parent_ctx.resource_scope(),
+                    &crate::agent::blackboard::task_note_id(&label, &child_scope),
+                    &detail,
+                );
+                return Err(e).context(retained).with_context(|| {
+                    format!(
+                        "sub-agent ({label}) failed; observed spend: {tokens_in}→{tokens_out} tok"
+                    )
+                });
             }
         };
 
@@ -1058,8 +1980,7 @@ impl Tool for TaskTool {
             crate::agent::StopReason::AwaitingInput(_) => "stopped to ask (no interactive user)",
             crate::agent::StopReason::Cancelled => "cancelled by user",
             crate::agent::StopReason::Deadline => "hit its time limit",
-            // A sub-agent has no thread to refresh; its final note IS the answer it hands back.
-            crate::agent::StopReason::Refresh => "done",
+            crate::agent::StopReason::Refresh => "incomplete: refresh requested",
         };
         let body = outcome
             .final_text
@@ -1085,9 +2006,13 @@ impl Tool for TaskTool {
                         &base_for_repair,
                         &key_for_repair,
                         &model_for_repair,
+                        effort_for_repair.clone(),
                         schema,
                         &body,
                         &first_err,
+                        &usage_out,
+                        &cfg.cancel,
+                        cfg.deadline,
                     );
                     match repaired.as_deref().map(|r| validate_contract(r, schema)) {
                         Some(Ok(v)) => (
@@ -1104,9 +2029,15 @@ impl Tool for TaskTool {
         };
         let body_warning = stop_body_warning(&stop_kind);
         let ok = matches!(stop_kind, crate::agent::StopReason::Done);
-        let tokens_in = tally_out.0.load(std::sync::atomic::Ordering::Relaxed);
-        let tokens_out = tally_out.1.load(std::sync::atomic::Ordering::Relaxed);
-        crate::agent::orchestration::add_usage(track.id(), tokens_in, tokens_out);
+        if let Some(task) = &prepared.speculative {
+            // Logical success never seals private bytes. The coordinator joins this entire
+            // driver (including TLS/cfg cleanup) before requesting a private-body-quiescent seal.
+            task.logical_complete.store(
+                ok && !json_tag.contains("json:invalid"),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        let (tokens_in, tokens_out) = usage_out.finish();
         let retry_tag = if retried { " · retried" } else { "" };
         let tok_tag = if tokens_in > 0 || tokens_out > 0 {
             format!(
@@ -1121,34 +2052,85 @@ impl Tool for TaskTool {
             "{} step(s), {stop}{json_tag}{retry_tag}{tok_tag}",
             outcome.iters
         );
-        if ok {
+        if let Some(task) = &prepared.speculative {
+            if ok && !json_tag.contains("json:invalid") {
+                track.set_phase(
+                    crate::agent::orchestration::Phase::Running,
+                    format!(
+                        "private attempt returned; awaiting parent sealing/integration · {detail}"
+                    ),
+                );
+                *task
+                    .track
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("speculative status poisoned"))? = Some(track);
+            } else {
+                track.finish_err(format!(
+                    "private attempt incomplete; no integration · {detail}"
+                ));
+            }
+        } else if ok {
             track.finish_ok(detail);
         } else {
             track.finish_err(detail);
         }
         let mut warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
-        match &restored {
-            Some(Ok(id)) => warning.push_str(&format!(
-                "[AUTO-RESTORED checkpoint #{id}: the retry also failed, so the tree is back to \
-                 before this dispatch; nothing below is applied.]\n"
-            )),
-            Some(Err(e)) => warning.push_str(&format!(
-                "[auto-restore of the pre-dispatch checkpoint FAILED ({e}); the tree may hold \
-                 partial edits from two attempts — inspect before building on it.]\n"
-            )),
-            None => {}
+        if !ok {
+            warning.push_str(if prepared.speculative.is_some() {
+                "[Private overlay attempt incomplete; no live integration or automatic retry/restore ran. The coordinating parent must inspect retained private work.]\n"
+            } else {
+                "[No automatic restore or undo ran; actual or possibly-applied edits from this dispatch remain. The coordinating parent must inspect and consolidate partial work.]\n"
+            });
         }
         // File the whole report on the sibling blackboard: the parent sees this result cut to
         // its budget, a later child can `file_read` all of it.
-        crate::agent::blackboard::note(
-            &parent_ctx.resource_scope(),
-            &crate::agent::blackboard::task_note_id(&label, &child_scope),
-            &body,
-        );
-        Ok(format!(
-            "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}]\n{warning}{body}",
-            outcome.iters
-        ))
+        if let Some(task) = &prepared.speculative {
+            if ok && !json_tag.contains("json:invalid") {
+                *task
+                    .report
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("speculative report poisoned"))? =
+                    Some(SpeculativeTaskReport {
+                        parent_scope: parent_ctx.resource_scope(),
+                        label: label.clone(),
+                        body: format!("{warning}{body}"),
+                    });
+            }
+        } else {
+            crate::agent::blackboard::note(
+                &parent_ctx.resource_scope(),
+                &crate::agent::blackboard::task_note_id(&label, &child_scope),
+                &format!("{warning}{body}"),
+            );
+        }
+        let images = if ok && !json_tag.contains("json:invalid") && relay_allowed {
+            crate::agent::selected_evidence_images(&msgs, &requested_evidence, &final_scope)
+        } else {
+            Vec::new()
+        };
+        if let Some(diagnostic) = evidence_omission_diagnostic(&requested_evidence, &images) {
+            warning.push_str(&diagnostic);
+            warning.push('\n');
+        }
+        if !requested_evidence.is_empty() && !relay_allowed {
+            warning.push_str("[Visual evidence not relayed: this child used a different provider destination; evidence IDs do not authorize disclosure across providers.]\n");
+        }
+        let overlay_tag = if let Some(task) = &prepared.speculative {
+            format!(
+                ", private overlay; not yet integrated; base={} overlay={}",
+                task.cohort.base().id(),
+                task.overlay.id()
+            )
+        } else {
+            String::new()
+        };
+        Ok(ToolObservation {
+            text: format!(
+                "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}{overlay_tag}]\n{warning}{body}",
+                outcome.iters
+            ),
+            images,
+        })
     }
 }
 
@@ -1191,15 +2173,35 @@ pub(crate) fn thin_brief(brief: &str) -> Option<String> {
     ))
 }
 
-/// Does a writer's stop reason earn the one retry? Only the two that leave a half-done tree
-/// behind for reasons a tighter brief can fix: it ran out of TIME, or its own check never
-/// passed. A step-budget stop is a scope problem, divergence a reasoning one — neither gets
-/// better by asking again.
+type TaskAttemptResult = Result<(crate::agent::AgentOutcome, Vec<Message>, String)>;
+
+/// One bounded retry shares partial progress, never undo authority; a live worker forbids retry.
+fn run_task_attempts(
+    first_text: String,
+    writer: bool,
+    mut run: impl FnMut(String) -> TaskAttemptResult,
+    mut note_retry: impl FnMut(&crate::agent::StopReason),
+) -> (TaskAttemptResult, bool) {
+    let mut retried = false;
+    let outcome = match run(first_text.clone()) {
+        Ok((o, msgs, _)) if writer && needs_retry(&o.stop) => {
+            retried = true;
+            note_retry(&o.stop);
+            run(tightened_brief(
+                &first_text,
+                &o.stop,
+                &partial_report_from_messages(&msgs),
+            ))
+        }
+        other => other,
+    };
+    (outcome, retried)
+}
+
+/// Only verification failure earns a tighter brief. An expired deadline is terminal: a new
+/// attempt cannot renew the dispatch's authority or time budget.
 pub(crate) fn needs_retry(stop: &crate::agent::StopReason) -> bool {
-    matches!(
-        stop,
-        crate::agent::StopReason::Deadline | crate::agent::StopReason::VerificationFailed
-    )
+    matches!(stop, crate::agent::StopReason::VerificationFailed)
 }
 
 fn stop_phrase(stop: &crate::agent::StopReason) -> &'static str {
@@ -1323,7 +2325,7 @@ pub(crate) fn partial_report_from_messages(msgs: &[Message]) -> String {
 /// piece of work. `VerificationFailed` is the sharp one: the child exhausted its repair budget, so
 /// the tree it edited may not build, yet the text can describe the change as done. Putting the
 /// caveat inside the body makes it travel with the claims it applies to.
-fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
+pub(crate) fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
     match stop {
         crate::agent::StopReason::Done => None,
         crate::agent::StopReason::VerificationFailed => Some(
@@ -1347,27 +2349,44 @@ fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
         crate::agent::StopReason::Deadline => Some(
             "[INCOMPLETE — the sub-agent ran out of TIME (its wall-clock limit), not steps, and nobody cancelled it. The work below is whatever it had reached; it was cut off mid-task.]",
         ),
-        // A sub-agent has no thread to refresh; its final note is its answer, same as Done.
-        crate::agent::StopReason::Refresh => None,
+        // Refresh returns a partial report; it never creates an implicit continuation.
+        crate::agent::StopReason::Refresh => Some(
+            "[INCOMPLETE — the sub-agent requested a context refresh. No automatic continuation ran; explicitly dispatch the remaining work before treating this report as complete.]",
+        ),
     }
 }
 
 impl TaskTool {
     /// ONE bounded repair call — the sync bridge over [`repair_contract_call`] for this tool's
     /// synchronous `execute`. Best-effort — `None` on any failure.
+    #[allow(clippy::too_many_arguments)]
     fn repair_contract(
         &self,
         base_url: &str,
         api_key: &str,
         model: &str,
+        effort: Option<String>,
         schema: &Value,
         prev: &str,
         err: &str,
+        usage: &crate::agent::orchestration::DispatchUsage,
+        cancel: &crate::core::cancel::TurnCancel,
+        run_deadline: Option<std::time::Instant>,
     ) -> Option<String> {
         let client = self.client.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(repair_contract_call(
-                &client, base_url, api_key, model, schema, prev, err,
+                &client,
+                base_url,
+                api_key,
+                model,
+                effort,
+                schema,
+                prev,
+                err,
+                usage,
+                cancel,
+                run_deadline,
             ))
         })
     }
@@ -1376,14 +2395,19 @@ impl TaskTool {
 /// ONE bounded repair call (no tools, non-streaming): echo the validation error and the bad
 /// reply, ask for corrected JSON. Best-effort — `None` on any failure. Shared by the `task` tool
 /// (through its sync bridge) and the workflow runner, so the two `expects` paths cannot drift.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn repair_contract_call(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     model: &str,
+    effort: Option<String>,
     schema: &Value,
     prev: &str,
     err: &str,
+    usage: &crate::agent::orchestration::DispatchUsage,
+    cancel: &crate::core::cancel::TurnCancel,
+    run_deadline: Option<std::time::Instant>,
 ) -> Option<String> {
     let sys = Message::system(format!(
         "You repair JSON output. Reply with ONLY one JSON object valid against this schema (no prose, no code fences):\n{schema}"
@@ -1397,12 +2421,35 @@ pub(crate) async fn repair_contract_call(
     // still held by the caller. Unbounded, a gateway that answers 200 and then drips
     // here reproduced the exact permanent-slot-strand `SUBAGENT_CALL_TIMEOUT` exists
     // to prevent: the slot held for the process lifetime, every later dispatch refused.
-    let deadline = subagent_call_timeout();
-    let cancel = crate::core::cancel::current().unwrap_or_default();
+    let now = std::time::Instant::now();
+    let deadline = run_deadline
+        .map(|d| d.min(now + subagent_call_timeout()))
+        .unwrap_or(now + subagent_call_timeout());
+    if cancel.is_cancelled() || deadline <= now {
+        return None;
+    }
     let msgs = [sys, usr];
-    let call = crate::llm::client::chat_with_tools(client, base_url, api_key, model, &msgs, &[]);
-    match crate::core::cancel::race(&cancel, tokio::time::timeout(deadline, call)).await {
-        Some(Ok(Ok(t))) => t.content,
+    let call = crate::llm::client::chat_with_tools_effort(
+        client,
+        base_url,
+        api_key,
+        model,
+        &msgs,
+        &[],
+        effort,
+    );
+    match crate::core::cancel::race(
+        cancel,
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call),
+    )
+    .await
+    {
+        Some(Ok(Ok(t))) => {
+            if let Some(u) = &t.usage {
+                usage.add(u.input_total(), u.completion_tokens.unwrap_or(0));
+            }
+            t.content
+        }
         // Timeout, API error, or cancellation — repair is best-effort by contract.
         _ => None,
     }
@@ -1456,9 +2503,10 @@ pub(crate) fn unknown_role_error(role: &str) -> String {
 /// Does a resolved sub-agent registry grant NO write-capable tool? Checked against the exact set
 /// a sub-agent scope can add (`canonical_subagent_tool`'s whole range + the role add-ons), so the
 /// parallel policy tracks the ACTUAL granted scope. The shared read-only base also carries gated
-/// OUTWARD tools (e.g. skill_install) that may have approval-gated network side effects, but they
-/// do not mutate repository/workspace state and remain parallel-safe. Repository metadata
-/// writers such as `checkpoint` are excluded from the read-only base entirely.
+/// OUTWARD tools (e.g. skill_install) that may have approval-gated network side effects but do
+/// not mutate repository/workspace state. Their own calls can remain serial (image_read and
+/// reference_read do); this classification only allows independent child dispatches to fan out.
+/// Repository metadata writers such as `checkpoint` are excluded from the read-only base entirely.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
     WRITERS.iter().all(|w| r.get(w).is_none())
 }
@@ -1482,6 +2530,15 @@ pub(crate) const WRITERS: &[&str] = &[
     "checkpoint",
     "symbol_replace",
     "symbol_insert",
+    // Browser sessions are shared state: even reads can observe a sibling's navigation. Treat
+    // browser-only grants as exclusive dispatches, not parallel-safe filesystem readers.
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_eval",
+    "browser_set_viewport",
+    "browser_screenshot",
 ];
 
 /// Live count of in-flight sub-agents (process-global; both `task` and the workflow tool draw
@@ -1539,23 +2596,52 @@ pub(crate) fn active_subagents() -> usize {
 
 /// RAII slot in the sub-agent gate — releases both the process-local count and cross-process OS slot.
 /// `model_key` releases the per-model budget on drop (Phase 3).
-pub(crate) struct SubagentSlot {
-    _global: crate::core::repo_lock::RepoTxnLock,
-    /// The counter this slot was charged to; released on drop.
-    active: &'static std::sync::atomic::AtomicUsize,
-    /// The per-model counter this slot was charged to (Phase 3). `None` when the model has no
-    /// `max_concurrent` configured — no budget to release.
-    model_active: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+enum ChargeCounter {
+    Global(&'static std::sync::atomic::AtomicUsize),
+    Model(std::sync::Arc<std::sync::atomic::AtomicUsize>),
 }
 
-impl Drop for SubagentSlot {
-    fn drop(&mut self) {
-        self.active
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(m) = &self.model_active {
-            m.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+impl ChargeCounter {
+    fn counter(&self) -> &std::sync::atomic::AtomicUsize {
+        match self {
+            Self::Global(c) => c,
+            Self::Model(c) => c,
         }
     }
+}
+
+struct CounterCharge(ChargeCounter);
+
+impl CounterCharge {
+    fn acquire(counter: ChargeCounter, cap: usize) -> Result<(Self, usize), SlotDenied> {
+        let prior = counter
+            .counter()
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let charge = Self(counter);
+        if prior >= cap {
+            return Err(SlotDenied::Full);
+        }
+        Ok((charge, prior))
+    }
+}
+
+impl Drop for CounterCharge {
+    fn drop(&mut self) {
+        self.0
+            .counter()
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for SubagentSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentSlot").finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct SubagentSlot {
+    _global: crate::core::repo_lock::RepoTxnLock,
+    _charges: Vec<CounterCharge>,
 }
 
 /// Per-model live counts (Phase 3). Keyed by model name; a model with no `max_concurrent` entry
@@ -1598,9 +2684,18 @@ pub(crate) enum SlotDenied {
 }
 
 impl SubagentGate {
+    #[cfg(test)]
+    pub(crate) fn isolated(
+        active: &'static std::sync::atomic::AtomicUsize,
+        cap: usize,
+        root: std::path::PathBuf,
+    ) -> Self {
+        Self { active, cap, root }
+    }
+
     /// The process-wide gate: the shared counter, the configured width, the slot files under
     /// `aizen_home()`.
-    fn global() -> Self {
+    pub(crate) fn global() -> Self {
         Self {
             active: &ACTIVE_SUBAGENTS,
             cap: max_parallel_subagents(),
@@ -1612,6 +2707,7 @@ impl SubagentGate {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_acquire(&self) -> Result<SubagentSlot, SlotDenied> {
         self.try_acquire_for(None)
     }
@@ -1620,35 +2716,32 @@ impl SubagentGate {
     /// the model's own `max_concurrent` budget (Phase 3) — a model with no configured budget
     /// (`None`) is gated only globally.
     pub(crate) fn try_acquire_for(&self, model: Option<&str>) -> Result<SubagentSlot, SlotDenied> {
-        use std::sync::atomic::Ordering;
-        let prev = self.active.fetch_add(1, Ordering::SeqCst);
-        if prev >= self.cap {
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            return Err(SlotDenied::Full);
-        }
-        // Phase 3: per-model budget. Only models with a configured `max_concurrent` get a counter;
-        // an over-budget model refuses exactly like a full gate (the caller parks).
-        let model_counter = model.and_then(|m| {
+        let model_limit = model.map(str::trim).and_then(|m| {
             let cap = model_max_concurrent(m)?;
-            let counter = {
-                let mut map = MODEL_ACTIVE.lock().unwrap();
-                map.entry(m.to_string())
-                    .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
-                    .clone()
-            };
-            let prev = counter.fetch_add(1, Ordering::SeqCst);
-            if prev >= cap {
-                counter.fetch_sub(1, Ordering::SeqCst);
-                self.active.fetch_sub(1, Ordering::SeqCst);
-                return Some(Err(SlotDenied::Full));
-            }
-            Some(Ok(counter))
+            let counter = MODEL_ACTIVE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(m.to_string())
+                .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+                .clone();
+            Some((counter, cap))
         });
-        let model_counter = match model_counter {
-            Some(Err(e)) => return Err(e),
-            Some(Ok(c)) => Some(c),
-            None => None,
-        };
+        self.try_acquire_with(model_limit, |path| {
+            crate::core::repo_lock::RepoTxnLock::acquire_exclusive(path, std::time::Duration::ZERO)
+        })
+    }
+
+    pub(crate) fn try_acquire_with(
+        &self,
+        model_limit: Option<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
+        mut probe: impl FnMut(&std::path::Path) -> anyhow::Result<crate::core::repo_lock::RepoTxnLock>,
+    ) -> Result<SubagentSlot, SlotDenied> {
+        let (global_charge, prev) =
+            CounterCharge::acquire(ChargeCounter::Global(self.active), self.cap)?;
+        let mut charges = vec![global_charge];
+        if let Some((counter, cap)) = model_limit {
+            charges.push(CounterCharge::acquire(ChargeCounter::Model(counter), cap)?.0);
+        }
         // Probe the whole GLOBAL band, not `0..cap`. The slot files are shared by every aizen
         // process on this machine, while `cap` is this process's own width — with mismatched
         // caps, a cap-2 process probing only slots 0–1 starved behind a cap-16 process holding
@@ -1661,15 +2754,11 @@ impl SubagentGate {
         for step in 0..HARD_CEILING {
             let idx = (start + step) % HARD_CEILING;
             let path = self.root.join(format!("slot-{idx}.lock"));
-            match crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
-                &path,
-                std::time::Duration::ZERO,
-            ) {
+            match probe(&path) {
                 Ok(global) => {
                     return Ok(SubagentSlot {
                         _global: global,
-                        active: self.active,
-                        model_active: model_counter.clone(),
+                        _charges: charges,
                     })
                 }
                 Err(e)
@@ -1685,32 +2774,17 @@ impl SubagentGate {
                 }
             }
         }
-        self.active.fetch_sub(1, Ordering::SeqCst);
         match (saw_busy, io_err) {
-            // Not one slot was even contested and every attempt failed on I/O: the gate itself
-            // is broken, not full.
-            (false, Some(e)) => Err(SlotDenied::Io(e)),
+            (_, Some(e)) => Err(SlotDenied::Io(e)),
             _ => Err(SlotDenied::Full),
         }
     }
 
-    /// Greedily reserve UP TO `want` slots (used by the `workflow` fan-out, which runs several
-    /// children under one call — reserving one slot per concurrent child keeps the global cap
-    /// honest, instead of a whole fan-out spending a single slot). Returns however many the gate
-    /// had free (0..=want); an empty Vec means the caller should degrade to a soft "gate full"
-    /// error. Each slot releases on drop, so the whole batch frees when the returned Vec drops.
+    /// Test helper for batch reservation accounting. Runtime dispatches use `try_acquire_for`
+    /// so every admitted child also charges its resolved model's quota. Each slot releases on drop.
+    #[cfg(test)]
     pub(crate) fn acquire_up_to(&self, want: usize) -> Vec<SubagentSlot> {
         (0..want).map_while(|_| self.try_acquire().ok()).collect()
-    }
-}
-
-impl SubagentSlot {
-    pub(crate) fn try_acquire() -> Result<Self, SlotDenied> {
-        SubagentGate::global().try_acquire()
-    }
-
-    pub(crate) fn acquire_up_to(want: usize) -> Vec<Self> {
-        SubagentGate::global().acquire_up_to(want)
     }
 }
 
@@ -1787,6 +2861,402 @@ fn validate_shallow(value: &Value, schema: &Value, path: &str) -> Result<(), Str
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_registry_rebuild_preserves_prose_and_following_sections() {
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let scope =
+            crate::core::native_scope::NativeWriteScope::resolve(temp.path(), &["owned.rs".into()])
+                .unwrap();
+        let mut registry = crate::agent::builtin::role_registry("daedalus", temp.path());
+        let heading = crate::agent::tool_routing::ROUTING_HEADING;
+        let prose = format!("# Context\nMention `{heading}` in prose, not as a section.\n");
+        let mut system =
+            format!("{prose}\n{heading}\nobsolete_tool\n# Output contract\nKEEP CONTRACT\n");
+        seat_native_registry(&mut registry, &mut system, &scope).unwrap();
+        assert!(system.starts_with(&prose));
+        assert!(system.contains("# Output contract\nKEEP CONTRACT"));
+        assert!(!system.contains("obsolete_tool"));
+        assert_eq!(system.lines().filter(|line| *line == heading).count(), 1);
+        assert!(registry
+            .advertised_names()
+            .iter()
+            .all(|name| { matches!(name.as_str(), "file_read" | "file_edit" | "file_write") }));
+        assert!(system.contains("<native_scope>"));
+    }
+
+    #[test]
+    fn child_effort_snapshots_are_independent_across_parallel_roles() {
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "metis".into(),
+            crate::core::cli_config::RoleModelConfig {
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+        );
+        roles.insert(
+            "argus".into(),
+            crate::core::cli_config::RoleModelConfig {
+                reasoning_effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        let cfg = std::sync::Arc::new(crate::core::cli_config::CliConfig {
+            reasoning_effort: Some("medium".into()),
+            roles: Some(crate::core::cli_config::RolesConfig {
+                pantheon: Some(roles),
+                subagent_default: Some(crate::core::cli_config::RoleModelConfig {
+                    reasoning_effort: Some("xhigh".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let threads: Vec<_> = ["metis", "argus", "planner", "unknown"]
+            .into_iter()
+            .map(|role| {
+                let cfg = cfg.clone();
+                std::thread::spawn(move || child_reasoning_effort_in(&cfg, Some(role)))
+            })
+            .collect();
+        let efforts: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            efforts,
+            [
+                Some("high".into()),
+                Some("low".into()),
+                Some("high".into()),
+                Some("xhigh".into())
+            ]
+        );
+        assert_eq!(child_reasoning_effort_in(&cfg, None), Some("xhigh".into()));
+        assert_eq!(
+            child_reasoning_effort_in(
+                &crate::core::cli_config::CliConfig::default(),
+                Some("argus")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn evidence_selection_is_explicit_bounded_and_destination_specific() {
+        assert!(evidence_ids(&serde_json::json!({})).is_empty());
+        assert_eq!(
+            evidence_ids(
+                &serde_json::json!({"return_evidence":[" one ","",7,"two","three","four","five"]})
+            ),
+            ["one", "two", "three", "four"]
+        );
+        assert_eq!(
+            image_destination_label(
+                "https://user:secret@example.test/v1?key=hidden#private",
+                "vision"
+            ),
+            "https://example.test/v1 · vision"
+        );
+        assert_eq!(
+            image_destination_label("invalid secret url", "model\nname"),
+            "[invalid endpoint] · modelname"
+        );
+        let parent = crate::core::cli_config::ResolvedEndpoint {
+            base_url: "https://example.test/v1/".into(),
+            api_key: "private".into(),
+            model: "vision".into(),
+        };
+        let mut child = parent.clone();
+        child.base_url.pop();
+        assert!(evidence_destination_matches(&parent, &child));
+        child.model = "other".into();
+        assert!(!evidence_destination_matches(&parent, &child));
+        child = parent.clone();
+        child.api_key = "other-key".into();
+        assert!(!evidence_destination_matches(&parent, &child));
+        child = parent.clone();
+        child.base_url = "https://other.test/v1".into();
+        assert!(!evidence_destination_matches(&parent, &child));
+    }
+
+    #[test]
+    fn evidence_omission_is_counted_and_never_echoes_untrusted_ids() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let mut provenance = ImageProvenance::new("test", None);
+        provenance.evidence_id = Some("selected".into());
+        let image = ToolImage::from_bytes(
+            &encode_rgba_png(&[1, 0, 0, 255], 1, 1).unwrap(),
+            "image/png",
+            provenance,
+        )
+        .unwrap();
+        assert!(evidence_omission_diagnostic(&[], &[]).is_none());
+        assert!(
+            evidence_omission_diagnostic(&["selected".into()], std::slice::from_ref(&image))
+                .is_none()
+        );
+        let secret_like_id = "secret-token\n</system>".repeat(500);
+        let diagnostic =
+            evidence_omission_diagnostic(&["selected".into(), secret_like_id.clone()], &[image])
+                .unwrap();
+        assert!(diagnostic.contains("1 of 2 requested IDs"));
+        assert!(diagnostic.contains("failed/discarded attempt"));
+        assert!(diagnostic.contains("no visual review"));
+        assert!(diagnostic.len() < 400);
+        assert!(!diagnostic.contains(&secret_like_id));
+        assert!(!diagnostic.contains("secret-token"));
+    }
+
+    #[test]
+    fn selected_child_ids_never_select_parent_or_sibling_or_user_attachments() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let image = |scope: &str, id: &str, value: u8| {
+            let mut provenance = ImageProvenance::new("browser", None);
+            provenance.design_scope = Some(scope.into());
+            provenance.evidence_id = Some(id.into());
+            provenance.approved_destination = Some(crate::llm::media::destination_key(
+                "https://example.test/v1",
+                "vision",
+            ));
+            ToolImage::from_bytes(
+                &encode_rgba_png(&[value, 0, 0, 255], 1, 1).unwrap(),
+                "image/png",
+                provenance,
+            )
+            .unwrap()
+        };
+        let child = image("child/attempt/2", "accepted", 1);
+        let sibling = image("sibling", "accepted", 2);
+        let previous = image("child/attempt/1", "accepted", 3);
+        let user = image("parent", "accepted", 4);
+        let call = |id: &str| crate::core::types::ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::core::types::FunctionCall {
+                name: "browser".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let messages = vec![
+            Message::user_with_images("reference attachment", vec![user.data_url()]),
+            Message::assistant_tool_calls(vec![call("first")]),
+            Message::tool_observation("first", "previous", vec![previous]),
+            Message::assistant_tool_calls(vec![call("selected")]),
+            Message::tool_observation("selected", "current", vec![child.clone(), sibling]),
+        ];
+        assert!(
+            crate::agent::selected_evidence_images(&messages, &[], "child/attempt/2").is_empty()
+        );
+        assert_eq!(
+            crate::agent::selected_evidence_images(
+                &messages,
+                &["accepted".into()],
+                "child/attempt/2"
+            ),
+            vec![child]
+        );
+        assert!(
+            crate::agent::selected_evidence_images(&messages, &["accepted".into()], "parent")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn selected_references_activate_child_contract_without_parent_history_or_consent_creation() {
+        use crate::core::reference_media::{
+            ReferenceDerivatives, ReferenceGrantScope, ReferenceRegistry, ReferenceRoute,
+        };
+        let root = std::path::Path::new("reference-fixture-root");
+        let png = crate::core::tool_media::encode_rgba_png(&[2, 4, 6, 255], 1, 1).unwrap();
+        let image = crate::core::tool_media::ToolImage::from_bytes(
+            &png,
+            "image/png",
+            crate::core::tool_media::ImageProvenance::new("fixture", None),
+        )
+        .unwrap();
+        let mut messages = vec![
+            Message::user("private parent text"),
+            Message::user_with_images("first", vec![image.data_url()]),
+            Message::user_with_images("second", vec![image.data_url()]),
+        ];
+        let registry = ReferenceRegistry::new("reference-owner");
+        let descriptors = registry.register_loaded(&mut messages).unwrap();
+        let ids = vec![descriptors[0].reference_id.clone()];
+        let parent = crate::core::exec_ctx::ExecutionContext::new(
+            crate::core::convo::ConversationId::new("reference-owner"),
+        );
+        let parent_scope = parent.resource_scope();
+        let route = ReferenceRoute {
+            destination: "route".into(),
+            account: "account-a".into(),
+        };
+        let fresh = || child_execution_context(&parent, "child", root, "child");
+        assert!(seat_child_references_for_route(
+            &parent,
+            fresh(),
+            &ids,
+            &route,
+            crate::llm::media::VisionPolicy::Supported
+        )
+        .is_err());
+        let access = registry
+            .grant(
+                &ids,
+                ReferenceGrantScope {
+                    owner: "reference-owner".into(),
+                    purpose: "match chosen reference".into(),
+                    task_scope: parent_scope,
+                    route: route.clone(),
+                },
+                ReferenceDerivatives::ALL,
+            )
+            .unwrap();
+        let parent = parent.with_references(access.clone());
+        let provider_calls = std::cell::Cell::new(0usize);
+        for (policy, expected) in [
+            (crate::llm::media::VisionPolicy::Unknown, "unknown"),
+            (
+                crate::llm::media::VisionPolicy::Unsupported,
+                "configured without vision",
+            ),
+        ] {
+            let fresh = child_execution_context(&parent, "blocked-child", root, "blocked-child");
+            let design = fresh.design().unwrap();
+            let attempt = seat_child_references_for_route(&parent, fresh, &ids, &route, policy)
+                .and_then(|ctx| {
+                    let message = child_reference_message(&ctx, "must not reach provider")?;
+                    provider_calls.set(provider_calls.get() + 1);
+                    Ok(message)
+                });
+            let error = attempt.unwrap_err().to_string();
+            assert!(
+                error.to_lowercase().contains("reference setup required")
+                    && error.contains(expected)
+            );
+            assert!(
+                !design.snapshot().active && design.snapshot().references.is_empty(),
+                "blocked capability must not activate a child reference contract or attach images"
+            );
+        }
+        assert_eq!(
+            provider_calls.get(),
+            0,
+            "missing vision must fail before provider invocation"
+        );
+        for policy in [
+            crate::llm::media::VisionPolicy::Unknown,
+            crate::llm::media::VisionPolicy::Unsupported,
+        ] {
+            let no_ids = seat_child_references(
+                &parent,
+                child_execution_context(&parent, "text-child", root, "text-child"),
+                &[],
+                "https://fixture.invalid",
+                "model",
+                "fixture-key",
+                policy,
+            )
+            .unwrap();
+            let message = child_reference_message(&no_ids, "text-only child").unwrap();
+            assert!(message.images.is_empty() && message.tool_images.is_empty());
+            assert!(no_ids.references().is_none());
+        }
+        let child = seat_child_references_for_route(
+            &parent,
+            child_execution_context(&parent, "child", root, "child"),
+            &ids,
+            &route,
+            crate::llm::media::VisionPolicy::Supported,
+        )
+        .unwrap();
+        let user = child_reference_message(&child, "child brief").unwrap();
+        assert_eq!(user.content.as_deref(), Some("child brief"));
+        assert_eq!(user.images.len(), 1);
+        assert_eq!(user.tool_images.len(), 1);
+        assert!(!user.tool_images[0].is_available());
+        let design = child.design().unwrap().snapshot();
+        assert!(design.active);
+        assert_eq!(design.references[0].reference_id, ids[0]);
+        assert!(design.evidence.is_empty() && design.reference_observations.is_empty());
+        let sibling = child_execution_context(&parent, "sibling", root, "sibling");
+        assert!(sibling.references().is_none());
+        let different_account = ReferenceRoute {
+            account: "account-b".into(),
+            ..route
+        };
+        assert!(seat_child_references_for_route(
+            &parent,
+            sibling,
+            &ids,
+            &different_account,
+            crate::llm::media::VisionPolicy::Supported
+        )
+        .is_err());
+        access.revoke();
+        assert!(child_reference_message(&child, "must not silently omit pixels").is_err());
+        assert!(reference_ids(&serde_json::json!({"reference_ids":["ref-a","ref-a"]})).is_err());
+        assert!(reference_ids(&serde_json::json!({"reference_ids":"ref-a"})).is_err());
+    }
+
+    #[test]
+    fn delegated_contexts_never_regain_workspace_restore_authority() {
+        let root = std::env::temp_dir();
+        let parent = crate::core::exec_ctx::ExecutionContext::default();
+        for scope in ["task/coder", "workflow/writer/attempt/1", "task/reader"] {
+            let child = child_execution_context(&parent, scope, &root, scope);
+            assert!(!child.can_restore_workspace());
+            assert!(!child.recovery().can_restore_workspace());
+            let retry = child_execution_context(&child, "retry", &root, "retry")
+                .with_recovery(parent.recovery().clone())
+                .fork_recovery();
+            assert!(!retry.can_restore_workspace());
+            assert!(!retry.recovery().can_restore_workspace());
+        }
+        assert!(parent.can_restore_workspace());
+        assert!(parent.recovery().can_restore_workspace());
+    }
+
+    #[test]
+    fn design_dispatch_contexts_share_constraints_not_state_or_evidence() {
+        use crate::agent::design::{DesignBrief, DesignContext, DesignIntent, DesignMode};
+        let root = std::env::temp_dir();
+        let design = DesignContext::new("parent", root.display().to_string(), DesignMode::Auto);
+        design.begin_turn("turn", root.display().to_string());
+        design
+            .apply_brief(
+                DesignBrief {
+                    intent: DesignIntent::Create,
+                    brief: "Bounded visual layout".into(),
+                    acceptance: "Readable on narrow screens".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let parent = crate::core::exec_ctx::ExecutionContext::default().with_design(design.clone());
+        let a = child_execution_context(&parent, "task/a/attempt/1", &root, "a");
+        let b = child_execution_context(&parent, "task/b/attempt/1", &root, "b");
+        let da = a.design().unwrap();
+        let db = b.design().unwrap();
+        assert_ne!(da.evidence_scope(), db.evidence_scope());
+        assert_ne!(da.evidence_scope(), design.evidence_scope());
+        assert_eq!(da.inherited_constraints(), db.inherited_constraints());
+        assert!(da.snapshot().evidence.is_empty());
+        assert!(!da.snapshot().active);
+        da.set_mode(DesignMode::Off);
+        assert_eq!(db.mode(), DesignMode::Auto);
+        assert_eq!(design.mode(), DesignMode::Auto);
+        assert!(child_design_system("system", &a).contains("not visual evidence"));
+        let retry = child_execution_context(&parent, "task/a/attempt/2", &root, "a");
+        assert_ne!(
+            retry.design().unwrap().evidence_scope(),
+            da.evidence_scope()
+        );
+        assert_eq!(retry.design().unwrap().mode(), DesignMode::Auto);
+    }
+
     fn tool(depth: usize) -> TaskTool {
         TaskTool::new(
             reqwest::Client::new(),
@@ -1840,9 +3310,159 @@ mod tests {
     }
 
     #[test]
-    fn only_time_and_verification_failures_earn_the_retry() {
+    fn two_failed_task_attempts_retain_partial_edits_and_sibling_work() {
+        use crate::agent::{AgentOutcome, StopReason};
+        use crate::core::{
+            config::{EnvGuard, TEST_HOME_LOCK},
+            exec_ctx::ExecutionContext,
+            workspace_txn::WorkspaceWriterLease,
+        };
+        let _home_lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let _env = EnvGuard::set([("AIZEN_HOME", home.as_os_str())]);
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        for root in [&first, &second] {
+            std::fs::create_dir(root).unwrap();
+            let init = crate::core::gitx::command()
+                .unwrap()
+                .current_dir(root)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(
+                init.status.success(),
+                "{}",
+                String::from_utf8_lossy(&init.stderr)
+            );
+            std::fs::write(
+                root.join("f.txt"),
+                root.file_name().unwrap().to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        }
+        let _ambient = EnvGuard::set([("AIZEN_WORKSPACE_ROOT", second.as_os_str())]);
+        let parent = ExecutionContext::default();
+        let ctx = child_execution_context(&parent, "bound-task", &first, "bound-task");
+        assert!(!ctx.can_restore_workspace());
+        let first_snapshot = crate::features::timemachine::save_for_in_context(
+            ctx.recovery(),
+            &first,
+            "before task",
+            true,
+            true,
+            &ctx,
+        )
+        .unwrap()
+        .unwrap();
+        let second_snapshot = crate::features::timemachine::save_for(
+            &crate::features::timemachine::RunRecovery::default(),
+            &second,
+            "before unrelated task",
+            true,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first_snapshot.id, second_snapshot.id,
+            "IDs alone do not identify the root"
+        );
+        // Baselines settle before the attempt-duration lease; the unrelated root must not try to
+        // reenter this child's physical authority under a default execution scope.
+        let _lease = WorkspaceWriterLease::acquire_scoped(
+            &first,
+            Duration::from_secs(1),
+            None,
+            "two task attempts retaining partial work",
+            "bound-task",
+        )
+        .unwrap();
+        std::fs::write(second.join("f.txt"), "unrelated edit remains").unwrap();
+        std::fs::write(first.join("sibling.txt"), "completed sibling work").unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let (result, retried) = run_task_attempts(
+            "fix f.txt".into(),
+            true,
+            |brief| {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n == 2 {
+                    assert!(brief.contains("<retry>") && brief.contains("first partial"));
+                }
+                std::fs::write(first.join("f.txt"), format!("partial attempt {n}")).unwrap();
+                Ok((
+                    AgentOutcome {
+                        final_text: Some("partial".into()),
+                        iters: 1,
+                        stop: if n == 1 {
+                            StopReason::VerificationFailed
+                        } else {
+                            StopReason::Deadline
+                        },
+                        verification: None,
+                    },
+                    vec![Message::assistant("first partial")],
+                    format!("attempt/{n}"),
+                ))
+            },
+            |_| {},
+        );
+        assert!(result.is_ok());
+        assert!(retried);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(
+            std::fs::read_to_string(first.join("f.txt")).unwrap(),
+            "partial attempt 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("sibling.txt")).unwrap(),
+            "completed sibling work"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.join("f.txt")).unwrap(),
+            "unrelated edit remains"
+        );
+    }
+
+    #[test]
+    fn live_worker_error_forbids_task_retry_after_either_attempt() {
+        use crate::agent::{AgentOutcome, StopReason};
+        for failed_at in [1, 2] {
+            let attempts = std::cell::Cell::new(0);
+            let (result, retried) = run_task_attempts(
+                "fix f.txt".into(),
+                true,
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() == failed_at {
+                        return Err(anyhow::Error::new(TaskWorkerStillRunning)
+                            .context("retained partial work"));
+                    }
+                    Ok((
+                        AgentOutcome {
+                            final_text: None,
+                            iters: 1,
+                            stop: StopReason::VerificationFailed,
+                            verification: None,
+                        },
+                        Vec::new(),
+                        "attempt/1".into(),
+                    ))
+                },
+                |_| {},
+            );
+            assert!(result.unwrap_err().is::<TaskWorkerStillRunning>());
+            assert_eq!(attempts.get(), failed_at);
+            assert_eq!(retried, failed_at == 2);
+        }
+    }
+
+    #[test]
+    fn only_verification_failure_earns_the_retry() {
         use crate::agent::StopReason;
-        assert!(needs_retry(&StopReason::Deadline));
+        assert!(!needs_retry(&StopReason::Deadline));
         assert!(needs_retry(&StopReason::VerificationFailed));
         assert!(!needs_retry(&StopReason::Done));
         assert!(!needs_retry(&StopReason::MaxIters));
@@ -2089,6 +3709,10 @@ mod tests {
             "skill_refine",
             "skill_forget",
             "skill_install",
+            // Explicit image disclosure needs privacy approval but cannot mutate workspace state;
+            // reference_read additionally requires a live task-scoped reference grant.
+            "image_read",
+            "reference_read",
         ];
         let root = std::env::current_dir().unwrap();
         for role in ["argus", "metis", "daedalus", "nemesis", "themis", "clio"] {
@@ -2104,6 +3728,108 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn explicit_image_disclosure_is_read_only_but_stays_approval_gated() {
+        use crate::agent::tools::WorkspaceEffect;
+
+        let root = std::env::temp_dir();
+        let mut registry = crate::agent::tools::ToolRegistry::new();
+        registry.register(Box::new(crate::agent::image_read::ImageRead::new(
+            root.clone(),
+        )));
+        registry.register(Box::new(crate::agent::image_read::ReferenceRead::new(root)));
+        let args = serde_json::json!({"ref_id":"ref-selected", "transmit_image":true});
+        for name in ["image_read", "reference_read"] {
+            let tool = registry.get(name).unwrap();
+            assert!(!WRITERS.contains(&name));
+            assert!(tool.is_destructive(), "{name} still requires approval");
+            assert!(!tool.is_concurrency_safe());
+            assert!(!tool.is_concurrency_safe_for(&args));
+            assert!(tool.transmits_images(&args));
+            assert!(tool.may_return_images(&args));
+            assert_eq!(tool.workspace_effect(&args), WorkspaceEffect::None);
+            assert!(tool.workspace_target(&args).is_none());
+            assert!(tool.command_to_guard(&args).is_none());
+            assert!(tool.execute(&args).is_err(), "no text-executor bypass");
+        }
+        assert!(dispatch_is_read_only(&registry));
+        for role in ["argus", "metis", "nemesis", "clio", "mnemosyne"] {
+            let registry = crate::agent::builtin::role_registry(role, &std::env::temp_dir());
+            assert!(dispatch_is_read_only(&registry), "role {role}");
+            let reference = registry.get("reference_read").unwrap();
+            assert!(reference.is_destructive());
+            assert!(reference.may_return_images(&args));
+            assert!(!reference.is_concurrency_safe_for(&args));
+            assert_eq!(reference.workspace_effect(&args), WorkspaceEffect::None);
+        }
+    }
+
+    #[test]
+    fn media_grants_keep_private_reads_parallel_but_browser_sessions_exclusive() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "aizen-media-grants-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", root.as_os_str()),
+            ("AIZEN_PROJECT_ROOT", root.as_os_str()),
+        ]);
+        let _endpoint_env = crate::core::config::EnvGuard::unset(["AIZEN_BROWSER_CDP"]);
+        let image = agent_def(
+            "Image reader",
+            &["ImageRead"],
+            None,
+            "Read selected evidence.",
+        );
+        let image_registry = crate::agent::builtin::agent_registry(&image, &root);
+        assert!(image_registry.get("image_read").is_some());
+        assert!(dispatch_is_read_only(&image_registry));
+        assert!(!WRITERS.contains(&"image_read"));
+        let no_media = agent_def("Reader", &[], None, "Read code.");
+        let plain = crate::agent::builtin::agent_registry(&no_media, &root);
+        assert!(plain.get("image_read").is_none());
+        assert!(plain.get("browser_navigate").is_none());
+        #[cfg(feature = "browser")]
+        {
+            let browser = agent_def("Browser operator", &["Browser"], None, "Inspect a page.");
+            assert!(!crate::agent::browser::is_configured());
+            let unconfigured = crate::agent::builtin::agent_registry(&browser, &root);
+            assert!(unconfigured.get("browser_navigate").is_none());
+            assert!(dispatch_is_read_only(&unconfigured));
+            // An explicit validated fixture enables advertisement without probing or connecting.
+            std::fs::write(
+                root.join("browser.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": 1,
+                    "default_profile": "local",
+                    "profiles": {"local": {"provider": "cdp", "endpoint": "127.0.0.1:9222"}},
+                    "routes": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(crate::agent::browser::is_configured());
+            let registry = crate::agent::builtin::agent_registry(&browser, &root);
+            assert!(registry.get("browser_navigate").is_some());
+            assert!(!dispatch_is_read_only(&registry));
+            let mut snapshot_only = crate::agent::tools::ToolRegistry::new();
+            snapshot_only.register(Box::new(crate::agent::browser::BrowserSnapshot));
+            assert!(!dispatch_is_read_only(&snapshot_only));
         }
     }
 
@@ -2163,6 +3889,119 @@ mod tests {
             "every slot released its charge"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_keeps_global_and_model_admission_after_observer_drops() {
+        use crate::core::repo_lock::RepoTxnLock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let gate = SubagentGate {
+            active: &ACTIVE,
+            cap: 1,
+            root: fixture.path().join("slots"),
+        };
+        let model = std::sync::Arc::new(AtomicUsize::new(0));
+        let slot = gate
+            .try_acquire_with(Some((model.clone(), 1)), |path| {
+                RepoTxnLock::acquire_exclusive(path, Duration::ZERO)
+            })
+            .unwrap();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default()
+            .with_attempt_slot(std::sync::Arc::new(slot));
+        let worker_ctx = ctx.with_resource_scope("worker");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            crate::core::exec_ctx::with_current(worker_ctx, || {
+                let _ = started.send(());
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let _ = finished.send(());
+        });
+        ready.await.unwrap();
+        drop(worker); // Observing handle disposal is not worker termination.
+        drop(ctx);
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        assert_eq!(model.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            gate.try_acquire_with(Some((model.clone(), 1)), |_| panic!("still charged")),
+            Err(SlotDenied::Full)
+        ));
+        release.send(()).unwrap();
+        done.await.unwrap();
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        assert_eq!(model.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn admission_charges_balance_on_every_probe_failure_and_unwind() {
+        use crate::core::repo_lock::{LockBusy, LockMode, RepoTxnLock};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let gate = SubagentGate {
+            active: &ACTIVE,
+            cap: 2,
+            root: fixture.path().join("slots"),
+        };
+        let model = std::sync::Arc::new(AtomicUsize::new(0));
+        for kind in [0, 1, 2] {
+            let mut probes = 0;
+            let denied = gate.try_acquire_with(Some((model.clone(), 1)), |path| {
+                probes += 1;
+                if kind == 0 || (kind == 2 && probes % 2 == 0) {
+                    Err(LockBusy {
+                        path: path.to_path_buf(),
+                        mode: LockMode::Exclusive,
+                        timeout: Duration::ZERO,
+                    }
+                    .into())
+                } else {
+                    Err(anyhow::anyhow!("injected OS I/O failure"))
+                }
+            });
+            assert!(matches!(
+                (kind, denied),
+                (0, Err(SlotDenied::Full)) | (1 | 2, Err(SlotDenied::Io(_)))
+            ));
+            assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+            assert_eq!(model.load(Ordering::SeqCst), 0);
+        }
+        let held = gate
+            .try_acquire_with(Some((model.clone(), 1)), |path| {
+                RepoTxnLock::acquire_exclusive(path, Duration::ZERO)
+            })
+            .unwrap();
+        assert!(matches!(
+            gate.try_acquire_with(Some((model.clone(), 1)), |_| {
+                panic!("model-full must not reach OS probe")
+            }),
+            Err(SlotDenied::Full)
+        ));
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        assert_eq!(model.load(Ordering::SeqCst), 1);
+        let other_model = std::sync::Arc::new(AtomicUsize::new(0));
+        let second = gate
+            .try_acquire_with(Some((other_model.clone(), 1)), |path| {
+                RepoTxnLock::acquire_exclusive(path, Duration::ZERO)
+            })
+            .unwrap();
+        assert!(matches!(
+            gate.try_acquire_with(None, |_| panic!("global-full before OS")),
+            Err(SlotDenied::Full)
+        ));
+        drop(second);
+        drop(held);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = gate.try_acquire_with(Some((model.clone(), 1)), |_| panic!("probe unwind"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        assert_eq!(model.load(Ordering::SeqCst), 0);
+        assert_eq!(other_model.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2270,6 +4109,7 @@ mod tests {
                     .unwrap(),
             ),
             Deadline,
+            Refresh,
         ] {
             let w = stop_body_warning(&stop).unwrap_or_else(|| panic!("{stop:?} must warn"));
             assert!(w.starts_with('['), "{stop:?} → {w}");
@@ -2872,6 +4712,53 @@ mod tests {
 
         drop(_env);
         let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn explicit_role_model_keeps_selected_provider_destination() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox =
+            std::env::temp_dir().join(format!("aizen-role-route-child-{}", std::process::id()));
+        let _env = crate::core::config::EnvGuard::set([
+            ("USERPROFILE", sandbox.clone()),
+            ("HOME", sandbox.clone()),
+            ("AIZEN_HOME", sandbox.join(".aizen")),
+            ("AIZEN_PROJECT_ROOT", sandbox.join("proj")),
+        ]);
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "metis".into(),
+            crate::core::cli_config::RoleModelConfig {
+                model: Some("pinned".into()),
+                base_url: Some("https://planner.test/v1".into()),
+                api_key_ref: Some("planner-key".into()),
+                ..Default::default()
+            },
+        );
+        crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
+            roles: Some(crate::core::cli_config::RolesConfig {
+                pantheon: Some(roles),
+                ..Default::default()
+            }),
+            model_endpoints: Some(vec![crate::core::cli_config::ModelEndpoint {
+                model: "override".into(),
+                base_url: Some("https://other.test/v1".into()),
+                api_key_ref: Some("other-key".into()),
+                max_concurrent: None,
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        let dispatch = tool(0).resolve_dispatch(
+            &serde_json::json!({"prompt":"src/lib.rs", "role":"planner", "model":"override"}),
+        );
+        assert_eq!(dispatch.model, "override");
+        assert_eq!(dispatch.base_url, "https://planner.test/v1");
+        assert_eq!(dispatch.api_key, "planner-key");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(sandbox);
     }
 
     #[test]

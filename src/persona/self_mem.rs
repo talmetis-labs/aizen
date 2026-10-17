@@ -487,7 +487,7 @@ fn is_near_duplicate(persona_slug: &str, body: &str) -> bool {
         .into_iter()
         .filter(|m| m.kind == Kind::Episode)
         .collect();
-    eps.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    eps.sort_by_key(|b| std::cmp::Reverse(b.mtime_ms));
     for m in eps.into_iter().take(DEDUP_WINDOW) {
         if normalize(&m.body) == norm {
             return true;
@@ -942,7 +942,7 @@ pub fn list_archive(persona_slug: &str) -> Vec<SelfMemory> {
             out.push(m);
         }
     }
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out.sort_by_key(|b| std::cmp::Reverse(b.mtime_ms));
     out
 }
 
@@ -953,7 +953,7 @@ pub fn recent_episode_bodies(persona_slug: &str, n: usize) -> Vec<String> {
         .into_iter()
         .filter(|m| m.kind == Kind::Episode && m.importance >= FORMATIVE_MIN)
         .collect();
-    eps.sort_by(|a, b| a.mtime_ms.cmp(&b.mtime_ms)); // chronological
+    eps.sort_by_key(|a| a.mtime_ms); // chronological
     let start = eps.len().saturating_sub(n);
     eps[start..].iter().map(|m| m.body.clone()).collect()
 }

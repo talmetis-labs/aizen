@@ -81,7 +81,7 @@ pub(crate) fn run_prompt_size(
             (n, d.function.name.clone())
         })
         .collect();
-    per_tool.sort_by(|a, b| b.0.cmp(&a.0));
+    per_tool.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     // `--live`: the lanes as a prompt cache sees them. A second build of the same lanes must be
     // byte-identical (else something in the build is nondeterministic), and neither lane may carry
@@ -443,9 +443,8 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
     match args.output_format.as_str() {
         "stream-json" => {
             crate::ui::events::enable(true);
-            // A pipe is the only stdin shape a control channel (approvals, steers) can arrive on;
-            // detected once here so the reader thread can decide to exist at all. The REPL's
-            // stdin-driven approval path never sets this — its stdin is a console.
+            // Pipes present independent requests concurrently; consoles queue presentation.
+            // Stream-json has one stdin owner in either case; the human REPL stays separate.
             crate::ui::events::note_stdin_piped(!std::io::IsTerminal::is_terminal(
                 &std::io::stdin(),
             ));
@@ -509,20 +508,78 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     let (base_url, api_key, model) = resolve_endpoint(args.base_url, args.api_key, args.model)?;
     let http = http_client()?;
 
-    // Armed before anything builds a request, and never cleared: a one-shot is one turn, and the
-    // process ends with it. `auto` runs the same classifier a typed REPL turn goes through, so the
-    // two surfaces answer "how hard should this be" the same way.
-    if let Some(want) = args.effort.as_deref() {
-        let tier = match want {
-            "auto" => crate::ui::effort_ui::resolve_turn_effort(args.task.trim()),
-            other => Some(other.to_string()),
-        };
-        status(&crate::ui::effort_ui::effort_turn_line(
-            tier.as_deref(),
-            None,
-        ));
-        cli_config::set_effort_override(tier);
+    // Resolve effort once; headless uses the same routed-turn contract as both REPLs.
+    // An omitted flag inherits the configured wire tier, without arming a process-global override.
+    let harness_effort = match args.effort.as_deref() {
+        Some("auto") => crate::ui::effort_ui::resolve_turn_effort(args.task.trim()),
+        Some(other) => Some(other.to_string()),
+        None => cli_config::load().reasoning_effort,
+    };
+    let endpoint = cli_config::ResolvedEndpoint {
+        base_url,
+        api_key,
+        model,
+    };
+    let design = crate::repl::turn::new_session_design(format!("agent:{}", std::process::id()));
+    design.set_mode(args.design);
+    // Load the session before planning so the same scoped design state is used throughout this turn.
+    let mut history = Vec::new();
+    if let Some(slug) = args.resume.as_deref() {
+        let (n, saved_design) =
+            session_store::load_session_with_design(&mut history, slug, &endpoint.model)?;
+        if let Some(state) = saved_design {
+            design.restore_session(state)?;
+        }
+        if !crate::ui::events::on() {
+            status(&format!("resumed '{slug}' ({n} messages)"));
+        }
     }
+    design.set_mode(args.design);
+    design.begin_turn(
+        format!("turn:{}", history.len()),
+        crate::repl::turn::design_workspace(),
+    );
+    let mut resolved = crate::repl::turn::ResolvedTurn::new(
+        &endpoint,
+        harness_effort.clone(),
+        harness_effort.clone(),
+        design.clone(),
+    );
+    if args.reference_images {
+        crate::repl::turn::seat_loaded_reference_images(&mut resolved, &images)?;
+    }
+    resolved.freeze_vision_config();
+    crate::repl::turn::validate_current_reference_route(&resolved)?;
+    let shape =
+        crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(args.task.trim()));
+    let cli_approval = if args.yes {
+        ApprovalMode::Yolo
+    } else {
+        ApprovalMode::Ask
+    };
+    let cancel = crate::core::cancel::TurnCancel::new();
+    let usage_cursor = client::cost_meter().cursor();
+    if crate::ui::events::streaming() {
+        crate::core::steer::arm();
+        crate::ui::events::start_stdin_reader();
+    }
+    crate::repl::turn::architect_phase(
+        &http,
+        &mut resolved,
+        shape,
+        args.task.trim(),
+        args.task.trim(),
+        cancel.clone(),
+        cli_approval,
+    )
+    .await;
+    resolved.freeze_vision_config();
+    crate::repl::turn::validate_current_reference_route(&resolved)?;
+    let ep = &resolved.endpoint;
+    let model = ep.model.clone();
+    let base_url = ep.base_url.clone();
+    let api_key = ep.api_key.clone();
+    agent::query_lang::set_expansion_endpoint(ep);
 
     // Session start: rebuild the always-on core for THIS project slug (STYLE + global prefs
     // only). Do not reuse a stale foreign-repo core.active — refresh_frozen_core is slug-aware.
@@ -531,19 +588,11 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // Where the cost meter stands now, so the `done` event can sum only this run's calls.
-    let usage_cursor = client::cost_meter().cursor();
+    // The cursor was captured before architect planning so its paid calls belong to this run.
 
     // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
     // role-scoped registry WITHOUT `task` (no recursion).
-    let cli_approval = if args.yes {
-        ApprovalMode::Yolo
-    } else {
-        ApprovalMode::Ask
-    };
     arm_lsp_session();
-    // The task's shape picks the deferred tool set the registry is built with.
-    crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(args.task.trim()));
     // Built BEFORE the prompt: it publishes the live tool surface the routing map is generated from.
     let registry = agent::builtin::default_registry_with_task(
         http.clone(),
@@ -559,7 +608,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     crate::ui::events::start(
         &model,
         &cwd,
-        cli_config::effort_override().flatten().as_deref(),
+        resolved.wire_effort.as_deref(),
         images.len(),
         &registry.advertised_names(),
         cli_approval.as_str(),
@@ -573,8 +622,10 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     );
     let max = args.max_iters.unwrap_or(25).max(1);
     let mut cfg = AgentConfig {
+        cancel,
         max_iters: max,
         auto_extend_to: max.saturating_mul(2),
+        enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
         approval_mode: cli_approval,
         context_window: resolve_ctx_window(&model).0,
         compact_at_pct: crate::compact_threshold_pct(),
@@ -586,63 +637,9 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         enable_steering: crate::ui::events::streaming(),
         ..Default::default()
     };
-    // Arm the mailbox + the stdin reader for the run's span. The reader thread owns stdin from
-    // here and dispatches control_responses (approvals) and steer lines; `run_agent_cmd`'s
-    // guard disarms and tells the driver about any leftovers.
-    if cfg.enable_steering {
-        crate::core::steer::arm();
-        crate::ui::events::start_stdin_reader();
-    }
-    // The tier gives the harness its budgets too, unless the caller pinned the step cap.
-    if args.max_iters.is_none() {
-        if let Some(t) = cli_config::effort_override().flatten() {
-            cfg.apply_effort(&t);
-        }
-    }
-
-    // Architect mode (see agent::architect): under max effort a multi-file task is planned first
-    // by metis on the strong model; the loop then applies the plan on the fast model at low
-    // wire effort. Decided before the chat closure borrows `model`.
-    let mut model = model;
-    let mut architect_plan: Option<String> = None;
-    {
-        let tier = cli_config::effort_override().flatten();
-        let shape = crate::core::turn_shape::classify(args.task.trim());
-        if crate::agent::architect::applies(
-            tier.as_deref(),
-            shape,
-            cli_config::architect_mode_enabled(),
-        ) {
-            let ep = cli_config::ResolvedEndpoint {
-                base_url: base_url.clone(),
-                api_key: api_key.clone(),
-                model: model.clone(),
-            };
-            let planner = crate::agent::architect::planner_model(&cli_config::load(), &model);
-            status(&format!("architect: metis planning on {planner}…"));
-            if let Some(plan) = crate::agent::architect::plan(
-                &http,
-                &ep,
-                cli_approval,
-                std::path::Path::new(&cwd),
-                args.task.trim(),
-                cfg.cancel.clone(),
-                cfg.context_window,
-            )
-            .await
-            {
-                let editor = crate::agent::architect::editor_model(&cli_config::load(), &model);
-                status(&crate::agent::architect::status_line(
-                    &planner,
-                    &editor,
-                    plan.chars().count(),
-                ));
-                model = editor;
-                cli_config::set_effort_override(Some("low".to_string()));
-                architect_plan = Some(plan);
-            }
-        }
-    }
+    // The stream-json control reader was armed before architect planning so child approvals work.
+    resolved.configure(&mut cfg, args.max_iters.is_none());
+    let architect_plan = resolved.architect_plan.as_ref();
 
     // The model call, injected into the loop. http_ref/base/key/model are all Copy
     // (&Client / &str), so the closure stays `Fn` across the loop's repeated calls.
@@ -653,21 +650,53 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     let registry_ref = &registry;
     let cfg_ref = &cfg;
     let eager_on = eager_enabled();
-    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        if eager_on {
-            let starter = agent::eager_starter(registry_ref, cfg_ref);
-            client::stream_chat_with_tools_eager(
-                http_ref,
+    let wire_effort = crate::repl::turn::explicit_wire_effort(&cfg);
+    let image_config = cfg.image_config.clone().unwrap_or_else(|| {
+        std::sync::Arc::new(cli_config::config_with_session_vision(cli_config::load()))
+    });
+    let streamed_text = std::sync::Mutex::new(None::<String>);
+    let streamed_text_ref = &streamed_text;
+    let chat = move |mut msgs: Vec<Message>, defs: Vec<ToolDef>| {
+        if let Some(design) = cfg_ref.exec_ctx.design() {
+            crate::agent::design::prompt::seat_prompt(&mut msgs, &design);
+        }
+        let image_config = image_config.clone();
+        let wire_effort = wire_effort.clone();
+        async move {
+            let (turn, receipt) = crate::llm::media::with_image_delivery(
+                &cfg_ref.exec_ctx,
                 base,
                 key,
                 model_ref,
-                &msgs,
-                &defs,
-                Some(&starter),
+                async {
+                    let starter = eager_on.then(|| agent::eager_starter(registry_ref, cfg_ref));
+                    client::stream_chat_with_tools_sink_frozen(
+                        http_ref,
+                        base,
+                        key,
+                        model_ref,
+                        &msgs,
+                        &defs,
+                        client::StreamSink {
+                            render: true,
+                            eager: starter
+                                .as_ref()
+                                .map(|hook| hook as client::EagerStartFn<'_>),
+                            ..Default::default()
+                        },
+                        wire_effort,
+                        &image_config,
+                    )
+                    .await
+                },
             )
-            .await
-        } else {
-            client::stream_chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+            .await?;
+            if let Some(design) = cfg_ref.exec_ctx.design() {
+                agent::mark_image_delivery(&msgs, &receipt, &design);
+            }
+            *streamed_text_ref.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(turn.content.clone().unwrap_or_default());
+            Ok(turn)
         }
     };
 
@@ -676,15 +705,16 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // handed, and `run_agent` is exactly these two opening messages plus that call.
     // One user turn either way. With attachments it serializes as a parts array (text first, then
     // one image_url part each) instead of a plain string, which is the only difference on the wire.
+    let sent = args.task.trim();
     let asked = if images.is_empty() {
-        Message::user(args.task.trim())
+        Message::user(sent)
     } else {
         status(
             &style(format!("📎 {} image(s) attached", images.len()))
                 .dim()
                 .to_string(),
         );
-        Message::user_with_images(args.task.trim(), images)
+        Message::user_with_images(sent, images)
     };
     // `--resume SLUG` continues a saved conversation instead of starting one: the stored
     // transcript is the history (its prompt lanes rebuilt for THIS project/model by
@@ -693,38 +723,55 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // runs into one continuous conversation. `load_session` is headless-safe: its cross-project
     // warning is an `emit_line`, which is an emit-line record when the JSON stream is on and a
     // terminal line otherwise.
-    let mut history = if let Some(slug) = args.resume.as_deref() {
-        let mut loaded = Vec::new();
-        let n = session_store::load_session(&mut loaded, slug, &model)?;
-        if !crate::ui::events::on() {
-            status(&format!("resumed '{slug}' ({n} messages)"));
-        }
-        loaded.push(asked);
-        loaded
+    if history.is_empty() {
+        history.push(Message::system(&system));
     } else {
-        vec![Message::system(&system), asked]
-    };
-    if let Some(plan) = &architect_plan {
-        crate::agent::architect::attach_plan(&mut history, plan);
+        crate::agent::prompt_lanes::refresh_prompt_lanes_in_place(&mut history, &model);
+    }
+    history.push(asked);
+    resolved.seat_reference_markers(&mut history);
+    if let Some(plan) = architect_plan {
+        crate::agent::architect::attach_plan(&mut history, &plan.text, plan.path.as_deref());
     }
     // A one-shot run is the canonical single-turn shape (one prompt, many tool steps): give it the
     // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
     // of relying on tool-result clearing alone.
     let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
+    let sum_effort =
+        cli_config::role_reasoning_effort("summarizer", cli_config::load().reasoning_effort);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
+        let effort = sum_effort.clone();
         async move {
-            client::chat_with_tools(http_ref, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
+            tokio::time::timeout(
+                crate::repl::postturn::chore_call_timeout(),
+                client::chat_with_tools_effort(
+                    http_ref,
+                    &ep.base_url,
+                    &ep.api_key,
+                    &ep.model,
+                    &msgs,
+                    &[],
+                    effort,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("summarizer model call timed out"))?
+            .map(|t| t.content.unwrap_or_default())
         }
     };
     let result =
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await;
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
+    design.finalize();
     let saved = if args.save_session {
-        save_finished_session(&history, &model, args.resume.as_deref())
+        save_finished_session_with_design(
+            &history,
+            &model,
+            args.resume.as_deref(),
+            Some(&design.snapshot()),
+        )
     } else {
         None
     };
@@ -744,19 +791,32 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     if crate::ui::events::on() {
         // One closing line carries what the text mode spreads over stdout and stderr: the stop
         // reason, the answer, the question when the model asked one, and this run's tokens.
-        let question = match &outcome.stop {
-            StopReason::AwaitingInput(ask) => Some(ask.display()),
-            _ => None,
+        // `question` stays the human-readable rendering; `ask` carries the same ask STRUCTURED,
+        // so a front-end with a picker (the desktop app) renders options instead of text.
+        let (question, ask) = match &outcome.stop {
+            StopReason::AwaitingInput(ask) => (Some(ask.display()), Some(ask.to_json())),
+            _ => (None, None),
         };
-        crate::ui::events::done(
+        let streamed = streamed_text.lock().unwrap_or_else(|e| e.into_inner());
+        crate::ui::events::done_with_verification(
             outcome.stop.label(),
             outcome.iters,
             outcome.final_text.as_deref(),
             question.as_deref(),
+            ask,
             saved.as_deref(),
             usage_since(usage_cursor),
+            outcome.verification.clone(),
+            streamed.as_deref(),
         );
         return Ok(());
+    }
+    {
+        let streamed = streamed_text.lock().unwrap_or_else(|e| e.into_inner());
+        crate::repl::turn::surface_appended_final_text(
+            outcome.final_text.as_deref(),
+            streamed.as_deref(),
+        );
     }
     match outcome.stop {
         // The final answer was already streamed to stdout during the call.
@@ -797,6 +857,11 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn save_finished_session(history: &[Message], model: &str, resume: Option<&str>) -> Option<String> {
+    save_finished_session_with_design(history, model, resume, None)
+}
+
 /// Put a finished one-shot conversation into core's own session pool, and say where it went.
 /// Returns the slug on success.
 ///
@@ -808,7 +873,12 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
 ///
 /// The line goes to stderr because stdout is the agent's answer: a caller piping it wants the
 /// answer and nothing else. On the JSON stream it is a `session` event.
-fn save_finished_session(history: &[Message], model: &str, resume: Option<&str>) -> Option<String> {
+fn save_finished_session_with_design(
+    history: &[Message],
+    model: &str,
+    resume: Option<&str>,
+    design: Option<&crate::agent::design::TaskDesignState>,
+) -> Option<String> {
     // A run that never got a user turn onto the wire is not a conversation.
     if !history.iter().any(|m| m.role == "user") {
         return None;
@@ -816,7 +886,7 @@ fn save_finished_session(history: &[Message], model: &str, resume: Option<&str>)
     let slug = resume
         .map(session_store::sanitize_name)
         .unwrap_or_else(|| session_store::allocate_session_slug(history));
-    match session_store::save_session(history, &slug, Some(model)) {
+    match session_store::save_session_with_design(history, &slug, Some(model), design) {
         Ok(path) => {
             if crate::ui::events::on() {
                 crate::ui::events::session_saved(&slug, &path);
@@ -977,6 +1047,9 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
     // such note (a non-workflow run), fall back to every task_id seen on the log.
     let task_ids: Vec<String> = {
         let from_note = events.iter().find_map(|e| {
+            if let crate::agent::runlog::Event::WorkflowStarted { task_ids, .. } = e {
+                return Some(task_ids.iter().map(|id| id.0.clone()).collect::<Vec<_>>());
+            }
             if let crate::agent::runlog::Event::Note { label, body, .. } = e {
                 if label == "workflow-spec" {
                     serde_json::from_str::<serde_json::Value>(body)
@@ -1021,6 +1094,12 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
                 println!("  skip  {id}  (log: {status})");
             }
             crate::agent::runlog::Action::Run => println!("  run   {id}"),
+            crate::agent::runlog::Action::Continue => {
+                println!("  next  {id}  (resume queued continuation)")
+            }
+            crate::agent::runlog::Action::Reconcile { reason } => {
+                println!("  hold  {id}  ({reason})")
+            }
         }
     }
 
@@ -1037,9 +1116,11 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
             "run '{run_id}' has no task events to resume from — was it started by `aizen workflow`?"
         );
     }
-    if skips == task_ids.len() {
-        println!("\nevery task is already done — nothing to resume.");
-        return Ok(());
+    if actions
+        .iter()
+        .any(|action| matches!(action, crate::agent::runlog::Action::Reconcile { .. }))
+    {
+        anyhow::bail!("resume refused: unresolved or incomplete outcomes require workspace/checkpoint reconciliation; no dispatch started");
     }
 
     let text = std::fs::read_to_string(spec_path)
@@ -1049,7 +1130,7 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
 
     if !yes {
         println!(
-            "\nabout to resume '{run_id}': {skips} skipped, {} re-run. Re-run spends LLM tokens.",
+            "\nabout to resume '{run_id}': {skips} completed, {} pending continuations. Pending work spends LLM tokens.",
             task_ids.len() - skips
         );
         let go = dialoguer::Confirm::new()

@@ -5,6 +5,81 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.7.2] — 2026-10-16
+
+### Changed
+- **A retry is one line that changes, not a column of notes.** Each attempt used to append
+  `⟳ rate-limited — retrying in 1s (1/3)`, then `(2/3)`, then `(3/3)` to the transcript, so a short
+  429 burst pushed the actual turn off the screen. The same text now rides the working line, which
+  replaces itself; nothing is appended. Off-TTY, where there is no working line, the single note
+  remains.
+- **`skill_load` reports what it loaded, not the skill's whole body.** The digest took the result's
+  first line, which for a skill is a multi-line header plus the procedure — so loading a skill
+  printed a block of its instructions above the conversation. It now reads `skill loaded · <name>`;
+  the body is still in history and opens with `Ctrl-E`.
+- **Checkpoint unavailability no longer prints on every phase boundary.** "not a git repository" is
+  a property of the working directory, not news about the turn; it repeats on every edit in a
+  non-repo folder. It now goes to the run log only. A real checkpoint FAILURE still warns.
+- **The dense embedder no longer announces a successful load at startup.** `[dense] loaded …`
+  appeared above the first turn on every launch. It now speaks only when the configured model was
+  missing and something else was substituted (naming both), or when loading failed.
+- **The `/workflows` panel is wide and no longer truncates.** The overlay was capped at 84 columns
+  and its rows were pre-cut at 72 chars (task labels at 160), so a child's brief and its progress
+  detail arrived as fragments and wrapped into four or five ragged lines each. It now takes almost
+  the full frame width and wraps instead of clipping; labels and details are kept whole up to a
+  generous bound that exists only to stop a pathological string from filling the screen.
+- **Attaching an image no longer opens a menu, and no longer prints a line per send.** Dropping an
+  image into the prompt asked two questions — "Vision capability" and "Use current attachments as
+  references?" — on every attachment, and answered the same way every time; both are gone. An
+  undeclared destination now defaults to vision-capable (an explicit `Unsupported` is still
+  honoured, and `/config → Vision` still changes either), and attachments become references for the
+  task automatically. This adds no transmission authority: a capability statement was never a
+  disclosure approval, and the reference grant stays the narrow one (this task, this
+  destination/account route, originals). The `Image send: N balanced preview(s), URI … → … bytes`
+  notice is removed as well — the numbers remain on `ImageSendStats` for tests, but nothing prints
+  them per request any more.
+- **A failed tool call is one line again.** A failure used to auto-expand its last six body lines
+  under the result row, so a run with several failed calls buried the transcript under indented log
+  rows. The row is now the call line, the error digest, and a `N more line(s) — Ctrl-E expands`
+  hint; the full tail still opens with `Ctrl-E`. A failed turn's own error line is likewise clipped
+  to its first line (with a `↵` marker when more followed), instead of dumping a child's partial
+  report or a workflow's infrastructure summary under the prompt.
+
+### Fixed
+- **A stalled provider stream can no longer look healthy, and a delegated child can no longer wait
+  forever.** Both come from the same place: the streaming reader treated *any* parsed frame as model
+  progress, so a gateway that answered `200` and then sent only keepalive/ping/role frames kept the
+  watchdog's clock fresh indefinitely, and every retry layer above it had its own separate
+  allowance. A child's model step now has ONE budget — three actual HTTP sends total, covering the
+  HTTP retry, the blank-stream replay and the compatibility retry — inside the existing 300 s call
+  limit, itself clamped by the dispatch and inherited parent deadline.
+- **Progress is now semantic, not byte-shaped.** Nonempty text, reasoning, and advancing tool-call
+  fragments renew the idle deadline; pings, empty deltas, repeated role-only chunks and unchanged
+  usage reports do not. `finish_reason` opens a bounded trailer window that still surfaces a late
+  provider error, instead of either waiting a full response window or declaring success instantly.
+- **A stream in another dialect is reported as a protocol error.** A native Anthropic Messages or
+  Codex Responses event, or a non-streaming completion body, served on the Chat Completions route
+  used to parse as an empty chunk and be silently swallowed; it is now a typed terminal failure that
+  is never replayed as a blank stream.
+- **Expired work is terminal, not renewable.** An expired dispatch deadline, an exhausted send
+  budget, an authentication/permanent provider error, a protocol failure, cancellation and uncertain
+  worker ownership keep their own categories instead of collapsing into a generic `error`; none of
+  them is restarted, sent to a recovery planner, or retried by a writer. A workflow task's deadline
+  is frozen before its first eligible admission and every restart/fix/recheck/planner/replacement
+  attempt shares the remaining budget — a resume cannot buy a fresh one, and a journal with no
+  recorded deadline is refused rather than granted new time.
+- **A child that outlives its observer is stopped, and its ownership is still not released early.**
+  A delegated read-only call now runs on its own cancellation token and a context clamped to the
+  observer deadline; observer expiry signals that child only — never the parent or its siblings —
+  then allows a bounded settlement grace. A worker that cannot be proven stopped stays charged and
+  visibly unsettled, and is ineligible for retry, replacement or dependent work.
+- **Waiting is visible.** A `task` row is created before it queues for a sub-agent slot, so a
+  dispatch waiting on admission no longer looks like a hung child, and transport progress is
+  reported as `HTTP n/3 · <phase>` rather than being mislabelled as an agent step.
+- **Deep fan-out no longer overflows a worker stack.** The per-step model future and each scheduler
+  attempt future are boxed: several whole child agent loops held inline in one state machine
+  overflowed the stack at real widths (the speculative real-executor tests caught it).
+
 ## [0.7.1] — 2026-10-09
 
 ### Added

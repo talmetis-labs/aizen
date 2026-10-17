@@ -53,6 +53,21 @@ pub(crate) async fn get(
     url: &str,
     headers: &[(&str, String)],
 ) -> Result<Fetched> {
+    get_bounded(c, url, headers, MAX_BODY_BYTES).await
+}
+
+/// GET with a caller-specific byte budget (skill archives need more than reach documents).
+/// This does not relax redirect/SSRF checks, the client's timeout, or other callers' 8 MiB cap.
+/// Like `get`, the caller must vet the initial URL before fetching.
+pub(crate) async fn get_bounded(
+    c: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    max_bytes: usize,
+) -> Result<Fetched> {
+    if max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
+        bail!("invalid HTTP body budget (expected 1..=64 MiB)");
+    }
     fn host_of(u: &str) -> Option<String> {
         reqwest::Url::parse(u)
             .ok()?
@@ -79,7 +94,7 @@ pub(crate) async fn get(
             url = next;
             continue;
         }
-        return read_body(resp).await;
+        return read_body_bounded(resp, max_bytes).await;
     }
     bail!("too many redirects (> {MAX_REDIRECTS})")
 }
@@ -128,7 +143,11 @@ fn redirect_target(resp: &reqwest::Response, current: &str) -> Result<Option<Str
 /// Buffer the body BOUNDEDLY (streamed chunk-by-chunk so a tarpit/giant file aborts at the cap
 /// instead of being buffered whole first), inflating gzip when the server says so (or the magic
 /// bytes do — api.stackexchange.com gzips unconditionally but not every proxy keeps the header).
-async fn read_body(mut resp: reqwest::Response) -> Result<Fetched> {
+async fn read_body(resp: reqwest::Response) -> Result<Fetched> {
+    read_body_bounded(resp, MAX_BODY_BYTES).await
+}
+
+async fn read_body_bounded(mut resp: reqwest::Response, max_bytes: usize) -> Result<Fetched> {
     let status = resp.status().as_u16();
     let ctype = resp
         .headers()
@@ -143,19 +162,19 @@ async fn read_body(mut resp: reqwest::Response) -> Result<Fetched> {
         .map(|v| v.to_ascii_lowercase().contains("gzip"))
         .unwrap_or(false);
     if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES as u64 {
-            bail!("response body too large ({len} bytes > {MAX_BODY_BYTES})");
+        if len > max_bytes as u64 {
+            bail!("response body too large ({len} bytes > {max_bytes})");
         }
     }
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.context("reading response body")? {
-        if bytes.len() + chunk.len() > MAX_BODY_BYTES {
-            bail!("response body too large (> {MAX_BODY_BYTES} bytes)");
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            bail!("response body too large (> {max_bytes} bytes)");
         }
         bytes.extend_from_slice(&chunk);
     }
     let body = if gzipped_hdr || bytes.starts_with(&[0x1f, 0x8b]) {
-        gunzip(&bytes)?
+        gunzip_bounded(&bytes, max_bytes)?
     } else {
         bytes
     };
@@ -167,14 +186,19 @@ async fn read_body(mut resp: reqwest::Response) -> Result<Fetched> {
 }
 
 /// Inflate a gzip body (pure-Rust miniz_oxide backend), bounded like the raw read.
+#[cfg(test)]
 fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
+    gunzip_bounded(bytes, MAX_BODY_BYTES)
+}
+
+fn gunzip_bounded(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();
-    let mut dec = flate2::read::GzDecoder::new(bytes).take(MAX_BODY_BYTES as u64 + 1);
+    let mut dec = flate2::read::GzDecoder::new(bytes).take(max_bytes as u64 + 1);
     dec.read_to_end(&mut out)
         .context("inflating gzip response")?;
-    if out.len() > MAX_BODY_BYTES {
-        bail!("decompressed body too large (> {MAX_BODY_BYTES} bytes)");
+    if out.len() > max_bytes {
+        bail!("decompressed body too large (> {max_bytes} bytes)");
     }
     Ok(out)
 }
@@ -214,6 +238,18 @@ mod tests {
         enc.write_all(b"{\"items\":[1,2,3]}").unwrap();
         let gz = enc.finish().unwrap();
         assert_eq!(gunzip(&gz).unwrap(), b"{\"items\":[1,2,3]}");
+    }
+
+    #[test]
+    fn gzip_uses_the_explicit_budget_without_changing_reach_defaults() {
+        use std::io::Write;
+        let data = vec![b'x'; 1024];
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&data).unwrap();
+        let gz = enc.finish().unwrap();
+        assert!(gunzip_bounded(&gz, 1023).is_err());
+        assert_eq!(gunzip_bounded(&gz, 1024).unwrap(), data);
+        assert_eq!(MAX_BODY_BYTES, 8 * 1024 * 1024);
     }
 
     #[test]

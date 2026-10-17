@@ -47,13 +47,22 @@ it for its own paste, so the keystroke never reaches `aizen`):
   turns image-file paths on the line into attachments (you can also type/paste a path). Real image
   files only — prose like `nope.png` that isn't a file stays as text.
 
-Both send the image with your text to a **vision-capable** model. **Ctrl-E** expands a tool result into a scrollable overlay — the one under your selection when it
+Both attach the image to your text; the selected model must support vision. Ordinary user
+attachments use a **balanced send-only preview** by default when safe: static opaque 8-bit PNGs
+may become smaller JPEGs while canonical attachments and stored blobs remain unchanged.
+`AIZEN_IMAGE_SEND_MODE=original` preserves the attached bytes on the wire. Unsupported/color-sensitive
+formats, transparency, animation, malformed inputs or a busy image-memory budget retain originals;
+remote image URLs are never fetched by the optimizer. Tool images and output screenshots are not
+silently compressed. See [Visual design and tool images](#visual-design-and-tool-images) for grants,
+exact reference inspection and delivery limits.
+
+**Ctrl-E** expands a tool result into a scrollable overlay — the one under your selection when it
 sits on a tool row, else the most recent; a failed command already shows its last lines under its
-row. **Ctrl-X** removes the most recent
-attachment (keeps your text); **Esc** clears the line and all attachments at once. Clipboard
-screenshots are downscaled to ≤1568px and encoded inline; the token gauge ignores attachments (they
-ride outside `content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works
-everywhere.
+row. **Ctrl-X** removes the most recent attachment (keeps your text); **Esc** clears the line and all
+attachments at once. Clipboard screenshots are downscaled to ≤1568px **at ingress**, before canonical
+attachment storage; original send mode cannot recover pre-ingress clipboard pixels. Attach the
+original file for full-resolution references. The token gauge ignores attachments (they ride outside
+`content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works everywhere.
 
 The context window is **auto-detected** from the provider's `/models` when it reports one
 (OpenRouter/LiteLLM-style gateways do; the bare OpenAI schema doesn't). When it's absent the bar
@@ -65,6 +74,8 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | command | does |
 | --- | --- |
 | `/help` | list commands |
+| `/where` | project identity and managed output roots, without creating them (also `aizen where`) |
+| `/files [artifacts\|scratch]` | read-only paths/sizes for this workspace's artifact runs and this process's managed scratch; omit the argument for both (also `aizen files`) |
 | `/model` | list the provider's models (with context windows) + arrow-key pick one |
 | `/provider [name|add|manage]` | one-pick switch among saved providers; add/edit/rename/delete in the same manager |
 | `/login` | sign in to Aizen in a browser — the session opens the gateway, so nothing is stored but the token |
@@ -75,6 +86,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
 | `/commands` | your **custom slash commands** — markdown macros you fire (see below) |
 | `/mcp` | MCP lifecycle status: connected tools, generation, health, and per-turn schema pinning (see below) |
+| `/design [auto\|on\|off]` | session-scoped visual guidance and evidence; bare shows status. `off` disables automatic guidance/gates, not manual design/image tools |
 | `/browser` | browser profile / host-route / pinned-session status (`--features browser`) |
 | `/apps` | connected apps & MCP catalog — Telegram/Discord/Slack/webhook notify + browser-sign-in MCP apps |
 | `/telegram` | Telegram integration menu: setup · test · status · start daemon · disable |
@@ -84,7 +96,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/timemachine` · `/checkpoint [note]` · `/diff` | `/timemachine` lists every crash-recoverable, worktree-scoped Git checkpoint and jumps back to the code **and** chat of the one you pick (one gesture, reversible); `/checkpoint` saves one now; `/diff` (or `aizen time diff`) shows what changed between two checkpoints, or `working` for the live tree; on the retained TUI `/diff --patch` draws each file as a diff box. `/undo` (alias `/rewind`) shows the rewind's diff stat first, refuses to discard work no checkpoint holds unless you add `--yes`, and names the files it restored. CLI: `aizen time doctor` inspects without touching the tree and reports loose objects once they pile up; `aizen time gc` prunes the objects no checkpoint reaches and compacts this repo's store (packs loose objects — a save does the packing automatically past 2,048); `aizen time gc --all` sweeps orphaned stores left by deleted/moved repos (dry-run by default, `--apply` moves them to a trash dir, which you then delete to reclaim the space) |
 | `/update` | list every published version (the one you're running is marked) and install whichever you pick — newer or older, so the same command is the rollback; the download is checked against the release's published SHA-256 and refused on a mismatch |
 | `/cost` | session token usage + a $ estimate (real provider usage when reported; set rates via `aizen config set --price-in/--price-out`) |
-| `/jobs` | background work at a glance: long-running `process` handles (dev servers, watchers) plus live monitor runs (sub-agents · workflows), self-refreshing. It is selectable and interactive — ↑↓ pick a row, Enter opens that process's live log, `x` stops it (a process is killed by handle; a monitor run gets a stop request), Esc closes (Esc again from a log returns to the list). Typed WHILE A TURN RUNS it opens immediately instead of queueing behind the turn (same inline path as `/workflows`). On the retained TUI a wide terminal shows the same summary in the sidebar, and a narrow one shows a clickable one-line strip under the composer that opens this panel |
+| `/jobs` | background work at a glance: running and completed `process` handles (dev servers, watchers) plus live monitor runs (sub-agents · workflows), self-refreshing. ↑↓ picks a row; Enter opens a process log, including completed logs; `x` / `k` stops only running rows (a process is killed by handle; a monitor run gets a stop request). Esc closes; from a log, Esc returns to the list. Typed WHILE A TURN RUNS it opens immediately instead of queueing behind the turn (same inline path as `/workflows`). On the retained TUI the sidebar / clickable narrow strip is a live-only HUD: completed processes leave it but remain available in `/jobs` |
 | `/theme [moonlight\|lanes]` | colour theme: `moonlight` (default) keeps the calm all-silver look; `lanes` colours each kind of work — read=blue, edit=gold, shell=mauve, web=cyan, memory=violet, talk=pink, plan=teal. Bare `/theme` lists both with a live colour swatch; the choice persists |
 | `/clear` | start a fresh conversation that REMEMBERS this one: the thread is distilled into a dense seed note the new conversation starts with · `/clear hard` wipes with nothing carried over · `/tokens` usage · `/quit` exit |
 
@@ -618,7 +630,9 @@ aizen agent --save-session "..."                            # keep the transcrip
 aizen agent --resume fix-delete-btn --save-session "..."    # continue a saved session under its slug
 aizen agent --effort high "..."                             # this run only; the config is untouched
 aizen agent --image shot.png "why is this button misaligned?"  # vision: repeat --image for more
+aizen agent --reference-images --image ref.png "reconstruct this reference" # task-local exact reference grant
 aizen agent --output-format stream-json "..."               # one JSON record per line on stdout (front-ends, CI)
+aizen agent --design auto "preserve this page's brand while fixing its mobile layout"  # session-scoped; auto|on|off
 ```
 Behavior worth knowing:
 - **Machine-readable output.** `--output-format stream-json` turns the run into one JSON record
@@ -633,7 +647,7 @@ Behavior worth knowing:
   |---|---|
   | `system` / `init` | `cwd`, `model`, `tools` (the names the first request advertises), `permissionMode` (`default`, or `bypassPermissions` with `--yes`), plus aizen's `approval_mode`, `version`, `effort`, `images`, `pid` |
   | `stream_event` | `event{type: content_block_delta, delta{type: text_delta, text}}` — a fragment of the answer as it streams; a `thinking_delta` for the model's reasoning channel, when the provider exposes one |
-  | `assistant` | `message{id, role, model, content[block]}` — one record per finished block: `text`, `thinking`, or `tool_use{id, name, input}`; the blocks of one model turn share `message.id`; `target` names what a tool call is about, and `request_id` names the `control_request` that approved it |
+  | `assistant` | `message{id, role, model, content[block]}` — one record per finished block: `text`, `thinking`, or `tool_use{id, name, input}`; the blocks of one model turn share `message.id`; `target` names what a tool call is about, and `request_id` names that invocation's approval request, including refused calls whose result reports an error |
   | `user` | `message{content[{type: tool_result, tool_use_id, content, is_error}]}` — a call's result (`content` cut at 64 KB); `tool_use_result{name, target, digest, elapsed_ms, truncated, dispatch}` is aizen's own account of it |
   | `control_request` | `request_id`, `request{subtype: can_use_tool, tool_name, input, tool_use_id, agent_id, title, description, preview}` — a destructive call is waiting for an answer on stdin |
   | `system` / `permission_denied` | `tool_name`, `tool_use_id`, `request_id`, `message` — the answer was no (or stdin closed) |
@@ -705,16 +719,29 @@ Behavior worth knowing:
   also change the model: `"models_by_effort": {"low": "cheap-model", "max": "strong-model"}` in
   `cli-config.json` sends turns of that tier to that model on the same endpoint (the effort line
   then names it); tiers without an entry use the main model.
-- **Architect mode under `max`.** A multi-file turn at `max` effort is planned first: `metis` on
-  the strongest configured model (`models_by_effort.max`, else `xhigh`, else the turn's model)
-  writes an ordered plan in prose — file:line anchors, the change and its check per step, what
-  not to touch, the verifying command, no code — and the turn's own loop then applies it on the
-  fastest model (`models_by_effort.low`, else the same model) at low wire effort, the plan folded
-  into the request under `<architect_plan>` and the `max` budgets (steps, verify rounds,
-  self-review) kept. The status line says `architect: plan by metis on X → applying on Y`.
-  Single-file turns, questions and research never enter it; a planner that fails or returns
-  nothing leaves the turn as it would have run. Off with `architect_mode: false` or
-  `AIZEN_ARCHITECT=0`.
+- **Architect mode: plan, then apply.** Multi-file turns use `metis` at `max` effort by default;
+  lower tiers also use it when `models_by_effort.max` or `xhigh` explicitly configures a planner.
+  The planner drafts a Markdown spec: requirements, scope/non-goals, design decisions, phases
+  naming files and checks, acceptance criteria and verification. The editor receives it under
+  `<architect_plan>` with a suggested unique `docs/plans/<topic>-<id>.md` path and instructions to
+  save it **before implementation**, using ordinary `file_write` (`purpose: project`). Missing
+  parent directories must first be created through the approved shell tool. Preparing
+  the draft does not write files or bypass approval, ownership checks or checkpoints. Denial or
+  write failure must be reported; the draft remains in context, not falsely reported as saved.
+  Confirmed nonvisual work may select `models_by_effort.low` as editor at low wire effort;
+  visual/unknown work preserves the selected model and effort unless an explicit apply role is set.
+  Harness budgets stay unchanged. Single-file turns, questions and research do not enter the split;
+  no usable planner result leaves the ordinary turn unchanged. Disable with `architect_mode: false`
+  or `AIZEN_ARCHITECT=0`.
+- **Two planning tiers.** The model judges scope: a few reversible steps get a short `todo_write`
+  list; multi-system work, migrations or multi-phase audits get a `docs/plans/<topic>.md` spec first,
+  then todos for execution. Plans are ordinary repo files the user can review and commit. Keep the
+  path in handoff summaries and re-read it after compaction or resume; this is guidance, not an
+  automatic resume loader. The top-level harness adds at most one advisory `[plan-nudge]` to the
+  next normal model request: initially for a multi-file request, or when edits grow to 3+ paths,
+  if neither todos nor a referenced/read/written nonempty plan is known. It does not block tool
+  calls or add a Done-gate round-trip; children do not run it. An architect draft already carries
+  save-first advice. Explicit plan-only requests do not authorize implementation.
 - **Images are attached, not described.** `--image <PATH>` inlines a PNG/JPEG/GIF/WebP (≤ 8 MB) into
   the first user message as an `image_url` data part — the same wire shape the REPL produces when you
   drag a file onto the window or press Ctrl-O to grab a screenshot — so a front-end driving this
@@ -739,12 +766,50 @@ Behavior worth knowing:
   digest (opening request + latest exchanges) so "continue the most recent session" resumes the
   work instead of sending the model hunting for transcripts. Restoring a full transcript stays
   yours: `/resume`.
-- **Scratch directory** — `<environment>` names a per-run `scratch:` path (under the OS temp dir)
-  where the agent is told to put throwaway helper files instead of your repo or cwd; abandoned
-  scratch dirs are swept automatically a week after their run ends. Two things land there
-  without being asked: the full text of any tool result over 16 KB (the cut result names the file),
-  and the full text of every tool result that has aged past the eight most recent and been
-  collapsed to a one-line digest — see the context notes under the REPL section.
+- **Purpose-aware native files** — new `file_write` targets and new `file_move` destinations
+  require `purpose: project | artifact | scratch`; an existing-file overwrite still works without
+  purpose. `project` keeps the explicit path for source, assets, repository docs, or an export whose
+  location you requested. `artifact` stores durable output under
+  `AIZEN_HOME/artifacts/<workspace-key>/<run-id>/<child-scope>/`, outside the checkout by default
+  (an explicit `AIZEN_HOME` inside the checkout keeps that location). `scratch` stores disposable output
+  under `managed/<compact-run>/root/` or a run-owned `agent-N/` namespace in this process's scratch
+  root. Handles are short labels, not truncated workspace/child identities; checked ownership
+  metadata still binds the full identity. Tool rows show `scratch/<relative>` (or
+  `scratch/agent-N/<relative>`), while complete-label copy and links retain the real absolute
+  destination. These are display labels, not executable filesystem aliases. Arguments, approvals,
+  raw results and event logs keep real paths. For managed purposes,
+  `path`/`to` is a safe relative logical name (for example `reports/audit.txt`), not the actual absolute
+  destination: traversal, absolute/device paths and unsafe Windows components are rejected. The tool
+  returns the actual final path; use that path for later reads or edits. `file_edit` edits existing
+  files only; create with `file_write` and purpose instead. Publish managed output to a requested
+  project location only through an explicitly approved `file_move` with `purpose: project`.
+  Managed directories are created after approval, never while planning/previewing or after denial;
+  if a later lease/checkpoint fails, approved empty parent directories may remain, but the transfer
+  is not run. Normal project writes retain their parent-must-exist rule. Native moves refuse different workspace
+  owners, including a repository outside this run's workspace; run from the owning workspace instead
+  of relying on a lease that protects only one side. Managed directory transfers use a bounded
+  no-follow preflight (1,024 entries, depth 32, 32 MiB of file contents) and refuse unsafe or oversized
+  trees. Artifacts persist across runs and are not scratch-TTL data. Scratch is not durable storage.
+  A lifetime ownership lock protects live
+  managed roots; the existing sweeper conservatively skips process roots containing a managed
+  namespace. Abandoned managed-scratch age cleanup is deferred: these files are not automatically
+  deleted after seven days.
+  This is native-tool placement, not universal filesystem enforcement: shell, MCP and build tools
+  retain their existing permissions; the prompt discourages using them to bypass native rules.
+- **Discover managed outputs** — `/where` / `aizen where` names the effective workspace artifact
+  root and the current process's planned managed scratch root without creating either. `/files`
+  / `aizen files` lists paths and sizes only; optional `artifacts` or `scratch` filters select one
+  root. Artifacts are listed across runs so a later session can find durable outputs; scratch lists
+  only this process's managed scopes (a fresh CLI invocation does not inspect another running
+  process's scratch). The shared listing caps traversal at 256 entries, depth 4 and 32 KiB of output,
+  reports truncation, quotes/control-escapes bounded filenames, refuses symlink/reparse roots and
+  skips linked descendants. Missing roots stay absent. It reads no file contents, provides no
+  cleanup/delete command and does not automatically publish output into your project. Path checks
+  are read-only no-follow guards, not kernel-atomic isolation against hostile concurrent path swaps.
+- **Internal scratch results** — large tool results and collapsed older results still use the
+  process scratch directory: the full text of any result over 16 KB (the cut result names its file),
+  and every result aged past the eight most recent and collapsed to a one-line digest — see the
+  context notes under the REPL section.
 - **Calls written as text are still calls** — arguments that are almost JSON (a trailing comma, a
   raw newline inside a string, Python quotes, a brace cut off by `max_tokens`) are repaired and the
   repair is traced; a call a local model wrote into its text — `<tool_call>…</tool_call>`, a
@@ -816,6 +881,10 @@ Behavior worth knowing:
   detects the commands and the suite and times the fast rung; the record lives in
   `~/.aizen/verify/<project>.json`, never in the checkout. A trusted `.aizen/verify.json`
   overrides detection: `{"commands": [...], "suite": "...", "timeout_secs": N}`.
+  The same engine runs headless as `aizen init` (`--status` reports without scanning, `--force`
+  rebuilds, `--progress` prints machine-readable `PROGRESS {json}` lines for the desktop app's
+  Codebase map tab, and the verify-command measurement runs only on an explicit `--verify` —
+  a script or GUI must not surprise-launch your build).
 - **Sub-agents (the Pantheon)** — the agent can call the `task` tool to delegate a self-contained
   sub-task to a fresh role-scoped sub-agent. Seven built-in roles, each with its own tool scope
   and embedded working method: `argus` (searcher — read-only, repo-local), `metis` (planner —
@@ -828,7 +897,11 @@ Behavior worth knowing:
   canonical name). An unknown `agent` or `role` is refused with the real list — never silently
   substituted. With neither given, the dispatch runs as `argus` (the safe read-only default;
   editing must be asked for by name: `role=daedalus`). Read-only dispatches fan out in parallel;
-  write-capable ones stay serial. Single depth: a sub-agent cannot spawn further sub-agents.
+  exact native readers and editors with frozen `read_paths`/`write_paths` can also run together
+  when no write intersects another child's reads or writes. Shared exact reads may overlap.
+  Conflicting files, shell/build and unrestricted dispatches remain serial barriers. A reader
+  without a frozen footprint does not overlap a writer. Single depth: a child cannot spawn
+  further sub-agents.
   Each role has its own default step budget — argus 15, clio 20, metis / nemesis / mnemosyne 25,
   themis 30, daedalus 45 (`max_steps` overrides; cap 80) — and can be pinned to its own provider
   or model: `roles.pantheon.<role>` in `cli-config.json`, or `/config` → Sub-agents → Pantheon
@@ -847,11 +920,25 @@ Behavior worth knowing:
   (`daedalus · fix parser wants: Run …`); `/workflows` shows each child's current step and its
   own tokens (`12.3k→1.2k tok`), which the `task` result header, the workflow status lines and
   `--trace` repeat. A write-capable `task` child that runs out of time or fails verification is
-  retried once with a tightened brief (its partial report attached); a second failure restores
-  the checkpoint taken before the dispatch and the result header says `retried` and
-  `AUTO-RESTORED`. A brief under 80 chars that names no file or symbol is refused (`brief too
+  retried once with a tightened brief (its partial report attached). Aizen's workspace restore/undo
+  APIs are parent-only, and no failure or cancellation automatically rolls back a child's
+  edits. Pre-dispatch checkpoints are audit baselines, not child undo grants. The coordinating
+  parent inspects and consolidates actual or possibly-applied work; a whole-tree restore requires
+  explicit parent action and workspace exclusion, never merely a child's failure. Known direct
+  Git/Aizen restore commands are refused in children before hooks/approval, including `/yolo`.
+  Unrestricted children still have shell access: arbitrary scripts and unrecognized command
+  wrappers can bypass this detector, so it is not a capability boundary against restoration.
+  Scoped native children do not receive those tools. Automatic checkpoint
+  recovery settles metadata only; an interrupted restore with conflicting contents retains its
+  journal and files for explicit parent reconciliation. If a blocking worker still owns the
+  attempt, no retry is authorized: reconcile its eventual effects first. A brief
+  under 80 chars that names no file or symbol is refused (`brief too
   thin`) — a child starts from an empty context, so the brief must say what to look at and what
-  to return.
+  to return. A child's `Refresh` stop is explicitly incomplete: the body says no automatic
+  continuation ran, and the parent must dispatch any remaining work explicitly. Live token
+  totals include retry and output-contract repair calls; publishing the final total does not
+  add those calls a second time. Final-answer synthesis and contract repair respect child
+  cancellation and the remaining absolute dispatch deadline.
   Example: `task(agent="argus", prompt="find every caller of parse_server_line …")` — and a solid
   change flow is one `daedalus` implementation followed by separate `themis` (verify) and
   `nemesis` (review) dispatches.
@@ -864,13 +951,162 @@ Behavior worth knowing:
 - **Clarify, don't guess** — when a choice is genuinely ambiguous and a wrong guess would waste
   real work, the agent calls `clarify` to ask one or more focused questions; the turn pauses and your
   next message is the answer (in the REPL, the plain prompt, or over Telegram — no stdin contention
-  with the input box). Under the REPL an ask with suggested answers opens a Claude-Code-style panel:
-  a tab per question, checkboxes for `multi_select`, arrow/Space to pick and Enter to submit all
-  answers at once. For low-stakes choices it assumes and states rather than stalling.
+  with the input box). Under the retained REPL an ask with suggested answers opens a
+  Claude-Code-style panel: ↑/↓ chooses a single answer, Space toggles `multi_select` options,
+  Tab switches questions, and Enter submits all answers as a normal user message and resumes the
+  turn. Unanswered questions keep the panel open. Esc or typing dismisses it; the questions and
+  options remain in the transcript for a typed reply. For low-stakes choices it assumes and states
+  rather than stalling.
 - **Web research** — `web_search` (needs a free Tavily key — set `TAVILY_API_KEY`) finds pages; `web_fetch` GETs a URL and
   returns it as readable text (HTML reduced to prose, capped); `web_crawl` spiders a site from a
   seed URL (see `aizen crawl` below). Read-only; available to every role except `argus`, whose
   whole job is inside the repository.
+
+### Scoped native delegation
+
+`task` and workflow tasks accept `read_paths` and `write_paths`: a union of 1–32 distinct exact
+local files, not directories, patterns, traversal spellings or authority inferred from a prompt.
+`read_paths` alone grants only `file_read`. `write_paths` grants reads and writes to those files;
+with both fields, reads use their union and writes use only `write_paths`. The final registry is
+an intersection with the selected role's existing tools: declaring writes never turns a reader
+role into an editor. Inherited scopes may narrow, never widen or upgrade read access to write.
+Scoped children receive only bounded native file tools; shell, builds, processes, LSP, search,
+move/delete, nested delegation and recovery are not granted. Every entry in a multi-file read
+is authorized before data is returned; scoped reads cannot use the ordinary cache shortcut.
+Preparation freezes actual targets and bytes; drift requires new preparation. Resource locks
+use canonical parent + normalized basename, so atomic replacement does not lose exclusion.
+These locks coordinate cooperating Aizen workers; fingerprint checks are **not** kernel
+conditional writes or confinement of external editors.
+
+**Parallel scoped reader/editor admission is enabled in source.** Submit exact `argus` readers
+and `daedalus` editors in the same turn or workflow. Admission uses frozen capabilities, not
+role names or prompt claims. Read/read pairs may share files; reader/editor and editor/editor
+pairs overlap only without write/read or write/write intersections, including cross-reads.
+Conflicting scopes serialize so later children read committed postimages; use `after` for an
+explicit dependency. Shell/build, opaque, image-bearing and unrestricted work remain barriers,
+as do readers without a frozen exact footprint beside a writer. The coordinating parent records
+actual settled edits (including partial edits before a later failure), verifies the combined tree,
+and owns recovery. A successful child report alone is not mutation or verification evidence.
+This source contract does not retroactively enable previously installed binaries.
+
+Live shell and build commands remain serialized on Windows: Job Objects contain process trees,
+not filesystem or network access. A copied working directory does not authorize editor/build
+overlap. No concurrent isolated-snapshot build capability is advertised on Linux or macOS either;
+that requires a dedicated restrictive backend and real escape/settlement tests, not merely the
+ordinary sandbox profile. Local verification identity tracks membership, contents and modes
+within limits but excludes output/dependency stores and lacks environment/toolchain provenance.
+It rejects stale or unsettled success; it is not permission to reuse arbitrary build results.
+
+Strict process/verify lifetime checks accompany scoped admission. On Windows, complete-tree
+proof requires suspended creation, checked
+Job assignment before the initial thread resumes, an empty Job and completed actual pipe workers.
+An ordinary late Job attachment is not proof: descendants may already have escaped the Job. Unix
+process groups and missing containment cannot prove detached descendants stopped. Do not enable
+overlap on the strength of a timeout, wrapper exit, pipe EOF or a UI “done” row. Unproven verify and
+sidecar startup effects remain typed uncertainty, not ordinary failure or permission to retry.
+A local sidecar (LSP or MCP stdio) is charged as unsettled while it starts, but a start that is still
+IN FLIGHT never blocks anything — its own caller is awaiting it, so a slow cold index cannot wedge the
+session. Only a startup that FAILS (or whose observer goes away) starts blocking, and that charge is
+retired **only** by its monitor proving the tree exited with every pipe worker finished. So a start
+that fails and then settles stops blocking on its own — no `/lsp off`, no restart, no relaunch —
+while a child nobody can account for keeps new work refused until the CLI exits. A boundary waits a
+short grace period for a just-failed start's teardown and refuses immediately when there is no proof
+path at all.
+Persistent local sidecars and ambiguous remote operations may keep scoped admission excluded until
+the CLI exits; ordinary parent native IO does not borrow that sidecar exclusion gate.
+
+Scoped writes use private durable native journals (64 MiB total, 128 records, before/after images
+at most 4 MiB each). Prepared intent precedes mutation; applied/settled records precede success.
+A failure from the first Prepared-publication attempt onward is possibly applied, not permission to
+retry or undo. Its assigned intent ID is retained even before source mutation starts; a failed first
+save does not prove whether that record reached disk. Missing exact proof remains unresolved.
+Conflicts are retained and block further mutation. There is no pruning or emergency undo reserve:
+a full journal refuses further writes **and undo**. Ordinary native edits cannot target journal
+storage. `native_owner_undo` is a destructive, parent-only exact-owner/exact-path operation; newer
+same-file sibling ownership conflicts rather than being overwritten. On Windows, undo deletion
+of an owner-created file is unsupported without a checked durable unlink primitive. Native and
+Time Machine restore/undo APIs remain parent-only, including for unrestricted children; no failure
+triggers rollback. This does not remove the unrestricted-shell limitation described above.
+The parent retains and consolidates actual reports before deciding on explicit recovery.
+Transcript autosave and an Idle phase are not physical settlement proof. Unsettled effects retain
+recovery warnings and baseline attribution even when ordinary shutdown cleanup runs. The recovery
+lease stays locked while the owning CLI process is alive; after process exit, its durable warning
+can be offered by recovery. Neither a later successful reader nor the lease TTL silently reconciles
+those effects.
+
+### Native speculative execution (source implementation; recovery incomplete)
+
+An explicit `execution: "speculative"` on scoped `task` or workflow tasks requests a different
+native lane; omission keeps the direct admission rules above. A controller captures one immutable
+base for a bounded cohort and seats each child in a distinct private overlay. Only native
+`file_read`/`file_edit`/`file_write` are eligible. Children see the base plus their own edits, never
+peer overlays or live changes. Exact scopes and role capabilities still apply. Configured lifecycle
+hooks that could run cause admission to refuse; disabling hook display does not isolate a process.
+
+Same-file children may edit concurrently, but only the coordinating parent integrates after every
+physical worker settles. Integration is deterministic, not completion-order overwrite. Identical
+results retain all contributors; overlapping edits, competing rewrites and uncertain syntax conflict.
+For Rust, automatic same-file combination requires confidently identified distinct function bodies;
+imports, signatures, macros and same-function changes require resolution. Other languages retain
+conservative same-file refusal. Live base/read drift refuses integration rather than rebasing intent.
+Partial effects and uncertain workers are retained without automatic retry or rollback.
+
+Combined-tree command verification is separate from overlay completion and byte integration.
+Workflow dependencies and accepted reports wait for required verification. Peer-read concerns remain
+explicit semantic-review flags even after commands pass; base-scoped findings are not fresh live-tree
+reviews. This is optimistic native-tool isolation, **not** isolated shell/build execution.
+
+Verification reserves its start/finish evidence capacity before integration source effects, claims a
+single attempt, and durably records `integration-verification-started` before invoking the opaque
+gate. Its finish links that exact immutable start and records `settled`, `possibly_applied` or
+`unknown_worker` explicitly. A start alone means attempt intent, not proof a process spawned or
+settled. Publication failure retains the evidence without rerunning the gate. No admission or
+metadata lock is held across a verifier subprocess. Workflow live completion and replay require the
+supported exact linked-ID success summary with an explicit settled effect; arbitrary strings and
+legacy summaries missing lifecycle evidence do not release dependents. Summaries remain provenance,
+not current-source proof or restart execution authority. Legacy verification is inspectable but
+cannot silently gain an accepted current lifecycle.
+
+Integration evidence retains exact per-file native journal IDs for changed files; no-ops do not gain
+journal ownership. New integrations first persist a complete ordered changed-write fence in the v2
+journal, bound to a random journal epoch and batch ID. The exact identity is copied into immutable
+prepared evidence before source effects and repeated by the version-2 receipt linkage. Existing-only
+restart inspection checks the entire fence, owner, historical bindings, images, ordinals and claims,
+including a real fence lookup for an empty batch. Missing expected records or omitted claims remain
+unresolved; unrelated journal writes do not count toward the batch. Legacy version-1 selected-ID
+receipts remain inspectable but never gain complete coverage by matching numeric IDs. Fences are
+bounded (128 retained fences, within the shared 64 MiB journal quota); exhaustion refuses admission.
+
+IDs and stored paths are evidence, not restart execution capabilities. Time Machine validates the
+prepared/receipt/verification chain and refuses mutation on unresolved or unsupported evidence,
+including older receipts missing exact journal linkage. Restart inspection requires fresh parent
+admission and caller-selected exact resources, classifies exact pre/post images, and refuses foreign
+or mixed images. Inspection never reconciles the native journal. A complete historical native batch
+is not a durable physical-worker roster or closure receipt; those lifecycle guarantees remain
+unfinished. A matching postimage or missing native proof is not effect attribution or proof of no effect.
+
+Use `checkpoint_view action=recovery_report cohort=<id> prepared=<m-hash.json>
+resource_paths=["src/file.rs"]`, or `aizen time doctor --cohort <id> --prepared <m-hash.json>
+--resource src/file.rs [--resource ...] [--json]`. Select every prepared file explicitly; the tool
+requires `resource_paths` even when empty. Stored paths are compared, never used as access authority.
+The default report cannot combine with `--repair`, settle pending evidence, replay, undo or append.
+It may create admission metadata/registry bookkeeping, but does not change source or journal bytes or
+initialize Git checkpoint storage. Non-Git restart inspection remains unsupported.
+
+For an explicit metadata-only write, add `--record-observation` to the same `aizen time doctor`
+selection. A freshly admitted plain parent records a bounded nonterminal observation in the existing
+cohort under exclusive ownership: exact prepared/receipt IDs, observed image fingerprints and
+historical native proof statuses. The default CLI report and `checkpoint_view` remain read-only.
+An observation is historical evidence, not accepted verification, effect attribution, current-tip
+proof or authority to retry/undo. It leaves pending guards and source/native journal bytes unchanged.
+Stale selection, active ownership, unsupported evidence and exhausted physical/expanded-data quotas
+refuse publication; a publication error may retain immutable artifacts and never runs cleanup/retry.
+
+**Not complete or release-verified:** terminal abandon/reconcile, selected integration inverse,
+atomic checkpoint linkage and cooperative-authorship integration are not yet implemented. There are
+no `aizen time` commands for those operations. Do not delete evidence to bypass a refusal, or use
+whole-tree restore as an individual child's undo. Existing binaries are unchanged until separately
+built and installed.
 
 ### Hooks — your own commands around the loop
 Three points of every run take a command of yours, configured under `hooks` in
@@ -909,6 +1145,12 @@ deliberate deny blocks. `aizen hooks` lists what is configured; `AIZEN_NO_HOOKS=
 hook off. On the stream each run is a `system` / `hook_response` record; in the transcript it is
 one `→ hook …` line.
 
+Native-only scoped children cannot spawn these opaque hook commands: the runner reports refusal
+before a process starts, without widening the child's file authority. As with other settled hook
+startup errors, the authorized native tool may proceed without that hook; do not rely on a
+subprocess hook as a mandatory policy gate inside a native scope. Unproven physical hook effects
+are different: they block further work until settlement can be established.
+
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
 in-REPL dispatches), then merge their results into one answer (mixture-of-agents). In the REPL the
@@ -943,19 +1185,38 @@ Roles set each sub-agent's tools (see the Pantheon above; omitted role = `nemesi
 legacy role names in existing specs keep working, unknown ones are refused). The contract fields
 travel INTO the child's prompt exactly as they do on a `task` dispatch; an `expects` schema is
 validated (one repair attempt) and the task's status carries `json:ok`/`json:invalid`. A failed
-task never aborts the workflow — its result is captured and the synthesis still runs. The synthesis uses `AIZEN_MODEL` unless `synthesis.model` overrides it.
+child remains a reported outcome; cancellation, admission infrastructure or journal failure stops new
+admission and drains already-admitted work. Synthesis uses `AIZEN_MODEL` unless `synthesis.model`
+overrides it; incomplete outcomes remain unresolved in the merged report.
 **Model diversity (mixture-of-agents):** each task may set its own `model` (e.g. a cheap model
-scouts, a strong one reviews) — else the workflow default. `--trace <path>` writes a JSON audit of
-the fan-out (per-task model + outcome + the synthesis model).
-**Chains and the fix loop:** `after` orders tasks into dependency waves (Kahn order; unknown
-ids and cycles are refused). Within a wave the read-only tasks fan out first and the wave's one
-writer (`daedalus`, or `themis`, which holds a shell) runs alone, so a reviewer never reads a
-tree the implementer is mutating — put the review AFTER the change with `after`. Two writers
-may share a workflow only when `after` orders them. A chained task's brief opens with an
-`<upstream>` block carrying its dependencies' latest reports (4,000 chars each, 12,000 total).
-A task with `retry_on_fail` whose report opens with `VERDICT: FAIL` re-runs the named upstream
-task once with the failure attached, then runs again; the trace keeps both attempts as `id`
-and `id#2`. Workflow writers run under the verify gate like a `task` writer. From the REPL,
+scouts, a strong one reviews) — else the configured role/default. `--trace <path>` records physical
+attempts, including their token spend; final logical reports select one outcome, without counting
+an alias as another paid call.
+**Chains and the fix loop:** `after` waits for durable logical settlement (unknown IDs and cycles
+are refused). Eligible tasks run from one queue, not a wave barrier. Every initial, restart, fix,
+recheck, planner and replacement passes the same global/model admission gate. Frozen disjoint
+native scopes may overlap; same-file, opaque and unrestricted work remains exclusive. A queued
+conflicting task occupies no slot, so compatible ready tasks may progress. Readers without exact
+footprints do not overlap writers: put a review AFTER the change with `after`. `<upstream>`
+contains settled dependency reports (4,000 chars each, 12,000
+total), never an unpublished failed fix. `retry_on_fail` runs one upstream fix then one recheck.
+IDs such as `a`, `a#2`, and `a#restart` are literal and independent; attempt labels are display only.
+The CLI may invoke Metis after a persistent failure and then one actual replacement worker, with
+the original role, model, boundaries and output contract. Planner success is not task success.
+The in-conversation collect path does not enable this extra planner policy.
+
+CLI logs flush dispatch intent before execution and completion before dependency publication.
+`aizen resume <run-id> --spec <spec.json>` replays pending transitions, not completed attempts;
+it checks frozen worker/recovery/synthesis routing and reuses the original prompt date. Old versioned
+journals lacking the frozen synthesis contract require reconciliation, not a guessed migration. An intent without a
+completion has an unknown possible side effect: resume refuses it and directs you to crash recovery
+and checkpoints. Legacy suffix collisions also require reconciliation. This contract covers
+process crashes, not exactly-once effects or power-loss durability (`flush` is not `fsync`).
+`Refresh`, deadline, verification failure and invalid output contracts are incomplete, never a
+successful skip. Cancellation/timeout does not prove a blocking worker stopped: its permits and
+workspace leases remain held until the worker actually releases them.
+
+Workflow writers run under the verify gate like a `task` writer. From the REPL,
 `workflow(mode="implement", prompt="…")` prebuilds implement (daedalus) → verify (themis,
 first line `VERDICT: PASS|FAIL`) → review (nemesis) with that fix loop; the same spec as a
 file is `bench-fixtures/workflows/implement.json`.
@@ -1047,21 +1308,78 @@ aizen soul clear
 
 ### `aizen skill` — reusable procedures (skills)
 A **skill** is a saved step-by-step playbook (deploy the VPS, cut a release, triage logs) — distinct
-from **memory** (facts/preferences). Skills live as human-editable markdown under `~/.aizen/skills/`.
-A compact index (`name: when`) is injected into the agent's system prompt (`<skills>`); the agent
-pulls a skill's full steps on demand with the **`skill_load`** tool, and can persist a new one with
-**`skill_save`** (approval-gated). Manage them from the REPL with **`/skills`** (list · view · new ·
-**fetch from URL** · delete), or the CLI:
+from **memory** (facts/preferences). A compact index (`lookup-key: when`) enters the agent's
+`<skills>` prompt; **`skill_load`** reads the full procedure only when needed. **`skill_save`**
+authors a local skill; **`skill_install`** imports third-party instructions and remains
+approval-gated and serial. Manage skills with **`/skills`** (view · new · fetch URL · install
+GitHub bundle · search marketplace · retire · restore), or the CLI:
+
 ```bash
 aizen skill add deploy-vps -d "ship over SSH" -w "asked to deploy"   # body from --body or stdin
-aizen skill fetch https://example.com/deploy-vps.md                  # pull a shared skill from a URL
-aizen skill list / show <name> / delete <name>
-aizen skill where                                                    # the three folders + counts
+aizen skill fetch https://example.com/deploy-vps.md --name deploy    # one Markdown file, not its resources
+aizen skill search deploy fastapi                                   # agentskill.sh; recent-catalogue fallback
+aizen skill install OWNER/SKILL                                     # existing marketplace syntax
+aizen skill install --github OWNER/REPO --path skills/release         # selected directory + resources
+aizen skill install --github OWNER/REPO --path skills/release --ref v1.2 --name team-release
+aizen skill list --all-zones
+aizen skill show team-release
+aizen skill refine team-release --body "Improved procedure"
+aizen skill delete team-release                                     # retire, not permanent deletion
+aizen skill restore team-release
+aizen skill where                                                   # scope folders + counts
 ```
 
-Optional frontmatter narrows when a skill shows in the index: **`requires:`** (tool names — hidden
-unless every one is in the live tool surface, so a `browser_*` skill is silent when browser tools
-aren't built) and **`platforms:`** (`linux`/`macos`/`windows`, or `unix`/`posix` — hidden off-OS).
+**Identity, scopes, and layouts.** The lookup key is the local install slug, not necessarily the
+upstream `name:`. A GitHub install defaults to the selected directory's name (repository name for
+`--path .`); `--name` gives it an alias without rewriting the source. Use that key in
+show/load/refine/retire/restore. Discovery
+accepts flat `<key>.md` and one-level `<key>/SKILL.md` bundles; Markdown resources inside a bundle
+are not separate skills. The same resolver is used throughout the lifecycle, in this order:
+
+1. `<repo>/.aizen/skills/` — repo-shipped, highest precedence; read-only through skill mutation tools.
+2. `~/.aizen/skills/p/<project-slug>/` — this workspace's zone; auto-learned procedures live here.
+3. `~/.aizen/skills/` — personal global skills; explicit authoring and imports live here.
+
+Other workspaces' zones are inspection-only with `list --all-zones`. If one scope has both
+`<key>.md` and `<key>/SKILL.md`, the key is ambiguous and cannot be loaded: resolve the duplicate
+rather than relying on an arbitrary choice. Imports are **new-only**: an existing global flat or
+bundle destination is refused untouched; there is no `--replace` or update mode. Installing a
+global copy below a repo/zone override is allowed, but the result reports the actual installed
+entry and warns that it is **shadowed**, not active here. Refinement/retirement do not fall through
+to a hidden global copy beneath a repo skill.
+
+**Source metadata and local state.** URL/marketplace imports preserve the complete source Markdown;
+GitHub bundles preserve it along with selected resources. UTF-8 is required, with non-empty steps
+and valid YAML frontmatter when present. Quoted, folded, and literal descriptions are supported;
+unknown/nested metadata is retained. Optional **`requires:`** (tool names) and **`platforms:`**
+(`linux`/`macos`/`windows`, or `unix`/`posix`) accept strings or lists and filter the index against
+available tools and the current OS. Install alias, provenance (source URL or registry,
+repository/path/resolved SHA), and local usage/version/update counters live in the writable scope's
+`.state/<key>.json`. Loading/recording usage does not rewrite source Markdown; legacy flat counters
+remain readable. Refinement preserves unrelated header fields, archives the prior version, and
+retirement/restoration keeps bundle resources and state with collision checks.
+
+**GitHub bundles and resources.** `--github OWNER/REPO` requires `--path` to a directory containing
+`SKILL.md` (use `--path .` for the repository root); it is mutually exclusive with the marketplace
+slug. `--ref` and `--name` are GitHub-only
+install options. Only **public GitHub repositories** are supported here; no credentials, Git
+subprocess, Node/Python runtime, dependency install, or script execution is involved. The default
+branch or supplied branch/tag/ref is resolved to an immutable commit SHA before the ZIP download;
+re-running with a branch does not update an existing install. The result and loaded skill expose
+its final entry and resource root. Relative references/assets/scripts resolve under that root,
+**not** the agent's working directory; the installer never changes cwd or executes scripts.
+Following a skill's procedure remains subject to the normal tool approvals and sandbox.
+
+The GitHub archive download and actual selected decompressed content are each capped at **64 MiB**,
+with **16 MiB per file**, **4096 archive entries**, and **32 path components**. Only Stored/Deflate
+ZIP entries are supported. Exact subtree selection keeps relative binary assets and dotfiles;
+unsafe paths, links/reparse points, duplicate/case-colliding outputs, unsupported archive forms,
+and exceeded limits are refused before publication. A hidden staging directory is validated
+before the final bundle is published, with recoverable state commits; multi-path renames are not
+universally atomic. Windows-reserved names and non-portable paths can be rejected even on another
+OS. URL/marketplace installs still fetch one document with the ordinary bounded HTTP limit; use a
+GitHub bundle when a skill needs sibling resources. Marketplace search remains best-effort: its
+recent-catalogue fallback cannot recover every older skill during an index outage.
 
 **Self-learning** — after a completed multi-step task, the REPL distills a *generalizable* procedure
 into a new skill automatically (conservative: skips one-offs and duplicates; prints `↯ learned skill
@@ -1185,20 +1503,176 @@ prompts only for real secrets, signs you in if it's OAuth), `aizen apps info <ke
 masked + a live tool probe), `aizen apps login <key>`, `aizen apps remove <key>`. Also the `/apps` TUI hub.
 LOCAL-FIRST: a self-hostable package (runs on your machine with your keys) beats a hosted gateway.
 
-### Browser automation (`--features browser`)
-Build with `cargo build --release --features browser` to give the agent five CDP tools that drive an
-**existing** Chrome/Edge/Brave (it never bundles a browser). The legacy local setup still works:
-```bash
-chrome --remote-debugging-port=9222     # or msedge / brave; AIZEN_BROWSER_CDP overrides local
+### Visual design and tool images
+
+`/design auto|on|off` and `aizen agent --design auto|on|off` affect only the current session/run,
+not saved configuration. `auto` activates on a model-grounded **create, redesign or preserve**
+visual intent, not a keyword or specialist role. `on` enables guidance; `off` disables automatic
+guidance and visual completion gates while keeping manual tools available. `design_brief` records
+a bounded audience/brief/type/palette/layout/assets/responsive/interactions/acceptance contract;
+`design_guide` reads one compact guide; `design_review` records concrete observations of an image
+actually shown to the model. Existing branding and repository conventions remain the default.
+For exact user-requested review sizes, a new `design_brief` may include
+`"required_viewports":[{"width":390,"height":844},{"width":1440,"height":900}]` alongside its
+intent, brief and acceptance. Supply one to four unique integer sizes (1–4096 pixels per side,
+at most 8,388,608 pixels each). They become the gate's exact width/height requirements rather than
+only prose; otherwise the default is narrow and wide review, or the task's existing requirements.
+This records review criteria, not a browser resize or a user waiver: capture those sizes with
+approved browser tools. Requirements persist with the brief across explicit resume; `{"resume":true}`
+must stand alone, without replacement fields/viewports. Invalid requests leave the prior contract
+unchanged; changing a brief never replenishes the task's operation or repair budgets.
+
+The full capsule is scoped to the active task and rides only on the outgoing user turn, not the
+cached system prefix. Finalization archives it; a later user turn receives only a prior-brief
+pointer until an explicit `design_brief` call with `{"resume":true}`. Saved sessions/recovery keep
+typed brief and evidence metadata; restoring a session makes old evidence **stale**, not verified.
+Delegated children inherit concise constraints, with separate task/evidence namespaces.
+
+**Vision capability is explicit per effective endpoint/model.** Open `/config` → provider/model →
+**Vision** to declare Supported or Unsupported for that exact destination. Unknown may be declared
+for this session only; persistent saving is a separate explicit action. The declaration is the
+user's assertion, not an automatic paid probe or inference from the model's name/HTTP success.
+The equivalent stored configuration is:
+
+```json
+{
+  "vision_capabilities": [
+    { "base_url": "https://your-provider.example/v1", "model": "your-model-id", "supported": true }
+  ]
+}
 ```
 
-For multiple/local-or-remote CDP endpoints, create versioned `~/.aizen/browser.json`:
+An absent entry means **unknown**; `supported:false` means unsupported. Both leave tool images as
+text/metadata rather than pretending the model saw them. The capability must match the effective
+endpoint and model after role/effort routing; configuring support does not grant image-transmission
+permission. For ChatGPT Codex, that tuple is the fixed Responses URL
+`https://chatgpt.com/backend-api/codex/responses` and the actual wire model **without its effort
+suffix** (for example, `gpt-5.4-high` uses `gpt-5.4`). Configure that URL/model, not a Codex base-URL
+alias or the effort-suffixed picker name; this routing normalization does not imply vision support.
+Tool-image approval names that destination, and a routed destination change requires matching
+approval. Media asks for invocation-only consent: generic allow-all grants do not bypass it, and a
+stream-json reply granting a tool/session is applied only to the current media call.
+`image_read` requires explicit `transmit_image:true` plus exactly one local
+PNG `path`, current scoped `evidence_id` or granted `ref_id`; an optional pixel crop preserves source lineage. Missing,
+expired or metadata-only retained images are unavailable, not silently replaced from another session.
+Manual image reads/crops do not establish current-render evidence or consume the successful capture
+budget, but approved transmitting reads during an active visual task consume its aggregate operation budget.
+
+A browser capture with `transmit:false` is capture-only and needs no vision declaration: saved
+pixels are available locally but are not visually reviewed. `image_read` remains a transmitting
+read requiring explicit `transmit_image:true`; it does not currently expose a capture-only mode.
+Capability Unknown/Unsupported, denied transmission, omitted budget selection and failed delivery
+are distinct limitations; none is repaired by silently changing providers. Executor and request
+projection use one frozen route/capability context; a route change needs a fresh context and grant.
+
+**Balanced user-reference sending.** The optimizer tries JPEG quality 88 at the attached resolution,
+then quality 82 only above a soft **512 KiB data-URL** target. If still necessary, one aspect-preserving
+Lanczos resize caps the long side at **1280px**, without upscaling. At most three candidates are
+encoded, and a larger candidate is never kept. This is lossy previewing, not exact pixel inspection.
+Only static opaque 8-bit PNGs with supported metadata are converted; APNG, 16-bit, nonopaque alpha,
+transparency chunks, ICC/gamma and other unsupported color metadata keep original bytes. Cache is bounded to eight
+encoded entries / 16 MiB, with no decoded pixels retained. Codecs, request materialization and local
+comparison share a nonblocking **192 MiB** application-buffer/work reservation budget; contention
+produces a limitation or original fallback. This is not a hard process-RSS cap: allocator overhead
+and unrelated memory are outside that accounting. After a successful parent send, one numeric
+note reports preview URI sizes/cache/encoding time; child calls remain quiet. Token estimation and
+occurrence-only queries do not invoke codecs.
+
+**Selected references and fidelity.** Reference IDs identify attachments in the already-loaded
+conversation, not globally readable blobs or file authority. The controller grants current-task
+purpose, destination/account route and allowed originals/previews/crops separately from declaring
+vision or approving a tool. Same-route children may receive only explicitly selected `reference_ids`;
+a different route/account requires fresh consent. Restoring a session does not restore live grants.
+For headless intentional handoff, use
+`aizen agent --reference-images --image ref.png "reconstruct this reference"`: this grants the attached
+references to this task and same-route selected delegates, with exact-original sending; it does **not**
+declare model vision support. Current exact fidelity selects **Original for the whole request**, not a
+mixed exact/preview projector. Preview-only grants are rejected with an actionable limitation.
+
+Discover `reference_read`, `reference_compare` and `reference_trace` with `tool_search` when they are
+not on the current schema surface. Inspect granted originals/crops before constructing geometry;
+`reference_trace` is deterministic bounded color/mask contour tracing, not semantic segmentation.
+`reference_compare` uses originals and current scoped output captures locally, with explicit equal
+viewport/region alignment, reporting changed-pixel fraction, channel error and mismatch regions.
+It never uploads originals merely to calculate a diff, silently aligns/resizes inputs or invents a
+passing tolerance. Exact mode requires zero pixel difference under frozen dimensions/source/render
+conditions; a model `design_review(passed:true)` cannot override failed or missing comparison.
+Unsupported formats/metadata, stale render/source state or unavailable grants remain incomplete.
+A delivery receipt proves successful request inclusion of that exact source occurrence and wire
+representation, not semantic understanding. Failed/replayed calls, omitted images, revoked grants
+and a different occurrence with identical pixels earn no delivery credit. A preview or crop cannot
+certify whole-original inspection, functional UI, accessibility or mobile behavior.
+
+**Image limits and privacy.** Browser capture/local crop are PNG-only. MCP image observations accept
+validated PNG/JPEG/GIF/WebP base64 blocks, at most **8 MiB per image**, with a tool-image request
+budget of **four images** and **16 MiB** combined. Existing user attachments retain their legacy
+wire behavior and are not silently stripped by the new tool-image capability gate; they consume
+that same request budget and can leave no room for tool images. This is not a new global cap or
+vision-support claim for legacy user attachments. Malformed, oversized, unsupported or
+unapproved tool blocks remain explicit text/metadata limitations; MCP error images are not projected.
+Image payloads may be retained in owner-only session blobs and sent to the approved provider; page
+content can contain private information. Inspect the target and destination before approving.
+Image approval does not authorize unrelated shell commands, browser setup or navigation.
+
+**Verification is deliberately limited.** A passing build or DOM/accessibility snapshot is not a
+visual review. The gate needs settled current-render viewport captures, actual image projection and
+an acceptance review for both narrow and wide views (or controller-required viewports). Editing the
+source, changing target or restoring a session makes prior checks stale. Each task allows at most
+**36 approved native visual operation attempts** across viewport changes, screenshots and transmitting
+image reads/crops, including failures. Separately, evidence allows **four successful capture records
+per pass** and **two repair rounds**. Repairs, brief edits/resume and compaction do not refill the
+aggregate attempt budget; a new user task or isolated child has its own budget. This bounds native
+visual retries, not total task wall time or arbitrary browser navigation/eval/shell work.
+Exhaustion without current verified evidence reports incomplete; an already verified current result
+remains verified. Unavailable vision/rendering/freshness also stops with an honest incomplete result
+rather than a fabricated pass. A user/controller waiver is labeled skipped, never verified.
+Dynamic pages/dev servers currently have **unknown workspace-source freshness**: a running
+server or a page marker alone does not prove it serves the latest source. The deterministic freshness
+path is limited to allowlisted, **scriptless**, self-contained static local HTML (up to 256 KiB,
+without external styles/assets or dynamic resources) whose served/browser resource bytes
+match canonical workspace bytes before and after capture. Time Machine restores workspace files,
+not live browser state, running dev-server output or external services; rewind is not a browser
+rollback and does not recover visual verification. Refresh/recapture must earn current-source evidence
+again, and dynamic source correspondence remains unknown. No live visual-quality claim is implied.
+
+**Machine-readable verdict.** The closing `result` in `--output-format json` / `stream-json` may
+include `verification`, captured from typed loop/gate state before task finalization, not parsed
+from the model's prose. It separates `build_test` (`passed`, `unverified`, `not_required`) from
+`visual.status` (`disabled`, `not_required`, `verified`, `pending`, `unavailable`, `failed`,
+`skipped_by_user`). The visual object includes `reason`, `task_id`, `revision`, `operations`,
+`repair_rounds` and bounded `evidence` rows (`id`, `status`, `width`, `height`, `revision`,
+`pixels_delivered`, `ready`); `limitations` states the remaining scope. No image hashes, target
+URLs or image payload bytes are included in this verdict. A delivered, ready image is not itself
+an acceptance pass, and visual review is not WCAG certification or proof of unobserved interactions.
+The field is optional; its absence is not proof of verification. Machine consumers should read
+these statuses rather than infer a visual pass from a successful build or the answer text.
+
+### Browser automation (included by default)
+
+The default build ships the lazy, attach-only CDP client; `--no-default-features` excludes browser
+code (`--features browser` opts it back in). Browser tool schemas are registered only when a valid,
+explicit `AIZEN_BROWSER_CDP` endpoint or nonempty `~/.aizen/browser.json` profiles are configured.
+This availability check is offline: no discovery, attachment or probe during registry construction,
+and no dead browser schemas from an implicit localhost default. Each operation consumes one validated,
+bounded configuration snapshot before attachment; deleting or emptying the explicit configuration
+cannot make an already registered tool fall back to localhost. A configured endpoint does not prove
+that a browser or unambiguous page target is reachable.
+
+Tools attach to an **existing**, explicitly configured Chrome/Edge/Brave target. Aizen does not
+install, bundle or launch a browser. `AIZEN_BROWSER_CDP` may override the legacy local endpoint;
+a missing endpoint/target is reported as unavailable, not repaired by silently changing browser
+security settings.
+
+For multiple/local-or-remote CDP endpoints, create versioned `~/.aizen/browser.json`.
+`target_id` must name an existing page; without it, attachment succeeds only when exactly one page
+exists. Multiple pages are an explicit ambiguity error, never an arbitrary "first page" choice.
+Tool calls can name the configured `profile` and existing `target_id` explicitly:
 ```json
 {
   "schema": 1,
   "default_profile": "local",
   "profiles": {
-    "local": { "provider": "cdp", "endpoint": "127.0.0.1:9222" },
+    "local": { "provider": "cdp", "endpoint": "127.0.0.1:9222", "target_id": "existing-page-id" },
     "work":  { "provider": "cdp", "endpoint": "https://cdp.example.com", "auth_env": "WORK_CDP_AUTH" }
   },
   "routes": { "*.corp.example": "work", "localhost": "local" }
@@ -1217,7 +1691,13 @@ credential values.
 
 Tools: **`browser_navigate`** (open a URL), **`browser_snapshot`** (the page's accessibility tree as
 `[@ref] role "name"` lines), **`browser_click`** / **`browser_type`** (act on a `@ref`), and
-**`browser_eval`** (run JS — read DOM/state, await fetches). `browser_snapshot` may reconnect/retry
+**`browser_eval`** (run JS — read DOM/state, await fetches). **`browser_set_viewport`** changes the
+attached target's bounded CSS width/height at DPR 1, with optional mobile emulation; **`browser_screenshot`**
+returns an approval-gated viewport/clip PNG with target, readiness, revision and capture metadata.
+Viewport/clip dimensions are at most 4096 pixels per side and 8,388,608 pixels total. Viewport overrides
+persist until an explicit `reset:true`; cancellation may retain them. Optional reload is also
+approval-gated, not automatic. Screenshot readiness has a bounded wait and may be false; it does not
+prove animation idle, full-page coverage or current dynamic-server source. `browser_snapshot` may reconnect/retry
 once after a transport failure; navigate/click/type/eval are never replayed after transport ambiguity.
 Still a **pure-Rust static binary, no bundled browser/Node/Playwright/CEF**. An absent browser returns
 an actionable error, not a crash.

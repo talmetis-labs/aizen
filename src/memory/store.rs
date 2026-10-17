@@ -244,7 +244,7 @@ impl MemoryEntry {
             .filter(|s| !s.is_empty())
             .map(|s| s.replace('\\', "/"));
         // ── tier/anchor/device (Phase 1) — legacy files get inferred ──
-        let tier = match fm.get("tier").and_then(|s| Tier::parse_strict(s)) {
+        let tier = match fm.get("tier").and_then(Tier::parse_strict) {
             Some(t) => t,
             None => infer_tier_from_legacy(&scope),
         };

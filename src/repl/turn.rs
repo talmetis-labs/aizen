@@ -4,19 +4,17 @@
 //! model call. Everything else was written out twice and drifted, so it lives here once: building
 //! the turn's tool registry, seating the user message, running the turn, and finishing it.
 
+use crate::agent::design::{DesignContext, DesignMode};
 use crate::agent::prompt_lanes::{
-    fold_context_into_query, refresh_dynamic_prompt_lane, update_system_prompt,
+    fold_context_into_query, refresh_dynamic_prompt_lane, refresh_prompt_lanes_in_place,
+    update_system_prompt,
 };
 use crate::agent::{self, AgentConfig, AgentOutcome, StopReason};
-use crate::core::session_store::{
-    autosave_last, autosave_session, publish_live_history, update_live_history,
-};
+use crate::core::session_store::publish_live_history;
 use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
-use crate::repl::postturn::{
-    chore_chat, last_turn_slice, maybe_evolve_persona, maybe_run_secretary,
-};
+use crate::repl::postturn::{last_turn_slice, maybe_evolve_persona, maybe_run_secretary};
 use crate::ui::context_report::{
     ctx_permille, resolve_ctx_window, usage_ctx_tokens, usage_input_tokens,
 };
@@ -26,6 +24,330 @@ use crate::{approval_mode, cancellable_slash, eager_enabled, summarizer_endpoint
 use anyhow::Result;
 use console::style;
 use types::Message;
+
+/// One final routing decision consumed by the prompt, registry, context and model request.
+/// Harness effort remains the requested tier even when architect deliberately uses a low editor.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedTurn {
+    pub endpoint: cli_config::ResolvedEndpoint,
+    pub harness_effort: Option<String>,
+    pub wire_effort: Option<String>,
+    pub design: DesignContext,
+    pub architect_plan: Option<crate::agent::architect::ArchitectPlan>,
+    pub(crate) references: Option<crate::core::reference_media::ReferenceAccess>,
+    reference_markers: Vec<crate::core::tool_media::ToolImage>,
+    /// Session declarations resolved after user setup, never a config to persist.
+    pub(crate) vision_config: cli_config::CliConfig,
+}
+
+impl ResolvedTurn {
+    pub(crate) fn new(
+        endpoint: &cli_config::ResolvedEndpoint,
+        harness_effort: Option<String>,
+        wire_effort: Option<String>,
+        design: DesignContext,
+    ) -> Self {
+        let routed = cli_config::route_endpoint_for_effort(endpoint, harness_effort.as_deref());
+        // Effort mappings may name models on another configured provider: credentials and URL
+        // must follow the chosen model, not remain those of the original session endpoint.
+        let endpoint = if routed.model != endpoint.model {
+            cli_config::endpoint_for_model(&routed.model, &routed)
+        } else {
+            routed
+        };
+        Self::from_frozen(
+            endpoint,
+            harness_effort,
+            wire_effort,
+            design,
+            cli_config::config_with_session_vision(cli_config::load()),
+        )
+    }
+
+    /// Seat an already resolved route and owned snapshot without loading saved config or credentials.
+    /// Replay and offline fixtures use this instead of the interactive routing constructor.
+    pub(crate) fn from_frozen(
+        endpoint: cli_config::ResolvedEndpoint,
+        harness_effort: Option<String>,
+        wire_effort: Option<String>,
+        design: DesignContext,
+        vision_config: cli_config::CliConfig,
+    ) -> Self {
+        Self {
+            endpoint,
+            harness_effort,
+            wire_effort,
+            design,
+            architect_plan: None,
+            references: None,
+            reference_markers: Vec::new(),
+            vision_config,
+        }
+    }
+
+    /// Freeze only after all capability/reference decisions and after any route change.
+    pub(crate) fn freeze_vision_config(&mut self) {
+        self.vision_config = cli_config::config_with_session_vision(cli_config::load());
+    }
+
+    pub(crate) fn execution_context(&self) -> crate::core::exec_ctx::ExecutionContext {
+        let state = self.design.snapshot();
+        let context = crate::core::exec_ctx::ExecutionContext::new(
+            crate::core::convo::ConversationId::new(state.owner_id),
+        )
+        .with_design(self.design.clone());
+        match &self.references {
+            Some(access) => context
+                .with_resource_scope(access.scope().task_scope.clone())
+                .with_references(access.clone()),
+            None => context,
+        }
+    }
+
+    /// Add identity sidecars to the newly seated canonical user occurrence, not another history
+    /// message with equal pixels. This does not transmit/grant or materialize another image URL.
+    pub(crate) fn seat_reference_markers(&self, history: &mut [Message]) {
+        if let Some(message) = history.last_mut().filter(|message| message.role == "user") {
+            message
+                .tool_images
+                .extend(self.reference_markers.iter().cloned());
+            if let Some(access) = &self.references {
+                let ids = access.ids().join(", ");
+                let note = format!("\n<selected_references>Current task reference IDs: {ids}. Inspect authorized originals with reference_read before constructing the implementation. Discover reference_read, reference_compare and reference_trace with tool_search when they are not advertised. Pass only selected reference_ids to same-route delegates. Exact fidelity requires current implementation capture and whole-frame comparison; preview/crop inspection is not original review.</selected_references>");
+                message
+                    .content
+                    .get_or_insert_with(String::new)
+                    .push_str(&note);
+            }
+        }
+    }
+
+    pub(crate) fn configure(&self, cfg: &mut AgentConfig, apply_budgets: bool) {
+        cfg.context_window = resolve_ctx_window(&self.endpoint.model).0;
+        cfg.nudge_role = agent::NudgeRole::for_base_url(&self.endpoint.base_url);
+        cfg.wire_reasoning_effort = Some(self.wire_effort.clone());
+        cfg.tool_image_destination = Some(crate::llm::media::effective_destination_key(
+            &self.endpoint.base_url,
+            &self.endpoint.model,
+        ));
+        cfg.image_config = Some(std::sync::Arc::new(self.vision_config.clone()));
+        cfg.tool_image_policy = crate::llm::media::vision_policy_in(
+            &self.vision_config,
+            &self.endpoint.base_url,
+            &self.endpoint.model,
+        );
+        let (destination_url, destination_model) = crate::llm::media::effective_image_destination(
+            &self.endpoint.base_url,
+            &self.endpoint.model,
+        );
+        let label_url = reqwest::Url::parse(&destination_url)
+            .ok()
+            .map(|mut url| {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                url.to_string()
+            })
+            .unwrap_or_else(|| "(invalid endpoint)".to_string());
+        let label_model: String = destination_model
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        cfg.tool_image_destination_label = Some(format!("{label_url} · {label_model}"));
+        cfg.exec_ctx = self.execution_context();
+        if apply_budgets {
+            if let Some(tier) = self.harness_effort.as_deref() {
+                cfg.apply_effort(tier);
+            }
+        }
+    }
+
+    pub(crate) fn refresh_prompt(&self, history: &mut Vec<Message>, effective_model: &mut String) {
+        let prompt_model_matches = history
+            .first()
+            .and_then(|m| m.content.as_deref())
+            .and_then(|prefix| prefix.split_once("<environment>"))
+            .and_then(|(_, environment)| environment.split_once("</environment>"))
+            .and_then(|(environment, _)| {
+                environment
+                    .lines()
+                    .find_map(|line| line.strip_prefix("model: "))
+            })
+            .is_some_and(|model| model == self.endpoint.model);
+        if *effective_model != self.endpoint.model || !prompt_model_matches {
+            refresh_prompt_lanes_in_place(history, &self.endpoint.model);
+            *effective_model = self.endpoint.model.clone();
+        }
+    }
+}
+
+/// Complete capability setup on the trusted top-level controller before dispatch. A capability
+/// declaration is not permission to disclose the attachments; media grants remain separate.
+/// The caller freezes request/config state only AFTER this returns, and repeats it on route change.
+pub(crate) async fn guided_vision_preflight(
+    turn: &ResolvedTurn,
+    has_attachments: bool,
+) -> Result<bool> {
+    if !has_attachments && !turn.design.snapshot().intent.is_visual() {
+        return Ok(true);
+    }
+    let base_url = turn.endpoint.base_url.clone();
+    let model = turn.endpoint.model.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::ui::config_ui::guided_vision_setup(&base_url, &model)
+    })
+    .await
+    .map_err(anyhow::Error::from)?
+}
+
+/// Register ONLY this submission's attachments, never grant references from restored history.
+/// Attachments become references for this task automatically — no prompt. The grant is still the
+/// narrow one (this task, this destination/account route, originals), and disclosure to the
+/// provider stays governed by the vision declaration, so nothing about sending became more
+/// permissive; the question was asked once per attachment and always answered the same way.
+pub(crate) fn prepare_current_references(turn: &mut ResolvedTurn, images: &[String]) -> Result<()> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let (registry, descriptors) = register_current_reference_images(turn, images)?;
+    validate_current_reference_selection(images, &descriptors)?;
+    seat_current_reference_grant(turn, registry, descriptors)
+}
+
+/// Explicit headless-controller reference-purpose opt-in. No dialog, saved config, history scan,
+/// provider request or disclosure approval: the caller invokes this only for its explicit CLI flag.
+pub(crate) fn seat_loaded_reference_images(
+    turn: &mut ResolvedTurn,
+    images: &[String],
+) -> Result<()> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let (registry, descriptors) = register_current_reference_images(turn, images)?;
+    validate_current_reference_selection(images, &descriptors)?;
+    seat_current_reference_grant(turn, registry, descriptors)
+}
+
+fn register_current_reference_images(
+    turn: &mut ResolvedTurn,
+    images: &[String],
+) -> Result<(
+    crate::core::reference_media::ReferenceRegistry,
+    Vec<crate::core::reference_media::ReferenceDescriptor>,
+)> {
+    let context = turn.execution_context();
+    let registry =
+        crate::core::reference_media::ReferenceRegistry::new(context.conversation().to_string());
+    let mut current = Message::user_with_images("", images.to_vec());
+    let descriptors = registry.register_loaded(std::slice::from_mut(&mut current))?;
+    turn.reference_markers = current.tool_images;
+    Ok((registry, descriptors))
+}
+
+fn validate_current_reference_selection(
+    images: &[String],
+    descriptors: &[crate::core::reference_media::ReferenceDescriptor],
+) -> Result<()> {
+    anyhow::ensure!(
+        images.len() <= crate::core::tool_media::MAX_REQUEST_IMAGES,
+        "Reference setup accepts at most four current attachments; attach fewer images and retry"
+    );
+    anyhow::ensure!(descriptors.len() == images.len(),
+        "Reference setup incomplete: one or more current attachments are unavailable or unsupported; no reference grant was issued");
+    Ok(())
+}
+
+/// Pure controller grant seating; no prompts, history lookup, persistence or provider request.
+fn seat_current_reference_grant(
+    turn: &mut ResolvedTurn,
+    registry: crate::core::reference_media::ReferenceRegistry,
+    descriptors: Vec<crate::core::reference_media::ReferenceDescriptor>,
+) -> Result<()> {
+    use crate::core::reference_media::{ReferenceDerivatives, ReferenceGrantScope};
+    let context = turn.execution_context();
+    let route = current_reference_route(&turn.endpoint)?;
+    let ids: Vec<String> = descriptors
+        .iter()
+        .map(|reference| reference.reference_id.clone())
+        .collect();
+    let access = registry.grant(&ids, ReferenceGrantScope {
+        owner: context.conversation().to_string(),
+        purpose: "Use explicitly selected current attachments as references for this task and same-route delegates".into(),
+        task_scope: context.resource_scope(),
+        route,
+    }, ReferenceDerivatives::ALL)?;
+    turn.design.activate_selected_references(
+        descriptors
+            .into_iter()
+            .map(|reference| (reference.reference_id, reference.original.sha256))
+            .collect(),
+        crate::agent::design::FidelityMode::Exact,
+    )?;
+    turn.references = Some(access);
+    Ok(())
+}
+
+fn current_reference_route(
+    endpoint: &cli_config::ResolvedEndpoint,
+) -> Result<crate::core::reference_media::ReferenceRoute> {
+    if crate::llm::oauth_codex::is_codex_base_url(&endpoint.base_url) {
+        let token = crate::llm::oauth_codex::load_token();
+        anyhow::ensure!(token.as_ref().is_some_and(|token| !token.access_token.is_empty()),
+            "Reference setup required: sign in to the selected Codex account before granting reference access");
+    }
+    Ok(crate::core::reference_media::ReferenceRoute {
+        destination: crate::llm::media::effective_destination_key(
+            &endpoint.base_url,
+            &endpoint.model,
+        ),
+        account: crate::llm::media::effective_image_route_key(
+            &endpoint.base_url,
+            &endpoint.model,
+            &endpoint.api_key,
+        ),
+    })
+}
+
+/// A planner-selected editor cannot inherit a reference grant for another destination/account.
+/// Returning to the controller is required; never silently drop references or reroute the image.
+pub(crate) fn validate_current_reference_route(turn: &ResolvedTurn) -> Result<()> {
+    if let Some(access) = &turn.references {
+        crate::llm::media::require_reference_vision(crate::llm::media::vision_policy_in(
+            &turn.vision_config,
+            &turn.endpoint.base_url,
+            &turn.endpoint.model,
+        ))?;
+        let context = turn.execution_context();
+        access.validate_scope(
+            &context.conversation().to_string(),
+            &context.resource_scope(),
+        )?;
+        anyhow::ensure!(access.scope().route == current_reference_route(&turn.endpoint)?,
+            "Reference setup required: the final editor destination/account differs from the approved reference route. Choose that route explicitly and retry for fresh consent");
+    }
+    Ok(())
+}
+
+/// Session-scoped handle: no design state is read from a process-global slot.
+pub(crate) fn new_session_design(owner: impl Into<String>) -> DesignContext {
+    DesignContext::new(owner, design_workspace(), DesignMode::Auto)
+}
+
+pub(crate) fn design_workspace() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+pub(crate) fn explicit_wire_effort(cfg: &AgentConfig) -> Option<String> {
+    cfg.wire_reasoning_effort
+        .clone()
+        .unwrap_or_else(|| cli_config::load().reasoning_effort)
+}
 
 /// Pull drag-dropped / pasted image paths out of a typed line, leaving the prose behind.
 ///
@@ -101,54 +423,90 @@ pub(crate) fn turn_agent_config(
     }
 }
 
-/// Architect mode for one turn (see `agent::architect`). When it applies — `max` effort, a
-/// multi-file request, the mode on — a `metis` child on the planner model writes the plan, and
-/// the turn continues on the editor model at low wire effort: the returned endpoint is the one
-/// to build the registry with, the plan is folded into the user message once it is seated
-/// (`architect::attach_plan`). `None` means the turn runs exactly as it would have.
+/// A multi-file turn may reuse one metis planner at max or when a planner model is configured.
+/// The final turn keeps visual/unknown endpoint and effort unless an explicit apply role overrides it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn architect_phase(
     http: &reqwest::Client,
-    ep: &cli_config::ResolvedEndpoint,
-    eff: Option<&str>,
+    turn: &mut ResolvedTurn,
     shape: crate::core::turn_shape::TurnShape,
     line: &str,
+    original_brief: &str,
     cancel: crate::core::cancel::TurnCancel,
-) -> Option<(cli_config::ResolvedEndpoint, String)> {
+    approval: crate::core::approval::ApprovalMode,
+) {
     use crate::agent::architect;
-    if !architect::applies(eff, shape, cli_config::architect_mode_enabled()) {
-        return None;
+    let cfg = cli_config::load();
+    if !architect::applies(
+        turn.harness_effort.as_deref(),
+        shape,
+        cli_config::architect_mode_enabled(),
+        &cfg,
+    ) {
+        return;
     }
-    let root = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let planner = architect::planner_model(&cli_config::load(), &ep.model);
+    let root = std::path::PathBuf::from(design_workspace());
+    let planner = architect::planner_model(&cfg, &turn.endpoint.model);
     tui::emit_line(&theme::faint(&format!("architect: metis planning on {planner}…")).to_string());
-    let plan = architect::plan(
+    let planner_context = turn.execution_context();
+    let Some(plan) = architect::plan(
         http,
-        ep,
-        approval_mode(),
+        &turn.endpoint,
+        approval,
         &root,
         line,
+        original_brief,
         cancel,
-        resolve_ctx_window(&ep.model).0,
+        resolve_ctx_window(&turn.endpoint.model).0,
+        &planner_context,
     )
-    .await?;
-    let editor = architect::editor_model(&cli_config::load(), &ep.model);
+    .await
+    else {
+        return;
+    };
+    // Prepare only: the editor saves through ordinary file tools, never a privileged write here.
+    let mut plan = plan;
+    architect::prepare_document(
+        original_brief,
+        &mut plan,
+        &planner,
+        turn.harness_effort.as_deref(),
+    );
+    if turn.references.is_none() {
+        turn.design.set_intent(plan.design_intent);
+    }
+    // A selected reference contract is already active before planning. A planner's Nonvisual or
+    // Unknown label cannot downgrade that trusted contract or select a cheap nonvisual editor.
+    let explicit_apply = cli_config::role_configured("apply").then(|| {
+        (
+            cli_config::resolve_role("apply", &turn.endpoint),
+            cli_config::role_reasoning_effort("apply", turn.wire_effort.clone()),
+        )
+    });
+    let (editor, wire_effort) = architect::select_editor(
+        &cfg,
+        &turn.endpoint,
+        turn.wire_effort.clone(),
+        turn.design.snapshot().intent,
+        explicit_apply,
+    );
+    turn.endpoint = if editor.model != turn.endpoint.model && !cli_config::role_configured("apply")
+    {
+        cli_config::endpoint_for_model(&editor.model, &editor)
+    } else {
+        editor
+    };
+    turn.wire_effort = wire_effort;
     tui::emit_line(
         &theme::faint(&architect::status_line(
             &planner,
-            &editor,
-            plan.chars().count(),
+            &turn.endpoint.model,
+            plan.text.chars().count(),
+            turn.wire_effort.as_deref(),
         ))
         .to_string(),
     );
-    let mut out = ep.clone();
-    out.model = editor;
-    // The editor types at low wire effort; the harness budgets the `max` tier already applied
-    // to `AgentConfig` stay — a multi-file change on `low`'s twelve steps would be cut off.
-    cli_config::set_effort_override(Some("low".to_string()));
-    Some((out, plan))
+    turn.architect_plan = Some(plan);
 }
 
 /// The nudge role for the endpoint this REPL talks to (saved config or the `AIZEN_BASE_URL`
@@ -172,6 +530,7 @@ pub(crate) fn seat_user_message(
     images: Vec<String>,
     history: &mut Vec<Message>,
     model: &str,
+    design: &DesignContext,
 ) {
     // Every model call from here until the next seated user message — the loop, its sub-agents,
     // the post-turn chores — is billed to this turn in the usage ledger.
@@ -195,7 +554,7 @@ pub(crate) fn seat_user_message(
     }
     // Refresh the exit-flush snapshot the moment the user turn lands, so an abrupt window close
     // mid-turn still persists the question (the per-turn autosave only runs on success).
-    update_live_history(history);
+    crate::core::session_store::update_live_history_with_design(history, Some(&design.snapshot()));
 }
 
 // ── the shared turn: everything both REPL surfaces do identically ─────────────────────────────
@@ -223,63 +582,104 @@ pub(crate) async fn run_agent_turn(
     registry: &agent::tools::ToolRegistry,
     history: &mut Vec<Message>,
 ) -> Result<AgentOutcome> {
+    let mut recovery_boundary = crate::core::recovery::TurnBoundary::new();
     let base = ep.base_url.as_str();
     let key = ep.api_key.as_str();
     let model = ep.model.as_str();
     let eager_on = eager_enabled();
     let window = resolve_ctx_window(model).0;
-    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        // LIVE context meter + `↑N tok` chip, fed per send: `msgs`+`defs` are exactly the request
-        // going out, so the gauge tracks tool results growing the context MID-turn (the idle
-        // status refresh never sees that). The chars/4 estimate moves both the moment the request
-        // leaves; the provider's real usage on the reply corrects them — and the context size is
-        // remembered so the idle refresh keeps the real number instead of stomping it (see
-        // `status_text`). This closure is the ONLY writer of either: sub-agent and chore calls
-        // answer for other contexts and must not steer the main meter.
-        let est = msgs
-            .iter()
-            .map(agent::estimate_message_tokens)
-            .sum::<usize>()
-            + agent::estimate_defs_tokens(&defs);
-        tui::set_ctx_permille(ctx_permille(est, window));
-        tui::set_sent_tokens(est as u64);
-        let turn = if eager_on {
-            // Read-only calls start the moment their streamed args complete.
-            let starter = agent::eager_starter(registry, cfg);
-            client::stream_chat_with_tools_eager(
-                http,
-                base,
-                key,
-                model,
-                &msgs,
-                &defs,
-                Some(&starter),
-            )
-            .await
-        } else {
-            client::stream_chat_with_tools(http, base, key, model, &msgs, &defs).await
-        }?;
-        if let Some(u) = &turn.usage {
-            let real = usage_ctx_tokens(u);
-            if real > 0 {
-                tui::set_ctx_real_tokens(real as u64);
-                tui::set_ctx_permille(ctx_permille(real, window));
-            }
-            let sent = usage_input_tokens(u);
-            if sent > 0 {
-                tui::set_sent_tokens(sent as u64);
-            }
+    let wire_effort = explicit_wire_effort(cfg);
+    let image_config = cfg.image_config.clone().unwrap_or_else(|| {
+        std::sync::Arc::new(cli_config::config_with_session_vision(cli_config::load()))
+    });
+    let streamed_text = std::sync::Mutex::new(None::<String>);
+    let streamed_text_ref = &streamed_text;
+    let chat = move |mut msgs: Vec<Message>, defs: Vec<ToolDef>| {
+        if let Some(design) = cfg.exec_ctx.design() {
+            crate::agent::design::prompt::seat_prompt(&mut msgs, &design);
         }
-        Ok(turn)
+        let image_config = image_config.clone();
+        let wire_effort = wire_effort.clone();
+        async move {
+            // LIVE context meter + `↑N tok` chip, fed per send: `msgs`+`defs` are exactly the request
+            // going out, so the gauge tracks tool results growing the context MID-turn (the idle
+            // status refresh never sees that). The chars/4 estimate moves both the moment the request
+            // leaves; the provider's real usage on the reply corrects them — and the context size is
+            // remembered so the idle refresh keeps the real number instead of stomping it (see
+            // `status_text`). This closure is the ONLY writer of either: sub-agent and chore calls
+            // answer for other contexts and must not steer the main meter.
+            let est = msgs
+                .iter()
+                .map(agent::estimate_message_tokens)
+                .sum::<usize>()
+                + agent::estimate_defs_tokens(&defs);
+            tui::set_ctx_permille(ctx_permille(est, window));
+            tui::set_sent_tokens(est as u64);
+            let (turn, receipt) =
+                crate::llm::media::with_image_delivery(&cfg.exec_ctx, base, key, model, async {
+                    let starter = eager_on.then(|| agent::eager_starter(registry, cfg));
+                    client::stream_chat_with_tools_sink_frozen(
+                        http,
+                        base,
+                        key,
+                        model,
+                        &msgs,
+                        &defs,
+                        client::StreamSink {
+                            render: true,
+                            eager: starter
+                                .as_ref()
+                                .map(|hook| hook as client::EagerStartFn<'_>),
+                            ..Default::default()
+                        },
+                        wire_effort,
+                        &image_config,
+                    )
+                    .await
+                })
+                .await?;
+            if let Some(design) = cfg.exec_ctx.design() {
+                agent::mark_image_delivery(&msgs, &receipt, &design);
+            }
+            *streamed_text_ref.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(turn.content.clone().unwrap_or_default());
+            if let Some(u) = &turn.usage {
+                let real = usage_ctx_tokens(u);
+                if real > 0 {
+                    tui::set_ctx_real_tokens(real as u64);
+                    tui::set_ctx_permille(ctx_permille(real, window));
+                }
+                let sent = usage_input_tokens(u);
+                if sent > 0 {
+                    tui::set_sent_tokens(sent as u64);
+                }
+            }
+            Ok(turn)
+        }
     };
     // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
     let sum_ep = summarizer_endpoint(base, key, model);
+    let sum_effort =
+        cli_config::role_reasoning_effort("summarizer", cli_config::load().reasoning_effort);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
+        let effort = sum_effort.clone();
         async move {
-            chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
+            tokio::time::timeout(
+                crate::repl::postturn::chore_call_timeout(),
+                client::chat_with_tools_effort(
+                    http,
+                    &ep.base_url,
+                    &ep.api_key,
+                    &ep.model,
+                    &msgs,
+                    &[],
+                    effort,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("summarizer model call timed out"))?
+            .map(|t| t.content.unwrap_or_default())
         }
     };
     // Optional oracle for self-review: only when `roles.oracle` names a stronger reviewer model;
@@ -287,16 +687,61 @@ pub(crate) async fn run_agent_turn(
     let oracle = cli_config::role_configured("oracle")
         .then(|| cli_config::resolve_role("oracle", ep))
         .map(|role| {
+            let effort =
+                cli_config::role_reasoning_effort("oracle", cli_config::load().reasoning_effort);
             move |msgs: Vec<Message>| {
                 let role = role.clone();
+                let effort = effort.clone();
                 async move {
-                    chore_chat(http, &role.base_url, &role.api_key, &role.model, &msgs, &[])
-                        .await
-                        .map(|t| t.content.unwrap_or_default())
+                    tokio::time::timeout(
+                        crate::repl::postturn::chore_call_timeout(),
+                        client::chat_with_tools_effort(
+                            http,
+                            &role.base_url,
+                            &role.api_key,
+                            &role.model,
+                            &msgs,
+                            &[],
+                            effort,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("oracle model call timed out"))?
+                    .map(|t| t.content.unwrap_or_default())
                 }
             }
         });
-    agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await
+    let result = agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await;
+    if result.as_ref().err().is_some_and(|error| {
+        agent::tool_error_effect_state(error) != agent::tools::ToolEffectState::Settled
+    }) {
+        crate::core::recovery::mark_effects_unsettled();
+    }
+    recovery_boundary.complete(result.is_ok());
+    if let Ok(outcome) = &result {
+        let streamed = streamed_text.lock().unwrap_or_else(|e| e.into_inner());
+        surface_appended_final_text(outcome.final_text.as_deref(), streamed.as_deref());
+    }
+    result
+}
+
+/// The loop may append an honest evidence verdict AFTER the model stream finished. Emit just that
+/// tail when the captured response matches; missing/mismatched captures must not hide a final answer.
+pub(crate) fn appended_final_text<'a>(
+    final_text: Option<&'a str>,
+    streamed_text: Option<&str>,
+) -> Option<&'a str> {
+    let final_text = final_text?;
+    let tail = streamed_text
+        .and_then(|streamed| final_text.strip_prefix(streamed))
+        .unwrap_or(final_text);
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
+pub(crate) fn surface_appended_final_text(final_text: Option<&str>, streamed_text: Option<&str>) {
+    if let Some(tail) = appended_final_text(final_text, streamed_text) {
+        tui::emit_line(tail.trim_start_matches('\n'));
+    }
 }
 
 /// Everything a turn that reached the model must do afterwards, on either surface.
@@ -311,7 +756,10 @@ pub(crate) async fn finish_turn(
     history: &mut Vec<Message>,
     http: &reqwest::Client,
     ep: &cli_config::ResolvedEndpoint,
+    design: &DesignContext,
 ) {
+    design.finalize();
+    crate::core::session_store::update_live_history_with_design(history, Some(&design.snapshot()));
     // ABNORMAL STOP, SAID OUT LOUD. The loop can end for reasons that are NOT success — the repair
     // budget ran out with the tree still broken, the step cap was hit mid-task, the model started
     // repeating itself — and in each case it has usually already streamed a confident closing
@@ -392,17 +840,22 @@ pub(crate) async fn finish_turn(
     // Persistence is NOT optional: a cancelled learning pass must still leave the conversation on
     // disk. `autosave_session` names the session with a model call,
     // so it is cancellable too — the local-only writer keeps the transcript either way.
-    if cancellable_slash(autosave_session(
+    if cancellable_slash(crate::core::session_store::autosave_session_with_design(
         history,
         http,
         &ep.base_url,
         &ep.api_key,
         &ep.model,
+        Some(&design.snapshot()),
     ))
     .await
     .is_none()
     {
-        autosave_last(history, Some(&ep.model));
+        crate::core::session_store::autosave_last_with_design(
+            history,
+            Some(&ep.model),
+            Some(&design.snapshot()),
+        );
     }
 }
 
@@ -472,9 +925,11 @@ fn surface_abnormal_stop(outcome: &AgentOutcome) {
 
 /// Render a `clarify` ask prominently and yield to the input box. Under the retained UI the whole
 /// structured ask is handed to the answer PANEL (`tui::ask_panel_open`) — a Claude-Code-style picker
-/// with a tab per question, checkboxes for multi-select questions, and a free-text row — and the
-/// rendered text of every question and option is ALSO emitted to the transcript, so dismissing the
-/// panel (Esc / typing) still leaves the free-text path completely usable. Every other surface (plain
+/// with a tab per question, checkboxes for multi-select questions, and a free-text row. Use ↑/↓ to
+/// choose, Space to toggle multi-select options, Tab to switch questions, and Enter to submit all;
+/// unanswered questions keep the panel open. The rendered text of every question and option is ALSO
+/// emitted to the transcript, so dismissing the panel (Esc / typing) still leaves the free-text path
+/// completely usable. Every other surface (plain
 /// REPL, `aizen agent`, Telegram) prints the same rendered text and the user types the answer.
 pub(crate) fn show_clarify(ask: &crate::agent::clarify::Ask) {
     let display = ask.display();
@@ -493,11 +948,21 @@ pub(crate) fn show_clarify(ask: &crate::agent::clarify::Ask) {
         for o in &rest {
             tui::emit_line(o);
         }
-        tui::emit_line(&hint);
         // Raise the answer panel. The numbered list above STAYS in the transcript: the panel is
         // dismissible (Esc / just start typing), and the options must survive its dismissal for the
         // free-text path. No-ops when there is nothing to pick (a bare question) — the box is enough.
         tui::ask_panel_open(ask);
+        if tui::ask_panel_active() {
+            tui::emit_line(
+                &style(
+                    "↳ ↑/↓ choose · Space toggle multi · Tab question · Enter submit all; unanswered stays open",
+                )
+                .dim()
+                .to_string(),
+            );
+        } else {
+            tui::emit_line(&hint);
+        }
     } else {
         println!("{head}");
         for o in &rest {
@@ -510,6 +975,256 @@ pub(crate) fn show_clarify(ask: &crate::agent::clarify::Ask) {
 #[cfg(test)]
 mod smoke_tests {
     use super::*;
+
+    #[test]
+    fn appended_evidence_surfaces_only_the_unstreamed_suffix() {
+        let answer = "The requested change is complete.";
+        let evidence =
+            "Verification: build/test passed; visual Verified.\nEvidence: synthetic test only";
+        let final_text = format!("{answer}\n\n{evidence}");
+        assert_eq!(
+            appended_final_text(Some(&final_text), Some(answer)),
+            Some(format!("\n\n{evidence}").as_str())
+        );
+        assert_eq!(appended_final_text(Some(answer), Some(answer)), None);
+        assert_eq!(
+            appended_final_text(Some(evidence), Some("")),
+            Some(evidence)
+        );
+        assert_eq!(appended_final_text(Some(answer), None), Some(answer));
+        assert_eq!(appended_final_text(None, Some(answer)), None);
+        assert_eq!(
+            appended_final_text(Some("different answer"), Some(answer)),
+            Some("different answer")
+        );
+        assert_eq!(
+            appended_final_text(Some("answer\n\n"), Some("answer")),
+            None
+        );
+        let incomplete =
+            format!("{answer}\n\nVisual verification incomplete: no pixels\n{evidence}");
+        let tail = appended_final_text(Some(&incomplete), Some(answer)).unwrap();
+        assert!(tail.contains("Visual verification incomplete"));
+        assert!(!tail.contains(answer));
+        assert_eq!(tail.matches("Verification: build/test").count(), 1);
+    }
+
+    #[test]
+    fn resolved_model_drives_prompt_context_and_harness_without_erasing_history() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("aizen-resolved-turn-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prior_home = std::env::var_os("AIZEN_HOME");
+        std::env::set_var("AIZEN_HOME", &home);
+        let design = DesignContext::new("test-owner", ".", DesignMode::Off);
+        let resolved = ResolvedTurn {
+            endpoint: cli_config::ResolvedEndpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                api_key: "unused".into(),
+                model: "resolved-model".into(),
+            },
+            harness_effort: Some("max".into()),
+            wire_effort: Some("low".into()),
+            design: design.clone(),
+            architect_plan: None,
+            references: None,
+            reference_markers: Vec::new(),
+            vision_config: cli_config::CliConfig::default(),
+        };
+        let mut cfg = AgentConfig::default();
+        resolved.configure(&mut cfg, true);
+        let mut expected = AgentConfig::default();
+        expected.apply_effort("max");
+        assert_eq!(cfg.max_iters, expected.max_iters);
+        assert_eq!(cfg.context_window, resolve_ctx_window("resolved-model").0);
+        assert_eq!(cfg.wire_reasoning_effort, Some(Some("low".into())));
+        assert_eq!(
+            cfg.exec_ctx.design().unwrap().snapshot().owner_id,
+            "test-owner"
+        );
+        let mut history = vec![
+            Message::system("old-model-prefix"),
+            Message::user("keep this"),
+            Message::assistant("and this"),
+        ];
+        let mut effective_model = "old-model".into();
+        resolved.refresh_prompt(&mut history, &mut effective_model);
+        assert_eq!(effective_model, "resolved-model");
+        assert!(history[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("model: resolved-model\n"));
+        assert!(history
+            .iter()
+            .any(|m| m.content.as_deref() == Some("keep this")));
+        assert!(history
+            .iter()
+            .any(|m| m.content.as_deref() == Some("and this")));
+        let before = serde_json::to_string(&history).unwrap();
+        resolved.refresh_prompt(&mut history, &mut effective_model);
+        assert_eq!(
+            serde_json::to_string(&history).unwrap(),
+            before,
+            "unchanged effective model preserves cached lanes"
+        );
+        match prior_home {
+            Some(value) => std::env::set_var("AIZEN_HOME", value),
+            None => std::env::remove_var("AIZEN_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn current_reference_fixture() -> (ResolvedTurn, Message) {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let image = ToolImage::from_bytes(
+            &encode_rgba_png(&[9, 8, 7, 255], 1, 1).unwrap(),
+            "image/png",
+            ImageProvenance::new("fixture", None),
+        )
+        .unwrap();
+        let mut vision_config = cli_config::CliConfig::default();
+        cli_config::set_vision_support_in(
+            &mut vision_config,
+            "https://fixture.invalid/v1",
+            "fixture-model",
+            Some(true),
+        )
+        .unwrap();
+        let turn = ResolvedTurn::from_frozen(
+            cli_config::ResolvedEndpoint {
+                base_url: "https://fixture.invalid/v1".into(),
+                api_key: "fixture-account-a".into(),
+                model: "fixture-model".into(),
+            },
+            None,
+            None,
+            DesignContext::new("fixture-owner", ".", DesignMode::Off),
+            vision_config,
+        );
+        (
+            turn,
+            Message::user_with_images("fixture", vec![image.data_url()]),
+        )
+    }
+
+    #[test]
+    fn current_reference_grant_is_available_before_planning_and_does_not_grant_history() {
+        let (mut turn, current) = current_reference_fixture();
+        let (_, historical) = current_reference_fixture();
+        seat_loaded_reference_images(&mut turn, &current.images).unwrap();
+        let ids = turn.references.as_ref().unwrap().ids().to_vec();
+        let context = turn.execution_context();
+        assert_eq!(context.references_checked().unwrap().unwrap().ids(), ids);
+        let state = turn.design.snapshot();
+        assert!(state.active && state.intent.is_visual());
+        assert_eq!(
+            state.comparison_request.unwrap().mode,
+            crate::agent::design::FidelityMode::Exact
+        );
+        let mut history = vec![
+            historical,
+            Message::user_with_images("new task", current.images.clone()),
+        ];
+        let original_images = history[1].images.clone();
+        turn.seat_reference_markers(&mut history);
+        assert!(
+            history[0].tool_images.is_empty(),
+            "same historical pixels do not acquire a grant"
+        );
+        assert_eq!(
+            history[1].images, original_images,
+            "canonical originals are not rewritten"
+        );
+        assert!(history[1]
+            .tool_images
+            .iter()
+            .all(|image| !image.is_available()));
+        let content = history[1].content.as_deref().unwrap();
+        assert!(content.contains(&ids[0]));
+        assert!(!content.contains("data:image/") && !content.contains("fixture-account"));
+        let json = serde_json::to_string(&history).unwrap();
+        assert!(!json.contains("fixture-account-a"));
+        validate_current_reference_route(&turn).unwrap();
+        turn.endpoint.api_key = "fixture-account-b".into();
+        assert!(validate_current_reference_route(&turn).is_err());
+    }
+
+    #[test]
+    fn current_reference_grant_does_not_imply_vision_capability() {
+        let (mut turn, current) = current_reference_fixture();
+        seat_loaded_reference_images(&mut turn, &current.images).unwrap();
+        turn.vision_config = cli_config::CliConfig::default();
+        let error = validate_current_reference_route(&turn)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vision support is unknown"));
+        cli_config::set_vision_support_in(
+            &mut turn.vision_config,
+            &turn.endpoint.base_url,
+            &turn.endpoint.model,
+            Some(false),
+        )
+        .unwrap();
+        assert!(validate_current_reference_route(&turn)
+            .unwrap_err()
+            .to_string()
+            .contains("configured without vision"));
+        turn.references = None;
+        assert!(
+            validate_current_reference_route(&turn).is_ok(),
+            "ordinary attach-only requests preserve their legacy policy"
+        );
+    }
+
+    #[test]
+    fn explicit_headless_reference_selection_rejects_excess_without_granting() {
+        let (mut turn, current) = current_reference_fixture();
+        let images =
+            vec![current.images[0].clone(); crate::core::tool_media::MAX_REQUEST_IMAGES + 1];
+        assert!(seat_loaded_reference_images(&mut turn, &images).is_err());
+        assert!(turn
+            .execution_context()
+            .references_checked()
+            .unwrap()
+            .is_none());
+        assert!(turn.design.snapshot().references.is_empty());
+    }
+
+    #[test]
+    fn attach_only_markers_are_identity_not_live_reference_authority() {
+        let (mut turn, mut current) = current_reference_fixture();
+        let registry = crate::core::reference_media::ReferenceRegistry::new("fixture-owner");
+        registry
+            .register_loaded(std::slice::from_mut(&mut current))
+            .unwrap();
+        turn.reference_markers = current.tool_images.clone();
+        let mut history = vec![Message::user_with_images("attached only", current.images)];
+        turn.seat_reference_markers(&mut history);
+        assert!(turn
+            .execution_context()
+            .references_checked()
+            .unwrap()
+            .is_none());
+        assert!(!history[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("selected_references"));
+        assert!(!history[0].tool_images.is_empty());
+        assert!(turn.design.snapshot().references.is_empty());
+    }
+
+    #[test]
+    fn explicit_omission_does_not_inherit_a_global_parent_override() {
+        let cfg = AgentConfig {
+            wire_reasoning_effort: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(explicit_wire_effort(&cfg), None);
+    }
 
     /// E6.2 (quality plan Q4): `src/repl/` had no tests at all. One user turn goes through the same
     /// `run_agent_turn` both REPL surfaces call, with the model's answer replayed from a tape, the

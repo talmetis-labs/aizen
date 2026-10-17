@@ -143,7 +143,7 @@ pub fn list() -> Vec<Persona> {
         by_name.insert(sanitize_name(&p.name), p); // HOME wins on a name collision
     }
     let mut out: Vec<Persona> = by_name.into_values().collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -449,7 +449,8 @@ pub fn self_block() -> Option<String> {
 /// system lane ahead of the whole transcript — so re-reading it every turn would bust the prefix
 /// cache each time the character learned something. Like the frozen core, it is adopted at a
 /// conversation boundary and reused byte-for-byte until the next one.
-static ADOPTED_SELF: Mutex<Option<((PathBuf, String), Option<String>)>> = Mutex::new(None);
+type AdoptedSelfBlock = ((PathBuf, String), Option<String>);
+static ADOPTED_SELF: Mutex<Option<AdoptedSelfBlock>> = Mutex::new(None);
 
 /// Drop the adopted `<self>` block so the next build re-reads the store. Called at conversation
 /// boundaries by `refreshed_system_prompt_bundle`.
@@ -463,19 +464,65 @@ pub fn forget_adopted_self() {
 mod tests {
     use super::*;
 
+    struct TestHome {
+        dir: std::path::PathBuf,
+        env: Option<crate::core::config::EnvGuard>,
+    }
+
+    impl TestHome {
+        // Caller holds TEST_HOME_LOCK until this fixture has restored the environment.
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "aizen-persona-{tag}-{}-{}",
+                std::process::id(),
+                crate::core::persist::unique_sequence(),
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let env = crate::core::config::EnvGuard::set([
+                ("AIZEN_HOME", &dir),
+                ("AIZEN_PROJECT_ROOT", &dir),
+            ]);
+            Self {
+                dir,
+                env: Some(env),
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            // Restore prior values, including on panic, before removing the isolated fixture.
+            drop(self.env.take());
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     fn with_home<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("aizen-persona-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("AIZEN_HOME", &dir);
-        std::env::set_var("AIZEN_PROJECT_ROOT", &dir); // isolate project-local discovery from the real repo
-        let out = f();
-        std::env::remove_var("AIZEN_HOME");
-        std::env::remove_var("AIZEN_PROJECT_ROOT");
-        let _ = std::fs::remove_dir_all(&dir);
-        out
+        let _home = TestHome::new(tag);
+        f()
+    }
+
+    #[test]
+    fn test_home_restores_environment_and_cleans_up_even_on_panic() {
+        let _g = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior_home = std::env::var_os("AIZEN_HOME");
+        let prior_project = std::env::var_os("AIZEN_PROJECT_ROOT");
+        let mut fixture_dir = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let home = TestHome::new("panic-fixture");
+            fixture_dir = Some(home.dir.clone());
+            assert!(home.dir.is_dir());
+            panic!("exercise fixture teardown");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(std::env::var_os("AIZEN_HOME"), prior_home);
+        assert_eq!(std::env::var_os("AIZEN_PROJECT_ROOT"), prior_project);
+        assert!(!fixture_dir.unwrap().exists());
     }
 
     #[test]
@@ -753,6 +800,10 @@ mod tests {
                 prompt_block().is_none(),
                 "an injection line drops the whole card"
             );
+        });
+        // These are independent prompt-validation cases, not a persistence replacement test.
+        // Keep config activation covered, with a fresh home for each card on Windows.
+        with_home("failclosed-secret", || {
             save("Leaky", "", "", "my key is sk-abcdefghijklmnopqrstuvwx").unwrap();
             set_active_raw("Leaky");
             assert!(

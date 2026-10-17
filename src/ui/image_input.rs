@@ -25,26 +25,7 @@ const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
 /// Base64-encode (standard alphabet, padded). Hand-rolled (encode-only) to avoid a dependency.
 pub fn base64_encode(input: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-        out.push(T[b0 >> 2] as char);
-        out.push(T[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 {
-            T[((b1 & 0x0f) << 2) | (b2 >> 6)] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[b2 & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
+    crate::core::tool_media::base64_encode(input)
 }
 
 /// Build a `data:<mime>;base64,<…>` URL.
@@ -53,33 +34,19 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
 }
 
 /// Detect an image mime from leading magic bytes. `None` if not a recognized image.
+#[cfg(test)]
 fn sniff_mime(b: &[u8]) -> Option<&'static str> {
-    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
-        Some("image/png")
-    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
+    crate::core::tool_media::sniff_mime(b)
 }
 
 /// Read an image FILE → a data URL (cross-platform). Mime sniffed from magic bytes; non-image or
 /// oversize files are rejected.
 pub fn image_file_to_data_url(path: &str) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading image {path}"))?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_BYTES,
-        "{path} is too large ({} MB; max {} MB)",
-        bytes.len() / 1_048_576,
-        MAX_BYTES / 1_048_576
-    );
-    let mime =
-        sniff_mime(&bytes).with_context(|| format!("{path} is not a PNG/JPEG/GIF/WebP image"))?;
-    Ok(data_url(mime, &bytes))
+    crate::core::tool_media::ToolImage::from_file(
+        std::path::Path::new(path),
+        crate::core::tool_media::ImageProvenance::new("user_file", Some(path.to_owned())),
+    )
+    .map(|image| image.data_url())
 }
 
 /// Pull image-file attachments off an input line (drag a file onto the terminal → it pastes the
@@ -90,11 +57,26 @@ pub fn image_file_to_data_url(path: &str) -> Result<String> {
 pub fn extract_image_attachments(line: &str) -> (String, Vec<String>) {
     let mut text: Vec<String> = Vec::new();
     let mut images: Vec<String> = Vec::new();
+    let mut image_bytes = 0usize;
     for tok in tokenize_quoted(line) {
         if has_image_ext(&tok) {
             if let Ok(url) = image_file_to_data_url(&tok) {
-                images.push(url);
-                continue; // consumed as an attachment → drop from the text
+                let size =
+                    crate::core::tool_media::split_data_url(&url)
+                        .ok()
+                        .and_then(|(_, data)| {
+                            crate::core::tool_media::base64_decoded_len(data, MAX_BYTES).ok()
+                        });
+                if let Some(size) = size {
+                    if images.len() < crate::core::tool_media::MAX_REQUEST_IMAGES
+                        && image_bytes.saturating_add(size)
+                            <= crate::core::tool_media::MAX_REQUEST_IMAGE_BYTES
+                    {
+                        image_bytes += size;
+                        images.push(url);
+                        continue; // consumed as an attachment → drop from the text
+                    }
+                }
             }
         }
         text.push(tok);
@@ -145,8 +127,10 @@ pub fn clipboard_image_data_url() -> Result<Option<String>> {
         Ok(i) => i,
         Err(_) => return Ok(None), // no image on the clipboard
     };
-    let (w, h) = (img.width as u32, img.height as u32);
-    if w == 0 || h == 0 || img.bytes.len() < (w * h * 4) as usize {
+    let w = u32::try_from(img.width).context("clipboard image width overflow")?;
+    let h = u32::try_from(img.height).context("clipboard image height overflow")?;
+    let size = crate::core::tool_media::rgba_size(w, h)?;
+    if img.bytes.len() < size {
         return Ok(None);
     }
     let (rgba, w, h) = downscale_rgba(&img.bytes, w, h, MAX_DIM);
@@ -177,9 +161,9 @@ fn downscale_rgba(src: &[u8], w: u32, h: u32, max_dim: u32) -> (Vec<u8>, u32, u3
     let nh = ((h as f64 * scale).round() as u32).max(1);
     let mut out = vec![0u8; (nw * nh * 4) as usize];
     for y in 0..nh {
-        let sy = (y * h / nh).min(h - 1);
+        let sy = ((u64::from(y) * u64::from(h) / u64::from(nh)) as u32).min(h - 1);
         for x in 0..nw {
-            let sx = (x * w / nw).min(w - 1);
+            let sx = ((u64::from(x) * u64::from(w) / u64::from(nw)) as u32).min(w - 1);
             let si = ((sy * w + sx) * 4) as usize;
             let di = ((y * nw + x) * 4) as usize;
             out[di..di + 4].copy_from_slice(&src[si..si + 4]);
@@ -191,15 +175,7 @@ fn downscale_rgba(src: &[u8], w: u32, h: u32, max_dim: u32) -> (Vec<u8>, u32, u3
 /// Encode an RGBA8 buffer to PNG bytes (pure-Rust `png` crate).
 #[cfg(any(windows, target_os = "macos"))]
 fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut buf, w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().context("png header")?;
-        writer.write_image_data(rgba).context("png data")?;
-    }
-    Ok(buf)
+    crate::core::tool_media::encode_rgba_png(rgba, w, h)
 }
 
 #[cfg(test)]
@@ -231,10 +207,7 @@ mod tests {
 
     #[test]
     fn sniff_mime_detects_formats() {
-        assert_eq!(
-            sniff_mime(&[0x89, b'P', b'N', b'G', 0, 0]),
-            Some("image/png")
-        );
+        assert_eq!(sniff_mime(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
         assert_eq!(sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(sniff_mime(b"GIF89a...."), Some("image/gif"));
         assert_eq!(sniff_mime(b"hello not an image"), None);
@@ -249,8 +222,7 @@ mod tests {
     fn temp_png(tag: &str) -> std::path::PathBuf {
         // A minimal valid PNG (header + bytes good enough for the magic-byte sniff).
         let p = std::env::temp_dir().join(format!("aizen-img-{tag}-{}.png", std::process::id()));
-        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        bytes.extend_from_slice(b"rest-of-a-tiny-png");
+        let bytes = crate::core::tool_media::encode_rgba_png(&[255, 0, 0, 255], 1, 1).unwrap();
         std::fs::write(&p, bytes).unwrap();
         p
     }

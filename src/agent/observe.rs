@@ -21,7 +21,51 @@
 //! reads the part it needs with `file_read` instead of re-running the command. Skipped for
 //! `file_read` itself — that file is already on disk.
 
+use crate::core::tool_media::ImageUnavailable;
 use crate::core::types::Message;
+
+pub const MAX_TOOL_IMAGES: usize = 32;
+pub const MAX_TOOL_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Evict payload only: hashes, dimensions, provenance and unavailable reason remain inspectable.
+pub fn evict_tool_images(message: &mut Message, reason: ImageUnavailable) -> usize {
+    let mut removed = 0;
+    for image in &mut message.tool_images {
+        if image.is_available() {
+            *image = image.without_payload(reason);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Bounded across the canonical conversation, newest payloads first. No request-only synthetic
+/// messages are involved. Unavailable metadata does not consume the decoded-byte/count budget.
+pub fn retain_tool_images(messages: &mut [Message]) -> usize {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    let mut removed = 0usize;
+    for message in messages.iter_mut().rev() {
+        for image in message.tool_images.iter_mut().rev() {
+            if !image.is_available() {
+                continue;
+            }
+            let size = image.metadata().byte_len;
+            if count >= MAX_TOOL_IMAGES
+                || bytes
+                    .checked_add(size)
+                    .is_none_or(|n| n > MAX_TOOL_IMAGE_BYTES)
+            {
+                *image = image.without_payload(ImageUnavailable::Retention);
+                removed += 1;
+            } else {
+                count += 1;
+                bytes += size;
+            }
+        }
+    }
+    removed
+}
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +101,7 @@ pub fn collapse_aged(
     spill: &mut dyn FnMut(&str, &str) -> Option<PathBuf>,
 ) -> CollapseStats {
     let mut stats = CollapseStats::default();
+    retain_tool_images(messages);
     if policy.keep_recent == 0 {
         return stats;
     }
@@ -101,7 +146,13 @@ pub fn collapse_aged(
             Some(p) => Some(PathBuf::from(p)),
             None => spill(tool, &body),
         };
-        let line = digest(tool, args, &body, path.as_deref());
+        let mut line = digest(tool, args, &body, path.as_deref());
+        let images = evict_tool_images(&mut messages[i], ImageUnavailable::Retention);
+        if images > 0 {
+            line.push_str(&format!(
+                " · {images} image payload(s) evicted; typed metadata retained"
+            ));
+        }
         stats.chars_reclaimed += body.chars().count().saturating_sub(line.chars().count());
         stats.collapsed += 1;
         messages[i].content = Some(line);
@@ -110,6 +161,9 @@ pub fn collapse_aged(
 }
 
 fn is_candidate(m: &Message, min_chars: usize) -> bool {
+    if m.tool_images.iter().any(|image| image.is_available()) {
+        return true;
+    }
     match m.content.as_deref() {
         Some(b) => !b.starts_with(COLLAPSED_PREFIX) && b.chars().count() > min_chars,
         None => false,
@@ -297,6 +351,38 @@ mod tests {
             .filter(|m| m.role == "tool")
             .map(|m| m.content.clone().unwrap_or_default())
             .collect()
+    }
+
+    #[test]
+    fn image_only_observations_collapse_and_payload_retention_keeps_diagnostics() {
+        let mut messages = history(3, 0);
+        let image = crate::core::tool_media::ToolImage::from_bytes(
+            b"GIF89a-test",
+            "image/gif",
+            crate::core::tool_media::ImageProvenance::new("capture", Some("local".into())),
+        )
+        .unwrap();
+        for m in messages.iter_mut().filter(|m| m.role == "tool") {
+            m.tool_images.push(image.clone());
+        }
+        let stats = collapse_aged(&mut messages, policy(1, 1), &mut fake_spill);
+        assert_eq!(stats.collapsed, 2);
+        let tools: Vec<_> = messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(
+            tools[0].tool_images[0].unavailable_reason(),
+            Some(ImageUnavailable::Retention)
+        );
+        assert_eq!(tools[0].tool_images[0].metadata(), image.metadata());
+        assert!(tools[2].tool_images[0].is_available());
+        let mut many: Vec<_> = (0..34)
+            .map(|_| {
+                let mut m = Message::tool_result("id", "");
+                m.tool_images.push(image.clone());
+                m
+            })
+            .collect();
+        assert_eq!(retain_tool_images(&mut many), 2);
+        assert_eq!(retain_tool_images(&mut many), 0, "idempotent");
     }
 
     #[test]

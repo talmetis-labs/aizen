@@ -7,6 +7,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Clip a plain string to `max` display columns (ellipsis when it would overflow). Width-aware so a
 /// wide glyph never half-lands past the frame.
@@ -20,12 +21,12 @@ pub(super) fn clip_to(s: &str, max: usize) -> String {
     let budget = max.saturating_sub(1);
     let mut out = String::new();
     let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = console::measure_text_width(&ch.to_string()).max(1);
-        if w + cw > budget {
+    for glyph in s.graphemes(true) {
+        let cw = console::measure_text_width(glyph);
+        if w.saturating_add(cw) > budget {
             break;
         }
-        out.push(ch);
+        out.push_str(glyph);
         w += cw;
     }
     out.push('…');
@@ -47,75 +48,52 @@ pub(super) fn pad_to(s: &str, width: usize) -> String {
 /// window. This is what keeps a long `sandbox:`/`[dense]`/`mcp:` boot note readable instead of
 /// clipped at the pane edge.
 pub(super) fn wrap_keep_sgr(row: &str, width: usize) -> Vec<String> {
-    if width < 4 || console::measure_text_width(row) <= width {
-        return vec![row.to_string()];
+    if width == 0 {
+        return vec![String::new()];
     }
-    // SGR sequences currently in force, rebuilt on the fly: a reset (`\x1b[m` / leading `0`)
-    // clears the stack, anything else stacks on top.
-    fn note_sgr(active: &mut Vec<String>, seq: &str, params: &str) {
-        let first = params.split(';').next().unwrap_or("");
-        if first.is_empty() || first == "0" {
-            active.clear();
-            if params.split(';').any(|p| !p.is_empty() && p != "0") {
-                active.push(seq.to_string());
+    let (glyphs, trailing) = crate::ui::links::sgr_glyphs(row);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < glyphs.len() {
+        let mut end = start;
+        let mut used = 0usize;
+        let mut space = None;
+        while end < glyphs.len() && glyphs[end].text != "\n" {
+            let w = glyphs[end].width.min(width);
+            if used.saturating_add(w) > width {
+                break;
             }
-        } else {
-            active.push(seq.to_string());
+            used += w;
+            end += 1;
+            if glyphs[end - 1].text == " " {
+                space = Some(end);
+            }
         }
+        let newline = end < glyphs.len() && glyphs[end].text == "\n";
+        if !newline && end < glyphs.len() {
+            end = space.filter(|at| *at > start).unwrap_or(end);
+        }
+        let mut rendered = glyphs[start].prefix.clone();
+        for glyph in &glyphs[start..end] {
+            if glyph.width > width {
+                // A double-width glyph cannot physically fit in a one-cell pane. Replace the
+                // WHOLE grapheme, never half an emoji or a base stripped of its combining marks.
+                rendered.push('�');
+            } else {
+                rendered.push_str(&glyph.raw);
+            }
+        }
+        if end == glyphs.len() {
+            rendered.push_str(&trailing);
+        }
+        if rendered.contains('\x1b') {
+            rendered.push_str("\x1b[0m");
+        }
+        out.push(rendered);
+        start = end + usize::from(newline);
     }
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_w = 0usize;
-    let mut active: Vec<String> = Vec::new();
-    // The last space in `cur` a soft break can land after: (byte end, width through it, SGR then).
-    let mut brk: Option<(usize, usize, Vec<String>)> = None;
-    let mut chars = row.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            let mut params = String::new();
-            let mut fin = None;
-            while let Some(&pc) = chars.peek() {
-                chars.next();
-                if pc.is_ascii_digit() || pc == ';' {
-                    params.push(pc);
-                } else {
-                    fin = Some(pc);
-                    break;
-                }
-            }
-            if fin == Some('m') {
-                let seq = format!("\x1b[{params}m");
-                note_sgr(&mut active, &seq, &params);
-                cur.push_str(&seq);
-            }
-            continue;
-        }
-        let w = console::measure_text_width(&c.to_string()).max(1);
-        if cur_w + w > width {
-            match brk.take() {
-                Some((at, bw, sgr)) => {
-                    let rest = cur.split_off(at);
-                    out.push(std::mem::take(&mut cur));
-                    cur = sgr.concat();
-                    cur.push_str(&rest);
-                    cur_w = cur_w.saturating_sub(bw);
-                }
-                None => {
-                    out.push(std::mem::take(&mut cur));
-                    cur = active.concat();
-                    cur_w = 0;
-                }
-            }
-        }
-        cur.push(c);
-        cur_w += w;
-        if c == ' ' {
-            brk = Some((cur.len(), cur_w, active.clone()));
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
+    if out.is_empty() || row.ends_with('\n') {
+        out.push(String::new());
     }
     out
 }
@@ -131,46 +109,7 @@ pub(super) fn sanitize_text(input: &str) -> String {
 /// turn them into styled ratatui spans. This is what keeps the `❯` user echo in accent, the edit
 /// diff green/salmon, and the `◆` tool anchor tinted by state — instead of one flat grey.
 pub(super) fn sanitize_keep_sgr(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    let mut seq = String::from("\x1b[");
-                    let mut final_byte = None;
-                    while let Some(&pc) = chars.peek() {
-                        chars.next();
-                        seq.push(pc);
-                        // A CSI sequence ends at its final byte (0x40–0x7E). We break on the first
-                        // ASCII letter, which covers every sequence we actually emit: `m` (SGR),
-                        // `J`/`K` (erase), `s`/`u` (save/restore cursor), `H`/`A`…`G` (moves).
-                        if pc.is_ascii_alphabetic() {
-                            final_byte = Some(pc);
-                            break;
-                        }
-                    }
-                    if final_byte == Some('m') {
-                        out.push_str(&seq); // keep colour / bold / dim — drop everything else
-                    }
-                }
-                // A non-CSI escape (e.g. `\x1b7` save cursor): drop the ESC and its one payload byte.
-                _ => {
-                    chars.next();
-                }
-            }
-            continue;
-        }
-        match c {
-            '\n' => out.push('\n'),
-            '\t' => out.push_str("    "),
-            '\r' => {}
-            c if !c.is_control() => out.push(c),
-            _ => {}
-        }
-    }
-    out
+    crate::ui::links::sanitize_sgr(input)
 }
 
 /// Map a basic ANSI colour index (0–15, the `30`–`37` / `90`–`97` SGR families) to a ratatui colour.
@@ -273,36 +212,29 @@ fn apply_sgr(base: Style, cur: Style, params: &str) -> Style {
 /// A row with no colour codes collapses to one span in the base style, so uncoloured output looks
 /// exactly as before.
 pub(crate) fn ansi_spans(row: &str, base: Style) -> Vec<Span<'static>> {
+    let (glyphs, _) = crate::ui::links::sgr_glyphs(row);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cur = base;
-    let mut buf = String::new();
-    let mut chars = row.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            let mut params = String::new();
-            let mut final_byte = None;
-            while let Some(&pc) = chars.peek() {
-                chars.next();
-                if pc.is_ascii_digit() || pc == ';' {
-                    params.push(pc);
-                } else {
-                    final_byte = Some(pc);
-                    break;
-                }
+    for glyph in glyphs {
+        let mut rest = glyph.raw.as_str();
+        let mut glyph_style = None;
+        while let Some(i) = rest.find("\x1b[") {
+            if i > 0 {
+                glyph_style.get_or_insert(cur);
             }
-            if final_byte == Some('m') {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), cur));
-                }
-                cur = apply_sgr(base, cur, &params);
-            }
-            continue;
+            rest = &rest[i..];
+            let end = rest.find('m').expect("sanitized SGR terminator");
+            cur = apply_sgr(base, cur, &rest[2..end]);
+            rest = &rest[end + 1..];
         }
-        buf.push(c);
-    }
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, cur));
+        let style = glyph_style.unwrap_or(cur);
+        // A style change inside an extended grapheme affects following glyphs, but must not
+        // split this one's base and combining/ZWJ sequence into independently measured spans.
+        if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
+            last.content.to_mut().push_str(&glyph.text);
+        } else {
+            spans.push(Span::styled(glyph.text, style));
+        }
     }
     if spans.is_empty() {
         spans.push(Span::styled(String::new(), base));

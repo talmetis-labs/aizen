@@ -153,8 +153,8 @@ async fn ls(json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<12} {:<22} {:<14} {:<9} {:<22} {}",
-        "ID", "LABEL", "PREFIX", "ENABLED", "LAST USED", ""
+        "{:<12} {:<22} {:<14} {:<9} {:<22} ",
+        "ID", "LABEL", "PREFIX", "ENABLED", "LAST USED"
     );
     for k in &keys {
         println!(
@@ -306,7 +306,7 @@ async fn loadout_ls(id: Option<String>, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<4} {:<32} {:<10} {}", "#", "PLAN", "KIND", "CALLABLE");
+    println!("{:<4} {:<32} {:<10} CALLABLE", "#", "PLAN", "KIND");
     for (i, e) in entries.iter().enumerate() {
         let ok = e
             .get("resolvable")

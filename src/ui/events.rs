@@ -53,6 +53,19 @@ static HOOK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// and two half-lines interleaved would be two broken records.
 static WRITE: Mutex<()> = Mutex::new(());
 static RUN: Mutex<Run> = Mutex::new(Run::new());
+// Console presentation is FIFO; the whole-run reader remains stdin's sole owner.
+fn console_approval() -> &'static crate::ui::tui::approval::Coordinator {
+    static COORDINATOR: std::sync::OnceLock<crate::ui::tui::approval::Coordinator> =
+        std::sync::OnceLock::new();
+    COORDINATOR.get_or_init(crate::ui::tui::approval::Coordinator::default)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdinReader {
+    NotStarted,
+    Live,
+    Closed,
+}
 
 /// A tool result longer than this (chars) is cut in the `tool_result` block, with
 /// `tool_use_result.truncated: true`. The model's own copy is budgeted separately
@@ -68,6 +81,26 @@ struct Pending {
     thinking: String,
 }
 
+/// Single-use correlation carried by the prepared invocation across approval and worker threads.
+/// It is not permission authority and cannot be claimed by matching another call's tool/input.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ApprovalIdentity(std::sync::Arc<Mutex<Option<(String, String)>>>);
+
+impl ApprovalIdentity {
+    fn bind(&self, tool_use_id: &str, request_id: &str) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((tool_use_id.to_owned(), request_id.to_owned()));
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn take(&self) -> Option<(String, String)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
 /// Everything the stream remembers about the run in progress.
 struct Run {
     session_id: Option<String>,
@@ -79,9 +112,6 @@ struct Run {
     /// Open `task` / `workflow` calls of the loop's own, newest last: a child's records point at
     /// the newest one.
     parents: Vec<(u64, String)>,
-    /// Ids handed out at approval time — `(tool, args, tool_use_id, request_id)` — claimed by
-    /// the matching `tool_call` right after.
-    approved: Vec<(String, Value, String, String)>,
     /// `permission_denials` rows for the result.
     denials: Vec<Value>,
     /// The answer text the loop's own `text` blocks carried so far, so a final answer that never
@@ -92,6 +122,7 @@ struct Run {
     /// and `ask_approval` — which is usually running on a tool thread, never on stdin's owner —
     /// waits on it. A sender that errors means the reader saw stdin close (a deny follows).
     waiting: Option<HashMap<String, Sender<String>>>,
+    stdin_reader: StdinReader,
     seed: u64,
 }
 
@@ -104,10 +135,10 @@ impl Run {
             pending: Vec::new(),
             ids: Vec::new(),
             parents: Vec::new(),
-            approved: Vec::new(),
             denials: Vec::new(),
             spoken: String::new(),
             waiting: None,
+            stdin_reader: StdinReader::NotStarted,
             seed: 0,
         }
     }
@@ -117,6 +148,32 @@ impl Run {
     /// The `request_id` → reply-sender table, created on first use (the const constructor cannot).
     fn waiting(&mut self) -> &mut HashMap<String, Sender<String>> {
         self.waiting.get_or_insert_with(HashMap::new)
+    }
+
+    fn register_waiter(&mut self, request_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+        if self.stdin_reader != StdinReader::Live
+            || request_id.is_empty()
+            || self.waiting().contains_key(request_id)
+        {
+            return None;
+        }
+        let (tx, rx) = channel();
+        self.waiting().insert(request_id.to_string(), tx);
+        Some(rx)
+    }
+
+    fn deliver_reply(&mut self, request_id: &str, line: String) {
+        if self.stdin_reader == StdinReader::Live && !request_id.is_empty() {
+            // Take once: duplicates and late replies never accumulate or answer another request.
+            if let Some(tx) = self.waiting().remove(request_id) {
+                let _ = tx.send(line);
+            }
+        }
+    }
+
+    fn close_stdin(&mut self) {
+        self.stdin_reader = StdinReader::Closed;
+        self.waiting().clear(); // Drop every sender so outstanding approvals safely deny.
     }
 }
 
@@ -201,15 +258,13 @@ fn write_line(line: &str) {
 
 // ── stdin control loop ───────────────────────────────────────────────────────
 
-/// Whether the stdin reader thread is alive. Plain `static`, written once at `aizen agent` entry
-/// and read on thread spawn: a one-shot run arms the reader exactly once, and a subprocess that
-/// inherited a closed pipe must not keep it alive (the desktop pipes stdin unconditionally).
+/// Whether entry received a pipe rather than a terminal. Reader ownership/liveness lives in `Run`,
+/// not this configuration bit; a closed pipe must never trigger a competing fallback reader.
 static STDIN_IS_PIPED: AtomicBool = AtomicBool::new(false);
 
-/// Called once from `run_agent_cmd` (before `run_agent_inner`): records whether stdin was handed
-/// to this process as a pipe — the only shape where a control channel (`control_response`,
-/// `steer` lines) can exist. Detected once, here, because `stdin.is_terminal()` reads the console
-/// mode and must not run per line.
+/// Called once from `run_agent_cmd`: pipes allow concurrent request presentation, while a console
+/// presents one approval at a time. Both use the same sole stdin reader and request-id routing.
+/// The human REPL does not enable this stream and retains its own input owner.
 pub fn note_stdin_piped(piped: bool) {
     STDIN_IS_PIPED.store(piped, Ordering::SeqCst);
 }
@@ -266,12 +321,15 @@ fn classify_inbound(line: &str) -> Inbound {
 /// skipped. EOF exits the thread; the waiters then see a closed channel and deny, the same safe
 /// default the old loop had on EOF.
 pub fn start_stdin_reader() {
+    if !streaming() {
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        if !streaming() {
-            return;
-        }
-        std::thread::Builder::new()
+        // Publish ownership before spawn. Requests can queue immediately, even before the new
+        // thread runs; a spawn failure closes those channels instead of competing for stdin.
+        lock().stdin_reader = StdinReader::Live;
+        let started = std::thread::Builder::new()
             .name("aizen-stdin".to_string())
             .spawn(|| {
                 let stdin = std::io::stdin();
@@ -282,18 +340,15 @@ pub fn start_stdin_reader() {
                     match handle.read_line(&mut line) {
                         // EOF or a read error: no more control traffic. Waiting approvals deny via
                         // the closed channel; nothing else to do.
-                        Ok(0) | Err(_) => return,
+                        Ok(0) | Err(_) => {
+                            lock().close_stdin();
+                            return;
+                        }
                         Ok(_) => {}
                     }
                     match classify_inbound(&line) {
                         Inbound::Reply { request_id, line } => {
-                            let sender = {
-                                let mut run = lock();
-                                run.waiting().get(&request_id).cloned()
-                            };
-                            if let Some(tx) = sender {
-                                let _ = tx.send(line);
-                            }
+                            lock().deliver_reply(&request_id, line);
                             // A reply to no pending request (stale id, late answer) is ignored.
                         }
                         Inbound::Steer(text) => {
@@ -333,16 +388,19 @@ pub fn start_stdin_reader() {
                         Inbound::Ignored => {}
                     }
                 }
-            })
-            .ok(); // A thread that could not spawn falls back to per-approval reads (old behavior).
+            });
+        if started.is_err() {
+            lock().close_stdin();
+        }
     });
 }
 
-/// Whether the whole-run stdin reader is dispatching lines. When it is not (never started, or
-/// stdin is a console rather than a pipe), `ask_approval` falls back to reading stdin itself —
-/// the original behavior, unchanged for a `aizen agent` typed at a terminal.
-fn reader_active() -> bool {
-    streaming() && stdin_is_piped()
+/// Approval waits are bounded by the calling turn's cancellation and inherited deadline.
+fn approval_interrupted() -> bool {
+    crate::core::cancel::current().is_some_and(|c| c.is_cancelled())
+        || crate::core::exec_ctx::current()
+            .and_then(|c| c.deadline())
+            .is_some_and(|d| Instant::now() >= d)
 }
 
 /// The record `kind` + `fields` serialize to, stamped with `uuid` and `session_id`: compact JSON,
@@ -621,29 +679,24 @@ pub fn warning(kind: &str, text: &str) {
     );
 }
 
-/// The ids a `tool_call` with this `seq` goes out under, when the call was approved a moment
-/// ago: the approval's `tool_use_id` and `request_id`, so the `control_request` and the
-/// `tool_use` block agree and a reader can close the question it drew.
-fn claim_approved_id(run: &mut Run, name: &str, args: &Value) -> Option<(String, String)> {
-    let i = run
-        .approved
-        .iter()
-        .position(|(n, a, _, _)| n == name && a == args)?;
-    let (_, _, tool_use_id, request_id) = run.approved.remove(i);
-    Some((tool_use_id, request_id))
-}
-
 /// A tool call is starting: an `assistant` record with one `tool_use` block. `seq` ties the
 /// later result to this call; `dispatch` names the delegated child whose call it is, `None`
 /// for the loop's own. A child's calls share the stream with its parent's and its siblings',
 /// interleaved — pair a result with its call by `tool_use_id`, never by order.
-pub fn tool_call(seq: u64, name: &str, args: &Value, target: &str, dispatch: Option<&str>) {
+pub(crate) fn tool_call(
+    seq: u64,
+    name: &str,
+    args: &Value,
+    target: &str,
+    dispatch: Option<&str>,
+    identity: Option<&ApprovalIdentity>,
+) {
     if !streaming() {
         return;
     }
     let mut run = lock();
     let msg_id = flush_locked(&mut run, dispatch, false);
-    let approved = claim_approved_id(&mut run, name, args);
+    let approved = identity.and_then(ApprovalIdentity::take);
     let id = approved
         .as_ref()
         .map(|(id, _)| id.clone())
@@ -653,7 +706,7 @@ pub fn tool_call(seq: u64, name: &str, args: &Value, target: &str, dispatch: Opt
     let mut extra = Map::new();
     extra.insert("target".to_string(), json!(target));
     if let Some((_, request_id)) = approved {
-        // The call a `control_request` asked about is running: the question is answered.
+        // Resolve only this invocation's question; refused calls also emit a result pair.
         extra.insert("request_id".to_string(), json!(request_id));
     }
     let v = assistant_record(
@@ -882,28 +935,37 @@ fn elapsed_ms(run: &Run) -> u64 {
 }
 
 /// The closing `result` record of a run that finished (in either format). `stop` is the loop's
-/// stop reason; `question` is set with `awaiting_input`; `session` is the saved session's slug;
-/// `usage` sums the provider's reported tokens over the run.
-pub fn done(
+/// stop reason; `question` is the ask's text rendering, set with `awaiting_input`; `ask` is that
+/// same ask STRUCTURED (questions/options/multi-select), so a front-end with a picker can render
+/// it instead of parsing text; `session` is the saved session's slug; `usage` sums the provider's
+/// reported tokens over the run.
+/// Includes the loop's typed verification snapshot and exact last streamed response.
+#[allow(clippy::too_many_arguments)]
+pub fn done_with_verification(
     stop: &str,
     steps: usize,
     final_text: Option<&str>,
     question: Option<&str>,
+    ask: Option<Value>,
     session: Option<&str>,
     usage: Value,
+    verification: Option<Value>,
+    last_streamed: Option<&str>,
 ) {
     if !on() {
         return;
     }
     let mut run = lock();
     flush_all(&mut run);
-    // A provider that did not stream left the whole answer for here: say it as the block the
-    // stream would have carried, so a reader that renders `assistant` text sees it.
+    // Append only the loop-added suffix when the provider's final response already streamed.
     if let Some(answer) = final_text.filter(|t| !t.trim().is_empty()) {
         if !run.spoken.ends_with(answer) {
-            let i = pending_index(&mut run, None);
-            run.pending[i].text.push_str(answer);
-            flush_locked(&mut run, None, true);
+            let text = unstreamed_result_text(answer, last_streamed, &run.spoken);
+            if !text.trim().is_empty() {
+                let i = pending_index(&mut run, None);
+                run.pending[i].text.push_str(text);
+                flush_locked(&mut run, None, true);
+            }
         }
     }
     let (subtype, is_error) = result_kind(stop);
@@ -918,13 +980,28 @@ pub fn done(
         "permission_denials": run.denials,
         "stop": stop,
         "question": question,
+        "ask": ask,
         "session": session,
         "calls": usage.get("calls").cloned().unwrap_or(json!(0)),
     });
+    if let Some(verification) = verification {
+        fields["verification"] = verification;
+    }
     if is_error {
         fields["errors"] = json!([stop]);
     }
     emit_locked(&mut run, "result", fields, true);
+}
+
+fn unstreamed_result_text<'a>(
+    answer: &'a str,
+    last_response: Option<&str>,
+    spoken: &str,
+) -> &'a str {
+    last_response
+        .filter(|text| !text.is_empty() && spoken.ends_with(text))
+        .and_then(|text| answer.strip_prefix(text))
+        .unwrap_or(answer)
 }
 
 /// A fatal error: the run ends after this record with a non-zero exit. A `result` of subtype
@@ -966,7 +1043,28 @@ pub enum Decision {
     Deny,
 }
 
-/// Whether an earlier `bypassPermissions` reply stands.
+/// Whether generic session grants may authorize this approval or be widened by its reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalScope {
+    Session,
+    Invocation,
+}
+
+impl ApprovalScope {
+    fn bypasses(self, prior_allow_all: bool) -> bool {
+        self == Self::Session && prior_allow_all
+    }
+
+    /// Invocation-bound consent cannot create a reusable tool or session grant.
+    fn decision(self, decision: Decision) -> Decision {
+        match (self, decision) {
+            (Self::Invocation, Decision::AllowTool | Decision::AllowAll) => Decision::Allow,
+            _ => decision,
+        }
+    }
+}
+
+/// Whether an earlier `bypassPermissions` reply stands for generic approvals.
 pub fn allow_all() -> bool {
     ALLOW_ALL.load(Ordering::Relaxed)
 }
@@ -1007,13 +1105,54 @@ fn record_denial(
 ///
 /// `who` names a delegated child when the request is a child's; `preview` is the call's
 /// pre-flight payload (`{title, lines, diff}`), when the tool can compute one.
-pub fn ask_approval(tool: &str, args: &Value, who: Option<&str>, preview: Option<Value>) -> bool {
-    if allow_all() {
+pub(crate) fn ask_approval(
+    tool: &str,
+    args: &Value,
+    who: Option<&str>,
+    preview: Option<Value>,
+    identity: &ApprovalIdentity,
+) -> bool {
+    ask_approval_scoped(tool, args, who, preview, ApprovalScope::Session, identity)
+}
+
+/// Ask for explicit consent to this invocation, even after a generic allow-all grant.
+/// Replies containing `addRules` or `bypassPermissions` authorize only this call and never
+/// record reusable grants. Intended for destination-bound media transmission.
+/// Without a stream-json approval channel this consent is refused, not inherited from `--yes`.
+pub(crate) fn ask_approval_once(
+    tool: &str,
+    args: &Value,
+    who: Option<&str>,
+    preview: Option<Value>,
+    identity: &ApprovalIdentity,
+) -> bool {
+    ask_approval_scoped(
+        tool,
+        args,
+        who,
+        preview,
+        ApprovalScope::Invocation,
+        identity,
+    )
+}
+
+fn ask_approval_scoped(
+    tool: &str,
+    args: &Value,
+    who: Option<&str>,
+    preview: Option<Value>,
+    scope: ApprovalScope,
+    identity: &ApprovalIdentity,
+) -> bool {
+    if !approval_interrupted() && scope.bypasses(allow_all()) {
         return true;
     }
     let n = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let request_id = format!("req_{n}");
     let tool_use_id = format!("toolu_a{n}");
+    // Correlation belongs to this invocation, including its refused/unrun result. This token
+    // confers no permission; only the returned decision authorizes launching the body.
+    identity.bind(&tool_use_id, &request_id);
     if !streaming() {
         let mut run = lock();
         record_denial(
@@ -1022,19 +1161,75 @@ pub fn ask_approval(tool: &str, args: &Value, who: Option<&str>, preview: Option
             &tool_use_id,
             &request_id,
             args,
-            "no approval channel under --output-format json (pass --yes to pre-approve)",
+            if scope == ApprovalScope::Invocation {
+                "explicit invocation approval requires --output-format stream-json"
+            } else {
+                "no approval channel under --output-format json (pass --yes to pre-approve)"
+            },
         );
         return false;
     }
-    {
+    if approval_interrupted() {
         let mut run = lock();
+        record_denial(
+            &mut run,
+            tool,
+            &tool_use_id,
+            &request_id,
+            args,
+            "approval cancelled",
+        );
+        return false;
+    }
+    start_stdin_reader();
+    // Serialize only console presentation. Cancellation while queued never waits for another
+    // request's answer; stdin itself always belongs to the same long-lived reader.
+    let _console = if !stdin_is_piped() {
+        let Some(owner) = console_approval().acquire(approval_interrupted) else {
+            let mut run = lock();
+            record_denial(
+                &mut run,
+                tool,
+                &tool_use_id,
+                &request_id,
+                args,
+                "approval cancelled",
+            );
+            return false;
+        };
+        Some(owner)
+    } else {
+        None
+    };
+    if approval_interrupted() {
+        let mut run = lock();
+        record_denial(
+            &mut run,
+            tool,
+            &tool_use_id,
+            &request_id,
+            args,
+            "approval cancelled",
+        );
+        return false;
+    }
+    if scope.bypasses(allow_all()) {
+        return true;
+    }
+    let reply_rx = {
+        let mut run = lock();
+        let Some(reply_rx) = run.register_waiter(&request_id) else {
+            record_denial(
+                &mut run,
+                tool,
+                &tool_use_id,
+                &request_id,
+                args,
+                "stdin closed or reader unavailable",
+            );
+            return false;
+        };
         flush_all(&mut run);
-        run.approved.push((
-            tool.to_string(),
-            args.clone(),
-            tool_use_id.clone(),
-            request_id.clone(),
-        ));
         let title = preview
             .as_ref()
             .and_then(|p| p.get("title"))
@@ -1058,77 +1253,61 @@ pub fn ask_approval(tool: &str, args: &Value, who: Option<&str>, preview: Option
             }),
             false,
         );
-    }
-    // The reply reaches us one of two ways. With the whole-run reader thread active (the normal
-    // shape when a desktop or script drives us: stdin is a pipe), we register a channel keyed by
-    // this request and block on it — every other line (steers, stale replies) was already consumed
-    // by the reader, so this wait cannot swallow them. Without it (stdin is a console, or the
-    // thread could not spawn), we read stdin here exactly as before, and lines that are not this
-    // request's reply are ignored.
-    if reader_active() {
-        let (tx, rx) = channel::<String>();
-        lock().waiting().insert(request_id.clone(), tx);
-        let reply = rx.recv();
-        lock().waiting().remove(&request_id);
-        let line = match reply {
-            Ok(line) => line,
-            Err(_) => {
-                // The reader thread exited: stdin closed.
-                let mut run = lock();
-                record_denial(
-                    &mut run,
-                    tool,
-                    &tool_use_id,
-                    &request_id,
-                    args,
-                    "stdin closed",
-                );
-                return false;
-            }
-        };
-        if let Some((d, message)) = parse_reply(&line, &request_id, tool) {
-            return finish_decision(d, message, tool, &tool_use_id, &request_id, args);
+        reply_rx
+    };
+    // Registration and publication hold the same state lock: an immediate driver reply cannot
+    // arrive in the old gap between printing the request and creating its waiter.
+    struct WaiterCleanup<'a>(&'a str);
+    impl Drop for WaiterCleanup<'_> {
+        fn drop(&mut self) {
+            lock().waiting().remove(self.0);
         }
-        // The reader delivered a line claiming our id that does not parse as a decision —
-        // an unrecognised answer must never run the call.
-        let mut run = lock();
-        record_denial(
-            &mut run,
-            tool,
-            &tool_use_id,
-            &request_id,
-            args,
-            "unrecognised control_response",
-        );
-        return false;
     }
-    let stdin = std::io::stdin();
-    let mut line = String::new();
+    let _cleanup = WaiterCleanup(&request_id);
+    let reply = wait_for_approval_reply(&reply_rx, approval_interrupted);
+    let line = match reply {
+        Ok(line) => line,
+        Err(why) => {
+            let mut run = lock();
+            record_denial(&mut run, tool, &tool_use_id, &request_id, args, why);
+            return false;
+        }
+    };
+    if let Some((d, message)) = parse_reply(&line, &request_id, tool) {
+        return finish_decision(d, message, tool, &tool_use_id, &request_id, args, scope);
+    }
+    // A line claiming our id without a recognized decision must never authorize this call.
+    let mut run = lock();
+    record_denial(
+        &mut run,
+        tool,
+        &tool_use_id,
+        &request_id,
+        args,
+        "unrecognised control_response",
+    );
+    false
+}
+
+fn wait_for_approval_reply(
+    rx: &std::sync::mpsc::Receiver<String>,
+    interrupted: impl Fn() -> bool,
+) -> Result<String, &'static str> {
     loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                let mut run = lock();
-                record_denial(
-                    &mut run,
-                    tool,
-                    &tool_use_id,
-                    &request_id,
-                    args,
-                    "stdin closed",
-                );
-                return false;
-            }
-            Ok(_) => {}
+        if interrupted() {
+            return Err("approval cancelled");
         }
-        if let Some((d, message)) = parse_reply(&line, &request_id, tool) {
-            return finish_decision(d, message, tool, &tool_use_id, &request_id, args);
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(line) if !interrupted() => return Ok(line),
+            Ok(_) => return Err("approval cancelled"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("stdin closed"),
         }
     }
 }
 
-/// Apply a parsed approval decision: widen the grants it carries, record a refusal, and return
-/// whether the call may run.
+/// Apply a parsed approval decision within its scope, record a refusal, and return
+/// whether the call may run. Only session-scoped approvals can widen generic grants.
 fn finish_decision(
     d: Decision,
     message: Option<String>,
@@ -1136,7 +1315,21 @@ fn finish_decision(
     tool_use_id: &str,
     request_id: &str,
     args: &Value,
+    scope: ApprovalScope,
 ) -> bool {
+    if approval_interrupted() {
+        let mut run = lock();
+        record_denial(
+            &mut run,
+            tool,
+            tool_use_id,
+            request_id,
+            args,
+            "approval cancelled",
+        );
+        return false;
+    }
+    let d = scope.decision(d);
     match d {
         Decision::AllowTool => crate::core::approval::grant_session(tool, None),
         Decision::AllowAll => ALLOW_ALL.store(true, Ordering::Relaxed),
@@ -1167,10 +1360,8 @@ pub(crate) fn parse_reply(
         return None;
     }
     let r = v.get("response")?;
-    if let Some(id) = r.get("request_id").and_then(Value::as_str) {
-        if id != request_id {
-            return None;
-        }
+    if r.get("request_id").and_then(Value::as_str) != Some(request_id) || request_id.is_empty() {
+        return None;
     }
     if r.get("subtype").and_then(Value::as_str) == Some("error") {
         let why = r.get("error").and_then(Value::as_str).map(str::to_string);
@@ -1220,6 +1411,10 @@ pub(crate) fn parse_reply(
 }
 
 #[cfg(test)]
+#[path = "events/approval_tests.rs"]
+pub(crate) mod approval_integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1227,6 +1422,94 @@ mod tests {
         let mut r = Run::new();
         r.model = "m".to_string();
         r
+    }
+
+    #[test]
+    fn immediate_approval_replies_are_registered_before_publication() {
+        let mut r = run();
+        r.stdin_reader = StdinReader::Live;
+        let rx = r.register_waiter("req_fast").unwrap();
+        // The production path retains this Run lock through publication; delivery starts with
+        // the waiter already present, even when the driver answers its first readable byte.
+        let request = record(&mut r, "control_request", json!({"request_id": "req_fast"}));
+        r.deliver_reply(request["request_id"].as_str().unwrap(), "allow".into());
+        assert_eq!(rx.try_recv().unwrap(), "allow");
+        assert!(r.waiting().is_empty());
+    }
+
+    #[test]
+    fn piped_approvals_match_ids_once_and_eof_closes_every_waiter() {
+        let mut r = run();
+        r.stdin_reader = StdinReader::Live;
+        let a = r.register_waiter("req_a").unwrap();
+        let b = r.register_waiter("req_b").unwrap();
+        assert!(
+            r.register_waiter("req_a").is_none(),
+            "never replace a live waiter"
+        );
+        assert!(r.register_waiter("").is_none());
+        for id in ["", "stale", "req_unknown"] {
+            r.deliver_reply(id, "wrong".into());
+        }
+        assert!(matches!(
+            a.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        r.deliver_reply("req_b", "b".into());
+        r.deliver_reply("req_b", "duplicate".into());
+        assert_eq!(b.try_recv().unwrap(), "b");
+        r.close_stdin();
+        assert!(matches!(
+            a.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(r.waiting().is_empty());
+        assert!(r.register_waiter("after_eof").is_none());
+        r.deliver_reply("req_a", "late".into());
+        assert_eq!(r.stdin_reader, StdinReader::Closed);
+    }
+
+    #[test]
+    fn unavailable_reader_never_registers_an_approval() {
+        let mut r = run();
+        assert!(r.register_waiter("not_started").is_none());
+        r.stdin_reader = StdinReader::Live;
+        let rx = r.register_waiter("spawn_failed").unwrap();
+        r.close_stdin(); // Spawn failure and EOF use the same terminal transition.
+        assert!(rx.recv().is_err());
+        assert!(r.register_waiter("new_request").is_none());
+    }
+
+    #[test]
+    fn interrupted_approval_waits_never_consume_a_late_grant() {
+        let (tx, rx) = channel();
+        tx.send("late allow-all".to_string()).unwrap();
+        assert_eq!(
+            wait_for_approval_reply(&rx, || true),
+            Err("approval cancelled")
+        );
+        assert_eq!(rx.try_recv().unwrap(), "late allow-all");
+        tx.send("cancelled after delivery".to_string()).unwrap();
+        let checks = AtomicU64::new(0);
+        assert_eq!(
+            wait_for_approval_reply(&rx, || checks.fetch_add(1, Ordering::SeqCst) != 0),
+            Err("approval cancelled")
+        );
+        drop(tx);
+        assert_eq!(wait_for_approval_reply(&rx, || false), Err("stdin closed"));
+    }
+
+    #[test]
+    fn cancelled_waiter_cleanup_does_not_touch_its_sibling() {
+        let mut r = run();
+        r.stdin_reader = StdinReader::Live;
+        let a = r.register_waiter("cancelled").unwrap();
+        let b = r.register_waiter("live").unwrap();
+        r.waiting().remove("cancelled");
+        r.deliver_reply("cancelled", "late grant".into());
+        r.deliver_reply("live", "own decision".into());
+        assert!(a.try_recv().is_err());
+        assert_eq!(b.try_recv().unwrap(), "own decision");
     }
 
     #[test]
@@ -1300,26 +1583,32 @@ mod tests {
         );
     }
 
-    /// An approval hands out the id its `tool_use` block will carry, so the `control_request`
-    /// and the block agree; an unrelated call keeps the seq-derived id.
     #[test]
-    fn an_approved_call_claims_the_id_the_request_named() {
-        let mut r = run();
-        r.approved.push((
-            "shell_run".into(),
-            json!({"command": "rm x"}),
-            "toolu_a1".into(),
-            "req_1".into(),
-        ));
+    fn approval_identity_is_invocation_local_and_single_use_across_threads() {
+        let first = ApprovalIdentity::default();
+        let second = ApprovalIdentity::default();
+        first.bind("toolu_a1", "req_1");
+        second.bind("toolu_a2", "req_2");
+        let worker = second.clone();
         assert_eq!(
-            claim_approved_id(&mut r, "shell_run", &json!({"command": "ls"})),
-            None
+            std::thread::spawn(move || worker.take()).join().unwrap(),
+            Some(("toolu_a2".into(), "req_2".into()))
         );
+        assert_eq!(second.take(), None, "worker claims this invocation once");
         assert_eq!(
-            claim_approved_id(&mut r, "shell_run", &json!({"command": "rm x"})),
-            Some(("toolu_a1".to_string(), "req_1".to_string()))
+            first.take(),
+            Some(("toolu_a1".into(), "req_1".into())),
+            "out-of-order consumption cannot take another request"
         );
-        assert!(r.approved.is_empty(), "claimed once");
+        assert_eq!(first.take(), None);
+        let abandoned = ApprovalIdentity::default();
+        abandoned.bind("toolu_a3", "req_3");
+        drop(abandoned);
+        assert_eq!(
+            ApprovalIdentity::default().take(),
+            None,
+            "no global stale identity"
+        );
     }
 
     #[test]
@@ -1340,6 +1629,40 @@ mod tests {
         assert_eq!(v["message"]["content"][0]["name"], "file_read");
         assert_eq!(v["parent_tool_use_id"], "toolu_1");
         assert_eq!(v["dispatch"], "argus");
+    }
+
+    #[test]
+    fn result_emits_only_the_appended_verification_tail() {
+        let final_text = "Answer\n\nVerification: pending";
+        assert_eq!(
+            unstreamed_result_text(final_text, Some("Answer"), "earlier textAnswer"),
+            "\n\nVerification: pending"
+        );
+        assert_eq!(
+            unstreamed_result_text("Answer", Some("Answer"), "Answer"),
+            ""
+        );
+        assert_eq!(unstreamed_result_text(final_text, None, ""), final_text);
+        assert_eq!(
+            unstreamed_result_text(final_text, Some("unrelated"), "unrelated"),
+            final_text
+        );
+        assert_eq!(unstreamed_result_text(final_text, Some(""), ""), final_text);
+    }
+
+    #[test]
+    fn result_preserves_nonstreamed_and_partial_provider_answers() {
+        let final_text = "Answer\n\nVerification: pending";
+        assert_eq!(
+            unstreamed_result_text(final_text, Some("Answer"), ""),
+            final_text,
+            "a returned completion is not proof that it streamed"
+        );
+        assert_eq!(
+            unstreamed_result_text(final_text, Some("Answer"), "Ans"),
+            final_text,
+            "partial fragments must not hide the remainder"
+        );
     }
 
     #[test]
@@ -1415,8 +1738,8 @@ mod tests {
         let no_id = r#"{"type":"control_response","response":{"subtype":"success","response":{"behavior":"allow"}}}"#;
         assert_eq!(
             parse_reply(no_id, "req_3", "shell_run"),
-            Some((Decision::Allow, None)),
-            "a reply without an id answers the pending request"
+            None,
+            "a reply without an id cannot authorize any request"
         );
         assert_eq!(
             parse_reply(r#"{"type":"user","message":{}}"#, "req_3", "x"),
@@ -1441,6 +1764,47 @@ mod tests {
             parse_reply(tool, "req_1", "file_edit"),
             Some((Decision::Allow, None)),
             "a rule for another tool is a plain allow of this call"
+        );
+    }
+
+    #[test]
+    fn invocation_approval_never_inherits_generic_allow_all() {
+        assert!(ApprovalScope::Session.bypasses(true));
+        assert!(!ApprovalScope::Session.bypasses(false));
+        assert!(!ApprovalScope::Invocation.bypasses(true));
+        assert!(!ApprovalScope::Invocation.bypasses(false));
+    }
+
+    #[test]
+    fn invocation_permission_updates_do_not_create_persistent_grants() {
+        for update in [
+            json!({"type": "setMode", "mode": "bypassPermissions", "destination": "session"}),
+            json!({"type": "addRules", "rules": [{"toolName": "image_read"}], "behavior": "allow", "destination": "session"}),
+        ] {
+            let line = json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "req_media",
+                    "response": {"behavior": "allow", "updatedPermissions": [update]},
+                },
+            })
+            .to_string();
+            let (decision, _) = parse_reply(&line, "req_media", "image_read").unwrap();
+            assert!(matches!(decision, Decision::AllowTool | Decision::AllowAll));
+            assert_eq!(
+                ApprovalScope::Invocation.decision(decision),
+                Decision::Allow
+            );
+            assert_eq!(ApprovalScope::Session.decision(decision), decision);
+        }
+        assert_eq!(
+            ApprovalScope::Invocation.decision(Decision::Deny),
+            Decision::Deny
+        );
+        assert_eq!(
+            ApprovalScope::Invocation.decision(Decision::Allow),
+            Decision::Allow
         );
     }
 

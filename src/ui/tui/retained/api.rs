@@ -77,7 +77,7 @@ pub(crate) fn preferred() -> bool {
 }
 
 /// Whether the current platform's terminal can host the full-screen retained TUI (alternate screen
-/// + mouse + bracketed paste). On Windows there is no $TERM to consult — any real console qualifies
+/// with mouse and bracketed paste). On Windows there is no $TERM to consult — any real console qualifies
 /// (`is_terminal` above already ruled out pipes/redirects). On Unix, defer to the $TERM deny list.
 #[cfg(windows)]
 fn term_supported_here() -> bool {
@@ -142,10 +142,6 @@ pub(crate) fn has_subagents_panel() -> bool {
 /// Set once the first sub-agents snapshot lands. Mirrors what the render thread's AppState knows,
 /// readable from the input thread without queueing a query command.
 pub(crate) static SUBAGENTS_PANEL_SEEN: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn size() -> (u16, u16) {
-    (ROWS.load(Ordering::Relaxed), COLS.load(Ordering::Relaxed))
-}
 
 /// The width CONTENT should lay itself out to: the transcript pane, not the raw grid. When the
 /// terminal is wide enough that the sidebar docks, the pane is `SIDEBAR_W` narrower — text wrapped

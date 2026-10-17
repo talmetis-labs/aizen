@@ -442,6 +442,7 @@ pub mod model2vec {
     /// a model REPLACED in place (a re-download, a different snapshot moved into the same dir) is a
     /// different key and gets reloaded, rather than silently serving the old weights forever.
     type LoadKey = (PathBuf, Option<std::time::SystemTime>, u64);
+    type LoadedModel = (LoadKey, Arc<StaticModel>, usize);
 
     fn load_key(dir: &Path) -> LoadKey {
         let weights = dir.join("model.safetensors");
@@ -469,7 +470,7 @@ pub mod model2vec {
     /// switch that happens at most once or twice in a session; the common case is the same key every
     /// time, and a genuine switch just pays one reload.
     fn load_shared(cand: &ModelCandidate) -> Result<(Arc<StaticModel>, usize)> {
-        static CACHE: OnceLock<Mutex<Option<(LoadKey, Arc<StaticModel>, usize)>>> = OnceLock::new();
+        static CACHE: OnceLock<Mutex<Option<LoadedModel>>> = OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(None));
         let key = load_key(&cand.dir);
 
@@ -557,21 +558,18 @@ pub fn default_dense_embedder() -> Box<dyn Embedder> {
     let configured = config::embed_model_name();
     match model2vec::Model2VecEmbedder::load_default() {
         Ok(e) => {
-            // Distinguish "loaded the exact name you asked for" from "loaded something we found" —
-            // the latter is the auto-detect path, and the user deserves to know WHICH model won so
-            // a surprising pick is traceable rather than silent.
-            let note = if e.name() == configured {
-                format!("[dense] loaded {} (dim {})", e.id(), e.dim())
-            } else {
-                format!(
-                    "[dense] loaded {} (dim {}) — auto-detected from {} (configured '{}' not present; set AIZEN_EMBED_MODEL to pin)",
+            // A successful load is the normal case and used to announce itself on every start
+            // ("[dense] loaded … auto-detected from …"), which read as noise above the first turn.
+            // Keep it for the case that actually needs explaining: the configured model was NOT
+            // found and something else was substituted, or loading failed.
+            if e.name() != configured {
+                note_once(&format!(
+                    "[dense] configured '{}' not found — using {} (dim {}); set AIZEN_EMBED_MODEL to pin",
+                    configured,
                     e.id(),
-                    e.dim(),
-                    e.source(),
-                    configured
-                )
-            };
-            note_once(&note);
+                    e.dim()
+                ));
+            }
             Box::new(e)
         }
         Err(err) => {

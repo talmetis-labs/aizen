@@ -158,6 +158,7 @@ pub(super) struct ToolEvent {
     pub icon: String,
     pub name: String,
     pub target: String,
+    pub display: crate::ui::links::DisplayTarget,
     pub digest: String,
     pub state: ToolState,
     /// Wall-clock run time of the tool call in milliseconds, appended to the result line (`· 1.2s`).
@@ -266,6 +267,7 @@ struct CacheKey {
 struct BlockRows {
     sgr: Vec<String>,
     plain: Vec<String>,
+    paths: Vec<Vec<crate::ui::links::PathFragment>>,
     /// Index-aligned with `sgr`/`plain`: `lines[i]` is `sgr[i]` parsed into styled spans.
     lines: Vec<Line<'static>>,
 }
@@ -451,7 +453,32 @@ fn render_block_rows(block: &UiBlock, width: u16) -> BlockRows {
             .map(|r| Line::from(ansi_spans(r, Style::default().fg(Color::Gray))))
             .collect(),
     };
-    BlockRows { sgr, plain, lines }
+    let paths = match &block.payload {
+        Payload::Tool(t) if !t.display.paths.is_empty() && w > 1 => {
+            let prefix = format!(
+                "{}{}   ",
+                if t.icon.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", t.icon)
+                },
+                t.name
+            );
+            crate::ui::links::wrap_path_fragments(
+                &plain,
+                sanitize_text(&prefix).len(),
+                &t.display,
+                t.seq,
+            )
+        }
+        _ => vec![Vec::new(); plain.len()],
+    };
+    BlockRows {
+        sgr,
+        plain,
+        lines,
+        paths,
+    }
 }
 
 struct AppState {
@@ -482,6 +509,9 @@ struct AppState {
     /// the same content while the user is scrolled up and new lines stream in at the bottom: the
     /// offset is bumped by however many lines were appended, so what you're reading doesn't move.
     last_total: usize,
+    /// Physical transcript budget at the last paint. Wrapped-row selections are invalid after
+    /// this changes; reflow is not appended output and must not trigger scroll anchoring.
+    transcript_width: Option<u16>,
     /// Scroll offset (in lines from the top) for the informational overlay, when one is open. Kept
     /// separate from `scroll_from_tail` so PageUp/PageDown over an overlay never disturb the
     /// transcript behind it; reset on open/close and clamped to the overlay's own content height.
@@ -580,6 +610,7 @@ impl AppState {
             jobs: JobsStatus::default(),
             scroll_from_tail: 0,
             last_total: 0,
+            transcript_width: None,
             overlay_scroll: 0,
             focused: true,
             plan_id: None,
@@ -990,22 +1021,9 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 session.take();
                 let _ = ack.send(());
                 dirty = false;
-                // Drain any raw input bytes the terminal queued while the menu owned stdin.
-                // When the alternate screen is dropped, mouse capture ends and the terminal's
-                // alternateScroll turns wheel motion into ↑/↓ key presses — those bytes sit in
-                // the stdin buffer. If we don't drain them here, the resumed session reads them
-                // as phantom history-scroll keys.
-                #[cfg(unix)]
-                {
-                    use std::io::Read;
-                    let mut stdin = std::io::stdin();
-                    let mut buf = [0u8; 256];
-                    while let Ok(n) = stdin.read(&mut buf) {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                }
+                // NOTE: no stdin drain here — a blocking read on the render thread wedges the
+                // suspend/resume handshake (the 0.7.1 Linux freeze). Stale menu-session bytes are
+                // drained by the input thread at its unpark edge instead (see tui.rs input_loop).
             }
             Ok(Command::Resume { status, ack }) => {
                 state.input.status = status;
@@ -1079,22 +1097,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     session.take();
                     let _ = ack.send(());
                     dirty = false;
-                    // Drain any raw input bytes the terminal queued while the menu owned stdin.
-                    // When the alternate screen is dropped, mouse capture ends and the terminal's
-                    // alternateScroll turns wheel motion into ↑/↓ key presses — those bytes sit in
-                    // the stdin buffer. If we don't drain them here, the resumed session reads them
-                    // as phantom history-scroll keys.
-                    #[cfg(unix)]
-                    {
-                        use std::io::Read;
-                        let mut stdin = std::io::stdin();
-                        let mut buf = [0u8; 256];
-                        while let Ok(n) = stdin.read(&mut buf) {
-                            if n == 0 {
-                                break;
-                            }
-                        }
-                    }
+                    // NOTE: no stdin drain here — see the blocking-recv Suspend arm above.
                 }
                 Command::Resume { status, ack } => {
                     state.input.status = status;
@@ -1228,7 +1231,7 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                         // across the probes stalled clicks behind slow stat calls.
                         let occluders = last_occluders();
                         let caret = last_caret();
-                        let (ctx, sgr_rows, plain_rows) = {
+                        let (ctx, sgr_rows, plain_rows, paths) = {
                             let g = transcript_geom_slot()
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
@@ -1240,10 +1243,21 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                                 caret,
                                 rows_offset: g.rows_offset,
                             };
-                            (ctx, g.sgr_rows.clone(), g.plain_rows.clone())
+                            (
+                                ctx,
+                                g.sgr_rows.clone(),
+                                g.plain_rows.clone(),
+                                g.paths.clone(),
+                            )
                         };
                         let out = s.terminal.backend_mut();
-                        crate::ui::links::inject_hyperlinks(out, &sgr_rows, &plain_rows, &ctx);
+                        crate::ui::links::inject_hyperlinks_with_paths(
+                            out,
+                            &sgr_rows,
+                            &plain_rows,
+                            &ctx,
+                            &paths,
+                        );
                     }
                 }
             }

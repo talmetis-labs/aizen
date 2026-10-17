@@ -232,6 +232,7 @@ tail{}",
             tool_calls: Vec::new(),
             tool_call_id: Some("c".to_string()),
             images: Vec::new(),
+            tool_images: Vec::new(),
             cache_control: None,
         }
     }

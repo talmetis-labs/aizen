@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "kind": "synthetic_offline_contract",
+  "protocol": {
+    "network": false,
+    "live_model": false,
+    "uploads": false,
+    "pixel_evidence": false,
+    "claim": "Fixtures and synthetic planner headers test parser, routing and scoped activation contracts; they do not measure a real model's semantic accuracy or prove rendered visual quality.",
+    "steps": [
+      "Read the original brief and local input; keep reference input separate from the original brief.",
+      "For hermetic tests only, supply the expected structured intent and exact evidence quote as a synthetic planner header.",
+      "Assert only confirmed nonvisual may select the automatic low editor; visual and ambiguous cases retain the selected endpoint and wire effort.",
+      "Assert visual intent activates a scoped gate and request-only capsule in auto mode; off suppresses both; on provides guidance without turning an ambiguous brief into verified work.",
+      "Assert no fixture file, source read or reference path creates projected, ready or verified pixel evidence.",
+      "If later evaluating a real planner, record its actual header separately and compare intent to these labels. Do not count the synthetic-header test as classifier accuracy.",
+      "If later editing and reviewing a surface, use fresh narrow and wide renders with current source provenance and an authorized image-capable endpoint. Report functional and visual verdicts separately."
+    ],
+    "viewports": [{"width": 390, "height": 844}, {"width": 1280, "height": 900}],
+    "limits": {"max_cases": 16, "max_asset_bytes": 16384, "max_suite_bytes": 65536}
+  },
+  "assets": ["starter.html", "existing.html", "crowded.html", "dashboard.html", "reference.svg", "styles.css"],
+  "cases": [
+    {
+      "id": "create-en",
+      "language": "en",
+      "category": "create",
+      "input": "starter.html",
+      "brief": "Create a calm responsive workshop landing page with a clear heading, three course cards and one primary action.",
+      "intent": "create",
+      "evidence": "Create a calm responsive workshop landing page",
+      "acceptance": "Readable hierarchy at 390 and 1280 px; all three cards and the primary action are reachable without horizontal page scroll."
+    },
+    {
+      "id": "redesign-vi",
+      "language": "vi",
+      "category": "redesign",
+      "input": "crowded.html",
+      "brief": "Thiết kế lại giao diện trang workshop: tạo phân cấp rõ ràng và sửa hàng thẻ tràn trên điện thoại, giữ nguyên nội dung.",
+      "intent": "redesign",
+      "evidence": "Thiết kế lại giao diện trang workshop",
+      "acceptance": "Improve hierarchy and card stacking at narrow widths; retain workshop copy. The crowded source intentionally starts with horizontal overflow."
+    },
+    {
+      "id": "preserve-ja",
+      "language": "ja",
+      "category": "preserve",
+      "input": "existing.html",
+      "brief": "現在の配色とレイアウトを維持したまま、コースカードにキーボードのフォーカス表示を追加してください。見た目を作り直さないでください。",
+      "intent": "preserve",
+      "evidence": "現在の配色とレイアウトを維持したまま",
+      "acceptance": "Keep the green accent, existing hierarchy, copy and navigation; provide visible keyboard focus without replacing the visual identity."
+    },
+    {
+      "id": "dashboard-en",
+      "language": "en",
+      "category": "dashboard",
+      "input": "dashboard.html",
+      "brief": "Create a responsive dashboard for this synthetic task sample: lead with the total, compare group counts and keep an exact accessible data table.",
+      "intent": "create",
+      "evidence": "Create a responsive dashboard",
+      "acceptance": "Total equals 90; group values are 36, 24, 18, 12; one shared zero baseline, no dual axis, consistent card/chart/table scope."
+    },
+    {
+      "id": "chart-vi",
+      "language": "vi",
+      "category": "chart",
+      "input": "dashboard.html",
+      "brief": "Thiết kế lại biểu đồ để so sánh số task giữa các nhóm dễ hơn; giữ số liệu 36, 24, 18, 12 và bảng dữ liệu, không dùng hai trục.",
+      "intent": "redesign",
+      "evidence": "Thiết kế lại biểu đồ",
+      "acceptance": "Magnitude remains proportional to counts on a zero-to-40 scale; labels, keyboard hover details and the exact table remain available."
+    },
+    {
+      "id": "reference-es",
+      "language": "es",
+      "category": "reference",
+      "input": "starter.html",
+      "reference": "reference.svg",
+      "brief": "Crea una página de talleres inspirada en la jerarquía y el espacio del archivo de referencia local. No inventes una marca real ni afirmes haber visto una captura.",
+      "intent": "create",
+      "evidence": "Crea una página de talleres",
+      "acceptance": "Use the local reference for hierarchy and spacing, not as a screenshot or runtime verification record; keep identity plainly fictional."
+    },
+    {
+      "id": "nonvisual-en",
+      "language": "en",
+      "category": "nonvisual",
+      "input": "dashboard.html",
+      "brief": "Change the backend chart-data cache key and add unit tests. Do not modify the dashboard markup, styling, interactions or any other visual surface.",
+      "intent": "nonvisual",
+      "evidence": "Change the backend chart-data cache key and add unit tests. Do not modify the dashboard markup, styling, interactions or any other visual surface.",
+      "acceptance": "Backend cache-key tests only; the chart-themed input is incidental and is not semantic permission to activate visual design."
+    },
+    {
+      "id": "nonvisual-vi",
+      "language": "vi",
+      "category": "nonvisual",
+      "input": "existing.html",
+      "brief": "Sửa parser của CLI và thêm unit test; không thay đổi giao diện hay file HTML/CSS nào.",
+      "intent": "nonvisual",
+      "evidence": "Sửa parser của CLI và thêm unit test; không thay đổi giao diện hay file HTML/CSS nào.",
+      "acceptance": "CLI parser and tests only; visual fixture files stay untouched."
+    },
+    {
+      "id": "nonvisual-ja",
+      "language": "ja",
+      "category": "nonvisual",
+      "input": "dashboard.html",
+      "brief": "CLIの設定ファイル読み込みにタイムアウトを追加し、単体テストを書いてください。画面やグラフは変更しません。",
+      "intent": "nonvisual",
+      "evidence": "CLIの設定ファイル読み込みにタイムアウトを追加し、単体テストを書いてください。画面やグラフは変更しません。",
+      "acceptance": "Configuration timeout and unit tests only; no visual gate should be inferred from an unrelated dashboard input."
+    },
+    {
+      "id": "ambiguous-en",
+      "language": "en",
+      "category": "ambiguous",
+      "input": "crowded.html",
+      "brief": "Improve this project. Start where it would help most.",
+      "intent": "unknown",
+      "evidence": "",
+      "acceptance": "Do not assume redesign or nonvisual work from repository contents; keep the selected endpoint and effort pending a grounded contract."
+    },
+    {
+      "id": "ambiguous-vi",
+      "language": "vi",
+      "category": "ambiguous",
+      "input": "dashboard.html",
+      "brief": "Làm phần này tốt hơn, cả cách dùng lẫn độ ổn định; chưa chốt có đổi giao diện không.",
+      "intent": "unknown",
+      "evidence": "",
+      "acceptance": "Mixed unspecified behavior and stability work is not consent to visual restyling or automatic low-effort routing."
+    },
+    {
+      "id": "preserve-en",
+      "language": "en",
+      "category": "preserve",
+      "input": "existing.html",
+      "brief": "Preserve the current visual identity and layout while making the primary action reachable by keyboard; do not redesign or replace the workshop copy.",
+      "intent": "preserve",
+      "evidence": "Preserve the current visual identity and layout",
+      "acceptance": "Existing green accent, wordmark, course cards and copy remain; a visible focus indicator makes the existing action reachable."
+    }
+  ]
+}

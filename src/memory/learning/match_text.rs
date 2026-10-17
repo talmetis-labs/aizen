@@ -122,7 +122,7 @@ static PHRASES: Lazy<Vec<(Vec<&'static str>, &'static str)>> = Lazy::new(|| {
         (vec!["bien", "dich"], "build"),
     ];
     // Longest phrase first so `nguoi su dung` wins over `su dung`.
-    v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    v.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
     v
 });
 

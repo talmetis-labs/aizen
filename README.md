@@ -131,5 +131,6 @@ copyright notices, state your changes, and pass along the [NOTICE](NOTICE) file.
 patent grant (§3).
 
 "Aizen" and the logo are trademarks of the Aizen authors; §6 grants no trademark rights, so a fork
-must not present itself as Aizen. Releases up to v0.5.5 shipped under PolyForm Noncommercial;
-everything after is Apache-2.0.
+must not present itself as Aizen. Rebranding a fork is allowed — the code is yours — but it means
+following the checklist in [TRADEMARK.md](TRADEMARK.md), not running a find-and-replace. Releases up
+to v0.5.5 shipped under PolyForm Noncommercial; everything after is Apache-2.0.

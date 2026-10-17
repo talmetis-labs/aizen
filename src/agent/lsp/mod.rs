@@ -21,7 +21,6 @@
 //!   range (Serena-style), so the model never dumps the file or thrash-matches `old_string`.
 
 pub mod discovery;
-pub mod jobobject;
 pub mod server;
 pub mod tools;
 pub mod uri;
@@ -187,6 +186,10 @@ pub struct LspManager {
     /// Post-edit diagnostics jobs still running when their edit result went out. The loop drains
     /// them into the next tool result or the done gate — see [`take_ready_feedback`].
     pending_folds: Mutex<Vec<PendingFold>>,
+    /// Startup settlement charges for children THIS manager admitted. Shares the process-global
+    /// instance in production (LSP and MCP stdio pool one admission gate, so they must share one
+    /// classification); a test may hold a private instance to exercise the transition in isolation.
+    startup_unsettled: Arc<crate::agent::process::UnsettledOwnership>,
 }
 
 /// One post-edit diagnostics job that outran the inline wait.
@@ -225,7 +228,24 @@ impl LspManager {
             restarts: Mutex::new(HashMap::new()),
             diag_baseline: Mutex::new(HashMap::new()),
             pending_folds: Mutex::new(Vec::new()),
+            startup_unsettled: Arc::clone(&crate::agent::mcp::LOCAL_SIDECAR_UNSETTLED),
         }
+    }
+
+    /// A manager with its own settlement state, for tests that must exercise the charged→proven
+    /// transition without perturbing the process-global charges other tests share.
+    #[cfg(test)]
+    fn new_isolated() -> Self {
+        let mut manager = Self::new();
+        manager.startup_unsettled = Arc::new(crate::agent::process::UnsettledOwnership::new());
+        manager
+    }
+
+    /// Parent turn boundary must check this before new work, including lexical LSP fallbacks.
+    /// Checking never clears it by itself: a startup that handed a child to its monitor clears the
+    /// charge only when that monitor PROVES the tree exited (see `UnsettledOwnership`).
+    pub(crate) fn check_startup_effects(&self) -> Result<()> {
+        crate::agent::mcp::startup_effects_check(&self.startup_unsettled)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -254,6 +274,7 @@ impl LspManager {
     /// Turn LSP on for this session: build the dedicated runtime if needed. Idempotent. Does NOT
     /// spawn any server yet — servers start lazily on first use.
     pub fn enable(&self) -> Result<()> {
+        self.check_startup_effects()?;
         let mut guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let rt = Builder::new_multi_thread()
@@ -689,9 +710,14 @@ impl LspManager {
     /// Fire-and-forget server spawn (a throwaway OS thread carries the blocking handshake) so the
     /// NEXT edit's fold finds a live server. Never blocks the caller.
     fn warm_spawn(&self, spec: &'static discovery::ServerSpec, root: PathBuf) {
+        if self.check_startup_effects().is_err() {
+            return;
+        }
         let Ok(handle) = self.handle() else { return };
         let timeout = self.request_timeout();
         std::thread::spawn(move || {
+            // A failed warm start needs no bookkeeping here: the child it admitted carries its own
+            // settlement charge and clears it by itself once the monitor proves the tree exited.
             let _ = LSP.get_or_spawn(spec, &root, &handle, timeout);
         });
     }
@@ -705,6 +731,7 @@ impl LspManager {
         F: FnOnce(Arc<LspServer>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
+        self.check_startup_effects()?;
         if !self.is_enabled() {
             bail!("LSP is off — enable it with `/lsp on`");
         }
@@ -752,6 +779,7 @@ impl LspManager {
         handle: &Handle,
         timeout: Duration,
     ) -> Result<Arc<LspServer>> {
+        self.check_startup_effects()?;
         let key = format!("{}\0{}", spec.lang, root.display());
         {
             let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
@@ -788,13 +816,23 @@ impl LspManager {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let root_owned = root.to_path_buf();
+        let unsettled = Arc::clone(&self.startup_unsettled);
         handle.spawn(async move {
-            let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout).await;
+            // `spawn` owns the charge: it releases it on a live handshake and marks it failed on any
+            // startup failure. An abandoned observer therefore cannot bless an unowned child.
+            let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout, &unsettled).await;
             let _ = tx.send(r);
         });
-        let server = rx
-            .recv_timeout(init_timeout + Duration::from_secs(5))
-            .map_err(|_| anyhow!("LSP server did not start in time"))??;
+        let result = match rx.recv_timeout(init_timeout + Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => {
+                // The spawn future may still be running and still holds its charge; if it never
+                // resolves, the charge stays failed and blocks until the monitor proves tree exit.
+                return Err(crate::agent::mcp::startup_failure_without_settlement(
+                    anyhow!("{} language-server startup observer timed out/disconnected; physical settlement unproven", spec.lang), true));
+            }
+        };
+        let server = result?;
         let server = Arc::new(server);
         self.servers
             .lock()
@@ -1071,6 +1109,47 @@ fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_uncertainty_blocks_queries_and_clears_once_settlement_is_proven() {
+        let manager = LspManager::new_isolated();
+        assert!(manager.check_startup_effects().is_ok());
+        // A start still in flight must NOT block: somebody is awaiting it, so a slow cold index can
+        // never wedge the session.
+        let held: Arc<crate::agent::process::SettlementLifetime<u8>> =
+            Arc::new(crate::agent::process::SettlementLifetime::new(1, |_| {}));
+        let charge = manager.startup_unsettled.track(&held);
+        assert!(manager.check_startup_effects().is_ok());
+        // The start failed with no owner: now every LSP entry point refuses, and so does `enable`.
+        charge.mark_failed();
+        for _ in 0..2 {
+            let error = manager.check_startup_effects().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+                    .unwrap()
+                    .0,
+                crate::agent::tools::ToolEffectState::UnknownWorker
+            );
+        }
+        let error = manager
+            .references(Path::new("owned-no-project"), "symbol", false)
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some());
+        assert!(manager
+            .enable()
+            .unwrap_err()
+            .downcast_ref::<crate::agent::tools::ToolEffectsUnsettled>()
+            .is_some());
+        // Once the monitor proves the tree exited, LSP works again without restarting aizen — this is
+        // the whole point: a transient failed start must not poison the session.
+        held.prove_tree_settled();
+        assert!(manager.check_startup_effects().is_ok());
+        assert!(manager.enable().is_ok());
+        manager.disable();
+    }
 
     /// An absolute path spelled for the HOST platform: a drive path on Windows, POSIX elsewhere.
     ///

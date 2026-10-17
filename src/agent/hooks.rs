@@ -104,11 +104,16 @@ impl Context {
         }
     }
 
-    /// A tool body's view: the process cwd and the execution context seeded for this call.
+    /// A tool body's view: the workspace pinned for this call, not the process-global cwd.
     pub fn here(quiet: bool) -> Self {
+        let ctx = crate::core::exec_ctx::current();
         Self {
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            dispatch: crate::core::exec_ctx::current().and_then(|c| c.dispatch_label()),
+            cwd: ctx
+                .as_ref()
+                .and_then(|ctx| ctx.placement())
+                .map(|placement| placement.workspace_root().to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            dispatch: ctx.and_then(|ctx| ctx.dispatch_label()),
             quiet,
         }
     }
@@ -143,6 +148,18 @@ pub fn configured() -> Option<HooksConfig> {
         return None;
     }
     cli_config::load().hooks.filter(|h| !h.is_empty())
+}
+
+/// Speculation cannot safely run workspace hooks. Inspect configuration without executing it;
+/// an environment toggle is not a durable isolation policy.
+pub(crate) fn check_speculative_policy() -> anyhow::Result<()> {
+    if cli_config::load()
+        .hooks
+        .is_some_and(|hooks| !hooks.is_empty())
+    {
+        anyhow::bail!("speculative native execution is unavailable while lifecycle hooks are configured; use direct execution so guards/formatters run normally (no hooks were skipped)");
+    }
+    Ok(())
 }
 
 /// Run the matching `pre_tool` hooks for `tool`.
@@ -370,6 +387,15 @@ fn execute(
         error: None,
         elapsed_ms: 0,
     };
+    // Even a policy change after admission cannot smuggle a process through a native overlay.
+    if crate::core::exec_ctx::current().is_some_and(|ctx| ctx.overlay().is_some()) {
+        let reason =
+            "lifecycle hooks cannot execute inside a private native overlay; use direct execution";
+        out.decision = Some(Decision::Deny);
+        out.reason = Some(reason.to_string());
+        out.error = Some(reason.to_string());
+        return out;
+    }
     if run.is_empty() {
         out.error = Some("empty `run`".to_string());
         return out;
@@ -392,7 +418,7 @@ fn execute(
     .private_tmp(false)
     .wall_timeout(timeout)
     .extra_env(env);
-    let mut sbx = match crate::sandbox::runner::prepare_std(req) {
+    let sbx = match crate::sandbox::runner::prepare_std(req) {
         Ok(s) => s,
         Err(e) => {
             out.error = Some(format!("refused by the sandbox policy: {e}"));
@@ -401,20 +427,20 @@ fn execute(
         }
     };
     let bytes = serde_json::to_vec(input).unwrap_or_default();
-    let bounded = crate::core::proctree::output_bounded_with_input(
-        &mut sbx.command,
-        &bytes,
-        timeout,
-        DRAIN_GRACE,
-    );
-    sbx.finish(match &bounded {
-        Ok(o) if o.timed_out => crate::sandbox::runner::Outcome::Timeout,
-        Ok(o) => crate::sandbox::runner::Outcome::Exit(o.code),
-        Err(_) => crate::sandbox::runner::Outcome::SpawnFailed,
-    });
+    let bounded = sbx.output_bounded_with_input(&bytes, timeout, DRAIN_GRACE);
     out.elapsed_ms = started.elapsed().as_millis() as u64;
     match bounded {
-        Err(e) => out.error = Some(format!("could not start: {e}")),
+        Err(e) => out.error = Some(format!("could not complete: {e}")),
+        Ok(o)
+            if crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED
+                && o.settlement == crate::core::proctree::BoundedSettlement::Unknown =>
+        {
+            out.error =
+                Some("hook physical effects remain unproven; further agent work blocked".into());
+        }
+        Ok(o) if o.output_truncated => {
+            out.error = Some("hook output incomplete; no approval or context accepted".into());
+        }
         Ok(o) => {
             out.exit = o.code;
             out.timed_out = o.timed_out;

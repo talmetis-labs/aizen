@@ -170,10 +170,18 @@ fn safe_text(value: &str, max: usize) -> String {
         .collect()
 }
 
-/// Detail strings are free text — a provider error sentence can run 200+ chars and make a panel
-/// row wrap until the job label scrolls off the side. Panel rows carry the detail only as a short
-/// elided tail; the full text stays in the manifest / transcript.
-const ROW_DETAIL_MAX: usize = 72;
+/// Board label cap, in CHARS. The `/workflows` overlay is informational and wraps, so it can afford
+/// a whole brief; the sidebar's expanded rows get ONE line (they hard-clip), so anything past it is
+/// wasted — and a model that front-loads a 400-char prompt would otherwise drown the role that leads
+/// the label. Sized so a realistic brief survives intact: the panel is wide now, and a task name cut
+/// mid-sentence was the complaint that produced the old 44-char clip.
+pub(crate) const BOARD_SUBJECT_MAX: usize = 400;
+
+/// Detail strings are free text — a provider error sentence can run 200+ chars. The overlay wraps
+/// and is wide, so the detail is shown whole up to this generous bound; the hard cap only exists so
+/// a pathological string cannot push a row to hundreds of wrapped lines. The full text still stays
+/// in the manifest / transcript.
+const ROW_DETAIL_MAX: usize = 400;
 
 fn elide_detail(detail: &str, max: usize) -> String {
     let flat = safe_text(detail, usize::MAX);
@@ -574,6 +582,81 @@ pub fn note_step(id: u64, step: usize, tool: &str) {
     publish_panel();
 }
 
+/// Transport status is not an agent step. The caller throttles progress notifications; this
+/// updates only the in-memory panel, never a manifest write for every streamed fragment.
+pub(crate) fn note_transport(id: u64, sends: usize, stage: &str) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.live.iter_mut().find(|e| e.id == id) {
+        if e.phase == Phase::Running {
+            e.detail = format!("HTTP {sends}/3 · {stage}");
+        }
+    }
+    drop(g);
+    publish_panel();
+}
+
+/// Non-draining totals and a separate publication watermark for one physical dispatch.
+#[derive(Clone, Default)]
+pub(crate) struct DispatchUsage(std::sync::Arc<std::sync::Mutex<DispatchUsageState>>);
+
+#[derive(Default)]
+struct DispatchUsageState {
+    total: (u64, u64),
+    published: (u64, u64),
+    row: Option<u64>,
+}
+
+impl DispatchUsage {
+    pub(crate) fn bind(&self, row: u64) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.row.is_some_and(|bound| bound != row) {
+            return;
+        }
+        state.row = Some(row);
+        Self::publish(&mut state);
+    }
+
+    pub(crate) fn add(&self, input: u64, output: u64) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.total.0 = state.total.0.saturating_add(input);
+        state.total.1 = state.total.1.saturating_add(output);
+        Self::publish(&mut state);
+    }
+
+    fn publish(state: &mut DispatchUsageState) {
+        if let Some(row) = state.row {
+            add_usage(
+                row,
+                state.total.0.saturating_sub(state.published.0),
+                state.total.1.saturating_sub(state.published.1),
+            );
+            state.published = state.total;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn totals(&self) -> (u64, u64) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).total
+    }
+
+    pub(crate) fn finish(&self) -> (u64, u64) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Self::publish(&mut state);
+        state.total
+    }
+}
+
+/// Fold one finished model call's usage into the row — live, while the child is still running.
+/// Callers publish deltas; dispatch totals are kept separately and never drained.
+#[cfg(test)]
+pub fn note_usage(id: u64, tokens_in: u64, tokens_out: u64) {
+    let mut g = store().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.live.iter_mut().find(|e| e.id == id) {
+        e.tokens_in += tokens_in;
+        e.tokens_out += tokens_out;
+    }
+}
+
 /// Add a run's model tokens (input, output) to its row — live or already finished, since the
 /// runner sums them after the child's loop returns.
 pub fn add_usage(id: u64, tokens_in: u64, tokens_out: u64) {
@@ -640,6 +723,10 @@ pub fn live_count() -> usize {
 /// Compact `(handle, label, elapsed)` rows for every live run, for the sidebar's monitor section and
 /// the jobs panel. The handle is the typeable short form so `/workflows stop #3` works from what the
 /// panel shows. Ordered newest-last (the store's own order), which matches how runs start.
+///
+/// The label is elided to [`BOARD_SUBJECT_MAX`]+~48 chars of prefix: these surfaces print one row per
+/// line with no wrap, so an unelided full brief would push elapsed/handle off the right edge, while
+/// 160 chars still swallows any realistic task name whole.
 pub fn live_rows() -> Vec<(String, String, String)> {
     let g = store().lock().unwrap_or_else(|e| e.into_inner());
     g.live
@@ -652,7 +739,7 @@ pub fn live_rows() -> Vec<(String, String, String)> {
             };
             (
                 short_handle(e.id),
-                label,
+                elide_detail(&label, BOARD_SUBJECT_MAX + 48),
                 fmt_elapsed(e.started, e.finished),
             )
         })
@@ -988,6 +1075,19 @@ pub fn hud_chip() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn isolated_home() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::core::file_placement::tests::TestDir,
+        crate::core::config::EnvGuard,
+    ) {
+        let lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let env = crate::core::config::EnvGuard::set([("AIZEN_HOME", temp.path())]);
+        (lock, temp, env)
+    }
+
     /* The origin field must be invisible to everything that existed before it.
     Two directions, both load-bearing: a manifest written by an older aizen (or by any ordinary
     run today) has no `origin` key and must still parse, and a run with no origin must still
@@ -1019,6 +1119,7 @@ mod tests {
 
     #[test]
     fn track_lifecycle_and_format() {
+        let (_home, _temp, _env) = isolated_home();
         // Isolate: this process may already have history from other tests; just assert our rows appear.
         let w = start_workflow("review", 2);
         let wid = w.id();
@@ -1040,6 +1141,7 @@ mod tests {
 
     #[test]
     fn step_notes_and_usage_reach_the_row() {
+        let (_home, _temp, _env) = isolated_home();
         let t = start_task("daedalus · fix parser");
         let id = t.id();
         note_step(id, 7, "file_edit+shell_run");
@@ -1062,7 +1164,109 @@ mod tests {
     }
 
     #[test]
+    fn transport_progress_reports_sends_without_claiming_an_agent_step() {
+        let (_home, _temp, _env) = isolated_home();
+        let t = start_task("daedalus · fix parser");
+        let id = t.id();
+        note_transport(id, 2, "retry backoff");
+        let live = format_status();
+        assert!(live.contains("HTTP 2/3 · retry backoff"), "{live}");
+        assert!(!live.contains("step 2"), "{live}");
+        t.finish_ok("done");
+        // A terminal row is never rewritten by a late transport note.
+        note_transport(id, 3, "streaming");
+        assert!(!format_status().contains("HTTP 3/3"), "{}", format_status());
+    }
+
+    #[test]
+    fn dispatch_usage_keeps_totals_and_publishes_each_call_once() {
+        let (_home, _temp, _env) = isolated_home();
+        let track = start_task("usage parity");
+        let id = track.id();
+        let usage = DispatchUsage::default();
+        usage.add(100, 10);
+        usage.bind(id);
+        let retry = usage.clone();
+        retry.add(200, 20);
+        assert_eq!(usage.totals(), (300, 30));
+        assert_eq!(usage.finish(), (300, 30));
+        assert_eq!(usage.finish(), (300, 30));
+        usage.bind(id);
+        usage.add(40, 4); // output-contract repair is billed to the same physical dispatch
+        assert_eq!(usage.finish(), (340, 34));
+        {
+            let state = store().lock().unwrap_or_else(|e| e.into_inner());
+            let row = state.live.iter().find(|row| row.id == id).unwrap();
+            assert_eq!((row.tokens_in, row.tokens_out), (340, 34));
+        }
+        track.finish_ok("complete");
+        assert_eq!(usage.finish(), (340, 34));
+        let state = store().lock().unwrap_or_else(|e| e.into_inner());
+        let row = state.history.iter().find(|row| row.id == id).unwrap();
+        assert_eq!((row.tokens_in, row.tokens_out), (340, 34));
+        assert_eq!(DispatchUsage::default().finish(), (0, 0));
+    }
+
+    #[test]
+    fn note_usage_grows_a_live_row_without_a_finish() {
+        let (_home, _temp, _env) = isolated_home();
+        // The "what is it doing" number: a child mid-run must show its tokens climbing, not a row
+        // that reads 0 until the loop returns and `add_usage` lands.
+        let t = start_task("daedalus · live tokens");
+        let id = t.id();
+        note_usage(id, 4_000, 300);
+        let live = format_status();
+        assert!(live.contains("4000→300 tok"), "{live}");
+        // The fold ACCUMULATES — the chat closure zeroes its own tally at hand-over, so two calls
+        // add up rather than the second replacing the first.
+        note_usage(id, 4_000, 300);
+        let live = format_status();
+        assert!(live.contains("8000→600 tok"), "{live}");
+        t.finish_ok("done");
+        // Live rows only: a late live-note on a finished entry is dropped (the runner's final
+        // `add_usage` is the one that still lands on history).
+        note_usage(id, 9_999, 9_999);
+        let recent = format_status();
+        assert!(recent.contains("8000→600 tok"), "{recent}");
+        assert!(!recent.contains("17.9k"), "{recent}");
+    }
+
+    #[test]
+    fn the_board_label_carries_a_full_task_brief() {
+        let (_home, _temp, _env) = isolated_home();
+        // The complaint: a 44-char clip cut the task name mid-sentence, so `/workflows` showed
+        // `reviewer · Check src/agent/mod.rs for …` and nothing more. The panel wraps — give the
+        // row the whole brief (bounded by BOARD_SUBJECT_MAX against a model that front-loads a
+        // whole file into the prompt's first line).
+        let long_prompt = "Review the orchestration registry in src/agent/orchestration.rs and the \
+                           workflow runner in src/agent/workflow.rs for races between the store lock \
+                           and manifest persistence, then report each finding with a file:line";
+        let subject = crate::agent::subagent_subject(
+            &serde_json::json!({"prompt": long_prompt}),
+            BOARD_SUBJECT_MAX,
+        );
+        let t = start_workflow_child(None, "t1", format!("reviewer · {subject}"));
+        let live = format_status();
+        assert!(
+            live.contains("races between the store lock"),
+            "the middle of the brief survives: {live}"
+        );
+        t.finish_ok("done");
+        // And the clip is still bounded: a giant first line cannot produce a giant row.
+        let giant = "x".repeat(BOARD_SUBJECT_MAX * 3);
+        let clipped = crate::agent::subagent_subject(
+            &serde_json::json!({"prompt": giant}),
+            BOARD_SUBJECT_MAX,
+        );
+        // `first_line_clip` takes `max` chars and then appends the ellipsis (its convention at
+        // every call site), so a clipped brief is BOARD_SUBJECT_MAX + 1 chars, never more.
+        assert_eq!(clipped.chars().count(), BOARD_SUBJECT_MAX + 1);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
     fn drop_marks_aborted() {
+        let (_home, _temp, _env) = isolated_home();
         let id = {
             let t = start_task("planner");
             t.id()
@@ -1095,6 +1299,7 @@ mod tests {
 
     #[test]
     fn a_row_shows_the_handle_you_would_type_to_stop_it() {
+        let (_home, _temp, _env) = isolated_home();
         let t = start_task("coder · rewrite the parser");
         let handle = short_handle(t.id());
         let s = format_status();
@@ -1110,6 +1315,7 @@ mod tests {
 
     #[test]
     fn stop_by_handle_cancels_only_that_row() {
+        let (_home, _temp, _env) = isolated_home();
         let turn = crate::core::cancel::TurnCancel::new();
         let a = start_task("coder · task A");
         let b = start_task("coder · task B");
@@ -1130,6 +1336,7 @@ mod tests {
 
     #[test]
     fn a_numeric_handle_never_matches_by_prefix() {
+        let (_home, _temp, _env) = isolated_home();
         // `#3` must not also stop `#30`: ids are exact, only names are substring-matched.
         let t = start_task("coder · exact match check");
         let armed = crate::core::cancel::TurnCancel::new();
@@ -1143,6 +1350,7 @@ mod tests {
 
     #[test]
     fn a_matched_row_with_no_handle_is_reported_separately() {
+        let (_home, _temp, _env) = isolated_home();
         // Otherwise "0 cancelled" reads as "you typed the id wrong".
         let t = start_task("planner · unarmed row");
         let report = cancel_matching(&short_handle(t.id()));
@@ -1178,6 +1386,7 @@ mod tests {
 
     #[test]
     fn empty_status_is_helpful() {
+        let (_home, _temp, _env) = isolated_home();
         // Can't guarantee empty process-wide, but format_status must always be non-empty & mention multi-agent.
         let s = format_status();
         assert!(s.contains("Multi-agent"));
@@ -1185,16 +1394,16 @@ mod tests {
     }
 
     #[test]
-    fn a_long_error_detail_is_elided_to_one_panel_line() {
-        // The screenshot bug: "provider returned 7 empty response(s) in a row (HTTP 200 with no
-        // text and no tool call)…" wrapped the row until the job label scrolled off the side.
+    fn a_real_error_detail_is_shown_whole_and_only_a_pathological_one_is_bounded() {
+        let (_home, _temp, _env) = isolated_home();
+        // The old panel cut details at 72 chars and the row then clipped the rest, so a provider
+        // error read as a fragment. The overlay is wide and wraps now, so the real sentence — this
+        // exact one, ~180 chars — must survive intact.
         let long = "error: provider returned 7 empty response(s) in a row (HTTP 200 with no text \
                     and no tool call); the gateway answered but never said anything — check the \
                     wire log for the raw bytes";
-        let elided = elide_detail(long, ROW_DETAIL_MAX);
-        assert_eq!(elided.chars().count(), ROW_DETAIL_MAX);
-        assert!(elided.ends_with('…'));
-        assert!(elided.starts_with("error: provider"));
+        assert!(long.chars().count() < ROW_DETAIL_MAX);
+        assert_eq!(elide_detail(long, ROW_DETAIL_MAX), long);
 
         let t = start_task("coder · elide check");
         let id = t.id();
@@ -1204,9 +1413,15 @@ mod tests {
             .lines()
             .find(|l| l.contains("elide check"))
             .expect("row present");
-        assert!(!row.contains("wire log"), "the tail is cut: {row}");
-        assert!(row.contains('…'), "the cut is marked: {row}");
+        assert!(row.contains("wire log"), "the detail is shown whole: {row}");
+        assert!(!row.contains('…'), "nothing was cut: {row}");
         let _ = id;
+
+        // The bound still exists so one absurd string cannot produce hundreds of wrapped rows.
+        let giant = "y".repeat(ROW_DETAIL_MAX * 2);
+        let elided = elide_detail(&giant, ROW_DETAIL_MAX);
+        assert_eq!(elided.chars().count(), ROW_DETAIL_MAX);
+        assert!(elided.ends_with('…'));
     }
 
     #[test]

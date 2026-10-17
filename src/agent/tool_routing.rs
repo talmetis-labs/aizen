@@ -234,8 +234,10 @@ impl Group {
             }
             Group::Delegation => {
                 "hand a child ONE complete, self-contained job and get back only its result. Fan out \
-                 when angles, subsystems or file groups are genuinely independent; keep writers \
-                 singular on a shared working tree. A child cannot delegate further."
+                 when angles, subsystems or file groups are genuinely independent. Independent editors \
+                 need exact, disjoint write_paths for parallel native edits; same-file, shell/build and \
+                 unrestricted work stay serial. Parent consolidates and verifies; no child restore/undo \
+                 or further delegation."
             }
             Group::Coordination => {
                 "other windows may be editing this repository right now; check before a wide change."
@@ -277,8 +279,8 @@ impl Group {
 /// routing map are both views over it, which is what stops the config bundles and the prompt from
 /// disagreeing about what a tool is.
 pub fn lane_for(name: &str) -> Option<Lane> {
-    // `tool_search` discovers DEFERRED MCP tools, so it lives (and is config-filtered) with them:
-    // disabling the `mcp` bundle removes the door along with the rooms.
+    // Catalog classification stays MCP-compatible; toolsets rebuilds the discovery door from
+    // remaining entries, including enabled deferred built-ins, after filtering.
     if name.starts_with("mcp_") || name == "tool_search" {
         return Some(Lane::Mcp);
     }
@@ -287,20 +289,30 @@ pub fn lane_for(name: &str) -> Option<Lane> {
             Lane::MemoryRead
         }
         "memory_save" | "memory_update" | "memory_forget" => Lane::MemoryWrite,
-        "file_read" | "file_glob" | "search_files" => Lane::FileRead,
+        "file_read" | "file_glob" | "search_files" | "image_read" | "reference_read" => {
+            Lane::FileRead
+        }
+        "reference_compare" | "reference_trace" => Lane::Todo,
         "file_edit" | "file_write" | "file_move" => Lane::FileWrite,
         "shell_run" => Lane::Shell,
         "process" => Lane::Process,
         "web_search" | "web_fetch" | "web_crawl" => Lane::Web,
-        "browser_navigate" | "browser_snapshot" | "browser_click" | "browser_type"
-        | "browser_eval" => Lane::Browser,
+        "browser_navigate"
+        | "browser_snapshot"
+        | "browser_click"
+        | "browser_type"
+        | "browser_eval"
+        | "browser_set_viewport"
+        | "browser_screenshot" => Lane::Browser,
         "skill_load" | "skill_save" | "skill_refine" | "skill_forget" | "skill_search"
         | "skill_install" => Lane::Skills,
         "task" | "workflow" => Lane::Delegation,
         "team_status" => Lane::Coordination,
-        "todo_write" | "goal_complete" => Lane::Todo,
+        "todo_write" | "goal_complete" | "design_brief" | "design_guide" | "design_review" => {
+            Lane::Todo
+        }
         "clarify" => Lane::Clarify,
-        "checkpoint" | "checkpoint_view" => Lane::Checkpoint,
+        "checkpoint" | "checkpoint_view" | "native_owner_undo" => Lane::Checkpoint,
         "telegram_send" | "telegram_ask" | "bot_admin" | "notify" => Lane::Messaging,
         "persona_create" => Lane::Persona,
         // `git_inspect` is read-only repo intel (status/log/diff/blame), not command execution —
@@ -400,6 +412,15 @@ fn render(names: &[String]) -> String {
     out
 }
 
+/// The routing sentence shared by the five search tools — a macro so each `description()` can
+/// `concat!` it into its `&'static str`.
+#[macro_export]
+macro_rules! search_routing {
+    () => {
+        " Routing: NAME→file_glob · CONTENT regex→search_files · CONCEPT→codebase_search · SYMBOL name→lsp_workspace_symbol · symbol BODY→read_symbol."
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +444,20 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn reference_tools_use_existing_scoped_file_and_design_lanes() {
+        assert_eq!(lane_for("reference_read"), Some(Lane::FileRead));
+        assert_eq!(lane_for("reference_compare"), Some(Lane::Todo));
+        assert_eq!(lane_for("reference_trace"), Some(Lane::Todo));
+        let surface = names(&["reference_read", "reference_compare", "reference_trace"]);
+        let map = routing_map(&surface).unwrap();
+        assert_eq!(backticked(&map), surface);
+        assert!(map.contains(Group::Discovery.label()));
+        assert!(map.contains(Group::Planning.label()));
+        assert!(!map.contains(Group::Other.label()));
+        assert!(!map.contains("browser_screenshot"));
     }
 
     #[test]
@@ -620,13 +655,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The routing sentence shared by the five search tools — a macro so each `description()` can
-/// `concat!` it into its `&'static str`.
-#[macro_export]
-macro_rules! search_routing {
-    () => {
-        " Routing: NAME→file_glob · CONTENT regex→search_files · CONCEPT→codebase_search · SYMBOL name→lsp_workspace_symbol · symbol BODY→read_symbol."
-    };
 }

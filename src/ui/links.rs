@@ -22,6 +22,129 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+
+/// One shared physical budget for transcript painting and post-draw overprinting. The last
+/// column belongs to the scrollbar, even in a pane too small to hold any text.
+pub(crate) fn transcript_content_width(width: u16) -> u16 {
+    width.saturating_sub(1)
+}
+
+/// Measure whole extended graphemes, just like the wrapper and ratatui's text cells.
+pub(crate) fn display_width(text: &str) -> usize {
+    text.graphemes(true).map(console::measure_text_width).sum()
+}
+
+/// Keep only the numeric SGR dialect understood by the retained painter. Consume entire control
+/// strings (OSC/DCS/APC/PM/SOS), including their payload, rather than leaking it as visible text.
+pub(crate) fn sanitize_sgr(input: &str) -> String {
+    fn control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, osc: bool) {
+        while let Some(c) = chars.next() {
+            if c == '\u{009c}' || (osc && c == '\x07') {
+                break;
+            }
+            if c == '\x1b' && chars.peek() == Some(&'\\') {
+                chars.next();
+                break;
+            }
+        }
+    }
+    fn csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+        let mut params = String::new();
+        for c in chars.by_ref() {
+            if ('\u{0040}'..='\u{007e}').contains(&c) {
+                if c == 'm' && params.chars().all(|p| p.is_ascii_digit() || p == ';') {
+                    out.push_str("\x1b[");
+                    out.push_str(&params);
+                    out.push('m');
+                }
+                break;
+            }
+            params.push(c);
+        }
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => csi(&mut chars, &mut out),
+                Some(']') => control_string(&mut chars, true),
+                Some('P' | 'X' | '^' | '_') => control_string(&mut chars, false),
+                Some(c) if (' '..='/').contains(&c) => {
+                    while chars.peek().is_some_and(|c| (' '..='/').contains(c)) {
+                        chars.next();
+                    }
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\u{009b}' => csi(&mut chars, &mut out),
+            '\u{009d}' => control_string(&mut chars, true),
+            '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => control_string(&mut chars, false),
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if !c.is_control() => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A complete printable grapheme, including SGR changes embedded between its codepoints. `prefix`
+/// replays the style in force before it, so a slice or a wrapped continuation can stand alone.
+pub(crate) struct SgrGlyph {
+    pub text: String,
+    pub raw: String,
+    pub prefix: String,
+    pub width: usize,
+}
+
+pub(crate) fn sgr_glyphs(input: &str) -> (Vec<SgrGlyph>, String) {
+    let safe = sanitize_sgr(input);
+    let mut plain = String::with_capacity(safe.len());
+    let mut events = Vec::new();
+    let mut rest = safe.as_str();
+    while let Some(i) = rest.find("\x1b[") {
+        plain.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let end = rest.find('m').expect("sanitized SGR terminator") + 1;
+        events.push((plain.len(), rest[..end].to_string()));
+        rest = &rest[end..];
+    }
+    plain.push_str(rest);
+    let mut events = events.into_iter().peekable();
+    let mut active = String::new();
+    let mut glyphs = Vec::new();
+    for (start, text) in plain.grapheme_indices(true) {
+        let end = start + text.len();
+        let prefix = active.clone();
+        let mut raw = String::new();
+        let mut at = start;
+        while events.peek().is_some_and(|(pos, _)| *pos < end) {
+            let (pos, seq) = events.next().unwrap();
+            raw.push_str(&plain[at..pos]);
+            raw.push_str(&seq);
+            // A leading full reset makes earlier history irrelevant. Keep compound sequences
+            // intact: zeroes inside an RGB colour are NOT reset parameters.
+            let params = &seq[2..seq.len() - 1];
+            if params.is_empty() || params.split(';').next() == Some("0") {
+                active.clear();
+            }
+            active.push_str(&seq);
+            at = pos;
+        }
+        raw.push_str(&plain[at..end]);
+        glyphs.push(SgrGlyph {
+            text: text.to_string(),
+            raw,
+            prefix,
+            width: console::measure_text_width(text),
+        });
+    }
+    let trailing = events.map(|(_, seq)| seq).collect::<String>();
+    (glyphs, trailing)
+}
 
 /// A detected hyperlink span within a plain-text row.
 #[derive(Debug, Clone)]
@@ -39,6 +162,93 @@ pub struct LinkSpan {
     /// needs to see to trust the scan.
     #[allow(dead_code)]
     pub text: String,
+}
+
+/// A placement-bound alias in a tool target. Offsets are UTF-8 boundaries in `text`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DisplayTarget {
+    pub text: String,
+    pub paths: Vec<(
+        std::ops::Range<usize>,
+        crate::core::file_placement::DisplayPath,
+    )>,
+}
+
+/// One painted fragment of an alias, aligned with the exact wrapped row and frame.
+#[derive(Clone, Debug)]
+pub(crate) struct PathFragment {
+    pub id: (u64, usize),
+    pub span: LinkSpan,
+    pub actual: PathBuf,
+    pub first: bool,
+    pub last: bool,
+}
+
+pub(crate) fn wrap_path_fragments(
+    rows: &[String],
+    start: usize,
+    display: &DisplayTarget,
+    seq: u64,
+) -> Vec<Vec<PathFragment>> {
+    let mut result = vec![Vec::new(); rows.len()];
+    let Some(target_end) = start.checked_add(display.text.len()) else {
+        return result;
+    };
+    // Sanitization or a narrow-pane glyph substitution must not move an alias onto other text.
+    let mut header = String::new();
+    for row in rows {
+        header.push_str(row);
+        if header.len() >= target_end {
+            break;
+        }
+    }
+    if header.get(start..target_end) != Some(display.text.as_str()) {
+        return result;
+    }
+    let mut offset = 0;
+    for (row, fragments) in rows.iter().zip(&mut result) {
+        let end = offset + row.len();
+        for (index, (range, path)) in display.paths.iter().enumerate() {
+            if display.text.get(range.clone()) != Some(path.label()) {
+                continue;
+            }
+            let a = start + range.start;
+            let b = start + range.end;
+            let lo = a.max(offset);
+            let hi = b.min(end);
+            if lo >= hi {
+                continue;
+            }
+            let Some(text) = row.get(lo - offset..hi - offset) else {
+                continue;
+            };
+            let Some(url) = file_url(path.actual()).filter(|url| {
+                !url.chars().any(char::is_control)
+                    && url::Url::parse(url)
+                        .ok()
+                        .is_some_and(|url| url.host_str().is_none())
+            }) else {
+                continue;
+            };
+            fragments.push(PathFragment {
+                id: (seq, index),
+                span: LinkSpan {
+                    col: display_width(&row[..lo - offset]),
+                    width: display_width(text),
+                    text: text.to_owned(),
+                    url,
+                },
+                actual: path.actual().to_path_buf(),
+                first: lo == a,
+                last: hi == b,
+            });
+        }
+        offset = end;
+        if offset >= start + display.text.len() {
+            break;
+        }
+    }
+    result
 }
 
 /// What a shape-scan matched, before anything has been checked against the filesystem.
@@ -222,7 +432,10 @@ fn is_unc(p: &str) -> bool {
 }
 
 fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\' | ':')
+    c.is_alphanumeric()
+        || matches!(c, '_' | '-' | '.' | '/' | '\\' | ':')
+        || (!c.is_control() && console::measure_text_width(&c.to_string()) == 0)
+        || ('\u{1f000}'..='\u{1faff}').contains(&c)
 }
 
 /// Known source/config file extensions that should be linkified.
@@ -332,10 +545,7 @@ fn file_url(abs: &Path) -> Option<String> {
 
 /// Compute the display-cell column of `chars[idx]` (sum of char widths before it).
 fn display_col(chars: &[char], idx: usize) -> usize {
-    chars[..idx.min(chars.len())]
-        .iter()
-        .map(|c| console::measure_text_width(&c.to_string()).max(1))
-        .sum()
+    display_width(&chars[..idx.min(chars.len())].iter().collect::<String>())
 }
 
 // ── wrapped-link rejoin ─────────────────────────────────────────────────────────────────────────
@@ -369,38 +579,39 @@ fn strip_continuation_prefix(row: &str) -> (usize, &str) {
     (skipped, rest)
 }
 
-/// Does `row` continue a link that ran off the end of the previous row?
-///
-/// Requires the row to open with non-break characters. `content_width` fullness is checked on the
-/// PREVIOUS row by the caller — a row that merely happens to be full is not a wrap unless the next
-/// row starts mid-token.
-fn continuation_chunk(row: &str) -> Option<(usize, usize, String)> {
-    let (skipped_bytes, rest) = strip_continuation_prefix(row);
-    let first = rest.chars().next()?;
-    if is_url_break(first) {
-        return None;
+fn row_continues(row: &str, next: &str, content_width: usize) -> bool {
+    if content_width == 0
+        || content_width == usize::MAX
+        || row.chars().last().is_none_or(is_url_break)
+    {
+        return false;
     }
-    let chunk: String = rest.chars().take_while(|c| !is_url_break(*c)).collect();
-    if chunk.is_empty() {
-        return None;
+    let (_, rest) = strip_continuation_prefix(next);
+    let Some(first) = rest.graphemes(true).next() else {
+        return false;
+    };
+    if first.chars().any(is_url_break)
+        || first
+            .chars()
+            .any(|c| matches!(c, '└' | '│' | '◆' | '▸' | '→' | '✓' | '✗'))
+        || rest.starts_with("https://")
+        || rest.starts_with("http://")
+    {
+        return false;
     }
-    let start_char = row[..skipped_bytes].chars().count();
-    let n = chunk.chars().count();
-    Some((start_char, start_char + n, chunk))
+    // A new absolute path is a separate token, not an arbitrary URL suffix. A wrapped token
+    // beginning with '/' still joins unless it carries a complete independent scheme/drive.
+    let chars: Vec<char> = rest.chars().take(3).collect();
+    if chars.len() == 3 && chars[0].is_ascii_alphabetic() && chars[1] == ':' {
+        return false;
+    }
+    let used = display_width(row);
+    used <= content_width && content_width - used < console::measure_text_width(first)
 }
 
-/// Was this row hard-split by the wrapper? `char_chunks` cuts a long token at exactly the column
-/// budget with no hyphen, so a wrapped row runs right up to the edge. A row that ends short ended
-/// because the text ended — nothing was carried over.
-fn row_is_full(row: &str, content_width: usize) -> bool {
-    content_width > 0 && console::measure_text_width(row) + 1 >= content_width
-}
-
-/// Find every link in `plain_rows[lo..hi]`, joining URLs that the renderer wrapped across rows.
-///
-/// A wrapped URL used to become two links, BOTH wrong: the first pointed at a truncated URL, the
-/// second at `file:///<tail>`. Here the pieces are concatenated, resolved once, and the resulting
-/// URL is attached to every visible piece — so clicking either half opens the right page.
+/// Find links in a rendered window. Scan joined hard-wrap runs BEFORE shape detection: a path's
+/// extension (or even a URL's scheme in a tiny pane) may be several rows beyond its first piece.
+/// All fragments share the complete URI, and are emitted only for rows in the requested window.
 pub fn scan_window_with(
     plain_rows: &[String],
     lo: usize,
@@ -409,67 +620,69 @@ pub fn scan_window_with(
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Vec<RowLink> {
     let hi = hi.min(plain_rows.len());
-    let mut out = Vec::new();
+    let lo = lo.min(hi);
+    if lo == hi {
+        return Vec::new();
+    }
     let mut row = lo;
+    while row > 0 && row_continues(&plain_rows[row - 1], &plain_rows[row], content_width) {
+        row -= 1;
+    }
+    let mut out = Vec::new();
     while row < hi {
-        let text = &plain_rows[row];
-        let chars: Vec<char> = text.chars().collect();
-        for cand in scan_row_shapes(text) {
-            let head: String = chars[cand.start..cand.end.min(chars.len())]
-                .iter()
-                .collect();
-            // Only a candidate that runs to the very end of a FULL row can have been wrapped.
-            let touches_end = cand.end >= chars.len();
-            let mut pieces: Vec<(usize, usize, usize, String)> =
-                vec![(row, cand.start, cand.end, head.clone())];
-            let mut joined = head.clone();
-            if touches_end && row_is_full(text, content_width) {
-                let mut next = row + 1;
-                while next < plain_rows.len() {
-                    let Some((s, e, chunk)) = continuation_chunk(&plain_rows[next]) else {
-                        break;
-                    };
-                    joined.push_str(&chunk);
-                    let ends_at_edge = e >= plain_rows[next].chars().count()
-                        && row_is_full(&plain_rows[next], content_width);
-                    pieces.push((next, s, e, chunk));
-                    next += 1;
-                    if !ends_at_edge {
-                        break;
-                    }
-                }
-            }
-            let full = trim_link_tail(&joined).to_string();
+        let mut joined = plain_rows[row].clone();
+        // (row, start char in joined run, chars skipped at that row's gutter, length)
+        let mut pieces = vec![(row, 0usize, 0usize, joined.chars().count())];
+        let mut next = row + 1;
+        while next < plain_rows.len()
+            && row_continues(&plain_rows[next - 1], &plain_rows[next], content_width)
+        {
+            let (skip, rest) = strip_continuation_prefix(&plain_rows[next]);
+            let start = joined.chars().count();
+            let skipped = plain_rows[next][..skip].chars().count();
+            let len = rest.chars().count();
+            joined.push_str(rest);
+            pieces.push((next, start, skipped, len));
+            next += 1;
+        }
+        let chars: Vec<char> = joined.chars().collect();
+        for cand in scan_row_shapes(&joined) {
+            let full: String = chars[cand.start..cand.end].iter().collect();
             let url = match cand.kind {
-                CandidateKind::Url => full.clone(),
+                CandidateKind::Url => full,
                 CandidateKind::Path => match resolve(strip_line_suffix(&full))
                     .as_deref()
                     .and_then(file_url)
                 {
-                    Some(u) => u,
+                    Some(url) => url,
                     None => continue,
                 },
             };
-            // Every piece gets the SAME url, so either half of a wrapped link opens the same target.
-            for (prow, s, e, piece_text) in pieces {
+            for &(prow, begin, skipped, len) in &pieces {
                 if prow < lo || prow >= hi {
                     continue;
                 }
-                let prow_chars: Vec<char> = plain_rows[prow].chars().collect();
-                let col = display_col(&prow_chars, s);
-                let width = display_col(&prow_chars, e) - col;
+                let from = cand.start.max(begin);
+                let to = cand.end.min(begin + len);
+                if from >= to {
+                    continue;
+                }
+                let row_chars: Vec<char> = plain_rows[prow].chars().collect();
+                let s = skipped + from - begin;
+                let e = skipped + to - begin;
+                let col = display_col(&row_chars, s);
                 out.push(RowLink {
                     row: prow,
                     span: LinkSpan {
                         col,
-                        width,
+                        width: display_col(&row_chars, e).saturating_sub(col),
                         url: url.clone(),
-                        text: piece_text,
+                        text: row_chars[s..e].iter().collect(),
                     },
                 });
             }
         }
-        row += 1;
+        row = next;
     }
     out
 }
@@ -485,10 +698,11 @@ pub fn osc8(url: &str, text: &str) -> String {
 /// Does the cell range `[x, x+w)` on screen row `y` fall inside any occluding rect?
 fn occluded(rects: &[ratatui::layout::Rect], x: u16, y: u16, w: u16) -> bool {
     rects.iter().any(|r| {
-        y >= r.y
-            && y < r.y.saturating_add(r.height)
-            && x < r.x.saturating_add(r.width)
-            && x.saturating_add(w) > r.x
+        let (x, y, w) = (usize::from(x), usize::from(y), usize::from(w));
+        y >= usize::from(r.y)
+            && y < usize::from(r.y) + usize::from(r.height)
+            && x < usize::from(r.x) + usize::from(r.width)
+            && x + w > usize::from(r.x)
     })
 }
 
@@ -524,11 +738,22 @@ pub struct InjectCtx {
 ///
 /// We use `MoveTo` + `Print` (raw crossterm) via `backend_mut()` — exactly like the screensaver
 /// blitter — so ratatui's cell model is never disturbed.
+#[cfg(test)]
 pub fn inject_hyperlinks<W: std::io::Write>(
     out: &mut W,
     sgr_rows: &[String],
     plain_rows: &[String],
     ctx: &InjectCtx,
+) {
+    inject_hyperlinks_with_paths(out, sgr_rows, plain_rows, ctx, &[]);
+}
+
+pub(crate) fn inject_hyperlinks_with_paths<W: std::io::Write>(
+    out: &mut W,
+    sgr_rows: &[String],
+    plain_rows: &[String],
+    ctx: &InjectCtx,
+    paths: &[Vec<PathFragment>],
 ) {
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
@@ -543,6 +768,11 @@ pub fn inject_hyperlinks<W: std::io::Write>(
         rows_offset,
     } = ctx;
     let (start, visible, area, base) = (*start, *visible, *area, *rows_offset);
+    let visible = visible.min(usize::from(area.height));
+    let content_width = usize::from(transcript_content_width(area.width));
+    if visible == 0 || content_width == 0 {
+        return;
+    }
 
     // Scan a window that reaches past both edges of the viewport so a URL wrapped across the top or
     // bottom boundary is still joined into one link (`scan_window_with` needs the off-screen half).
@@ -556,13 +786,30 @@ pub fn inject_hyperlinks<W: std::io::Write>(
     // Mirror `draw_transcript`'s content budget exactly: the scrollbar overlays the rightmost
     // column, so content gets `width - 1`. A wider assumption here would join/split wrapped URLs
     // one cell off from how the painter wrapped them.
-    let content_width = area.width.saturating_sub(1).max(8) as usize;
-    let links = scan_window_with(plain_rows, lo, hi, content_width, &resolve_path);
+    let mut links = scan_window_with(plain_rows, lo, hi, content_width, &resolve_path);
+    links.retain(|link| {
+        !paths.get(link.row).is_some_and(|fragments| {
+            fragments.iter().any(|p| {
+                link.span.col < p.span.col + p.span.width
+                    && p.span.col < link.span.col + link.span.width
+            })
+        })
+    });
+    for (row, fragments) in paths.iter().enumerate().take(hi).skip(lo) {
+        links.extend(fragments.iter().map(|path| RowLink {
+            row,
+            span: path.span.clone(),
+        }));
+    }
 
     let mut wrote = false;
     for link in &links {
         // Rows outside the viewport were only scanned for context — they have no screen position.
-        let Some(screen_row) = (link.row + base).checked_sub(start) else {
+        let Some(screen_row) = link
+            .row
+            .checked_add(base)
+            .and_then(|row| row.checked_sub(start))
+        else {
             continue;
         };
         if screen_row >= visible {
@@ -572,17 +819,34 @@ pub fn inject_hyperlinks<W: std::io::Write>(
             continue;
         };
         let span = &link.span;
-        let y = area.y + screen_row as u16;
-        let x = area.x + span.col as u16;
-        if x >= area.x + area.width {
+        if span.col >= content_width || span.url.chars().any(char::is_control) {
             continue;
         }
-        let w = (span.width as u16).min(area.x + area.width - x);
-        if occluded(occluders, x, y, w.max(1)) {
+        let Some(y) = usize::from(area.y)
+            .checked_add(screen_row)
+            .and_then(|y| u16::try_from(y).ok())
+        else {
+            continue;
+        };
+        let Some(x) = usize::from(area.x)
+            .checked_add(span.col)
+            .and_then(|x| u16::try_from(x).ok())
+        else {
+            continue;
+        };
+        // The scrollbar and sidebar are outside this budget. Keep the full URI in OSC8 metadata,
+        // but NEVER use the original (possibly overlong) span width for the raw printable slice.
+        let w = span.width.min(content_width - span.col);
+        let coloured_text = extract_sgr_slice(sgr, span.col, w);
+        let printed_w = display_width(console::strip_ansi_codes(&coloured_text).as_ref());
+        if printed_w == 0
+            || usize::from(x)
+                .checked_add(printed_w)
+                .is_none_or(|end| end > usize::from(u16::MAX))
+            || occluded(occluders, x, y, printed_w as u16)
+        {
             continue;
         }
-        // Extract the SGR-bearing slice for this display column range.
-        let coloured_text = extract_sgr_slice(sgr, span.col, span.width);
         let linked = osc8(&span.url, &coloured_text);
         let _ = queue!(out, MoveTo(x, y), Print(&linked));
         wrote = true;
@@ -596,60 +860,71 @@ pub fn inject_hyperlinks<W: std::io::Write>(
     let _ = out.flush();
 }
 
-/// Extract the portion of an SGR string that covers display columns `[col, col+width)`.
-/// We walk the string char by char (skipping SGR escape sequences) tracking the display column,
-/// and reconstruct the substring including any SGR codes it carries.
+/// Slice only complete graphemes in `[col, col+width)`, replaying the style active at the first
+/// glyph. The final reset prevents raw post-draw colour from leaking into the next terminal write.
 fn extract_sgr_slice(sgr: &str, col: usize, width: usize) -> String {
+    let Some(end) = col.checked_add(width) else {
+        return String::new();
+    };
+    if width == 0 {
+        return String::new();
+    }
+    let (glyphs, _) = sgr_glyphs(sgr);
     let mut out = String::new();
-    let mut display_pos = 0usize;
-    let mut in_range = false;
-    let mut chars = sgr.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        // SGR escape: \x1b[ ... m  — copy through if we are in-range (preserves colour)
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            let mut seq = String::from("\x1b[");
-            chars.next(); // consume '['
-            let mut final_byte = None;
-            while let Some(&pc) = chars.peek() {
-                chars.next();
-                seq.push(pc);
-                if pc.is_ascii_alphabetic() {
-                    final_byte = Some(pc);
-                    break;
+    let mut pos = 0usize;
+    let mut started = false;
+    for glyph in glyphs {
+        if glyph.text == "\n" {
+            break;
+        }
+        let next = pos.saturating_add(glyph.width);
+        if pos < col {
+            if next > col {
+                // Starting halfway through a wide glyph would shift later glyphs to the wrong cell.
+                return String::new();
+            }
+        } else if next > end {
+            break;
+        } else if glyph.width > 0 || started {
+            if !started {
+                if pos != col {
+                    return String::new();
                 }
+                out.push_str(&glyph.prefix);
+                started = true;
             }
-            if final_byte == Some('m') && in_range {
-                out.push_str(&seq);
-            }
-            continue;
+            out.push_str(&glyph.raw);
         }
-
-        let cw = console::measure_text_width(&c.to_string()).max(1);
-        let next_pos = display_pos + cw;
-
-        if display_pos >= col && display_pos < col + width {
-            if !in_range {
-                in_range = true;
-            }
-            out.push(c);
-        } else if in_range {
-            // past the end
-            break;
-        }
-
-        display_pos = next_pos;
-        if display_pos >= col + width {
-            break;
-        }
+        pos = next;
     }
-
-    if out.is_empty() {
-        // fallback: use the plain col slice
-        out
-    } else {
-        out
+    if started {
+        out.push_str("\x1b[0m");
     }
+    out
+}
+
+/// Decode our captured post-draw stream for geometry assertions. OSC metadata has zero width;
+/// tests must inspect the printable payload rather than mistaking a safe ratatui buffer for proof.
+#[cfg(test)]
+pub(crate) fn captured_links(bytes: &[u8]) -> Vec<(usize, usize, String, String)> {
+    let raw = std::str::from_utf8(bytes).expect("UTF-8 terminal writes");
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("\x1b]8;;") {
+        let before = &rest[..start];
+        let cursor = before.rsplit("\x1b[").next().unwrap();
+        let (y, x) = cursor.trim_end_matches('H').split_once(';').unwrap();
+        let (y, x) = (
+            y.parse::<usize>().unwrap() - 1,
+            x.parse::<usize>().unwrap() - 1,
+        );
+        rest = &rest[start + 5..];
+        let (uri, tail) = rest.split_once("\x1b\\").unwrap();
+        let (payload, tail) = tail.split_once("\x1b]8;;\x1b\\").unwrap();
+        out.push((x, y, uri.to_string(), payload.to_string()));
+        rest = tail;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -872,7 +1147,7 @@ mod tests {
         let url = "https://example.com/a/very/long/path/that/keeps/going/final.html";
         let rows = hard_wrap(url, 30);
         assert!(rows.len() >= 2, "test needs a real wrap: {rows:?}");
-        let area = Rect::new(0, 0, 32, 8);
+        let area = Rect::new(0, 0, 31, 8);
         let mut out: Vec<u8> = Vec::new();
         inject_hyperlinks(
             &mut out,
@@ -969,6 +1244,227 @@ mod tests {
             s.ends_with("\x1b[22;8H"),
             "must end by parking the caret back: {s:?}"
         );
+    }
+
+    #[test]
+    fn raw_injection_clips_before_scrollbar_and_keeps_full_uri_and_style() {
+        let uri = format!("https://example.com/{}", "long/".repeat(35));
+        let row = format!("界e\u{301} {uri}");
+        let sgr = format!("\x1b[38;2;12;0;90m{row}\x1b[0m");
+        let mut out = Vec::new();
+        inject_hyperlinks(
+            &mut out,
+            &[sgr],
+            &[row],
+            &InjectCtx {
+                area: ratatui::layout::Rect::new(7, 5, 42, 2),
+                visible: usize::MAX,
+                caret: Some((3, 20)),
+                ..Default::default()
+            },
+        );
+        let links = captured_links(&out);
+        assert_eq!(links.len(), 1);
+        let (x, y, url, text) = &links[0];
+        assert_eq!((*x, *y), (11, 5), "combining mark is not an extra column");
+        assert_eq!(url, &uri, "metadata must not be clipped");
+        assert!(
+            text.starts_with("\x1b[38;2;12;0;90m"),
+            "active style replay: {text:?}"
+        );
+        assert!(text.ends_with("\x1b[0m"), "raw style must end here");
+        assert!(*x + display_width(console::strip_ansi_codes(text).as_ref()) <= 7 + 41);
+        assert!(std::str::from_utf8(&out).unwrap().ends_with("\x1b[21;4H"));
+    }
+
+    #[test]
+    fn raw_slice_preserves_complete_graphemes_and_rejects_controls() {
+        let text = "\x1b[31mae\x1b[1m\u{301}界👩‍💻Z\x1b[0m";
+        let slice = extract_sgr_slice(text, 1, 1);
+        assert_eq!(console::strip_ansi_codes(&slice), "e\u{301}");
+        assert!(slice.starts_with("\x1b[31m"));
+        assert!(slice.ends_with("\x1b[0m"));
+        let glyphs = "e\u{301}界👩‍💻Z";
+        for width in 0..=display_width(glyphs) {
+            let slice = extract_sgr_slice(glyphs, 0, width);
+            let plain = console::strip_ansi_codes(&slice);
+            assert!(display_width(&plain) <= width, "{width}: {slice:?}");
+            assert!(!plain.ends_with('\u{200d}'));
+        }
+        assert!(extract_sgr_slice("界x", 1, 2).is_empty());
+        assert!(extract_sgr_slice("abc", usize::MAX, 1).is_empty());
+        let dirty = "\x1b]8;;https://evil.invalid\x07ok\x1b]8;;\x1b\\\x1b[2J\x1bPsecret\x1b\\!";
+        assert_eq!(
+            console::strip_ansi_codes(&extract_sgr_slice(dirty, 0, 4)),
+            "ok!"
+        );
+        assert_eq!(sanitize_sgr("ok\x1b]unfinished payload"), "ok");
+    }
+
+    #[test]
+    fn raw_wide_glyph_never_crosses_the_clip_boundary() {
+        let row = "https://example.com/界suffix".to_string();
+        let prefix_w = display_width("https://example.com/");
+        let mut out = Vec::new();
+        inject_hyperlinks(
+            &mut out,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&row),
+            &InjectCtx {
+                area: ratatui::layout::Rect::new(4, 2, (prefix_w + 2) as u16, 1),
+                visible: 50,
+                ..Default::default()
+            },
+        );
+        let links = captured_links(&out);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            console::strip_ansi_codes(&links[0].3),
+            "https://example.com/"
+        );
+        assert!(links[0].2.ends_with("界suffix"));
+    }
+
+    #[test]
+    fn raw_injection_limits_tiny_height_origins_and_large_column_casts() {
+        let rows = vec!["https://example.com/long/path".to_string(); 3];
+        for width in 0..=3 {
+            let mut out = Vec::new();
+            inject_hyperlinks(
+                &mut out,
+                &rows,
+                &rows,
+                &InjectCtx {
+                    area: ratatui::layout::Rect::new(9, 4, width, 1),
+                    visible: usize::MAX,
+                    ..Default::default()
+                },
+            );
+            for (x, y, _, text) in captured_links(&out) {
+                assert_eq!(y, 4);
+                assert!(
+                    x + display_width(console::strip_ansi_codes(&text).as_ref())
+                        <= 9 + usize::from(width.saturating_sub(1))
+                );
+            }
+            if width <= 1 {
+                assert!(out.is_empty());
+            }
+        }
+        let mut out = Vec::new();
+        inject_hyperlinks(
+            &mut out,
+            &rows,
+            &rows,
+            &InjectCtx {
+                area: ratatui::layout::Rect::new(2, 3, 80, 1),
+                visible: usize::MAX,
+                ..Default::default()
+            },
+        );
+        assert!(captured_links(&out).iter().all(|(_, y, _, _)| *y == 3));
+        // The link is beyond the physical pane; narrowing a usize to u16 must not bring it back.
+        let row = format!("{}https://example.com/path", " ".repeat(65536));
+        let mut out = Vec::new();
+        inject_hyperlinks(
+            &mut out,
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&row),
+            &InjectCtx {
+                area: ratatui::layout::Rect::new(2, 3, 80, 1),
+                visible: 1,
+                ..Default::default()
+            },
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn wrapped_paths_join_before_existence_and_extension_checks() {
+        let source = format!("src/{}/source.rs", "directory/".repeat(12));
+        let dest = format!("src/{}/destination.rs", "another/".repeat(14));
+        let rows = hard_wrap(&format!("{source} → {dest}"), 21);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let links = scan_window_with(&rows, 0, rows.len(), 21, &|path| {
+            seen.borrow_mut().push(path.to_string());
+            if path == dest {
+                always(path)
+            } else {
+                None
+            }
+        });
+        assert!(
+            seen.borrow().contains(&source),
+            "a moved-away source is still resolved as a FULL path"
+        );
+        assert!(seen.borrow().contains(&dest));
+        assert!(!links.is_empty());
+        assert!(links
+            .iter()
+            .all(|link| link.span.url.ends_with("destination.rs")));
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.span.text.as_str())
+                .collect::<String>(),
+            dest
+        );
+    }
+
+    #[test]
+    fn wrapped_urls_join_unicode_short_edges_and_deep_viewport() {
+        let viewport_row = REJOIN_WINDOW + 2;
+        let part = "界e\u{301}👩‍💻/";
+        let repeats = (19 * (viewport_row + 2)).div_ceil(display_width(part));
+        let uri = format!("https://example.com/{}", part.repeat(repeats));
+        // Use the same grapheme wrapper as production without importing the private TUI module.
+        let mut rows = Vec::new();
+        let mut row = String::new();
+        for glyph in uri.graphemes(true) {
+            if display_width(&row) + display_width(glyph) > 19 {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push_str(glyph);
+        }
+        rows.push(row);
+        assert!(
+            rows.len() > viewport_row,
+            "fixture needs a visible row beyond the lookbehind: {rows:?}"
+        );
+        let links = scan_window_with(&rows, viewport_row, viewport_row + 1, 19, &never);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].span.url, uri);
+        let mut out = Vec::new();
+        inject_hyperlinks(
+            &mut out,
+            &rows,
+            &rows,
+            &InjectCtx {
+                start: viewport_row,
+                visible: 1,
+                area: ratatui::layout::Rect::new(3, 2, 20, 1),
+                ..Default::default()
+            },
+        );
+        assert!(captured_links(&out)
+            .iter()
+            .all(|(_, _, full, _)| full == &uri));
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn full_urls_do_not_absorb_indented_prose_or_another_scheme() {
+        let url = "https://example.com/abc";
+        for next in [
+            " and then continue",
+            "https://other.example/new",
+            "└ result",
+            "C:/new/file.rs",
+        ] {
+            let rows = vec![url.to_string(), next.to_string()];
+            let links = scan_window_with(&rows, 0, 2, display_width(url), &never);
+            assert_eq!(links[0].span.url, url, "{next:?}: {links:?}");
+        }
     }
 
     #[test]

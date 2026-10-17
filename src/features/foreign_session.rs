@@ -496,8 +496,7 @@ fn prompt_subject(text: &str) -> Option<String> {
     for tag in ENVELOPE_TAGS {
         let open = format!("<{tag}>");
         let close = format!("</{tag}>");
-        loop {
-            let Some(start) = s.find(&open) else { break };
+        while let Some(start) = s.find(&open) {
             let end = match s[start..].find(&close) {
                 Some(rel) => start + rel + close.len(),
                 // Unclosed opener: the block runs to the end of what we have.
@@ -510,7 +509,7 @@ fn prompt_subject(text: &str) -> Option<String> {
     let kept: Vec<&str> = s
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !(l.starts_with('<') && l.ends_with('>')))
+        .filter(|l| !(l.is_empty() || l.starts_with('<') && l.ends_with('>')))
         .collect();
     let joined = kept.join(" ");
     let joined = joined.trim();
@@ -652,7 +651,7 @@ fn claude_tool_result(msg: &serde_json::Value) -> Option<Message> {
                 .unwrap_or(false);
             let body = part
                 .get("content")
-                .and_then(|c| claude_result_body(c))
+                .and_then(claude_result_body)
                 .unwrap_or_default();
             let body = if is_error && !body.is_empty() {
                 format!("Error: {body}")
@@ -743,6 +742,7 @@ fn claude_assistant(msg: &serde_json::Value) -> Option<Message> {
         tool_calls,
         tool_call_id: None,
         images: Vec::new(),
+        tool_images: Vec::new(),
         cache_control: None,
     })
 }
@@ -877,6 +877,7 @@ fn attach_or_push_call(out: &mut Vec<Message>, call: ToolCall) {
         tool_calls: vec![call],
         tool_call_id: None,
         images: Vec::new(),
+        tool_images: Vec::new(),
         cache_control: None,
     });
 }
@@ -901,7 +902,46 @@ const MISSING_RESULT: &str = "(no result recorded — imported from a foreign CL
 /// Runs in one left-to-right pass with a set of declared call ids, mirroring `assert_valid_history`
 /// exactly — what passes this passes that.
 pub fn repair_history(msgs: &mut Vec<Message>) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    // Some compatible providers reuse call IDs across distinct turns (different entry UUIDs).
+    // Preserve each invocation/result pair, not just the first ID. Reserve original IDs so a
+    // generated name cannot collide with a later source call. Extra results for an already-closed
+    // invocation are dropped, never reassigned to a future call.
+    let mut reserved: HashSet<String> = msgs
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|c| c.id.clone()))
+        .collect();
+    let mut used = HashSet::new();
+    let mut pending = HashMap::new();
+    let mut serial = 0usize;
+    msgs.retain_mut(|message| {
+        if message.role == "tool" {
+            let Some(original) = message.tool_call_id.as_deref() else {
+                return false;
+            };
+            let Some(id) = pending.remove(original) else {
+                return false;
+            };
+            message.tool_call_id = Some(id);
+        } else if message.role == "assistant" {
+            for call in &mut message.tool_calls {
+                let original = call.id.clone();
+                if !used.insert(original.clone()) {
+                    loop {
+                        serial += 1;
+                        let candidate = format!("imported_call_{serial}");
+                        if reserved.insert(candidate.clone()) {
+                            call.id = candidate;
+                            break;
+                        }
+                    }
+                }
+                pending.insert(original, call.id.clone());
+            }
+        }
+        true
+    });
 
     // Pass 1 — drop orphan tool results (no preceding matching tool_call). Build the declared-id
     // set as we go so a result only matches a call that came BEFORE it, never one later.
@@ -1168,6 +1208,71 @@ mod tests {
     // ── repair_history ────────────────────────────────────────────────────────
 
     #[test]
+    fn repair_reused_call_ids_preserves_distinct_results_and_avoids_name_collisions() {
+        let mut msgs = Vec::new();
+        for (id, body) in [
+            ("same", "first"),
+            ("same", "second"),
+            ("imported_call_1", "third"),
+            ("same", "fourth"),
+        ] {
+            msgs.push(Message {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "file_read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                tool_call_id: None,
+                images: Vec::new(),
+                tool_images: Vec::new(),
+                cache_control: None,
+            });
+            msgs.push(Message::tool_result(id, body));
+        }
+        // A replayed result without another invocation is not a second invocation.
+        msgs.push(Message::tool_result("same", "duplicate fourth"));
+        repair_history(&mut msgs);
+        assert_valid(&msgs);
+        let calls: Vec<_> = msgs
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(calls.iter().copied().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(calls[0], "same");
+        assert_eq!(calls[2], "imported_call_1");
+        let results: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| {
+                (
+                    m.tool_call_id.as_deref().unwrap(),
+                    m.content.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            results.iter().map(|r| r.1).collect::<Vec<_>>(),
+            ["first", "second", "third", "fourth"]
+        );
+        for (id, (result_id, _)) in calls.iter().zip(results) {
+            assert_eq!(*id, result_id);
+        }
+        let once = serde_json::to_string(&msgs).unwrap();
+        repair_history(&mut msgs);
+        assert_eq!(
+            serde_json::to_string(&msgs).unwrap(),
+            once,
+            "repair is idempotent"
+        );
+    }
+
+    #[test]
     fn repair_drops_orphan_tool_result() {
         let mut msgs = vec![
             // tool_result with no preceding call — compaction cut the call.
@@ -1198,6 +1303,7 @@ mod tests {
                 }],
                 tool_call_id: None,
                 images: Vec::new(),
+                tool_images: Vec::new(),
                 cache_control: None,
             },
         ];
@@ -1226,6 +1332,7 @@ mod tests {
                 }],
                 tool_call_id: None,
                 images: Vec::new(),
+                tool_images: Vec::new(),
                 cache_control: None,
             },
             Message::tool_result("c", "done"),

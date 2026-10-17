@@ -117,6 +117,23 @@ impl Ask {
         out
     }
 
+    /// The ask as JSON — the structured twin of [`Ask::display`]. Events-mode consumers with a
+    /// real picker (the desktop app) render from this instead of parsing the text; surfaces with
+    /// no picker keep the display string.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "questions": self.questions.iter().map(|q| json!({
+                "question": q.question,
+                "header": q.header,
+                "options": q.options.iter().map(|o| json!({
+                    "label": o.label,
+                    "description": o.description,
+                })).collect::<Vec<_>>(),
+                "multi_select": q.multi_select,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     /// The model-facing acknowledgement, handed back as the `clarify` tool result: it names what was
     /// asked and instructs the model to STOP. Kept short — the display string already carries the
     /// detail to the user.
@@ -279,11 +296,9 @@ impl Tool for Clarify {
     }
 
     fn description(&self) -> &str {
-        "Ask the user when the task is genuinely ambiguous and a wrong guess would waste real work \
-         (which file, which framework, confirm a risky direction). The turn PAUSES; the user's next \
-         message is the answer. Ask one question (`question` + optional `options`) or several at \
-         once (`questions`) — shown as one panel. `multi_select: true` checks several options. For \
-         unattended approve/deny use telegram_ask."
+        "Ask only when ambiguity/risky direction makes guessing waste work. Pauses turn; next user \
+         message answers. One question + optional options, or questions in one panel. multi_select \
+         allows several options. Unattended approve/deny -> telegram_ask."
     }
 
     fn parameters(&self) -> Value {

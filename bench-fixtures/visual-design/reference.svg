@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640" role="img" aria-labelledby="title description">
+  <title id="title">Synthetic layout reference</title>
+  <desc id="description">Offline input only, not a screenshot or evidence of a rendered result. A green-accented learning page with a header, left aligned hero and three quiet cards.</desc>
+  <rect width="960" height="640" fill="#f3f3f0"/>
+  <g fill="#0b0b0b" font-family="system-ui, sans-serif">
+    <text x="48" y="48" font-size="14">SYNTHETIC OFFLINE REFERENCE / NOT VISUAL REVIEW EVIDENCE</text>
+    <text x="48" y="104" font-size="20" font-weight="700">Practice / garden</text>
+    <text x="704" y="104" font-size="16">Courses</text><text x="808" y="104" font-size="16">Details</text>
+    <text x="48" y="178" font-size="13" fill="#52514e" letter-spacing="2">A SMALL LEARNING SPACE</text>
+    <text x="48" y="244" font-size="52" font-weight="700">A little room to grow.</text>
+    <text x="48" y="288" font-size="18" fill="#52514e">Practical workshops, simple tools and enough room to think.</text>
+  </g>
+  <rect x="48" y="318" width="204" height="48" rx="4" fill="#315b45"/>
+  <text x="66" y="348" font-family="system-ui, sans-serif" font-size="16" font-weight="600" fill="#ffffff">Explore workshops</text>
+  <g fill="#fcfcfb" stroke="#deded8"><rect x="48" y="424" width="272" height="140" rx="8"/><rect x="344" y="424" width="272" height="140" rx="8"/><rect x="640" y="424" width="272" height="140" rx="8"/></g>
+  <g fill="#0b0b0b" font-family="system-ui, sans-serif" font-size="23" font-weight="600"><text x="72" y="470">Observe</text><text x="368" y="470">Make</text><text x="664" y="470">Share</text></g>
+  <g fill="#52514e" font-family="system-ui, sans-serif" font-size="16"><text x="72" y="510">Notice what is around you.</text><text x="368" y="510">Build one small thing.</text><text x="664" y="510">Compare ideas together.</text></g>
+</svg>

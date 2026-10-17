@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crowded Layout Input</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    /* Deliberate evaluation defects: an unresponsive row and weak visual hierarchy. */
+    .legacy { width: 1040px; margin: 16px; }
+    .legacy h1 { font-size: 20px; max-width: none; }
+    .legacy-row { display: flex; gap: 6px; }
+    .legacy-row article { width: 340px; flex-shrink: 0; padding: 8px; border: 2px solid var(--ink); }
+    .legacy h2 { font-size: 18px; }
+  </style>
+</head>
+<body>
+  <p class="fixture-banner">Synthetic offline fixture. Deliberate layout defects are inputs, not a proposed design.</p>
+  <main class="legacy">
+    <p>Practice / garden | Courses | Details</p>
+    <h1>A little room to grow.</h1>
+    <p>Practical workshops for people who like learning with their hands.</p>
+    <div class="legacy-row">
+      <article><h2>Observe</h2><p>Notice the materials and patterns already around you.</p></article>
+      <article><h2>Make</h2><p>Build one small thing, then learn from the result.</p></article>
+      <article><h2>Share</h2><p>Compare ideas with a small group of learners.</p></article>
+    </div>
+    <p>Improve hierarchy and narrow-screen behavior only when the brief authorizes redesign.</p>
+  </main>
+</body>
+</html>
