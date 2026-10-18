@@ -10,6 +10,7 @@ on:
         description: "aizen-voice commit SHA (full 40 hex) containing tests/contract/v1"
         required: true
         type: string
+        default: "c1dfde65f68dc74043fa96e723a23c3b78dcf925"
 
 permissions:
   contents: read
