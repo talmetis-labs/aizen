@@ -57,6 +57,10 @@ An Aizen plan is bought by signing in: the session opens the gateway on its own,
 token is written to disk. On a machine that cannot open a browser — SSH, a container, CI — pair it
 instead with `aizen login`, which approves a short code and comes back with a key.
 
+**Voice (opt-in):** hold `F9` to dictate, release to put the transcript in the draft; `F10` is
+optional English. Install it with `aizen voice install [--with-english]` — see the
+[Voice reference](docs/REFERENCE.md#voice-hold-to-talk).
+
 <sub>Prefer to do it by hand? Grab a binary from the
 [latest release](https://github.com/talmetis-labs/aizen/releases/latest) — or build it yourself with
 `cargo install --git https://github.com/talmetis-labs/aizen`. Upgrade or roll back any time with

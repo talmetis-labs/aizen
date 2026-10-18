@@ -18,6 +18,7 @@
 //! `checksum.txt` for the model packs (whose API digests are `null` — they predate the field).
 
 use crate::core::download::{download_to, fetch_checksum, http_client, verify_checksum};
+use crate::features::voice_manifest::{self, PackEntry};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -190,7 +191,12 @@ async fn verify_asset(
         verified(&digest_hex[..16]);
         return Ok(true);
     }
-    let checksums_url = format!("https://github.com/{REPO}/releases/download/{tag}/checksum.txt");
+    let checksums_url = match std::env::var("AIZEN_VOICE_UPSTREAM_BASE") {
+        Ok(base) if !base.trim().is_empty() => {
+            format!("{}/{tag}/checksum.txt", base.trim_end_matches('/'))
+        }
+        _ => format!("https://github.com/{REPO}/releases/download/{tag}/checksum.txt"),
+    };
     match fetch_checksum(&checksums_url).await {
         Ok(text) => match digest_line(&text, asset_name) {
             Some(line) => {
@@ -214,20 +220,27 @@ async fn verify_asset(
 /// payload in one root dir like `sherpa-onnx-zipformer-vi-int8-2025-04-20/`); an archive with
 /// no wrapper yields the stage dir itself.
 async fn fetch_asset(tag: &str, asset_name: &str, max_bytes: u64, root: &Path) -> Result<PathBuf> {
-    let info = match asset_info(tag, asset_name).await {
-        Ok(info) => info,
-        Err(e) => {
-            // Manifest unreachable (API hiccup, rate limit): fall back to the fixed release URL.
-            // The download itself still runs size-capped; only the digest check is lost.
-            emit(&format!(
-                "⚠ release manifest unavailable ({e}) — using the fixed release URL"
-            ));
-            AssetInfo {
-                url: format!("https://github.com/{REPO}/releases/download/{tag}/{asset_name}"),
-                size: 0,
-                sha256: None,
+    let info = match std::env::var("AIZEN_VOICE_UPSTREAM_BASE") {
+        Ok(base) if !base.trim().is_empty() => AssetInfo {
+            url: format!("{}/{tag}/{asset_name}", base.trim_end_matches('/')),
+            size: 0,
+            sha256: None,
+        },
+        _ => match asset_info(tag, asset_name).await {
+            Ok(info) => info,
+            Err(e) => {
+                // Manifest unreachable (API hiccup, rate limit): fall back to the fixed release URL.
+                // The download itself still runs size-capped; only the digest check is lost.
+                emit(&format!(
+                    "⚠ release manifest unavailable ({e}) — using the fixed release URL"
+                ));
+                AssetInfo {
+                    url: format!("https://github.com/{REPO}/releases/download/{tag}/{asset_name}"),
+                    size: 0,
+                    sha256: None,
+                }
             }
-        }
+        },
     };
     emit(&format!(
         "downloading {asset_name} ({})",
@@ -243,14 +256,53 @@ async fn fetch_asset(tag: &str, asset_name: &str, max_bytes: u64, root: &Path) -
     }
 
     emit(&format!("extracting {asset_name} ({})", fmt_size(size)));
+    extract_archive(&part, root).await
+}
+
+/// Download one asset through the manifest entry, verifying the manifest's `size_bytes` and
+/// `sha256` before unpacking it.
+async fn fetch_manifest_asset(
+    entry: &PackEntry,
+    asset_name: &str,
+    max_bytes: u64,
+    root: &Path,
+) -> Result<PathBuf> {
+    emit(&format!(
+        "downloading {asset_name} ({}) from manifest",
+        fmt_size(entry.size_bytes)
+    ));
+    let part = root.join(format!(".aizen-voice-{}-{asset_name}", std::process::id()));
+    let (size, digest) = download_to(&entry.url, &part, entry.size_bytes, max_bytes)
+        .await
+        .with_context(|| format!("downloading {asset_name} from the manifest"))?;
+    if size != entry.size_bytes {
+        let _ = std::fs::remove_file(&part);
+        bail!(
+            "manifest size mismatch for {asset_name}: expected {}, downloaded {size}",
+            entry.size_bytes
+        );
+    }
+    if !entry.sha256.eq_ignore_ascii_case(&digest) {
+        let _ = std::fs::remove_file(&part);
+        bail!(
+            "manifest SHA-256 mismatch for {asset_name}: expected {}, got {digest}",
+            entry.sha256
+        );
+    }
+    emit(&format!("extracting {asset_name} ({})", fmt_size(size)));
+    extract_archive(&part, root).await
+}
+
+/// Extract the already-downloaded archive into a clean stage and return its payload root.
+async fn extract_archive(part: &Path, root: &Path) -> Result<PathBuf> {
     let stage = stage_dir(root);
     let _ = std::fs::remove_dir_all(&stage); // a stage from a crashed previous run
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
-    let (p, s) = (part.clone(), stage.clone());
+    let (p, s) = (part.to_path_buf(), stage.clone());
     let outcome = tokio::task::spawn_blocking(move || extract_tar_bz2(&p, &s))
         .await
         .context("extraction task panicked")?;
-    let _ = std::fs::remove_file(&part);
+    let _ = std::fs::remove_file(part);
     match outcome {
         Ok(stripped) => Ok(stripped),
         Err(e) => {
@@ -400,7 +452,12 @@ fn replace_dir(new: &Path, dest: &Path) -> Result<()> {
 
 /// `aizen voice install [--with-english]` — the whole command.
 pub async fn run(with_english: bool) -> Result<()> {
-    let asset = engine_asset_for(std::env::consts::OS, std::env::consts::ARCH)?;
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let manifest = voice_manifest::fetch_manifest().await?;
+    match manifest.as_ref() {
+        Some(_) => emit("source: manifest v1"),
+        None => emit("source: upstream"),
+    }
     let voice_dir = voice_root();
     std::fs::create_dir_all(&voice_dir)
         .with_context(|| format!("creating {}", voice_dir.display()))?;
@@ -412,22 +469,70 @@ pub async fn run(with_english: bool) -> Result<()> {
     ));
 
     // 1 — engine package: BOTH CLIs (offline F9 + streaming F10) come out of this one tarball.
-    let engine_root = fetch_asset(ENGINE_TAG, asset, MAX_ENGINE_BYTES, &voice_dir).await?;
+    let engine_entry = manifest.as_ref().and_then(|m| m.engine(&platform));
+    let engine_root = match engine_entry {
+        Some(entry) => {
+            let root = fetch_manifest_asset(entry, "engine", MAX_ENGINE_BYTES, &voice_dir).await?;
+            root
+        }
+        None => {
+            let asset = engine_asset_for(std::env::consts::OS, std::env::consts::ARCH)?;
+            fetch_asset(ENGINE_TAG, asset, MAX_ENGINE_BYTES, &voice_dir).await?
+        }
+    };
     let has_streaming = install_engine(&engine_root, &voice_dir)?;
     let _ = std::fs::remove_dir_all(stage_dir(&voice_dir));
+    if let Some(binaries) = engine_entry.and_then(|entry| entry.binaries.as_ref()) {
+        for binary in binaries {
+            let present =
+                voice_dir.join(binary).is_file() || voice_dir.join("bin").join(binary).is_file();
+            if !present {
+                bail!("manifest engine binaries mismatch: {binary} was not installed");
+            }
+        }
+    }
     if with_english && !has_streaming {
         emit("⚠ the engine package ships no streaming sherpa-onnx CLI — F10 (English) will be unavailable");
     }
 
-    // 2 — F9 Vietnamese pack (~60 MB).
-    let model_root = fetch_asset(MODEL_TAG, VI_MODEL, MAX_MODEL_BYTES, &voice_dir).await?;
+    // 2 — F9 Vietnamese pack.
+    let vi_entry = manifest.as_ref().and_then(|m| m.model("vi"));
+    let model_root = match vi_entry {
+        Some(entry) => {
+            let root = fetch_manifest_asset(entry, "vi model", MAX_MODEL_BYTES, &voice_dir).await?;
+            if let Some(files) = &entry.files {
+                for file in files {
+                    if !root.join(file).is_file() {
+                        bail!("manifest vi files mismatch: {file} is missing");
+                    }
+                }
+            }
+            root
+        }
+        None => fetch_asset(MODEL_TAG, VI_MODEL, MAX_MODEL_BYTES, &voice_dir).await?,
+    };
     require_pack(&model_root)?;
     replace_dir(&model_root, &voice_dir.join("model"))?;
     let _ = std::fs::remove_dir_all(stage_dir(&voice_dir));
 
-    // 3 — F10 English pack (opt-in, ~484 MiB compressed).
+    // 3 — F10 English pack (opt-in).
     if with_english {
-        let en_root = fetch_asset(MODEL_TAG, EN_MODEL, MAX_MODEL_BYTES, &voice_dir).await?;
+        let en_entry = manifest.as_ref().and_then(|m| m.model("en"));
+        let en_root = match en_entry {
+            Some(entry) => {
+                let root =
+                    fetch_manifest_asset(entry, "en model", MAX_MODEL_BYTES, &voice_dir).await?;
+                if let Some(files) = &entry.files {
+                    for file in files {
+                        if !root.join(file).is_file() {
+                            bail!("manifest en files mismatch: {file} is missing");
+                        }
+                    }
+                }
+                root
+            }
+            None => fetch_asset(MODEL_TAG, EN_MODEL, MAX_MODEL_BYTES, &voice_dir).await?,
+        };
         require_pack(&en_root)?;
         replace_dir(&en_root, &voice_dir.join("model_en"))?;
         let _ = std::fs::remove_dir_all(stage_dir(&voice_dir));
@@ -575,5 +680,167 @@ mod tests {
             "static archives are link-time only"
         );
         assert!(voice.join("lib").join("libonnxruntime.so").is_file());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manifest_install_uses_local_http_assets() {
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn sha256(data: &[u8]) -> String {
+            crate::core::download::hex_lower(
+                ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
+            )
+        }
+
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
+        let engine_bytes = std::fs::read(fixture.join("engine.tar.bz2")).unwrap();
+        let model_bytes = std::fs::read(fixture.join("model.tar.bz2")).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let offline = exe_name("sherpa-onnx-offline");
+        let streaming = exe_name("sherpa-onnx");
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let mut engines = serde_json::Map::new();
+        engines.insert(
+            platform,
+            json!({
+                "url": format!("http://{address}/engine.tar.bz2"),
+                "size_bytes": engine_bytes.len(),
+                "sha256": sha256(&engine_bytes),
+                "license": "Apache-2.0",
+                "binaries": [offline.clone(), streaming.clone()],
+                "min_aizen": "0.7.0"
+            }),
+        );
+        let manifest = json!({
+            "schema": 1,
+            "generated_at": "2026-10-18T00:00:00Z",
+            "upstream": {},
+            "engines": engines,
+            "models": {
+                "vi": {
+                    "url": format!("http://{address}/model.tar.bz2"),
+                    "size_bytes": model_bytes.len(),
+                    "sha256": sha256(&model_bytes),
+                    "license": "Apache-2.0",
+                    "files": ["tokens.txt"]
+                }
+            }
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body: &[u8] = if request.starts_with("GET /manifest.json") {
+                    &manifest_bytes
+                } else if request.starts_with("GET /engine.tar.bz2") {
+                    &engine_bytes
+                } else {
+                    &model_bytes
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let root = scratch("manifest-install").join("voice");
+        std::env::set_var("AIZEN_VOICE_HOME", &root);
+        std::env::set_var("AIZEN_ALLOW_PRIVATE_NET", "1");
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+        std::env::set_var(
+            "AIZEN_VOICE_MANIFEST",
+            format!("http://{address}/manifest.json"),
+        );
+        run(false).await.unwrap();
+        std::env::remove_var("AIZEN_VOICE_MANIFEST");
+        std::env::remove_var("AIZEN_ALLOW_PRIVATE_NET");
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("AIZEN_VOICE_HOME");
+        server.abort();
+
+        assert!(root.join("bin").join(offline).is_file());
+        assert!(root.join(streaming).is_file());
+        assert!(root.join("model").join("tokens.txt").is_file());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_two_manifest_falls_back_to_upstream_mirror() {
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
+        let engine_bytes = std::fs::read(fixture.join("engine.tar.bz2")).unwrap();
+        let model_bytes = std::fs::read(fixture.join("model.tar.bz2")).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let schema_two = serde_json::to_vec(&json!({
+            "schema": 2,
+            "generated_at": "2026-10-18T00:00:00Z",
+            "upstream": {},
+            "engines": {},
+            "models": {}
+        }))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body: &[u8] = if request.starts_with("GET /manifest.json") {
+                    &schema_two
+                } else if request.contains("v1.13.8") {
+                    &engine_bytes
+                } else {
+                    &model_bytes
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let root = scratch("fallback-install").join("voice");
+        std::env::set_var("AIZEN_VOICE_HOME", &root);
+        std::env::set_var("AIZEN_ALLOW_PRIVATE_NET", "1");
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+        std::env::set_var(
+            "AIZEN_VOICE_MANIFEST",
+            format!("http://{address}/manifest.json"),
+        );
+        std::env::set_var("AIZEN_VOICE_UPSTREAM_BASE", format!("http://{address}"));
+        run(false).await.unwrap();
+        std::env::remove_var("AIZEN_VOICE_MANIFEST");
+        std::env::remove_var("AIZEN_VOICE_UPSTREAM_BASE");
+        std::env::remove_var("AIZEN_ALLOW_PRIVATE_NET");
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("AIZEN_VOICE_HOME");
+        server.abort();
+
+        assert!(root
+            .join("bin")
+            .join(exe_name("sherpa-onnx-offline"))
+            .is_file());
+        assert!(root.join(exe_name("sherpa-onnx")).is_file());
+        assert!(root.join("model").join("tokens.txt").is_file());
     }
 }

@@ -1794,6 +1794,43 @@ returns `0` even if it stops on the step limit or divergence — it prints the r
 (with `--output-format stream-json` or `json`, the `stop` and `is_error` fields of the `result`
 record; a run that died is a `result` with `errors` and a `1`).
 
+## Voice (hold-to-talk)
+
+Voice is an **opt-in Aizen build** (the default binary must not require Linux's audio library).
+Install the voice build, then fetch the engine and Vietnamese model through Aizen:
+
+```sh
+aizen voice install                 # engine + vi
+aizen voice install --with-english  # + streaming en (F10)
+```
+
+Measured pack sizes (2026-10-18; Windows engine built, macOS/Linux pending V-002):
+
+| Pack | Download | Installed |
+|---|---:|---:|
+| engine win-x64 | 12.6 MiB | 35.5 MiB |
+| engine macOS arm64 | 15.2 MiB | 56.1 MiB |
+| engine Linux x64 | 21.5 MiB | 69.2 MiB |
+| vi model | 57.0 MiB | 73.5 MiB |
+| en model (optional) | 161.8 MiB | 179.9 MiB |
+
+Enable with `voice.enabled: true`, then hold `F9` for Vietnamese; with the `en` pack, hold `F10` for
+English. Change the keys with `voice.hotkey` / `voice.hotkey_alt`. After install nothing leaves the
+machine: no account, no key, no telemetry. Uninstall by deleting `~/.aizen/voice` (or
+`AIZEN_VOICE_HOME`); this removes the engine and both model packs.
+
+| Symptom | Fix |
+|---|---|
+| install HTTP 403/429 | retry later; set `AIZEN_VOICE_MANIFEST` to a mirror |
+| checksum mismatch | delete the part file and retry; report the digest |
+| F9 does nothing | check `voice.enabled`; use a voice build; try `AIZEN_NO_STICKY=1` |
+| F10 does nothing | install the `en` pack: `aizen voice install --with-english` |
+| no microphone on Linux | install `libasound2`; check `arecord -l`; use the voice build |
+| SmartScreen warning | binaries are unsigned; "More info → Run anyway" |
+
+The full install/troubleshooting matrix lives in
+[`aizen-voice` V-007](https://github.com/vbach8/aizen-voice/blob/main/specs/V-007-install-and-troubleshooting.md).
+
 ## Safety model
 Three layers, bottom to top. (1) A **hard safety floor** — a deterministic blocklist (`rm -rf /`
 incl. GNU long flags like `rm --recursive --force /`, `mkfs`, `dd of=/dev/…`, fork bombs,

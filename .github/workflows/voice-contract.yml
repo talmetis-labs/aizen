@@ -1,0 +1,37 @@
+name: voice-contract
+
+# V-006/V-011: parse the shared aizen-voice contract corpus with Aizen's real manifest structs.
+# Manual dispatch only while the pack release process is still being built; the SHA input must be
+# the full 40-hex commit, never a branch or a moving tag.
+on:
+  workflow_dispatch:
+    inputs:
+      aizen_voice_sha:
+        description: "aizen-voice commit SHA (full 40 hex) containing tests/contract/v1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the pinned contract corpus
+        uses: actions/checkout@v4
+        with:
+          repository: vbach8/aizen-voice
+          ref: ${{ inputs.aizen_voice_sha }}
+          path: aizen-voice
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Parse the shared corpus with Aizen structs
+        env:
+          AIZEN_VOICE_CONTRACT_DIR: ${{ github.workspace }}/aizen-voice/tests/contract/v1
+        run: cargo test --features voice parses_the_checked_out_contract_corpus_when_available
