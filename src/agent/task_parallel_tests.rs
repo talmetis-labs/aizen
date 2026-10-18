@@ -192,6 +192,8 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
     let cross = matches!(case, AccessCase::CrossRead);
     let serial = matches!(case, AccessCase::SameFile | AccessCase::CrossRead);
     let reader_file = if serial || shared { "a.txt" } else { "b.txt" };
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let arrival_deadline = tokio::time::Instant::from_std(deadline);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     if !serial {
@@ -214,9 +216,15 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
     } else {
         Some(tokio::spawn(async move {
             let mut entered = Vec::new();
-            for _ in 0..2 {
+            for index in 0..2 {
+                // Setup is bounded by the run deadline; overlap starts at the first actual body.
+                let next = if index == 0 {
+                    arrival_deadline
+                } else {
+                    arrival_deadline.min(tokio::time::Instant::now() + Duration::from_secs(10))
+                };
                 entered.push(
-                    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    tokio::time::timeout_at(next, rx.recv())
                         .await
                         .unwrap()
                         .unwrap(),
@@ -236,7 +244,7 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
     let server = tokio::spawn(async move {
         let mut handlers = Vec::new();
         for _ in 0..(4 + usize::from(workflow)) {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
+            let (mut socket, _) = tokio::time::timeout_at(arrival_deadline, listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
@@ -343,7 +351,7 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
             .collect()
     };
     cfg.image_config = Some(Arc::new(crate::core::cli_config::CliConfig::default()));
-    cfg.deadline = Some(std::time::Instant::now() + Duration::from_secs(25));
+    cfg.deadline = Some(deadline);
     cfg.exec_ctx = cfg.exec_ctx.with_deadline(cfg.deadline);
     let prepared = if planned {
         plan_execution_calls(&registry, &calls, &cfg)
@@ -473,6 +481,8 @@ async fn real_native_dispatch_case(
     const KEY: &str = "owned-task-account";
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let arrival_deadline = tokio::time::Instant::from_std(deadline);
     let arrival = Arc::new(tokio::sync::Barrier::new(2));
     let body_controller = if !same_file {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -497,9 +507,15 @@ async fn real_native_dispatch_case(
             }));
         Some(tokio::spawn(async move {
             let mut entered = Vec::new();
-            for _ in 0..2 {
+            for index in 0..2 {
+                // Baseline verification/admission are not part of the body-overlap window.
+                let next = if index == 0 {
+                    arrival_deadline
+                } else {
+                    arrival_deadline.min(tokio::time::Instant::now() + Duration::from_secs(10))
+                };
                 entered.push(
-                    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    tokio::time::timeout_at(next, rx.recv())
                         .await
                         .expect("bounded actual-body rendezvous")
                         .expect("native body sender"),
@@ -519,7 +535,7 @@ async fn real_native_dispatch_case(
         let mut handlers = Vec::new();
         // Existing file: read/edit/report; creation: write/report; same file: two read/edit/report.
         for _ in 0..(5 + usize::from(same_file) + usize::from(workflow)) {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
+            let (mut socket, _) = tokio::time::timeout_at(arrival_deadline, listener.accept())
                 .await
                 .expect("bounded fixture accept")
                 .unwrap();
@@ -652,7 +668,7 @@ async fn real_native_dispatch_case(
         )];
     }
     c.image_config = Some(Arc::new(crate::core::cli_config::CliConfig::default()));
-    c.deadline = Some(std::time::Instant::now() + Duration::from_secs(25));
+    c.deadline = Some(deadline);
     c.exec_ctx = c.exec_ctx.with_deadline(c.deadline);
     let prepared = if bind_at_boundary {
         plan_execution_calls(&r, &calls, &c)

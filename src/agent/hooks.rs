@@ -602,12 +602,24 @@ mod tests {
         }
     }
 
-    fn ctx() -> Context {
-        Context {
-            cwd: std::env::temp_dir(),
-            dispatch: None,
-            quiet: true,
-        }
+    fn with_fixture<T>(run: impl FnOnce(&Context) -> T) -> T {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("workspace");
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        // Real opaque hooks must not borrow another test's HOME, effects latch, or temp-root lease.
+        crate::core::workspace_txn::with_test_lock_home(&home, || {
+            run(&Context {
+                cwd: root,
+                dispatch: None,
+                quiet: true,
+            })
+        })
     }
 
     #[test]
@@ -731,17 +743,35 @@ mod tests {
             pre_tool: vec![hook(line, Some("shell_run"))],
             ..Default::default()
         };
-        let v = pre_tool_with(&cfg, "shell_run", &json!({ "command": "ls" }), &ctx());
-        match v {
-            PreToolVerdict::Deny { run, reason } => {
-                assert_eq!(run, line);
-                assert_eq!(reason, "hook exited 2");
+        with_fixture(|ctx| {
+            // Keep the actual process receipt in the assertion: fail-open hook errors otherwise
+            // collapse to Pass and hide whether spawn, stdin, or physical settlement failed.
+            let event = input(
+                HookEvent::PreTool,
+                ctx,
+                json!({"tool":"shell_run","args":{"command":"ls"}}),
+            );
+            let receipt = execute(
+                &cfg.pre_tool[0],
+                HookEvent::PreTool,
+                Some("shell_run"),
+                &event,
+                ctx,
+            );
+            assert!(receipt.error.is_none(), "{receipt:?}");
+            assert_eq!(receipt.decision, Some(Decision::Deny), "{receipt:?}");
+            let v = pre_tool_with(&cfg, "shell_run", &json!({ "command": "ls" }), ctx);
+            match v {
+                PreToolVerdict::Deny { run, reason } => {
+                    assert_eq!(run, line);
+                    assert_eq!(reason, "hook exited 2");
+                }
+                other => panic!("expected a deny, got {other:?}"),
             }
-            other => panic!("expected a deny, got {other:?}"),
-        }
-        // The same hook does not fire for a tool its `match` excludes.
-        let v = pre_tool_with(&cfg, "file_read", &json!({ "path": "x" }), &ctx());
-        assert_eq!(v, PreToolVerdict::Pass);
+            // The same hook does not fire for a tool its `match` excludes.
+            let v = pre_tool_with(&cfg, "file_read", &json!({ "path": "x" }), ctx);
+            assert_eq!(v, PreToolVerdict::Pass);
+        });
     }
 
     #[test]
@@ -750,13 +780,15 @@ mod tests {
             post_tool: vec![hook("echo checked by the hook", None)],
             ..Default::default()
         };
-        let note = post_tool_with(&cfg, "file_edit", &json!({}), "edited x.rs", true, &ctx())
-            .expect("the echo is context");
-        assert!(
-            note.starts_with("[hook `echo checked by the hook`]\n"),
-            "{note}"
-        );
-        assert!(note.contains("checked by the hook"));
+        with_fixture(|ctx| {
+            let note = post_tool_with(&cfg, "file_edit", &json!({}), "edited x.rs", true, ctx)
+                .expect("the echo is context");
+            assert!(
+                note.starts_with("[hook `echo checked by the hook`]\n"),
+                "{note}"
+            );
+            assert!(note.contains("checked by the hook"));
+        });
     }
 
     #[test]
@@ -765,17 +797,19 @@ mod tests {
             pre_tool: vec![hook("exit 3", None)],
             ..Default::default()
         };
-        assert_eq!(
-            pre_tool_with(&cfg, "shell_run", &json!({}), &ctx()),
-            PreToolVerdict::Pass
-        );
-        let empty = HooksConfig {
-            pre_tool: vec![hook("   ", None)],
-            ..Default::default()
-        };
-        assert_eq!(
-            pre_tool_with(&empty, "shell_run", &json!({}), &ctx()),
-            PreToolVerdict::Pass
-        );
+        with_fixture(|ctx| {
+            assert_eq!(
+                pre_tool_with(&cfg, "shell_run", &json!({}), ctx),
+                PreToolVerdict::Pass
+            );
+            let empty = HooksConfig {
+                pre_tool: vec![hook("   ", None)],
+                ..Default::default()
+            };
+            assert_eq!(
+                pre_tool_with(&empty, "shell_run", &json!({}), ctx),
+                PreToolVerdict::Pass
+            );
+        });
     }
 }
