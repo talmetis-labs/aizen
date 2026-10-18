@@ -3939,12 +3939,19 @@ mod native_speculation_acceptance {
         assert_eq!(synthesis.model, MODEL);
         let prepared = tool.prepare_call(&args, &ctx).unwrap();
         let body_state = state.clone();
+        let deadline = tokio::time::Instant::from_std(ctx.deadline().unwrap());
         let controller = tokio::spawn(async move {
             let _release_on_return = ReleaseOnDrop(release);
             let mut entered = Vec::new();
-            for _ in 0..2 {
+            for index in 0..2 {
+                // First arrival includes capture/admission; only the inter-body gap proves overlap.
+                let next = if index == 0 {
+                    deadline
+                } else {
+                    deadline.min(tokio::time::Instant::now() + WAIT)
+                };
                 entered.push(
-                    tokio::time::timeout(WAIT, rx.recv())
+                    tokio::time::timeout_at(next, rx.recv())
                         .await
                         .expect("both actual Workflow bodies must enter")
                         .unwrap(),
