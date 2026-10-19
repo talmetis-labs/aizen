@@ -52,6 +52,7 @@ pub(crate) struct ReleasedOverlay {
 }
 
 pub(crate) struct Cohort {
+    _background: crate::core::workspace_txn::BackgroundProcessBarrier,
     parent: String,
     base: BaseSnapshot,
     binding: Option<crate::features::timemachine::TimeMachineBinding>,
@@ -110,7 +111,8 @@ impl Cohort {
             "capture speculative base",
             &scope,
         )?;
-        let physical = PhysicalEffectLease::exclusive(
+        let background = crate::core::workspace_txn::BackgroundProcessBarrier::acquire(cancel)?;
+        let physical = PhysicalEffectLease::exclusive_without_background(
             Duration::from_secs(15),
             cancel,
             "capture speculative base",
@@ -145,6 +147,7 @@ impl Cohort {
             }
         }
         Ok(Arc::new(Self {
+            _background: background,
             parent: scope,
             base,
             binding,
@@ -391,7 +394,7 @@ impl Cohort {
             "integrate speculative cohort",
             &self.parent,
         )?;
-        let physical = PhysicalEffectLease::exclusive(
+        let physical = PhysicalEffectLease::exclusive_without_background(
             Duration::from_secs(15),
             cancel,
             "integrate speculative cohort",
@@ -640,7 +643,7 @@ impl Cohort {
                     "publish speculative verification",
                     &self.parent,
                 )?;
-                let physical = PhysicalEffectLease::exclusive(
+                let physical = PhysicalEffectLease::exclusive_without_background(
                     Duration::from_secs(15),
                     None,
                     "publish speculative verification",

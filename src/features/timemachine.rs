@@ -119,6 +119,7 @@ struct RecoveryState {
 struct RecoveryAnchors {
     pre_edit: Option<SnapshotHandle>,
     last_good: Option<SnapshotHandle>,
+    pre_edit_current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +205,14 @@ impl RunRecovery {
         require_workspace_restore()
     }
 
+    /// Preserve historical anchors, but do not reuse them as coverage after opaque background work.
+    pub(crate) fn defer_background_coverage(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        for anchors in state.repositories.values_mut() {
+            anchors.pre_edit_current = false;
+        }
+    }
+
     fn publish(&self, mut handle: SnapshotHandle, pre_edit: bool) -> Result<()> {
         handle.restore_authorized &= self.can_restore_workspace();
         let mut state = self
@@ -215,8 +224,14 @@ impl RunRecovery {
             .entry(handle.binding.namespace_dir.clone())
             .or_default();
         if pre_edit {
-            anchors.pre_edit.get_or_insert_with(|| handle.clone());
-            anchors.last_good.get_or_insert(handle);
+            if !anchors.pre_edit_current {
+                anchors.pre_edit = Some(handle.clone());
+                anchors.last_good = Some(handle);
+                anchors.pre_edit_current = true;
+            } else {
+                anchors.pre_edit.get_or_insert_with(|| handle.clone());
+                anchors.last_good.get_or_insert(handle);
+            }
         } else {
             anchors.last_good = Some(handle);
         }
@@ -292,6 +307,9 @@ impl RunRecovery {
         if !handle.restore_authorized {
             bail!(CHILD_RESTORE_DENIED);
         }
+        let _background = crate::core::workspace_txn::BackgroundProcessBarrier::acquire(
+            crate::core::cancel::current().as_ref(),
+        )?;
         let reservation = {
             let mut state = self
                 .0
@@ -1534,7 +1552,7 @@ fn inspect_or_record_speculation_recovery(
         "restart inspection",
         &scope,
     )?;
-    let physical = PhysicalEffectLease::exclusive(
+    let physical = PhysicalEffectLease::exclusive_without_background(
         LOCK_TIMEOUT.saturating_sub(start.elapsed()),
         cancel.as_ref(),
         "restart inspection",
@@ -5198,6 +5216,7 @@ pub fn save_for_in_context(
                 .map_err(|_| anyhow::anyhow!("recovery lock poisoned"))?
                 .repositories
                 .get(&ctx.namespace_dir)
+                .filter(|anchors| anchors.pre_edit_current)
                 .and_then(|a| a.pre_edit.clone());
             if let Some(handle) = existing {
                 if handle.binding != RepoBinding::from_context(&ctx) {
@@ -5348,7 +5367,7 @@ fn snapshot_admission(
         "time checkpoint",
         &scope,
     )?;
-    let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+    let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive_without_background(
         timeout.saturating_sub(start.elapsed()),
         cancel.as_ref(),
         "time checkpoint snapshot",
@@ -5823,7 +5842,7 @@ fn restore_in_reported_checked(
     } else {
         None
     };
-    let _physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+    let _physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive_without_background(
         LOCK_TIMEOUT,
         None,
         "time restore",
@@ -5831,105 +5850,115 @@ fn restore_in_reported_checked(
             .unwrap_or_default()
             .resource_scope(),
     )?;
-    let _quiescence = crate::core::workspace_txn::WorkspaceRestoreGuard::acquire(&ctx.root)?;
-    let _store = ctx.store_shared()?;
-    let _lock = ctx.lock()?;
-    let mut ledger = ctx.load_ledger()?;
-    ctx.recover_pending_with_restore(&mut ledger, true)?;
-    ctx.migrate_legacy_refs(&mut ledger)?;
-    let target = ledger
-        .snapshots
-        .iter()
-        .find(|s| s.id == id)
-        .cloned()
-        .with_context(|| format!("no checkpoint #{id} (see `aizen time list`)"))?;
-    ctx.validate_snapshot_ref(&target)?;
-    if let Some(handle) = expected {
-        if handle.binding != RepoBinding::from_context(ctx)
-            || target.commit != handle.commit
-            || target.tree != handle.tree
-            || target.worktree_id != handle.worktree_id
-        {
-            bail!("bound checkpoint identity no longer matches ledger/ref; restore refused");
-        }
-    }
-
-    let (cur_tree, cur_coverage) = current_tree(ctx)?;
-    let preimage_id = if cur_tree != target.tree {
-        // Restore always creates a fresh immutable preimage event. Reusing an older equal-tree
-        // checkpoint makes `/redo` ambiguous after branching and can leave no forward recovery point.
-        Some(save_preimage_locked(
-            ctx,
-            &mut ledger,
-            cur_tree,
-            cur_coverage,
-        )?)
+    let body_context = crate::core::exec_ctx::current()
+        .unwrap_or_default()
+        .with_physical_effect_lease(_physical.clone());
+    let body_context = if let Some(writer) = supplied_lease.or(_workspace.as_ref()) {
+        body_context.with_writer_lease(writer.clone())
     } else {
-        ledger.cursor_id
+        body_context
     };
-    if let Some(pid) = preimage_id {
-        if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
-            let recovery_ref = ctx.recovery_ref_name(pid);
-            if ctx
-                .git(None, ["rev-parse", "--verify", &recovery_ref])
-                .is_err()
+    crate::core::exec_ctx::with_current(body_context, || {
+        let _quiescence = crate::core::workspace_txn::WorkspaceRestoreGuard::acquire(&ctx.root)?;
+        let _store = ctx.store_shared()?;
+        let _lock = ctx.lock()?;
+        let mut ledger = ctx.load_ledger()?;
+        ctx.recover_pending_with_restore(&mut ledger, true)?;
+        ctx.migrate_legacy_refs(&mut ledger)?;
+        let target = ledger
+            .snapshots
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .with_context(|| format!("no checkpoint #{id} (see `aizen time list`)"))?;
+        ctx.validate_snapshot_ref(&target)?;
+        if let Some(handle) = expected {
+            if handle.binding != RepoBinding::from_context(ctx)
+                || target.commit != handle.commit
+                || target.tree != handle.tree
+                || target.worktree_id != handle.worktree_id
             {
-                ctx.update_ref_create(&recovery_ref, &preimage.commit)?;
+                bail!("bound checkpoint identity no longer matches ledger/ref; restore refused");
             }
         }
-    }
 
-    let mut journal = Journal::new(JournalKind::Restore, ledger.generation);
-    journal.target_id = Some(id);
-    journal.preimage_id = preimage_id;
-    // E5.1: stage the worktree the way a checkpoint sees it and journal what the restore will
-    // remove BEFORE it removes anything.
-    let staged = stage_for_apply(ctx)?;
-    let removed = paths_absent_from(ctx, &staged.0, &target.commit)?;
-    journal.removed = removed.clone();
-    journal.phase = JournalPhase::Applying;
-    ctx.save_journal(&journal)?;
-
-    let rollback = |original: anyhow::Error| -> anyhow::Error {
-        let result = preimage_id
-            .and_then(|pid| ledger.snapshots.iter().find(|s| s.id == pid))
-            .context("restore preimage unavailable")
-            .and_then(|preimage| {
-                apply_tree(ctx, &preimage.commit)?;
-                let (actual, _) = current_tree(ctx)?;
-                if actual != preimage.tree {
-                    bail!("rollback tree verification failed");
+        let (cur_tree, cur_coverage) = current_tree(ctx)?;
+        let preimage_id = if cur_tree != target.tree {
+            // Restore always creates a fresh immutable preimage event. Reusing an older equal-tree
+            // checkpoint makes `/redo` ambiguous after branching and can leave no forward recovery point.
+            Some(save_preimage_locked(
+                ctx,
+                &mut ledger,
+                cur_tree,
+                cur_coverage,
+            )?)
+        } else {
+            ledger.cursor_id
+        };
+        if let Some(pid) = preimage_id {
+            if let Some(preimage) = ledger.snapshots.iter().find(|s| s.id == pid) {
+                let recovery_ref = ctx.recovery_ref_name(pid);
+                if ctx
+                    .git(None, ["rev-parse", "--verify", &recovery_ref])
+                    .is_err()
+                {
+                    ctx.update_ref_create(&recovery_ref, &preimage.commit)?;
                 }
-                Ok(preimage.id)
-            });
-        let detail = match result {
+            }
+        }
+
+        let mut journal = Journal::new(JournalKind::Restore, ledger.generation);
+        journal.target_id = Some(id);
+        journal.preimage_id = preimage_id;
+        // E5.1: stage the worktree the way a checkpoint sees it and journal what the restore will
+        // remove BEFORE it removes anything.
+        let staged = stage_for_apply(ctx)?;
+        let removed = paths_absent_from(ctx, &staged.0, &target.commit)?;
+        journal.removed = removed.clone();
+        journal.phase = JournalPhase::Applying;
+        ctx.save_journal(&journal)?;
+
+        let rollback = |original: anyhow::Error| -> anyhow::Error {
+            let result = preimage_id
+                .and_then(|pid| ledger.snapshots.iter().find(|s| s.id == pid))
+                .context("restore preimage unavailable")
+                .and_then(|preimage| {
+                    apply_tree(ctx, &preimage.commit)?;
+                    let (actual, _) = current_tree(ctx)?;
+                    if actual != preimage.tree {
+                        bail!("rollback tree verification failed");
+                    }
+                    Ok(preimage.id)
+                });
+            let detail = match result {
             Ok(id) => format!("rollback to preimage #{id} verified; recovery journal preserved"),
             Err(error) => format!("rollback FAILED or unverifiable ({error:#}); partial tree changes may remain; recovery journal preserved"),
         };
-        original.context(detail)
-    };
-    if let Err(apply_error) = apply_staged(ctx, &staged, &target.commit) {
-        return Err(rollback(apply_error));
-    }
-    let (actual, _) = current_tree(ctx).map_err(&rollback)?;
-    if actual != target.tree {
-        return Err(rollback(anyhow::anyhow!("restore verification failed")));
-    }
-
-    ledger.set_cursor(Some(id));
-    ctx.save_ledger(&mut ledger).context(
-        "target tree applied and verified, but restore ledger commit failed; journal preserved",
-    )?;
-    if let Some(pid) = preimage_id {
-        let recovery_ref = ctx.recovery_ref_name(pid);
-        if let Ok(oid) = ctx.git(None, ["rev-parse", "--verify", &recovery_ref]) {
-            let _ = ctx.update_ref_delete(&recovery_ref, &oid);
+            original.context(detail)
+        };
+        if let Err(apply_error) = apply_staged(ctx, &staged, &target.commit) {
+            return Err(rollback(apply_error));
         }
-    }
-    journal.phase = JournalPhase::LedgerCommitted;
-    ctx.save_journal(&journal)?;
-    ctx.clear_journal()?;
-    Ok((target, removed))
+        let (actual, _) = current_tree(ctx).map_err(&rollback)?;
+        if actual != target.tree {
+            return Err(rollback(anyhow::anyhow!("restore verification failed")));
+        }
+
+        ledger.set_cursor(Some(id));
+        ctx.save_ledger(&mut ledger).context(
+            "target tree applied and verified, but restore ledger commit failed; journal preserved",
+        )?;
+        if let Some(pid) = preimage_id {
+            let recovery_ref = ctx.recovery_ref_name(pid);
+            if let Ok(oid) = ctx.git(None, ["rev-parse", "--verify", &recovery_ref]) {
+                let _ = ctx.update_ref_delete(&recovery_ref, &oid);
+            }
+        }
+        journal.phase = JournalPhase::LedgerCommitted;
+        ctx.save_journal(&journal)?;
+        ctx.clear_journal()?;
+        Ok((target, removed))
+    })
 }
 
 fn save_preimage_locked(
@@ -6544,7 +6573,7 @@ pub fn doctor_repair() -> Result<DoctorReport> {
         None,
         "time doctor repair",
     )?;
-    let _physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+    let _physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive_without_background(
         LOCK_TIMEOUT,
         None,
         "time restore",
@@ -6552,14 +6581,20 @@ pub fn doctor_repair() -> Result<DoctorReport> {
             .unwrap_or_default()
             .resource_scope(),
     )?;
-    let _quiescence = crate::core::workspace_txn::WorkspaceRestoreGuard::acquire(&ctx.root)?;
-    let _store = ctx.store_shared()?;
-    let _lock = ctx.lock()?;
-    let mut ledger = ctx.load_ledger()?;
-    ctx.recover_pending_with_restore(&mut ledger, true)?;
-    drop(_lock);
-    drop(_store);
-    doctor()
+    let body_context = crate::core::exec_ctx::current()
+        .unwrap_or_default()
+        .with_physical_effect_lease(_physical.clone())
+        .with_writer_lease(_workspace.clone());
+    crate::core::exec_ctx::with_current(body_context, || {
+        let _quiescence = crate::core::workspace_txn::WorkspaceRestoreGuard::acquire(&ctx.root)?;
+        let _store = ctx.store_shared()?;
+        let _lock = ctx.lock()?;
+        let mut ledger = ctx.load_ledger()?;
+        ctx.recover_pending_with_restore(&mut ledger, true)?;
+        drop(_lock);
+        drop(_store);
+        doctor()
+    })
 }
 
 /// Returns the health report plus what compaction reclaimed, so the CLI can report bytes rather than
@@ -7746,7 +7781,7 @@ mod tests {
                     crate::core::repo_lock::RepoTxnLock::acquire_exclusive(path, Duration::ZERO)
                 })
                 .unwrap();
-            let physical = PhysicalEffectLease::exclusive(
+            let physical = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "git pipe fixture",
@@ -7808,7 +7843,7 @@ mod tests {
                     gate.try_acquire_with(None, |_| panic!("live admission must reject first")),
                     Err(SlotDenied::Full)
                 ));
-                assert!(PhysicalEffectLease::exclusive(
+                assert!(PhysicalEffectLease::exclusive_without_background(
                     Duration::ZERO,
                     None,
                     "competing body",
@@ -7820,7 +7855,7 @@ mod tests {
             }
             assert!(context_alive.upgrade().is_none());
             assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
-            let after = PhysicalEffectLease::exclusive(
+            let after = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "after actual pipe completion",
@@ -7975,7 +8010,7 @@ mod tests {
                 "snapshot-parent",
             )
             .unwrap();
-            let worker = PhysicalEffectLease::exclusive(
+            let worker = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "live worker",
@@ -8001,7 +8036,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            assert!(PhysicalEffectLease::exclusive(
+            assert!(PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "sibling body",
@@ -8009,7 +8044,7 @@ mod tests {
             )
             .is_err());
             assert!(
-                PhysicalEffectLease::exclusive(
+                PhysicalEffectLease::exclusive_without_background(
                     Duration::ZERO,
                     None,
                     "nested snapshot",
@@ -8019,7 +8054,7 @@ mod tests {
                 "save_locked/preimages must reuse outer admission, never acquire it again"
             );
             drop(snapshot);
-            let after = PhysicalEffectLease::exclusive(
+            let after = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "after snapshot",
@@ -8843,6 +8878,71 @@ mod tests {
     }
 
     #[test]
+    fn background_refuses_checkpoint_and_rewind_then_refreshes_pre_edit_coverage() {
+        use crate::core::workspace_txn::{BackgroundProcessBusy, SidecarEffectLease, SidecarKind};
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let root = fixture.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.as_os_str()),
+            ("AIZEN_WORKSPACE_ROOT", root.as_os_str()),
+        ]);
+        assert!(git_cmd()
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let path = root.join("f.txt");
+        fs::write(&path, "historical").unwrap();
+        let run = RunRecovery::default();
+        let historical = save_for(&run, &root, PRE_EDIT_LABEL, true, true)
+            .unwrap()
+            .unwrap();
+        let background =
+            SidecarEffectLease::acquire(SidecarKind::BackgroundProcess, Duration::ZERO, None)
+                .unwrap();
+        fs::write(&path, "background interval").unwrap();
+        let error = save_for(&run, &root, PRE_EDIT_LABEL, true, true).unwrap_err();
+        assert!(
+            error.downcast_ref::<BackgroundProcessBusy>().is_some(),
+            "{error:#}"
+        );
+        let error = run.rewind(&historical, "background-recovery").unwrap_err();
+        assert!(
+            error.downcast_ref::<BackgroundProcessBusy>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(run.status(&root).rewinds_used, 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "background interval");
+        run.defer_background_coverage();
+        assert_eq!(run.status(&root).pre_edit, Some(historical.id));
+        drop(background);
+        let fresh = save_for(&run, &root, PRE_EDIT_LABEL, true, true)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            fresh.id, historical.id,
+            "historical coverage cannot certify a new interval"
+        );
+        assert_eq!(run.status(&root).pre_edit, Some(fresh.id));
+        assert!(historical
+            .binding
+            .context()
+            .unwrap()
+            .load_ledger()
+            .unwrap()
+            .snapshots
+            .iter()
+            .any(|s| s.id == historical.id));
+    }
+
+    #[test]
     fn delegated_recovery_handles_and_checkpoint_primitives_refuse_restore() {
         use crate::agent::tools::Tool as _;
         let _home_lock = crate::core::config::TEST_HOME_LOCK
@@ -9501,7 +9601,7 @@ mod tests {
                 "binding-parent",
             )
             .unwrap();
-            let physical = PhysicalEffectLease::exclusive(
+            let physical = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "binding metadata",
@@ -9566,7 +9666,7 @@ mod tests {
                 "wrong-binding-parent",
             )
             .unwrap();
-            let physical = PhysicalEffectLease::exclusive(
+            let physical = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "wrong binding metadata",
@@ -9588,7 +9688,7 @@ mod tests {
                 "stale-binding-parent",
             )
             .unwrap();
-            let physical = PhysicalEffectLease::exclusive(
+            let physical = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "stale binding metadata",
@@ -9668,7 +9768,7 @@ mod tests {
                 "registry-binding-parent",
             )
             .unwrap();
-            let physical = PhysicalEffectLease::exclusive(
+            let physical = PhysicalEffectLease::exclusive_without_background(
                 Duration::ZERO,
                 None,
                 "registry metadata",

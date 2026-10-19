@@ -204,6 +204,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             eager_tools,
             self_review,
             sandbox_mode,
+            sandbox_network,
             disabled_toolsets,
             enabled_toolsets,
             max_subagents,
@@ -296,6 +297,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 eager_tools.is_some(),
                 self_review.is_some(),
                 sandbox_mode.is_some(),
+                sandbox_network.is_some(),
                 disabled_toolsets.is_some(),
                 enabled_toolsets.is_some(),
                 max_subagents.is_some(),
@@ -451,15 +453,12 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             if let Some(b) = self_review {
                 cfg.self_review = Some(b);
             }
-            // `sandbox.mode` only — the rest of the sandbox block (roots, pass-env, limits) stays a
-            // hand-edit, because those are lists whose meaning depends on the machine.
+            // Machine-specific lists (roots, pass-env, limits) remain a hand-edit.
             if let Some(v) = sandbox_mode {
-                let mode = v
-                    .parse::<crate::sandbox::SandboxMode>()
-                    .map_err(anyhow::Error::msg)?;
-                let mut sb = cfg.sandbox.take().unwrap_or_default();
-                sb.mode = Some(mode);
-                cfg.sandbox = Some(sb);
+                set_sandbox_mode(&mut cfg, &v)?;
+            }
+            if let Some(v) = sandbox_network {
+                set_sandbox_network(&mut cfg, &v)?;
             }
             if let Some(v) = disabled_toolsets {
                 cfg.disabled_toolsets = parse_toolset_list(&v);
@@ -947,6 +946,38 @@ fn print_config(cfg: &cli_config::CliConfig) {
             fmt_bytes(cfg.timemachine_max_bytes.unwrap_or(2 * 1024 * 1024 * 1024)),
             fmt_bytes(cfg.timemachine_max_file_bytes.unwrap_or(512 * 1024 * 1024))
         ),
+    );
+
+    section("Sandbox");
+    row(
+        "saved mode",
+        cfg.sandbox
+            .as_ref()
+            .and_then(|s| s.mode)
+            .unwrap_or_default()
+            .to_string(),
+    );
+    row("current mode", crate::sandbox::mode().to_string());
+    row(
+        "capabilities",
+        "aizen sandbox status (platform support, not a guarantee for every mode)".into(),
+    );
+    let network_allow = cfg
+        .sandbox
+        .as_ref()
+        .is_some_and(crate::sandbox::policy::network_default_allow);
+    row(
+        "child network",
+        if network_allow {
+            theme::warn("allow · all future children").to_string()
+        } else {
+            theme::accent("deny · per-command network:true grants").to_string()
+        },
+    );
+    #[cfg(windows)]
+    row(
+        "network deny",
+        theme::warn("unavailable on Windows").to_string(),
     );
 
     // ── Memory ──
@@ -2076,6 +2107,17 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Approval        · {approval_h}"),
             format!("Display         · icons {icons_h} · visuals {visuals_h}"),
             "Vision          · exact endpoint/model declarations (no probe)".to_string(),
+            format!(
+                "Sandbox         · {} · network {}",
+                cfg.sandbox
+                    .as_ref()
+                    .and_then(|s| s.mode)
+                    .unwrap_or_default(),
+                cfg.sandbox
+                    .as_ref()
+                    .and_then(|s| s.network.as_deref())
+                    .unwrap_or("deny")
+            ),
             "Show full config".to_string(),
             "Done".to_string(),
         ];
@@ -2096,6 +2138,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             }
             continue;
         }
+        let mut apply_sandbox_mode = false;
         let edited = match pick {
             0 => config_edit_providers(&mut cfg).await,
             1 => config_edit_model(&mut cfg).await,
@@ -2106,7 +2149,8 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             6 => config_edit_reasoning(&mut cfg),
             7 => config_edit_approval(&mut cfg),
             8 => config_edit_display(&mut cfg),
-            10 => {
+            10 => config_edit_sandbox(&mut cfg).map(|changed| apply_sandbox_mode = changed),
+            11 => {
                 print_config(&cfg);
                 continue;
             }
@@ -2114,11 +2158,22 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
         };
         match edited {
             Ok(()) => match cli_config::save(&cfg) {
-                Ok(_) => tui::emit_line(&format!(
-                    "  {} {}",
-                    crate::ui::theme::ok("✓"),
-                    style("saved").color256(splash::ACCENT)
-                )),
+                Ok(_) => {
+                    if apply_sandbox_mode {
+                        crate::sandbox::set_mode(
+                            cfg.sandbox
+                                .as_ref()
+                                .and_then(|s| s.mode)
+                                .unwrap_or_default(),
+                        );
+                        tui::note_line("Sandbox mode saved and applied to future child processes in this session.");
+                    }
+                    tui::emit_line(&format!(
+                        "  {} {}",
+                        crate::ui::theme::ok("✓"),
+                        style("saved").color256(splash::ACCENT)
+                    ));
+                }
                 Err(e) => tui::note_line(&format!("  {} {e}", style("save:").red())),
             },
             Err(e) => tui::note_line(&format!("  {} {e}", style("config:").red())),
@@ -4062,6 +4117,165 @@ fn config_edit_approval(cfg: &mut cli_config::CliConfig) -> Result<()> {
             2 => ApprovalMode::Yolo,
             _ => ApprovalMode::Ask,
         });
+    }
+    Ok(())
+}
+
+fn set_sandbox_mode(cfg: &mut cli_config::CliConfig, value: &str) -> Result<()> {
+    let mode = value
+        .parse::<crate::sandbox::SandboxMode>()
+        .map_err(anyhow::Error::msg)?;
+    cfg.sandbox.get_or_insert_with(Default::default).mode = Some(mode);
+    Ok(())
+}
+
+fn sandbox_mode_needs_confirmation(
+    current: crate::sandbox::SandboxMode,
+    selected: crate::sandbox::SandboxMode,
+) -> bool {
+    use crate::sandbox::SandboxMode;
+    current != selected
+        && (matches!(selected, SandboxMode::Guarded | SandboxMode::Off)
+            || current == SandboxMode::Strict && selected == SandboxMode::Auto)
+}
+
+/// Returns whether an explicit mode selection should take effect after the hub saves successfully.
+fn config_edit_sandbox(cfg: &mut cli_config::CliConfig) -> Result<bool> {
+    use crate::sandbox::SandboxMode;
+    let theme = ui_theme();
+    let mut apply_mode = false;
+    loop {
+        let saved = cfg
+            .sandbox
+            .as_ref()
+            .and_then(|s| s.mode)
+            .unwrap_or_default();
+        let current = crate::sandbox::mode();
+        let network = if cfg
+            .sandbox
+            .as_ref()
+            .is_some_and(crate::sandbox::policy::network_default_allow)
+        {
+            "allow"
+        } else {
+            "deny"
+        };
+        tui::note_line(&format!(
+            "Sandbox: saved {saved} · current session {current}"
+        ));
+        tui::note_line(
+            "Sandbox controls child isolation; Approval separately controls permission prompts.",
+        );
+        tui::note_line("Changes affect future children, not processes already running. CLI/env overrides still apply on restart.");
+        #[cfg(windows)]
+        tui::note_line("Windows: strict refuses child spawns; auto falls back to guarded interactively. Filesystem/network kernel isolation is unavailable.");
+        let items = [
+            format!("Mode            · {saved}"),
+            format!("Child network   · {network}"),
+            "Back".to_string(),
+        ];
+        match Select::with_theme(&theme)
+            .with_prompt("Sandbox (Esc goes back)")
+            .report(false)
+            .items(&items)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(0) => {
+                tui::note_line("auto: strongest available backend; interactive fallback to software guards. Unattended fallback requires explicit opt-in.");
+                tui::note_line(
+                    "strict: refuse before spawning if required kernel enforcement is unavailable.",
+                );
+                tui::note_line("guarded: software guards, env scrubbing and available limits; no kernel filesystem/network isolation.");
+                tui::note_line("off: no sandbox isolation, env scrub or resource ceilings. Approval, hard command guard, containment, timeouts and audit remain.");
+                let modes = [
+                    SandboxMode::Auto,
+                    SandboxMode::Strict,
+                    SandboxMode::Guarded,
+                    SandboxMode::Off,
+                ];
+                let selected = if apply_mode { saved } else { current };
+                if let Some(pick) = Select::with_theme(&theme)
+                    .with_prompt("Sandbox mode (Esc keeps current)")
+                    .report(false)
+                    .items(&[
+                        "auto — strongest available, guarded interactive fallback (default)",
+                        "strict — kernel enforcement or refuse",
+                        "guarded — software guards only",
+                        "off — disable sandbox isolation and environment scrubbing",
+                    ])
+                    .default(modes.iter().position(|m| *m == selected).unwrap_or(0))
+                    .interact_opt()?
+                {
+                    let mode = modes[pick];
+                    if (sandbox_mode_needs_confirmation(current, mode)
+                        || sandbox_mode_needs_confirmation(saved, mode))
+                        && !Confirm::with_theme(&theme)
+                            .with_prompt(format!(
+                                "Use {mode} for this session and save it as the default?"
+                            ))
+                            .default(false)
+                            .interact_opt()?
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    set_sandbox_mode(cfg, mode.as_str())?;
+                    apply_mode = true;
+                }
+            }
+            Some(1) => config_edit_network(cfg)?,
+            _ => return Ok(apply_mode),
+        }
+    }
+}
+
+fn set_sandbox_network(cfg: &mut cli_config::CliConfig, value: &str) -> Result<()> {
+    if !matches!(value, "deny" | "allow") {
+        anyhow::bail!("--sandbox-network must be deny or allow");
+    }
+    cfg.sandbox.get_or_insert_with(Default::default).network = Some(value.to_string());
+    Ok(())
+}
+
+fn config_edit_network(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    tui::note_line("Child processes only; provider API and web-search connections are unchanged.");
+    tui::note_line(
+        "deny keeps per-command network:true grants (including dev-server port binding).",
+    );
+    tui::note_line(
+        "allow grants network to all future child processes; tool approval still applies.",
+    );
+    tui::note_line(
+        "Network deny needs a supporting kernel backend; guarded/off do not enforce it.",
+    );
+    #[cfg(windows)]
+    tui::note_line("Windows: network deny is policy intent only; this backend cannot enforce it in the kernel.");
+    let current = cfg
+        .sandbox
+        .as_ref()
+        .is_some_and(crate::sandbox::policy::network_default_allow);
+    let pick = Select::with_theme(&theme)
+        .with_prompt("Child network (Esc keeps current)")
+        .report(false)
+        .items(&[
+            "deny — require per-command network permission",
+            "allow — network for all child processes",
+        ])
+        .default(usize::from(current))
+        .interact_opt()?;
+    if let Some(pick) = pick {
+        if pick == 1
+            && !current
+            && !Confirm::with_theme(&theme)
+                .with_prompt("Allow network for all future child processes?")
+                .default(false)
+                .interact()?
+        {
+            return Ok(());
+        }
+        set_sandbox_network(cfg, if pick == 1 { "allow" } else { "deny" })?;
     }
     Ok(())
 }

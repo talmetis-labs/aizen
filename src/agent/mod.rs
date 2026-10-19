@@ -1366,9 +1366,22 @@ where
     // `<run_id>.signals.jsonl`; the loop drains the UNREAD tail each iteration and injects it as a
     // nudge. Byte offset = high-water mark; a signal written mid-run is seen on the next turn.
     let mut signal_offset: u64 = 0;
+    let mut background_coverage_noted = false;
 
     loop {
         check_background_effects()?;
+        if managed_background_active() {
+            verify_passed = false;
+            verify_baseline = None;
+            auto_checkpointed = false;
+            crate::core::recovery::set_checkpoint(None);
+            crate::features::coop::note_background_coverage_gap();
+            cfg.exec_ctx.recovery().defer_background_coverage();
+            if !background_coverage_noted && !cfg.quiet {
+                emit_trace("→ managed background process active: automatic checkpoints and certified verification deferred; ordinary tools may continue");
+                background_coverage_noted = true;
+            }
+        }
         // COOPERATIVE CANCEL wins before any cap bookkeeping. Goal mode bypasses the cap exactly as
         // before; ordinary runs get one convergent extension at this single boundary, regardless of
         // whether the previous iteration reached it through a tool path or a Done-gate `continue`.
@@ -2384,6 +2397,7 @@ where
             // work is always re-verified. Best-effort: an unknown project / missing toolchain → the
             // gate returns None and this turn falls through to Done (never loops on absence).
             if cfg.enable_verify_gate
+                && !managed_background_active()
                 && made_any_edits
                 && !verify_passed
                 && verify_attempts < cfg.max_verify_attempts
@@ -2421,7 +2435,7 @@ where
                     }
                     demands.push(verify_gate::ABSENCE_DEMAND.to_string());
                 }
-                if let Some(result) = gate {
+                if let Some(result) = gate.filter(|result| !result.background_deferred) {
                     if result.effect_state != tools::ToolEffectState::Settled {
                         return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
                             result.effect_state,
@@ -2504,7 +2518,8 @@ where
                         if cfg.checkpoint_each_edit && made_edits_in_phase {
                             phase_counter += 1;
                             let label = format!("phase {phase_counter} verified");
-                            stamp_phase_checkpoint(cfg, last_edit_dir.as_deref(), &label);
+                            let checkpoint_saved =
+                                stamp_phase_checkpoint(cfg, last_edit_dir.as_deref(), &label);
                             // Run-log: record the phase boundary so a crash leaves a durable trace
                             // of which phases completed (durable-run Phase 1).
                             if let Some(log) = runlog.as_mut() {
@@ -2514,7 +2529,7 @@ where
                                     body: String::new(),
                                 });
                             }
-                            made_edits_in_phase = false;
+                            made_edits_in_phase = !checkpoint_saved;
                             phase_todos_before = crate::agent::todo::snapshot();
                         }
                     }
@@ -2524,6 +2539,7 @@ where
             // round that SPENT the last attempt on its repair turn (the old `continue` did this by
             // construction): only the NEXT tool-free claim, with nothing left to spend, returns.
             if cfg.enable_verify_gate
+                && !managed_background_active()
                 && made_any_edits
                 && !verify_passed
                 && !verify_failed_now
@@ -3070,6 +3086,7 @@ where
                     .count();
             }
             if cfg.enable_verify_gate
+                && !managed_background_active()
                 && cfg.harness_check_after_edits > 0
                 && edits_since_check >= cfg.harness_check_after_edits
             {
@@ -3085,6 +3102,7 @@ where
                     &cfg.exec_ctx,
                 )
                 .await
+                .filter(|result| !result.background_deferred)
                 {
                     if result.effect_state != tools::ToolEffectState::Settled {
                         return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
@@ -3149,7 +3167,7 @@ where
                     &phase_todos_before,
                     &phase_todos_after,
                 ) {
-                    stamp_phase_checkpoint(
+                    let checkpoint_saved = stamp_phase_checkpoint(
                         cfg,
                         last_edit_dir.as_deref(),
                         &format!("phase: {label}"),
@@ -3163,7 +3181,7 @@ where
                             body: String::new(),
                         });
                     }
-                    made_edits_in_phase = false;
+                    made_edits_in_phase = !checkpoint_saved;
                 }
             }
             // Track the latest list so the next boundary is measured against it, moved or not.
@@ -3909,6 +3927,30 @@ async fn execute_execution_calls_with_policy(
             i += 1;
             continue;
         }
+        if !eager.contains_key(&i)
+            && !parsed[i].as_ref().is_ok_and(|prepared| {
+                process_observation_or_cleanup(&calls[i].function.name, &prepared.args)
+            })
+        {
+            if let Err(error) = process::check_background_effects() {
+                land(
+                    i,
+                    tools::ToolOutcome::failed_with_effect_state(
+                        note_unrun_call(
+                            &calls[i].function.name,
+                            &serde_json::Value::Null,
+                            format!("error: {error:#}"),
+                            cfg,
+                        ),
+                        tool_error_effect_state(&error),
+                    ),
+                    &mut results,
+                    sink,
+                );
+                i += 1;
+                continue;
+            }
+        }
         // Speculative scopes may overlap only inside a controller-seated common-base cohort.
         // Direct native calls below retain their existing read/write conflict barriers.
         let mut speculative = Vec::new();
@@ -3979,7 +4021,7 @@ async fn execute_execution_calls_with_policy(
                             );
                         }
                         cancelled = true;
-                    } else {
+                    } else if !baseline.background_deferred {
                         *verify_baseline = Some(verify_gate::baseline_from_result(&baseline));
                     }
                 }
@@ -4089,7 +4131,7 @@ async fn execute_execution_calls_with_policy(
                                 );
                             }
                             cancelled = true;
-                        } else {
+                        } else if !result.background_deferred {
                             *verify_baseline = Some(verify_gate::baseline_from_result(&result));
                         }
                     }
@@ -4359,7 +4401,19 @@ async fn execute_execution_calls_with_policy(
                                     || tool.name() == "native_owner_undo"
                                     || (args.delegation.is_some()
                                         && matches!(tool.name(), "task" | "workflow"));
+                                let background_active = matches!(
+                                    crate::core::workspace_txn::BackgroundProcessBarrier::acquire(Some(&cfg.cancel)),
+                                    Err(ref error) if error.downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>().is_some()
+                                );
+                                if background_active {
+                                    *verify_baseline = None;
+                                    *auto_checkpointed = false;
+                                    crate::core::recovery::set_checkpoint(None);
+                                    crate::features::coop::note_background_coverage_gap();
+                                    cfg.exec_ctx.recovery().defer_background_coverage();
+                                }
                                 if placement_error.is_none()
+                                    && !background_active
                                     && cfg.exec_ctx.native_scope().is_none()
                                     && tool.name() != "native_owner_undo"
                                     && cfg.enable_verify_gate
@@ -4379,7 +4433,7 @@ async fn execute_execution_calls_with_policy(
                                         if result.effect_state != tools::ToolEffectState::Settled {
                                             baseline_effect = result.effect_state;
                                             placement_error = Some(result.output);
-                                        } else {
+                                        } else if !result.background_deferred {
                                             *verify_baseline =
                                                 Some(verify_gate::baseline_from_result(&result));
                                         }
@@ -4519,10 +4573,21 @@ async fn execute_execution_calls_with_policy(
                                         }
                                         None
                                     }
-                                    Err(e) => Some(format!(
-                                        "error: protected workspace change was not run because the pre-edit checkpoint failed: {e:#}{}",
-                                        crate::features::timemachine::checkpoint_failure_hint(&e)
-                                    )),
+                                    Err(e) if e.downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>().is_some() => {
+                                        *auto_checkpointed = false;
+                                        *verify_baseline = None;
+                                        crate::core::recovery::set_checkpoint(None);
+                                        crate::features::coop::note_background_coverage_gap();
+                                        cfg.exec_ctx.recovery().defer_background_coverage();
+                                        None
+                                    }
+                                    Err(e) => {
+                                        baseline_effect = tool_error_effect_state(&e);
+                                        Some(format!(
+                                            "error: protected workspace change was not run because the pre-edit checkpoint failed: {e:#}{}",
+                                            crate::features::timemachine::checkpoint_failure_hint(&e)
+                                        ))
+                                    },
                                 }
                                 } else {
                                     None
@@ -5086,6 +5151,13 @@ fn gate_prepared_and_approve(
     cfg: &AgentConfig,
 ) -> Option<String> {
     let args = &prepared.args;
+    if !process_observation_or_cleanup(tool.name(), args)
+        && process::check_background_effects().is_err()
+    {
+        // The body returns the typed UnknownWorker outcome before any hook or effect. Do not
+        // stringify it into an ordinary approval refusal and lose settlement authority here.
+        return None;
+    }
     if let Err(error) = check_native_capability(&cfg.exec_ctx, tool, prepared) {
         return Some(format!("error: {error}"));
     }
@@ -5138,17 +5210,19 @@ fn gate_prepared_and_approve(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
     if network_requested {
+        let message = if crate::sandbox::policy::network_default_allow(
+            &crate::sandbox::policy::settings(),
+        ) {
+            "network access requested (child network default: allow; change in /config → Sandbox → Child network)"
+        } else {
+            "network access requested; approve this command or change /config → Sandbox → Child network (default: deny)"
+        };
         let line = format!(
             "{} {}",
             style("⚠ network").color256(crate::ui::theme::WARN).bold(),
-            style("this command requests network access (sandbox default is deny)").dim()
+            style(message).dim()
         );
-        emit_warning(
-            "network",
-            "network: this command requests network access (sandbox default is deny)",
-            &line,
-            cfg.quiet,
-        );
+        emit_warning("network", &format!("network: {message}"), &line, cfg.quiet);
     }
     if let Some(command) = guarded_command.as_deref() {
         match cmd_guard::classify(command) {
@@ -5196,7 +5270,7 @@ fn gate_prepared_and_approve(
     // Hooks for safe readers run in the body, including exact readers admitted beside writers.
     // Other calls run theirs here, after the hard floor and before approval, never twice.
     let mut hook_allow = false;
-    if !pre_tool_hook_in_body(tool, prepared) {
+    if !pre_tool_hook_in_body(tool, prepared) && process::check_background_effects().is_ok() {
         let hook_ctx = hooks::Context::from_cfg(cfg);
         match hooks::run_blocking(|| hooks::pre_tool(tool.name(), args, &hook_ctx)) {
             hooks::PreToolVerdict::Deny { run, reason } => {
@@ -5515,6 +5589,14 @@ fn run_prepared_tool_body(
     run_prepared_tool_body_cached(tool, prepared, quiet, budgets, image_destination, None)
 }
 
+fn process_observation_or_cleanup(name: &str, args: &serde_json::Value) -> bool {
+    name == "process"
+        && matches!(
+            args.get("action").and_then(|v| v.as_str()),
+            Some("list" | "log" | "status" | "wait" | "kill")
+        )
+}
+
 fn run_prepared_tool_body_cached(
     tool: std::sync::Arc<dyn tools::Tool>,
     prepared: &tools::PreparedToolCall,
@@ -5524,7 +5606,14 @@ fn run_prepared_tool_body_cached(
     cache: Option<(ReadCacheEntry, std::path::PathBuf)>,
 ) -> tools::ToolOutcome {
     let args = &prepared.args;
-    if let Err(error) = check_background_effects() {
+    let process_cleanup = process_observation_or_cleanup(tool.name(), args);
+    if let Err(error) = check_background_effects().and_then(|_| {
+        if process_cleanup {
+            Ok(())
+        } else {
+            process::check_background_effects()
+        }
+    }) {
         return tools::ToolOutcome::failed_with_effect_state(
             format!("error: {error:#}"),
             tool_error_effect_state(&error),
@@ -5567,7 +5656,9 @@ fn run_prepared_tool_body_cached(
     let missing = tools::missing_required_strings(&tool.parameters(), args);
     // Safe readers run their pre hook here; barrier calls already ran it ahead of approval.
     let hook_ctx = hooks::Context::here(quiet);
-    let hook_denied = if pre_tool_hook_in_body(tool.as_ref(), prepared) {
+    let hook_denied = if pre_tool_hook_in_body(tool.as_ref(), prepared)
+        && process::check_background_effects().is_ok()
+    {
         match hooks::pre_tool(tool.name(), args, &hook_ctx) {
             hooks::PreToolVerdict::Deny { run, reason } => {
                 Some(format!("error: blocked by hook `{run}`: {reason}"))
@@ -5577,7 +5668,13 @@ fn run_prepared_tool_body_cached(
     } else {
         None
     };
-    let execution = if let Err(error) = check_background_effects() {
+    let execution = if let Err(error) = check_background_effects().and_then(|_| {
+        if process_cleanup {
+            Ok(())
+        } else {
+            process::check_background_effects()
+        }
+    }) {
         Err(error)
     } else if let Some(denied) = hook_denied.clone() {
         Err(anyhow::anyhow!(denied))
@@ -5670,7 +5767,7 @@ fn run_prepared_tool_body_cached(
         }
         Err(error) => {
             let effect_state = tool_error_effect_state(&error);
-            let text = error.to_string();
+            let text = format!("{error:#}");
             let text = if text.starts_with("error:") {
                 text
             } else {
@@ -5725,12 +5822,21 @@ fn run_prepared_tool_body_cached(
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     // `post_tool` hooks read the raw result; what they say rides the result the model reads.
-    let hook_note = if hook_denied.is_none() && effect_state == tools::ToolEffectState::Settled {
+    let hook_note = if hook_denied.is_none()
+        && effect_state == tools::ToolEffectState::Settled
+        && process::check_background_effects().is_ok()
+    {
         hooks::post_tool(tool.name(), args, &out, failure.is_none(), &hook_ctx)
     } else {
         None
     };
-    if let Err(error) = check_background_effects() {
+    if let Err(error) = check_background_effects().and_then(|_| {
+        if process_cleanup {
+            Ok(())
+        } else {
+            process::check_background_effects()
+        }
+    }) {
         effect_state = tools::ToolEffectState::UnknownWorker;
         let note = format!("error: {error:#}");
         failure = Some(note.clone());
@@ -5781,6 +5887,14 @@ fn run_prepared_tool_body_cached(
         failure,
         effect_state,
     }
+}
+
+fn managed_background_active() -> bool {
+    crate::core::workspace_txn::BackgroundProcessBarrier::acquire(None).is_err_and(|error| {
+        error
+            .downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>()
+            .is_some()
+    })
 }
 
 fn check_background_effects() -> anyhow::Result<()> {
@@ -6321,9 +6435,9 @@ pub(crate) fn emit_trace_public(line: &str) {
 /// Factored out of the loop because the phase mark can fire on a turn that made no edit (the closing
 /// `todo_write` lands alone), so the call site is outside the `edited_this_turn` block. `label` is the
 /// full checkpoint label (e.g. `"phase: wire up auth"`), already prefixed by the caller.
-fn stamp_phase_checkpoint(cfg: &AgentConfig, root: Option<&std::path::Path>, label: &str) {
+fn stamp_phase_checkpoint(cfg: &AgentConfig, root: Option<&std::path::Path>, label: &str) -> bool {
     if cfg.exec_ctx.native_scope().is_some() {
-        return;
+        return false;
     }
     let root = root
         .map(std::path::Path::to_path_buf)
@@ -6343,11 +6457,21 @@ fn stamp_phase_checkpoint(cfg: &AgentConfig, root: Option<&std::path::Path>, lab
                     snap.id, snap.id
                 ));
             }
+            return true;
         }
         Ok(None) => {
             // Same benign, repeating case as the two arms below: no git-visible coverage is a
             // property of the directory, not news about this turn.
             tracing_note("checkpoint unavailable: no git-visible repository coverage");
+        }
+        Err(e)
+            if e.downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>()
+                .is_some() =>
+        {
+            crate::features::coop::note_background_coverage_gap();
+            cfg.exec_ctx.recovery().defer_background_coverage();
+            crate::core::recovery::set_checkpoint(None);
+            tracing_note("phase checkpoint deferred: managed background process active");
         }
         Err(e) if e.to_string().contains("not a git repository") => {
             // Benign and repeated: every phase boundary in a non-repo directory would print this.
@@ -6363,6 +6487,7 @@ fn stamp_phase_checkpoint(cfg: &AgentConfig, root: Option<&std::path::Path>, lab
             ));
         }
     }
+    false
 }
 
 /// The tool-call anchor icon — the moonlight cog `⚙` (matching the mockup), or empty when icons are
@@ -13064,6 +13189,46 @@ mod tests {
         (temp, pin_placement_context(&c).unwrap())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Pin the fixture home across dispatch workers"
+    )]
+    async fn managed_background_defers_automatic_coverage_but_runs_ordinary_body() {
+        use crate::core::workspace_txn::{SidecarEffectLease, SidecarKind};
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (temp, mut config) = placement_executor_fixture();
+        let root = config.effective_root();
+        let home = temp.path().join("coordination-home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        assert!(crate::core::gitx::command()
+            .unwrap()
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        config.enable_verify_gate = true;
+        config.auto_checkpoint = true;
+        let background = crate::core::exec_ctx::with_current(config.exec_ctx.clone(), || {
+            SidecarEffectLease::acquire(
+                SidecarKind::BackgroundProcess,
+                std::time::Duration::ZERO,
+                None,
+            )
+            .unwrap()
+        });
+        let results = exec(&registry(), &[call("ordinary", "delete", "{}")], &config).await;
+        assert_eq!(results[0].1, "deleted");
+        assert_eq!(config.exec_ctx.recovery().status(&root).pre_edit, None);
+        drop(background);
+        let results = exec(&registry(), &[call("fresh", "delete", "{}")], &config).await;
+        assert_eq!(results[0].1, "deleted");
+        assert!(config.exec_ctx.recovery().status(&root).pre_edit.is_some());
+    }
+
     #[test]
     fn native_independent_child_loops_overlap_through_actual_executor_bodies() {
         let _home_lock = crate::core::config::TEST_HOME_LOCK
@@ -14218,6 +14383,33 @@ mod tests {
                 .is_some_and(|c| c.starts_with("[self-review]"))),
             "read-only runs never pay the review turn"
         );
+    }
+
+    #[test]
+    fn nested_tool_failure_keeps_actionable_cause_and_cleanup_is_narrow() {
+        let error = anyhow::anyhow!("physical effects gate is held by another body")
+            .context("acquiring physical effects gate");
+        assert!(format!("{error:#}").contains("held by another body"));
+        assert_eq!(
+            tool_error_effect_state(&error),
+            tools::ToolEffectState::Settled
+        );
+        for action in ["list", "log", "status", "wait", "kill"] {
+            assert!(process_observation_or_cleanup(
+                "process",
+                &serde_json::json!({"action": action})
+            ));
+        }
+        for action in ["start", "write", "unknown"] {
+            assert!(!process_observation_or_cleanup(
+                "process",
+                &serde_json::json!({"action": action})
+            ));
+        }
+        assert!(!process_observation_or_cleanup(
+            "shell_run",
+            &serde_json::json!({"action": "kill"})
+        ));
     }
 
     #[test]

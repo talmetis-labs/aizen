@@ -89,8 +89,21 @@ device probe on macOS. None of them execute model-supplied strings.
 | `guarded` | software guards only: approval, `cmd_guard`, env scrubbing, private temp, timeouts, tree-kill, and the resource ceilings the OS offers. Reported as software, never as a kernel sandbox. |
 | `off` | the sandbox subsystem stands down: children inherit the full environment and no resource ceilings are applied. The `cmd_guard` hard floor, approval, process-tree containment, timeouts, and the audit log still apply. User-only — no model output can select it. |
 
-Set the mode with `--sandbox <mode>`, `AIZEN_SANDBOX=<mode>`, `/sandbox <mode>` in the REPL, or
-`"sandbox": { "mode": "…" }` in `~/.aizen/cli-config.json` (that order wins).
+Choose the overall level in **`/config` → Sandbox → Mode**, or persist it explicitly:
+
+```sh
+aizen config set --sandbox-mode auto     # default: strongest available with interactive fallback
+aizen config set --sandbox-mode strict   # kernel enforcement or refusal
+aizen config set --sandbox-mode guarded  # software guards only
+aizen config set --sandbox-mode off      # no isolation, env scrub or resource ceilings
+```
+
+The menu asks for confirmation before choosing `guarded`/`off` or relaxing `strict` to `auto`.
+After a successful save, an explicit mode selection also applies to future children in the current
+session (including replacing a current session override); it does not resandbox existing processes.
+A new invocation resolves `--sandbox <mode>` before `AIZEN_SANDBOX=<mode>`, persisted config, and
+finally `auto`. `/sandbox <mode>` changes the current session and saves the default as well.
+Network is a separate capability under **Sandbox → Child network**, not the sandbox level itself.
 
 ## Platform capability matrix
 
@@ -146,10 +159,18 @@ accepts verification or clears pending guards. Publication failures retain evide
 cleanup/retry. Safe terminal reconciliation, selective inverse and checkpoint/authorship linkage are
 unfinished. This does not change the process capability matrix or imply release/install verification.
 
-Live shell/build/process work stays an opaque exclusive barrier. In particular, Windows Job
-Objects provide containment and resource limits, **not filesystem/network isolation**; shell
-and build commands do not overlap live native editors. Copying the checkout or changing `cwd`
-does not prevent absolute-path access, inherited handles, daemon/cache access or IPC escapes.
+Foreground shell/build work stays an opaque exclusive barrier against scoped native editors.
+Managed background `process` commands instead retain a separate lifetime barrier, allowing ordinary
+sequential tools in the same authorized writer scope to continue while a dev server lives. This is
+an explicit compatibility exception, **not filesystem/build isolation**: a background command may
+write arbitrary reachable paths while those tools run. Scoped native work, speculative cohorts,
+coherent checkpoints, recovery/undo and certified verification remain excluded. Automatic coverage
+is deferred during that interval; no protected/verified claim is earned. Lost observer/tree proof
+blocks ordinary effects with typed uncertainty until actual tree and pipe settlement is proven.
+
+Windows Job Objects provide containment and resource limits, **not filesystem/network isolation**.
+Copying the checkout or changing `cwd` does not prevent absolute-path access, inherited handles,
+daemon/cache access or IPC escapes.
 The ordinary Linux profile retains local IPC and writable host caches; the ordinary macOS
 profile permits broad reads. Neither is an isolated-build profile.
 
@@ -222,6 +243,21 @@ Default: **deny**. `shell_run` and `process start` accept `network: true|false` 
 `false`); requesting it is a capability escalation — it always surfaces in the approval flow,
 `smart` never auto-clears a command that asked for network, and `/yolo` (which only skips
 prompts) still gets the caution line printed.
+
+Change the child-network default in **`/config` → Sandbox → Child network** (also available through
+`aizen config`), or explicitly persist it from the CLI:
+
+```sh
+aizen config set --sandbox-network deny   # default: per-command network:true grants
+aizen config set --sandbox-network allow  # broader: network for all future child processes
+```
+
+`allow` does not approve the command itself or disable the sandbox/hard command guard. The menu
+requires confirmation before widening the default. Changes apply to newly started children, not
+already running servers. Port binding for a dev server also needs network capability. This setting
+does not control Aizen's own provider/API or web-search connections. `deny` is not a non-overridable
+ban: an approved `network:true` command may still use the network. Kernel deny also requires a
+supporting backend in `auto`/`strict`; `guarded` and `off` do not enforce network isolation.
 
 - Linux: enforced by seccomp — `socket(AF_INET/AF_INET6)` returns `EACCES`; UNIX sockets stay
   usable so local IPC and build tooling keep working. A denied `cargo build` that needs to

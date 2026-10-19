@@ -83,10 +83,14 @@ impl Fixture {
             )
             .unwrap();
         drop(body);
-        let released =
+        let released = with_test_lock_home(&home, || {
             super::super::speculative_attempt::release_idle_for_test(&work, &overlay, &scope)
-                .unwrap();
+        })
+        .unwrap();
         let cohort = Arc::new(Cohort {
+            _background: with_test_lock_home(&home, || {
+                crate::core::workspace_txn::BackgroundProcessBarrier::acquire(None).unwrap()
+            }),
             parent: parent.resource_scope(),
             base,
             binding: None,
@@ -159,8 +163,10 @@ fn speculation_parent_seal_refuses_foreign_parent_handle_and_live_private_body()
         .seal_after_driver(&fixture.parent, &overlay)
         .is_err());
     drop(body);
-    let released =
-        super::super::speculative_attempt::release_idle_for_test(root, &overlay, &scope).unwrap();
+    let released = with_test_lock_home(&fixture.home, || {
+        super::super::speculative_attempt::release_idle_for_test(root, &overlay, &scope)
+    })
+    .unwrap();
     let sealed = fixture
         .cohort
         .seal_released(&fixture.parent, &overlay, released)
@@ -181,6 +187,7 @@ fn speculation_parent_seal_refuses_foreign_parent_handle_and_live_private_body()
 
 fn gate_result(effect_state: ToolEffectState) -> VerifyGateResult {
     VerifyGateResult {
+        background_deferred: false,
         passed: true,
         command: "owned-lifecycle-gate".into(),
         output: String::new(),
