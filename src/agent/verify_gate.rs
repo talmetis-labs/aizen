@@ -143,6 +143,7 @@ pub const ABSENCE_DEMAND: &str = "[verify] No build or test command could be run
 /// The outcome of one verify-gate run.
 #[derive(Debug, Clone)]
 pub struct VerifyGateResult {
+    pub background_deferred: bool,
     pub passed: bool,
     pub command: String,
     pub output: String,
@@ -153,7 +154,8 @@ pub struct VerifyGateResult {
 
 impl VerifyGateResult {
     pub fn accepted(&self) -> bool {
-        self.passed
+        !self.background_deferred
+            && self.passed
             && self.stable
             && self.effect_state == crate::agent::tools::ToolEffectState::Settled
     }
@@ -879,6 +881,10 @@ pub async fn run_verify_ladder_in_context(
     quiet: bool,
     ctx: &ExecutionContext,
 ) -> Option<VerifyGateResult> {
+    let _background = match background_admission() {
+        Ok(guard) => guard,
+        Err(error) => return background_refusal(error),
+    };
     let baseline = source_fingerprint(root);
     let record = load_record(root);
     let ladder = plan_ladder(root, edited, timeout_secs, &record.measured_ms);
@@ -952,6 +958,10 @@ pub async fn run_verify_ladder_in_context(
 /// `/init`'s share of verification: detect the commands and the suite, time the fast rung once,
 /// and keep the result in HOME. Returns the lines to show the user.
 pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
+    let _background = match background_admission() {
+        Ok(guard) => guard,
+        Err(error) => return vec![format!("verify unavailable: {error:#}")],
+    };
     let ctx = crate::core::exec_ctx::current().unwrap_or_default();
     let baseline = source_fingerprint(root);
     let cmds = detect_verify_commands(root);
@@ -1082,6 +1092,10 @@ pub async fn run_verify_gate_in_context(
     timeout_secs: u64,
     ctx: &ExecutionContext,
 ) -> Option<VerifyGateResult> {
+    let _background = match background_admission() {
+        Ok(guard) => guard,
+        Err(error) => return background_refusal(error),
+    };
     let baseline = source_fingerprint(cwd);
     let cmds = detect_verify_commands(cwd);
     if cmds.is_empty() {
@@ -1139,6 +1153,7 @@ fn quarantine_verify(ownership: VerifyOwnership) {
 
 fn verify_failed(command: &str, start: Instant, output: String) -> Option<VerifyGateResult> {
     Some(VerifyGateResult {
+        background_deferred: false,
         passed: false,
         command: command.to_string(),
         output,
@@ -1146,6 +1161,27 @@ fn verify_failed(command: &str, start: Instant, output: String) -> Option<Verify
         stable: true,
         effect_state: crate::agent::tools::ToolEffectState::Settled,
     })
+}
+
+fn background_admission() -> anyhow::Result<crate::core::workspace_txn::BackgroundProcessBarrier> {
+    crate::core::workspace_txn::BackgroundProcessBarrier::acquire(
+        crate::core::cancel::current().as_ref(),
+    )
+}
+
+fn background_refusal(error: anyhow::Error) -> Option<VerifyGateResult> {
+    let deferred = error
+        .downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>()
+        .is_some();
+    let mut result = verify_failed(
+        "verify",
+        Instant::now(),
+        format!("verification unavailable: {error:#}"),
+    )?;
+    result.effect_state = super::tool_error_effect_state(&error);
+    result.background_deferred = deferred;
+    result.stable = false;
+    Some(result)
 }
 
 fn verify_unsettled(command: &str, start: Instant, output: String) -> Option<VerifyGateResult> {
@@ -1207,12 +1243,13 @@ async fn run_one_verify(
                 "verify command",
                 &scope,
             )?;
-            let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
-                Duration::from_secs(15),
-                cancel.as_ref(),
-                "verify command body",
-                &scope,
-            )?;
+            let physical =
+                crate::core::workspace_txn::PhysicalEffectLease::exclusive_without_background(
+                    Duration::from_secs(15),
+                    cancel.as_ref(),
+                    "verify command body",
+                    &scope,
+                )?;
             let activity = crate::core::workspace_txn::WorkspaceActivity::begin(cwd, &scope)?;
             Ok((writer, physical, activity))
         })();
@@ -1358,6 +1395,7 @@ async fn run_one_verify(
                 return None;
             }
             Some(VerifyGateResult {
+                background_deferred: false,
                 passed: output.status.success(),
                 command: command_line,
                 output: tail_chars(combined.trim_end(), MAX_OUTPUT_CHARS),
@@ -2077,6 +2115,39 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     }
 
     #[test]
+    fn background_refusal_is_deferred_but_uncertainty_is_not() {
+        let busy = background_refusal(anyhow::Error::new(
+            crate::core::workspace_txn::BackgroundProcessBusy,
+        ))
+        .unwrap();
+        assert!(busy.background_deferred);
+        assert!(!busy.accepted());
+        assert!(!busy.stable);
+        let unknown = background_refusal(
+            anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                crate::agent::tools::ToolEffectState::UnknownWorker,
+            ))
+            .context("lost background monitor"),
+        )
+        .unwrap();
+        assert!(!unknown.background_deferred);
+        assert!(!unknown.accepted());
+        assert_eq!(
+            unknown.effect_state,
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
+        let prose = background_refusal(anyhow::anyhow!(
+            "managed background process is active; UnknownWorker"
+        ))
+        .unwrap();
+        assert!(!prose.background_deferred);
+        assert_eq!(
+            prose.effect_state,
+            crate::agent::tools::ToolEffectState::Settled
+        );
+    }
+
+    #[test]
     fn custom_verify_requires_trust_gate() {
         // An untrusted repo's verify.json must be INERT. Sandbox AIZEN_HOME so the developer's
         // real trust store (which may trust THIS repo) can't leak into the assertion.
@@ -2107,6 +2178,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         use crate::agent::tools::ToolEffectState;
 
         let mut result = VerifyGateResult {
+            background_deferred: false,
             passed: true,
             command: "owned verify".into(),
             output: String::new(),
@@ -2152,6 +2224,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     #[test]
     fn stale_pass_and_stale_red_baseline_are_never_reused() {
         let mut result = VerifyGateResult {
+            background_deferred: false,
             passed: true,
             command: "cargo check".into(),
             output: "error[E0308]: old error\n --> src/a.rs:1:1".into(),
@@ -2180,6 +2253,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         let baseline = source_fingerprint(root);
         assert!(baseline.is_some());
         let pass = VerifyGateResult {
+            background_deferred: false,
             passed: true,
             command: "owned verify".into(),
             output: String::new(),
@@ -2249,6 +2323,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     #[test]
     fn format_failure_includes_command_and_output() {
         let r = VerifyGateResult {
+            background_deferred: false,
             passed: false,
             command: "cargo check".into(),
             output: "error[E0308]: mismatched types".into(),

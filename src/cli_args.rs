@@ -1322,8 +1322,11 @@ pub(crate) enum ConfigCmd {
         self_review: Option<bool>,
         /// Persist the sandbox mode (`sandbox.mode`): auto | strict | guarded | off. Unlike the
         /// global `--sandbox`, which overrides one invocation, this one is written to the config.
-        #[arg(long)]
+        #[arg(long, value_parser = ["auto", "strict", "guarded", "off"])]
         sandbox_mode: Option<String>,
+        /// Persist child network policy: deny (per-command network:true) or allow (all children).
+        #[arg(long, value_parser = ["deny", "allow"])]
+        sandbox_network: Option<String>,
         /// Comma-separated tool bundles to hide.
         #[arg(long)]
         disabled_toolsets: Option<String>,

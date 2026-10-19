@@ -210,6 +210,9 @@ impl Tool for NativeOwnerUndo {
                     }),
             "native owner undo resource footprint changed; prepare and approve again"
         );
+        let _background = crate::core::workspace_txn::BackgroundProcessBarrier::acquire(
+            crate::core::cancel::current().as_ref(),
+        )?;
         // Revalidate every target BEFORE any reversal; a preparation drift never partially applies.
         for resource in &frozen.resources {
             resource.verify()?;

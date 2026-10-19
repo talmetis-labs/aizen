@@ -3,6 +3,149 @@
 
 use super::*;
 
+#[test]
+fn sandbox_network_control_preserves_other_settings_and_rejects_invalid_values() {
+    let mut cfg = cli_config::CliConfig {
+        sandbox: Some(crate::sandbox::policy::SandboxSettings {
+            mode: Some(crate::sandbox::SandboxMode::Strict),
+            pass_env: vec!["MYAPP_*".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(!crate::sandbox::policy::network_default_allow(
+        cfg.sandbox.as_ref().unwrap()
+    ));
+    set_sandbox_network(&mut cfg, "allow").unwrap();
+    assert!(crate::sandbox::policy::network_default_allow(
+        cfg.sandbox.as_ref().unwrap()
+    ));
+    assert!(set_sandbox_network(&mut cfg, "alow").is_err());
+    assert_eq!(
+        cfg.sandbox.as_ref().unwrap().network.as_deref(),
+        Some("allow")
+    );
+    set_sandbox_network(&mut cfg, "deny").unwrap();
+    let saved: cli_config::CliConfig =
+        serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+    let sandbox = saved.sandbox.unwrap();
+    assert!(!crate::sandbox::policy::network_default_allow(&sandbox));
+    assert_eq!(sandbox.mode, Some(crate::sandbox::SandboxMode::Strict));
+    assert_eq!(sandbox.pass_env, ["MYAPP_*"]);
+}
+
+#[test]
+fn sandbox_network_cli_accepts_only_documented_values() {
+    use clap::Parser;
+    for policy in ["deny", "allow"] {
+        let parsed = crate::cli_args::Cli::try_parse_from([
+            "aizen",
+            "config",
+            "set",
+            "--sandbox-network",
+            policy,
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(crate::cli_args::Commands::Config {
+            cmd: Some(ConfigCmd::Set { sandbox_network: Some(value), .. })
+        }) if value == policy)
+        );
+    }
+    assert!(crate::cli_args::Cli::try_parse_from([
+        "aizen",
+        "config",
+        "set",
+        "--sandbox-network",
+        "alow",
+    ])
+    .is_err());
+}
+
+#[test]
+fn sandbox_mode_control_preserves_capabilities_and_rejects_invalid_values() {
+    use crate::sandbox::{policy::SandboxSettings, SandboxMode};
+    let mut cfg = cli_config::CliConfig {
+        sandbox: Some(SandboxSettings {
+            network: Some("allow".into()),
+            pass_env: vec!["MYAPP_*".into()],
+            writable_roots: vec!["build-cache".into()],
+            allow_guarded_fallback: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for mode in [
+        SandboxMode::Auto,
+        SandboxMode::Strict,
+        SandboxMode::Guarded,
+        SandboxMode::Off,
+    ] {
+        set_sandbox_mode(&mut cfg, mode.as_str()).unwrap();
+        let saved: cli_config::CliConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        let sandbox = saved.sandbox.unwrap();
+        assert_eq!(sandbox.mode, Some(mode));
+        assert_eq!(sandbox.network.as_deref(), Some("allow"));
+        assert_eq!(sandbox.pass_env, ["MYAPP_*"]);
+        assert_eq!(sandbox.writable_roots, ["build-cache"]);
+        assert_eq!(sandbox.allow_guarded_fallback, Some(false));
+    }
+    assert!(set_sandbox_mode(&mut cfg, "yolo").is_err());
+    assert_eq!(cfg.sandbox.as_ref().unwrap().mode, Some(SandboxMode::Off));
+    let mut defaults = cli_config::CliConfig::default();
+    set_sandbox_mode(&mut defaults, "strict").unwrap();
+    assert_eq!(defaults.sandbox.unwrap().mode, Some(SandboxMode::Strict));
+}
+
+#[test]
+fn sandbox_mode_confirmation_covers_weaker_selections() {
+    use crate::sandbox::SandboxMode::{Auto, Guarded, Off, Strict};
+    let modes = [Auto, Strict, Guarded, Off];
+    let expected = [
+        [false, false, true, true],
+        [true, false, true, true],
+        [false, false, false, true],
+        [false, false, true, false],
+    ];
+    for (i, current) in modes.into_iter().enumerate() {
+        for (j, selected) in modes.into_iter().enumerate() {
+            assert_eq!(
+                sandbox_mode_needs_confirmation(current, selected),
+                expected[i][j]
+            );
+        }
+    }
+}
+
+#[test]
+fn sandbox_mode_cli_accepts_only_documented_levels() {
+    use clap::Parser;
+    for mode in ["auto", "strict", "guarded", "off"] {
+        let parsed = crate::cli_args::Cli::try_parse_from([
+            "aizen",
+            "config",
+            "set",
+            "--sandbox-mode",
+            mode,
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(crate::cli_args::Commands::Config {
+            cmd: Some(ConfigCmd::Set { sandbox_mode: Some(value), .. })
+        }) if value == mode)
+        );
+    }
+    assert!(crate::cli_args::Cli::try_parse_from([
+        "aizen",
+        "config",
+        "set",
+        "--sandbox-mode",
+        "yolo",
+    ])
+    .is_err());
+}
+
 fn models() -> Vec<String> {
     vec![
         "opus-4-8".to_string(),

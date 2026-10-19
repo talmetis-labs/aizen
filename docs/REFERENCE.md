@@ -989,7 +989,16 @@ actual settled edits (including partial edits before a later failure), verifies 
 and owns recovery. A successful child report alone is not mutation or verification evidence.
 This source contract does not retroactively enable previously installed binaries.
 
-Live shell and build commands remain serialized on Windows: Job Objects contain process trees,
+Managed background `process` commands can coexist with ordinary sequential parent file/shell tools
+under the same authorized writer scope. Their lifetime barrier still excludes scoped native work,
+speculation, coherent checkpoints, restore/undo and certified verification. Automatic checkpoint and
+verification coverage is deferred while they live; an ordinary shell build may run but does not earn
+a verification certificate. This compatibility lane is not filesystem isolation or serializability
+against arbitrary background writes. Unrelated writer scopes remain excluded. If the monitor loses
+proof of ownership/settlement, ordinary effects are refused until tree proof and every actual pipe
+worker settle; UI completion, kill requests and registry removal are not proof.
+
+Live foreground shell and build commands remain serialized on Windows: Job Objects contain process trees,
 not filesystem or network access. A copied working directory does not authorize editor/build
 overlap. No concurrent isolated-snapshot build capability is advertised on Linux or macOS either;
 that requires a dedicated restrictive backend and real escape/settlement tests, not merely the
@@ -1246,8 +1255,20 @@ aizen --sandbox strict …      # per-invocation mode override (also AIZEN_SANDB
 
 Modes: `auto` (default — strongest backend, guarded fallback for interactive sessions only) ·
 `strict` (kernel enforcement or refusal) · `guarded` (software guards, said plainly) · `off`.
+Choose a level in **`/config` → Sandbox → Mode**, or persist it with
+`aizen config set --sandbox-mode auto|strict|guarded|off`. The menu saves the selection and applies
+it to future children in the current session; CLI/env overrides still win on the next startup.
+Weaker selections require confirmation. Already running processes are unchanged. `guarded` does
+not provide kernel filesystem/network isolation; `off` additionally disables environment scrubbing
+and resource ceilings, not approval or the hard command guard. Windows `strict` refuses child spawns.
 Config lives under `"sandbox": {…}` in `~/.aizen/cli-config.json`. Threat model, per-platform
 matrix and limitations: [SANDBOX.md](SANDBOX.md).
+
+**Child network:** `/config` → **Sandbox → Child network**, or `aizen config set --sandbox-network deny|allow`.
+`deny` (default) requires an approved per-command `network:true`; `allow` gives all future children
+network access without that capability request, while ordinary tool approval still applies. The
+setting includes dev-server port binding, not Aizen's own API/web-search traffic. Existing processes
+are unchanged. On Windows, network deny is currently **not kernel-enforced**.
 
 ### `/persona` — a character that evolves
 A **persona** is *who the agent is* — a third identity layer alongside **user_memory** (who you are)

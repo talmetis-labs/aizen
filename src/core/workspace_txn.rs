@@ -823,6 +823,7 @@ fn native_node_identity(_path: &Path, _md: &std::fs::Metadata) -> Result<((u64, 
 #[derive(Clone)]
 pub(crate) struct PhysicalEffectLease {
     _locks: std::sync::Arc<LockSet>,
+    _background: Option<BackgroundProcessBarrier>,
     mode: LockMode,
 }
 
@@ -843,6 +844,18 @@ impl PhysicalEffectLease {
         Self::acquire(LockMode::Exclusive, timeout, cancel, operation, scope)
     }
 
+    pub(crate) fn exclusive_without_background(
+        timeout: Duration,
+        cancel: Option<&crate::core::cancel::TurnCancel>,
+        operation: &str,
+        scope: &str,
+    ) -> Result<Self> {
+        let background = BackgroundProcessBarrier::acquire(cancel)?;
+        let mut lease = Self::exclusive(timeout, cancel, operation, scope)?;
+        lease._background = Some(background);
+        Ok(lease)
+    }
+
     fn acquire(
         mode: LockMode,
         timeout: Duration,
@@ -850,6 +863,7 @@ impl PhysicalEffectLease {
         operation: &str,
         scope: &str,
     ) -> Result<Self> {
+        crate::agent::process::check_background_effects()?;
         if scope.is_empty() || scope.len() > 4096 || operation.len() > 4096 {
             anyhow::bail!("physical effect lease requires bounded operation and nonempty scope");
         }
@@ -864,8 +878,11 @@ impl PhysicalEffectLease {
             cancel,
             &LockOwner::new(scope, operation),
         )?;
+        // A background monitor may have been lost while this body waited for foreground admission.
+        crate::agent::process::check_background_effects()?;
         Ok(Self {
             _locks: std::sync::Arc::new(locks),
+            _background: None,
             mode,
         })
     }
@@ -877,7 +894,7 @@ impl PhysicalEffectLease {
 
 /// Which category of live sidecar this is — and therefore how it relates to scoped native work.
 ///
-/// The two categories carry different effect risk, so they take SEPARATE gates:
+/// These categories carry different effect risk, so they take SEPARATE gates:
 ///
 /// - A **language server** is a read-mostly whole-repo observer, so it SHARES its gate with scoped
 ///   native bodies. That coexistence is sound because host writes are atomic
@@ -887,13 +904,16 @@ impl PhysicalEffectLease {
 ///   *every* child for the whole session, so parallel agents silently edited nothing.
 /// - An **MCP server** has arbitrary effects and may write anywhere, so it holds its gate
 ///   EXCLUSIVELY: it is excluded by scoped native work, and excludes it in turn.
+/// - A **managed background process** is opaque too. It excludes scoped/coherent operations,
+///   while ordinary sequential parent work deliberately remains compatible.
 ///
-/// Separate gates also keep the two categories able to coexist, which the old single pooled gate
+/// Separate gates also keep the categories able to coexist, which the old single pooled gate
 /// allowed; one shared gate at two different modes would have made them exclude each other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SidecarKind {
     LanguageServer,
     McpServer,
+    BackgroundProcess,
 }
 
 impl SidecarKind {
@@ -901,13 +921,14 @@ impl SidecarKind {
         match self {
             Self::LanguageServer => resource_lock("sidecar-effects", "lsp"),
             Self::McpServer => resource_lock("sidecar-effects", "mcp"),
+            Self::BackgroundProcess => resource_lock("sidecar-effects", "background-process"),
         }
     }
 
     fn mode(self) -> LockMode {
         match self {
             Self::LanguageServer => LockMode::Shared,
-            Self::McpServer => LockMode::Exclusive,
+            Self::McpServer | Self::BackgroundProcess => LockMode::Exclusive,
         }
     }
 
@@ -915,7 +936,56 @@ impl SidecarKind {
         match self {
             Self::LanguageServer => "live language server",
             Self::McpServer => "live MCP server",
+            Self::BackgroundProcess => "managed background process",
         }
+    }
+}
+
+/// An opaque managed background excludes coherent snapshots and recovery, but not ordinary IO.
+#[derive(Debug)]
+pub(crate) struct BackgroundProcessBusy;
+
+impl std::fmt::Display for BackgroundProcessBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("managed background process is active; stop it and wait for settlement before checkpoint, recovery or certified verification")
+    }
+}
+
+impl std::error::Error for BackgroundProcessBusy {}
+
+#[derive(Clone)]
+pub(crate) struct BackgroundProcessBarrier {
+    _locks: std::sync::Arc<LockSet>,
+}
+
+impl BackgroundProcessBarrier {
+    /// Independent, nonpooled shared admission. Never wait while callers may own later gates.
+    pub(crate) fn acquire(cancel: Option<&crate::core::cancel::TurnCancel>) -> Result<Self> {
+        crate::agent::process::check_background_effects()?;
+        let locks = LockSet::acquire(
+            vec![LockRequest::new(
+                LockClass::SidecarEffect,
+                SidecarKind::BackgroundProcess.gate(),
+                LockMode::Shared,
+                "managed background process barrier",
+            )],
+            Duration::ZERO,
+            cancel,
+            &LockOwner::new("background-barrier", "coherent workspace operation"),
+        )
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::core::repo_lock::LockBusy>()
+                .is_some()
+            {
+                anyhow::Error::new(BackgroundProcessBusy)
+            } else {
+                error
+            }
+        })?;
+        Ok(Self {
+            _locks: std::sync::Arc::new(locks),
+        })
     }
 }
 
@@ -934,7 +1004,8 @@ impl std::fmt::Debug for SidecarEffectLease {
 
 /// Pooled per category, so an MCP start can never adopt a language server's SHARED handle — that
 /// would silently grant it the coexistence it must not have.
-static SIDECAR_HELD: Mutex<Vec<(SidecarKind, std::sync::Weak<LockSet>)>> = Mutex::new(Vec::new());
+static SIDECAR_HELD: Mutex<Vec<(SidecarKind, PathBuf, std::sync::Weak<LockSet>)>> =
+    Mutex::new(Vec::new());
 
 impl SidecarEffectLease {
     pub(crate) fn acquire(
@@ -955,11 +1026,11 @@ impl SidecarEffectLease {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 // Retire dead entries so a long session cannot grow the pool without bound.
-                held.retain(|(_, locks)| locks.strong_count() > 0);
+                held.retain(|(_, _, locks)| locks.strong_count() > 0);
                 if let Some(locks) = held
                     .iter()
-                    .find(|(pooled, _)| *pooled == kind)
-                    .and_then(|(_, locks)| locks.upgrade())
+                    .find(|(pooled, pooled_path, _)| *pooled == kind && *pooled_path == path)
+                    .and_then(|(_, _, locks)| locks.upgrade())
                 {
                     return Ok(Self {
                         _locks: vec![locks],
@@ -978,7 +1049,7 @@ impl SidecarEffectLease {
                 ) {
                     Ok(locks) => {
                         let locks = std::sync::Arc::new(locks);
-                        held.push((kind, std::sync::Arc::downgrade(&locks)));
+                        held.push((kind, path.clone(), std::sync::Arc::downgrade(&locks)));
                         return Ok(Self {
                             _locks: vec![locks],
                         });
@@ -998,7 +1069,7 @@ impl SidecarEffectLease {
     }
 }
 
-/// Independent SHARED admission for one scoped native body. It takes BOTH sidecar gates at SHARED:
+/// Independent SHARED admission for one scoped native body. It takes all sidecar gates at SHARED:
 /// an MCP server (EXCLUSIVE) is excluded, while a language server (SHARED) coexists — so an
 /// LSP-attached session can still run scoped native children instead of starving every native body
 /// they make. Must be retained with its actual resource lifetime; never replace it with a clone of a
@@ -1008,7 +1079,9 @@ pub(crate) fn acquire_shared_sidecar(
     cancel: Option<&crate::core::cancel::TurnCancel>,
 ) -> Result<SidecarEffectLease> {
     let start = std::time::Instant::now();
-    let mut locks = Vec::with_capacity(2);
+    let background = BackgroundProcessBarrier::acquire(cancel)?;
+    let mut locks = Vec::with_capacity(3);
+    locks.push(background._locks);
     for kind in [SidecarKind::LanguageServer, SidecarKind::McpServer] {
         locks.push(std::sync::Arc::new(LockSet::acquire(
             vec![LockRequest::new(
@@ -1305,11 +1378,14 @@ pub(crate) fn require_workspace_quiescent(root: &Path) -> Result<()> {
 /// but a restore attempt never waits for physical workers to settle: live activity refuses it.
 /// Not Send, not an OS lock: retain exclusive global/workspace gates separately before acquiring.
 pub(crate) struct WorkspaceRestoreGuard {
+    _background: BackgroundProcessBarrier,
     _activities: std::sync::MutexGuard<'static, Option<ActivityMap>>,
 }
 
 impl WorkspaceRestoreGuard {
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
+        let background =
+            BackgroundProcessBarrier::acquire(crate::core::cancel::current().as_ref())?;
         let identity = WorkspaceIdentity::discover_cached(root)?;
         // Reentrant/nested attempts fail rather than deadlock. No lock or worker wait here: a
         // conflicting restore/start may be retried by the controller after this operation ends.
@@ -1329,6 +1405,7 @@ impl WorkspaceRestoreGuard {
             anyhow::bail!("workspace restore refused while delegated activity is live");
         }
         Ok(Self {
+            _background: background,
             _activities: activities,
         })
     }
@@ -2651,6 +2728,99 @@ mod tests {
                 drop(second);
             });
             SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, None).unwrap();
+        });
+    }
+
+    #[test]
+    fn sidecar_pool_never_adopts_another_lock_namespace() {
+        let outer = TestLockNamespace::owned();
+        let inner = TestLockNamespace::owned();
+        with_test_lock_home(outer.root(), || {
+            let first =
+                SidecarEffectLease::acquire(SidecarKind::BackgroundProcess, Duration::ZERO, None)
+                    .unwrap();
+            with_test_lock_home(inner.root(), || {
+                let barrier = BackgroundProcessBarrier::acquire(None).unwrap();
+                assert!(SidecarEffectLease::acquire(
+                    SidecarKind::BackgroundProcess,
+                    Duration::ZERO,
+                    None
+                )
+                .is_err());
+                drop(barrier);
+                let second = SidecarEffectLease::acquire(
+                    SidecarKind::BackgroundProcess,
+                    Duration::ZERO,
+                    None,
+                )
+                .unwrap();
+                assert!(!std::sync::Arc::ptr_eq(&first._locks[0], &second._locks[0]));
+            });
+            assert!(BackgroundProcessBarrier::acquire(None).is_err());
+        });
+    }
+
+    #[test]
+    fn managed_background_excludes_coherent_work_not_ordinary_physical_bodies() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (temp, resource, _) = native_fixture();
+        with_test_lock_home(temp.path(), || {
+            let first =
+                SidecarEffectLease::acquire(SidecarKind::BackgroundProcess, Duration::ZERO, None)
+                    .unwrap();
+            let second =
+                SidecarEffectLease::acquire(SidecarKind::BackgroundProcess, Duration::ZERO, None)
+                    .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first._locks[0], &second._locks[0]));
+            assert!(BackgroundProcessBarrier::acquire(None)
+                .err()
+                .unwrap()
+                .downcast_ref::<BackgroundProcessBusy>()
+                .is_some());
+            assert!(acquire_shared_sidecar(Duration::ZERO, None).is_err());
+            let native = NativeResourceLease::acquire(
+                resource.path().parent().unwrap(),
+                &[(resource.clone(), LockMode::Exclusive)],
+                Duration::ZERO,
+                None,
+                "parent",
+            )
+            .unwrap();
+            drop(native);
+            PhysicalEffectLease::exclusive(Duration::ZERO, None, "ordinary shell", "parent")
+                .unwrap();
+            assert!(PhysicalEffectLease::exclusive_without_background(
+                Duration::ZERO,
+                None,
+                "checkpoint",
+                "parent"
+            )
+            .is_err());
+            assert!(WorkspaceRestoreGuard::acquire(temp.path()).is_err());
+            SidecarEffectLease::acquire(SidecarKind::LanguageServer, Duration::ZERO, None).unwrap();
+            drop(first);
+            assert!(BackgroundProcessBarrier::acquire(None).is_err());
+            drop(second);
+            let coherent = PhysicalEffectLease::exclusive_without_background(
+                Duration::ZERO,
+                None,
+                "checkpoint",
+                "parent",
+            )
+            .unwrap();
+            let retained = coherent.clone();
+            drop(coherent);
+            assert!(SidecarEffectLease::acquire(
+                SidecarKind::BackgroundProcess,
+                Duration::ZERO,
+                None
+            )
+            .is_err());
+            drop(retained);
+            SidecarEffectLease::acquire(SidecarKind::BackgroundProcess, Duration::ZERO, None)
+                .unwrap();
         });
     }
 

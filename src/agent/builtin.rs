@@ -5341,11 +5341,11 @@ impl Drop for ShellSettlement {
     }
 }
 
-struct ShellRun {
+pub(super) struct ShellRun {
     root: PathBuf,
 }
 impl ShellRun {
-    fn new(root: PathBuf) -> Self {
+    pub(super) fn new(root: PathBuf) -> Self {
         Self { root }
     }
 }
@@ -5471,12 +5471,21 @@ impl Tool for ShellRun {
         // The executor excludes shell_run from its central physical gate to avoid double admission.
         let strict_lifetime = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
         let physical = if strict_lifetime {
-            Some(crate::core::workspace_txn::PhysicalEffectLease::exclusive(
-                Duration::from_secs(15),
-                cancel.as_ref(),
-                "shell_run physical body",
-                &scope,
-            )?)
+            Some(if restore {
+                crate::core::workspace_txn::PhysicalEffectLease::exclusive_without_background(
+                    Duration::from_secs(15),
+                    cancel.as_ref(),
+                    "shell_run restore body",
+                    &scope,
+                )?
+            } else {
+                crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+                    Duration::from_secs(15),
+                    cancel.as_ref(),
+                    "shell_run physical body",
+                    &scope,
+                )?
+            })
         } else {
             None
         };

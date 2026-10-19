@@ -156,6 +156,7 @@ struct ProcessOwnership {
     _workspace_activities: Vec<Arc<crate::core::workspace_txn::WorkspaceActivity>>,
     _writer_leases: Vec<crate::core::workspace_txn::WorkspaceWriterLease>,
     _physical_effect: Option<crate::core::workspace_txn::PhysicalEffectLease>,
+    _background_effect: Option<crate::core::workspace_txn::SidecarEffectLease>,
     strict_unknown: bool,
     _containment: Arc<crate::core::proctree::Containment>,
     _sandbox: Arc<Mutex<crate::sandbox::runner::SpawnGuard>>,
@@ -357,6 +358,7 @@ impl UnsettledOwnership {
         let settled = Arc::new(AtomicBool::new(false));
         let resolved = Arc::new(AtomicBool::new(false));
         let hook_settled = Arc::clone(&settled);
+        let hook_resolved = Arc::clone(&resolved);
         let hook_owner = Arc::clone(self);
         // A proven release settles the charge — unless a live owner already did, in which case the
         // hook must not decrement a second time and cancel another child's charge.
@@ -365,6 +367,9 @@ impl UnsettledOwnership {
         // it parks the hook (true), the later release runs it; when it runs the hook inline (false),
         // the child had already settled and the hook has just undone the increments above.
         let _ = lifetime.on_release(move || {
+            if !hook_resolved.swap(true, Ordering::AcqRel) {
+                hook_owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
             if !hook_settled.swap(true, Ordering::AcqRel) {
                 hook_owner.decrement();
             }
@@ -446,6 +451,18 @@ impl<T> Drop for SettlementLifetime<T> {
             }
         }
     }
+}
+
+static BACKGROUND_UNSETTLED: Lazy<Arc<UnsettledOwnership>> =
+    Lazy::new(|| Arc::new(UnsettledOwnership::new()));
+
+pub(crate) fn check_background_effects() -> Result<()> {
+    if BACKGROUND_UNSETTLED.is_unsettled() {
+        return Err(anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+            crate::agent::tools::ToolEffectState::UnknownWorker,
+        )).context("background process settlement is unknown; inspect/stop owned processes before continuing"));
+    }
+    Ok(())
 }
 
 type ProcessLifetime = SettlementLifetime<ProcessOwnership>;
@@ -584,7 +601,7 @@ fn start(
         if reg.len() >= MAX_PROCESSES {
             let victim = reg
                 .iter()
-                .filter(|(_, e)| e.done.load(Ordering::Acquire))
+                .filter(|(_, e)| e._lifetime.released.load(Ordering::Acquire))
                 .min_by_key(|(_, e)| e.finished_at.lock().map(|g| *g).unwrap_or(None))
                 .map(|(k, _)| k.clone());
             match victim {
@@ -600,40 +617,47 @@ fn start(
 
     // Strong lifetime admission is feature-gated until every platform can prove settlement.
     // Gate OFF keeps legacy serial background behavior, not a false tree-proof claim.
+    check_background_effects()?;
     let strict_unknown = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
-    let (workspace_activities, writer_leases, physical_effect) = if strict_unknown {
-        let context = crate::core::exec_ctx::current();
-        let mut activities = context
-            .as_ref()
-            .map(|ctx| ctx.workspace_activities())
-            .unwrap_or_default();
-        activities.push(crate::core::workspace_txn::WorkspaceActivity::begin(
-            root, scope,
-        )?);
-        let mut writers = context
-            .as_ref()
-            .map(|ctx| ctx.writer_leases())
-            .unwrap_or_default();
-        writers.push(
-            crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
-                root,
+    let (workspace_activities, writer_leases, physical_effect, background_effect) =
+        if strict_unknown {
+            let context = crate::core::exec_ctx::current();
+            let mut activities = context
+                .as_ref()
+                .map(|ctx| ctx.workspace_activities())
+                .unwrap_or_default();
+            activities.push(crate::core::workspace_txn::WorkspaceActivity::begin(
+                root, scope,
+            )?);
+            let mut writers = context
+                .as_ref()
+                .map(|ctx| ctx.writer_leases())
+                .unwrap_or_default();
+            writers.push(
+                crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
+                    root,
+                    Duration::from_secs(15),
+                    crate::core::cancel::current().as_ref(),
+                    "background process lifetime",
+                    scope,
+                )?,
+            );
+            let background = crate::core::workspace_txn::SidecarEffectLease::acquire(
+                crate::core::workspace_txn::SidecarKind::BackgroundProcess,
+                Duration::ZERO,
+                crate::core::cancel::current().as_ref(),
+            )?;
+            // Fresh startup admission, released only after all actual owners are installed.
+            let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
                 Duration::from_secs(15),
                 crate::core::cancel::current().as_ref(),
-                "background process lifetime",
+                "background process body",
                 scope,
-            )?,
-        );
-        // Always fresh admission for ONE physical body, never ancestor/scope reentry.
-        let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
-            Duration::from_secs(15),
-            crate::core::cancel::current().as_ref(),
-            "background process body",
-            scope,
-        )?;
-        (activities, writers, Some(physical))
-    } else {
-        (Vec::new(), Vec::new(), None)
-    };
+            )?;
+            (activities, writers, Some(physical), Some(background))
+        } else {
+            (Vec::new(), Vec::new(), None, None)
+        };
 
     // One construction path with `shell_run`: the sandbox runner wraps the shell, scrubs the
     // environment and applies policy — going background must never sidestep the sandbox.
@@ -662,11 +686,13 @@ fn start(
                 let note = error.to_string();
                 // Cleanup intention is not settlement. Keep the just-created child/job and every
                 // admitted workspace/physical owner until CLI exit when cleanup is unproven.
+                BACKGROUND_UNSETTLED.charge_permanent();
                 std::mem::forget((
                     error,
                     workspace_activities,
                     writer_leases,
                     physical_effect,
+                    background_effect,
                     sbx,
                 ));
                 return Err(
@@ -693,6 +719,7 @@ fn start(
             _workspace_activities: workspace_activities,
             _writer_leases: writer_leases,
             _physical_effect: physical_effect,
+            _background_effect: background_effect,
             strict_unknown,
             _containment: Arc::clone(&containment),
             _sandbox: Arc::clone(&sandbox),
@@ -700,12 +727,13 @@ fn start(
         },
         quarantine_process,
     ));
+    let monitor_charge = BACKGROUND_UNSETTLED.track(&lifetime);
     // Seat both drain tokens before starting either worker: one fast EOF must not cause early
     // physical settlement before the other pipe has even been registered.
     let stdout_lifetime = lifetime.drain();
     let stderr_lifetime = lifetime.drain();
-    spawn_drain(out_pipe, Arc::clone(&out), stdout_lifetime);
-    spawn_drain(err_pipe, Arc::clone(&out), stderr_lifetime);
+    spawn_drain(out_pipe, Arc::clone(&out), stdout_lifetime)?;
+    spawn_drain(err_pipe, Arc::clone(&out), stderr_lifetime)?;
 
     let exit = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
@@ -723,54 +751,61 @@ fn start(
         let sandbox = Arc::clone(&sandbox);
         let containment = Arc::clone(&containment);
         let lifetime = Arc::clone(&lifetime);
-        std::thread::spawn(move || {
-            loop {
-                if done.load(Ordering::Acquire) {
-                    signal_done(&notify);
-                    break;
-                }
-                let st = { child.lock().unwrap_or_else(|e| e.into_inner()).try_wait() };
-                match st {
-                    Ok(Some(status)) => {
-                        *exit.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(status.code().unwrap_or(-1));
-                        mark_finished(&finished_at, &done, Instant::now());
-                        sandbox
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .finish(crate::sandbox::runner::Outcome::Exit(status.code()));
+        std::thread::Builder::new()
+            .name("process-monitor".into())
+            .spawn(move || {
+                // An observer failure/panic drops this unresolved charge and blocks ordinary admission.
+                let monitor_charge = monitor_charge;
+                loop {
+                    if done.load(Ordering::Acquire) {
                         signal_done(&notify);
                         break;
                     }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(60)),
-                    Err(_) => {
-                        // UI observer completion is not proof of physical completion.
-                        mark_finished(&finished_at, &done, Instant::now());
-                        signal_done(&notify);
-                        return;
+                    let st = { child.lock().unwrap_or_else(|e| e.into_inner()).try_wait() };
+                    match st {
+                        Ok(Some(status)) => {
+                            *exit.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(status.code().unwrap_or(-1));
+                            mark_finished(&finished_at, &done, Instant::now());
+                            sandbox
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .finish(crate::sandbox::runner::Outcome::Exit(status.code()));
+                            signal_done(&notify);
+                            break;
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(60)),
+                        Err(_) => {
+                            // UI observer completion is not proof of physical completion.
+                            mark_finished(&finished_at, &done, Instant::now());
+                            signal_done(&notify);
+                            return;
+                        }
                     }
                 }
-            }
-            let settle_deadline = Instant::now() + TREE_SETTLE_WINDOW;
-            loop {
-                match containment.known_quiescent() {
-                    Ok(Some(true)) => {
-                        lifetime.prove_tree_settled();
-                        break;
+                let settle_deadline = Instant::now() + TREE_SETTLE_WINDOW;
+                loop {
+                    match containment.known_quiescent() {
+                        Ok(Some(true)) => {
+                            // Tree proof alone cannot admit new work while a pipe worker still owns IO.
+                            monitor_charge.mark_failed();
+                            lifetime.prove_tree_settled();
+                            break;
+                        }
+                        Ok(Some(false)) if strict_unknown && Instant::now() < settle_deadline => {
+                            std::thread::sleep(Duration::from_millis(60))
+                        }
+                        // Gate-OFF observers retain legacy lifecycle without a permanent monitor.
+                        // Past the window a still-live descendant is unprovable: stop observing and let
+                        // the final lifetime drop quarantine exclusion instead of claiming settlement.
+                        Ok(Some(false)) => break,
+                        // None/errors cannot prove settlement. The final lifetime drop quarantines
+                        // exclusion instead of silently admitting natives.
+                        Ok(None) | Err(_) => break,
                     }
-                    Ok(Some(false)) if strict_unknown && Instant::now() < settle_deadline => {
-                        std::thread::sleep(Duration::from_millis(60))
-                    }
-                    // Gate-OFF observers retain legacy lifecycle without a permanent monitor.
-                    // Past the window a still-live descendant is unprovable: stop observing and let
-                    // the final lifetime drop quarantine exclusion instead of claiming settlement.
-                    Ok(Some(false)) => break,
-                    // None/errors cannot prove settlement. The final lifetime drop quarantines
-                    // exclusion instead of silently admitting natives.
-                    Ok(None) | Err(_) => break,
                 }
-            }
-        });
+            })
+            .map_err(process_observer_start_error)?;
     }
 
     let id = format!("proc_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
@@ -788,7 +823,7 @@ fn start(
         finished_at,
         containment,
         sandbox,
-        _lifetime: lifetime,
+        _lifetime: Arc::clone(&lifetime),
         #[cfg(test)]
         fixture_root: root.to_path_buf(),
     };
@@ -796,6 +831,21 @@ fn start(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), entry);
+    // Even a server that exits before the next controller iteration creates an opaque interval.
+    // Invalidate coverage at admission rather than relying on the loop's later live-process probe.
+    if let Some(context) = crate::core::exec_ctx::current() {
+        context.recovery().defer_background_coverage();
+    }
+    crate::core::recovery::set_checkpoint(None);
+    crate::features::coop::note_background_coverage_gap();
+    if let Some(ownership) = lifetime
+        .ownership
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        ownership._physical_effect.take();
+    }
     Ok(id)
 }
 
@@ -804,22 +854,35 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
     out: Arc<Mutex<RingBuf>>,
     lifetime: DrainLifetime<ProcessOwnership>,
-) {
+) -> Result<()> {
     if let Some(mut p) = pipe {
-        std::thread::spawn(move || {
-            let _lifetime = lifetime;
-            let mut buf = [0u8; 8192];
-            loop {
-                match p.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => out
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(&buf[..n]),
+        std::thread::Builder::new()
+            .name("process-output".into())
+            .spawn(move || {
+                let _lifetime = lifetime;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match p.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(&buf[..n]),
+                    }
                 }
-            }
-        });
+            })
+            .map_err(process_observer_start_error)?;
     }
+    Ok(())
+}
+
+fn process_observer_start_error(error: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+        crate::agent::tools::ToolEffectState::UnknownWorker,
+    ))
+    .context(format!(
+        "background process observer could not start: {error}"
+    ))
 }
 
 /// Best-effort kill of a process AND its children (a bg shell usually has a real child).
@@ -830,6 +893,9 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(
 /// wrappers do), the chain is broken and the real server survives — holding its port and the pipe. The
 /// kernel's job membership has no such gap, and needs no extra process spawn to do the killing.
 fn kill_tree(entry: &ProcEntry) {
+    if entry._lifetime.released.load(Ordering::Acquire) {
+        return;
+    }
     let mut child = entry.child.lock().unwrap_or_else(|e| e.into_inner());
     crate::core::proctree::kill_tree(&mut child, &entry.containment);
     mark_finished(&entry.finished_at, &entry.done, Instant::now());
@@ -840,6 +906,28 @@ fn kill_tree(entry: &ProcEntry) {
         .finish(crate::sandbox::runner::Outcome::Exit(None));
     // Wake a `wait` immediately rather than leaving it to sit out its remaining timeout.
     signal_done(&entry.notify);
+    if !entry._lifetime.released.load(Ordering::Acquire) {
+        let containment = Arc::clone(&entry.containment);
+        let lifetime = Arc::clone(&entry._lifetime);
+        // Failure to start this optional recovery observer must not panic or retire uncertainty.
+        let _ = std::thread::Builder::new()
+            .name("process-stop-proof".into())
+            .spawn(move || {
+                let deadline = Instant::now() + TREE_SETTLE_WINDOW;
+                loop {
+                    match containment.known_quiescent() {
+                        Ok(Some(true)) => {
+                            lifetime.prove_tree_settled();
+                            return;
+                        }
+                        Ok(Some(false)) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                        _ => return,
+                    }
+                }
+            });
+    }
 }
 
 /// Kill every still-running background process and clear the pool. Called on REPL + daemon exit so
@@ -849,7 +937,7 @@ fn kill_tree(entry: &ProcEntry) {
 pub fn kill_all() {
     let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     for entry in reg.values() {
-        if !entry.done.load(Ordering::Acquire) {
+        if !entry._lifetime.released.load(Ordering::Acquire) {
             kill_tree(entry);
         }
     }
@@ -907,7 +995,7 @@ fn numeric_handle(id: &str) -> u64 {
 pub fn kill_by_id(id: &str) -> String {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     match reg.get(id) {
-        Some(e) if !e.done.load(Ordering::Acquire) => {
+        Some(e) if !e._lifetime.released.load(Ordering::Acquire) => {
             kill_tree(e);
             format!("✓ stopped {id}")
         }
@@ -1177,6 +1265,7 @@ impl Tool for Process {
                 Ok(format!("{id} killed"))
             }
             "write" => {
+                check_background_effects()?;
                 let id = args
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -1249,6 +1338,7 @@ mod tests {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in owned {
+                kill_by_id(&id);
                 forget(&id);
             }
             drop(self.env.take());
@@ -1365,6 +1455,45 @@ mod tests {
     }
 
     #[test]
+    fn lost_background_monitor_stays_unknown_until_tree_and_all_drains_settle() {
+        fn quarantine(_: ()) {}
+        let tracker = Arc::new(UnsettledOwnership::new());
+        let lifetime = Arc::new(SettlementLifetime::new((), quarantine));
+        let stdout = lifetime.drain();
+        let stderr = lifetime.drain();
+        let monitor = tracker.track(&lifetime);
+        assert!(!tracker.is_unsettled(), "a live monitor is accountable");
+        drop(monitor); // Lost observer, not a proven exit.
+        assert!(tracker.is_unsettled());
+        lifetime.prove_tree_settled();
+        drop(stdout);
+        assert!(
+            tracker.is_unsettled(),
+            "tree proof cannot retire pending IO"
+        );
+        drop(stderr);
+        assert!(!tracker.is_unsettled());
+        assert_eq!(tracker.in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(tracker.outstanding.load(Ordering::Acquire), 0);
+
+        // Settlement can race the live monitor; its later drop must not poison other charges.
+        let lifetime = Arc::new(SettlementLifetime::new((), quarantine));
+        let monitor = tracker.track(&lifetime);
+        lifetime.prove_tree_settled();
+        drop(monitor);
+        assert!(!tracker.is_unsettled());
+        assert_eq!(tracker.in_flight.load(Ordering::Acquire), 0);
+        let unknown = Arc::new(SettlementLifetime::new((), quarantine));
+        drop(tracker.track(&unknown));
+        assert!(tracker.is_unsettled());
+        drop(unknown);
+        assert!(
+            tracker.is_unsettled(),
+            "unproven quarantine never retires a charge"
+        );
+    }
+
+    #[test]
     fn elapsed_duration_running_advances_with_now() {
         let started = Instant::now();
         assert_eq!(elapsed_duration(started, None, started), Duration::ZERO);
@@ -1414,6 +1543,92 @@ mod tests {
         mark_finished(&finished_at, &done, first + Duration::from_secs(60));
         assert!(done.load(Ordering::Acquire));
         assert_eq!(*finished_at.lock().unwrap(), Some(first));
+    }
+
+    #[test]
+    fn live_background_allows_sequential_native_and_shell_and_second_process() {
+        let fixture = serial();
+        crate::core::workspace_txn::with_test_lock_home(fixture.directory.path(), || {
+            scoped("background-compatible", || {
+                use crate::core::workspace_txn::{
+                    BackgroundProcessBarrier, NativeResource, NativeResourceLease,
+                };
+                let command = if cfg!(windows) {
+                    "powershell.exe -NoProfile -NonInteractive -Command \"Write-Output ready; Start-Sleep -Seconds 60\""
+                } else {
+                    "printf ready; sleep 60"
+                };
+                let first =
+                    start(&fixture.root, command, None, "background-compatible", false).unwrap();
+                let second =
+                    start(&fixture.root, command, None, "background-compatible", false).unwrap();
+                let ready_deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let reg = REGISTRY.lock().unwrap_or_else(|error| error.into_inner());
+                    let ready = [&first, &second].into_iter().all(|id| {
+                        let entry = reg.get(id).unwrap();
+                        assert!(
+                            !entry.done.load(Ordering::Acquire),
+                            "server exited before regression body"
+                        );
+                        entry.out.lock().unwrap().text().contains("ready")
+                    });
+                    drop(reg);
+                    if ready {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < ready_deadline,
+                        "owned servers must publish readiness"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                use crate::core::workspace_txn::WorkspaceWriterLease;
+                assert!(WorkspaceWriterLease::acquire_scoped(
+                    &fixture.root,
+                    Duration::ZERO,
+                    None,
+                    "foreign writer",
+                    "unrelated-session",
+                )
+                .is_err());
+                WorkspaceWriterLease::acquire_scoped(
+                    &fixture.root,
+                    Duration::ZERO,
+                    None,
+                    "delegated writer",
+                    "background-compatible/child",
+                )
+                .unwrap();
+                std::fs::write(fixture.root.join("ordinary.txt"), "before").unwrap();
+                let resource = NativeResource::resolve(&fixture.root.join("ordinary.txt")).unwrap();
+                let native = NativeResourceLease::acquire(
+                    &fixture.root,
+                    &[(resource, crate::core::repo_lock::LockMode::Exclusive)],
+                    Duration::ZERO,
+                    None,
+                    "background-compatible",
+                )
+                .unwrap();
+                std::fs::write(fixture.root.join("ordinary.txt"), "after").unwrap();
+                drop(native);
+                let shell = crate::agent::builtin::ShellRun::new(fixture.root.clone());
+                let output = shell
+                    .execute(&serde_json::json!({"command": "echo foreground-with-background"}))
+                    .unwrap();
+                assert!(output.contains("foreground-with-background"), "{output}");
+                assert!(!crate::agent::is_failure_result(&output), "{output}");
+                assert!(BackgroundProcessBarrier::acquire(None).is_err());
+                assert!(check_background_effects().is_ok());
+                kill_by_id(&first);
+                forget(&first);
+                assert!(BackgroundProcessBarrier::acquire(None).is_err());
+                kill_by_id(&second);
+                forget(&second);
+                BackgroundProcessBarrier::acquire(None).unwrap();
+                assert!(check_background_effects().is_ok());
+            })
+        });
     }
 
     #[test]
