@@ -23,18 +23,27 @@ pub(crate) struct TerminalSession {
 
 impl TerminalSession {
     pub(crate) fn enter() -> io::Result<Self> {
+        // Raw mode FIRST. crossterm's input reader needs it anyway, and this kills the
+        // capture-on-while-stdin-is-cooked window: at startup `tui::activate` (render thread, here)
+        // runs well before `tui::spawn_input`, and on resume the render thread re-enters while the
+        // input thread is still parked — so without this, motion reports armed below would ECHO as
+        // literal `[<35;col;rowM` text on any still-cooked consumer. enable_raw_mode is idempotent
+        // and process-global (termios on unix), and it must NOT be disabled here or on exit: the
+        // input thread already owns raw re-assert/park/release (tui.rs), and `restore_stdin_cooked`
+        // owns the final disable.
+        let _ = crossterm::terminal::enable_raw_mode();
         let mut stdout = io::stdout();
-        // EnableMouseCapture: the terminal reports wheel/click/drag as crossterm mouse events
-        // instead of leaking the wheel through as ↑/↓ keys (Windows Terminal "alternateScroll").
+        // Mouse capture via our own sequences, NOT crossterm's EnableMouseCapture (see the comment
+        // on MOUSE_ENABLE): clicks + drags + wheel as crossterm mouse events instead of leaking the
+        // wheel through as ↑/↓ keys (Windows Terminal "alternateScroll"), WITHOUT the ?1003h
+        // any-motion flood that ends up echoed into the draft on Linux/macOS. MOUSE_DISABLE first —
+        // a previous aizen killed mid-session (kill -9, SSH drop, tmux kill-pane) can leave these
+        // modes armed in the terminal; start from a known-clean slate before arming ours.
+        stdout.write_all(MOUSE_DISABLE.as_bytes())?;
+        stdout.write_all(MOUSE_ENABLE.as_bytes())?;
         // EnableBracketedPaste: terminals that support it deliver a paste as one Event::Paste
         // instead of a burst of key events — one insert, one repaint, no coalesce lag.
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-            Hide
-        )?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -48,10 +57,16 @@ impl Drop for TerminalSession {
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
-            DisableMouseCapture,
             Show,
             LeaveAlternateScreen
         );
+        // Disarm mouse reporting with the SAME explicit set enter() arms, instead of crossterm's
+        // DisableMouseCapture (which also writes ?1015l/?1005l — harmless, but two "disable" vocab-
+        // ularies in one codebase is how a missed mode rots in). Runs after leaving the alt screen:
+        // per xterm's sequence semantics DECRST only flips flags, so nothing escapes mid-teardown.
+        let mut out = io::stdout();
+        let _ = out.write_all(MOUSE_DISABLE.as_bytes());
+        let _ = out.flush();
     }
 }
 

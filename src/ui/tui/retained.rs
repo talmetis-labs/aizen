@@ -8,9 +8,7 @@
 //! other. The rest is split by concern into the submodules below.
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -29,6 +27,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::{HealthKind, JobsStatus, SessionFacts};
+
+// Mouse tracking, minus the flood. crossterm's `EnableMouseCapture` arms ?1000h (clicks) +
+// ?1002h (button drags) + ?1003h (ANY pointer motion) + ?1006h (SGR encoding). Nothing in aizen
+// consumes idle-motion events (`handle_retained_mouse` only reads Down/Drag/Up/Scroll), so ?1003h
+// is pure cost — and worse, it's the bytes in the "[<35;col;rowM garbage in the draft on
+// Linux/macOS" bug: a reopen/resume window where capture is armed while stdin is still cooked
+// echoes every motion report into the prompt as literal text. Enable: clicks + drags + wheel
+// (1000/1002) with SGR encoding, no any-motion. Disable: ?1003l FIRST so the flood stops before
+// the rest, then the modes we arm, then SGR — and exactly the same set `emergency_restore` writes.
+pub(crate) const MOUSE_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+pub(crate) const MOUSE_DISABLE: &str = "\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l";
 
 // The backend split by concern; `retained.rs` keeps the state, the command enum and the render
 // loop that ties them together. Re-exported at this level because callers outside (`ui::tui`) have
@@ -1044,9 +1053,12 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                 dirty = ok;
                 // Re-assert mouse capture explicitly: `TerminalSession::enter()` already enables it,
                 // but some terminals (especially on Linux after alternateScroll was active while the
-                // menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓ keys.
+                // menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓ keys. Raw
+                // sequences, not crossterm's EnableMouseCapture — see MOUSE_ENABLE (no ?1003h).
                 if ok {
-                    let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+                    let mut out = io::stdout();
+                    let _ = out.write_all(MOUSE_ENABLE.as_bytes());
+                    let _ = execute!(out, Hide);
                 }
             }
             Ok(Command::Redraw) => {
@@ -1114,9 +1126,11 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
                     // Re-assert mouse capture explicitly: `TerminalSession::enter()` already enables
                     // it, but some terminals (especially on Linux after alternateScroll was active
                     // while the menu owned stdin) need a fresh mode-set to stop leaking wheel-as-↑/↓
-                    // keys.
+                    // keys. Raw sequences, not crossterm's EnableMouseCapture — see MOUSE_ENABLE.
                     if ok {
-                        let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+                        let mut out = io::stdout();
+                        let _ = out.write_all(MOUSE_ENABLE.as_bytes());
+                        let _ = execute!(out, Hide);
                     }
                 }
                 Command::Redraw => {
@@ -1144,9 +1158,13 @@ fn render_loop(rx: Receiver<Command>, ready: Sender<bool>, intro: String, status
         // All three are idempotent — a terminal already in these modes ignores the repeat, and the
         // escapes are invisible mode-sets (no flicker, ~270 B/s while working). Idle ticks skip it
         // entirely: nothing resets the mode while the user is just reading, so there's no cost there.
+        // The write is our own three-mode set, not crossterm's EnableMouseCapture — MOUSE_ENABLE
+        // deliberately omits ?1003h so pointer motion never floods stdin.
         if session.is_some() && (state.working || was_working) {
             let _ = crossterm::terminal::enable_raw_mode();
-            let _ = execute!(io::stdout(), EnableMouseCapture, Hide);
+            let mut out = io::stdout();
+            let _ = out.write_all(MOUSE_ENABLE.as_bytes());
+            let _ = execute!(out, Hide);
         }
         was_working = state.working;
         // The quiet gap passed with no further size change ⇒ the drag is over. Repaint from scratch
