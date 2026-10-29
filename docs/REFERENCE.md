@@ -1579,6 +1579,15 @@ prompts only for real secrets, signs you in if it's OAuth), `aizen apps info <ke
 masked + a live tool probe), `aizen apps login <key>`, `aizen apps remove <key>`. Also the `/apps` TUI hub.
 LOCAL-FIRST: a self-hostable package (runs on your machine with your keys) beats a hosted gateway.
 
+`aizen apps status [key] --json` is an **offline** redacted view of HOME `mcp.json` and the
+creative-operation journal. It does not resolve project overrides, connect, launch, probe or install.
+It reports only connector keys/enabled/transport, not commands, arguments, URLs, headers or secrets.
+A configured MCP connector is not an enrolled production adapter; live probe/use remain unknown.
+Journal states are last-recorded observations, not a live probe; IDs/status never grant control.
+Invalid or incomplete journal state returns an error, not an empty success. The creative foundation currently enables **no**
+Blender/Unity/Unreal/Spine adapter or `app_*` mutation tools; see the
+[implementation plan](plans/creative-production-2026-10-29.md) for gates and current limits.
+
 ### Visual design and tool images
 
 `/design auto|on|off` and `aizen agent --design auto|on|off` affect only the current session/run,

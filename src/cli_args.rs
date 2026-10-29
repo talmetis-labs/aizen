@@ -307,6 +307,14 @@ pub(crate) enum Commands {
 pub(crate) enum AppsCmd {
     /// List the featured apps and which are already connected.
     List,
+    /// Read HOME connector configuration and durable jobs without connecting or launching apps.
+    Status {
+        /// Optional connector key in HOME mcp.json (not the project-effective configuration).
+        name: Option<String>,
+        /// Machine-readable, redacted status. Unknown live capabilities remain unknown.
+        #[arg(long)]
+        json: bool,
+    },
     /// Search the MCP registry for an app/server by keyword.
     Search {
         /// Search keywords.
@@ -2096,6 +2104,29 @@ mod agent_reference_args_tests {
         .unwrap();
         assert!(args.reference_images);
         assert_eq!(args.image, ["ref.png"]);
+    }
+}
+
+#[cfg(test)]
+mod apps_status_args_tests {
+    use super::*;
+
+    #[test]
+    fn offline_status_accepts_optional_key_and_json() {
+        for args in [
+            vec!["aizen", "apps", "status"],
+            vec!["aizen", "apps", "status", "--json"],
+            vec!["aizen", "apps", "status", "fixture", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Apps {
+                    cmd: Some(AppsCmd::Status { .. })
+                })
+            ));
+        }
+        assert!(Cli::try_parse_from(["aizen", "apps", "status", "--live"]).is_err());
     }
 }
 

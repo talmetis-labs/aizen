@@ -153,6 +153,13 @@ async fn main() -> Result<()> {
     // can neither see nor dismiss; with it the child just returns a status we handle. Idempotent.
     suppress_hard_error_dialogs();
     let cli = Cli::parse();
+    // Offline Apps status must not run store migrations or resolve project configuration.
+    if let Some(Commands::Apps {
+        cmd: Some(AppsCmd::Status { name, json }),
+    }) = &cli.command
+    {
+        return apps_status(name.as_deref(), *json);
+    }
     // `--sandbox` pins the process-wide sandbox mode before anything can spawn a child. User-only:
     // nothing the model outputs can reach this flag (or the env/config it overrides).
     if let Some(mode) = cli.sandbox {

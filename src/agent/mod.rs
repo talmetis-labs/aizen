@@ -11,6 +11,7 @@
 //! (no live calls). Production passes a closure over `client::chat_with_tools`.
 
 pub mod app_catalog;
+pub(crate) mod apps;
 pub mod architect;
 pub mod blackboard;
 #[cfg(feature = "browser")]
