@@ -36,7 +36,7 @@ pub(crate) struct ResolvedTurn {
     pub architect_plan: Option<crate::agent::architect::ArchitectPlan>,
     pub(crate) references: Option<crate::core::reference_media::ReferenceAccess>,
     reference_markers: Vec<crate::core::tool_media::ToolImage>,
-    /// Session declarations resolved after user setup, never a config to persist.
+    /// Frozen saved config with explicit session overrides; never persist this snapshot.
     pub(crate) vision_config: cli_config::CliConfig,
 }
 
@@ -123,7 +123,8 @@ impl ResolvedTurn {
     }
 
     pub(crate) fn configure(&self, cfg: &mut AgentConfig, apply_budgets: bool) {
-        cfg.context_window = resolve_ctx_window(&self.endpoint.model).0;
+        cfg.context_window =
+            crate::core::model_context::resolve_in(&self.vision_config, &self.endpoint).tokens;
         cfg.nudge_role = agent::NudgeRole::for_base_url(&self.endpoint.base_url);
         cfg.wire_reasoning_effort = Some(self.wire_effort.clone());
         cfg.tool_image_destination = Some(crate::llm::media::effective_destination_key(
@@ -183,9 +184,8 @@ impl ResolvedTurn {
     }
 }
 
-/// Complete capability setup on the trusted top-level controller before dispatch. A capability
-/// declaration is not permission to disclose the attachments; media grants remain separate.
-/// The caller freezes request/config state only AFTER this returns, and repeats it on route change.
+/// Check an explicit vision override without setup, probing, or persistence. The same frozen
+/// config is used for requests; route/account disclosure grants remain a separate requirement.
 pub(crate) async fn guided_vision_preflight(
     turn: &ResolvedTurn,
     has_attachments: bool,
@@ -193,46 +193,61 @@ pub(crate) async fn guided_vision_preflight(
     if !has_attachments && !turn.design.snapshot().intent.is_visual() {
         return Ok(true);
     }
-    let base_url = turn.endpoint.base_url.clone();
-    let model = turn.endpoint.model.clone();
-    tokio::task::spawn_blocking(move || {
-        crate::ui::config_ui::guided_vision_setup(&base_url, &model)
-    })
-    .await
-    .map_err(anyhow::Error::from)?
+    crate::ui::config_ui::guided_vision_setup(
+        &turn.vision_config,
+        &turn.endpoint.base_url,
+        &turn.endpoint.model,
+    )
 }
 
 /// Register ONLY this submission's attachments, never grant references from restored history.
 /// Attachments become references for this task automatically — no prompt. The grant is still the
-/// narrow one (this task, this destination/account route, originals), and disclosure to the
-/// provider stays governed by the vision declaration, so nothing about sending became more
-/// permissive; the question was asked once per attachment and always answered the same way.
+/// narrow one (this task, this destination/account route, originals). Vision defaults on but never
+/// grants access to restored images or another provider/account.
 pub(crate) fn prepare_current_references(turn: &mut ResolvedTurn, images: &[String]) -> Result<()> {
-    if images.is_empty() {
-        return Ok(());
-    }
-    let (registry, descriptors) = register_current_reference_images(turn, images)?;
-    validate_current_reference_selection(images, &descriptors)?;
-    seat_current_reference_grant(turn, registry, descriptors)
+    prepare_current_references_with_preferences(turn, images, &[])
 }
 
-/// Explicit headless-controller reference-purpose opt-in. No dialog, saved config, history scan,
-/// provider request or disclosure approval: the caller invokes this only for its explicit CLI flag.
-pub(crate) fn seat_loaded_reference_images(
+pub(crate) fn prepare_current_references_with_preferences(
     turn: &mut ResolvedTurn,
     images: &[String],
+    preferences: &[crate::core::types::ImagePreference],
 ) -> Result<()> {
     if images.is_empty() {
         return Ok(());
     }
-    let (registry, descriptors) = register_current_reference_images(turn, images)?;
+    let (registry, descriptors) = register_current_reference_images(turn, images, preferences)?;
     validate_current_reference_selection(images, &descriptors)?;
-    seat_current_reference_grant(turn, registry, descriptors)
+    seat_current_reference_grant(turn, registry, descriptors, false)
+}
+
+/// Explicit headless-controller reference-purpose opt-in. No dialog, saved config, history scan,
+/// provider request or disclosure approval: the caller invokes this only for its explicit CLI flag.
+#[cfg(test)]
+pub(crate) fn seat_loaded_reference_images(
+    turn: &mut ResolvedTurn,
+    images: &[String],
+) -> Result<()> {
+    seat_loaded_reference_images_with_preferences(turn, images, &[])
+}
+
+pub(crate) fn seat_loaded_reference_images_with_preferences(
+    turn: &mut ResolvedTurn,
+    images: &[String],
+    preferences: &[crate::core::types::ImagePreference],
+) -> Result<()> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let (registry, descriptors) = register_current_reference_images(turn, images, preferences)?;
+    validate_current_reference_selection(images, &descriptors)?;
+    seat_current_reference_grant(turn, registry, descriptors, true)
 }
 
 fn register_current_reference_images(
     turn: &mut ResolvedTurn,
     images: &[String],
+    preferences: &[crate::core::types::ImagePreference],
 ) -> Result<(
     crate::core::reference_media::ReferenceRegistry,
     Vec<crate::core::reference_media::ReferenceDescriptor>,
@@ -240,7 +255,21 @@ fn register_current_reference_images(
     let context = turn.execution_context();
     let registry =
         crate::core::reference_media::ReferenceRegistry::new(context.conversation().to_string());
+    anyhow::ensure!(
+        preferences.is_empty() || preferences.len() == images.len(),
+        "image preferences must match the selected attachments"
+    );
     let mut current = Message::user_with_images("", images.to_vec());
+    current.image_preferences = if preferences.is_empty() {
+        vec![
+            turn.vision_config
+                .image_mode
+                .unwrap_or(crate::core::types::ImagePreference::Auto);
+            images.len()
+        ]
+    } else {
+        preferences.to_vec()
+    };
     let descriptors = registry.register_loaded(std::slice::from_mut(&mut current))?;
     turn.reference_markers = current.tool_images;
     Ok((registry, descriptors))
@@ -264,6 +293,7 @@ fn seat_current_reference_grant(
     turn: &mut ResolvedTurn,
     registry: crate::core::reference_media::ReferenceRegistry,
     descriptors: Vec<crate::core::reference_media::ReferenceDescriptor>,
+    comparison: bool,
 ) -> Result<()> {
     use crate::core::reference_media::{ReferenceDerivatives, ReferenceGrantScope};
     let context = turn.execution_context();
@@ -278,13 +308,15 @@ fn seat_current_reference_grant(
         task_scope: context.resource_scope(),
         route,
     }, ReferenceDerivatives::ALL)?;
-    turn.design.activate_selected_references(
-        descriptors
-            .into_iter()
-            .map(|reference| (reference.reference_id, reference.original.sha256))
-            .collect(),
-        crate::agent::design::FidelityMode::Exact,
-    )?;
+    if comparison {
+        turn.design.activate_selected_references(
+            descriptors
+                .into_iter()
+                .map(|reference| (reference.reference_id, reference.original.sha256))
+                .collect(),
+            crate::agent::design::FidelityMode::Exact,
+        )?;
+    }
     turn.references = Some(access);
     Ok(())
 }
@@ -353,15 +385,13 @@ pub(crate) fn explicit_wire_effort(cfg: &AgentConfig) -> Option<String> {
 ///
 /// The other half of Ctrl-O clipboard attach: only real image files are lifted, so a message that
 /// merely mentions a path keeps its text intact.
-pub(crate) fn lift_image_attachments(line: &mut String, images: &mut Vec<String>) {
-    if line.is_empty() {
-        return;
-    }
-    let (cleaned, from_line) = image_input::extract_image_attachments(line);
+pub(crate) fn lift_image_attachments(line: &mut String, images: &mut Vec<String>) -> Result<()> {
+    let (cleaned, from_line) = image_input::prepare_image_attachments(line, images)?;
     if !from_line.is_empty() {
         images.extend(from_line);
         *line = cleaned;
     }
+    Ok(())
 }
 
 /// Build this turn's tool registry against the resolved endpoint.
@@ -375,7 +405,7 @@ pub(crate) fn build_turn_registry(
         ep.api_key.clone(),
         ep.model.clone(),
         approval_mode(),
-        resolve_ctx_window(&ep.model).0,
+        crate::core::model_context::resolve(ep).tokens,
         None, // cwd IS the project in the REPL
     )
 }
@@ -457,7 +487,7 @@ pub(crate) async fn architect_phase(
         line,
         original_brief,
         cancel,
-        resolve_ctx_window(&turn.endpoint.model).0,
+        crate::core::model_context::resolve_in(&cfg, &turn.endpoint).tokens,
         &planner_context,
     )
     .await
@@ -582,12 +612,17 @@ pub(crate) async fn run_agent_turn(
     registry: &agent::tools::ToolRegistry,
     history: &mut Vec<Message>,
 ) -> Result<AgentOutcome> {
+    // Resolve after the architect/effort route is final, before either context guards or the HUD
+    // consume the limit. Registry children resolve their own routes independently.
+    let window = crate::core::model_context::discover(ep).await.tokens;
+    let mut runtime_cfg = cfg.clone();
+    runtime_cfg.context_window = window;
+    let cfg = &runtime_cfg;
     let mut recovery_boundary = crate::core::recovery::TurnBoundary::new();
     let base = ep.base_url.as_str();
     let key = ep.api_key.as_str();
     let model = ep.model.as_str();
     let eager_on = eager_enabled();
-    let window = resolve_ctx_window(model).0;
     let wire_effort = explicit_wire_effort(cfg);
     let image_config = cfg.image_config.clone().unwrap_or_else(|| {
         std::sync::Arc::new(cli_config::config_with_session_vision(cli_config::load()))
@@ -659,28 +694,9 @@ pub(crate) async fn run_agent_turn(
     };
     // Non-streaming summarizer for mid-loop auto-compaction (keeps the streamed display clean).
     let sum_ep = summarizer_endpoint(base, key, model);
-    let sum_effort =
-        cli_config::role_reasoning_effort("summarizer", cli_config::load().reasoning_effort);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
-        let effort = sum_effort.clone();
-        async move {
-            tokio::time::timeout(
-                crate::repl::postturn::chore_call_timeout(),
-                client::chat_with_tools_effort(
-                    http,
-                    &ep.base_url,
-                    &ep.api_key,
-                    &ep.model,
-                    &msgs,
-                    &[],
-                    effort,
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("summarizer model call timed out"))?
-            .map(|t| t.content.unwrap_or_default())
-        }
+        async move { crate::llm::compact_summary::summarize(http, &ep, msgs).await }
     };
     // Optional oracle for self-review: only when `roles.oracle` names a stronger reviewer model;
     // otherwise the loop falls back to nudge-mode.
@@ -977,6 +993,34 @@ mod smoke_tests {
     use super::*;
 
     #[test]
+    fn lifting_images_validates_combined_selection_before_mutating_the_draft() {
+        let image = crate::llm::media::tests::image(93);
+        let url = image.data_url();
+        let path = std::env::temp_dir().join(format!(
+            "aizen-lift-{}-{}.png",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::write(&path, image.bytes().unwrap()).unwrap();
+        let mut line = format!("inspect \"{}\"", path.display());
+        let original_line = line.clone();
+        let mut images = vec![url.clone(); 4];
+        let original_images = images.clone();
+        assert!(lift_image_attachments(&mut line, &mut images).is_err());
+        assert_eq!(line, original_line);
+        assert_eq!(images, original_images);
+        images.pop();
+        lift_image_attachments(&mut line, &mut images).unwrap();
+        assert_eq!(line, "inspect");
+        assert_eq!(images, vec![url.clone(); 4]);
+        let mut blank = String::new();
+        images.push(url);
+        assert!(lift_image_attachments(&mut blank, &mut images).is_err());
+        assert_eq!(images.len(), 5);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn appended_evidence_surfaces_only_the_unstreamed_suffix() {
         let answer = "The requested change is complete.";
         let evidence =
@@ -1153,14 +1197,73 @@ mod smoke_tests {
     }
 
     #[test]
-    fn current_reference_grant_does_not_imply_vision_capability() {
+    fn current_reference_preferences_are_frozen_before_handoff_without_implying_comparison() {
+        use crate::core::types::ImagePreference::{Auto, Original, Photo};
+        for preference in [Auto, Photo, Original] {
+            let (mut turn, current) = current_reference_fixture();
+            turn.vision_config.image_mode = Some(preference);
+            prepare_current_references(&mut turn, &current.images).unwrap();
+            assert_eq!(
+                turn.references
+                    .as_ref()
+                    .unwrap()
+                    .user_message("child")
+                    .unwrap()
+                    .image_preferences,
+                [preference]
+            );
+            assert!(turn.design.snapshot().comparison_request.is_none());
+        }
+        let (mut turn, current) = current_reference_fixture();
+        turn.vision_config.image_mode = Some(Original);
+        prepare_current_references_with_preferences(&mut turn, &current.images, &[Photo]).unwrap();
+        assert_eq!(
+            turn.references
+                .as_ref()
+                .unwrap()
+                .user_message("child")
+                .unwrap()
+                .image_preferences,
+            [Photo]
+        );
+        assert!(turn.design.snapshot().comparison_request.is_none());
+        let (mut explicit, current) = current_reference_fixture();
+        seat_loaded_reference_images_with_preferences(&mut explicit, &current.images, &[Auto])
+            .unwrap();
+        assert_eq!(
+            explicit
+                .references
+                .as_ref()
+                .unwrap()
+                .user_message("child")
+                .unwrap()
+                .image_preferences,
+            [Auto]
+        );
+        assert_eq!(
+            explicit.design.snapshot().comparison_request.unwrap().mode,
+            crate::agent::design::FidelityMode::Exact
+        );
+    }
+
+    #[test]
+    fn current_reference_grant_uses_default_vision_but_honors_explicit_disable() {
         let (mut turn, current) = current_reference_fixture();
         seat_loaded_reference_images(&mut turn, &current.images).unwrap();
         turn.vision_config = cli_config::CliConfig::default();
-        let error = validate_current_reference_route(&turn)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("vision support is unknown"));
+        validate_current_reference_route(&turn).unwrap();
+        let mut cfg = AgentConfig::default();
+        turn.configure(&mut cfg, false);
+        assert_eq!(
+            cfg.tool_image_policy,
+            crate::llm::media::VisionPolicy::Supported
+        );
+        assert!(cfg
+            .image_config
+            .as_ref()
+            .unwrap()
+            .vision_capabilities
+            .is_none());
         cli_config::set_vision_support_in(
             &mut turn.vision_config,
             &turn.endpoint.base_url,

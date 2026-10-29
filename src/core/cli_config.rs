@@ -57,14 +57,17 @@ pub struct CliConfig {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Context window (tokens) for `model`, learned from the provider's `/models` (when it reports
-    /// one) or set manually. Drives the `% context` HUD. `None` ⇒ HUD uses a name heuristic.
+    /// Optional context-window override for the exact saved route. `None` uses core provider
+    /// discovery/cache, then an explicitly labelled estimate. Shared by HUD and loop guards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<usize>,
-    /// Explicit tool-image support for an exact endpoint/model pair. Absent entries are unknown,
-    /// not a guess based on the model's name. Legacy user attachments are unaffected.
+    /// Optional vision override for an exact endpoint/model pair. Absent entries use the enabled
+    /// core default; this is not a provider capability probe or image disclosure permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_capabilities: Option<Vec<VisionCapability>>,
+    /// Default attachment representation; does not grant disclosure or keep pixels active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_mode: Option<crate::core::types::ImagePreference>,
     /// Named main-endpoint profiles for manual provider failover. The active profile is copied into
     /// the root `base_url`/`api_key`/`model` fields, so legacy callers keep one resolution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,8 +523,9 @@ pub fn role_reasoning_effort(role: &str, fallback: Option<String>) -> Option<Str
     role_reasoning_effort_in(&load(), role, fallback)
 }
 
-/// Exact endpoint/model matching prevents a capability declared for one provider from leaking to
-/// another provider with the same model alias. Only a trailing slash is normalized.
+/// Exact override lookup, not the effective policy: `None` uses the enabled core default.
+/// Matching prevents an override for one provider from leaking to another provider with the same
+/// model alias. Only a trailing slash is normalized.
 pub fn vision_support_in(cfg: &CliConfig, base_url: &str, model: &str) -> Option<bool> {
     cfg.vision_capabilities.as_ref()?.iter().find_map(|entry| {
         (entry.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
@@ -549,7 +553,7 @@ impl SessionVisionPolicy {
             .unwrap_or_else(|| vision_support_in(cfg, base_url, model))
     }
 
-    /// Apply explicit session overrides, including Unknown (which masks a saved declaration).
+    /// Apply explicit session overrides; None masks a saved override and restores the core default.
     /// Do not persist this overlaid config: saving capability is a separate user action.
     pub fn apply_to(&self, cfg: &mut CliConfig) {
         for ((base_url, model), supported) in &self.declarations {
@@ -643,7 +647,7 @@ fn replace_vision_support(
 }
 
 /// Pure persisted-config edit, with exact destination matching and duplicate replacement.
-/// `None` explicitly resets to Unknown. This does not save or grant transmission permission.
+/// `None` removes the override and restores the enabled default. Does not save or grant disclosure.
 pub fn set_vision_support_in(
     cfg: &mut CliConfig,
     base_url: &str,
@@ -2695,6 +2699,11 @@ mod effort_routing_tests {
         session.apply_to(&mut unknown);
         assert_eq!(vision_support_in(&unknown, endpoint, "alias"), None);
         assert_eq!(
+            crate::llm::media::vision_policy_in(&unknown, endpoint, "alias"),
+            crate::llm::media::VisionPolicy::Supported,
+            "explicit reset masks the saved disable and restores the enabled default"
+        );
+        assert_eq!(
             serde_json::to_string(&saved).unwrap(),
             saved_json,
             "session setup never edits persisted input"
@@ -2704,7 +2713,7 @@ mod effort_routing_tests {
     }
 
     #[test]
-    fn vision_edit_replaces_duplicates_and_unknown_removes_only_the_exact_pair() {
+    fn vision_edit_replaces_duplicates_and_reset_removes_only_the_exact_pair() {
         let endpoint = "https://one.example/v1";
         let mut cfg = CliConfig {
             vision_capabilities: Some(vec![

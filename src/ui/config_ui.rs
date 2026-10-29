@@ -29,6 +29,34 @@ fn parse_toolset_list(s: &str) -> Option<Vec<String>> {
     (!values.is_empty()).then_some(values)
 }
 
+/// A context override belongs to one complete route, not a model name shared by other connections.
+fn apply_main_endpoint(
+    cfg: &mut cli_config::CliConfig,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+) {
+    let base_url = base_url.map(|v| v.trim().trim_end_matches('/'));
+    let api_key = api_key.map(str::trim);
+    let model = model.map(str::trim);
+    if base_url
+        .is_some_and(|v| cfg.base_url.as_deref().map(|old| old.trim_end_matches('/')) != Some(v))
+        || api_key.is_some_and(|v| cfg.api_key.as_deref() != Some(v))
+        || model.is_some_and(|v| cfg.model.as_deref() != Some(v))
+    {
+        cfg.model_context_window = None;
+    }
+    if let Some(v) = base_url {
+        cfg.base_url = Some(v.to_string());
+    }
+    if let Some(v) = api_key {
+        cfg.api_key = Some(v.to_string());
+    }
+    if let Some(v) = model {
+        cfg.model = Some(v.to_string());
+    }
+}
+
 /// Apply one `--model-endpoint` spec to the config's model→endpoint registry. Spec is
 /// `model[,base_url=URL][,api_key_ref=env:VAR|KEY]`. The first comma-token is the model id; the
 /// rest are `key=value` fields. A bare model id (no fields) or a `clear` token removes the entry.
@@ -188,6 +216,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             price_out,
             icons,
             response_visuals,
+            image_mode,
             update_check,
             skill_registry,
             timemachine_keep,
@@ -281,6 +310,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 price_out.is_some(),
                 icons.is_some(),
                 response_visuals.is_some(),
+                image_mode.is_some(),
                 update_check.is_some(),
                 skill_registry.is_some(),
                 timemachine_keep.is_some(),
@@ -313,16 +343,12 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             let mut cfg = cli_config::load();
             let previous_url = cfg.base_url.clone();
             let base_url_was_set = base_url.is_some();
-            if let Some(v) = base_url {
-                cfg.base_url = Some(v.trim().trim_end_matches('/').to_string());
-            }
-            if let Some(v) = api_key {
-                cfg.api_key = Some(v.trim().to_string());
-            }
-            if let Some(v) = model {
-                cfg.model = Some(v.trim().to_string());
-                cfg.model_context_window = None; // model changed manually → re-derive via heuristic
-            }
+            apply_main_endpoint(
+                &mut cfg,
+                base_url.as_deref(),
+                api_key.as_deref(),
+                model.as_deref(),
+            );
             // An explicit --context-window wins (applied after model so it isn't cleared above).
             if let Some(w) = context_window {
                 cfg.model_context_window = if w > 0 { Some(w) } else { None };
@@ -385,6 +411,9 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                     v.parse::<cli_config::ResponseVisuals>()
                         .map_err(anyhow::Error::msg)?,
                 );
+            }
+            if let Some(mode) = image_mode {
+                cfg.image_mode = Some(mode);
             }
             if let Some(b) = update_check {
                 cfg.update_check = Some(b);
@@ -1073,6 +1102,16 @@ fn print_config(cfg: &cli_config::CliConfig) {
         "visuals",
         theme::accent(cfg.response_visuals().to_string()).to_string(),
     );
+    row(
+        "image mode",
+        match cfg.image_mode {
+            Some(crate::core::types::ImagePreference::Auto) => "auto",
+            Some(crate::core::types::ImagePreference::Original) => "original",
+            Some(crate::core::types::ImagePreference::Photo) => "photo",
+            None => "compatibility (balanced)",
+        }
+        .to_owned(),
+    );
     println!();
 }
 
@@ -1289,7 +1328,7 @@ fn vision_status(supported: Option<bool>) -> &'static str {
     match supported {
         Some(true) => "Supported",
         Some(false) => "Unsupported",
-        None => "Unknown",
+        None => "Enabled by default",
     }
 }
 
@@ -1325,7 +1364,7 @@ fn show_vision_destination(
         vision_destination_label(base_url, model)
     ));
     line_dim(&format!(
-        "Status: {} (explicit declaration, not a provider probe)",
+        "Status: {} (local policy, not a provider probe)",
         vision_status(supported)
     ));
     line_dim("Capability does not approve sending any particular image. Disclosure is approved separately.");
@@ -1337,7 +1376,7 @@ fn prompt_vision_declaration(current: Option<bool>) -> Result<Option<Option<bool
     let items = [
         "Declare Supported for this exact destination — this session only",
         "Declare Unsupported for this exact destination — this session only",
-        "Declare Unknown for this exact destination — this session only",
+        "Use default (enabled) — this session only",
         "Cancel — leave declaration unchanged",
     ];
     if current == Some(false) {
@@ -1452,7 +1491,7 @@ fn config_edit_vision(cfg: &mut cli_config::CliConfig) -> Result<()> {
             )
         })
         .collect();
-    items.push("Exact endpoint/model from a setup requirement (manual, no probe)".into());
+    items.push("Exact endpoint/model (manual override, no probe)".into());
     items.push("Back".into());
     let Some(pick) = Select::with_theme(&ui_theme())
         .with_prompt("Vision — choose a destination")
@@ -1469,7 +1508,9 @@ fn config_edit_vision(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let (base_url, model) = match destinations.get(pick) {
         Some((_, base_url, model)) => (base_url.clone(), model.clone()),
         None => {
-            line_dim("Paste the exact endpoint and wire model named in the setup requirement. No test request is sent.");
+            line_dim(
+                "Enter the exact endpoint and wire model to override. No test request is sent.",
+            );
             let base_url = Input::<String>::with_theme(&ui_theme())
                 .with_prompt("Endpoint")
                 .report(false)
@@ -1504,23 +1545,15 @@ fn config_edit_vision(cfg: &mut cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Guided top-level preflight. Workers never call this: a missing child capability is returned
-/// to its controller as an actionable setup requirement. This is not an image disclosure grant.
-/// The controller must build a NEW immutable request/config snapshot after this returns true.
-///
-/// An UNDECLARED destination defaults to vision-capable instead of opening a menu on every
-/// attachment. The menu asked a question whose answer never varied, and it interrupted the turn
-/// that was already carrying the image; a capability statement is not a disclosure approval, so
-/// defaulting it adds no transmission authority. An explicitly configured `Unsupported` is a real
-/// answer and is still honoured — `/config → Vision` remains the way to change either.
-pub(crate) fn guided_vision_setup(base_url: &str, model: &str) -> Result<bool> {
+/// Top-level override check against the controller's frozen config. Default vision never opens
+/// a menu, probes a provider, or writes a capability entry. Disclosure grants remain separate.
+pub(crate) fn guided_vision_setup(
+    cfg: &cli_config::CliConfig,
+    base_url: &str,
+    model: &str,
+) -> Result<bool> {
     let (base_url, model) = crate::llm::media::effective_image_destination(base_url, model);
-    let cfg = cli_config::load();
-    let supported = cli_config::session_vision_policy().support_in(&cfg, &base_url, &model);
-    if supported == Some(true) {
-        return Ok(true);
-    }
-    if supported == Some(false) {
+    if cli_config::vision_support_in(cfg, &base_url, &model) == Some(false) {
         line_warn(&format!(
             "Vision is configured Unsupported for {}. Attachments are not sent; \
              change it in /config → Vision.",
@@ -1528,14 +1561,6 @@ pub(crate) fn guided_vision_setup(base_url: &str, model: &str) -> Result<bool> {
         ));
         return Ok(false);
     }
-    // Undeclared: state the default once, remember it, and get out of the way.
-    cli_config::declare_session_vision(&base_url, &model, Some(true))?;
-    cli_config::persist_vision_support(&base_url, &model, Some(true))?;
-    line_dim(&format!(
-        "Vision: {} · Supported by default (explicit declaration, not a provider probe). \
-         Change it in /config → Vision.",
-        vision_destination_label(&base_url, &model)
-    ));
     Ok(true)
 }
 
@@ -2106,7 +2131,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             format!("Reasoning       · {effort_h}"),
             format!("Approval        · {approval_h}"),
             format!("Display         · icons {icons_h} · visuals {visuals_h}"),
-            "Vision          · exact endpoint/model declarations (no probe)".to_string(),
+            "Vision          · enabled by default · optional overrides".to_string(),
             format!(
                 "Sandbox         · {} · network {}",
                 cfg.sandbox
@@ -2118,6 +2143,7 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
                     .and_then(|s| s.network.as_deref())
                     .unwrap_or("deny")
             ),
+            "Context window override (optional)".to_string(),
             "Show full config".to_string(),
             "Done".to_string(),
         ];
@@ -2150,7 +2176,8 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             7 => config_edit_approval(&mut cfg),
             8 => config_edit_display(&mut cfg),
             10 => config_edit_sandbox(&mut cfg).map(|changed| apply_sandbox_mode = changed),
-            11 => {
+            11 => prompt_context_window(&theme, &mut cfg),
+            12 => {
                 print_config(&cfg);
                 continue;
             }
@@ -2729,7 +2756,11 @@ pub(crate) async fn config_edit_providers(cfg: &mut cli_config::CliConfig) -> Re
                 let mut replacement = cli_config::ProviderProfile::normalized(
                     &old.name, &conn.base, &conn.key, &model,
                 )?;
-                replacement.model_context_window = old.model_context_window;
+                replacement.model_context_window = (old.model == model
+                    && old.base_url.trim_end_matches('/') == conn.base.trim_end_matches('/')
+                    && old.api_key == conn.key)
+                    .then_some(old.model_context_window)
+                    .flatten();
                 let active = cfg
                     .active_provider
                     .as_deref()
@@ -2907,10 +2938,10 @@ fn pick_model_from(
         None => return Ok(()),
     };
     if pick < infos.len() {
+        if cfg.model.as_deref() != Some(infos[pick].id.as_str()) {
+            cfg.model_context_window = None;
+        }
         cfg.model = Some(infos[pick].id.clone());
-        // Provider-reported window when it gave one, else clear it so the HUD uses its heuristic
-        // rather than keeping the PREVIOUS model's number, which would be wrong for this one.
-        cfg.model_context_window = infos[pick].context_length;
     } else {
         let mut mi = Input::<String>::with_theme(theme).with_prompt("Model id");
         if let Some(s) = cfg
@@ -2923,7 +2954,7 @@ fn pick_model_from(
         let m = mi.allow_empty(true).interact_text()?;
         if !m.trim().is_empty() {
             cfg.model = Some(m.trim().to_string());
-            cfg.model_context_window = None; // custom id → heuristic
+            cfg.model_context_window = None; // custom id → resolve limits on the next execution
         }
     }
     Ok(())
@@ -3615,8 +3646,10 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
                 None => return Ok(()),
             };
             if pick < infos.len() {
+                if cfg.model.as_deref() != Some(infos[pick].id.as_str()) {
+                    cfg.model_context_window = None;
+                }
                 cfg.model = Some(infos[pick].id.clone());
-                cfg.model_context_window = infos[pick].context_length; // auto when reported, else heuristic
             } else {
                 let m: String = Input::with_theme(&theme)
                     .with_prompt("Model id")
@@ -3644,14 +3677,13 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
             }
         }
     }
-    prompt_context_window(&theme, cfg)?;
+    line_ok("context is detected automatically at execution; use the optional context override only when needed");
     cfg.sync_active_provider();
     Ok(())
 }
 
-/// Ask for the context window. Drives the `% context` HUD and the auto-compact trigger — and it is
-/// deliberately NOT a cap, the provider enforces the real limit. `auto`/blank/garbage clears it back
-/// to detect-or-heuristic rather than keeping a number the user just tried to remove.
+/// Optional manual context override. Core normally discovers the actual route's provider metadata
+/// and falls back to a labelled estimate; `auto`/blank clears this override.
 ///
 /// A no-op when no model is set: the prompt shows the CURRENT model's window, so asking without one
 /// would be asking about nothing.
@@ -3665,7 +3697,7 @@ fn prompt_context_window(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig)
         .map(|w| w.to_string())
         .unwrap_or_else(|| "auto".to_string());
     let note = if was_cfg {
-        "auto-detected from the provider"
+        "configured override"
     } else {
         "estimated from the model name"
     };
@@ -4329,6 +4361,37 @@ fn config_edit_display(cfg: &mut cli_config::CliConfig) -> Result<()> {
         });
     }
 
+    let image_idx = match cfg.image_mode {
+        None => 0,
+        Some(crate::core::types::ImagePreference::Auto) => 1,
+        Some(crate::core::types::ImagePreference::Original) => 2,
+        Some(crate::core::types::ImagePreference::Photo) => 3,
+    };
+    tui::note_line("Image mode controls representation, not pins or disclosure consent.");
+    tui::note_line("Auto preserves text/UI/unknown inputs; Photo allows smaller lossy previews.");
+    tui::note_line(
+        "Exact requirements and AIZEN_IMAGE_SEND_MODE=original still require originals.",
+    );
+    if let Some(pick) = Select::with_theme(&theme)
+        .with_prompt("Image sending (Esc keeps current)")
+        .report(false)
+        .items(&[
+            "Compatibility — keep the existing balanced policy",
+            "Auto — preserve text/UI and unknown originals",
+            "Original — no transforms",
+            "Photo — permit smaller JPEG previews",
+        ])
+        .default(image_idx)
+        .interact_opt()?
+    {
+        cfg.image_mode = match pick {
+            1 => Some(crate::core::types::ImagePreference::Auto),
+            2 => Some(crate::core::types::ImagePreference::Original),
+            3 => Some(crate::core::types::ImagePreference::Photo),
+            _ => None,
+        };
+    }
+
     // The retained full-frame renderer is the only interactive UI, so there is no backend to pick:
     // on a non-TTY (or if the alternate screen won't open) the plain line-REPL takes over on its own.
     Ok(())
@@ -4380,8 +4443,7 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     )
     .await?
     .ok_or_else(|| anyhow::anyhow!("a connection is required"))?;
-    cfg.base_url = Some(conn.base.clone());
-    cfg.api_key = Some(conn.key.clone());
+    apply_main_endpoint(cfg, Some(&conn.base), Some(&conn.key), None);
     // Same reason as the provider editor: a pairing inside that step already wrote the key to disk
     // under its own profile, and this `cfg` was read before it. Absorb the row before the save at
     // the end of setup writes over the file it lives in.
@@ -4404,7 +4466,7 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
         let m = mi.interact_text().context("reading a model id")?;
         if !m.trim().is_empty() {
             cfg.model = Some(m.trim().to_string());
-            cfg.model_context_window = None; // manual id, no provider metadata → heuristic
+            cfg.model_context_window = None; // manual id → resolve limits on the next execution
         }
     } else {
         pick_model_from(&theme, cfg, &infos, preset.map(|p| p.sample_model))?;
@@ -4413,9 +4475,8 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
         anyhow::bail!("a model is required (run `aizen models` to list them)");
     }
 
-    // 4) context window. The model pick above pre-filled `model_context_window` from the provider
-    //    when it reported one, so the prompt's default already reflects it.
-    prompt_context_window(&theme, cfg)?;
+    // Limits are resolved by core on the actual execution route; setup never requires a manual cap.
+    line_ok("context is detected automatically; an optional override is available in /config");
 
     // Web search key (Tavily) — web_search is KEYED-ONLY, so without a key it can't search at all.
     // Optional here (Enter skips): a fresh install should be usable before the user has gone and
@@ -4488,15 +4549,32 @@ mod vision_tests {
     use super::*;
 
     #[test]
-    fn explicit_declaration_choices_keep_cancel_distinct_from_unknown() {
+    fn explicit_declaration_choices_keep_cancel_distinct_from_default() {
         assert_eq!(vision_declaration_choice(Some(0)), Some(Some(true)));
         assert_eq!(vision_declaration_choice(Some(1)), Some(Some(false)));
         assert_eq!(vision_declaration_choice(Some(2)), Some(None));
         assert_eq!(vision_declaration_choice(Some(3)), None);
         assert_eq!(vision_declaration_choice(None), None);
-        assert_eq!(vision_status(None), "Unknown");
+        assert_eq!(vision_status(None), "Enabled by default");
         assert_eq!(vision_status(Some(true)), "Supported");
         assert_eq!(vision_status(Some(false)), "Unsupported");
+    }
+
+    #[test]
+    fn default_vision_preflight_does_not_mutate_config_or_session_policy() {
+        let cfg = cli_config::CliConfig::default();
+        let before = serde_json::to_value(&cfg).unwrap();
+        let endpoint = "https://vision-default-preflight.invalid/v1";
+        let model = "fixture";
+        let before_session = cli_config::session_vision_policy().support_in(&cfg, endpoint, model);
+        for _ in 0..2 {
+            assert!(guided_vision_setup(&cfg, endpoint, model).unwrap());
+        }
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
+        assert_eq!(
+            cli_config::session_vision_policy().support_in(&cfg, endpoint, model),
+            before_session
+        );
     }
 
     #[test]

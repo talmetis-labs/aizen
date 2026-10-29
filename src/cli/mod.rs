@@ -4,6 +4,7 @@
 pub mod account_cmd;
 pub mod agents_cmd;
 pub mod apps;
+pub mod compact;
 pub mod coop_cmd;
 pub mod custom_cmd;
 pub mod files_cmd;

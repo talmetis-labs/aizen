@@ -47,27 +47,38 @@ it for its own paste, so the keystroke never reaches `aizen`):
   turns image-file paths on the line into attachments (you can also type/paste a path). Real image
   files only — prose like `nope.png` that isn't a file stays as text.
 
-Both attach the image to your text; the selected model must support vision. Ordinary user
-attachments use a **balanced send-only preview** by default when safe: static opaque 8-bit PNGs
-may become smaller JPEGs while canonical attachments and stored blobs remain unchanged.
-`AIZEN_IMAGE_SEND_MODE=original` preserves the attached bytes on the wire. Unsupported/color-sensitive
-formats, transparency, animation, malformed inputs or a busy image-memory budget retain originals;
-remote image URLs are never fetched by the optimizer. Tool images and output screenshots are not
-silently compressed. See [Visual design and tool images](#visual-design-and-tool-images) for grants,
-exact reference inspection and delivery limits.
+Both attach the image to your text; the selected model must support vision. Live canonical attachments remain unchanged; input image pixels are not saved in sessions or recovery. The compatibility default remains **Balanced**: eligible opaque
+8-bit PNGs may use smaller JPEGs on the wire. Choose `aizen config set --image-mode auto` to preserve
+unknown/text/UI pixels, `original` to disable transforms, or `photo` to permit the JPEG ladder.
+The interactive picker is under `/config` → Display → Image sending; Compatibility keeps Balanced.
+Headless runs can override each selection with `--image-mode auto|original|photo` (repeat once per
+selected image, in `--image` path order). Exact reference requirements override
+Photo; `AIZEN_IMAGE_SEND_MODE=original` is an unconditional no-transform rollback. Original is a
+representation preference, not a retention pin. Unsupported/color-sensitive formats, transparency,
+animation, malformed inputs or busy codec admission retain originals; remote URLs are never fetched.
+Typed tool captures are not silently compressed. See
+[Visual design and tool images](#visual-design-and-tool-images) for grants, lifecycle and limits.
 
 **Ctrl-E** expands a tool result into a scrollable overlay — the one under your selection when it
 sits on a tool row, else the most recent; a failed command already shows its last lines under its
 row. **Ctrl-X** removes the most recent attachment (keeps your text); **Esc** clears the line and all
-attachments at once. Clipboard screenshots are downscaled to ≤1568px **at ingress**, before canonical
-attachment storage; original send mode cannot recover pre-ingress clipboard pixels. Attach the
-original file for full-resolution references. The token gauge ignores attachments (they ride outside
-`content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works everywhere.
+attachments at once. Clipboard screenshots retain original pixels within the decoded and encoded
+limits; oversized input is refused with a crop/size diagnostic rather than silently downscaled.
+The context gauge uses selected-image dimensions with a conservative, provider-independent planning
+allowance, not a billed-token formula. Clipboard grab is desktop-only (Windows/macOS);
+drag-drop/path works everywhere.
 
-The context window is **auto-detected** from the provider's `/models` when it reports one
-(OpenRouter/LiteLLM-style gateways do; the bare OpenAI schema doesn't). When it's absent the bar
-shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M · DeepSeek 64K · else
-128K). Override it explicitly with `aizen config set --context-window <tokens>`.
+Core resolves the context window at execution from the **exact endpoint, model and account**.
+It reads `/models` (then exact-model detail when needed), caches positive metadata for 24 hours and
+misses for 10 minutes, and does not send a completion probe or rewrite your config. Discovery is
+bounded to three seconds on a cold route. Provider metadata is **provider-reported**, not proof of
+the deployed gateway's true capacity; output limits are not mistaken for input context. When no
+usable limit is available (including Codex), the bar remains `ctx·est`: a model-name estimate
+(Claude 200K · Gemini/GPT-4.1 1M · DeepSeek 64K · else 128K). `/context` names the source.
+Manual overrides remain optional: `/config` → Context window override, or
+`aizen config set --context-window <tokens>`. Existing saved nonzero values are honored as overrides.
+Changing the saved endpoint, account or model clears its old override; a new `--context-window`
+passed in the same command takes precedence. `--context-window 0` returns to automatic resolution.
 
 **Slash commands** (the meta layer):
 
@@ -110,13 +121,21 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `` !`<cmd>` `` | splice a **read-only** command's output into your message (same gate as custom commands) |
 
 **Context window + auto-compact** live in **`/config`** (so the settings stay in one place). The
-window drives the `% context` HUD (auto-detected from `/models` when the provider reports it, else
-estimated by model name, else whatever you type). Auto-compact (default **80%**, the `⊟ 80%` marker
-on the status line) summarizes older turns into one dense note when usage crosses the threshold —
-during a turn, between the agent's steps, so a long task compacts mid-flight instead of after it
-ends — keeping the last few turns verbatim; the cut is always at a user-message boundary (no
-orphan tool results). `/compact` forces it now. Both also settable non-interactively:
+window drives both the `% context` HUD and runtime guards. Auto-compact (default **80%**, the
+`⊟ 80%` marker on the status line) summarizes older turns into one dense note when usage crosses the
+threshold — during a turn, between the agent's steps. Multi-turn histories keep recent user turns;
+a long single-turn task keeps its original prompt and recent assistant/tool steps. Cuts preserve
+complete tool groups. If nothing older can be cut, the loop skips compaction without reporting a
+summary failure. `/compact` forces an eligible cut now. Both settings are also available through
 `aizen config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
+
+The summarizer uses **its own route's** context/output limits, not the coding model's large output
+cap. Oversized transcripts are split into bounded text-only portions, then merged, with bounded
+calls/reduction depth and smaller requests on a provider context-overflow rejection. A compaction
+has a separate 300-second overall deadline (discovery + portions + merge + retries); an explicit
+positive `AIZEN_CHORE_CALL_SECS` overrides it, still bounded by the sub-agent call ceiling. Short
+background learning chores retain their 60-second default. Failed, empty, truncated or cancelled
+auto-compaction does not replace the original history; it is not reported as a successful boundary.
 
 Two cheaper measures run before compaction ever triggers, whatever the threshold: tool results
 older than the eight most recent collapse to a one-line digest (tool, target, size, and the scratch
@@ -710,15 +729,19 @@ Behavior worth knowing:
   user's settings between them. `--effort auto` runs the same keyword-plus-complexity classifier a
   typed REPL turn goes through, against the task text. Omit the flag and nothing changes: the
   configured `reasoning_effort` applies and the request is byte-identical to one from a core that
-  never had the flag. The tier is named on **stderr**, next to the rest of the trace.
+  never had the flag. The tier is named on **stderr**, next to the rest of the trace. In the REPL
+  the **status row** carries the effort state instead: a tinted `·auto` chip right after the model
+  name (`aizen/kimi-k3·auto · ~17.6K/128.0K tok · …`), refreshed at every turn — auto-detection is
+  what the user picked, the resolved rung stays in the stderr trace, and no per-turn `effort:` line
+  is printed into the chat. A pinned tier (`/effort high`, `--effort high`) names the tier itself.
 - **A tier changes the harness, not only the wire.** In the REPL the resolved tier also sets the
   step cap and its extension, how many fresh budgets a still-progressing run may claim, how many
   verify-and-fix rounds a broken tree gets, whether the self-review pass runs before Done
   (`xhigh`/`max`), and how much of a build log reaches the model — so `/effort low` and
   `/effort max` behave differently even on a provider that ignores `reasoning_effort`. A tier can
   also change the model: `"models_by_effort": {"low": "cheap-model", "max": "strong-model"}` in
-  `cli-config.json` sends turns of that tier to that model on the same endpoint (the effort line
-  then names it); tiers without an entry use the main model.
+  `cli-config.json` sends turns of that tier to that model on the same endpoint (the status row
+  then names the routed model); tiers without an entry use the main model.
 - **Architect mode: plan, then apply.** Multi-file turns use `metis` at `max` effort by default;
   lower tiers also use it when `models_by_effort.max` or `xhigh` explicitly configures a planner.
   The planner drafts a Markdown spec: requirements, scope/non-goals, design decisions, phases
@@ -1160,6 +1183,38 @@ startup errors, the authorized native tool may proceed without that hook; do not
 subprocess hook as a mandatory policy gate inside a native scope. Unproven physical hook effects
 are different: they block further work until settlement can be established.
 
+### `aizen compact <slug>` — compact a saved conversation
+
+```bash
+aizen compact fix-delete-btn                        # human-readable result
+aizen compact fix-delete-btn --output-format json   # {"slug":"…","before":16292,"after":8195}
+aizen agent --resume fix-delete-btn --save-session "continue"
+```
+
+Uses the same summarizer and recent-turn retention as REPL `/compact`, rewriting the saved
+conversation under its existing slug. `before` and `after` are **approximate tokens**, not provider
+billing counts. The configured `summarizer` role still takes precedence over the main endpoint;
+`--model`, `--base-url`, and `--api-key` override the main endpoint defaults. Prefer environment or
+stored credentials over an API key in argv.
+
+The command preserves session provenance, design state and usage metadata. A missing/unreadable
+session, a conversation too short to compact, or a failed/empty summary exits nonzero without
+writing the result. JSON mode writes exactly one result object on stdout on success; errors go to
+stderr. Changes to the session envelope or delta log detected during summarization reject the
+stale write. This revision check is not a cross-process lock: do not compact a session another run
+is actively writing.
+
+Interactive CLI `/compact` also saves the result under the current session slug **before** reporting
+success; exiting the CLI is not required. Desktop refreshes the session list and an idle selected
+transcript when its window regains focus or becomes visible, including the compacted summary.
+Draft text and pending attachments are retained; active runs and unanswered clarify choices are not
+replayed from disk. Do not actively write the same session from both clients at once.
+
+Desktop `/compact` calls this command, keeps the visible transcript and pending clarify choices,
+and resumes the compacted saved history on the next send. It requires a core advertising both
+`compact` and `agent --resume`. `/context` remains the context meter; its fixed prompt/tool/memory
+floor is not a measurement of the conversation history this command reduces.
+
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
 in-REPL dispatches), then merge their results into one answer (mixture-of-agents). In the REPL the
@@ -1549,27 +1604,31 @@ pointer until an explicit `design_brief` call with `{"resume":true}`. Saved sess
 typed brief and evidence metadata; restoring a session makes old evidence **stale**, not verified.
 Delegated children inherit concise constraints, with separate task/evidence namespaces.
 
-**Vision capability is explicit per effective endpoint/model.** Open `/config` → provider/model →
-**Vision** to declare Supported or Unsupported for that exact destination. Unknown may be declared
-for this session only; persistent saving is a separate explicit action. The declaration is the
-user's assertion, not an automatic paid probe or inference from the model's name/HTTP success.
-The equivalent stored configuration is:
+**Vision is enabled by default, without setup or capability verification.** CLI, Desktop/headless
+runs, tool images and delegated children attempt image requests on their resolved route without
+creating a `vision_capabilities` entry. This is a local default, not a provider probe or a claim that
+every model understands images. A provider rejection remains an error: core does not silently strip
+images, switch providers or upload them elsewhere.
+
+Optional `/config` → provider/model → **Vision** overrides apply to one exact effective endpoint/model.
+Supported enables it explicitly, Unsupported disables it, and Default removes the override (enabled).
+Session-only overrides need not be saved; persistence is a separate explicit action. For example,
+to disable image transmission on one destination:
 
 ```json
 {
   "vision_capabilities": [
-    { "base_url": "https://your-provider.example/v1", "model": "your-model-id", "supported": true }
+    { "base_url": "https://your-provider.example/v1", "model": "your-model-id", "supported": false }
   ]
 }
 ```
 
-An absent entry means **unknown**; `supported:false` means unsupported. Both leave tool images as
-text/metadata rather than pretending the model saw them. The capability must match the effective
-endpoint and model after role/effort routing; configuring support does not grant image-transmission
-permission. For ChatGPT Codex, that tuple is the fixed Responses URL
-`https://chatgpt.com/backend-api/codex/responses` and the actual wire model **without its effort
-suffix** (for example, `gpt-5.4-high` uses `gpt-5.4`). Configure that URL/model, not a Codex base-URL
-alias or the effort-suffixed picker name; this routing normalization does not imply vision support.
+An absent entry uses the enabled default; `supported:false` blocks selected-reference and tool-image
+transmission on that destination. Overrides match the effective endpoint and model after role/effort
+routing. Enabling vision does not grant image-transmission permission. For ChatGPT Codex, that tuple
+is the fixed Responses URL `https://chatgpt.com/backend-api/codex/responses` and the actual wire model
+**without its effort suffix** (for example, `gpt-5.4-high` uses `gpt-5.4`). Optional overrides use that
+URL/model, not a Codex base-URL alias or the effort-suffixed picker name.
 Tool-image approval names that destination, and a routed destination change requires matching
 approval. Media asks for invocation-only consent: generic allow-all grants do not bypass it, and a
 stream-json reply granting a tool/session is applied only to the current media call.
@@ -1582,7 +1641,7 @@ budget, but approved transmitting reads during an active visual task consume its
 A browser capture with `transmit:false` is capture-only and needs no vision declaration: saved
 pixels are available locally but are not visually reviewed. `image_read` remains a transmitting
 read requiring explicit `transmit_image:true`; it does not currently expose a capture-only mode.
-Capability Unknown/Unsupported, denied transmission, omitted budget selection and failed delivery
+Explicitly disabled/unresolved dispatch policy, denied transmission, omitted budget selection and failed delivery
 are distinct limitations; none is repaired by silently changing providers. Executor and request
 projection use one frozen route/capability context; a route change needs a fresh context and grant.
 
@@ -1595,20 +1654,43 @@ transparency chunks, ICC/gamma and other unsupported color metadata keep origina
 encoded entries / 16 MiB, with no decoded pixels retained. Codecs, request materialization and local
 comparison share a nonblocking **192 MiB** application-buffer/work reservation budget; contention
 produces a limitation or original fallback. This is not a hard process-RSS cap: allocator overhead
-and unrelated memory are outside that accounting. After a successful parent send, one numeric
-note reports preview URI sizes/cache/encoding time; child calls remain quiet. Token estimation and
-occurrence-only queries do not invoke codecs.
+and unrelated memory are outside that accounting. Preparation runs off the async executor with
+nonblocking admission: at most two process-wide codec workers and one transform shared by a parent
+run and its children. Warm hits avoid re-encoding; contention preserves originals without queueing.
+The optional machine-readable `result.media` reports actual HTTP attempts, JSON bytes, image-URI
+bytes, image count and peak reserved request bytes, including child sends/retries in that run.
+It does not log pixels or prove model comprehension. Token estimation and occurrence-only queries
+do not invoke codecs.
+
+For a reproducible local check, run
+`python -I scripts/vision_http_smoke.py target/release/aizen.exe --default-vision-only`
+(use `target/release/aizen` on Unix). This verifies default-on behavior and child isolation without
+legacy saved-image flows. Add `--performance-samples 10 --performance-requests 4` instead of
+`--default-vision-only` for
+fresh-process synthetic grid/noise cases with Auto, Original, Photo and explicit release. This uses
+an isolated temporary home and a loopback-only scripted provider, never your configured model.
+The JSON report separates source/HTTP bytes, cold launch-to-request and cache-eligible follow-up
+interval p50/p95, observed stream/text arrival, request media leases and Windows process working-set
+peaks. These timings include intake/tools/serialization/loopback overhead, not pure codec time or real
+provider TTFT. Synthetic usage and fixtures cannot certify billing or small-text readability.
+On Windows, `python -I scripts/vision_tui_smoke.py target/debug/aizen.exe` drives the actual
+plain and retained input surfaces through ConPTY. It verifies that an excess five-image selection
+sends no HTTP request, preserves the draft, and sends exactly the remaining four distinct originals
+and accompanying text after editing. It uses an isolated temporary home and loopback provider,
+never reads or changes the clipboard, and terminates only the CLI process trees it created.
+This is an intake/wire check, not a semantic model or Desktop UI test.
 
 **Selected references and fidelity.** Reference IDs identify attachments in the already-loaded
 conversation, not globally readable blobs or file authority. The controller grants current-task
-purpose, destination/account route and allowed originals/previews/crops separately from declaring
-vision or approving a tool. Same-route children may receive only explicitly selected `reference_ids`;
+purpose, destination/account route and allowed originals/previews/crops separately from the optional
+vision override or tool approval. Same-route children may receive only explicitly selected `reference_ids`;
 a different route/account requires fresh consent. Restoring a session does not restore live grants.
 For headless intentional handoff, use
 `aizen agent --reference-images --image ref.png "reconstruct this reference"`: this grants the attached
 references to this task and same-route selected delegates, with exact-original sending; it does **not**
-declare model vision support. Current exact fidelity selects **Original for the whole request**, not a
-mixed exact/preview projector. Preview-only grants are rejected with an actionable limitation.
+override an explicit vision disable. Exact fidelity requires originals for the selected required reference
+occurrences; unrelated attachments can still use their own permitted representations. Preview-only
+grants remain rejected with an actionable limitation.
 
 Discover `reference_read`, `reference_compare` and `reference_trace` with `tool_search` when they are
 not on the current schema surface. Inspect granted originals/crops before constructing geometry;
@@ -1624,12 +1706,46 @@ representation, not semantic understanding. Failed/replayed calls, omitted image
 and a different occurrence with identical pixels earn no delivery credit. A preview or crop cannot
 certify whole-original inspection, functional UI, accessibility or mobile behavior.
 
-**Image limits and privacy.** Browser capture/local crop are PNG-only. MCP image observations accept
-validated PNG/JPEG/GIF/WebP base64 blocks, at most **8 MiB per image**, with a tool-image request
-budget of **four images** and **16 MiB** combined. Existing user attachments retain their legacy
-wire behavior and are not silently stripped by the new tool-image capability gate; they consume
-that same request budget and can leave no room for tool images. This is not a new global cap or
-vision-support claim for legacy user attachments. Malformed, oversized, unsupported or
+**Visual working set.** New attachments and scoped original/ROI rereads start active. A successful
+request records which exact occurrence/representation was delivered, not whether it was understood.
+Use the lazily exposed `image_context` tool to list, remember, pin/unpin or release accessible
+occurrences. Releasing pixels requires successful delivery, a bounded observation and a live scoped
+reread handle; conflicting mutations of the same occurrence in one tool group are rejected.
+Released occurrences contribute descriptors/notes but **zero image bytes** until explicitly reread or
+reselected. A note is an untrusted observation, never verification or an API-side image cache. Neither
+age nor transport success releases images automatically. Model pins cannot clear controller pins;
+Original controls representation only and does not keep a dormant image active. Live pins take
+priority over newer optional screenshots in the 32-image / 64 MiB retained payload budget and the
+32-entry working set. Current task/source/render capture identities and explicit comparison
+references are controller-pinned until that live requirement ends; stale captures are not kept as
+fresh acceptance evidence. Required pixels that exceed the four-image / 16 MiB request limit cause
+an actionable refusal instead of silent omission. Saved pin flags never restore live priority or
+consent.
+
+Input image pixels (including compacted originals, reference sidecars and ROI rereads) are not saved
+in session envelopes, deltas or recovery. Resume keeps text and bounded untrusted historical visual
+observations, not attachment handles: attach the original image again to inspect or verify details.
+Legacy saved input images are ignored before CAS hydration; existing files are not physically deleted.
+Unrelated tool captures retain the existing bounded CAS retention policy. Runtime grants, delivery
+credit and approval never survive restore. Within the same live task, compaction may retain scoped
+originals and reread handles in memory, but its summarizer receives only bounded text descriptors and
+uncertainty, never image bytes. Workflow dependencies and saved hashes are not disclosure consent.
+For child outputs, `return_evidence:["@latest_capture"]` selects at most one successful completed
+final-attempt screenshot under existing route/approval gates; literal capture IDs remain supported.
+
+**Image limits and privacy.** Browser capture is PNG; scoped original-coordinate ROI supports PNG
+and bounded JPEG input and returns PNG. GIF/WebP remain exact pass-through and unsupported ROI is
+reported explicitly. User selections and MCP image observations accept validated PNG/JPEG/GIF/WebP,
+at most **8 MiB per image**, **four selected images** and **16 MiB** combined source bytes per
+request. Excess explicit selections are refused, not silently truncated. TUI path attachments and
+clipboard selections share the same combined budget; count and file-size preflight runs before
+reading/encoding selected files, with loaded bytes checked again afterward. Malformed selected
+files or a failed batch refuse the send and keep the editable draft instead of submitting only some images or treating
+rejected paths as prose. Image submissions queue as their own turn, never enter text-only steering;
+clipboard additions also refuse an excess batch before retaining it. Historical active images
+can require release/reselection before another send fits the same hard budget. Tool projection
+uses vision by default but still needs destination approval; ordinary legacy user attachments retain
+their existing behavior. Malformed, oversized, unsupported or
 unapproved tool blocks remain explicit text/metadata limitations; MCP error images are not projected.
 Image payloads may be retained in owner-only session blobs and sent to the approved provider; page
 content can contain private information. Inspect the target and destination before approving.

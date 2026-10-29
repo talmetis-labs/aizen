@@ -2,6 +2,7 @@
 //! third of the file.
 
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The two tests below read and write the process-wide transcript geometry slot (one through a
 /// paint, one directly). Run in parallel they see each other's numbers; the lock keeps them
@@ -533,6 +534,33 @@ fn ansi_spans_splits_on_colour_and_collapses_when_plain() {
         Some(Color::Gray),
         "reset returns to base"
     );
+}
+
+#[test]
+fn styled_clipping_keeps_complete_sgr_and_graphemes() {
+    let raw = "model\x1b[38;5;179m·xhigh 👩‍💻 e\u{301}\x1b[0m";
+    let expected = sanitize_text(raw);
+    for width in 0..=30 {
+        let clipped = clip_keep_sgr(raw, width);
+        let spans = ansi_spans(&clipped, Style::default());
+        let shown: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(crate::ui::links::display_width(&shown) <= width);
+        assert!(!shown.contains("[38;") && !shown.contains("[0m"));
+        if width >= crate::ui::links::display_width(&expected) {
+            assert_eq!(shown, expected);
+        } else if width > 0 {
+            assert!(shown.ends_with('…'));
+            let prefix = shown.strip_suffix('…').unwrap();
+            assert!(expected.starts_with(prefix));
+            assert_eq!(
+                prefix.graphemes(true).collect::<Vec<_>>(),
+                expected
+                    .graphemes(true)
+                    .take(prefix.graphemes(true).count())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 #[test]
@@ -1863,6 +1891,38 @@ fn painted_rows(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
             row.trim_end().to_string()
         })
         .collect()
+}
+
+#[test]
+fn footer_renders_effort_colour_without_literal_ansi_even_when_clipped() {
+    let _geom = GeomLock::acquire();
+    let model = "claude-opus-5-thinking-kiro";
+    let status = format!("{model}\x1b[38;5;179m·xhigh\x1b[0m  ·  ~6.3K/200.0K tok  ·  0 turns");
+    for width in [32, 48, 64, 120] {
+        let mut state = AppState::new("intro", &status);
+        let layout = input_layout(&state, width as usize, 1);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(width, 4)).unwrap();
+        term.draw(|frame| draw_footer(frame, frame.area(), &mut state, &layout))
+            .unwrap();
+        let buffer = term.backend().buffer();
+        let row: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            !row.contains("[38;") && !row.contains("[0m") && !row.contains('\x1b'),
+            "SGR must become cell styles, not visible text at width {width}: {row:?}"
+        );
+        if width == 120 {
+            assert!(row.starts_with(&format!("{model}·xhigh")), "{row:?}");
+            assert_eq!(
+                buffer[(model.len() as u16 + 1, 0)].fg,
+                ratatui::style::Color::Indexed(179)
+            );
+            assert_eq!(
+                buffer[(model.len() as u16 + 6, 0)].fg,
+                ratatui::style::Color::DarkGray,
+                "the reset restores the footer's base colour"
+            );
+        }
+    }
 }
 
 #[test]

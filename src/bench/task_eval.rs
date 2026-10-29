@@ -350,6 +350,7 @@ fn prepare_task(
             cli_config::CliConfig::default(),
         );
         cfg.image_config = Some(std::sync::Arc::new(resolved.vision_config.clone()));
+        cfg.tool_image_policy = crate::llm::media::VisionPolicy::Unknown;
         cfg.context_window = crate::ui::context_report::ctx_window_for(&resolved.endpoint.model);
         cfg.nudge_role = agent::NudgeRole::for_base_url(&resolved.endpoint.base_url);
         cfg.wire_reasoning_effort = Some(None);
@@ -859,6 +860,7 @@ mod tests {
             home.join("cli-config.json"),
             serde_json::json!({
                 "model":"bench-final", "model_context_window":32123,
+                "base_url":"https://fixture.invalid/v1", "api_key":"fixture-key",
                 "models_by_effort":{"max":"bench-final", "low":"bench-cheap"},
                 "model_endpoints":[{"model":"bench-final",
                     "base_url":"https://fixture.invalid/v1", "api_key_ref":"fixture-key"}],
@@ -1014,6 +1016,7 @@ mod tests {
                 message_index: 3,
                 image_index: 0,
                 sha256: outgoing[3].tool_images[0].metadata().sha256.clone(),
+                visual_identity: None,
             }],
             user_images: Vec::new(),
         };

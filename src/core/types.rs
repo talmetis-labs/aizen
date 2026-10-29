@@ -148,6 +148,17 @@ pub struct PromptTokensDetails {
     pub cached_tokens: Option<u64>,
 }
 
+/// Controller-selected transport preference, never image access or a retention pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePreference {
+    /// Preserve unknown/text/UI content; use an explicit ROI when detail is needed.
+    Auto,
+    Original,
+    /// Explicitly compressible photographic content; never overrides exact/grant restrictions.
+    Photo,
+}
+
 /// A chat message. Carries optional `tool_calls` (assistant turn) and `tool_call_id`
 /// (tool-result turn) so one Vec<Message> models the whole tool-calling history.
 ///
@@ -172,6 +183,10 @@ pub struct Message {
     /// Storage-only tool observations. Actual request builders clear these and project validated
     /// images into a synthetic user turn AFTER the entire matching tool-result group.
     pub tool_images: Vec<crate::core::tool_media::ToolImage>,
+    /// Storage-only per-occurrence visual notes. Request projection clears this metadata.
+    pub visual_context: Vec<crate::core::visual_context::VisualNote>,
+    /// Storage-only preferences aligned with attachment indices. Missing entries inherit config.
+    pub image_preferences: Vec<ImagePreference>,
     /// Anthropic prompt-cache breakpoint, set on a stable message just before the volatile turn so
     /// the provider caches the prefix up to here. Write-only: emitted by the custom `Serialize`,
     /// never read from the wire (a stale breakpoint from a saved transcript must not be replayed).
@@ -252,6 +267,18 @@ struct MessageWire {
     tool_call_id: Option<String>,
     #[serde(default)]
     tool_images: Vec<crate::core::tool_media::ToolImage>,
+    #[serde(default)]
+    visual_context: Vec<crate::core::visual_context::VisualNote>,
+    #[serde(default)]
+    image_preferences: Vec<ImagePreference>,
+    #[serde(default)]
+    visual_assets: Option<VisualAssets>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VisualAssets {
+    version: u8,
+    images: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -261,7 +288,7 @@ impl<'de> Deserialize<'de> for Message {
         // text in `content`, image data URLs in `images`. Keeping images OUT of `content` is load
         // bearing — the `chars/4` token HUD and auto-compact measure `content` only, so folding a
         // multi-MB base64 URL into it would blow up both (see the struct doc above).
-        let (content, images) = match wire.content {
+        let (content, mut images) = match wire.content {
             None => (None, Vec::new()),
             Some(ContentField::Text(s)) => (Some(s), Vec::new()),
             Some(ContentField::Parts(parts)) => {
@@ -284,13 +311,24 @@ impl<'de> Deserialize<'de> for Message {
                 (Some(text), images)
             }
         };
+        if wire.role != "user" {
+            if let Some(assets) = wire.visual_assets.filter(|assets| assets.version == 1) {
+                images = assets.images;
+            }
+        }
         Ok(Message {
             role: wire.role,
             content,
             tool_calls: wire.tool_calls,
             tool_call_id: wire.tool_call_id,
-            images,
             tool_images: wire.tool_images,
+            visual_context: wire.visual_context,
+            image_preferences: wire
+                .image_preferences
+                .into_iter()
+                .take(images.len())
+                .collect(),
+            images,
             cache_control: None,
         })
     }
@@ -304,14 +342,26 @@ impl Serialize for Message {
         let mut map = ser.serialize_map(None)?;
         map.serialize_entry("role", &self.role)?;
         if self.role == "user" && !self.images.is_empty() {
-            let mut parts: Vec<serde_json::Value> = Vec::with_capacity(self.images.len() + 1);
-            if let Some(text) = &self.content {
-                if !text.is_empty() {
-                    parts.push(serde_json::json!({"type": "text", "text": text}));
-                }
+            #[derive(Serialize)]
+            #[serde(tag = "type")]
+            enum Part<'a> {
+                #[serde(rename = "text")]
+                Text { text: &'a str },
+                #[serde(rename = "image_url")]
+                Image { image_url: Url<'a> },
+            }
+            #[derive(Serialize)]
+            struct Url<'a> {
+                url: &'a str,
+            }
+            let mut parts = Vec::with_capacity(self.images.len() + 1);
+            if let Some(text) = self.content.as_deref().filter(|text| !text.is_empty()) {
+                parts.push(Part::Text { text });
             }
             for url in &self.images {
-                parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+                parts.push(Part::Image {
+                    image_url: Url { url },
+                });
             }
             map.serialize_entry("content", &parts)?;
         } else {
@@ -326,6 +376,26 @@ impl Serialize for Message {
         }
         if !self.tool_images.is_empty() {
             map.serialize_entry("tool_images", &self.tool_images)?;
+        }
+        if !self.image_preferences.is_empty() {
+            map.serialize_entry("image_preferences", &self.image_preferences)?;
+        }
+        if !self.visual_context.is_empty() {
+            map.serialize_entry("visual_context", &self.visual_context)?;
+            if self.role != "user" && !self.images.is_empty() {
+                #[derive(Serialize)]
+                struct Assets<'a> {
+                    version: u8,
+                    images: &'a [String],
+                }
+                map.serialize_entry(
+                    "visual_assets",
+                    &Assets {
+                        version: 1,
+                        images: &self.images,
+                    },
+                )?;
+            }
         }
         // Prompt-cache breakpoint (omitted entirely when None → byte-identical for non-cache providers).
         if let Some(cc) = &self.cache_control {
@@ -344,6 +414,8 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }
@@ -355,6 +427,8 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }
@@ -367,6 +441,8 @@ impl Message {
             tool_call_id: None,
             images,
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }
@@ -379,6 +455,8 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }
@@ -394,6 +472,8 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }
@@ -417,6 +497,8 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }

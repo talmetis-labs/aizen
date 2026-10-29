@@ -765,6 +765,9 @@ pub(crate) fn evidence_omission_diagnostic(
         .filter(|id| {
             !selected.iter().any(|image| {
                 image.metadata().provenance.evidence_id.as_deref() == Some(id.as_str())
+                    || (id.as_str() == crate::agent::LATEST_CAPTURE_SELECTOR
+                        && image.metadata().provenance.source == "browser_screenshot"
+                        && image.metadata().provenance.crop.is_none())
             })
         })
         .count();
@@ -868,25 +871,27 @@ fn seat_child_references_for_route(
         &child.resource_scope(),
         route,
     )?;
-    let descriptors = selected.descriptors()?;
-    if let Some(design) = child.design() {
-        let mode = parent
-            .design()
-            .and_then(|design| design.snapshot().brief)
-            .and_then(|brief| brief.fidelity_mode)
-            .unwrap_or(crate::agent::design::FidelityMode::Exact);
-        design.activate_selected_references(
-            descriptors
+    if let Some(state) = parent
+        .design()
+        .map(|design| design.snapshot())
+        .filter(|state| state.active && !state.archived)
+    {
+        if let (Some(design), Some(requirements)) = (child.design(), state.comparison_request) {
+            let references: Vec<_> = selected
+                .descriptors()?
                 .into_iter()
+                .filter(|descriptor| {
+                    state
+                        .references
+                        .iter()
+                        .any(|reference| reference.reference_id == descriptor.reference_id)
+                })
                 .map(|descriptor| (descriptor.reference_id, descriptor.original.sha256))
-                .collect(),
-            mode,
-        )?;
-        if let Some(requirements) = parent
-            .design()
-            .and_then(|design| design.snapshot().comparison_request)
-        {
-            design.set_comparison_requirements(requirements)?;
+                .collect();
+            if !references.is_empty() {
+                design.activate_selected_references(references, requirements.mode)?;
+                design.set_comparison_requirements(requirements)?;
+            }
         }
     }
     Ok(child.with_references(selected))
@@ -1028,7 +1033,7 @@ impl TaskTool {
                     let registry = crate::agent::builtin::agent_registry(def, &self.root);
                     let system = build_agent_subagent_prompt(
                         def,
-                        &registry.names(),
+                        &registry.advertised_names(),
                         &self.root,
                         &ep.model,
                         &date,
@@ -1083,7 +1088,7 @@ impl TaskTool {
             let registry = crate::agent::builtin::role_registry(&role, &self.root);
             let system = build_subagent_prompt(
                 &role,
-                &registry.names(),
+                &registry.advertised_names(),
                 &self.root,
                 &ep.model,
                 &date,
@@ -1202,8 +1207,8 @@ impl Tool for TaskTool {
                 "read_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"Exact native reads; read-only without write_paths. Union <=32; no dirs/globs."},
                 "write_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"Exact native read/write files; read_paths union; parent verifies. No dirs/globs."},
                 "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Native exact scopes: private same-base edits, parent merges/verifies; default direct."},
-                "reference_ids": {"type":"array", "maxItems":4, "uniqueItems":true, "items":{"type":"string","maxLength":128}, "description":"Current-conversation user refs; live controller purpose/destination/account grant. No parent history/sibling evidence."},
-                "return_evidence": {"type": "array", "items": {"type": "string", "maxLength": 128}, "maxItems": 4, "description": "child-capture IDs (default none); final completed attempt only, no user/refs or unapproved provider boundaries"},
+                "reference_ids": {"type":"array", "maxItems":4, "uniqueItems":true, "items":{"type":"string","maxLength":128}, "description":"Current-chat refs; live purpose/destination/account grant. No parent history/sibling evidence."},
+                "return_evidence": {"type": "array", "items": {"type": "string", "maxLength": 128}, "maxItems": 4, "description": "child captures or @latest_capture (one latest successful screenshot); final completed attempt only, no refs/unapproved providers"},
                 "expects": {"type": "object", "description": "final-answer JSON Schema; JSON only, validated json:ok|invalid"}
             },
             "required": ["prompt"],
@@ -1589,6 +1594,20 @@ impl TaskTool {
             )?)
         };
         let native_scoped = child_ctx.native_scope().is_some();
+        let context_window = if self.context_window == 0 {
+            0 // explicit guard-off fixtures/controllers remain guard-off
+        } else {
+            let endpoint = crate::core::cli_config::ResolvedEndpoint {
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+                model: model_for_repair.clone(),
+            };
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(crate::core::model_context::discover(&endpoint))
+            })
+            .tokens
+        };
         let mut cfg = AgentConfig {
             auto_checkpoint: !native_scoped,
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
@@ -1611,9 +1630,8 @@ impl TaskTool {
             // no outer continuation loop to reset this budget.
             max_iters: max_steps.div_ceil(2).max(1),
             auto_extend_to: max_steps,
-            // Inherit the parent's window so TOOL-RESULT CLEARING is ON for deep investigations
-            // (mid-loop compaction stays off by construction: one user turn can't be cut).
-            context_window: self.context_window,
+            // Clearing uses the actual child route, not the possibly much larger parent model.
+            context_window,
             // Recitation reads the PROCESS-GLOBAL `todo::snapshot()` — the top-level user's list,
             // not this sub-agent's own `ScopedTodo` (W17, a private per-instance list the loop has
             // no handle to). Leaving this on would recite the PARENT's plan into a sub-agent's
@@ -3064,7 +3082,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_references_activate_child_contract_without_parent_history_or_consent_creation() {
+    fn selected_references_preserve_explicit_contract_without_inventing_inspection_acceptance() {
         use crate::core::reference_media::{
             ReferenceDerivatives, ReferenceGrantScope, ReferenceRegistry, ReferenceRoute,
         };
@@ -3113,10 +3131,21 @@ mod tests {
                 ReferenceDerivatives::ALL,
             )
             .unwrap();
-        let parent = parent.with_references(access.clone());
+        let inspection_design = crate::agent::design::DesignContext::new(
+            "reference-owner",
+            root.display().to_string(),
+            crate::agent::design::DesignMode::Auto,
+        );
+        inspection_design.begin_turn("ordinary-inspection", root.display().to_string());
+        let parent = parent
+            .with_design(inspection_design)
+            .with_references(access.clone());
         let provider_calls = std::cell::Cell::new(0usize);
         for (policy, expected) in [
-            (crate::llm::media::VisionPolicy::Unknown, "unknown"),
+            (
+                crate::llm::media::VisionPolicy::Unknown,
+                "no resolved vision policy",
+            ),
             (
                 crate::llm::media::VisionPolicy::Unsupported,
                 "configured without vision",
@@ -3168,7 +3197,7 @@ mod tests {
             child_execution_context(&parent, "child", root, "child"),
             &ids,
             &route,
-            crate::llm::media::VisionPolicy::Supported,
+            crate::llm::media::VisionPolicy::from(None),
         )
         .unwrap();
         let user = child_reference_message(&child, "child brief").unwrap();
@@ -3177,9 +3206,38 @@ mod tests {
         assert_eq!(user.tool_images.len(), 1);
         assert!(!user.tool_images[0].is_available());
         let design = child.design().unwrap().snapshot();
-        assert!(design.active);
-        assert_eq!(design.references[0].reference_id, ids[0]);
+        assert!(!design.active);
+        assert!(design.references.is_empty() && design.comparison_request.is_none());
         assert!(design.evidence.is_empty() && design.reference_observations.is_empty());
+        let explicit_design = crate::agent::design::DesignContext::new(
+            "reference-owner",
+            root.display().to_string(),
+            crate::agent::design::DesignMode::Auto,
+        );
+        explicit_design.begin_turn("explicit-parent", root.display().to_string());
+        explicit_design
+            .activate_selected_references(
+                vec![(ids[0].clone(), descriptors[0].original.sha256.clone())],
+                crate::agent::design::FidelityMode::Exact,
+            )
+            .unwrap();
+        let explicit_parent = parent.with_design(explicit_design);
+        let explicit_child = seat_child_references_for_route(
+            &explicit_parent,
+            child_execution_context(&explicit_parent, "explicit-child", root, "comparison"),
+            &ids,
+            &route,
+            crate::llm::media::VisionPolicy::Supported,
+        )
+        .unwrap();
+        let explicit = explicit_child.design().unwrap().snapshot();
+        assert!(explicit.active);
+        assert_eq!(explicit.references[0].reference_id, ids[0]);
+        assert_eq!(
+            explicit.comparison_request.unwrap().mode,
+            crate::agent::design::FidelityMode::Exact
+        );
+        assert!(explicit.evidence.is_empty() && explicit.reference_observations.is_empty());
         let sibling = child_execution_context(&parent, "sibling", root, "sibling");
         assert!(sibling.references().is_none());
         let different_account = ReferenceRoute {

@@ -579,13 +579,9 @@ fn refreshing_prompt_lanes_keeps_the_conversation() {
     );
 }
 
-/// A conversation containing a pasted image must survive save → load.
-///
-/// This is the session-level half of the `Message` round-trip bug: the writer emitted `content`
-/// as a multimodal parts array, `parse_session_bytes` could not read it back, and the file was
-/// reported as "(unreadable)" for the rest of its life with the serde error discarded. Two real
-/// transcripts were lost this way before it was noticed, so the reason string is asserted too —
-/// a silent `None` is what let this hide.
+/// A conversation containing a pasted image must stay readable after save → load, without
+/// retaining input pixels. The live multimodal serializer must still round-trip parts arrays:
+/// that used to make image-bearing transcripts unreadable before the session privacy projection.
 #[test]
 fn a_session_with_images_survives_save_and_load() {
     let _g = crate::core::config::TEST_HOME_LOCK
@@ -605,18 +601,32 @@ fn a_session_with_images_survives_save_and_load() {
         ),
         Message::assistant("it says hello"),
     ];
+    let live: Vec<Message> =
+        serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+    assert_eq!(live[1].content, history[1].content);
+    assert_eq!(live[1].images, history[1].images);
     save_session(&history, "with-image", Some("m")).unwrap();
 
     let bytes = std::fs::read(sessions_dir().join("with-image.json")).unwrap();
     let (msgs, _) =
         parse_session_reason(&bytes).expect("a transcript we wrote ourselves must be readable");
     assert_eq!(msgs.len(), 3);
-    assert_eq!(msgs[1].content.as_deref(), Some("read this screenshot"));
-    assert_eq!(
-        msgs[1].images,
-        vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
-        "image attachments must come back out of the parts array"
+    let restored_text = msgs[1].content.as_deref().unwrap();
+    assert!(restored_text.starts_with("read this screenshot\n"));
+    assert!(restored_text.contains("input-image-not-saved:"));
+    assert!(restored_text.contains("attach the original image again"));
+    assert!(
+        msgs[1].images.is_empty(),
+        "input pixels must not be restored"
     );
+    assert!(msgs[1].image_preferences.is_empty());
+    assert_eq!(msgs[2].content, history[2].content);
+    assert_eq!(
+        history[1].images, live[1].images,
+        "save must not mutate live pixels"
+    );
+    let stored_text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!stored_text.contains("base64") && !stored_text.contains("blob:"));
 
     // The picker must count it as a real conversation, not report it unreadable.
     let (count, _) = read_session_row(&sessions_dir().join("with-image.json"));
@@ -1324,26 +1334,23 @@ fn classify_health_probe_rules() {
 }
 
 #[test]
-fn effort_turn_line_names_the_tier_or_default() {
-    // The per-turn status line must contain the tier name (or "default" when the field is
-    // omitted), regardless of colour stripping under the test harness.
-    assert!(effort_turn_line(Some("high"), None).contains("high"));
-    assert!(effort_turn_line(Some("low"), None).contains("low"));
+fn effort_chip_names_auto_or_default() {
+    // The model-segment chip says "auto" for every resolved rung (tinted by rung; colours are
+    // stripped under the test harness, so we assert the text), "default" when the field is
+    // omitted, and nothing when the caller armed "omit this field".
+    for tier in ["low", "medium", "high", "xhigh", "max"] {
+        assert!(
+            effort_chip_styled(Some(tier)).contains("auto"),
+            "{tier} rung ⇒ ·auto chip"
+        );
+    }
     assert!(
-        effort_turn_line(Some("xhigh"), None).contains("xhigh"),
-        "xhigh rung named"
-    );
-    assert!(
-        effort_turn_line(Some("max"), None).contains("max"),
-        "max rung named"
-    );
-    assert!(
-        effort_turn_line(None, None).contains("default"),
+        effort_chip_styled(None).contains("default"),
         "None ⇒ default"
     );
     assert!(
-        effort_turn_line(Some("high"), None).contains("effort:"),
-        "always prefixed"
+        effort_chip_styled(Some("")).is_empty(),
+        "armed-but-omitted ⇒ bare model name, no chip"
     );
 }
 

@@ -203,6 +203,8 @@ struct Inner {
     references: Option<crate::core::reference_media::ReferenceAccess>,
     /// Current completed tool image groups for this one resource scope; never a session/global index.
     tool_images: Arc<std::sync::Mutex<Vec<crate::core::tool_media::ToolImage>>>,
+    visual: Arc<std::sync::Mutex<crate::core::visual_context::VisualContext>>,
+    media: Arc<crate::core::media_budget::MediaBudget>,
     /// Keep the owned fixture directory alive until this context's lock leases have dropped.
     #[cfg(test)]
     test_lock_namespace: Option<crate::core::workspace_txn::TestLockNamespace>,
@@ -240,6 +242,8 @@ impl Default for Inner {
             deadline: None,
             references: None,
             tool_images: Arc::new(std::sync::Mutex::new(Vec::new())),
+            visual: Arc::new(std::sync::Mutex::new(Default::default())),
+            media: Arc::new(Default::default()),
             #[cfg(test)]
             test_lock_namespace: crate::core::workspace_txn::explicit_test_lock_namespace(),
         }
@@ -297,7 +301,7 @@ impl ExecutionContext {
             native_body_probe: self.0.native_body_probe.clone(),
             #[cfg(test)]
             speculative_driver_join_probe: self.0.speculative_driver_join_probe.clone(),
-            attempt_carrier: self.0.attempt_carrier.as_ref().map(Clone::clone),
+            attempt_carrier: self.0.attempt_carrier.clone(),
             attempt_slot: self.0.attempt_slot.clone(),
             tool_workers: self.0.tool_workers.clone(),
             writer_leases: self.0.writer_leases.clone(),
@@ -305,6 +309,8 @@ impl ExecutionContext {
             deadline: self.0.deadline,
             references: self.0.references.clone(),
             tool_images: self.0.tool_images.clone(),
+            visual: self.0.visual.clone(),
+            media: self.0.media.clone(),
             #[cfg(test)]
             test_lock_namespace: self.0.test_lock_namespace.clone(),
         };
@@ -379,6 +385,7 @@ impl ExecutionContext {
         self.with(|i| {
             if i.resource_scope.as_deref() != Some(scope.as_str()) {
                 i.tool_images = Arc::new(std::sync::Mutex::new(Vec::new()));
+                i.visual = Arc::new(std::sync::Mutex::new(Default::default()));
             }
             i.resource_scope = Some(scope);
         })
@@ -456,20 +463,136 @@ impl ExecutionContext {
         }
     }
 
-    /// Replace the local image snapshot from exact completed groups in this run's current messages.
-    /// Payload retention applies first; stale/partial groups and references never become outputs.
+    pub(crate) fn media(&self) -> Arc<crate::core::media_budget::MediaBudget> {
+        self.0.media.clone()
+    }
+
+    pub(crate) fn visual(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::core::visual_context::VisualContext> {
+        self.0.visual.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn visual_requirements(&self) -> crate::core::visual_context::VisualRequirements {
+        let mut required = crate::core::visual_context::VisualRequirements::default();
+        if let Some(design) = self.design() {
+            let state = design.snapshot();
+            if state.active && !state.archived {
+                if state.comparison_request.is_some() {
+                    required.references = state
+                        .references
+                        .iter()
+                        .filter(|reference| reference.original_sha256.is_some())
+                        .map(|reference| reference.reference_id.clone())
+                        .collect();
+                }
+                let scope = design.evidence_scope();
+                required.captures = state
+                    .evidence
+                    .iter()
+                    .filter(|evidence| {
+                        evidence.owner_id == state.owner_id
+                            && evidence.task_id == state.task_id
+                            && evidence.render_revision == state.render_revision
+                            && evidence.source_hash.is_some()
+                            && evidence.source_hash == state.source_hash
+                            && state.target.as_deref() == Some(evidence.target.as_str())
+                            && evidence.ready
+                            && !matches!(
+                                evidence.status,
+                                crate::agent::design::EvidenceStatus::Stale
+                                    | crate::agent::design::EvidenceStatus::Unavailable
+                                    | crate::agent::design::EvidenceStatus::SkippedByUser
+                            )
+                    })
+                    .filter_map(|evidence| {
+                        evidence.capture_identity.as_ref().map(|identity| {
+                            (
+                                evidence.id.clone(),
+                                identity.output_sha256.clone(),
+                                scope.clone(),
+                            )
+                        })
+                    })
+                    .collect();
+            }
+        }
+        required
+    }
+
+    pub(crate) fn visual_pins(
+        &self,
+        messages: &[crate::core::types::Message],
+    ) -> std::collections::BTreeSet<(usize, bool, usize)> {
+        let required = self.visual_requirements();
+        self.visual().pinned_occurrences(messages, &required)
+    }
+
+    pub(crate) fn refresh_visual(
+        &self,
+        messages: &mut [crate::core::types::Message],
+    ) -> anyhow::Result<()> {
+        let refs = self.references();
+        let required = self.visual_requirements();
+        let retained = self
+            .0
+            .tool_images
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut visual = self.visual();
+        visual.refresh_required(messages, refs.as_ref(), &retained, &required)?;
+        visual.sync(messages);
+        Ok(())
+    }
+
+    /// Replace the local snapshot from completed groups, retaining compacted originals only when
+    /// the same live scope already owned their reread handles. Saved boundaries grant no access.
     pub(crate) fn refresh_tool_images(&self, messages: &[crate::core::types::Message]) {
         let mut images = Vec::new();
         let mut bytes = 0usize;
         if let Some(design) = self.design() {
             let scope = design.evidence_scope();
-            for occurrence in crate::llm::media::completed_tool_image_occurrences(messages)
-                .into_iter()
-                .rev()
-            {
+            let pins = self.visual_pins(messages);
+            let live = self
+                .0
+                .tool_images
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let mut occurrences: Vec<_> =
+                crate::llm::media::completed_tool_image_occurrences(messages)
+                    .into_iter()
+                    .map(|image| (image.message_index, image.image_index))
+                    .collect();
+            for (mi, message) in messages.iter().enumerate() {
+                if message.role != "system"
+                    || !message.content.as_deref().is_some_and(|content| {
+                        content.starts_with(crate::agent::compact::COMPACT_MARKER_PREFIX)
+                    })
+                {
+                    continue;
+                }
+                for (ii, image) in message.tool_images.iter().enumerate() {
+                    if message
+                        .visual_context
+                        .iter()
+                        .any(|state| state.matches_tool(ii, image) && state.releases_pixels())
+                        && live
+                            .iter()
+                            .any(|candidate| candidate.metadata() == image.metadata())
+                    {
+                        occurrences.push((mi, ii));
+                    }
+                }
+            }
+            occurrences.sort_unstable();
+            occurrences.reverse();
+            occurrences.sort_by_key(|&(mi, ii)| !pins.contains(&(mi, true, ii)));
+            for (mi, ii) in occurrences {
                 let Some(image) = messages
-                    .get(occurrence.message_index)
-                    .and_then(|message| message.tool_images.get(occurrence.image_index))
+                    .get(mi)
+                    .and_then(|message| message.tool_images.get(ii))
                 else {
                     continue;
                 };
@@ -1037,6 +1160,208 @@ mod tests {
         output.tool_call_id = Some("unmatched".into());
         ctx.refresh_tool_images(&[assistant, output]);
         assert!(ctx.scoped_tool_image("output").is_none());
+    }
+
+    #[test]
+    fn live_compacted_capture_reread_survives_without_restoring_saved_authority() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        use crate::core::types::Message;
+        let design = crate::agent::design::DesignContext::new(
+            "owner",
+            "fixture",
+            crate::agent::design::DesignMode::Auto,
+        );
+        design.begin_turn("task", "fixture");
+        let mut provenance = ImageProvenance::new("image_read", None);
+        provenance.design_scope = Some(design.evidence_scope());
+        provenance.evidence_id = Some("compact-output".into());
+        provenance.approved_destination = Some("a".repeat(64));
+        let image = ToolImage::from_bytes(
+            &encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap(),
+            "image/png",
+            provenance,
+        )
+        .unwrap();
+        let ctx = ExecutionContext::new(ConversationId::new("owner")).with_design(design.clone());
+        let mut messages = vec![Message::system("SYS")];
+        messages.extend(crate::llm::media::tests::observed_group(image));
+        ctx.refresh_tool_images(&messages);
+        ctx.refresh_visual(&mut messages).unwrap();
+        let id = messages[2].visual_context[0].id.clone();
+        let (_, receipt) = crate::llm::media::project_messages_for_send(
+            &messages,
+            crate::llm::media::VisionPolicy::Supported,
+            Some(&"a".repeat(64)),
+            crate::llm::image_send::ImageSendPolicy::Original,
+        );
+        ctx.visual().record_delivery(&receipt);
+        ctx.visual()
+            .mutate(&id, "release", Some("Original retained"), None, true)
+            .unwrap();
+        ctx.refresh_visual(&mut messages).unwrap();
+        let cut = messages.len();
+        crate::agent::compact::splice_compacted(&mut messages, cut, "summary").unwrap();
+        assert!(crate::llm::media::completed_tool_image_occurrences(&messages).is_empty());
+        for _ in 0..2 {
+            ctx.refresh_tool_images(&messages);
+            ctx.refresh_visual(&mut messages).unwrap();
+            assert!(ctx.scoped_tool_image("compact-output").is_some());
+            assert_eq!(ctx.visual().list()[0]["evidence_id"], "compact-output");
+        }
+        let restored_messages: Vec<Message> =
+            serde_json::from_str(&serde_json::to_string(&messages).unwrap()).unwrap();
+        let fresh = ExecutionContext::new(ConversationId::new("owner")).with_design(design.clone());
+        fresh.refresh_tool_images(&restored_messages);
+        assert!(fresh.scoped_tool_image("compact-output").is_none());
+        let sibling = ctx
+            .with_resource_scope("sibling")
+            .with_design(design.fork_child("sibling", "fixture"));
+        sibling.refresh_tool_images(&messages);
+        assert!(sibling.scoped_tool_image("compact-output").is_none());
+        design.begin_turn("new-task", "fixture");
+        ctx.refresh_tool_images(&messages);
+        assert!(ctx.scoped_tool_image("compact-output").is_none());
+    }
+
+    #[test]
+    fn newer_completed_captures_win_quota_over_unpinned_compacted_originals() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        use crate::core::types::Message;
+        let design = crate::agent::design::DesignContext::new(
+            "owner",
+            "fixture",
+            crate::agent::design::DesignMode::Auto,
+        );
+        design.begin_turn("task", "fixture");
+        let mut provenance = ImageProvenance::new("image_read", None);
+        provenance.design_scope = Some(design.evidence_scope());
+        provenance.evidence_id = Some("older-compacted".into());
+        provenance.approved_destination = Some("a".repeat(64));
+        let original = ToolImage::from_bytes(
+            &encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap(),
+            "image/png",
+            provenance,
+        )
+        .unwrap();
+        let ctx = ExecutionContext::new(ConversationId::new("owner")).with_design(design);
+        let mut messages = vec![Message::system("SYS")];
+        messages.extend(crate::llm::media::tests::observed_group(original.clone()));
+        ctx.refresh_tool_images(&messages);
+        ctx.refresh_visual(&mut messages).unwrap();
+        let id = messages[2].visual_context[0].id.clone();
+        let (_, receipt) = crate::llm::media::project_messages_for_send(
+            &messages,
+            crate::llm::media::VisionPolicy::Supported,
+            Some(&"a".repeat(64)),
+            crate::llm::image_send::ImageSendPolicy::Original,
+        );
+        ctx.visual().record_delivery(&receipt);
+        ctx.visual()
+            .mutate(&id, "release", Some("Original retained"), None, true)
+            .unwrap();
+        ctx.refresh_visual(&mut messages).unwrap();
+        let cut = messages.len();
+        crate::agent::compact::splice_compacted(&mut messages, cut, "summary").unwrap();
+        for index in 0..crate::agent::observe::MAX_TOOL_IMAGES {
+            let mut provenance = original.metadata().provenance.clone();
+            provenance.evidence_id = Some(format!("newer-{index}"));
+            let capture =
+                ToolImage::from_bytes(&original.bytes().unwrap(), "image/png", provenance).unwrap();
+            messages.extend(crate::llm::media::tests::observed_group(capture));
+        }
+        ctx.refresh_tool_images(&messages);
+        assert!(ctx.scoped_tool_image("older-compacted").is_none());
+        for index in 0..crate::agent::observe::MAX_TOOL_IMAGES {
+            assert!(ctx.scoped_tool_image(&format!("newer-{index}")).is_some());
+        }
+        assert!(messages.iter().any(|message| message
+            .tool_images
+            .iter()
+            .any(|image| image.metadata() == original.metadata() && image.is_available())));
+    }
+
+    #[test]
+    fn current_capture_pin_survives_retention_and_expires_with_render_revision() {
+        use crate::agent::design::{
+            CaptureIdentity, DesignBrief, DesignContext, DesignIntent, DesignMode, Viewport,
+        };
+        let design = DesignContext::new("owner", "fixture", DesignMode::Auto);
+        design.begin_turn("task", "fixture");
+        design
+            .apply_brief(
+                DesignBrief {
+                    intent: DesignIntent::Create,
+                    brief: "Inspect the current generated fixture".into(),
+                    acceptance: "Capture current pixels before review".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        design.set_target("owned-fixture").unwrap();
+        design.set_source_revision("fixture-source").unwrap();
+        let mut provenance =
+            crate::core::tool_media::ImageProvenance::new("browser_screenshot", None);
+        provenance.evidence_id = Some("required-capture".into());
+        provenance.design_scope = Some(design.evidence_scope());
+        let image = crate::core::tool_media::ToolImage::from_bytes(
+            &crate::core::tool_media::encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap(),
+            "image/png",
+            provenance,
+        )
+        .unwrap();
+        design
+            .record_capture(
+                "required-capture",
+                Some("fixture-source"),
+                "owned-fixture",
+                Viewport {
+                    width: 1,
+                    height: 1,
+                },
+                design.current_revision(),
+                true,
+                "Owned fixture",
+            )
+            .unwrap();
+        design
+            .record_capture_identity(
+                "required-capture",
+                CaptureIdentity {
+                    output_sha256: image.metadata().sha256.clone(),
+                    dpr_milli: 1000,
+                    font_identity: "fixture-font".into(),
+                    frame_state: "fixture-frame".into(),
+                },
+            )
+            .unwrap();
+        let ctx = ExecutionContext::new(ConversationId::new("owner")).with_design(design.clone());
+        let mut messages = crate::llm::media::tests::observed_group(image.clone());
+        for i in 0..crate::agent::observe::MAX_TOOL_IMAGES + 2 {
+            let mut provenance = image.metadata().provenance.clone();
+            provenance.evidence_id = Some(format!("optional-{i}"));
+            let optional = crate::core::tool_media::ToolImage::from_bytes(
+                &image.bytes().unwrap(),
+                "image/png",
+                provenance,
+            )
+            .unwrap();
+            messages.extend(crate::llm::media::tests::observed_group(optional));
+        }
+        let pins = ctx.visual_pins(&messages);
+        assert_eq!(pins, std::collections::BTreeSet::from([(1, true, 0)]));
+        crate::agent::observe::retain_tool_images_with_pins(&mut messages, &pins).unwrap();
+        ctx.refresh_tool_images(&messages);
+        ctx.refresh_visual(&mut messages).unwrap();
+        assert!(ctx.scoped_tool_image("required-capture").is_some());
+        assert!(messages[1].visual_context[0].runtime_pinned);
+        design.mark_render_changed();
+        assert!(
+            ctx.visual_pins(&messages).is_empty(),
+            "stale revision cannot keep a controller pin"
+        );
+        ctx.refresh_visual(&mut messages).unwrap();
+        assert!(!messages[1].visual_context[0].runtime_pinned);
     }
 
     #[test]

@@ -1,9 +1,7 @@
 //! What is in the context window, what it cost, and how full it is.
 //!
-//! Read-only reporting for `/tokens`, `/context` and `/cost`. The window size is a heuristic keyed
-//! off the model name and is deliberately NOT a cap: the provider enforces the real limit, and this
-//! only decides how honest the HUD looks. Guessing low would nag the user into compacting a
-//! conversation that fits; guessing high would let the fill bar read green right up to a 400.
+//! Reporting for `/tokens`, `/context` and `/cost`. Route-scoped core resolution is shared with
+//! compaction and loop guards; unknown provider limits remain explicitly estimated.
 
 use crate::agent;
 use crate::core::cli_config;
@@ -11,26 +9,9 @@ use crate::core::types::{Message, Usage};
 use crate::ui::{theme, tui};
 use crate::*;
 
-/// Approximate context window (tokens) for a model, by name pattern. A rough heuristic for the
-/// `% context` HUD only — not a hard cap (the upstream enforces the real limit). Defaults to 128K.
+/// Last-resort estimate, also used by deterministic offline benchmarks.
 pub(crate) fn ctx_window_for(model: &str) -> usize {
-    let m = model.to_ascii_lowercase();
-    if m.contains("1m") || m.contains("gemini") {
-        // Explicit 1M-context variants take precedence over the family heuristics.
-        1_000_000
-    } else if m.contains("claude")
-        || m.contains("opus")
-        || m.contains("sonnet")
-        || m.contains("haiku")
-    {
-        200_000
-    } else if m.contains("gpt-4.1") || m.contains("o3") || m.contains("o4") {
-        1_000_000
-    } else if m.contains("deepseek") {
-        64_000
-    } else {
-        128_000 // gpt-4o family + safe default
-    }
+    crate::core::model_context::estimate(model)
 }
 
 /// A 10-cell context-fill bar, coloured by pressure using the semantic palette (P-ctx4): OK below
@@ -62,14 +43,34 @@ pub(crate) fn effective_ctx_window(model: &str, configured: Option<usize>) -> (u
     }
 }
 
-/// The effective context window for `model`: a provider-reported/manually-set value in config (when
-/// it matches the active model) wins over the name heuristic. Returns `(tokens, was_configured)`.
-pub(crate) fn resolve_ctx_window(model: &str) -> (usize, bool) {
+/// Resolve a display-only model label against the current session route. Execution boundaries pass
+/// their complete endpoint directly to core instead of resolving credentials from a model label.
+fn context_window(model: &str) -> crate::core::model_context::ContextWindow {
     let cfg = cli_config::load();
-    let configured = cfg
-        .model_context_window
-        .filter(|_| cfg.model.as_deref() == Some(model));
-    effective_ctx_window(model, configured)
+    let (base_url, api_key) =
+        crate::core::endpoint::resolve_base_key(None, None).unwrap_or_else(|_| {
+            (
+                cfg.base_url.clone().unwrap_or_default(),
+                cfg.api_key.clone().unwrap_or_default(),
+            )
+        });
+    let endpoint = cli_config::endpoint_for_model(
+        model,
+        &cli_config::ResolvedEndpoint {
+            base_url,
+            api_key,
+            model: model.to_string(),
+        },
+    );
+    crate::core::model_context::resolve_in(&cfg, &endpoint)
+}
+
+pub(crate) fn resolve_ctx_window(model: &str) -> (usize, bool) {
+    let window = context_window(model);
+    (
+        window.tokens,
+        window.source != crate::core::model_context::Source::Estimate,
+    )
 }
 
 /// Rough session size in tokens — shared by the HUD + auto-compact. Delegates to the agent
@@ -316,7 +317,8 @@ pub(crate) fn print_compact_summary(before: usize, after: usize, tp: &agent::com
 /// role. Estimated (chars/4) — the same honest basis the HUD + auto-compact use; `/cost` shows the
 /// provider's REAL billed count when the endpoint reports usage.
 pub(crate) fn print_context(history: &[Message], model: &str) {
-    let (window, auto) = resolve_ctx_window(model);
+    let window_info = context_window(model);
+    let window = window_info.tokens;
     let total = session_tokens(history);
     let pct = (total as f64 / window as f64 * 100.0).min(100.0);
 
@@ -353,12 +355,12 @@ pub(crate) fn print_context(history: &[Message], model: &str) {
     }
 
     tui::emit_line(&format!(
-        "{}  {model} · window {}{}",
+        "{}  {model} · window {} ({})",
         style("📊 context breakdown")
             .color256(splash::ACCENT)
             .bold(),
         fmt_k(window),
-        if auto { "" } else { " (est)" },
+        window_info.source.label(),
     ));
     tui::emit_line(&line("system prompt", sys_tok, 0, false));
     for (label, c) in &sys_blocks {

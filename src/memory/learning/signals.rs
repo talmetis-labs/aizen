@@ -177,6 +177,8 @@ mod tests {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         }
     }

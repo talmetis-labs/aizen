@@ -309,6 +309,7 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     r.register(Box::new(crate::agent::design::DesignReviewTool));
     r.register(Box::new(crate::agent::design::ReferenceCompareTool));
     r.register(Box::new(crate::agent::design::ReferenceTraceTool));
+    r.register(Box::new(crate::agent::image_context::ImageContext));
     r.register(Box::new(crate::agent::image_read::ReferenceRead::new(
         root.to_path_buf(),
     )));
@@ -718,6 +719,7 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     r.register(Box::new(crate::agent::design::DesignReviewTool));
     r.register(Box::new(crate::agent::design::ReferenceCompareTool));
     r.register(Box::new(crate::agent::design::ReferenceTraceTool));
+    r.register(Box::new(crate::agent::image_context::ImageContext));
     r.register(Box::new(crate::agent::image_read::ReferenceRead::new(
         root.to_path_buf(),
     )));

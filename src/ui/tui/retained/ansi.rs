@@ -33,6 +33,32 @@ pub(super) fn clip_to(s: &str, max: usize) -> String {
     out
 }
 
+/// Clip an SGR-styled row without cutting an escape sequence or a grapheme. The footer keeps its
+/// effort tint until [`ansi_spans`] converts it into cell styles; plain [`clip_to`] cannot do that.
+pub(super) fn clip_keep_sgr(row: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let (glyphs, trailing) = crate::ui::links::sgr_glyphs(row);
+    let clipped = glyphs.iter().map(|glyph| glyph.width).sum::<usize>() > max;
+    let budget = max - usize::from(clipped);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for glyph in glyphs {
+        if used.saturating_add(glyph.width) > budget {
+            break;
+        }
+        out.push_str(&glyph.raw);
+        used += glyph.width;
+    }
+    if clipped {
+        out.push_str("…\x1b[0m");
+    } else {
+        out.push_str(&trailing);
+    }
+    out
+}
+
 /// Clip then right-pad a plain string to exactly `width` display columns (for a box header).
 pub(super) fn pad_to(s: &str, width: usize) -> String {
     let clipped = clip_to(s, width);

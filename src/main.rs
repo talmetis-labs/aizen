@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
     };
     match command {
         Commands::Chat(args) => run_chat(args).await,
+        Commands::Compact(args) => crate::cli::compact::run(args).await,
         Commands::Agent(args) => run_agent_cmd(args).await,
         Commands::Workflow(args) => run_workflow_cmd(args).await,
         Commands::Status { run_id } => crate::cli::run_cmds::run_run_status(&run_id),
@@ -406,7 +407,15 @@ async fn run_menu() -> Result<()> {
 /// optional persona / todo / agents chip. The raw token + turn counts are back on the row (the
 /// mockup shows them); the graphical context meter is still fed via `tui::set_ctx_permille` and the
 /// retained backend's footer tints the mode/persona chips as it draws the row.
+///
+/// The effort chip rides on the model segment via a side channel: `effort_ui` arms it per turn
+/// (see `apply_turn_effort_hud`) through `tui::status_chip_arm`, this takes it back out, splices
+/// the styled chip onto the model name, and re-arms so the NEXT rebuild carries it too. Keeping
+/// the chip out of the signature keeps the four call sites (activate / resume / post-slash /
+/// post-turn) untouched; a plain-REPL just never arms it.
 fn status_text(history: &[Message], model: &str) -> String {
+    // An armed chip owns the model segment — name plus effort tier.
+    let chip = tui::status_chip_take().unwrap_or_default();
     // The meter + token chip prefer the provider-reported size of this conversation's most recent
     // request (recorded by the turn's chat closure) over the chars/4 estimate — the estimate only
     // carries a fresh thread, or one whose provider never reports usage. The real number is
@@ -481,7 +490,14 @@ fn status_text(history: &[Message], model: &str) -> String {
         memory_facts: crate::memory::live_fact_count(),
         memory_recalled: crate::memory::stats::session_counters().0 as usize,
     });
-    format!("{model}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
+    // Re-arm for the next call, then compose: the chip owns the model segment's effort part — a
+    // routed model (models_by_effort) plus the tinted `·auto` (or the pinned tier at idle) land
+    // there, while the token/turn/persona lanes are always rebuilt from live state.
+    if !chip.is_empty() {
+        tui::status_chip_arm(chip.clone());
+    }
+    let model_chip = format!("{model}{chip}");
+    format!("{model_chip}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
@@ -685,6 +701,9 @@ async fn run_menu_sticky() -> Result<()> {
     // The retained backend is the only interactive surface. If it can't take the terminal (alt-screen
     // refused), there is no second renderer to degrade into — hand off to the plain line-REPL rather
     // than run this loop headless, which would queue keystrokes against a UI that never painted.
+    // Arm the idle chip first so the very first status row already shows the tier (`·auto` or the
+    // pinned effort) next to the model name.
+    refresh_effort_hud();
     if !tui::activate(&intro, &status_text(&history, &model_label)) {
         return run_menu_plain().await;
     }
@@ -758,6 +777,9 @@ async fn run_menu_sticky() -> Result<()> {
             }
         };
         tui::note_submission_dequeued();
+        // Only injected/clarify text needs path lifting here. Keyboard submissions already
+        // validated before clearing the draft; parsing cleaned prose twice can select new paths.
+        let prepared_images = matches!(&sub, tui::Submission::PreparedChat(..));
         match sub {
             tui::Submission::Quit => {
                 drain_learning_before_exit().await;
@@ -779,6 +801,9 @@ async fn run_menu_sticky() -> Result<()> {
                         let _ = input.resume.send(());
                         break;
                     }
+                    // A slider pick just re-armed the idle chip (`refresh_effort_hud` in
+                    // `apply_effort_choice`); `status_text` takes and re-arms it, so the row the
+                    // menu hands back to carries the new tier immediately.
                     tui::resume(&status_text(&history, &model_label));
                     let _ = input.resume.send(()); // unpark the keyboard thread
                                                    // A custom command expanded to a prompt → re-inject it as a chat submission so the
@@ -805,10 +830,18 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 }
             }
-            tui::Submission::Chat(line, images) => {
+            tui::Submission::Chat(line, images) | tui::Submission::PreparedChat(line, images) => {
                 let mut line = line.trim().to_string();
                 let mut images = images;
-                lift_image_attachments(&mut line, &mut images);
+                if !prepared_images {
+                    if let Err(error) = lift_image_attachments(&mut line, &mut images) {
+                        tui::emit_line(
+                            &theme::warn(&format!("image selection refused: {error:#}"))
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                }
                 if line.is_empty() && images.is_empty() {
                     continue;
                 }
@@ -921,11 +954,12 @@ async fn run_menu_sticky() -> Result<()> {
                 let mut resolved = ResolvedTurn::new(&ep, eff.clone(), eff.clone(), design.clone());
                 let routed =
                     (resolved.endpoint.model != model).then_some(resolved.endpoint.model.as_str());
-                tui::emit_line(&format!(
-                    "{} {}",
-                    effort_turn_line(eff.as_deref(), routed),
-                    theme::faint(&format!("· {}", shape.as_str()))
-                ));
+                // The effort state lives on the HUD's model segment now, not in a transcript
+                // line — push the composed chip (routed model + tinted `·auto`; the chip alone
+                // otherwise) straight into the status row, then rebuild the row right away so
+                // the chip is on screen before the first request leaves.
+                apply_turn_effort_hud(&eff, routed);
+                tui::set_status(&status_text(&history, &model_label));
                 if !images.is_empty() {
                     match crate::repl::turn::guided_vision_preflight(&resolved, true).await {
                         Ok(true) => {}
@@ -1341,17 +1375,15 @@ async fn run_menu_plain() -> Result<()> {
     loop {
         icons::set_tier(cli_config::load().icons.as_deref()); // refresh after a possible /config change
         print_status_line(&history, &model_label);
-        let (line, mut images) = match read_input_box(&input_history)? {
+        let (line, images) = match read_input_box(&input_history)? {
             Some(l) => l,
             None => {
                 drain_learning_before_exit().await;
                 break;
             }
         };
+        // The input box validates clipboard/path attachments before consuming the draft.
         let mut line = line.trim().to_string();
-        // Drag-drop / typed / pasted image-file paths on the line → vision attachments (the other
-        // half of Ctrl-O clipboard attach). Only real image files are pulled; prose is preserved.
-        lift_image_attachments(&mut line, &mut images);
         if line.is_empty() && images.is_empty() {
             continue;
         }
@@ -1461,11 +1493,10 @@ async fn run_menu_plain() -> Result<()> {
         design.begin_turn(format!("turn:{}", history.len()), design_workspace());
         let mut resolved = ResolvedTurn::new(&ep, eff.clone(), eff.clone(), design.clone());
         let routed = (resolved.endpoint.model != model).then_some(resolved.endpoint.model.as_str());
-        println!(
-            "{} {}",
-            effort_turn_line(eff.as_deref(), routed),
-            theme::faint(&format!("· {}", shape.as_str()))
-        );
+        // No status row to host the tier here — but the HUD channel is shared, so arming the chip
+        // keeps the effort visible when a retained surface is driving this REPL (and is a no-op
+        // where it is not).
+        apply_turn_effort_hud(&eff, routed);
         let turn_cancel = crate::core::cancel::TurnCancel::new();
         if !images.is_empty() {
             match crate::repl::turn::guided_vision_preflight(&resolved, true).await {

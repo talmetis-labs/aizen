@@ -31,6 +31,8 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     /// Stream a chat completion from an OpenAI-compatible endpoint.
     Chat(ChatArgs),
+    /// Compact an existing saved session without opening the interactive REPL.
+    Compact(crate::cli::compact::CompactArgs),
     /// Run the agentic loop: the model uses tools (memory + files + shell) to do a task.
     /// (For the library of specialist sub-agents you can DELEGATE to, see `agents`.)
     Agent(AgentArgs),
@@ -1226,7 +1228,7 @@ pub(crate) enum ConfigCmd {
         api_key: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        /// Context window in tokens for the `% context` HUD (overrides auto-detect/heuristic).
+        /// Context window override in tokens for guards, auto-compaction and the HUD (`0` = automatic).
         #[arg(long)]
         context_window: Option<usize>,
         /// Cap on the model's OUTPUT tokens per call — a runaway-completion guard, not a way to
@@ -1266,6 +1268,9 @@ pub(crate) enum ConfigCmd {
         /// Final-answer visuals: `auto` (when useful), `always` (substantial replies), or `off`.
         #[arg(long)]
         response_visuals: Option<String>,
+        /// Default image representation: auto | original | photo. Does not pin or authorize images.
+        #[arg(long, value_enum)]
+        image_mode: Option<crate::core::types::ImagePreference>,
         /// Silent background release check at REPL startup (cached 24h, one line at most).
         /// `AIZEN_NO_UPDATE_CHECK` disables it without touching the file.
         #[arg(long)]
@@ -1600,6 +1605,10 @@ pub(crate) struct AgentArgs {
     /// attach produce. A path that is not a readable image fails the run rather than being dropped.
     #[arg(long = "image", value_name = "PATH")]
     pub(crate) image: Vec<String>,
+    /// Per-image transport preferences in --image order. Repeat once per selection.
+    /// auto preserves unknown/text/UI pixels; photo allows lossy previews; original never transforms.
+    #[arg(long = "image-mode", value_enum)]
+    pub(crate) image_modes: Vec<crate::core::types::ImagePreference>,
     /// Authorize current --image attachments as exact references for this task and same-route
     /// delegates. Does not grant another provider/account or declare vision capability.
     #[arg(long, requires = "image")]
@@ -2027,6 +2036,52 @@ mod agent_reference_args_tests {
         let args = parse_agent(&["--image", "ref.png", "inspect the image"]).unwrap();
         assert!(!args.reference_images);
         assert_eq!(args.image, ["ref.png"]);
+    }
+
+    #[test]
+    fn per_image_modes_are_explicit_bounded_values_and_keep_selection_order() {
+        let args = parse_agent(&[
+            "--resume",
+            "saved",
+            "--image",
+            "new.png",
+            "--image",
+            "second.png",
+            "--image-mode",
+            "original",
+            "--image-mode",
+            "photo",
+            "inspect",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.image_modes,
+            [
+                crate::core::types::ImagePreference::Original,
+                crate::core::types::ImagePreference::Photo
+            ]
+        );
+        assert!(parse_agent(&["--image", "new.png", "--image-mode", "lossy", "inspect"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["aizen", "config", "set", "--image-mode", "auto"])
+                .unwrap()
+                .command,
+            Some(Commands::Config {
+                cmd: Some(ConfigCmd::Set {
+                    image_mode: Some(crate::core::types::ImagePreference::Auto),
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn saved_image_selection_is_not_a_cli_surface() {
+        assert!(parse_agent(&["--image-id", "visual-one", "inspect"]).is_err());
+        assert!(
+            parse_agent(&["--resume", "saved", "--image-id", "visual-one", "inspect"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["aizen", "images", "saved", "--json"]).is_err());
     }
 
     #[test]

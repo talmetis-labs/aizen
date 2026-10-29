@@ -735,7 +735,7 @@ impl ToolRegistry {
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools
             .iter()
-            .filter(|e| !e.deferred)
+            .filter(|e| !e.deferred && e.tool.name() != "image_context")
             .map(|e| ToolDef::function(e.tool.name(), e.tool.description(), e.tool.parameters()))
             .collect()
     }
@@ -755,7 +755,7 @@ impl ToolRegistry {
     pub fn advertised_names(&self) -> Vec<String> {
         self.tools
             .iter()
-            .filter(|e| !e.deferred)
+            .filter(|e| !e.deferred && e.tool.name() != "image_context")
             .map(|e| e.tool.name().to_string())
             .collect()
     }

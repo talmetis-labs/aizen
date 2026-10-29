@@ -770,11 +770,19 @@ fn handle_status_command_inline(name: &str, arg: &str) -> bool {
 pub enum Submission {
     /// A normal chat/agent message (text + pasted image data URLs).
     Chat(String, Vec<String>),
+    /// Enter validated the full editable selection; do not reinterpret its cleaned prose as paths.
+    PreparedChat(String, Vec<String>),
     /// A slash command line (without the leading `/`). The input thread parks itself after sending
     /// this so the REPL can hand stdin to a `dialoguer` menu, then unparks it via the resume channel.
     Slash(String),
     /// Esc/Ctrl-C/Ctrl-D while idle with an empty draft → leave the REPL.
     Quit,
+}
+
+fn steer_text_submission(text: &str, image_count: usize) -> bool {
+    image_count == 0
+        && !crate::ui::image_input::contains_image_path(text)
+        && crate::core::steer::push(text)
 }
 
 /// Shared input state behind the global lock: the draft buffer plus which overlay is open. The input
@@ -2500,6 +2508,23 @@ pub fn current_status() -> String {
         .clone()
 }
 
+/// The effort chip waiting to ride on the status row's model segment. `effort_ui` arms it per turn
+/// (and on a tier change) by pushing `<styled-chip>\n<rest>` through [`set_status`]; `status_text`
+/// in main.rs takes it back out and splices the styled chip onto the model name, so the row is the
+/// only place the tier is ever shown. Kept as a plain cell rather than a field of the shared status
+/// because the chip must survive the status string being rebuilt around it between turns.
+static STATUS_CHIP: Mutex<Option<String>> = Mutex::new(None);
+
+/// Arm the effort chip. Called by `effort_ui` with the styled chip (or the empty string to clear).
+pub fn status_chip_arm(chip: String) {
+    *STATUS_CHIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(chip);
+}
+
+/// Take the armed chip out of the cell, leaving it disarmed. `status_text` re-arms what it used.
+pub fn status_chip_take() -> Option<String> {
+    STATUS_CHIP.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// Update the status text (model · tokens · yolo) and repaint. (Does not touch the output slot —
 /// see [`set_working`].)
 pub fn set_status(status: &str) {
@@ -4064,8 +4089,11 @@ fn input_loop(
                         && (ke.modifiers.contains(KeyModifiers::ALT)
                             || ke.modifiers.contains(KeyModifiers::CONTROL))
                     {
-                        let line: String = render().lock().unwrap().draft.iter().collect();
-                        if crate::core::steer::push(&line) {
+                        let (line, images) = {
+                            let r = render().lock().unwrap();
+                            (r.draft.iter().collect::<String>(), r.images)
+                        };
+                        if steer_text_submission(&line, images) {
                             let mut r = render().lock().unwrap();
                             r.draft.clear();
                             r.cursor = 0;
@@ -4379,23 +4407,41 @@ fn input_loop(
                         continue;
                     }
                 }
-                let (line, images, pick) = {
+                let (line, images, pick, attached) = {
+                    let line: String = render().lock().unwrap().draft.iter().collect();
+                    let mut pending = pending_images().lock().unwrap();
+                    let (cleaned, from_line) =
+                        match crate::ui::image_input::prepare_image_attachments(&line, &pending) {
+                            Ok(selection) => selection,
+                            Err(error) => {
+                                drop(pending);
+                                note_line(
+                                    &theme::warn(format!(
+                                        "image selection refused: {error:#}; draft kept"
+                                    ))
+                                    .to_string(),
+                                );
+                                continue;
+                            }
+                        };
                     let mut r = render().lock().unwrap();
-                    let line: String = r.draft.iter().collect();
-                    let images = r.images;
-                    // If the live palette is open, Enter runs the HIGHLIGHTED command — this is what
-                    // resolves a partial `/se` (or an ↑/↓ pick) to the full command name.
+                    let line = if from_line.is_empty() { line } else { cleaned };
+                    let images = pending.len() + from_line.len();
+                    // Resolve attachments before routing: image messages cannot steer a text-only
+                    // mailbox, and failed intake must leave both the text and clipboard editable.
                     let matches = slash_matches(&r.draft);
                     let pick = if images > 0 || matches.is_empty() {
-                        None // an image attachment makes it a chat message, not a slash command
+                        None
                     } else {
                         Some(matches[r.palette_sel.min(matches.len() - 1)].name.clone())
                     };
+                    let mut attached = std::mem::take(&mut *pending);
+                    attached.extend(from_line);
                     r.draft.clear();
                     r.cursor = 0;
                     r.images = 0;
                     r.palette_sel = 0;
-                    (line, images, pick)
+                    (line, images, pick, attached)
                 };
                 hist_idx = None;
                 repaint();
@@ -4497,14 +4543,13 @@ fn input_loop(
                         // unchanged, so the message is delivered either way, never lost.
                         // Image attachments keep the queue: the mailbox carries text only, and a
                         // vision message belongs in its own turn.
-                        if crate::core::steer::push(trimmed.as_str()) {
+                        if steer_text_submission(trimmed.as_str(), images) {
                             continue;
                         }
-                        // Image data URLs aren't carried here (the box only tracks a count); the
-                        // REPL resolves attachments — we forward the text and the clipboard images
-                        // live in shared state drained by the caller.
-                        let imgs = take_pending_images();
-                        if sub_tx.send(Submission::Chat(line, imgs)).is_err() {
+                        if sub_tx
+                            .send(Submission::PreparedChat(line, attached))
+                            .is_err()
+                        {
                             return;
                         }
                         note_submission_enqueued();
@@ -4651,10 +4696,19 @@ fn input_loop(
             }
             Key::Char('\u{f}') => {
                 // Ctrl-O: grab a clipboard screenshot (Win+Shift+S) as a vision attachment.
-                if let Ok(Some(url)) = crate::ui::image_input::clipboard_image_data_url() {
-                    push_pending_image(url);
-                    render().lock().unwrap().images = pending_image_count();
-                    repaint();
+                match crate::ui::image_input::clipboard_image_data_url().and_then(|url| {
+                    if let Some(url) = url {
+                        push_pending_image(url)?;
+                    }
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        render().lock().unwrap().images = pending_image_count();
+                        repaint();
+                    }
+                    Err(error) => note_line(
+                        &theme::warn(format!("image attachment refused: {error:#}")).to_string(),
+                    ),
                 }
             }
             Key::Char('\u{18}') => {
@@ -4874,8 +4928,8 @@ fn pending_images() -> &'static Mutex<Vec<String>> {
     static P: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(Vec::new()))
 }
-fn push_pending_image(url: String) {
-    pending_images().lock().unwrap().push(url);
+fn push_pending_image(url: String) -> anyhow::Result<()> {
+    crate::ui::image_input::append_clipboard_image(&mut pending_images().lock().unwrap(), url)
 }
 fn pop_pending_image() -> bool {
     pending_images().lock().unwrap().pop().is_some()
@@ -4885,9 +4939,6 @@ fn pending_image_count() -> usize {
 }
 fn clear_pending_images() {
     pending_images().lock().unwrap().clear();
-}
-fn take_pending_images() -> Vec<String> {
-    std::mem::take(&mut *pending_images().lock().unwrap())
 }
 
 /// Whether the `/model` overlay is open (input thread routes ↑↓/Enter/Esc to it).
@@ -5823,7 +5874,7 @@ pub(crate) mod tests {
         let _lock = crate::core::steer::test_lock();
         crate::core::steer::arm(); // stands in for the turn the input thread would steer
         assert!(
-            crate::core::steer::push("wait, also update the README"),
+            steer_text_submission("wait, also update the README", 0),
             "an armed mailbox accepts the mid-turn message — this is what the Verdict::Chat path tries FIRST"
         );
         let drained = crate::core::steer::drain();
@@ -5835,6 +5886,27 @@ pub(crate) mod tests {
             !crate::core::steer::push("arrived after the turn ended"),
             "unarmed ⇒ the queue path must take it, never a silent drop"
         );
+    }
+
+    #[test]
+    fn image_submissions_never_enter_the_text_only_steering_mailbox() {
+        let _lock = crate::core::steer::test_lock();
+        crate::core::steer::arm();
+        assert!(!steer_text_submission("inspect clipboard", 1));
+        let path = std::env::temp_dir().join(format!(
+            "aizen-steer-{}-{}.png",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        // Even an invalid selected image must reach intake refusal, not bypass it as text.
+        std::fs::write(&path, b"invalid selected image").unwrap();
+        assert!(!steer_text_submission(
+            &format!("inspect \"{}\"", path.display()),
+            0
+        ));
+        assert!(crate::core::steer::drain().is_empty());
+        assert!(crate::core::steer::disarm().is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

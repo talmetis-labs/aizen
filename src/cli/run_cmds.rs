@@ -310,6 +310,13 @@ pub(crate) async fn run_agent_capture(
     task: &str,
     approval_mode: ApprovalMode,
 ) -> Result<String> {
+    let context_window = crate::core::model_context::discover(&cli_config::ResolvedEndpoint {
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        model: model.to_string(),
+    })
+    .await
+    .tokens;
     let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -324,7 +331,7 @@ pub(crate) async fn run_agent_capture(
         api_key.to_string(),
         model.to_string(),
         approval_mode,
-        resolve_ctx_window(model).0,
+        context_window,
         None, // cwd IS the project on the CLI path
     )?;
     let system = agent::build_top_level_system_prompt(
@@ -338,6 +345,7 @@ pub(crate) async fn run_agent_capture(
         approval_mode,
         quiet: true,
         enable_verify_gate: false,
+        context_window,
         ..Default::default()
     };
 
@@ -500,11 +508,30 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // billed request. Loud rather than skipped: this is the scripting and CI entry point, and an
     // attachment that quietly vanished would produce a confident answer about an image the model
     // never saw — the one failure mode a vision flag must not have.
+    let requested_images = args.image.len();
+    anyhow::ensure!(
+        args.image_modes.is_empty() || args.image_modes.len() == requested_images,
+        "--image-mode must be omitted or repeated once per --image selection, in that order"
+    );
+    anyhow::ensure!(
+        requested_images <= crate::core::tool_media::MAX_REQUEST_IMAGES,
+        "select at most four images"
+    );
     let images = args
         .image
         .iter()
         .map(|p| crate::ui::image_input::image_file_to_data_url(p))
         .collect::<Result<Vec<_>>>()?;
+    crate::core::tool_media::validate_image_batch_sizes(images.iter().map(|url| {
+        crate::core::tool_media::split_data_url(url)
+            .and_then(|(_, data)| {
+                crate::core::tool_media::base64_decoded_len(
+                    data,
+                    crate::core::tool_media::MAX_IMAGE_BYTES,
+                )
+            })
+            .unwrap_or(usize::MAX)
+    }))?;
     let (base_url, api_key, model) = resolve_endpoint(args.base_url, args.api_key, args.model)?;
     let http = http_client()?;
 
@@ -545,8 +572,35 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         harness_effort.clone(),
         design.clone(),
     );
+    let image_preferences = if args.image_modes.is_empty() {
+        vec![
+            cli_config::load()
+                .image_mode
+                .unwrap_or(crate::core::types::ImagePreference::Auto);
+            images.len()
+        ]
+    } else {
+        args.image_modes.clone()
+    };
     if args.reference_images {
-        crate::repl::turn::seat_loaded_reference_images(&mut resolved, &images)?;
+        crate::repl::turn::seat_loaded_reference_images_with_preferences(
+            &mut resolved,
+            &images,
+            &image_preferences,
+        )?;
+    } else if crate::llm::media::vision_policy_in(
+        &resolved.vision_config,
+        &resolved.endpoint.base_url,
+        &resolved.endpoint.model,
+    ) == crate::llm::media::VisionPolicy::Supported
+    {
+        // Ordinary image inspection needs a reread handle, not a mandatory exact comparison.
+        // Vision defaults on; the resolved snapshot still honors an explicit disable.
+        crate::repl::turn::prepare_current_references_with_preferences(
+            &mut resolved,
+            &images,
+            &image_preferences,
+        )?;
     }
     resolved.freeze_vision_config();
     crate::repl::turn::validate_current_reference_route(&resolved)?;
@@ -575,6 +629,9 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     .await;
     resolved.freeze_vision_config();
     crate::repl::turn::validate_current_reference_route(&resolved)?;
+    let context_window = crate::core::model_context::discover(&resolved.endpoint)
+        .await
+        .tokens;
     let ep = &resolved.endpoint;
     let model = ep.model.clone();
     let base_url = ep.base_url.clone();
@@ -600,7 +657,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         api_key.clone(),
         model.clone(),
         cli_approval,
-        resolve_ctx_window(&model).0,
+        context_window,
         None, // cwd IS the project on the CLI path
     )?;
     // The first record of a machine-readable run — `system` / `init`: what is about to happen and
@@ -627,7 +684,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         auto_extend_to: max.saturating_mul(2),
         enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
         approval_mode: cli_approval,
-        context_window: resolve_ctx_window(&model).0,
+        context_window,
         compact_at_pct: crate::compact_threshold_pct(),
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         nudge_role: agent::NudgeRole::for_base_url(&base_url),
@@ -706,7 +763,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // One user turn either way. With attachments it serializes as a parts array (text first, then
     // one image_url part each) instead of a plain string, which is the only difference on the wire.
     let sent = args.task.trim();
-    let asked = if images.is_empty() {
+    let mut asked = if images.is_empty() {
         Message::user(sent)
     } else {
         status(
@@ -716,6 +773,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         );
         Message::user_with_images(sent, images)
     };
+    asked.image_preferences = image_preferences;
     // `--resume SLUG` continues a saved conversation instead of starting one: the stored
     // transcript is the history (its prompt lanes rebuilt for THIS project/model by
     // `load_session`, the same contract as /resume), the new task is the next user turn, and the
@@ -737,28 +795,9 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
     // of relying on tool-result clearing alone.
     let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
-    let sum_effort =
-        cli_config::role_reasoning_effort("summarizer", cli_config::load().reasoning_effort);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
-        let effort = sum_effort.clone();
-        async move {
-            tokio::time::timeout(
-                crate::repl::postturn::chore_call_timeout(),
-                client::chat_with_tools_effort(
-                    http_ref,
-                    &ep.base_url,
-                    &ep.api_key,
-                    &ep.model,
-                    &msgs,
-                    &[],
-                    effort,
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("summarizer model call timed out"))?
-            .map(|t| t.content.unwrap_or_default())
-        }
+        async move { crate::llm::compact_summary::summarize(http_ref, &ep, msgs).await }
     };
     let result =
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await;
@@ -798,6 +837,10 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             _ => (None, None),
         };
         let streamed = streamed_text.lock().unwrap_or_else(|e| e.into_inner());
+        let mut usage = usage_since(usage_cursor);
+        let media = cfg.exec_ctx.media().snapshot();
+        usage["media"] = serde_json::json!({"attempts":media.attempts,"json_bytes":media.json_bytes,
+            "image_uri_bytes":media.image_uri_bytes,"images":media.images,"peak_reserved_bytes":media.peak});
         crate::ui::events::done_with_verification(
             outcome.stop.label(),
             outcome.iters,
@@ -805,7 +848,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             question.as_deref(),
             ask,
             saved.as_deref(),
-            usage_since(usage_cursor),
+            usage,
             outcome.verification.clone(),
             streamed.as_deref(),
         );

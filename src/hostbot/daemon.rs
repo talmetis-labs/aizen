@@ -352,6 +352,14 @@ async fn run_serve_turn(
     lane: &LaneCtx,
     shared: &lane::LaneShared,
 ) -> Result<String> {
+    let context_window =
+        crate::core::model_context::discover(&crate::core::cli_config::ResolvedEndpoint {
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+        })
+        .await
+        .tokens;
     let lead = crate::agent::compact::leading_system_count(history);
     // Default-ON lazy LSP (same as REPL/agent CLI) so remote coding turns get symbol tools. Armed —
     // and the registry built — BEFORE the prompt bundle: building the registry publishes this lane's
@@ -364,7 +372,7 @@ async fn run_serve_turn(
         api_key.to_string(),
         model.to_string(),
         approval_mode,
-        crate::resolve_ctx_window(model).0,
+        context_window,
         Some(lane.root.clone()), // this bot's directory, not the process cwd
     )?;
     // A brand-new or legacy-restored thread is a conversation boundary and may adopt pending
@@ -421,7 +429,7 @@ async fn run_serve_turn(
         workspace_root: Some(lane.root.clone()),
         quiet: true,
         enable_verify_gate: false,
-        context_window: crate::resolve_ctx_window(model).0,
+        context_window,
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         ..Default::default()
     };

@@ -1270,7 +1270,8 @@ async fn handle_slash_scoped(
             tui::emit_line(&style("compacting… (Esc to stop)").dim().to_string());
             // Interruptible: the summarizer call is a network round-trip on the REPL's own thread.
             // Without this the whole app is frozen until it returns (or the 300s read timeout).
-            match cancellable_slash(compact_now(history)).await {
+            let saved_design = design.map(|d| d.snapshot());
+            match cancellable_slash(compact_now(history, model_label, saved_design.as_ref())).await {
                 Some(Ok((b, a))) => print_compact_summary(b, a, &tp),
                 Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
                 // Cancelled before the summary landed. `compact_history` only splices AFTER a
@@ -1605,6 +1606,9 @@ SlashId::Yolo => {
             // `✦ ultimate` status chip), moonlight when OFF. Reflects the effective state — an
             // env-forced ON wins over the toggle, so read it back rather than trusting `now`.
             tui::set_ultimate(cli_config::ultimate_enabled());
+            // The status row's model segment carries the effort state (`·auto` tinted salmon while
+            // ultimate is ON — ultimate resolves turns to `max` — plain `·auto` after OFF).
+            crate::ui::effort_ui::refresh_effort_hud();
             if std::env::var("AIZEN_ULTIMATE").is_ok() {
                 tui::emit_line(&style("(note: AIZEN_ULTIMATE is set in your environment — it forces ultimate ON regardless of this toggle)").dim().to_string());
             }
@@ -1666,6 +1670,9 @@ SlashId::Yolo => {
                     &style(format!("usage: /effort [auto|off|low|medium|high|xhigh|max|none]  (unknown '{other}')")).dim().to_string(),
                 ),
             }
+            // The HUD's model segment carries the tier — re-arm it so the row the slash
+            // handler returns to already shows the new setting.
+            crate::ui::effort_ui::refresh_effort_hud();
         }
         SlashId::Theme => {
             let sub = arg.trim().to_ascii_lowercase();

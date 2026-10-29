@@ -4,6 +4,36 @@
 use super::*;
 
 #[test]
+fn context_override_is_retained_only_on_the_same_main_route() {
+    let original = cli_config::CliConfig {
+        base_url: Some("https://fixture.invalid/v1".into()),
+        api_key: Some("fixture-account".into()),
+        model: Some("same-model".into()),
+        model_context_window: Some(32_000),
+        ..Default::default()
+    };
+    let mut same = original.clone();
+    apply_main_endpoint(
+        &mut same,
+        Some(" https://fixture.invalid/v1/ "),
+        Some(" fixture-account "),
+        Some(" same-model "),
+    );
+    assert_eq!(same.model_context_window, Some(32_000));
+    apply_main_endpoint(&mut same, None, None, None);
+    assert_eq!(same.model_context_window, Some(32_000));
+    for (base, key, model) in [
+        (Some("https://another.invalid/v1"), None, None),
+        (None, Some("another-account"), None),
+        (None, None, Some("another-model")),
+    ] {
+        let mut changed = original.clone();
+        apply_main_endpoint(&mut changed, base, key, model);
+        assert_eq!(changed.model_context_window, None);
+    }
+}
+
+#[test]
 fn sandbox_network_control_preserves_other_settings_and_rejects_invalid_values() {
     let mut cfg = cli_config::CliConfig {
         sandbox: Some(crate::sandbox::policy::SandboxSettings {

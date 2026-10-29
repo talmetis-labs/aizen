@@ -22,10 +22,9 @@ use anyhow::Result;
 use console::style;
 use types::Message;
 
-/// A chore — a compaction summary, the secretary's reading of a turn, a persona reflection, a
-/// reconcile judgement — is one short answer, so it gets a shorter per-call cap than a sub-agent:
-/// a chore still running after a minute is a chore that has hung (quality plan M6 measured them
-/// at 300 s each, three in a row, before the next prompt). `AIZEN_CHORE_CALL_SECS` overrides;
+/// A short background chore (secretary, persona reflection or reconcile judgement) gets a shorter
+/// per-call cap than a sub-agent. Compaction has a separate whole-operation deadline because it may
+/// need several bounded transcript portions. `AIZEN_CHORE_CALL_SECS` overrides either default;
 /// the sub-agent ceiling still bounds it.
 const CHORE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -51,8 +50,8 @@ pub(crate) fn last_turn_slice(history: &[Message]) -> &[Message] {
 /// Wrap a background / chore model call in a per-call wall-clock deadline
 /// ([`chore_call_timeout`], default 60s, `AIZEN_CHORE_CALL_SECS`).
 ///
-/// Every one of these is a NON-streaming `chat_with_tools` call — compaction summaries, the
-/// end-of-turn secretary, persona reflection, memory reconcile, the oracle reviewer, persona distill.
+/// Every one of these is a NON-streaming `chat_with_tools` call — end-of-turn secretary,
+/// persona reflection, memory reconcile, the oracle reviewer and persona distill.
 /// None is streamed, so the streaming path's inter-event stall watchdog never applies; the shared
 /// client carries no total-request ceiling (removed so a long *streamed* turn isn't cut — see
 /// `http_client`); and `read_timeout` resets on every byte, so a gateway that keepalive-drips without
@@ -512,7 +511,7 @@ pub(crate) fn render_transcript(msgs: &[Message]) -> String {
 }
 
 /// Summarize older turns to free context. Thin wrapper over [`agent::compact::compact_history`] that
-/// supplies a NON-streaming summarize closure over this session's endpoint. Returns
+/// supplies the shared bounded, NON-streaming summarizer for this session's route. Returns
 /// (tokens_before, tokens_after). Same core the agent loop uses, so the REPL and `aizen serve` compact
 /// identically.
 pub(crate) async fn compact_history(
@@ -525,14 +524,13 @@ pub(crate) async fn compact_history(
     let sum_ep = summarizer_endpoint(base, key, model);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
-        async move {
-            chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
-        }
+        async move { crate::llm::compact_summary::summarize(http, &ep, msgs).await }
     };
-    let out = agent::compact::compact_history(history, summarize, COMPACT_KEEP_TURNS).await;
+    // The shared core strips recall before the model call; keep manual failures transactional too.
+    let mut staged = history.clone();
+    let out = agent::compact::compact_history(&mut staged, summarize, COMPACT_KEEP_TURNS).await;
     if out.is_ok() {
+        *history = staged;
         // The recorded real context size predates the cut — let the estimate carry the meter until
         // the next model call reports usage for the compacted history.
         tui::clear_ctx_real_tokens();
@@ -540,11 +538,55 @@ pub(crate) async fn compact_history(
     out
 }
 
-/// `/compact` — resolve the endpoint, then summarize older turns now (manual compaction).
-pub(crate) async fn compact_now(history: &mut Vec<Message>) -> Result<(usize, usize)> {
+/// Commit a manual compact before reporting success: other clients can only resume disk history.
+async fn compact_live_with<F, Fut>(
+    history: &mut Vec<Message>,
+    model: &str,
+    design: Option<&crate::agent::design::TaskDesignState>,
+    compact: F,
+) -> Result<(usize, usize)>
+where
+    F: FnOnce(Vec<Message>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<Message>, (usize, usize))>>,
+{
+    use crate::core::session_store;
+    let saved = session_store::current_session_slug()
+        .map(|slug| {
+            session_store::read_session_for_edit(&slug)
+                .map(|((_, meta, _), revision)| (slug, meta.unwrap_or_default(), revision))
+        })
+        .transpose()?;
+    // Allocate from the original first turn, not the tail that survives compaction.
+    let name = saved
+        .as_ref()
+        .map(|(slug, _, _)| slug.clone())
+        .unwrap_or_else(|| session_store::allocate_session_slug(history));
+    let (staged, counts) = compact(history.clone()).await?;
+    if let Some((_, meta, revision)) = saved {
+        session_store::write_session_if_unchanged(&staged, &name, meta, design, &revision)?;
+    } else {
+        session_store::save_session_with_design(&staged, &name, Some(model), design)?;
+    }
+    *history = staged;
+    session_store::set_session_slug(Some(name));
+    session_store::update_live_history_with_design(history, design);
+    tui::clear_ctx_real_tokens();
+    Ok(counts)
+}
+
+/// `/compact` — summarize, then durably replace the same saved session before returning success.
+pub(crate) async fn compact_now(
+    history: &mut Vec<Message>,
+    model_label: &str,
+    design: Option<&crate::agent::design::TaskDesignState>,
+) -> Result<(usize, usize)> {
     let (base, key, model) = resolve_endpoint(None, None, None)?;
     let http = http_client()?;
-    compact_history(history, &http, &base, &key, &model).await
+    compact_live_with(history, model_label, design, |mut staged| async move {
+        let counts = compact_history(&mut staged, &http, &base, &key, &model).await?;
+        Ok((staged, counts))
+    })
+    .await
 }
 
 /// `/clear` carry-over — distill the WHOLE current conversation into one dense seed note (routed
@@ -568,6 +610,115 @@ pub(crate) async fn refresh_distill_now(history: &[Message]) -> Result<String> {
         anyhow::bail!("the model returned an empty carry-over summary");
     }
     Ok(summary.trim().to_string())
+}
+
+#[cfg(test)]
+mod compact_persistence_tests {
+    use super::*;
+    use crate::core::{config::EnvGuard, session_store::*};
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "isolated session home and replay state across compact"
+    )]
+    async fn manual_compact_is_durable_before_success_and_transactional_on_failure() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tape = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "aizen-live-compact-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let env = EnvGuard::set([
+            ("AIZEN_HOME", root.as_os_str()),
+            ("AIZEN_PROJECT_ROOT", root.as_os_str()),
+        ]);
+        let previous = current_session_slug();
+        let mut history = vec![Message::system("fixture instructions")];
+        for i in 0..6 {
+            history.push(Message::user(format!(
+                "Original topic {i}: {}",
+                "older detail ".repeat(80)
+            )));
+            history.push(Message::assistant(format!("Answer {i}")));
+        }
+        save_session(&history, "same-session", Some("historical-model")).unwrap();
+        set_session_slug(Some("same-session".into()));
+        let path = sessions_dir().join("same-session.json");
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let counts = compact_live_with(
+            &mut history,
+            "current-model",
+            None,
+            |mut staged| async move {
+                let counts = agent::compact::compact_history(
+                    &mut staged,
+                    |_| async { Ok("Saved compact summary".into()) },
+                    COMPACT_KEEP_TURNS,
+                )
+                .await?;
+                Ok((staged, counts))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(counts.0 > counts.1);
+        assert_eq!(current_session_slug().as_deref(), Some("same-session"));
+        let (saved, meta, _) = read_session_path_with_design(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+        assert!(saved.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|s| s.contains("Saved compact summary"))));
+        assert_eq!(meta.unwrap().model.as_deref(), Some("historical-model"));
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_ne!(before["generation"], after["generation"]);
+        assert_eq!(before["meta"]["created"], after["meta"]["created"]);
+
+        let unchanged = serde_json::to_value(&history).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let error = compact_live_with(&mut history, "current-model", None, |_| async {
+            anyhow::bail!("summary failed")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("summary failed"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(serde_json::to_value(&history).unwrap(), unchanged);
+
+        let conflict = compact_live_with(&mut history, "current-model", None, |staged| async {
+            save_session(
+                &[Message::user("concurrent writer")],
+                "same-session",
+                Some("other"),
+            )
+            .unwrap();
+            Ok((staged, (1000, 100)))
+        })
+        .await;
+        assert!(
+            conflict.is_err(),
+            "do not overwrite an external save during summarization"
+        );
+        assert_eq!(serde_json::to_value(&history).unwrap(), unchanged);
+        let (disk, _, _) = read_session_path_with_design(&path).unwrap();
+        assert_eq!(disk[0].content.as_deref(), Some("concurrent writer"));
+
+        set_session_slug(previous);
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

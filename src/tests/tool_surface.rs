@@ -187,7 +187,7 @@ fn a_disabled_toolset_leaves_the_request_and_the_routing_map_together() {
             .unwrap_or(true)
     });
 
-    let names = registry.names();
+    let names = registry.advertised_names();
     for gone in ["web_search", "web_fetch", "web_crawl"] {
         assert!(!names.iter().any(|n| n == gone), "{gone} still registered");
     }
@@ -212,7 +212,7 @@ fn the_top_level_prompt_carries_the_published_surface_and_children_never_inherit
     let _g = crate::core::config::TEST_HOME_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let names = coder_registry().names();
+    let names = coder_registry().advertised_names();
     let prior = builtin::swap_active_tools_for_test(Some(names.clone()));
 
     let top = crate::agent::build_top_level_system_prompt("/w", "linux", "2026-08-17", "m", None);
@@ -245,7 +245,7 @@ fn the_top_level_prompt_carries_the_published_surface_and_children_never_inherit
 #[test]
 fn routing_map_names_exactly_the_advertised_tools_in_registry_order() {
     let registry = coder_registry();
-    let names = registry.names();
+    let names = registry.advertised_names();
     let map = tool_routing::routing_map(&names).expect("non-empty surface");
 
     let routed = routed_names(&map);
@@ -267,6 +267,30 @@ fn routing_map_names_exactly_the_advertised_tools_in_registry_order() {
     // Within a group, names keep the registry's advertised order.
     let idx = |n: &str| routed.iter().position(|r| r == n).unwrap();
     assert!(idx("file_read") < idx("file_glob") || idx("file_glob") < idx("file_read"));
+}
+
+#[test]
+fn visual_context_is_dispatchable_but_absent_from_text_only_schemas_and_routing() {
+    let registry = coder_registry();
+    assert!(registry.names().iter().any(|name| name == "image_context"));
+    assert!(registry.get("image_context").is_some());
+    let advertised = registry.advertised_names();
+    assert!(!advertised.iter().any(|name| name == "image_context"));
+    assert_eq!(
+        advertised,
+        registry
+            .defs()
+            .into_iter()
+            .map(|def| def.function.name)
+            .collect::<Vec<_>>()
+    );
+    let map = tool_routing::routing_map(&advertised).unwrap();
+    assert!(!map.contains("`image_context`"));
+    let mut visual = advertised;
+    visual.push("image_context".into());
+    assert!(tool_routing::routing_map(&visual)
+        .unwrap()
+        .contains("`image_context`"));
 }
 
 #[test]
@@ -317,7 +341,7 @@ fn the_stable_prompt_body_carries_no_tool_schemas_and_no_tool_catalog() {
 #[test]
 fn a_registered_tool_cannot_drift_between_schema_routing_and_dispatch() {
     let registry = coder_registry();
-    let names = registry.names();
+    let names = registry.advertised_names();
     let map = tool_routing::routing_map(&names).unwrap();
 
     let mut seen = std::collections::HashSet::new();
@@ -361,7 +385,7 @@ fn every_registered_tool_is_classified_for_config_filtering() {
 #[test]
 fn dynamic_mcp_tools_appear_only_when_connected() {
     // With none connected (the test environment), nothing MCP-shaped is advertised or routed.
-    let names = coder_registry().names();
+    let names = coder_registry().advertised_names();
     assert!(!names.iter().any(|n| n.starts_with("mcp_")));
     let map = tool_routing::routing_map(&names).unwrap();
     assert!(!map.contains("connected integrations"));
@@ -460,7 +484,7 @@ fn the_top_level_prompt_carries_the_deferred_note_only_when_something_is_deferre
     let _g = crate::core::config::TEST_HOME_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let names = coder_registry().names();
+    let names = coder_registry().advertised_names();
     let prior = builtin::swap_active_tools_for_test(Some(names));
     let prior_deferred = builtin::swap_deferred_tools_for_test(Some((
         vec!["mcp_gh_create_issue".into(), "mcp_gh_list_repos".into()],
@@ -771,7 +795,7 @@ fn windows_gets_powershell_context_and_other_platforms_do_not() {
 #[test]
 fn prompt_construction_never_embeds_credentials() {
     const SECRET: &str = "sk-test-DEADBEEF-should-never-appear";
-    let names = coder_registry().names();
+    let names = coder_registry().advertised_names();
     let map = tool_routing::routing_map(&names).unwrap();
     // Schemas carry descriptions, not values; the map carries names only.
     assert!(!map.contains(SECRET));

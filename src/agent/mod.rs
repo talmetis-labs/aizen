@@ -24,6 +24,7 @@ pub mod context_pack;
 pub mod design;
 pub mod goal;
 pub mod hooks;
+pub mod image_context;
 pub mod image_read;
 pub mod lenient;
 pub mod lsp;
@@ -897,7 +898,7 @@ impl Default for AgentConfig {
             delegated_call_cap: None,
             deadline: None,
             wire_reasoning_effort: None,
-            tool_image_policy: crate::llm::media::VisionPolicy::Unknown,
+            tool_image_policy: crate::llm::media::VisionPolicy::default(),
             image_config: None,
             tool_image_destination: None,
             tool_image_destination_label: None,
@@ -1220,10 +1221,11 @@ where
     let mut review_request = capture_review_request(messages);
     // ExecutionContext owns this logical run's anchors. Continuations preserve the handle;
     // fresh turns and delegated children explicitly create independent recovery.
-    let defs = registry.defs();
+    let mut defs = registry.defs();
     // Tool schemas ride on EVERY request but live in no message — count them once here so the
     // context guards below compare the real request size against the window.
-    let schema_overhead = estimate_defs_tokens(&defs);
+    let mut schema_overhead = estimate_defs_tokens(&defs);
+    let mut visual_revision = cfg.exec_ctx.visual().revision();
     let mut cap = cfg.max_iters;
     let mut extended = false;
     // Fresh budgets granted to a still-progressing run after the one-shot extension was spent, and
@@ -1561,7 +1563,8 @@ where
             }
         }
 
-        observe::retain_tool_images(messages);
+        let visual_pins = cfg.exec_ctx.visual_pins(messages);
+        observe::retain_tool_images_with_pins(messages, &visual_pins)?;
         // AGE-BASED OBSERVATION COLLAPSING (runs BEFORE the estimate so the guards see the slimmer
         // history): tool results older than the newest `collapse_after_observations`, longer than
         // `collapse_min_chars`, become one-line digests naming the scratch file with the full text.
@@ -1569,7 +1572,7 @@ where
         // (`collapse_batch`) so the provider prompt cache breaks once per batch, not per step. The
         // percentage-gated clearing below stays as the second line of defense for what this leaves.
         if cfg.collapse_after_observations > 0 {
-            let stats = observe::collapse_aged(
+            let stats = observe::collapse_aged_with_pins(
                 messages,
                 observe::CollapsePolicy {
                     keep_recent: cfg.collapse_after_observations,
@@ -1577,7 +1580,8 @@ where
                     min_chars: cfg.collapse_min_chars,
                 },
                 &mut observe::spill_to_scratch,
-            );
+                &visual_pins,
+            )?;
             if stats.collapsed > 0 && !cfg.quiet {
                 emit_trace(&format!(
                     "→ collapsed {} older tool result(s) to one line each (−{} chars; full text in scratch)",
@@ -1587,6 +1591,24 @@ where
         }
 
         cfg.exec_ctx.refresh_tool_images(messages);
+        cfg.exec_ctx.refresh_visual(messages)?;
+        let revision = cfg.exec_ctx.visual().revision();
+        if revision != visual_revision {
+            real_anchor = None;
+            visual_revision = revision;
+        }
+        if cfg.exec_ctx.visual().has_images()
+            && !defs.iter().any(|def| def.function.name == "image_context")
+        {
+            if let Some(tool) = registry.get("image_context") {
+                defs.push(ToolDef::function(
+                    tool.name(),
+                    tool.description(),
+                    tool.parameters(),
+                ));
+                schema_overhead = estimate_defs_tokens(&defs);
+            }
+        }
         // Effective request size for ALL guards this iteration: estimate (messages + tool schemas)
         // corrected by the provider's last real usage report when we have one. Recomputed after any
         // guard mutates history.
@@ -1605,9 +1627,14 @@ where
         if let Some(ref summarize) = summarize {
             if cfg.compact_at_pct > 0
                 && cfg.context_window > 0
-                && est_now * 100 >= cfg.context_window * cfg.compact_at_pct as usize
+                && est_now.saturating_mul(100)
+                    >= cfg
+                        .context_window
+                        .saturating_mul(cfg.compact_at_pct as usize)
+                && compact::plan_compact_cut_at(messages, compact::KEEP_TURNS, compact::KEEP_STEPS)
+                    .is_some()
             {
-                let pct = est_now * 100 / cfg.context_window;
+                let pct = est_now.saturating_mul(100) / cfg.context_window;
                 // CADENCE GUARD: don't re-compact every iteration once
                 // history sits above `compact_at_pct`. compact_history keeps the last KEEP_TURNS
                 // verbatim, so a single big turn can leave the result still above threshold — without
@@ -1620,20 +1647,47 @@ where
                     cfg.clear_step_pct,
                     cfg.clear_cooldown_iters,
                 ) {
-                    let arm = match compact::compact_history(
-                        messages,
-                        summarize,
-                        compact::KEEP_TURNS,
-                    )
-                    .await
-                    {
+                    // Compact a staged history: summary failure, cancellation or visual quota
+                    // failure must not strip recall or replace any part of the live transcript.
+                    let mut staged = messages.clone();
+                    let compacted = tokio::select! {
+                        biased;
+                        _ = cfg.cancel.cancelled() => {
+                            return Ok(AgentOutcome {
+                                final_text: None,
+                                iters: iter,
+                                verification: design_verification(cfg, verify_passed, made_any_edits),
+                                stop: StopReason::Cancelled,
+                            });
+                        }
+                        result = compact::compact_history(
+                            &mut staged, summarize, compact::KEEP_TURNS,
+                        ) => result,
+                    };
+                    let arm = match compacted {
                         Ok((before, after)) => {
+                            if cfg.cancel.is_cancelled() {
+                                return Ok(AgentOutcome {
+                                    final_text: None,
+                                    iters: iter,
+                                    verification: design_verification(
+                                        cfg,
+                                        verify_passed,
+                                        made_any_edits,
+                                    ),
+                                    stop: StopReason::Cancelled,
+                                });
+                            }
+                            *messages = staged;
                             compact_failures = 0;
                             context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
                             budget_band_shown = None; // …and the running budget signal (P-ctx1)
                             real_anchor = None; // spliced history invalidates the anchor
                             stall.forget_successes(); // summarized-away results must not mark a re-read as stale
                             read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
+                            cfg.exec_ctx.refresh_tool_images(messages);
+                            cfg.exec_ctx.refresh_visual(messages)?;
+                            visual_revision = cfg.exec_ctx.visual().revision();
                             crate::ui::events::compact_boundary(before, after);
                             est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
                             if !cfg.quiet {
@@ -1675,7 +1729,8 @@ where
                     // model round-trip. Recompute pct against the (possibly shrunk) history so
                     // the latch reflects the post-compaction size.
                     if arm {
-                        last_compact = Some((est_now * 100 / cfg.context_window, iter));
+                        last_compact =
+                            Some((est_now.saturating_mul(100) / cfg.context_window, iter));
                     }
                 }
             }
@@ -2686,6 +2741,8 @@ where
                     tool_call_id: None,
                     images: Vec::new(),
                     tool_images: Vec::new(),
+                    visual_context: Vec::new(),
+                    image_preferences: Vec::new(),
                     cache_control: None,
                 });
                 let combined = if demands.len() == 1 {
@@ -2750,6 +2807,8 @@ where
                         tool_call_id: None,
                         images: Vec::new(),
                         tool_images: Vec::new(),
+                        visual_context: Vec::new(),
+                        image_preferences: Vec::new(),
                         cache_control: None,
                     });
                     messages.push(Message::user(format!(
@@ -2794,6 +2853,8 @@ where
                         tool_call_id: None,
                         images: Vec::new(),
                         tool_images: Vec::new(),
+                        visual_context: Vec::new(),
+                        image_preferences: Vec::new(),
                         cache_control: None,
                     });
                     messages.push(Message::user(crate::core::steer::format_injection(&steers)));
@@ -2880,6 +2941,20 @@ where
         // `assistant.tool_calls` (strict gateways 400 on that). Real results overwrite the
         // placeholders as they land inside `execute_calls`.
         let calls = turn.tool_calls.clone();
+        cfg.exec_ctx.visual().begin_group();
+        cfg.exec_ctx
+            .visual()
+            .reject_group_conflicts(calls.iter().filter_map(|call| {
+                if call.function.name != "image_context" {
+                    return None;
+                }
+                let args: serde_json::Value =
+                    serde_json::from_str(&call.function.arguments).ok()?;
+                if args.get("action")?.as_str()? == "list" {
+                    return None;
+                }
+                args.get("id")?.as_str().map(str::to_owned)
+            }));
         let planned_calls = plan_execution_calls(registry, &calls, cfg);
         messages.push(Message {
             role: "assistant".to_string(),
@@ -2888,6 +2963,8 @@ where
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
             cache_control: None,
         });
         let base = messages.len();
@@ -2942,6 +3019,7 @@ where
             &cache_candidates,
         )
         .await;
+        cfg.exec_ctx.visual().sync(messages);
         let results: Vec<_> = executions
             .iter()
             .map(|r| (r.call_id.clone(), r.outcome.text.clone()))
@@ -5177,7 +5255,7 @@ fn gate_prepared_and_approve(
             || cfg.tool_image_destination.is_none())
     {
         let state = match cfg.tool_image_policy {
-            crate::llm::media::VisionPolicy::Unknown => "unknown; open /config → Vision and declare support for the resolved endpoint/model",
+            crate::llm::media::VisionPolicy::Unknown => "unresolved for this dispatch; return to the controller to resolve its endpoint/model",
             crate::llm::media::VisionPolicy::Unsupported => "configured unsupported; choose an explicitly vision-capable route or change its declaration in /config → Vision",
             crate::llm::media::VisionPolicy::Supported => "supported, but the dispatch has no destination binding",
         };
@@ -5362,6 +5440,9 @@ fn reserve_visual_operation(
 
 /// Select only explicitly requested evidence from one child namespace. Never relay user attachments
 /// or a discarded attempt's whole history; request caps apply before copying any payload.
+/// A bounded selector resolved by the controller, only within successful final-attempt outputs.
+pub(crate) const LATEST_CAPTURE_SELECTOR: &str = "@latest_capture";
+
 pub fn selected_evidence_images(
     messages: &[Message],
     ids: &[String],
@@ -5384,16 +5465,24 @@ pub fn selected_evidence_images(
             })
             .find(|image| {
                 let p = &image.metadata().provenance;
+                let selected_id = p.evidence_id.as_deref();
+                let requested = if id == LATEST_CAPTURE_SELECTOR {
+                    p.source == "browser_screenshot" && p.crop.is_none() && selected_id.is_some()
+                } else {
+                    selected_id == Some(id.as_str())
+                };
                 image.is_available()
                     && p.approved_destination.is_some()
                     && p.design_scope.as_deref() == Some(scope)
-                    && p.evidence_id.as_deref() == Some(id.as_str())
+                    && p.source != "reference_read"
+                    && p.source != crate::core::reference_media::REFERENCE_SOURCE
+                    && requested
             });
         if let Some(image) = image {
             if selected
                 .iter()
                 .any(|old: &crate::core::tool_media::ToolImage| {
-                    old.metadata().provenance.evidence_id.as_deref() == Some(id.as_str())
+                    old.metadata().provenance.evidence_id == image.metadata().provenance.evidence_id
                 })
             {
                 continue;
@@ -7754,19 +7843,12 @@ fn estimate_tokens(messages: &[Message]) -> usize {
 /// Context guards count the outgoing view, not retained images the wire will omit. Synthetic
 /// observations and the task capsule remain request-only; base64 is not counted as prose tokens.
 fn estimate_request_tokens(messages: &[Message], cfg: &AgentConfig) -> usize {
-    if cfg.exec_ctx.design().is_none() && messages.iter().all(|m| m.tool_images.is_empty()) {
-        return estimate_tokens(messages);
-    }
-    let mut request = messages.to_vec();
-    if let Some(ctx) = cfg.exec_ctx.design() {
-        design::prompt::seat_prompt(&mut request, &ctx);
-    }
-    let projected = crate::llm::media::project_messages_for_destination(
-        &request,
+    crate::llm::media::estimate_request_tokens(
+        messages,
         cfg.tool_image_policy,
         cfg.tool_image_destination.as_deref(),
-    );
-    estimate_tokens(&projected.messages)
+        cfg.exec_ctx.design().as_ref(),
+    )
 }
 
 /// The most recent tool-schema overhead estimate, published by the loop for `main.rs`'s HUD /
@@ -9188,6 +9270,7 @@ mod tests {
             user_images: vec![ProjectedUserImage {
                 message_index: 0,
                 image_index: 0,
+                visual_id: None,
                 source_sha256: source_sha256.clone(),
                 wire_sha256: source_sha256,
                 original: true,
@@ -9244,6 +9327,7 @@ mod tests {
             user_images: vec![ProjectedUserImage {
                 message_index: 0,
                 image_index: 1,
+                visual_id: None,
                 source_sha256: crate::core::tool_media::sha256(messages[0].images[1].as_bytes()),
                 wire_sha256: crate::core::tool_media::sha256(b"balanced preview wire fixture"),
                 original: false,
@@ -9320,6 +9404,7 @@ mod tests {
                 message_index: 1,
                 image_index: 0,
                 sha256: image.metadata().sha256.clone(),
+                visual_identity: None,
             }],
         };
         mark_image_delivery(&messages, &ImageDeliveryReceipt::default(), &design);
@@ -9373,6 +9458,75 @@ mod tests {
         messages[1].content = Some("reference".into());
         messages[1].tool_images = vec![observation_image("good", "child", None)];
         assert!(selected_evidence_images(&messages, &ids, "child").is_empty());
+    }
+
+    #[test]
+    fn latest_capture_selector_resolves_only_approved_completed_own_captures() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let image = |id: &str, source: &str, scope: &str, approved: bool, value: u8| {
+            let mut provenance = ImageProvenance::new(source, None);
+            provenance.evidence_id = Some(id.into());
+            provenance.design_scope = Some(scope.into());
+            provenance.approved_destination = approved.then(|| "a".repeat(64));
+            ToolImage::from_bytes(
+                &encode_rgba_png(&[value, 0, 0, 255], 1, 1).unwrap(),
+                "image/png",
+                provenance,
+            )
+            .unwrap()
+        };
+        let old = image("dynamic-old", "browser_screenshot", "final", true, 1);
+        let latest = image("dynamic-latest", "browser_screenshot", "final", true, 2);
+        let mut messages = vec![
+            Message::assistant_tool_calls(vec![call("old", "browser_screenshot", "{}")]),
+            Message::tool_observation("old", "captured", vec![old]),
+            Message::assistant_tool_calls(vec![call("new", "browser_screenshot", "{}")]),
+            Message::tool_observation("new", "captured", vec![latest.clone()]),
+        ];
+        for (id, source, scope, approved, failed) in [
+            ("reference", "reference_read", "final", true, false),
+            ("sibling", "browser_screenshot", "sibling", true, false),
+            ("failed", "browser_screenshot", "final", true, true),
+            ("unapproved", "browser_screenshot", "final", false, false),
+        ] {
+            messages.push(Message::assistant_tool_calls(vec![call(id, source, "{}")]));
+            messages.push(Message::tool_observation(
+                id,
+                if failed {
+                    "error: capture failed"
+                } else {
+                    "captured"
+                },
+                vec![image(id, source, scope, approved, 3)],
+            ));
+        }
+        messages.push(Message::assistant_tool_calls(vec![
+            call("incomplete", "browser_screenshot", "{}"),
+            call("missing", "echo", "{}"),
+        ]));
+        messages.push(Message::tool_observation(
+            "incomplete",
+            "captured",
+            vec![image("incomplete", "browser_screenshot", "final", true, 4)],
+        ));
+        let ids = vec![
+            LATEST_CAPTURE_SELECTOR.into(),
+            "dynamic-latest".into(),
+            LATEST_CAPTURE_SELECTOR.into(),
+        ];
+        let selected = selected_evidence_images(&messages, &ids, "final");
+        assert_eq!(selected, vec![latest]);
+        assert!(task_tool::evidence_omission_diagnostic(
+            &[LATEST_CAPTURE_SELECTOR.into()],
+            &selected
+        )
+        .is_none());
+        assert!(selected_evidence_images(
+            &messages,
+            &[LATEST_CAPTURE_SELECTOR.into()],
+            "previous-attempt"
+        )
+        .is_empty());
     }
 
     #[test]
@@ -9642,9 +9796,21 @@ mod tests {
             Some(&destination),
         );
         assert_eq!(projection.selected_tool_images.len(), 1);
+        let plan = crate::llm::media::ImageSelectionPlan::new(
+            &messages,
+            config.tool_image_policy,
+            Some(&destination),
+        );
+        assert_eq!(plan.tool_images.len(), 1);
+        // The dimension-based planning allowance replaces the old flat 768/image HUD estimate.
+        assert_eq!(plan.estimated_image_tokens(&messages), 1536);
+        let mut text_only = projection.messages.clone();
+        for message in &mut text_only {
+            message.images.clear();
+        }
         assert_eq!(
             estimate_request_tokens(&messages, &config),
-            estimate_tokens(&projection.messages)
+            estimate_tokens(&text_only) + plan.estimated_image_tokens(&messages)
         );
         assert!(estimate_request_tokens(&messages, &config) < estimate_tokens(&messages));
         assert_eq!(serde_json::to_string(&messages).unwrap(), before);
@@ -13074,6 +13240,112 @@ mod tests {
                 .as_deref()
                 .is_some_and(|x| x.contains(&"x".repeat(200)))),
             "the oldest bulky turn was compacted away"
+        );
+    }
+
+    #[tokio::test]
+    async fn compacting_loop_does_not_call_summary_without_an_eligible_cut() {
+        let c = AgentConfig {
+            context_window: 100,
+            compact_at_pct: 20,
+            ..cfg()
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("x".repeat(400))];
+        let out = run_agent_loop_compacting(
+            scripted(vec![final_turn("done")]),
+            |_| async { panic!("a recent-only history is not a compaction failure") },
+            &c,
+            &ToolRegistry::new(),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some(&"x".repeat(400))));
+    }
+
+    #[tokio::test]
+    async fn compacting_loop_failure_preserves_original_recall_and_tool_pairs() {
+        let c = AgentConfig {
+            context_window: 100,
+            compact_at_pct: 20,
+            ..cfg()
+        };
+        let recalled = format!(
+            "{} (may be stale):\n[m1] prefers pnpm\n\nold task",
+            crate::memory::RECALL_MARKER
+        );
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user(recalled.clone()),
+            Message::assistant_tool_calls(vec![call(
+                "compact-failure-read",
+                "file_read",
+                r#"{"path":"fixture.txt"}"#,
+            )]),
+            Message::tool_result("compact-failure-read", "original read result"),
+            Message::assistant("old answer"),
+            Message::user("second task"),
+            Message::assistant("second answer"),
+            Message::user("current task"),
+        ];
+        let original = messages.clone();
+        let out = run_agent_loop_compacting(
+            scripted(vec![final_turn("done")]),
+            |_| async { anyhow::bail!("fixture summary failure") },
+            &c,
+            &ToolRegistry::new(),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        for message in original {
+            let expected = serde_json::to_value(message).unwrap();
+            assert!(messages
+                .iter()
+                .any(|m| serde_json::to_value(m).unwrap() == expected));
+        }
+        assert_eq!(compact::compaction_count(&messages), 0);
+    }
+
+    #[tokio::test]
+    async fn compacting_loop_cancellation_discards_staged_history() {
+        let c = AgentConfig {
+            context_window: 100,
+            compact_at_pct: 20,
+            ..cfg()
+        };
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user("first task"),
+            Message::assistant("a1"),
+            Message::user("second task"),
+            Message::assistant("a2"),
+            Message::user("current task"),
+        ];
+        let original = messages.clone();
+        let cancel = c.cancel.clone();
+        let out = run_agent_loop_compacting(
+            |_messages, _tools| async {
+                panic!("cancel during compaction must not reach the coding model")
+            },
+            move |_| {
+                cancel.cancel();
+                async { std::future::pending::<Result<String>>().await }
+            },
+            &c,
+            &ToolRegistry::new(),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Cancelled);
+        assert_eq!(
+            serde_json::to_value(messages).unwrap(),
+            serde_json::to_value(original).unwrap()
         );
     }
 
