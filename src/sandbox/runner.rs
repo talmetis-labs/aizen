@@ -986,7 +986,9 @@ mod tests {
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("(subpath \"/dev\")"));
-        assert!(!profile.contains("/private/var/folders"));
+        // A fixture's allowlisted directories can live below this macOS temp root. Reject
+        // the ambient subtree grant, not every occurrence of its prefix in a private path.
+        assert!(!profile.contains("(subpath \"/private/var/folders\")"));
         let escaped = |path: &Path| {
             path.to_string_lossy()
                 .replace('\\', "\\\\")

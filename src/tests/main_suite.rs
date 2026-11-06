@@ -216,8 +216,10 @@ fn where_reports_name_every_store_and_flag_missing_dirs() {
     let _g = crate::core::config::TEST_HOME_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let home = std::env::temp_dir().join(format!("aizen-whererep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
+    let old_home = std::env::var_os("AIZEN_HOME");
+    // The helper resolves macOS's /var alias before strict host-storage checks run.
+    let fixture = crate::core::file_placement::tests::TestDir::new();
+    let home = fixture.path().join("home");
     std::env::set_var("AIZEN_HOME", &home);
 
     let entries = crate::legacy_memory_fixture::entries_dir();
@@ -259,8 +261,11 @@ fn where_reports_name_every_store_and_flag_missing_dirs() {
         "zone slug not spelled out:\n{sk}"
     );
 
-    std::env::remove_var("AIZEN_HOME");
-    let _ = std::fs::remove_dir_all(&home);
+    if let Some(old) = old_home {
+        std::env::set_var("AIZEN_HOME", old);
+    } else {
+        std::env::remove_var("AIZEN_HOME");
+    }
 }
 
 /// Both `where` sub-commands have to be reachable, or the footers point at nothing.

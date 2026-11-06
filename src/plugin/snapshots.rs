@@ -489,11 +489,9 @@ pub(crate) mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let old_home = std::env::var_os("AIZEN_HOME");
-        let home = std::env::temp_dir().join(format!(
-            "aizen-snapshot-absent-{}-{}",
-            std::process::id(),
-            crate::core::persist::unique_sequence()
-        ));
+        // The helper canonicalizes the existing parent; AIZEN_HOME must remain absent.
+        let parent = crate::core::file_placement::tests::TestDir::new();
+        let home = parent.path().join("absent-home");
         std::env::set_var("AIZEN_HOME", &home);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

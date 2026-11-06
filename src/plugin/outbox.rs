@@ -292,22 +292,29 @@ fn finish_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::file_placement::tests::TestDir;
     use serde_json::json;
-    struct Fixture(PathBuf);
+    struct Fixture {
+        root: PathBuf,
+        _parent: TestDir,
+    }
     impl Fixture {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!(
-                "aizen-memory-outbox-{}-{}",
-                std::process::id(),
-                crate::core::persist::unique_sequence()
-            )))
+            // Keep the outbox absent, but give it an existing owned parent: /tmp has a sticky
+            // bit on Linux, and macOS temp paths may enter through the /var symlink.
+            let parent = TestDir::new();
+            let root = parent.path().join("outbox");
+            Self {
+                root,
+                _parent: parent,
+            }
         }
         fn receipt(&self) -> Receipt {
             let context: api::ProviderContext = serde_json::from_value(json!({
                 "generation":1,"user_id":"fixture-user","workspace_id":"fixture-workspace",
-                "workspace_root":self.0,"cwd":self.0,"device_id":"fixture-device","device_aliases":[],
+                "workspace_root":self.root,"cwd":self.root,"device_id":"fixture-device","device_aliases":[],
                 "session_id":"fixture-session","turn_id":"fixture-turn","boundary_id":"fixture-session",
-                "data_root":self.0.join("data"),"settings":{},"granted_capabilities":["learning"],
+                "data_root":self.root.join("data"),"settings":{},"granted_capabilities":["learning"],
                 "budgets":{"context_tokens":100,"recall_tokens":100,"max_records":10}
             })).unwrap();
             let mut params = api::ProcessTurn {
@@ -332,17 +339,12 @@ mod tests {
             }
         }
     }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     #[test]
     fn duplicate_turns_never_requeue_in_any_durable_phase() {
         let fixture = Fixture::new();
         let receipt = fixture.receipt();
-        assert!(prepare_at(&fixture.0, receipt.clone()).unwrap());
-        let destination = path(&fixture.0, &receipt.params.operation_id);
+        assert!(prepare_at(&fixture.root, receipt.clone()).unwrap());
+        let destination = path(&fixture.root, &receipt.params.operation_id);
         for phase in [
             Phase::Prepared,
             Phase::Dispatching,
@@ -357,7 +359,7 @@ mod tests {
                     "learning_mode":"offline","added":[],"reinforced":[],"review":[],"skipped_passive":true,"session_candidates":[]})).unwrap());
             }
             save(&destination, &stored).unwrap();
-            assert!(!prepare_at(&fixture.0, receipt.clone()).unwrap());
+            assert!(!prepare_at(&fixture.root, receipt.clone()).unwrap());
             assert_eq!(read(&destination).unwrap().unwrap().phase, phase);
         }
     }
@@ -365,10 +367,10 @@ mod tests {
     fn claims_survive_reload_and_acknowledgements_are_bound_and_bounded() {
         let fixture = Fixture::new();
         let receipt = fixture.receipt();
-        prepare_at(&fixture.0, receipt.clone()).unwrap();
-        claim_at(&fixture.0, &receipt.context, &receipt.params).unwrap();
-        assert!(claim_at(&fixture.0, &receipt.context, &receipt.params).is_err());
-        let destination = path(&fixture.0, &receipt.params.operation_id);
+        prepare_at(&fixture.root, receipt.clone()).unwrap();
+        claim_at(&fixture.root, &receipt.context, &receipt.params).unwrap();
+        assert!(claim_at(&fixture.root, &receipt.context, &receipt.params).is_err());
+        let destination = path(&fixture.root, &receipt.params.operation_id);
         let before = std::fs::read(&destination).unwrap();
         let mut result: api::ProcessTurnResult = serde_json::from_value(json!({"accepted":true,
             "operation_id":receipt.params.operation_id,"payload_sha256":receipt.params.payload_sha256,
@@ -376,15 +378,15 @@ mod tests {
             "skipped_passive":false,"session_candidates":(0..24).map(|_| json!({"text":"x".repeat(1600),"anchor":null,"importance":5})).collect::<Vec<_>>()
         })).unwrap();
         result.operation_id = "wrong-operation".into();
-        assert!(finish_at(&fixture.0, &receipt.params, Some(result.clone())).is_err());
+        assert!(finish_at(&fixture.root, &receipt.params, Some(result.clone())).is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), before);
         result.operation_id = receipt.params.operation_id.clone();
-        finish_at(&fixture.0, &receipt.params, Some(result)).unwrap();
+        finish_at(&fixture.root, &receipt.params, Some(result)).unwrap();
         assert_eq!(read(&destination).unwrap().unwrap().phase, Phase::Done);
-        assert!(!prepare_at(&fixture.0, receipt.clone()).unwrap());
-        assert!(finish_at(&fixture.0, &receipt.params, None).is_err());
+        assert!(!prepare_at(&fixture.root, receipt.clone()).unwrap());
+        assert!(finish_at(&fixture.root, &receipt.params, None).is_err());
         std::fs::write(&destination, b"{corrupt").unwrap();
-        assert!(prepare_at(&fixture.0, receipt).is_err());
+        assert!(prepare_at(&fixture.root, receipt).is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), b"{corrupt");
     }
 
@@ -396,21 +398,21 @@ mod tests {
         for index in 0..capacity {
             let mut receipt = original.clone();
             receipt.params.operation_id = format!("turn-{index}");
-            assert!(prepare_at(&fixture.0, receipt).unwrap());
+            assert!(prepare_at(&fixture.root, receipt).unwrap());
         }
-        let before = std::fs::read_dir(&fixture.0).unwrap().count();
+        let before = std::fs::read_dir(&fixture.root).unwrap().count();
         assert_eq!(before, capacity);
-        assert!(prepare_at(&fixture.0, original).is_err());
-        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), before);
+        assert!(prepare_at(&fixture.root, original).is_err());
+        assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), before);
     }
 
     #[test]
     fn offline_status_counts_bounded_receipts_without_creating_or_exposing_content() {
         let fixture = Fixture::new();
-        let empty = status_at(&fixture.0).unwrap();
+        let empty = status_at(&fixture.root).unwrap();
         assert_eq!(empty.receipts, 0);
         assert_eq!(empty.available, 64);
-        assert!(!fixture.0.exists());
+        assert!(!fixture.root.exists());
         for (index, phase) in [
             Phase::Prepared,
             Phase::Dispatching,
@@ -426,7 +428,7 @@ mod tests {
             receipt.params.payload_sha256 = Some(manifest::sha256(
                 &receipt.params.payload_bytes(&receipt.context).unwrap(),
             ));
-            prepare_at(&fixture.0, receipt.clone()).unwrap();
+            prepare_at(&fixture.root, receipt.clone()).unwrap();
             receipt.phase = phase.clone();
             if phase == Phase::Done {
                 receipt.result = Some(serde_json::from_value(json!({"accepted":true,
@@ -434,9 +436,9 @@ mod tests {
                     "learning_mode":"offline","added":[],"reinforced":[],"review":[],"useful":[],"already_useful":[],
                     "skipped_passive":true,"session_candidates":[]})).unwrap());
             }
-            save(&path(&fixture.0, &receipt.params.operation_id), &receipt).unwrap();
+            save(&path(&fixture.root, &receipt.params.operation_id), &receipt).unwrap();
         }
-        let before: Vec<_> = std::fs::read_dir(&fixture.0)
+        let before: Vec<_> = std::fs::read_dir(&fixture.root)
             .unwrap()
             .map(|entry| {
                 let path = entry.unwrap().path();
@@ -444,7 +446,7 @@ mod tests {
                 (path, bytes)
             })
             .collect();
-        let status = status_at(&fixture.0).unwrap();
+        let status = status_at(&fixture.root).unwrap();
         assert_eq!(
             (
                 status.prepared,
@@ -463,10 +465,10 @@ mod tests {
         for (path, bytes) in before {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
-        std::fs::write(fixture.0.join("corrupt.json"), b"{broken").unwrap();
-        assert!(status_at(&fixture.0).is_err());
+        std::fs::write(fixture.root.join("corrupt.json"), b"{broken").unwrap();
+        assert!(status_at(&fixture.root).is_err());
         assert_eq!(
-            std::fs::read(fixture.0.join("corrupt.json")).unwrap(),
+            std::fs::read(fixture.root.join("corrupt.json")).unwrap(),
             b"{broken"
         );
     }
@@ -475,26 +477,26 @@ mod tests {
     fn offline_status_rejects_misnamed_receipts_and_special_roots() {
         let fixture = Fixture::new();
         let receipt = fixture.receipt();
-        prepare_at(&fixture.0, receipt.clone()).unwrap();
+        prepare_at(&fixture.root, receipt.clone()).unwrap();
         std::fs::rename(
-            path(&fixture.0, &receipt.params.operation_id),
-            fixture.0.join("wrong.json"),
+            path(&fixture.root, &receipt.params.operation_id),
+            fixture.root.join("wrong.json"),
         )
         .unwrap();
-        assert!(status_at(&fixture.0).is_err());
+        assert!(status_at(&fixture.root).is_err());
         let file = Fixture::new();
-        std::fs::write(&file.0, b"not a directory").unwrap();
-        assert!(status_at(&file.0).is_err());
-        assert_eq!(std::fs::read(&file.0).unwrap(), b"not a directory");
-        std::fs::remove_file(&file.0).unwrap();
+        std::fs::write(&file.root, b"not a directory").unwrap();
+        assert!(status_at(&file.root).is_err());
+        assert_eq!(std::fs::read(&file.root).unwrap(), b"not a directory");
+        std::fs::remove_file(&file.root).unwrap();
     }
 
     #[test]
     fn changed_payload_scope_or_pins_cannot_replace_existing_receipts() {
         let fixture = Fixture::new();
         let receipt = fixture.receipt();
-        prepare_at(&fixture.0, receipt.clone()).unwrap();
-        let destination = path(&fixture.0, &receipt.params.operation_id);
+        prepare_at(&fixture.root, receipt.clone()).unwrap();
+        let destination = path(&fixture.root, &receipt.params.operation_id);
         let before = std::fs::read(&destination).unwrap();
         for field in ["payload", "scope", "pins"] {
             let mut changed = receipt.clone();
@@ -507,7 +509,7 @@ mod tests {
             changed.params.payload_sha256 = Some(manifest::sha256(
                 &changed.params.payload_bytes(&changed.context).unwrap(),
             ));
-            assert!(prepare_at(&fixture.0, changed).is_err());
+            assert!(prepare_at(&fixture.root, changed).is_err());
             assert_eq!(std::fs::read(&destination).unwrap(), before);
         }
     }
