@@ -52,7 +52,7 @@ use once_cell::sync::Lazy;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
 
-use crate::memory::tokenize::tokenize;
+use crate::retrieval::tokenize::tokenize;
 
 /// Multi-word concepts, matched against the raw lowercased query before the token pass.
 ///

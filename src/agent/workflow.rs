@@ -124,9 +124,6 @@ pub(crate) fn workflow_task_text_only_effect_free(task: &WorkflowTask) -> bool {
                         | "search_files"
                         | "codebase_search"
                         | "git_inspect"
-                        | "memory_search"
-                        | "memory_list"
-                        | "memory_profile"
                         | "todo_write"
                         | "skill_load"
                         | "lsp_definition"
@@ -425,7 +422,7 @@ fn resolve_workflow_dispatch(
             let registry = agent_registry(def, root);
             let system = build_agent_subagent_prompt(
                 def,
-                &registry.names(),
+                &registry.advertised_names(),
                 root,
                 &ep.model,
                 date,
@@ -438,7 +435,7 @@ fn resolve_workflow_dispatch(
             let registry = role_registry(&task.role, root);
             let system = build_subagent_prompt(
                 &task.role,
-                &registry.names(),
+                &registry.advertised_names(),
                 root,
                 &ep.model,
                 date,
@@ -1032,7 +1029,10 @@ fn workflow_evidence_diagnostic(
                 .is_some_and(|result| {
                     result.evidence_images.iter().any(|image| {
                         let provenance = &image.metadata().provenance;
-                        provenance.evidence_id.as_deref() == Some(id.as_str())
+                        (provenance.evidence_id.as_deref() == Some(id.as_str())
+                            || (id == crate::agent::LATEST_CAPTURE_SELECTOR
+                                && provenance.source == "browser_screenshot"
+                                && provenance.crop.is_none()))
                             && images.iter().any(|selected| {
                                 selected.metadata().provenance.evidence_id == provenance.evidence_id
                                     && selected.metadata().provenance.design_scope
@@ -1416,7 +1416,9 @@ async fn run_workflow_with_cancel(
     // The same cap the `workflow` tool applies: two chars per token of the model's window, never
     // below one summary. The CLI passed `None` here, so a 32-task spec could build a ~128 k-char
     // synthesis request that the endpoint then refused.
-    let window = crate::ui::context_report::resolve_ctx_window(model).0;
+    let window = crate::core::model_context::discover(&synthesis.ep)
+        .await
+        .tokens;
     let synth_prompt = build_synthesis_prompt_capped(
         &spec.name,
         instruction,
@@ -1472,21 +1474,35 @@ async fn run_workflow_with_cancel(
             Vec::new()
         },
     );
+    let synthesis_ctx = parent_ctx
+        .with_resource_scope(format!(
+            "{}/synthesis/{parent_id}",
+            parent_ctx.resource_scope()
+        ))
+        .without_references();
     match await_synthesis(
         &cancel,
         parent_ctx.deadline(),
         crate::agent::task_tool::subagent_call_timeout(),
-        || {
-            stream_chat_with_visual_contract_frozen(
-                http,
+        || async {
+            crate::llm::media::with_image_delivery(
+                &synthesis_ctx,
                 &synthesis_endpoint.base_url,
                 &synthesis_endpoint.api_key,
                 &synthesis_endpoint.model,
-                synth_messages,
-                true,
-                &synthesis.config,
-                synthesis.effort.clone(),
+                stream_chat_with_visual_contract_frozen(
+                    http,
+                    &synthesis_endpoint.base_url,
+                    &synthesis_endpoint.api_key,
+                    &synthesis_endpoint.model,
+                    synth_messages,
+                    true,
+                    &synthesis.config,
+                    synthesis.effort.clone(),
+                ),
             )
+            .await
+            .map(|(text, _)| text)
         },
     )
     .await
@@ -1668,18 +1684,15 @@ pub(crate) async fn fan_out(
     .await
 }
 
+type DeferredWorkflowReport = (
+    Option<crate::agent::orchestration::Track>,
+    TaskOutcome,
+    Option<crate::agent::speculative_attempt::ReleasedAttempt>,
+);
+
 struct DeferredWorkflowReports {
     parent_scope: String,
-    pending: std::cell::RefCell<
-        std::collections::HashMap<
-            AttemptKey,
-            (
-                Option<crate::agent::orchestration::Track>,
-                TaskOutcome,
-                Option<crate::agent::speculative_attempt::ReleasedAttempt>,
-            ),
-        >,
-    >,
+    pending: std::cell::RefCell<std::collections::HashMap<AttemptKey, DeferredWorkflowReport>>,
 }
 
 impl DeferredWorkflowReports {
@@ -2130,11 +2143,18 @@ pub(crate) async fn run_workflow_collect_observation(
         .as_ref()
         .and_then(|s| s.prompt.as_deref())
         .unwrap_or(default_instruction);
+    let synthesis_window = if context_window == 0 {
+        0
+    } else {
+        crate::core::model_context::discover(&synthesis.ep)
+            .await
+            .tokens
+    };
     let synth_prompt = build_synthesis_prompt_capped(
         &spec.name,
         instruction,
         &results,
-        context_window
+        synthesis_window
             .checked_mul(2)
             .filter(|&chars| chars >= SUMMARY_CHAR_CAP),
     );
@@ -2166,23 +2186,36 @@ pub(crate) async fn run_workflow_collect_observation(
             Vec::new()
         },
     );
+    // Synthesis shares performance accounting, not the parent's attachment grant or observations.
+    let synthesis_ctx = parent_ctx
+        .with_resource_scope(format!(
+            "{}/synthesis/{parent_id}",
+            parent_ctx.resource_scope()
+        ))
+        .without_references();
     let merged = match await_synthesis(
         &cancel,
         parent_ctx.deadline(),
         crate::agent::task_tool::subagent_call_timeout(),
         || async {
-            crate::llm::client::chat_with_tools_frozen(
-                http,
+            crate::llm::media::with_image_delivery(
+                &synthesis_ctx,
                 &synthesis_endpoint.base_url,
                 &synthesis_endpoint.api_key,
                 &synthesis_endpoint.model,
-                &synth_messages,
-                &[],
-                synthesis.effort.clone(),
-                &synthesis.config,
+                crate::llm::client::chat_with_tools_frozen(
+                    http,
+                    &synthesis_endpoint.base_url,
+                    &synthesis_endpoint.api_key,
+                    &synthesis_endpoint.model,
+                    &synth_messages,
+                    &[],
+                    synthesis.effort.clone(),
+                    &synthesis.config,
+                ),
             )
             .await
-            .map(|turn| turn.content.unwrap_or_default())
+            .map(|(turn, _)| turn.content.unwrap_or_default())
         },
     )
     .await
@@ -2330,8 +2363,8 @@ fn workflow_fingerprint(spec: &WorkflowSpec) -> Result<u64> {
         .iter()
         .map(|task| {
             serde_json::json!({"task": task,
-            "routing": task.prepared.as_deref().map(&dispatch),
-            "recovery_routing": task.prepared_metis.as_deref().map(&dispatch)})
+            "routing": task.prepared.as_deref().map(dispatch),
+            "recovery_routing": task.prepared_metis.as_deref().map(dispatch)})
         })
         .collect();
     let synthesis = spec.prepared_synthesis.as_ref().map(|s| {
@@ -2971,6 +3004,11 @@ async fn run_one_task_owned(
         .map(|design| design.evidence_scope())
         .unwrap_or_default();
     let system = crate::agent::task_tool::child_design_system(&system, &child_ctx);
+    let context_window = if context_window == 0 {
+        0 // preserve an explicit disabled guard
+    } else {
+        crate::core::model_context::discover(&ep).await.tokens
+    };
     let mut cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
@@ -3014,12 +3052,7 @@ async fn run_one_task_owned(
         // without consulting the (parent-owned) process-global todo list, so a child that goes
         // flat gets one bounded change-of-approach turn instead of dying on the spot.
         max_stall_recoveries: 1,
-        // The PARENT's resolved window, so tool-result clearing and the wrap-up guard are ON for a
-        // child (the clearing/guard knobs themselves come from `AgentConfig::default()` below, which
-        // already carries the production percentages — they are inert while this is 0).
-        //
-        // A child is intentionally narrow: the one soft extension reaches 30 total steps. Split a
-        // broader request into another workflow call instead of silently multiplying child budgets.
+        // Actual child-route limit; a differently routed parent cannot lend it extra capacity.
         context_window,
         // Absolute attempt ceiling, tightened by the inherited parent deadline below. Expiry
         // remains an incomplete outcome; it neither refreshes the parent budget nor proves that
@@ -3144,7 +3177,9 @@ async fn run_one_task_owned(
     let result = match initial_user {
         Ok(user) => {
             msgs.push(user);
-            run_agent_loop(&chat, &cfg, &registry, &mut msgs).await
+            // Keep the streaming loop out of every enclosing scheduler/attempt future. In debug
+            // builds its inline state otherwise multiplies stack copies on the native tool bridge.
+            Box::pin(run_agent_loop(&chat, &cfg, &registry, &mut msgs)).await
         }
         Err(error) => Err(error),
     };
@@ -4148,6 +4183,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workflow_child_future_stays_within_stack_frame_budget() {
+        let http = reqwest::Client::new();
+        let spec = WorkflowSpec {
+            name: "frame-size".into(),
+            tasks: Vec::new(),
+            synthesis: None,
+            prepared_synthesis: None,
+        };
+        let collect = run_workflow_collect_observation(
+            &http,
+            "http://127.0.0.1:1/v1",
+            "unused",
+            "fixture",
+            crate::core::approval::ApprovalMode::Ask,
+            &spec,
+            false,
+            Path::new("."),
+            0,
+        );
+        let parent_ctx = crate::core::exec_ctx::ExecutionContext::default();
+        let task = WorkflowTask::default();
+        let child = run_one_task_with_context(
+            &http,
+            "http://127.0.0.1:1/v1",
+            "unused",
+            "fixture",
+            crate::core::approval::ApprovalMode::Ask,
+            Path::new("."),
+            "fixture-date",
+            &task,
+            None,
+            crate::core::cancel::TurnCancel::default(),
+            0,
+            &parent_ctx,
+        );
+        assert!(std::mem::size_of_val(&collect) <= 16 * 1024);
+        let child_bytes = std::mem::size_of_val(&child);
+        assert!(
+            child_bytes <= 64 * 1024,
+            "workflow child future is {child_bytes} B; keep the streaming loop boxed"
+        );
+    }
+
+    #[test]
     fn workflow_terminal_transport_statuses_survive_as_distinct_non_retryable_categories() {
         use crate::llm::delegated::Failure;
         for (failure, status) in [
@@ -4877,19 +4956,21 @@ mod tests {
             assert_ne!(workflow_fingerprint(&changed).unwrap(), hash, "{field}");
         }
         for recovery in [false, true] {
-            let mut changed = original.clone();
-            let task = &mut changed.tasks[0];
-            let d = std::sync::Arc::make_mut(if recovery {
-                task.prepared_metis.as_mut().unwrap()
-            } else {
-                task.prepared.as_mut().unwrap()
-            });
-            d.image_policy = VisionPolicy::Unsupported;
-            assert_ne!(
-                workflow_fingerprint(&changed).unwrap(),
-                hash,
-                "worker/recovery vision policy"
-            );
+            for policy in [VisionPolicy::Supported, VisionPolicy::Unsupported] {
+                let mut changed = original.clone();
+                let task = &mut changed.tasks[0];
+                let d = std::sync::Arc::make_mut(if recovery {
+                    task.prepared_metis.as_mut().unwrap()
+                } else {
+                    task.prepared.as_mut().unwrap()
+                });
+                d.image_policy = policy;
+                assert_ne!(
+                    workflow_fingerprint(&changed).unwrap(),
+                    hash,
+                    "worker/recovery resolved policy differs from internal Unknown"
+                );
+            }
         }
         for field in ["max_tokens", "cache", "visuals"] {
             let mut changed = original.clone();

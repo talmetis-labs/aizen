@@ -289,9 +289,8 @@ pub fn lane_for(name: &str) -> Option<Lane> {
             Lane::MemoryRead
         }
         "memory_save" | "memory_update" | "memory_forget" => Lane::MemoryWrite,
-        "file_read" | "file_glob" | "search_files" | "image_read" | "reference_read" => {
-            Lane::FileRead
-        }
+        "file_read" | "file_glob" | "search_files" | "image_read" | "reference_read"
+        | "image_context" => Lane::FileRead,
         "reference_compare" | "reference_trace" => Lane::Todo,
         "file_edit" | "file_write" | "file_move" => Lane::FileWrite,
         "shell_run" => Lane::Shell,

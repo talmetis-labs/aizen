@@ -15,7 +15,7 @@ The product's three-line pitch (from the splash): *"One fast binary: chat · too
 
 What makes it distinctive (the parts worth featuring in docs/marketing):
 
-- **A self-learning memory brain** — a markdown knowledge base that passively learns durable facts about the user/project from each turn, ranks them by reuse, and injects the important ones into every prompt.
+- **Optional persistent Memory** — explicitly selected providers can recall user/project facts; no provider is a normal, fully usable Core configuration. Learning and conversation sharing require separate grants.
 - **A layered identity model** — Soul (operating policies) → Persona (character) → Self-memory (what the character has become) → User-memory → Skills, each a distinct, optional prompt block.
 - **Multi-surface** — the same agent runs as an interactive TUI, a one-shot command, a Telegram/Discord bot, and an OS-scheduled job.
 - **Safety-first autonomy** — a hard command floor that can never be bypassed, plus tiered approval (interactive, session-wide, or routed to your phone).
@@ -75,10 +75,11 @@ A key cross-cutting fact for design: **output adapts to context** — rich ANSI/
 
 Every tool is one clear capability. Tools are either **read-only** (run freely, often in parallel) or **destructive** (approval-gated). Each call renders as a `⚙ tool_name   target` event line with its result **digest right-aligned on the same line** (lines read, matches found, `+adds −dels`, exit code), tinted by outcome (green ok / salmon error). Under the retained TUI the digest updates that same line in place; on the classic/one-shot surface the line is drawn once with the digest and a too-narrow terminal wraps it to a second row. Edits push a boxed `diff · <path>` preview, the task list a boxed in-place `☑ done/total · plan` checklist, and a passing verify gate a green `✓ <cmd> — …` line. The full output goes to the model; only the digest reaches the terminal.
 
-**Memory (read-only):**
-- `memory_search` — recall a specific fact (query + limit).
-- `memory_profile` — the aggregated user profile (verbosity, autonomy, tooling, stack…) with confidence + cited facts.
-- `memory_ask` — answer one question about the user; **abstains rather than guessing**.
+**Optional provider Memory (top-level, capability/grant dependent):**
+- `memory_search` / `memory_list` — search or inspect records through the selected provider.
+- `memory_save` / `memory_update` / `memory_forget` — approval-gated provider record mutations.
+- No Memory provider tools are advertised when Memory is unavailable or disabled; derived
+  profile/Q&A views, when supported, use the provider's management CLI rather than built-in tools.
 
 **Files:**
 - `file_read` — read a file or a 1-based line range (whole-file budget ~2000 lines / 200 KB, else head+tail preview). *Read-only.*
@@ -125,42 +126,34 @@ Every tool is one clear capability. Tools are either **read-only** (run freely, 
 
 ---
 
-### D. Memory brain — `aizen memory …`
+### D. Optional persistent Memory — `aizen memory …`
 
-The headline differentiator. **One fact = one markdown file** under `~/.aizen/cli-memory/entries/<id>.md` with YAML frontmatter (name, description, `type`, created/updated, and learned-fact metadata: source, confidence, reinforced count, sessions, validTo, supersededBy).
+Persistent User/Project Memory is supplied only by an **explicitly installed, eligible and selected
+external provider**. Core has no built-in fact-store fallback and remains a functioning coding agent
+when Memory is unavailable or disabled. Installing a package neither starts nor selects it.
 
-**Four fact types** (drive ranking priority): `user` (durable preferences), `feedback` (high-confidence corrections), `project` (task-scoped), `reference` (background, default).
+`aizen memory status --json` reports local provider state without starting the provider. Record
+commands such as `add`, `list`, `show`, `search`, `edit` and `forget` dispatch to the selected provider
+subject to its capabilities, executable authorization, scope and grants. Provider-specific commands
+may expose derived profiles, learning, review queues, archives and maintenance; these are not Core
+engine guarantees. `aizen memory --help` and the [reference](REFERENCE.md) describe the current CLI.
 
-**Subcommands:**
-| Command | What it does |
-|---|---|
-| `add <name> [-d desc] [-t type] [-b body]` | Manually create one fact (body from stdin if omitted). |
-| `list` | All active memories `[type] name — desc`; notes hidden/superseded count. |
-| `show <id|name>` | Full content of one memory. |
-| `search <query> [-k N] [--dimension …]` | Ranked lexical retrieval; `score [type/dimension] name`. |
-| `frozen [--rebuild]` | Show the always-on prompt-prefix block (with token/entry counts). |
-| `learn [text] [--yes] [--dry-run]` | Passive ingest of a turn → extract/sanitize/scan/route/store, with a report. |
-| `style` | Show the learned user-style profile (STYLE.md). |
-| `profile [--json]` | Derived user profile per dimension (language, verbosity, autonomy, tooling, stack, frustrations) with confidence + cited facts. |
-| `ask <question> [--json]` | Dialectic Q&A about the user; **abstains** when evidence is insufficient or the question is counterfactual. |
-| `review [--promote id] [--clear]` | Manage the mid-confidence review queue. |
-| `as-of <YYYY-MM-DD>` | Bi-temporal: what was true on a given date. |
-| `supersede <old> <new>` | Mark a fact replaced (history kept, not deleted). |
-| `archive` / `restore <id>` | List LRU-evicted memories / bring one back. |
-| `compact` | Enforce the inferred-fact LRU cap (archive oldest). |
+**Ownership and consent:**
+- **Provider:** persistent facts, ranking, standing/recall context, store layout and maintenance.
+  Mnemos preserves the extracted fact engine, including lexical ranking and optional semantic
+  retrieval; its package/data/settings are separate from Core. Other compatible providers are valid.
+- **Core:** Runtime, Skills, Persona, Soul, conversation history/resume, temporary in-process
+  `<session_memory>` notes and codebase retrieval. These do not require a Memory provider.
+- **Learning:** the host's automatic-learning policy does not grant access on its own. Provider
+  execution, conversation sharing and learning permissions remain explicit and separate. No real
+  legacy store is automatically opened, adopted, migrated or converted.
+- **Models/cache:** Core's `dense` feature serves codebase retrieval. Persistent Memory model
+  configuration/provisioning belongs to its provider; the former built-in model-download flow is
+  not a Core promise. The historical `cli-memory` namespace still holds Core codebase caches, not
+  an active built-in fact engine.
 
-**Key concepts to document:**
-- **Three memory layers (token-lean):**
-  1. **L1 Always-on frozen core** (`<user_memory>`) — **STYLE.md + global user prefs only**. Project-zone facts never spend the prefix budget. Built fresh at **session start**, then **immutable mid-session** (prefix-cache stability). Cap ~800 tokens (chars/4). Stored **per-repo** at `~/.aizen/cli-memory/core/active/<project-slug>.md` so repo A's core never injects into repo B.
-  2. **L2 Session working memory** (`<session_memory>`, optional) — temporary in-process notes for the current session. Inferred / mid-confidence facts park here first (not durable). Cap ~300 tokens; empty → no tag. Cleared on `/new` / `/reset` / handoff / rebuild.
-  3. **L3 Durable long-tail** (`entries/*.md`) — zone-tagged (`scope: <slug>` or global). Retrieved via `memory_search` (default = current workspace + global). Project knowledge lives **here**, not in always-on.
-- **Passive auto-learning** (on by default): free regex extraction (zero token cost) → sanitize → **threat-scan** → **consolidate** → **route**:
-  - **Explicit** (`remember` / correction / `#…`) → durable L3 (and STYLE when confirmed).
-  - **Inferred** preferences / one-shots → L2 session only (no permanent pollution).
-  - Style CorePromote still confirmation-gated (non-TTY / denied → no STYLE write).
-- **Retrieval & ranking:** a BM25 **lexical floor** (always on), an optional **fuzzy** Jaro-Winkler bridge (`AIZEN_MEM_FUZZY=1`), and a **dense semantic** tier via RRF fusion — **on by default on `--features dense` release builds** (the model2vec backend), off on a default build (only the non-semantic fallback embedder ships there). The dense tier is **query-gated**: it fuses only when the top lexical hit covers <60% of the query tokens (paraphrase / cross-lingual), so a confident literal match keeps BM25's precision. Run `aizen memory model-download` once to fetch the ~30 MB model into `~/.aizen/models/`. Override with `AIZEN_MEM_DENSE=0/1`. Final score = `BM25 × decay × salience` — **facts rise/sink on reuse and reinforcement, not age alone**. Workspace scope filter runs **before** BM25 so IDF is computed on the in-view zone only.
-- **Anti-bloat:** LRU caps + archive (recoverable), recency decay (inferred facts only), dedup-on-write, supersede. Deliberate (manual) facts never auto-evict.
-- **Derived views are free/local** (no LLM): `profile` and `ask` compute deterministically and cite their basis; `ask` has a hard **abstain firewall** for unknowns.
+See [Memory plugins](MEMORY_PLUGINS.md) for the trust/protocol contract and remaining verification
+limits. Persona evolution is separate from provider Memory auto-learning.
 
 ---
 
@@ -254,7 +247,9 @@ transport ambiguity.
 
 ### L. Benchmarks — `aizen bench …`
 
-Internal quality gates (useful for a "trust/quality" docs section, not end-user UI): `memory` (anti-oracle recall, with `--split`, `--hybrid`, `--evolution`), `profile` (B2 golden set), `dialectic` (B3 Q&A incl. abstain-when-unknown).
+Internal Core quality gates are `loop` (scripted offline loop behavior), `tasks` (recorded task tapes;
+missing tapes are reported as skipped) and `sessions` (local saved-conversation statistics). Persistent
+Memory recall/profile/dialectic benchmarks belong to the standalone provider, not `aizen bench`.
 
 ---
 
@@ -322,7 +317,7 @@ The system prompt is split into two leading `system` messages for provider-cache
 4. `<agent_identity>` — **Soul** (durable operating policies)
 5. `<persona>` — the active character
 6. `<self>` — the persona's accumulated episodes + insights
-7. `<user_memory>` — STYLE + global user prefs only (always-on frozen core; per-repo cache)
+7. Optional provider standing context — validated and rendered by Core; absent without an active provider, not a built-in STYLE/frozen store
 8. `<session_memory>` — optional temporary notes for this session (inferred facts; cleared on `/new`)
 9. `<skills>` / `<agents>` / reply-visuals / ultimate-mode contracts
 
@@ -340,7 +335,7 @@ scratch → how to do things* — is the conceptual heart of Aizen.
 | `aizen chat [--prompt]` | One-shot streaming chat. |
 | `aizen agent <task> [--yes --max-iters -m]` | Run the agentic loop. |
 | `aizen workflow <spec.json> [--trace --yes -m]` | Multi-agent fan-out + synthesis. |
-| `aizen memory <add\|list\|show\|search\|frozen\|learn\|style\|profile\|ask\|review\|as-of\|supersede\|archive\|restore\|compact>` | The memory brain. |
+| `aizen memory …` | Offline provider status/configuration and capability-dependent record management; no built-in engine. |
 | `aizen skill <list\|show\|add\|delete\|fetch\|search\|install>` | Reusable procedures. |
 | `aizen persona <list\|show\|new\|use\|clear\|self\|remember\|block>` | Characters + self-memory. |
 | `aizen soul <show\|set\|clear\|path>` | Durable operating identity. |
@@ -350,7 +345,7 @@ scratch → how to do things* — is the conceptual heart of Aizen.
 | `aizen crawl <url…>` | Website crawler. |
 | `aizen time <save\|list\|restore\|undo\|redo\|prune\|doctor\|gc\|clear>` | Crash-recoverable Time Machine with private external store. |
 | `aizen cron <add\|list\|remove>` | OS-scheduled jobs. |
-| `aizen bench <memory\|profile\|dialectic>` | Quality benchmarks. |
+| `aizen bench <loop\|tasks\|sessions>` | Core loop/task evaluation and local session statistics. |
 
 ---
 
@@ -362,10 +357,9 @@ Home root: **`~/.aizen/`** (override with `AIZEN_HOME`). Project-local overrides
 |---|---|
 | `~/.aizen/config.json` | Endpoint + behavior settings |
 | `~/.aizen/SOUL.md` | Operating identity |
-| `~/.aizen/cli-memory/entries/*.md` | Memory facts (one per file; zone via `scope:`) |
-| `~/.aizen/cli-memory/STYLE.md` | Learned user-style core (always-on) |
-| `~/.aizen/cli-memory/core/active/<slug>.md` | Per-repo frozen-core cache |
-| `~/.aizen/cli-memory/{review,archive,embed-cache}/` | Review queue · LRU archive · dense cache |
+| `~/.aizen/cli-memory/{codebase,embed-cache}/` | Core codebase indexes/embeddings; historical namespace retained |
+| `~/.aizen/cli-memory/entries/`, `STYLE.md`, `core/`, review/archive | Legacy Memory data, preserved but not automatically opened/adopted by Core |
+| Provider-resolved data root | Persistent Memory records and provider maintenance state; see `aizen memory where` |
 | `~/.aizen/personas/<name>.md` · `<slug>.self/` | Persona cards · self-memory streams |
 | `~/.aizen/skills/*.md` | Saved skills |
 | `~/.aizen/commands/**/*.md` | Custom slash commands |
@@ -382,7 +376,7 @@ Home root: **`~/.aizen/`** (override with `AIZEN_HOME`). Project-local overrides
 **Docs (information architecture suggestion):**
 1. *Getting started* — install (one binary), `aizen config`, first chat.
 2. *The agent* — loop, tools, approval/safety, verify gate.
-3. *Memory brain* — the killer feature; lead with "it learns you," then the subcommand reference.
+3. *Optional persistent Memory* — provider install/selection, trust, consent and record management; make the no-provider configuration first-class.
 4. *Identity* — Soul → Persona → Self-memory, with the layered-prompt diagram (§6).
 5. *Extending* — Skills, custom commands, Apps/MCP.
 6. *Automation* — Telegram/Discord bots, cron, notifications.

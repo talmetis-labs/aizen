@@ -387,9 +387,11 @@ fn compare_inner(
     let mut diagnostic = vec![0; reference.pixels.len()];
     for ((a, b), dst) in reference
         .pixels
-        .chunks_exact(4)
-        .zip(output.pixels.chunks_exact(4))
-        .zip(diagnostic.chunks_exact_mut(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(output.pixels.as_chunks::<4>().0.iter())
+        .zip(diagnostic.as_chunks_mut::<4>().0.iter_mut())
     {
         dst.copy_from_slice(&[
             a[0].abs_diff(b[0]),
@@ -401,9 +403,11 @@ fn compare_inner(
     let diff = tool_media::encode_rgba_png(&diagnostic, reference.width, reference.height);
     for ((a, b), dst) in reference
         .pixels
-        .chunks_exact(4)
-        .zip(output.pixels.chunks_exact(4))
-        .zip(diagnostic.chunks_exact_mut(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(output.pixels.as_chunks::<4>().0.iter())
+        .zip(diagnostic.as_chunks_mut::<4>().0.iter_mut())
     {
         if a == b {
             dst.copy_from_slice(b);
@@ -544,7 +548,7 @@ pub(crate) fn decode_supported(bytes: &[u8], mime: &str) -> Result<RgbaImage> {
             let (info, decoded) = tool_media::decode_png(bytes)?;
             let channels = match info.color_type { png::ColorType::Grayscale => 1, png::ColorType::GrayscaleAlpha => 2, png::ColorType::Rgb => 3, png::ColorType::Rgba => 4, _ => bail!("unsupported expanded PNG color") };
             let mut pixels = vec![0; tool_media::rgba_size(info.width, info.height)?];
-            for (source, target) in decoded.chunks_exact(channels).zip(pixels.chunks_exact_mut(4)) {
+            for (source, target) in decoded.chunks_exact(channels).zip(pixels.as_chunks_mut::<4>().0.iter_mut()) {
                 let rgba = match channels { 1 => [source[0],source[0],source[0],255], 2 => [source[0],source[0],source[0],source[1]], 3 => [source[0],source[1],source[2],255], _ => [source[0],source[1],source[2],source[3]] };
                 target.copy_from_slice(&rgba);
             }
@@ -562,7 +566,7 @@ pub(crate) fn decode_supported(bytes: &[u8], mime: &str) -> Result<RgbaImage> {
             let mut rgb = vec![0; decoder.total_bytes() as usize];
             decoder.read_image(&mut rgb)?;
             let mut pixels = vec![0; size];
-            for (p,t) in rgb.chunks_exact(3).zip(pixels.chunks_exact_mut(4)) { t.copy_from_slice(&[p[0],p[1],p[2],255]); }
+            for (p,t) in rgb.as_chunks::<3>().0.iter().zip(pixels.as_chunks_mut::<4>().0.iter_mut()) { t.copy_from_slice(&[p[0],p[1],p[2],255]); }
             Ok(RgbaImage { width,height,pixels })
         }
         _ => bail!("unsupported reference comparison format; use explicit static 8-bit PNG or opaque RGB8 JPEG"),

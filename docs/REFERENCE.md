@@ -47,27 +47,38 @@ it for its own paste, so the keystroke never reaches `aizen`):
   turns image-file paths on the line into attachments (you can also type/paste a path). Real image
   files only — prose like `nope.png` that isn't a file stays as text.
 
-Both attach the image to your text; the selected model must support vision. Ordinary user
-attachments use a **balanced send-only preview** by default when safe: static opaque 8-bit PNGs
-may become smaller JPEGs while canonical attachments and stored blobs remain unchanged.
-`AIZEN_IMAGE_SEND_MODE=original` preserves the attached bytes on the wire. Unsupported/color-sensitive
-formats, transparency, animation, malformed inputs or a busy image-memory budget retain originals;
-remote image URLs are never fetched by the optimizer. Tool images and output screenshots are not
-silently compressed. See [Visual design and tool images](#visual-design-and-tool-images) for grants,
-exact reference inspection and delivery limits.
+Both attach the image to your text; the selected model must support vision. Live canonical attachments remain unchanged; input image pixels are not saved in sessions or recovery. The compatibility default remains **Balanced**: eligible opaque
+8-bit PNGs may use smaller JPEGs on the wire. Choose `aizen config set --image-mode auto` to preserve
+unknown/text/UI pixels, `original` to disable transforms, or `photo` to permit the JPEG ladder.
+The interactive picker is under `/config` → Display → Image sending; Compatibility keeps Balanced.
+Headless runs can override each selection with `--image-mode auto|original|photo` (repeat once per
+selected image, in `--image` path order). Exact reference requirements override
+Photo; `AIZEN_IMAGE_SEND_MODE=original` is an unconditional no-transform rollback. Original is a
+representation preference, not a retention pin. Unsupported/color-sensitive formats, transparency,
+animation, malformed inputs or busy codec admission retain originals; remote URLs are never fetched.
+Typed tool captures are not silently compressed. See
+[Visual design and tool images](#visual-design-and-tool-images) for grants, lifecycle and limits.
 
 **Ctrl-E** expands a tool result into a scrollable overlay — the one under your selection when it
 sits on a tool row, else the most recent; a failed command already shows its last lines under its
 row. **Ctrl-X** removes the most recent attachment (keeps your text); **Esc** clears the line and all
-attachments at once. Clipboard screenshots are downscaled to ≤1568px **at ingress**, before canonical
-attachment storage; original send mode cannot recover pre-ingress clipboard pixels. Attach the
-original file for full-resolution references. The token gauge ignores attachments (they ride outside
-`content`). Clipboard grab is desktop-only (Windows/macOS); drag-drop/path works everywhere.
+attachments at once. Clipboard screenshots retain original pixels within the decoded and encoded
+limits; oversized input is refused with a crop/size diagnostic rather than silently downscaled.
+The context gauge uses selected-image dimensions with a conservative, provider-independent planning
+allowance, not a billed-token formula. Clipboard grab is desktop-only (Windows/macOS);
+drag-drop/path works everywhere.
 
-The context window is **auto-detected** from the provider's `/models` when it reports one
-(OpenRouter/LiteLLM-style gateways do; the bare OpenAI schema doesn't). When it's absent the bar
-shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M · DeepSeek 64K · else
-128K). Override it explicitly with `aizen config set --context-window <tokens>`.
+Core resolves the context window at execution from the **exact endpoint, model and account**.
+It reads `/models` (then exact-model detail when needed), caches positive metadata for 24 hours and
+misses for 10 minutes, and does not send a completion probe or rewrite your config. Discovery is
+bounded to three seconds on a cold route. Provider metadata is **provider-reported**, not proof of
+the deployed gateway's true capacity; output limits are not mistaken for input context. When no
+usable limit is available (including Codex), the bar remains `ctx·est`: a model-name estimate
+(Claude 200K · Gemini/GPT-4.1 1M · DeepSeek 64K · else 128K). `/context` names the source.
+Manual overrides remain optional: `/config` → Context window override, or
+`aizen config set --context-window <tokens>`. Existing saved nonzero values are honored as overrides.
+Changing the saved endpoint, account or model clears its old override; a new `--context-window`
+passed in the same command takes precedence. `--context-window 0` returns to automatic resolution.
 
 **Slash commands** (the meta layer):
 
@@ -81,7 +92,7 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 | `/login` | sign in to Aizen in a browser — the session opens the gateway, so nothing is stored but the token |
 | `/logout` | leave Aizen here: the session **and** the pinned key. Revokes neither |
 | `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
-| `/memory [query]` | show your profile, or search memory |
+| `/memory [query]` | offline provider status, or search the explicitly selected Memory provider |
 | `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory · `coding on\|off` keeps it on coding turns |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
 | `/commands` | your **custom slash commands** — markdown macros you fire (see below) |
@@ -104,19 +115,27 @@ shows `ctx·est` and estimates by model name (Claude 200K · Gemini/GPT-4.1 1M �
 
 | type | does |
 | --- | --- |
-| `#<text>` | **remember** `<text>` as a durable memory fact in one keystroke (straight into the brain the agent reads) — sends no turn |
+| `#<text>` | save a durable fact through the selected, enabled Memory provider — sends no agent turn; unavailable without a provider |
 | `!<cmd>` | **shell escape** — run `<cmd>` and show its output (the hard safety floor still blocks catastrophic commands) — sends no turn |
 | `@<path>` | inline that file's contents into your message (only when the file exists — `@handle` in prose is left alone) |
 | `` !`<cmd>` `` | splice a **read-only** command's output into your message (same gate as custom commands) |
 
 **Context window + auto-compact** live in **`/config`** (so the settings stay in one place). The
-window drives the `% context` HUD (auto-detected from `/models` when the provider reports it, else
-estimated by model name, else whatever you type). Auto-compact (default **80%**, the `⊟ 80%` marker
-on the status line) summarizes older turns into one dense note when usage crosses the threshold —
-during a turn, between the agent's steps, so a long task compacts mid-flight instead of after it
-ends — keeping the last few turns verbatim; the cut is always at a user-message boundary (no
-orphan tool results). `/compact` forces it now. Both also settable non-interactively:
+window drives both the `% context` HUD and runtime guards. Auto-compact (default **80%**, the
+`⊟ 80%` marker on the status line) summarizes older turns into one dense note when usage crosses the
+threshold — during a turn, between the agent's steps. Multi-turn histories keep recent user turns;
+a long single-turn task keeps its original prompt and recent assistant/tool steps. Cuts preserve
+complete tool groups. If nothing older can be cut, the loop skips compaction without reporting a
+summary failure. `/compact` forces an eligible cut now. Both settings are also available through
 `aizen config set --context-window <tokens> --compact-threshold <0–95>` (`0` = off).
+
+The summarizer uses **its own route's** context/output limits, not the coding model's large output
+cap. Oversized transcripts are split into bounded text-only portions, then merged, with bounded
+calls/reduction depth and smaller requests on a provider context-overflow rejection. A compaction
+has a separate 300-second overall deadline (discovery + portions + merge + retries); an explicit
+positive `AIZEN_CHORE_CALL_SECS` overrides it, still bounded by the sub-agent call ceiling. Short
+background learning chores retain their 60-second default. Failed, empty, truncated or cancelled
+auto-compaction does not replace the original history; it is not reported as a successful boundary.
 
 Two cheaper measures run before compaction ever triggers, whatever the threshold: tool results
 older than the eight most recent collapse to a one-line digest (tool, target, size, and the scratch
@@ -157,7 +176,8 @@ aizen serve              # start listening (Ctrl-C to stop)
 ```
 In a chat: a plain message runs read-only-safe (destructive ops prompt you here); prefix `/agent `
 to run fully autonomously. **Follow-ups keep context** — "now fix it" works because each chat's
-conversation is carried across messages (memory + SOUL + persona seeded once per session). `/new`
+conversation is carried across messages (SOUL and persona remain built in; persistent Memory is
+optional and comes only from the explicitly selected provider). `/new`
 (or `/reset`) starts fresh; `/resume` reports how much context is kept. If the agent needs to
 disambiguate it asks (the `clarify` tool) and your next message is the answer. Token lives in
 `~/.aizen/cli-config.json` (or `AIZEN_TELEGRAM_TOKEN`); only `allowed_chat_ids` may talk to it. The
@@ -216,8 +236,8 @@ stamps from inside its own event loop, and distinguishes idle from busy — so a
 notice a wedged loop won't restart a container that's ten minutes into a legitimate build. Raise
 `AIZEN_HEALTH_MAX_BUSY_SECS` if your turns routinely run longer than 30 minutes.
 
-Build without the dense retrieval tier by passing `FEATURES=` (empty) — a smaller image, at the cost
-of the embedding-based memory tier.
+Build without the dense retrieval tier by passing `FEATURES=` (empty) — a smaller Core image without
+semantic codebase retrieval. A separately installed Memory provider has its own build features.
 
 ### Host it on Kubernetes
 
@@ -583,34 +603,62 @@ servers, `cache_control` on some gateways, `reasoning_effort` out of range): the
 field is dropped or renamed (`max_tokens` → `max_completion_tokens`), the request is re-sent, and
 the model is remembered for the session so it costs one failed call per model, once.
 
+For a route that requires `max_completion_tokens`, set `"output_token_parameter":
+"max_completion_tokens"` in the Core JSON config; `"max_tokens"` explicitly selects the older wire
+field, and omission retains ordinary chat's reactive compatibility. This is a config-wide setting,
+not endpoint discovery or a provider-profile override. It chooses the field, not the cap: `max_tokens`
+continues to set the numerical ceiling. Prepared Memory model jobs do not probe or retry, so a cold
+route requiring the newer field needs this explicit setting. Those jobs honor the tighter of the
+captured turn's cap and the job cap, and refuse HTTP dispatch during tape replay/strict mode.
+
 ### `aizen models` — list the provider's models
 ```bash
 aizen models                       # GET {base}/models, marks your default
 aizen config set --model <id>      # pick one as the default
 ```
 
-The memory brain lives under `~/.aizen/cli-memory/` (override the root with `AIZEN_HOME`).
-Memory commands are fully offline — no creds needed.
+### `aizen codebase model-download` — explicit local model provisioning
 
-Retrieval is **Unicode-aware**: the lexical tokenizer NFC-normalizes before lowercasing and
-splits on `\p{L}\p{N}_`, so Vietnamese (and any accented script) is matched whole instead of
-being shredded to ASCII fragments. This is pure-Rust and adds no dependency to the static binary.
-Measured on the recall bench, Vietnamese paraphrase recall@5 went 0.00 → 1.00 with literal/English
-recall unchanged. Verify with `aizen bench memory --split all`.
+```bash
+aizen codebase model-download potion-base-8M
+aizen codebase model-download                 # uses Core's configured embed_model name
+```
 
-Ranking is **BM25** (Okapi k1=1.2, b=0.75, floored IDF over the active corpus + length
-normalization) — term rarity and doc length now shape relevance, so concise on-point facts beat
-verbose keyword-stuffed ones. A pure-Rust Jaro-Winkler fuzzy bridge for typo'd query terms is
-implemented + unit-tested but **off by default** (on the current corpus it adds candidate noise
-without a recall gain; one flag from on).
+This host command provisions Core codebase retrieval, independently of any Memory provider. It is
+never invoked automatically by startup or retrieval. Only a single portable `minishlab` model name
+is accepted; configured absolute local model paths remain loader inputs, not download destinations.
+The command downloads three Model2Vec assets from Hugging Face into Core's model directory. Loading
+requires a `dense` build. Existing nonempty regular assets are retained; size/path checks are **not**
+a cryptographic integrity check. New assets use bounded transfers and no-overwrite publication.
+Unsupported filesystems fail rather than replacing an existing file.
 
-The store **evolves from reuse** — no LLM, zero extra tokens. Every fact the agent retrieves into
-context is reinforced (at most once/day); ranking is `bm25 · decay · salience`, where reused facts
-decay slower (`half_life·(1+ln1p(reinforced))`) and gain salience (`0.5 + 0.3·reuse + 0.2·recency`,
-capped so BM25 stays dominant), and the always-on frozen core is packed salience-greedy so the
-prompt prefix holds the facts you actually use. This is provable, not marketing: `aizen bench memory
---evolution` runs a 6-session reuse simulation and **fails** unless recall@5 climbs ≥5%/session
-until it plateaus.
+Persistent User/Project Memory is an **optional external executable**, not a built-in store. Without
+a selected enabled provider, ordinary coding, Skills, Persona/Self-memory, Soul, saved conversations
+and ephemeral session notes still work. There is no automatic legacy fallback or provider launch.
+
+Core keeps packages under `<AIZEN_HOME>/plugins/<id>/` and provider data separately under
+`<AIZEN_HOME>/memory-data/<id>/` (the default home is `~/.aizen`). Installation alone never enables,
+selects or executes a provider. `aizen memory status` is offline and does not initialize a store.
+
+Mnemos is the independently built `aizen-mnemos` implementation of the existing persistent engine:
+Unicode-aware lexical matching, BM25/ranking, frozen facts, profiles, learning and maintenance belong
+to that package, not Core. Its default operation is offline; optional semantic retrieval requires
+its own build/model configuration. Core's `dense` feature remains for codebase retrieval. See
+[Memory plugins](MEMORY_PLUGINS.md) for trust, protocol and current implementation limits, and
+[verification](MNEMOS_VERIFICATION.md) for measured coverage. No public Mnemos package is assumed.
+
+**Existing users:** Desktop Memory settings offers an explicit legacy-transfer flow with an
+`AIZEN_HOME`-aware source and a new managed destination, plus optional alternate source/destination
+locations. Preview first, stop old writers, then confirm backup and transfer. The old source and any
+current Mnemos store remain untouched; a separate **Use imported memory** confirmation selects the
+new store without changing Learning. Interrupted work has explicit status/recovery, never automatic
+replay. Import is whole-store and byte-preserving, not a merge or automatic project-scope repair.
+A compatible package declaring `legacy_adoption_v1` is required. V2 additionally advertises
+`legacy_adoption_v2`, supporting bounded streaming backups of large derived caches and exact reviewed
+archive attachments (backup-only, never Memory). The normal wizard has three steps: **Check**, **Back
+up and transfer** with one stopped-writers acknowledgement, then a separate **Use this store** click.
+Failed checks without a plan offer rechecking, not Resume. See
+[legacy transfer and its limits](MEMORY_PLUGINS.md#transferring-legacy-aizen-memory).
 
 ## Commands
 
@@ -621,7 +669,8 @@ echo "summarize this" | aizen chat        # prompt from stdin
 ```
 
 ### `aizen agent` — the tool-using loop
-The model reads/edits files, runs shell, and uses memory to finish a task end-to-end.
+The model reads/edits files and runs shell to finish a task end-to-end. Persistent Memory tools and
+context are available only from an explicitly selected, enabled provider with the relevant capabilities.
 ```bash
 aizen agent "add a --version flag and update the help text"
 aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
@@ -710,15 +759,19 @@ Behavior worth knowing:
   user's settings between them. `--effort auto` runs the same keyword-plus-complexity classifier a
   typed REPL turn goes through, against the task text. Omit the flag and nothing changes: the
   configured `reasoning_effort` applies and the request is byte-identical to one from a core that
-  never had the flag. The tier is named on **stderr**, next to the rest of the trace.
+  never had the flag. The tier is named on **stderr**, next to the rest of the trace. In the REPL
+  the **status row** carries the effort state instead: a tinted `·auto` chip right after the model
+  name (`aizen/kimi-k3·auto · ~17.6K/128.0K tok · …`), refreshed at every turn — auto-detection is
+  what the user picked, the resolved rung stays in the stderr trace, and no per-turn `effort:` line
+  is printed into the chat. A pinned tier (`/effort high`, `--effort high`) names the tier itself.
 - **A tier changes the harness, not only the wire.** In the REPL the resolved tier also sets the
   step cap and its extension, how many fresh budgets a still-progressing run may claim, how many
   verify-and-fix rounds a broken tree gets, whether the self-review pass runs before Done
   (`xhigh`/`max`), and how much of a build log reaches the model — so `/effort low` and
   `/effort max` behave differently even on a provider that ignores `reasoning_effort`. A tier can
   also change the model: `"models_by_effort": {"low": "cheap-model", "max": "strong-model"}` in
-  `cli-config.json` sends turns of that tier to that model on the same endpoint (the effort line
-  then names it); tiers without an entry use the main model.
+  `cli-config.json` sends turns of that tier to that model on the same endpoint (the status row
+  then names the routed model); tiers without an entry use the main model.
 - **Architect mode: plan, then apply.** Multi-file turns use `metis` at `max` effort by default;
   lower tiers also use it when `models_by_effort.max` or `xhigh` explicitly configures a planner.
   The planner drafts a Markdown spec: requirements, scope/non-goals, design decisions, phases
@@ -759,8 +812,9 @@ Behavior worth knowing:
   generated from that same registry, never the schemas. So `/tools`, `/lsp off`, `/apps`, a missing
   Telegram token or a build without `--features browser` all remove a tool from the prompt and the
   request together, and the model is never told about a tool it cannot call.
-- **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
-  concurrently; any turn that edits or runs shell stays serial (and approval-gated).
+- **Parallel reads** — eligible native file reads/globs may run concurrently; edits and shell work
+  follow their own approval/admission rules. External Memory calls remain serialized opaque
+  transactions, including searches that may update retrieval caches or reinforcement state.
 - **Continuing earlier work** — a fresh conversation's prompt lists this project's recent saved
   conversations in a `<sessions>` block, and the read-only `session_recall` tool returns a clipped
   digest (opening request + latest exchanges) so "continue the most recent session" resumes the
@@ -1160,6 +1214,38 @@ startup errors, the authorized native tool may proceed without that hook; do not
 subprocess hook as a mandatory policy gate inside a native scope. Unproven physical hook effects
 are different: they block further work until settlement can be established.
 
+### `aizen compact <slug>` — compact a saved conversation
+
+```bash
+aizen compact fix-delete-btn                        # human-readable result
+aizen compact fix-delete-btn --output-format json   # {"slug":"…","before":16292,"after":8195}
+aizen agent --resume fix-delete-btn --save-session "continue"
+```
+
+Uses the same summarizer and recent-turn retention as REPL `/compact`, rewriting the saved
+conversation under its existing slug. `before` and `after` are **approximate tokens**, not provider
+billing counts. The configured `summarizer` role still takes precedence over the main endpoint;
+`--model`, `--base-url`, and `--api-key` override the main endpoint defaults. Prefer environment or
+stored credentials over an API key in argv.
+
+The command preserves session provenance, design state and usage metadata. A missing/unreadable
+session, a conversation too short to compact, or a failed/empty summary exits nonzero without
+writing the result. JSON mode writes exactly one result object on stdout on success; errors go to
+stderr. Changes to the session envelope or delta log detected during summarization reject the
+stale write. This revision check is not a cross-process lock: do not compact a session another run
+is actively writing.
+
+Interactive CLI `/compact` also saves the result under the current session slug **before** reporting
+success; exiting the CLI is not required. Desktop refreshes the session list and an idle selected
+transcript when its window regains focus or becomes visible, including the compacted summary.
+Draft text and pending attachments are retained; active runs and unanswered clarify choices are not
+replayed from disk. Do not actively write the same session from both clients at once.
+
+Desktop `/compact` calls this command, keeps the visible transcript and pending clarify choices,
+and resumes the compacted saved history on the next send. It requires a core advertising both
+`compact` and `agent --resume`. `/context` remains the context meter; its fixed prompt/tool/memory
+floor is not a measurement of the conversation history this command reduces.
+
 ### `aizen workflow <spec.json>` — fan-out + synthesis
 Run several role-scoped sub-agents concurrently (bounded to a machine-derived cap, shared with
 in-REPL dispatches), then merge their results into one answer (mixture-of-agents). In the REPL the
@@ -1405,8 +1491,9 @@ recent-catalogue fallback cannot recover every older skill during an index outag
 **Self-learning** — after a completed multi-step task, the REPL distills a *generalizable* procedure
 into a new skill automatically (conservative: skips one-offs and duplicates; prints `↯ learned skill
 '…'`). It fires when a turn did real work (**≥4 tool calls**) **or recovered from a dead end** (a tool
-errored, then a later call succeeded — that hard-won path is worth saving). It's like memory's
-self-learning, but for how-to. Toggle in `/config` (default on) or `aizen config set --auto-skill-learn false`.
+errored, then a later call succeeded — that hard-won path is worth saving). This Core policy is
+independent of persistent Memory and `memory_auto_learn`. Toggle in `/config` (default on) or
+`aizen config set --auto-skill-learn false`.
 
 ### Custom slash commands — markdown macros you fire
 Where a **skill** is something the *agent* pulls when relevant, a **custom command** is a prompt-macro
@@ -1424,8 +1511,8 @@ Review this staged diff and flag bugs, security issues, and risky changes:
 !`git diff --cached $ARGUMENTS`
 ```
 
-The body is expanded at fire time, then submitted as a normal chat turn (full agent loop + tools +
-memory apply):
+The body is expanded at fire time, then submitted as a normal chat turn (full agent loop/tools and,
+only when explicitly enabled, external Memory context):
 - **`$ARGUMENTS`** → everything you typed after the command; **`$1`..`$9`** → positional words.
 - **`@<path>`** → inlines that file's contents (confined to the working dir; only at a word boundary,
   so emails/handles pass through).
@@ -1524,6 +1611,15 @@ prompts only for real secrets, signs you in if it's OAuth), `aizen apps info <ke
 masked + a live tool probe), `aizen apps login <key>`, `aizen apps remove <key>`. Also the `/apps` TUI hub.
 LOCAL-FIRST: a self-hostable package (runs on your machine with your keys) beats a hosted gateway.
 
+`aizen apps status [key] --json` is an **offline** redacted view of HOME `mcp.json` and the
+creative-operation journal. It does not resolve project overrides, connect, launch, probe or install.
+It reports only connector keys/enabled/transport, not commands, arguments, URLs, headers or secrets.
+A configured MCP connector is not an enrolled production adapter; live probe/use remain unknown.
+Journal states are last-recorded observations, not a live probe; IDs/status never grant control.
+Invalid or incomplete journal state returns an error, not an empty success. The creative foundation currently enables **no**
+Blender/Unity/Unreal/Spine adapter or `app_*` mutation tools; see the
+[implementation plan](plans/creative-production-2026-10-29.md) for gates and current limits.
+
 ### Visual design and tool images
 
 `/design auto|on|off` and `aizen agent --design auto|on|off` affect only the current session/run,
@@ -1549,27 +1645,31 @@ pointer until an explicit `design_brief` call with `{"resume":true}`. Saved sess
 typed brief and evidence metadata; restoring a session makes old evidence **stale**, not verified.
 Delegated children inherit concise constraints, with separate task/evidence namespaces.
 
-**Vision capability is explicit per effective endpoint/model.** Open `/config` → provider/model →
-**Vision** to declare Supported or Unsupported for that exact destination. Unknown may be declared
-for this session only; persistent saving is a separate explicit action. The declaration is the
-user's assertion, not an automatic paid probe or inference from the model's name/HTTP success.
-The equivalent stored configuration is:
+**Vision is enabled by default, without setup or capability verification.** CLI, Desktop/headless
+runs, tool images and delegated children attempt image requests on their resolved route without
+creating a `vision_capabilities` entry. This is a local default, not a provider probe or a claim that
+every model understands images. A provider rejection remains an error: core does not silently strip
+images, switch providers or upload them elsewhere.
+
+Optional `/config` → provider/model → **Vision** overrides apply to one exact effective endpoint/model.
+Supported enables it explicitly, Unsupported disables it, and Default removes the override (enabled).
+Session-only overrides need not be saved; persistence is a separate explicit action. For example,
+to disable image transmission on one destination:
 
 ```json
 {
   "vision_capabilities": [
-    { "base_url": "https://your-provider.example/v1", "model": "your-model-id", "supported": true }
+    { "base_url": "https://your-provider.example/v1", "model": "your-model-id", "supported": false }
   ]
 }
 ```
 
-An absent entry means **unknown**; `supported:false` means unsupported. Both leave tool images as
-text/metadata rather than pretending the model saw them. The capability must match the effective
-endpoint and model after role/effort routing; configuring support does not grant image-transmission
-permission. For ChatGPT Codex, that tuple is the fixed Responses URL
-`https://chatgpt.com/backend-api/codex/responses` and the actual wire model **without its effort
-suffix** (for example, `gpt-5.4-high` uses `gpt-5.4`). Configure that URL/model, not a Codex base-URL
-alias or the effort-suffixed picker name; this routing normalization does not imply vision support.
+An absent entry uses the enabled default; `supported:false` blocks selected-reference and tool-image
+transmission on that destination. Overrides match the effective endpoint and model after role/effort
+routing. Enabling vision does not grant image-transmission permission. For ChatGPT Codex, that tuple
+is the fixed Responses URL `https://chatgpt.com/backend-api/codex/responses` and the actual wire model
+**without its effort suffix** (for example, `gpt-5.4-high` uses `gpt-5.4`). Optional overrides use that
+URL/model, not a Codex base-URL alias or the effort-suffixed picker name.
 Tool-image approval names that destination, and a routed destination change requires matching
 approval. Media asks for invocation-only consent: generic allow-all grants do not bypass it, and a
 stream-json reply granting a tool/session is applied only to the current media call.
@@ -1582,7 +1682,7 @@ budget, but approved transmitting reads during an active visual task consume its
 A browser capture with `transmit:false` is capture-only and needs no vision declaration: saved
 pixels are available locally but are not visually reviewed. `image_read` remains a transmitting
 read requiring explicit `transmit_image:true`; it does not currently expose a capture-only mode.
-Capability Unknown/Unsupported, denied transmission, omitted budget selection and failed delivery
+Explicitly disabled/unresolved dispatch policy, denied transmission, omitted budget selection and failed delivery
 are distinct limitations; none is repaired by silently changing providers. Executor and request
 projection use one frozen route/capability context; a route change needs a fresh context and grant.
 
@@ -1595,20 +1695,43 @@ transparency chunks, ICC/gamma and other unsupported color metadata keep origina
 encoded entries / 16 MiB, with no decoded pixels retained. Codecs, request materialization and local
 comparison share a nonblocking **192 MiB** application-buffer/work reservation budget; contention
 produces a limitation or original fallback. This is not a hard process-RSS cap: allocator overhead
-and unrelated memory are outside that accounting. After a successful parent send, one numeric
-note reports preview URI sizes/cache/encoding time; child calls remain quiet. Token estimation and
-occurrence-only queries do not invoke codecs.
+and unrelated memory are outside that accounting. Preparation runs off the async executor with
+nonblocking admission: at most two process-wide codec workers and one transform shared by a parent
+run and its children. Warm hits avoid re-encoding; contention preserves originals without queueing.
+The optional machine-readable `result.media` reports actual HTTP attempts, JSON bytes, image-URI
+bytes, image count and peak reserved request bytes, including child sends/retries in that run.
+It does not log pixels or prove model comprehension. Token estimation and occurrence-only queries
+do not invoke codecs.
+
+For a reproducible local check, run
+`python -I scripts/vision_http_smoke.py target/release/aizen.exe --default-vision-only`
+(use `target/release/aizen` on Unix). This verifies default-on behavior and child isolation without
+legacy saved-image flows. Add `--performance-samples 10 --performance-requests 4` instead of
+`--default-vision-only` for
+fresh-process synthetic grid/noise cases with Auto, Original, Photo and explicit release. This uses
+an isolated temporary home and a loopback-only scripted provider, never your configured model.
+The JSON report separates source/HTTP bytes, cold launch-to-request and cache-eligible follow-up
+interval p50/p95, observed stream/text arrival, request media leases and Windows process working-set
+peaks. These timings include intake/tools/serialization/loopback overhead, not pure codec time or real
+provider TTFT. Synthetic usage and fixtures cannot certify billing or small-text readability.
+On Windows, `python -I scripts/vision_tui_smoke.py target/debug/aizen.exe` drives the actual
+plain and retained input surfaces through ConPTY. It verifies that an excess five-image selection
+sends no HTTP request, preserves the draft, and sends exactly the remaining four distinct originals
+and accompanying text after editing. It uses an isolated temporary home and loopback provider,
+never reads or changes the clipboard, and terminates only the CLI process trees it created.
+This is an intake/wire check, not a semantic model or Desktop UI test.
 
 **Selected references and fidelity.** Reference IDs identify attachments in the already-loaded
 conversation, not globally readable blobs or file authority. The controller grants current-task
-purpose, destination/account route and allowed originals/previews/crops separately from declaring
-vision or approving a tool. Same-route children may receive only explicitly selected `reference_ids`;
+purpose, destination/account route and allowed originals/previews/crops separately from the optional
+vision override or tool approval. Same-route children may receive only explicitly selected `reference_ids`;
 a different route/account requires fresh consent. Restoring a session does not restore live grants.
 For headless intentional handoff, use
 `aizen agent --reference-images --image ref.png "reconstruct this reference"`: this grants the attached
 references to this task and same-route selected delegates, with exact-original sending; it does **not**
-declare model vision support. Current exact fidelity selects **Original for the whole request**, not a
-mixed exact/preview projector. Preview-only grants are rejected with an actionable limitation.
+override an explicit vision disable. Exact fidelity requires originals for the selected required reference
+occurrences; unrelated attachments can still use their own permitted representations. Preview-only
+grants remain rejected with an actionable limitation.
 
 Discover `reference_read`, `reference_compare` and `reference_trace` with `tool_search` when they are
 not on the current schema surface. Inspect granted originals/crops before constructing geometry;
@@ -1624,12 +1747,46 @@ representation, not semantic understanding. Failed/replayed calls, omitted image
 and a different occurrence with identical pixels earn no delivery credit. A preview or crop cannot
 certify whole-original inspection, functional UI, accessibility or mobile behavior.
 
-**Image limits and privacy.** Browser capture/local crop are PNG-only. MCP image observations accept
-validated PNG/JPEG/GIF/WebP base64 blocks, at most **8 MiB per image**, with a tool-image request
-budget of **four images** and **16 MiB** combined. Existing user attachments retain their legacy
-wire behavior and are not silently stripped by the new tool-image capability gate; they consume
-that same request budget and can leave no room for tool images. This is not a new global cap or
-vision-support claim for legacy user attachments. Malformed, oversized, unsupported or
+**Visual working set.** New attachments and scoped original/ROI rereads start active. A successful
+request records which exact occurrence/representation was delivered, not whether it was understood.
+Use the lazily exposed `image_context` tool to list, remember, pin/unpin or release accessible
+occurrences. Releasing pixels requires successful delivery, a bounded observation and a live scoped
+reread handle; conflicting mutations of the same occurrence in one tool group are rejected.
+Released occurrences contribute descriptors/notes but **zero image bytes** until explicitly reread or
+reselected. A note is an untrusted observation, never verification or an API-side image cache. Neither
+age nor transport success releases images automatically. Model pins cannot clear controller pins;
+Original controls representation only and does not keep a dormant image active. Live pins take
+priority over newer optional screenshots in the 32-image / 64 MiB retained payload budget and the
+32-entry working set. Current task/source/render capture identities and explicit comparison
+references are controller-pinned until that live requirement ends; stale captures are not kept as
+fresh acceptance evidence. Required pixels that exceed the four-image / 16 MiB request limit cause
+an actionable refusal instead of silent omission. Saved pin flags never restore live priority or
+consent.
+
+Input image pixels (including compacted originals, reference sidecars and ROI rereads) are not saved
+in session envelopes, deltas or recovery. Resume keeps text and bounded untrusted historical visual
+observations, not attachment handles: attach the original image again to inspect or verify details.
+Legacy saved input images are ignored before CAS hydration; existing files are not physically deleted.
+Unrelated tool captures retain the existing bounded CAS retention policy. Runtime grants, delivery
+credit and approval never survive restore. Within the same live task, compaction may retain scoped
+originals and reread handles in memory, but its summarizer receives only bounded text descriptors and
+uncertainty, never image bytes. Workflow dependencies and saved hashes are not disclosure consent.
+For child outputs, `return_evidence:["@latest_capture"]` selects at most one successful completed
+final-attempt screenshot under existing route/approval gates; literal capture IDs remain supported.
+
+**Image limits and privacy.** Browser capture is PNG; scoped original-coordinate ROI supports PNG
+and bounded JPEG input and returns PNG. GIF/WebP remain exact pass-through and unsupported ROI is
+reported explicitly. User selections and MCP image observations accept validated PNG/JPEG/GIF/WebP,
+at most **8 MiB per image**, **four selected images** and **16 MiB** combined source bytes per
+request. Excess explicit selections are refused, not silently truncated. TUI path attachments and
+clipboard selections share the same combined budget; count and file-size preflight runs before
+reading/encoding selected files, with loaded bytes checked again afterward. Malformed selected
+files or a failed batch refuse the send and keep the editable draft instead of submitting only some images or treating
+rejected paths as prose. Image submissions queue as their own turn, never enter text-only steering;
+clipboard additions also refuse an excess batch before retaining it. Historical active images
+can require release/reselection before another send fits the same hard budget. Tool projection
+uses vision by default but still needs destination approval; ordinary legacy user attachments retain
+their existing behavior. Malformed, oversized, unsupported or
 unapproved tool blocks remain explicit text/metadata limitations; MCP error images are not projected.
 Image payloads may be retained in owner-only session blobs and sent to the approved provider; page
 content can contain private information. Inspect the target and destination before approving.
@@ -1723,74 +1880,162 @@ once after a transport failure; navigate/click/type/eval are never replayed afte
 Still a **pure-Rust static binary, no bundled browser/Node/Playwright/CEF**. An absent browser returns
 an actionable error, not a crash.
 
-### `aizen memory` — the self-learning brain
+### `aizen memory` — optional persistent Memory
+
+Native Memory installation is separate from marketplace `aizen sub plugin`. Generic providers use
+local directories/ZIPs. Mnemos also has a fixed anonymous public binary release channel, shared
+background availability tracking and explicitly reviewed first installation or installed updates:
+
 ```bash
-aizen memory add "prefer-pnpm" -t feedback -b "I prefer pnpm over npm"
-aizen memory list [current|global|project|<zone>]   # narrow a long listing to one workspace view
-aizen memory search "package manager" [--dimension tooling]
-aizen memory profile [--json]      # derived preferences rollup (verbosity/tooling/stack/…)
-aizen memory ask "which package manager should I use?"   # abstains rather than guessing
-aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
-aizen memory frozen                 # the always-on prompt-prefix core
-aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
-aizen memory consolidate [--apply]  # merge near-duplicates locally (lexical, then MinHash + normalised tokens); dry run by default
-aizen memory reconcile [--apply]    # the model-judged pass for the pairs consolidate leaves in the review band
-aizen memory where                  # the folders + counts, for editing or clearing out many at once
+aizen config memory                                      # offline provider hub; no chat credentials needed
+aizen plugin list --json
+aizen plugin install /path/to/verified-local-package.zip   # no execution or activation
+aizen plugin releases mnemos --json                       # explicit public check; no installation
+aizen plugin install-release mnemos                      # default-No reviewed download/install
+aizen plugin install-release mnemos --version X.Y.Z --sha256 <64-lowercase-hex> --yes
+aizen plugin update mnemos                               # newer package; activation required afterward
+aizen plugin update mnemos --version X.Y.Z --sha256 <64-lowercase-hex> --yes
+aizen plugin recover-update mnemos                       # offline inspection; --apply requires consent
+aizen plugin info mnemos
+aizen plugin enable mnemos                                # eligibility only
+aizen memory use mnemos                                   # explicit executable trust consent
+aizen memory status --json                                # offline; never starts a provider
+aizen memory disable                                     # preserves selection and data
+aizen memory enable                                      # reuses saved consent if still eligible
+aizen plugin storage mnemos                              # inspect effective path; no execution
+aizen plugin storage mnemos --path /absolute/dedicated-directory
+aizen plugin storage mnemos --default                     # does not move or delete old data
+aizen plugin configure mnemos                            # declared options and host budgets; no execution
+aizen plugin configure mnemos --set enable_fuzzy=false --recall-inject-tokens 200
+aizen plugin revoke mnemos                               # removes grant; selected Memory is disabled
+aizen memory unselect                                    # clears selection; saved grants/data remain
+aizen plugin uninstall mnemos                            # removes package, preserves data
 ```
 
-Ids are whole words. A fact named "Người dùng giao tiếp bằng tiếng Việt" files as
-`nguoi-dung-giao-tiep-bang-tieng-viet` — accents are folded off each letter, and `-` marks a word
-boundary and nothing else. An earlier slugifier tested one codepoint at a time, so every accented
-letter became a separator and cut inside words: the same name came out `ng-i-d-ng-giao-ti-p…`. Stores
-written by that version are re-slugged once, automatically, on the first run of a build that has this
-— the old→new table is left in `cli-memory/.id-migration-<date>.tsv`, and graph edges are re-pointed
-in the same pass. Set `AIZEN_NO_ID_MIGRATE=1` to skip it.
+The four states are independent: installed, eligible, selected, Memory enabled. `memory use` selects
+and enables; installation/eligibility alone do neither. A hash proves integrity, not publisher trust.
+On Windows, selection additionally needs informed `--allow-guarded` consent: Job containment and
+scrubbed environment do **not** confine filesystem/network access. Strict refuses unsupported
+isolation; native providers refuse sandbox `off`. Declared network access needs a separate saved
+`--allow-network` grant **and** the global child-network policy must allow it. Offline Mnemos requests
+no network. See [sandbox limits](SANDBOX.md#native-memory-provider-policy).
 
-A fact's id comes from its display `name`, which is the first 60 characters of the fact — so that cut
-has to land on a word too. It used to cut anywhere: 73 entries on one store had names ending in a
-one- or two-letter fragment, and the id inherited it (`…-la-khe-uoc-lam-viec-l`, where `l` began
-`lâu`). New facts back the cut up to the last word; the names already written are left alone, since
-their bodies still hold the full text and a second automatic rewrite of a store belongs behind a
-command you type, not a startup pass.
+The `/config` → Memory hub has five entries: **Provider**, **Learning**, **Storage**, **Advanced** and
+**Back**. Mnemos always has a highlighted row and textual status; its setup offers an explicit
+release check plus expected-ID local import, never an automatic download. The fixed public channel
+is `talmetis-labs/aizen-mnemos-releases`; metadata-only releases are not installable. Release
+installation pins version, target and mandatory checksum before publication and never activates it.
+Installed Mnemos follows Aizen's 24-hour background-check policy (`update_check: false` or
+`AIZEN_NO_UPDATE_CHECK=1` opts out); no automatic package download/replacement occurs. `/update mnemos`
+and Desktop **Settings → Updates** review a strictly newer package. Bare `/update` remains Aizen-only.
+Updates retain selection, options, budgets, data-root and data, but revoke Mnemos execution/Learning
+consent and disable selected Mnemos until separately activated. Busy providers refuse replacement.
+Interrupted updates require explicit inspected recovery; no automatic retry or data rollback. See
+[package update/recovery details](MEMORY_PLUGINS.md#package-contract). Installed custom providers appear by verified
+name. No Obsidian adapter is currently implemented. Advanced holds lifecycle, options/budgets,
+diagnostics and explicit consent/revocation. Learning On reflects the active provider's capability,
+valid execution/sharing grant and automatic policy; the first On asks for sharing and optional model
+assistance separately. Off keeps recall, records and saved grants. Storage selects the default
+`<AIZEN_HOME>/memory-data/<id>/` or a dedicated custom absolute directory. Saving/resetting paths never
+moves, copies, adopts or deletes data; future operations use the chosen location.
 
-The same rule now governs every name derived from free text — memory ids, `#remember` captures,
-persona self-memories, session saves, and the project zone key all share one implementation:
+Configuration discovery is manifest-only, never provider execution. Options need a bounded
+manifest-declared scalar schema; no secrets, arbitrary JSON, independent model routes or file-access
+grants. Draft edits save only after explicit confirmation. Active configuration changes apply at the
+next valid user-turn boundary; switching never copies data or options. See
+[settings schema and budgets](MEMORY_PLUGINS.md#configuration-ui-and-per-provider-options).
 
-| Surface | Where | Migrated? |
-|---|---|---|
-| memory entry id | `cli-memory/entries/` | yes — `.id-migration-<date>.tsv` |
-| `#remember` id | same | yes, same pass |
-| persona self-memory | `personas/<slug>.self/` | yes — `.stem-migration-<persona>-<date>.tsv` |
-| session save name | `sessions/` | no — existing files keep working, see below |
-| project zone key | `skills/p/<slug>`, index | only if the checkout path is non-ASCII |
+Default standing allowance is 1024 tokens. Recall response allowance is 1024, but actual chat injection
+is only 300, with 12 requested records and at most 100 response records. Per-provider host overrides
+remain bounded to 4096 tokens / 100 records. Zero skips the corresponding automatic operation.
+The separate `/config` → Codebase entry controls local Core embedding, not a Memory model.
 
-**Persona self-memories** get one extra thing: a short content hash on the end
-(`ep-hoan-thien-landing-install-tabs-os-85ed`). Every episode body opens with its own type label, so a
-stem taken from the first few words described the format rather than the memory — twelve files on one
-store all read `ep-correction-user-redirected-me-todo`, separated only by a counter. The stem now skips
-the label and carries a hash, so it identifies one memory.
+With a selected enabled provider, Core forwards bounded typed operations and prints JSON results:
 
-**Session names** are derived, not migrated. New saves fold to ASCII whole words; files already saved
-with accents keep their names and stay loadable, listable and deletable. Two guards on derivation:
-credential-shaped tokens are dropped before the name exists (a key pasted as the first line of a chat
-used to become the filename — and `/sessions` prints filenames), and a name is never cut mid-word.
-The credential guard covers name derivation only: it does not redact what is inside a saved transcript,
-so a key pasted into a chat is still in that file's message text.
-
-### `aizen bench` — anti-oracle benches
 ```bash
-aizen bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a baseline
-aizen bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
-aizen bench profile                                     # golden set for the profile rollup (+ tier hints)
+aizen memory add prefer-pnpm -t feedback -b "Use pnpm for this project."
+aizen memory list current
+aizen memory show <opaque-id>
+aizen memory search "package manager"
+aizen memory edit <opaque-id> -b "Use pnpm, not npm, for this project."
+aizen memory forget <opaque-id>                            # provider archive semantics
+aizen memory health
+aizen memory where                                       # separate package/data locations
+```
+
+Record IDs/revisions are provider-owned. Core performs get-then-revision-checked update/forget;
+it does not read record files or guess archive handles. REPL `/memory` (or `/memory status`) is
+offline status; a query searches the provider. `#<fact>` and `/memory remember <fact>` store a Project
+fact; `#global: <fact>` stores a User fact. No provider means an actionable unavailable error, not a
+hidden built-in store. Hosted `/memory` uses its explicit chat/workspace context for data operations,
+but refuses `enable`, `disable` and `use`: change host-global activation from the local CLI. Changes to
+activation/trust are not granted by provider output.
+
+Uninstall never deletes provider data or executes a recovery hook. A missing package directory can
+be unregistered. A corrupt or partial remaining package is disabled, but removal fails with host
+pins retained; unknown files are not swept. Inspect/repair that payload explicitly before retrying.
+A physical recovery barrier still blocks uninstall, even if its package is missing.
+
+Mnemos currently supports CRUD, current-scope search/list, standing context/recall, and human-management inspection through Core. With the sealed human `Management` grant, Core forwards the provider's typed scope/dimension/category filters, superseded listings, review promote/drop/clear, revive, supersede, permitted scope moves, archive/restore/purge, compact/consolidate, doctor, neighbors, model inventory, and prepared offline reconciliation. `reconcile` uses an explicit bounded reply file (`--reply`), never a model route; `--apply` requires that reply and stale bindings fail closed. `model-download` remains an honest unsupported refusal because Mnemos is offline and has no bundled downloader. Core's parser may expose a command before a selected provider advertises the corresponding capability; provider validation remains authoritative.
+Its independent native CLI has the same broader maintenance/archive surface; inspect that package's help and supply its explicit data/context options. Human inspection is distinct from model-visible reads: Management originates only in the sealed local CLI/manual path, never from provider JSON, settings or model output. Core still keeps activation host-global and refuses hosted `enable`, `disable` and `use`.
+
+Completed-turn auto-learning needs **separate** saved `--allow-learning` consent at `memory use`, plus
+`memory_auto_learn` enabled. It sends bounded user/transcript content to the selected executable,
+not credentials or permission to use a host model route. Only successful `Done` turns qualify;
+clarification, cancellation and exhausted budgets do not. Mnemos's offline path extracts from user text,
+not assistant/tool instructions. Explicit human `memory learn <text> --yes` is a management operation
+for bounded STYLE promotion; it is not the same grant as completed-turn auto-learning, and provider
+validation remains authoritative. Core Skill learning and Persona evolution remain independently
+controlled when Memory is absent or disabled.
+
+The `--allow-turn-model` flag is a separate opt-in, requires `--allow-learning`, and only applies
+to a provider declaring `host_llm`. It authorizes an additional bounded no-tool call on the completed
+turn's captured chat endpoint/model, with possible remote transmission of provider-prepared Memory/conversation
+text and extra token costs. Keys stay in Core; no summarizer, alternate model, redirect or retry fallback
+is used. Mnemos now advertises `host_llm` and accepts this route only with the separate Learning grant,
+the exact prepared-job marker and captured binding; offline/strict/replay paths do not use HTTP. Revocation,
+cancellation, timeout and malformed-completion cases remain tested negative paths, not a semantic-quality
+claim. See [prepared continuation status](MEMORY_PLUGINS.md#prepared-same-turn-model-continuation-partial-source-implementation).
+
+`memory status --json` also reports bounded host learning-outbox inventory without exposing text or
+starting a provider. Receipts are not automatically replayed or pruned; capacity exhaustion stops
+new learning, and corrupt inventory is reported as invalid rather than empty. Physical recovery
+barriers are independent. This is not exactly-once delivery. See [protocol/learning](MEMORY_PLUGINS.md)
+and [verification/open gates](MNEMOS_VERIFICATION.md).
+
+Legacy `~/.aizen/cli-memory/` is **not** automatically adopted, converted, re-slugged or deleted by
+startup, installation or selection. It can contain Core codebase indexes alongside old facts; never
+copy the entire tree into a provider. The standalone Mnemos CLI now has explicit `adoption plan`
+(with required `--dry-run`), reviewed-digest-bound `apply`, verified `resume`, and full-backup `restore`
+into a **new** directory. Planning does not initialize Engine; apply preserves source bytes, backs up
+exclusions too, and refuses occupied/unknown/corrupt layouts. No ID conversion or real-data adoption
+is automatic. Consult Mnemos's `docs/ADOPTION.md` and the [verification record](MNEMOS_VERIFICATION.md)
+before use. Windows fixture coverage does not establish non-Windows or power-loss safety. Uninstall
+preserves original and provider data.
+
+### Core Persona and session names
+
+Persona self-memory remains built in under `personas/<slug>.self/`, independent of a Memory provider.
+Episode stems skip the type label and include a short content hash. Core's Persona stem migration is
+separate from any provider-owned fact/graph migration.
+
+New session names fold to ASCII whole words; existing accented names remain loadable, listable and
+deletable. Credential-shaped tokens are dropped during name derivation, and names are not cut
+mid-word. This does **not** redact message text inside a saved transcript.
+
+### `aizen bench` — Core loop/task/session benches
+```bash
 aizen bench loop                                        # loop discipline on scripted models, no key
-aizen bench tasks [--json] [--record --task <id>]       # the six-task suite on recorded tapes (see bench-tasks/)
-aizen bench sessions [--json]                           # turn-shape statistics of your saved conversations
-aizen bench dialectic                                   # golden set incl. abstain-when-unknown
-aizen bench loop                                        # loop discipline vs a scripted model (offline)
-aizen bench tasks [--task <id>] [--json]                # task suite: real loop + real tools on fixture crates
-aizen bench tasks --record [--task <id>]                # record the model's answers once (spends tokens)
-aizen bench tasks --update-baseline                     # capture steps/tokens per task as the baseline
+aizen bench tasks [--task <id>] [--json]                 # real loop/tools on disposable fixture crates
+aizen bench tasks --record [--task <id>]                 # record model answers once (spends tokens)
+aizen bench tasks --update-baseline                      # explicitly replace task baseline measurements
+aizen bench sessions [--json]                            # statistics of saved Core conversations
 ```
+
+Persistent Memory/profile/dialectic/health benchmarks moved to the independent `aizen-mnemos` CLI.
+Core's compatibility commands report that move; they do not start a built-in engine. Use the Mnemos
+package's benchmark help and isolated fixture roots. Scripted/hash-model results are not semantic
+model-quality evidence.
 
 `bench tasks` runs each `bench-tasks/<id>/` (a prompt plus a dependency-free cargo crate) through
 the real agent loop with the verify gate on and every tool rooted in a throwaway copy, then checks

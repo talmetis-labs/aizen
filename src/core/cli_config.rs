@@ -49,22 +49,37 @@ impl FromStr for ResponseVisuals {
     }
 }
 
+/// Explicit output-cap wire dialect for routes that cannot negotiate it on a no-retry request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTokenParameter {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
+    /// Optional external Memory configuration. Missing means no selected or active provider.
+    /// Executable pins and user consent are host-owned; never expose this object to a plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_plugins: Option<crate::plugin::settings::MemoryPlugins>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Context window (tokens) for `model`, learned from the provider's `/models` (when it reports
-    /// one) or set manually. Drives the `% context` HUD. `None` ⇒ HUD uses a name heuristic.
+    /// Optional context-window override for the exact saved route. `None` uses core provider
+    /// discovery/cache, then an explicitly labelled estimate. Shared by HUD and loop guards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_window: Option<usize>,
-    /// Explicit tool-image support for an exact endpoint/model pair. Absent entries are unknown,
-    /// not a guess based on the model's name. Legacy user attachments are unaffected.
+    /// Optional vision override for an exact endpoint/model pair. Absent entries use the enabled
+    /// core default; this is not a provider capability probe or image disclosure permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_capabilities: Option<Vec<VisionCapability>>,
+    /// Default attachment representation; does not grant disclosure or keep pixels active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_mode: Option<crate::core::types::ImagePreference>,
     /// Named main-endpoint profiles for manual provider failover. The active profile is copied into
     /// the root `base_url`/`api_key`/`model` fields, so legacy callers keep one resolution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,14 +174,14 @@ pub struct CliConfig {
     /// skill. `None` ⇒ default ON. `Some(false)` ⇒ disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_skill_learn: Option<bool>,
-    /// Auto-learn memory: after each turn the REPL passively learns durable user/project facts from
-    /// the user's message (FREE regex extraction → sanitize → threat-scan → confidence route → store).
-    /// Core promotion always stays human-gated. `None` ⇒ default ON. `Some(false)` ⇒ disabled.
+    /// Global automatic-learning policy for the selected optional Memory provider. Provider
+    /// availability, capabilities and explicit sharing/learning grants are separate requirements.
+    /// `None` ⇒ policy ON; `Some(false)` ⇒ disabled. Core does not persist user/project facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_auto_learn: Option<bool>,
-    /// Dense (semantic) retrieval model for memory recall: a directory name under
-    /// `~/.aizen/models/`, or an absolute path to a model2vec model dir. `None` ⇒ auto-detect
-    /// (see `memory::embed::discover_local_model`). `AIZEN_EMBED_MODEL` overrides this.
+    /// Dense (semantic) model for Core codebase retrieval: a directory name under
+    /// `~/.aizen/models/`, or an absolute model2vec model directory. `None` ⇒ local discovery
+    /// (see `crate::retrieval::embed`). `AIZEN_EMBED_MODEL` overrides this.
     ///
     /// Only meaningful on a `--features dense` build; a default build carries no semantic backend, so
     /// the field is stored but inert there rather than silently changing retrieval.
@@ -228,6 +243,10 @@ pub struct CliConfig {
     /// saving). `None` ⇒ provider default (no cap sent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Explicit wire field for output caps. `None` keeps reactive compatibility for ordinary chat;
+    /// no-retry extension jobs can use `max_completion_tokens` without a probing failed request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_parameter: Option<OutputTokenParameter>,
     /// First-run flag: `Some(true)` once the welcome/onboarding intro has been shown, so a brand-new
     /// user sees it exactly once. `None` ⇒ never onboarded (a fresh install → show the intro).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,8 +539,9 @@ pub fn role_reasoning_effort(role: &str, fallback: Option<String>) -> Option<Str
     role_reasoning_effort_in(&load(), role, fallback)
 }
 
-/// Exact endpoint/model matching prevents a capability declared for one provider from leaking to
-/// another provider with the same model alias. Only a trailing slash is normalized.
+/// Exact override lookup, not the effective policy: `None` uses the enabled core default.
+/// Matching prevents an override for one provider from leaking to another provider with the same
+/// model alias. Only a trailing slash is normalized.
 pub fn vision_support_in(cfg: &CliConfig, base_url: &str, model: &str) -> Option<bool> {
     cfg.vision_capabilities.as_ref()?.iter().find_map(|entry| {
         (entry.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
@@ -549,7 +569,7 @@ impl SessionVisionPolicy {
             .unwrap_or_else(|| vision_support_in(cfg, base_url, model))
     }
 
-    /// Apply explicit session overrides, including Unknown (which masks a saved declaration).
+    /// Apply explicit session overrides; None masks a saved override and restores the core default.
     /// Do not persist this overlaid config: saving capability is a separate user action.
     pub fn apply_to(&self, cfg: &mut CliConfig) {
         for ((base_url, model), supported) in &self.declarations {
@@ -643,7 +663,7 @@ fn replace_vision_support(
 }
 
 /// Pure persisted-config edit, with exact destination matching and duplicate replacement.
-/// `None` explicitly resets to Unknown. This does not save or grant transmission permission.
+/// `None` removes the override and restores the enabled default. Does not save or grant disclosure.
 pub fn set_vision_support_in(
     cfg: &mut CliConfig,
     base_url: &str,
@@ -1637,7 +1657,123 @@ pub fn save(cfg: &CliConfig) -> Result<()> {
     save_unlocked(cfg, &path)
 }
 
+/// Explicit policy writers share the configuration lock with provider grants; generic saves cannot
+/// overwrite a newer switch with an old dashboard snapshot.
+pub(crate) fn save_with_memory_policy(cfg: &CliConfig, policy: Option<bool>) -> Result<()> {
+    let Some(policy) = policy else {
+        return save(cfg);
+    };
+    let _admission = crate::plugin::manager::Admission::acquire()?;
+    let path = config_path();
+    let lock_path = crate::core::workspace_txn::store_lock("cli_config", "global");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::ZERO,
+    )?;
+    let latest = read_config_for_memory(&path)?;
+    let mut state = latest.memory_plugins.unwrap_or_default();
+    state.validate()?;
+    if latest.memory_auto_learn.unwrap_or(true) != policy {
+        state.learning_policy_changed()?;
+    }
+    let mut merged = cfg.clone();
+    merged.memory_plugins = Some(state);
+    merged.memory_auto_learn = Some(policy);
+    save_unlocked_impl(&merged, &path)
+}
+
+/// Read optional Memory state without creating a store, invoking a provider, or hiding corruption.
+pub(crate) fn read_memory_configuration(
+) -> Result<(crate::plugin::settings::MemoryPlugins, Option<bool>)> {
+    let cfg = read_config_for_memory(&config_path())?;
+    let state = cfg.memory_plugins.unwrap_or_default();
+    state.validate()?;
+    Ok((state, cfg.memory_auto_learn))
+}
+
+pub(crate) fn read_memory_plugins() -> Result<crate::plugin::settings::MemoryPlugins> {
+    Ok(read_memory_configuration()?.0)
+}
+
+pub(crate) fn read_config_for_memory(path: &std::path::Path) -> Result<CliConfig> {
+    let Some(bytes) = crate::plugin::install::read_host_file(path, 2 * 1024 * 1024)? else {
+        return Ok(CliConfig::default());
+    };
+    // Preserve original bytes for typed decoding; never erase duplicate package/grant map keys.
+    crate::plugin::memory_api::strict_json(&bytes)
+        .context("CLI config is not bounded duplicate-free JSON")?;
+    serde_json::from_slice(&bytes).context("CLI config is corrupt; Memory provider is unavailable")
+}
+
+/// Merge only external Memory settings into the latest persisted config under its existing lock.
+/// The manager holds activation admission first, through physical settlement and this commit.
+pub(crate) fn edit_memory_plugins<T>(
+    edit: impl FnOnce(&mut crate::plugin::settings::MemoryPlugins) -> Result<T>,
+) -> Result<T> {
+    edit_memory_configuration(|state, _| edit(state))
+}
+
+pub(crate) fn edit_memory_configuration<T>(
+    edit: impl FnOnce(&mut crate::plugin::settings::MemoryPlugins, &mut Option<bool>) -> Result<T>,
+) -> Result<T> {
+    let path = config_path();
+    let lock_path = crate::core::workspace_txn::store_lock("cli_config", "global");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::ZERO,
+    )?;
+    let mut cfg = read_config_for_memory(&path)?;
+    let settings = cfg.memory_plugins.get_or_insert_with(Default::default);
+    settings.validate()?;
+    let result = edit(settings, &mut cfg.memory_auto_learn)?;
+    settings.validate()?;
+    save_unlocked_impl(&cfg, &path)?;
+    Ok(result)
+}
+
+/// Updater-only merge into the latest configuration using checked flush semantics. This does not
+/// normalize unrelated fields or keep whole configuration copies in transaction journals.
+pub(crate) fn edit_memory_plugins_checked<T>(
+    edit: impl FnOnce(&mut crate::plugin::settings::MemoryPlugins) -> Result<T>,
+) -> Result<T> {
+    let path = config_path();
+    let lock_path = crate::core::workspace_txn::store_lock("cli_config", "global");
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::ZERO,
+    )?;
+    let mut cfg = read_config_for_memory(&path)?;
+    let state = cfg.memory_plugins.get_or_insert_with(Default::default);
+    state.validate()?;
+    let result = edit(state)?;
+    state.validate()?;
+    let json = serde_json::to_string_pretty(&cfg)? + "\n";
+    crate::core::persist::atomic_write_owner_only_checked(&path, json.as_bytes())?;
+    Ok(result)
+}
+
 fn save_unlocked(cfg: &CliConfig, path: &std::path::Path) -> Result<()> {
+    let mut merged = cfg.clone();
+    // Generic settings callers often hold a stale whole-config snapshot. Only the plugin manager
+    // may change activation/pins: a later model/settings save must not resurrect an old generation.
+    // Preserve the existing explicit config-repair behavior only when no plugin state is proposed.
+    merged.memory_plugins = match read_config_for_memory(path) {
+        Ok(latest) => {
+            merged.memory_auto_learn = latest.memory_auto_learn;
+            latest.memory_plugins
+        }
+        Err(error) => {
+            anyhow::ensure!(
+                cfg.memory_plugins.is_none(),
+                "cannot preserve plugin state in unreadable config: {error:#}"
+            );
+            None
+        }
+    };
+    save_unlocked_impl(&merged, path)
+}
+
+fn save_unlocked_impl(cfg: &CliConfig, path: &std::path::Path) -> Result<()> {
     let mut canonical = cfg.clone();
     canonical.normalize_approval();
     if let Some(parent) = path.parent() {
@@ -1684,6 +1820,154 @@ pub fn mask(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_plugin_config_status_is_read_only_and_rejects_duplicate_or_corrupt_json() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("not-created");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        assert_eq!(read_memory_plugins().unwrap(), Default::default());
+        assert!(!home.exists());
+        std::fs::create_dir(&home).unwrap();
+        let path = config_path();
+        for bytes in [
+            b"{".as_slice(),
+            br#"{"memory_plugins":null,"memory_plugins":null}"#,
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_memory_plugins().is_err());
+            assert!(edit_memory_plugins(|state| state.set_memory_enabled(false)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn memory_plugin_config_stale_generic_save_cannot_reactivate_or_erase_state() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
+        let stale = CliConfig::default();
+        let path = config_path();
+        let state = crate::plugin::settings::MemoryPlugins {
+            generation: 42,
+            ..Default::default()
+        };
+        let latest = CliConfig {
+            memory_plugins: Some(state.clone()),
+            ..Default::default()
+        };
+        save_unlocked_impl(&latest, &path).unwrap();
+        let mut unrelated = stale;
+        unrelated.model = Some("fixture-model".into());
+        save(&unrelated).unwrap();
+        assert_eq!(read_memory_plugins().unwrap(), state);
+        assert_eq!(load().model.as_deref(), Some("fixture-model"));
+    }
+
+    #[test]
+    fn memory_plugin_settings_and_revocation_survive_unrelated_stale_save() {
+        use crate::plugin::install::{FilePin, InstallPins};
+        use crate::plugin::settings::ExecutionGrant;
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
+        edit_memory_plugins(|state| {
+            state.record_install(InstallPins {
+                schema_version: 1,
+                id: "fixture".into(),
+                target: "x86_64-pc-windows-msvc".into(),
+                manifest: FilePin {
+                    path: "plugin.json".into(),
+                    bytes: 1,
+                    sha256: "a".repeat(64),
+                    unix_mode: None,
+                },
+                files: vec![],
+            })?;
+            state.set_eligible("fixture", true)?;
+            state.select(
+                "fixture",
+                ExecutionGrant {
+                    manifest_sha256: "a".repeat(64),
+                    guarded_execution: true,
+                    network: false,
+                    learning: false,
+                    turn_model_learning: false,
+                },
+            )
+        })
+        .unwrap();
+        let mut stale = load();
+        edit_memory_plugins(|state| {
+            state.configure(
+                "fixture",
+                std::collections::BTreeMap::from([(
+                    "enable_fuzzy".into(),
+                    serde_json::json!(false),
+                )]),
+                Some(Default::default()),
+            )?;
+            state.update_grant("fixture", None)
+        })
+        .unwrap();
+        let expected = read_memory_plugins().unwrap();
+        stale.model = Some("unrelated-edit".into());
+        save(&stale).unwrap();
+        assert_eq!(read_memory_plugins().unwrap(), expected);
+        assert!(!expected.enabled && expected.packages["fixture"].grant.is_none());
+        assert_eq!(load().model.as_deref(), Some("unrelated-edit"));
+    }
+
+    #[test]
+    fn memory_plugin_learning_policy_survives_stale_saves_and_explicit_writers_work() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        let mut stale = CliConfig::default();
+        save_with_memory_policy(&stale, Some(true)).unwrap();
+        let first = read_memory_plugins().unwrap().generation;
+        crate::plugin::manager::set_learning_policy(false).unwrap();
+        let disabled = read_memory_plugins().unwrap().generation;
+        assert!(disabled > first);
+        stale.model = Some("unrelated-model".into());
+        stale.memory_auto_learn = Some(true);
+        save(&stale).unwrap();
+        assert_eq!(read_memory_configuration().unwrap().1, Some(false));
+        assert_eq!(read_memory_plugins().unwrap().generation, disabled);
+        save_with_memory_policy(&stale, Some(true)).unwrap();
+        assert_eq!(read_memory_configuration().unwrap().1, Some(true));
+        assert!(read_memory_plugins().unwrap().generation > disabled);
+        assert!(!home.join("memory-data").exists());
+        assert_eq!(load().model.as_deref(), Some("unrelated-model"));
+    }
+
+    #[test]
+    fn memory_plugin_failed_policy_transaction_does_not_persist_half_an_edit() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
+        save_with_memory_policy(&CliConfig::default(), Some(false)).unwrap();
+        let before = std::fs::read(config_path()).unwrap();
+        let result: Result<()> = edit_memory_configuration(|state, policy| {
+            state.learning_policy_changed()?;
+            *policy = Some(true);
+            anyhow::bail!("synthetic aborted consent")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(config_path()).unwrap(), before);
+    }
 
     /// A profile whose credential lives out of band is allowed to carry none — and only those.
     ///
@@ -2695,6 +2979,11 @@ mod effort_routing_tests {
         session.apply_to(&mut unknown);
         assert_eq!(vision_support_in(&unknown, endpoint, "alias"), None);
         assert_eq!(
+            crate::llm::media::vision_policy_in(&unknown, endpoint, "alias"),
+            crate::llm::media::VisionPolicy::Supported,
+            "explicit reset masks the saved disable and restores the enabled default"
+        );
+        assert_eq!(
             serde_json::to_string(&saved).unwrap(),
             saved_json,
             "session setup never edits persisted input"
@@ -2704,7 +2993,7 @@ mod effort_routing_tests {
     }
 
     #[test]
-    fn vision_edit_replaces_duplicates_and_unknown_removes_only_the_exact_pair() {
+    fn vision_edit_replaces_duplicates_and_reset_removes_only_the_exact_pair() {
         let endpoint = "https://one.example/v1";
         let mut cfg = CliConfig {
             vision_capabilities: Some(vec![

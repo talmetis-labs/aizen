@@ -365,7 +365,7 @@ fn check_loadout(names: &[String]) -> Result<(), String> {
         if t.chars().count() > 200 {
             return Err(format!(
                 "'{}…' is longer than 200 characters",
-                &t.chars().take(30).collect::<String>()
+                t.chars().take(30).collect::<String>()
             ));
         }
         if names[..i].iter().any(|p| p == n) {

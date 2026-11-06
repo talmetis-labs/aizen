@@ -26,34 +26,70 @@ pub(crate) fn resolve_turn_effort(line: &str) -> Option<String> {
     cli_config::load().reasoning_effort.clone()
 }
 
-/// The per-turn "effort: <tier>" status line, tinted to match the slider's tier colours (auto =
-/// moonlight · low = green · medium = dim silver · high = gold) so the whole effort feature reads as
-/// one system. `None` ⇒ the field is omitted this turn → shown as a faint "default".
-pub(crate) fn effort_turn_line(eff: Option<&str>, routed_model: Option<&str>) -> String {
-    // low = green, medium = dim silver; the three "hot" rungs escalate high → xhigh → max
-    // (gold → bold gold → salmon) so the eye can tell them apart at a glance.
-    let styled = match eff {
-        Some("low") => console::style("low".to_string()).color256(theme::OK),
-        Some("medium") => console::style("medium".to_string()).color256(theme::ACCENT_DIM),
-        Some("high") => console::style("high".to_string()).color256(theme::WARN),
-        Some("xhigh") => console::style("xhigh".to_string())
-            .color256(theme::WARN)
-            .bold(),
-        Some("max") => console::style("max".to_string())
+/// The effort chip the HUD's model segment carries: `model·auto`, tinted by the rung the turn
+/// resolved to (low/medium = dim silver · high/xhigh = gold · max = salmon, like the slider's
+/// tier colours) — auto-detection is the mode the user sees, the rung is the provider's detail.
+/// `None` ⇒ no effort field this turn ⇒ faint "default".
+pub(crate) fn effort_chip_styled(eff: Option<&str>) -> String {
+    match eff {
+        Some("low") | Some("medium") => {
+            console::style("·auto".to_string()).color256(theme::ACCENT_DIM)
+        }
+        Some("high") | Some("xhigh") => console::style("·auto".to_string()).color256(theme::WARN),
+        Some("max") => console::style("·auto".to_string())
             .color256(theme::ERR)
             .bold(),
-        Some(other) => console::style(other.to_string()).color256(theme::ACCENT),
-        None => console::style("default".to_string()).color256(theme::FAINT),
+        Some("") => return String::new(),
+        Some(other) => console::style(format!("·{other}")).color256(theme::ACCENT),
+        None => console::style("·default".to_string()).color256(theme::FAINT),
+    }
+    .to_string()
+}
+
+/// What the HUD's model chip should show for THIS turn: the effort-resolved model plus a `·auto`
+/// chip tinted by the resolved rung (the rung goes on the wire but stays out of the HUD; a routed
+/// model is still named, since that is what requests actually go to). Pushes the composed chip into
+/// the status row's side channel (`tui::status_chip_arm`), which `status_text` splices onto the
+/// model name on the next rebuild — so the prep-time read already carries the chip on the next
+/// frame.
+///
+/// `routed`: `models_by_effort` sent this tier to another model — the chip names the ROUTED model,
+/// which is what the requests actually go to; the bare label returns with the post-turn refresh.
+///
+/// The old per-turn `effort: <tier> · <shape>` transcript line was removed in favour of this —
+/// the shape still drives the deferred tool surface via `turn_shape::note_turn`, it just no
+/// longer prints anywhere.
+pub(crate) fn apply_turn_effort_hud(eff: &Option<String>, routed: Option<&str>) {
+    let chip_styled = effort_chip_styled(eff.as_deref());
+    // A missing chip (eff = Some("") — the caller armed "omit this field") means the model
+    // segment stands bare; arming unconditionally is what clears a stale chip from the cell.
+    let label = match routed {
+        Some(m) => format!("{m}{chip_styled}"),
+        None => chip_styled,
     };
-    match routed_model {
-        // `models_by_effort` sent this tier to another model: say which, next to the tier.
-        Some(m) => format!(
-            "{} {} {}",
-            theme::faint("  effort:"),
-            styled,
-            theme::faint(&format!("· model {m}"))
-        ),
-        None => format!("{} {}", theme::faint("  effort:"), styled),
+    tui::status_chip_arm(label);
+}
+
+/// What the HUD shows between turns: `·auto` when detection decides each turn, otherwise the
+/// pinned tier itself (`·low`…`·max`) — pinned is a standing user choice, so it is named, while a
+/// resolved auto rung is not (see `effort_chip_styled`).
+/// Called where the REPL already rebuilds the status row (activate / resume / post-slash /
+/// post-turn), so the chip follows the setting the moment it changes. No-op when the status row
+/// isn't live (plain REPL), where `tui::status_chip_arm` already goes nowhere.
+pub(crate) fn refresh_effort_hud() {
+    let cfg = cli_config::load();
+    let styled = if cli_config::auto_effort_enabled() {
+        effort_chip_styled(Some("auto"))
+    } else {
+        match cfg.reasoning_effort.as_deref() {
+            Some(t) if !t.is_empty() => console::style(format!("·{t}"))
+                .color256(theme::WARN)
+                .to_string(),
+            _ => effort_chip_styled(None),
+        }
+    };
+    if !styled.is_empty() {
+        tui::status_chip_arm(styled);
     }
 }
 
@@ -127,6 +163,8 @@ fn apply_effort_choice(idx: usize) {
     // moonlight when OFF. Reads the effective state, so an `AIZEN_ULTIMATE` in the environment
     // keeps the box gold even after the slider was dragged down from the top.
     tui::set_ultimate(cli_config::ultimate_enabled());
+    // The HUD's model segment carries the new tier from this moment on.
+    refresh_effort_hud();
 }
 
 /// The plain text status report for `/effort status` (and the off-TTY fallback of the bare `/effort`).

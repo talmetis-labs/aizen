@@ -13,7 +13,6 @@ use crate::core::session_store::*;
 use crate::core::{cli_config, types};
 use crate::features::slash::{self, SlashId};
 use crate::features::{commands, coop, timemachine};
-use crate::memory;
 use crate::ui::menus::{personas_menu, skills_menu, telegram_menu};
 use crate::ui::{config_ui, icons, splash, theme, tui};
 use crate::*;
@@ -21,111 +20,6 @@ use anyhow::Result;
 use console::style;
 use dialoguer::{Confirm, Select};
 use types::Message;
-
-/// `/memory <sub>` — the in-REPL view of the same store the agent writes through, so the user can
-/// audit and correct it without dropping to the CLI. Sub-commands mirror `aizen memory <sub>` 1:1
-/// (same functions, same ids) rather than reimplementing a second, drifting surface.
-///
-/// `forget` here is the SOFT delete (archive → restorable); hard `purge` is CLI-only on purpose, so
-/// nothing typed mid-chat can destroy a fact irreversibly.
-fn slash_memory(arg: &str) -> Result<()> {
-    let (sub, rest) = match arg.split_once(char::is_whitespace) {
-        Some((s, r)) => (s.trim(), r.trim()),
-        None => (arg.trim(), ""),
-    };
-    match sub {
-        // Bare `/memory` keeps its old meaning (the rolled-up profile).
-        "" => memory::cmd_profile(false),
-        "list" | "ls" => memory::cmd_list(if rest.is_empty() { None } else { Some(rest) }),
-        "show" | "cat" => {
-            if rest.is_empty() {
-                anyhow::bail!("usage: /memory show <id>  (ids from `/memory list`)");
-            }
-            memory::cmd_show(rest)
-        }
-        "remember" | "add" => {
-            if rest.is_empty() {
-                anyhow::bail!("usage: /memory remember <fact>");
-            }
-            let id = memory::remember(rest)?;
-            tui::emit_line(
-                &style(format!("{}remembered ({id})", icons::g(icons::learned())))
-                    .color256(splash::ACCENT)
-                    .to_string(),
-            );
-            Ok(())
-        }
-        "edit" | "update" => {
-            // `/memory edit <id> <new body>` — the common correction. Field-by-field editing
-            // (description/type/scope) stays on the CLI, which has real flags for it.
-            let (id, body) = rest
-                .split_once(char::is_whitespace)
-                .map(|(i, b)| (i.trim(), b.trim()))
-                .unwrap_or((rest, ""));
-            if id.is_empty() || body.is_empty() {
-                anyhow::bail!("usage: /memory edit <id> <corrected fact>  (field flags: `aizen memory edit --help`)");
-            }
-            memory::cmd_edit(id, None, None, None, Some(body.to_string()), None)
-        }
-        "forget" | "rm" => {
-            if rest.is_empty() {
-                anyhow::bail!("usage: /memory forget <id>  (archived, not erased — restorable)");
-            }
-            memory::cmd_forget(rest)
-        }
-        "archive" => memory::cmd_archive_list(),
-        // The review queue is where mid-confidence learned facts wait for a human. It had a CLI but
-        // no REPL door, so the queue only ever grew — 29 items deep on this machine before anyone
-        // could see them. Same functions as `aizen memory review`, so the two can't drift.
-        "review" | "queue" => {
-            let (op, key) = match rest.split_once(char::is_whitespace) {
-                Some((o, k)) => (o.trim(), k.trim()),
-                None => (rest, ""),
-            };
-            match op {
-                "" => memory::cmd_review(None, None, false),
-                "promote" | "keep" | "accept" => {
-                    if key.is_empty() {
-                        anyhow::bail!("usage: /memory review promote <id>  (ids from `/memory review`)");
-                    }
-                    memory::cmd_review(Some(key.to_string()), None, false)
-                }
-                "drop" | "reject" => {
-                    if key.is_empty() {
-                        anyhow::bail!("usage: /memory review drop <id>  (ids from `/memory review`)");
-                    }
-                    memory::cmd_review(None, Some(key.to_string()), false)
-                }
-                "clear" => memory::cmd_review(None, None, true),
-                other => anyhow::bail!(
-                    "unknown: /memory review {other}  (try: review | review promote <id> | review drop <id> | review clear)"
-                ),
-            }
-        }
-        "restore" => {
-            if rest.is_empty() {
-                anyhow::bail!(
-                    "usage: /memory restore <id> [--as <new-id>]  (ids from `/memory archive`)"
-                );
-            }
-            // `--as` has to be reachable from here too: a collision makes plain `restore` fail, and
-            // without the escape hatch in the REPL the only way out would be to leave the REPL.
-            let (id, as_id) = match rest.split_once("--as") {
-                Some((a, b)) => (a.trim(), Some(b.trim()).filter(|s| !s.is_empty())),
-                None => (rest, None),
-            };
-            if id.is_empty() {
-                anyhow::bail!("usage: /memory restore <id> [--as <new-id>]");
-            }
-            memory::cmd_restore(id, as_id)
-        }
-        "profile" => memory::cmd_profile(false),
-        "style" => memory::cmd_style(),
-        "frozen" | "core" => memory::cmd_frozen(false),
-        // Anything else is treated as a search query, which is what `/memory <words>` always did.
-        _ => memory::cmd_search(arg, 5, None, None, None),
-    }
-}
 
 pub(crate) enum SlashOutcome {
     Continue,
@@ -1270,7 +1164,8 @@ async fn handle_slash_scoped(
             tui::emit_line(&style("compacting… (Esc to stop)").dim().to_string());
             // Interruptible: the summarizer call is a network round-trip on the REPL's own thread.
             // Without this the whole app is frozen until it returns (or the 300s read timeout).
-            match cancellable_slash(compact_now(history)).await {
+            let saved_design = design.map(|d| d.snapshot());
+            match cancellable_slash(compact_now(history, model_label, saved_design.as_ref())).await {
                 Some(Ok((b, a))) => print_compact_summary(b, a, &tp),
                 Some(Err(e)) => tui::emit_line(&format!("{} {e}", style("compact:").red())),
                 // Cancelled before the summary landed. `compact_history` only splices AFTER a
@@ -1369,7 +1264,15 @@ async fn handle_slash_scoped(
         SlashId::Update => {
             // Talks to GitHub, so wrap in `cancellable_slash` for Esc; owns stdin through the
             // dialoguer picker, which is why `tui::slash_takes_stdin` suspends the frame for it.
-            match cancellable_slash(features::update::run()).await {
+            let update_result = match arg.trim() {
+                "" => cancellable_slash(features::update::run()).await,
+                "mnemos" => cancellable_slash(crate::cli::plugin_cmd::update_mnemos(None, None, false)).await,
+                _ => {
+                    tui::emit_line("usage: /update [mnemos] — bare /update updates Aizen");
+                    return SlashOutcome::Continue;
+                }
+            };
+            match update_result {
                 None => tui::emit_line(&style("update cancelled").dim().to_string()),
                 Some(Err(e)) => tui::emit_line(&format!("{} {e:#}", style("update:").red())),
                 Some(Ok(())) => {}
@@ -1605,6 +1508,9 @@ SlashId::Yolo => {
             // `✦ ultimate` status chip), moonlight when OFF. Reflects the effective state — an
             // env-forced ON wins over the toggle, so read it back rather than trusting `now`.
             tui::set_ultimate(cli_config::ultimate_enabled());
+            // The status row's model segment carries the effort state (`·auto` tinted salmon while
+            // ultimate is ON — ultimate resolves turns to `max` — plain `·auto` after OFF).
+            crate::ui::effort_ui::refresh_effort_hud();
             if std::env::var("AIZEN_ULTIMATE").is_ok() {
                 tui::emit_line(&style("(note: AIZEN_ULTIMATE is set in your environment — it forces ultimate ON regardless of this toggle)").dim().to_string());
             }
@@ -1666,6 +1572,9 @@ SlashId::Yolo => {
                     &style(format!("usage: /effort [auto|off|low|medium|high|xhigh|max|none]  (unknown '{other}')")).dim().to_string(),
                 ),
             }
+            // The HUD's model segment carries the tier — re-arm it so the row the slash
+            // handler returns to already shows the new setting.
+            crate::ui::effort_ui::refresh_effort_hud();
         }
         SlashId::Theme => {
             let sub = arg.trim().to_ascii_lowercase();
@@ -1870,8 +1779,9 @@ SlashId::Yolo => {
             refresh_prompt_lanes_in_place(history, model_label);
         }
         SlashId::Memory => {
-            if let Err(e) = slash_memory(arg) {
-                tui::note_line(&format!("{} {e}", style("memory:").red()));
+            match crate::plugin::manual::slash(arg).await {
+                Ok(result)=>tui::emit_line(&result),
+                Err(error)=>tui::note_line(&format!("memory: {error:#}")),
             }
         }
         SlashId::Persona => {

@@ -352,6 +352,14 @@ async fn run_serve_turn(
     lane: &LaneCtx,
     shared: &lane::LaneShared,
 ) -> Result<String> {
+    let context_window =
+        crate::core::model_context::discover(&crate::core::cli_config::ResolvedEndpoint {
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+        })
+        .await
+        .tokens;
     let lead = crate::agent::compact::leading_system_count(history);
     // Default-ON lazy LSP (same as REPL/agent CLI) so remote coding turns get symbol tools. Armed —
     // and the registry built — BEFORE the prompt bundle: building the registry publishes this lane's
@@ -364,14 +372,51 @@ async fn run_serve_turn(
         api_key.to_string(),
         model.to_string(),
         approval_mode,
-        crate::resolve_ctx_window(model).0,
+        context_window,
         Some(lane.root.clone()), // this bot's directory, not the process cwd
     )?;
     // A brand-new or legacy-restored thread is a conversation boundary and may adopt pending
     // memory. Ordinary messages in an established thread must keep the active core byte-stable.
     // The bundle states THIS lane's cwd and wears THIS lane's persona.
-    let mut bundle =
-        crate::hostbot_prompt_bundle(model, &lane.root, lane.persona.clone(), lead < 2);
+    let turn_cancel = crate::core::cancel::TurnCancel::new();
+    let exec_ctx =
+        crate::core::exec_ctx::ExecutionContext::new(crate::core::convo::ConversationId::new(
+            format!("{platform_name}:{}:{}", lane.route, lane.chat),
+        ))
+        .with_persona(lane.persona.clone())
+        .with_approval_route(Some(crate::core::exec_ctx::ApprovalRoute {
+            route: lane.route.clone(),
+            chat: lane.chat.clone(),
+        }));
+    crate::core::memory_context::strip_history(history);
+    let memory_key = format!("hostbot:{platform_name}:{}:{}", lane.route, lane.chat);
+    let user_turn_id = crate::core::types::UserTurnId::new()?;
+    let memory_snapshot = match crate::plugin::snapshots::prepare(
+        &memory_key,
+        &lane.root,
+        exec_ctx.clone(),
+        &user_turn_id,
+        task,
+        lead < 2,
+        turn_cancel.clone(),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::plugin::runtime::optional_failure(error)?;
+            Default::default()
+        }
+    };
+    let mut bundle = crate::plugin::associations::with_affinity(&memory_snapshot, || {
+        crate::hostbot_prompt_bundle(
+            model,
+            &lane.root,
+            lane.persona.clone(),
+            lead < 2,
+            &memory_snapshot.standing,
+        )
+    });
     bundle.dynamic.push_str(&format!(
         "\n<hostbot_surface platform=\"{platform_name}\">\n\
          Format the final answer for a narrow mobile chat. Lead with the result; keep headings and\n\
@@ -398,22 +443,18 @@ async fn run_serve_turn(
             history[1] = Message::system(bundle.dynamic.clone());
         }
     }
-    history.push(Message::user(task.to_string()));
+    let memory_prefix = memory_snapshot.turn_prefix(true);
+    let sent = if memory_prefix.is_empty() {
+        task.to_string()
+    } else {
+        format!("{memory_prefix}\n\n{task}")
+    };
+    let mut asked = Message::user(sent);
+    asked.user_turn_id = Some(user_turn_id);
+    memory_snapshot.seal_message(&mut asked);
+    history.push(asked);
 
-    let turn_cancel = crate::core::cancel::TurnCancel::new();
-    // Identity + approval routing ride on the context so a tool body — and the approval gate on the
-    // driver — read THIS lane's values rather than whichever lane wrote a global last. The workspace
-    // root and the effort tier have direct owners (`AgentConfig` and the chat closure below), so they
-    // are not duplicated here.
-    let exec_ctx =
-        crate::core::exec_ctx::ExecutionContext::new(crate::core::convo::ConversationId::new(
-            format!("{platform_name}:{}:{}", lane.route, lane.chat),
-        ))
-        .with_persona(lane.persona.clone())
-        .with_approval_route(Some(crate::core::exec_ctx::ApprovalRoute {
-            route: lane.route.clone(),
-            chat: lane.chat.clone(),
-        }));
+    // The same execution carrier and cancellation token prepared the Memory boundary above.
     let cfg = AgentConfig {
         approval_mode,
         cancel: turn_cancel,
@@ -421,7 +462,7 @@ async fn run_serve_turn(
         workspace_root: Some(lane.root.clone()),
         quiet: true,
         enable_verify_gate: false,
-        context_window: crate::resolve_ctx_window(model).0,
+        context_window,
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         ..Default::default()
     };
@@ -431,17 +472,27 @@ async fn run_serve_turn(
     let model_ref = model;
     // Effort is passed EXPLICITLY, not read from the process-global override: two lanes may want
     // different tiers, and the global would stamp whichever armed it last onto both.
-    let lane_effort = lane.effort.clone();
+    let learning_config = crate::core::cli_config::load();
+    let lane_effort = lane.effort.clone().unwrap_or_else(|| {
+        crate::core::cli_config::resolved_reasoning_effort(learning_config.reasoning_effort.clone())
+    });
+    let learning_model = crate::plugin::events::TurnModel::new(
+        &crate::core::cli_config::ResolvedEndpoint {
+            base_url: base.into(),
+            api_key: key.into(),
+            model: model_ref.into(),
+        },
+        lane_effort.clone(),
+        &learning_config,
+    );
     let chat = move |msgs: Vec<Message>, defs: Vec<crate::core::types::ToolDef>| {
-        let effort = match lane_effort.clone() {
-            Some(inner) => inner,
-            None => crate::core::cli_config::resolved_reasoning_effort(
-                crate::core::cli_config::load().reasoning_effort,
-            ),
-        };
+        let effort = lane_effort.clone();
+        let config = learning_config.clone();
         async move {
-            client::chat_with_tools_effort(http_ref, base, key, model_ref, &msgs, &defs, effort)
-                .await
+            client::chat_with_tools_frozen(
+                http_ref, base, key, model_ref, &msgs, &defs, effort, &config,
+            )
+            .await
         }
     };
     let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
@@ -458,8 +509,21 @@ async fn run_serve_turn(
     // per-lane list is a later step.)
     crate::agent::todo::begin_user_turn();
     crate::agent::todo::end_turn(true);
-    let outcome =
-        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history).await?;
+    let result = crate::plugin::associations::scoped(
+        memory_snapshot.clone(),
+        cfg.exec_ctx.clone(),
+        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history),
+    )
+    .await;
+    if result
+        .as_ref()
+        .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
+    {
+        crate::plugin::associations::flush(&memory_snapshot).await?;
+    } else {
+        crate::plugin::associations::discard(&memory_snapshot);
+    }
+    let outcome = result?;
     // The user's `stop` hooks see every finished bot turn too (see `agent::hooks`).
     {
         let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
@@ -474,11 +538,31 @@ async fn run_serve_turn(
     }
     crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
 
-    // The passive learner writes ONE global memory store, so lanes take turns rather than racing to
-    // rewrite the same files. Short and off the critical path — the turn's answer is already formed.
+    // A generation-bound provider event never writes Core's legacy Memory store. No selected
+    // capable provider means no event and no child process; the lane's explicit context is retained.
     {
         let _learning = shared.learn.lock().await;
-        crate::maybe_learn_memory(history);
+        match crate::plugin::events::prepare(
+            &outcome.stop,
+            history,
+            &lane.root,
+            cfg.exec_ctx.clone(),
+            cfg.cancel.clone(),
+            Some(&memory_snapshot),
+            Some(learning_model),
+        ) {
+            Ok(Some(event)) => {
+                if crate::plugin::events::dispatch(event).await.is_err() {
+                    crate::ui::tui::note_line(
+                        "Memory provider learning failed; no automatic retry was attempted.",
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(_) => crate::ui::tui::note_line(
+                "Memory provider learning unavailable; coding result preserved.",
+            ),
+        }
     }
     cap_session(history, SERVE_SESSION_MAX_MSGS);
 
@@ -783,6 +867,7 @@ async fn handle_command<P: Platform>(
     match name {
         "help" | "start" => Some(serve_help_text()),
         "new" | "reset" => {
+            crate::plugin::snapshots::reset(&format!("hostbot:{}:{route}:{chat}", platform.name()));
             history.clear();
             store::drop_session(platform.name(), route, &chat.to_string());
             // Free this chat's browser session too (its page/@refs are part of the dropped context).
@@ -851,7 +936,13 @@ async fn handle_command<P: Platform>(
                 l.cwd = Some(resolved.clone());
                 Ok(())
             }) {
-                Ok(()) => Some(format!("📁 cwd → {} (this bot only)", resolved.display())),
+                Ok(()) => {
+                    crate::plugin::snapshots::reset(&format!(
+                        "hostbot:{}:{route}:{chat}",
+                        platform.name()
+                    ));
+                    Some(format!("📁 cwd → {} (this bot only)", resolved.display()))
+                }
                 Err(e) => Some(format!("✗ cd failed: {e}")),
             }
         }
@@ -995,6 +1086,10 @@ async fn handle_command<P: Platform>(
                         Ok(())
                     }) {
                         Ok(()) => {
+                            crate::plugin::snapshots::reset(&format!(
+                                "hostbot:{}:{route}:{chat}",
+                                platform.name()
+                            ));
                             let (effective, _) = resolve_effective_model(route, model);
                             format!("model cleared for this bot — back to the machine default ({effective}).")
                         }
@@ -1027,6 +1122,10 @@ async fn handle_command<P: Platform>(
                     // turn's context guard is sized by `resolve_ctx_window(model)`. Keeping a prefix
                     // that names the OLD model would both mislead the new one and size its window
                     // wrong. `run_serve_turn` rebuilds both lanes from the cleared history.
+                    crate::plugin::snapshots::reset(&format!(
+                        "hostbot:{}:{route}:{chat}",
+                        platform.name()
+                    ));
                     history.clear();
                     store::drop_session(platform.name(), route, &chat.to_string());
                     // Read back through the seam so the confirmation states what the next turn will
@@ -1040,43 +1139,19 @@ async fn handle_command<P: Platform>(
             }
         }
         "memory" | "mem" => {
-            if let Some(rest) = arg
-                .strip_prefix("remember")
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                Some(match crate::memory::remember(rest) {
-                    Ok(id) => format!("🧠 remembered ({id})"),
-                    Err(e) => format!("memory: {e}"),
-                })
-            } else if arg.trim().is_empty() {
-                Some("usage: /memory <query>  ·  /memory remember <fact>".to_string())
-            } else {
-                Some(
-                    match crate::memory::search_scoped(
-                        arg.trim(),
-                        5,
-                        &crate::memory::ScopeSel::default_view(),
-                    ) {
-                        Ok(hits) if hits.is_empty() => {
-                            format!("(no memory matches '{}')", arg.trim())
-                        }
-                        Ok(hits) => {
-                            let mut s = String::new();
-                            for h in &hits {
-                                let body: String = h.entry.body.chars().take(160).collect();
-                                s.push_str(&format!(
-                                    "• {} — {}\n",
-                                    h.entry.name,
-                                    body.replace('\n', " ")
-                                ));
-                            }
-                            s.trim_end().to_string()
-                        }
-                        Err(e) => format!("memory: {e}"),
-                    },
-                )
-            }
+            let root = lane_cwd(route);
+            let execution = crate::core::exec_ctx::ExecutionContext::new(
+                crate::core::convo::ConversationId::new(format!(
+                    "{}:{route}:{chat}",
+                    platform.name()
+                )),
+            );
+            Some(
+                match crate::plugin::manual::slash_in(arg, &root, Some(execution)).await {
+                    Ok(result) => result,
+                    Err(error) => format!("memory: {error:#}"),
+                },
+            )
         }
         "tools" | "toolsets" => Some(crate::agent::toolsets::format_config_status()),
         "status" => {
@@ -1212,6 +1287,179 @@ pub async fn run_discord_serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OfflinePlatform;
+    impl Platform for OfflinePlatform {
+        type Chat = u64;
+
+        fn name(&self) -> &'static str {
+            "memory-command-fixture"
+        }
+        fn message_max(&self) -> usize {
+            4096
+        }
+        async fn start(&self, _: Sender<Inbound<Self::Chat>>) -> Result<()> {
+            panic!("command regression must not start a bot transport")
+        }
+        async fn send(&self, _: &str, _: Self::Chat, _: &str) -> Result<()> {
+            panic!("command regression must not send a bot message")
+        }
+    }
+
+    struct MemoryCommandFixture {
+        old_home: Option<std::ffi::OsString>,
+        key: String,
+        sibling: String,
+        home: crate::core::file_placement::tests::TestDir,
+    }
+    impl MemoryCommandFixture {
+        fn new() -> Self {
+            let home = crate::core::file_placement::tests::TestDir::new();
+            let old_home = std::env::var_os("AIZEN_HOME");
+            std::env::set_var("AIZEN_HOME", home.path());
+            let key = "hostbot:memory-command-fixture:fixture-route:1".to_owned();
+            let sibling = "hostbot:memory-command-fixture:fixture-route:2".to_owned();
+            for key in [&key, &sibling] {
+                crate::plugin::snapshots::tests::install_candidate_fixture(key);
+            }
+            Self {
+                old_home,
+                key,
+                sibling,
+                home,
+            }
+        }
+    }
+    impl Drop for MemoryCommandFixture {
+        fn drop(&mut self) {
+            crate::plugin::snapshots::reset(&self.key);
+            crate::plugin::snapshots::reset(&self.sibling);
+            if let Some(home) = &self.old_home {
+                std::env::set_var("AIZEN_HOME", home);
+            } else {
+                std::env::remove_var("AIZEN_HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn memory_commands_retire_the_current_chat_only_after_success() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (name, argument, retires, clears_history) in [
+            ("new", "", true, true),
+            ("reset", "", true, true),
+            ("cd", "valid-directory", true, false),
+            ("cd", "missing-directory", false, false),
+            ("model", "fixture-model", true, true),
+            ("model", "clear", true, false),
+            ("model", "", false, false),
+            ("model", "invalid model", false, false),
+        ] {
+            let fixture = MemoryCommandFixture::new();
+            let argument = match argument {
+                "valid-directory" => fixture.home.path().to_string_lossy().into_owned(),
+                "missing-directory" => fixture
+                    .home
+                    .path()
+                    .join("missing")
+                    .to_string_lossy()
+                    .into_owned(),
+                argument => argument.to_owned(),
+            };
+            let mut history = vec![Message::user("fixture conversation")];
+            store::save_session(OfflinePlatform.name(), "fixture-route", "1", &history).unwrap();
+            store::save_session(OfflinePlatform.name(), "fixture-route", "2", &history).unwrap();
+            let (tx, _rx) = mpsc::channel(1);
+            let reply = runtime
+                .block_on(handle_command(
+                    &OfflinePlatform,
+                    name,
+                    &argument,
+                    &mut history,
+                    "fixture-route",
+                    1,
+                    "fixture-default",
+                    &Weak::new(),
+                    &tx,
+                ))
+                .unwrap();
+            assert!(!reply.is_empty());
+            let snapshot = crate::plugin::snapshots::current(&fixture.key);
+            assert_eq!(snapshot.context.is_none(), retires, "{name} {argument}");
+            assert_eq!(snapshot.turn_prefix(true).is_empty(), retires);
+            assert!(!crate::plugin::snapshots::current(&fixture.sibling)
+                .turn_prefix(true)
+                .is_empty());
+            assert_eq!(history.is_empty(), clears_history);
+            let sessions = store::load_sessions(OfflinePlatform.name());
+            assert_eq!(
+                sessions.iter().any(|(_, chat, _)| chat == "1"),
+                !clears_history
+            );
+            assert!(sessions.iter().any(|(_, chat, _)| chat == "2"));
+            assert!(!fixture.home.path().join("memory-data").exists());
+            assert!(!fixture.home.path().join("plugin-state").exists());
+        }
+    }
+
+    #[test]
+    fn memory_commands_preserve_candidates_when_settings_cannot_be_saved() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (name, argument) in [
+            ("cd", "directory"),
+            ("model", "fixture-model"),
+            ("model", "clear"),
+        ] {
+            let fixture = MemoryCommandFixture::new();
+            // A fixture-owned file prevents creating the settings directory; no real path is touched.
+            let blocker = fixture.home.path().join("hostbot");
+            std::fs::write(&blocker, b"owned settings blocker").unwrap();
+            let argument = if name == "cd" {
+                fixture.home.path().to_string_lossy().into_owned()
+            } else {
+                argument.to_owned()
+            };
+            let mut history = vec![Message::user("fixture conversation")];
+            let (tx, _rx) = mpsc::channel(1);
+            let reply = runtime
+                .block_on(handle_command(
+                    &OfflinePlatform,
+                    name,
+                    &argument,
+                    &mut history,
+                    "fixture-route",
+                    1,
+                    "fixture-default",
+                    &Weak::new(),
+                    &tx,
+                ))
+                .unwrap();
+            assert!(
+                reply.contains("failed") || reply.starts_with("model:"),
+                "{reply}"
+            );
+            assert!(!crate::plugin::snapshots::current(&fixture.key)
+                .turn_prefix(true)
+                .is_empty());
+            assert!(!crate::plugin::snapshots::current(&fixture.sibling)
+                .turn_prefix(true)
+                .is_empty());
+            assert_eq!(history.len(), 1);
+            assert_eq!(std::fs::read(&blocker).unwrap(), b"owned settings blocker");
+        }
+    }
 
     /// Pin `AIZEN_HOME` to a fresh tempdir so lane settings read/write there. Serialized on the
     /// crate-wide `TEST_HOME_LOCK`, like every other HOME-mutating test.

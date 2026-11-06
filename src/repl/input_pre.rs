@@ -4,7 +4,6 @@
 //! Shared by both REPL surfaces so a line typed into either one is preprocessed identically.
 
 use crate::features::commands;
-use crate::memory;
 use crate::ui::{splash, theme, tui};
 use console::style;
 
@@ -23,7 +22,7 @@ const SHELL_ESCAPE_CAP: usize = 6000;
 /// `!cmd` is a shell escape (both run NO turn); a normal message has its `@file` and inline
 /// `` !`cmd` `` refs expanded. Output routes through `tui::emit_line` (works under the sticky TUI and
 /// the plain REPL alike). Sync — every step (remember / classify / expand / run) is synchronous.
-pub(crate) fn preprocess_input(line: &str) -> InputPre {
+pub(crate) async fn preprocess_input(line: &str) -> InputPre {
     let t = line.trim_start();
     // `#text` → remember a fact directly (the highest-confidence capture → straight into the store).
     if let Some(rest) = t.strip_prefix('#') {
@@ -35,7 +34,7 @@ pub(crate) fn preprocess_input(line: &str) -> InputPre {
                     .to_string(),
             );
         } else {
-            match memory::remember(text) {
+            match crate::plugin::manual::remember(text).await {
                 Ok(id) => tui::emit_line(
                     &style(format!("🧠 remembered ({id})"))
                         .color256(splash::ACCENT)

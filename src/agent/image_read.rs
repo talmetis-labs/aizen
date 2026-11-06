@@ -1,4 +1,4 @@
-//! Approval-gated local PNG observations. No runtime, upload client or global evidence lookup.
+//! Approval-gated local image observations. No runtime, upload client or global evidence lookup.
 
 use super::tools::{ApprovalPreview, PreparedToolCall, Tool, ToolObservation};
 use crate::core::tool_media::{ImageProvenance, PixelRect, ToolImage};
@@ -205,12 +205,12 @@ impl Tool for ImageRead {
         "image_read"
     }
     fn description(&self) -> &str {
-        "Send PNG pixels: exactly one local path, scoped evidence_id or granted user ref_id; optional pixel crop. Requires transmit_image:true and destination approval. Refs need live controller consent. No freshness/visual-review claim."
+        "Send original PNG/JPEG/GIF/WebP: exactly one local path, scoped evidence_id or granted user ref_id. Optional PNG/JPEG crop uses original-raster coordinates, refuses profiles/animation/orientation. Requires transmit_image:true and destination approval. Refs need live controller consent. No freshness/visual-review claim."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{
-            "path":{"type":"string","minLength":1,"maxLength":2048,"description":"Local PNG path; omit evidence_id and ref_id."},
-            "evidence_id":{"type":"string","minLength":1,"maxLength":128,"description":"Scoped PNG evidence; omit path and ref_id."},
+            "path":{"type":"string","minLength":1,"maxLength":2048,"description":"Local PNG/JPEG/GIF/WebP path; omit evidence_id and ref_id."},
+            "evidence_id":{"type":"string","minLength":1,"maxLength":128,"description":"Scoped retained image; omit path and ref_id."},
             "ref_id":{"type":"string","minLength":1,"maxLength":128,"description":"Granted user reference; omit path and evidence_id."},
             "transmit_image":{"type":"boolean","enum":[true]},
             "crop":{"type":"object","properties":{
@@ -250,51 +250,62 @@ impl Tool for ImageRead {
     }
     fn preview(&self, value: &Value) -> Option<ApprovalPreview> {
         let source = match Args::parse(value) {
-            Ok(args) => {
-                match args.path {
-                    Some(path) => match self.source_path(&path) {
-                        Ok(path) => format!(
-                            "canonical source: {}",
-                            safe_display(&path.to_string_lossy())
+            Ok(args) => match args.path {
+                Some(path) => match self.source_path(&path) {
+                    Ok(path) => format!(
+                        "canonical source: {}",
+                        safe_display(&path.to_string_lossy())
+                    ),
+                    Err(error) => {
+                        format!("source unavailable: {}", safe_display(&error.to_string()))
+                    }
+                },
+                None if args.ref_id.is_some() => {
+                    let id = args.ref_id.as_deref().unwrap_or_default();
+                    let image = crate::core::exec_ctx::current()
+                        .and_then(|ctx| ctx.references())
+                        .and_then(|access| access.original(id).ok());
+                    match image {
+                        Some(image) => format!(
+                            "granted user reference: {} · {}x{} · original payload available",
+                            safe_display(id),
+                            image.metadata().width.unwrap_or_default(),
+                            image.metadata().height.unwrap_or_default()
                         ),
-                        Err(error) => {
-                            format!("source unavailable: {}", safe_display(&error.to_string()))
+                        None => {
+                            "reference unavailable or no live controller grant in this task".into()
                         }
-                    },
-                    None if args.ref_id.is_some() => {
-                        let id = args.ref_id.as_deref().unwrap_or_default();
-                        let image = crate::core::exec_ctx::current()
-                            .and_then(|ctx| ctx.references())
-                            .and_then(|access| access.original(id).ok());
-                        match image {
-                            Some(image) => format!(
-                                "granted user reference: {} · {}x{} · original payload available",
-                                safe_display(id),
-                                image.metadata().width.unwrap_or_default(),
-                                image.metadata().height.unwrap_or_default()
-                            ),
-                            None => {
-                                "reference unavailable or no live controller grant in this task"
-                                    .into()
-                            }
-                        }
-                    }
-                    None => {
-                        let id = args.evidence_id.as_deref().unwrap_or_default();
-                        let image = crate::core::exec_ctx::current()
-                            .and_then(|ctx| ctx.design())
-                            .and_then(|ctx| {
-                                crate::core::session_store::scoped_live_tool_image(&ctx, id)
-                            });
-                        match image {
-                        Some(image) => format!("retained evidence: {} · source: {} · payload {}", safe_display(id),
-                            safe_display(image.metadata().provenance.locator.as_deref().unwrap_or("unavailable")),
-                            if image.is_available() { "available" } else { "unavailable" }),
-                        None => format!("retained evidence: {} (current-session scoped payload unavailable)", safe_display(id)),
-                    }
                     }
                 }
-            }
+                None => {
+                    let id = args.evidence_id.as_deref().unwrap_or_default();
+                    let image =
+                        crate::core::exec_ctx::current().and_then(|ctx| ctx.scoped_tool_image(id));
+                    match image {
+                        Some(image) => format!(
+                            "retained evidence: {} · source: {} · payload {}",
+                            safe_display(id),
+                            safe_display(
+                                image
+                                    .metadata()
+                                    .provenance
+                                    .locator
+                                    .as_deref()
+                                    .unwrap_or("unavailable")
+                            ),
+                            if image.is_available() {
+                                "available"
+                            } else {
+                                "unavailable"
+                            }
+                        ),
+                        None => format!(
+                            "retained evidence: {} (execution-scoped payload unavailable)",
+                            safe_display(id)
+                        ),
+                    }
+                }
+            },
             Err(error) => {
                 return Some(ApprovalPreview {
                     title: self.name().into(),
@@ -309,7 +320,7 @@ impl Tool for ImageRead {
         Some(ApprovalPreview {
             title: "image_read".into(), diff: None,
             lines: vec![source,
-                "Transmit potentially sensitive PNG pixels to the configured image-capable model destination; approval is still required.".into(),
+                "Transmit potentially sensitive image pixels to the configured image-capable model destination; approval is still required.".into(),
                 "Local source validation only; no network, capture, runtime, install or upload in this preview.".into(),
                 format!("pixel crop: {}", safe_display(&value.get("crop").map(Value::to_string).unwrap_or_else(|| "none".into()))),
             ],
@@ -329,10 +340,6 @@ impl Tool for ImageRead {
                 height: crop.height,
             });
             let image = access.read(id, crop)?;
-            ensure!(
-                image.metadata().mime == "image/png",
-                "image_read supports PNG only"
-            );
             // This explicit reference lineage can credit only a reference observation receipt,
             // never implementation capture/review evidence in the parent's or child's ledger.
             return Ok(ToolObservation {
@@ -354,9 +361,9 @@ impl Tool for ImageRead {
             ToolImage::from_file(&path, provenance)?
         } else {
             let id = args.evidence_id.as_deref().context("evidence_id missing")?;
-            let ctx = design.as_ref().context("retained evidence image unavailable: no coherent current-session scoped payload lookup")?;
-            let image = crate::core::session_store::scoped_live_tool_image(ctx, id)
-                .context("retained evidence image unavailable in this current-session scope")?;
+            let image = crate::core::exec_ctx::current()
+                .and_then(|ctx| ctx.scoped_tool_image(id))
+                .context("retained evidence image unavailable in this execution scope")?;
             ensure!(
                 image.is_available(),
                 "retained evidence image payload unavailable: {:?}",
@@ -368,13 +375,9 @@ impl Tool for ImageRead {
             );
             image
         };
-        ensure!(
-            image.metadata().mime == "image/png",
-            "image_read supports PNG only"
-        );
         if let Some(crop) = args.crop {
             let retained = args.evidence_id.is_some();
-            image = image.crop_png(PixelRect {
+            image = image.crop_pixels(PixelRect {
                 x: crop.x,
                 y: crop.y,
                 width: crop.width,
@@ -397,7 +400,7 @@ impl Tool for ImageRead {
         // design viewport capture budget. Their scoped identity is selection provenance only.
         Ok(ToolObservation {
             text: json!({"image":image.metadata(),"freshness":"unavailable",
-                "note":"Actual PNG reference pixels attached; not rendered acceptance evidence or visual review."})
+                "note":"Actual original or bounded crop pixels attached; not rendered acceptance evidence or visual review."})
             .to_string(),
             images: vec![image],
         })
@@ -426,7 +429,7 @@ impl Tool for ReferenceRead {
         "reference_read"
     }
     fn description(&self) -> &str {
-        "Read original PNG pixels or a pixel crop from a current-task granted user ref_id only. Requires transmit_image:true, vision support and destination approval. No filesystem path, rendered evidence or sibling access. Not visual review."
+        "Read original PNG/JPEG/GIF/WebP or a bounded PNG/JPEG original-raster crop from a current-task granted user ref_id only. Profiled/oriented/animated crop is refused. Requires transmit_image:true, vision support and destination approval. No filesystem path, rendered evidence or sibling access. Not visual review."
     }
     fn parameters(&self) -> Value {
         let mut parameters = self.0.parameters();
@@ -648,11 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_corrupt_non_png_missing_directory_and_oversize() {
+    fn rejects_corrupt_unsupported_missing_directory_and_oversize() {
         let fixture = Fixture::new();
         let tool = fixture.tool();
         std::fs::write(fixture.0.join("corrupt.png"), b"\x89PNG\r\n\x1a\n").unwrap();
-        std::fs::write(fixture.0.join("other.png"), b"GIF89a-not-decoded").unwrap();
+        std::fs::write(fixture.0.join("other.png"), b"unsupported image format").unwrap();
         let file = std::fs::File::create(fixture.0.join("large.png")).unwrap();
         file.set_len(MAX_IMAGE_BYTES as u64 + 1).unwrap();
         for path in ["corrupt.png", "other.png", "missing.png", "large.png", "."] {
@@ -771,7 +774,80 @@ mod tests {
             .tool()
             .execute_observation(&json!({"evidence_id":"test.png","transmit_image":true}))
             .unwrap_err();
-        assert!(error.to_string().contains("scoped payload lookup"));
+        assert!(error
+            .to_string()
+            .contains("unavailable in this execution scope"));
+    }
+
+    #[test]
+    fn retained_reads_and_previews_are_execution_local() {
+        use crate::core::types::{FunctionCall, Message, ToolCall};
+        let fixture = Fixture::new();
+        fixture.png();
+        let design = super::super::design::DesignContext::new(
+            "scoped-image-reader",
+            fixture.0.to_string_lossy(),
+            super::super::design::DesignMode::Auto,
+        );
+        design.begin_turn("parent", fixture.0.to_string_lossy());
+        let parent = crate::core::exec_ctx::ExecutionContext::new(
+            crate::core::convo::ConversationId::new("scoped-image-reader"),
+        )
+        .with_design(design.clone());
+        let original = crate::core::exec_ctx::with_current(parent.clone(), || {
+            fixture
+                .tool()
+                .execute_observation(&json!({"path":"test.png","transmit_image":true}))
+        })
+        .unwrap()
+        .images
+        .remove(0);
+        let id = original.metadata().provenance.evidence_id.clone().unwrap();
+        let mut assistant = Message::user("unused");
+        assistant.role = "assistant".into();
+        assistant.tool_calls = vec![ToolCall {
+            id: "read-original".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "image_read".into(),
+                arguments: "{}".into(),
+            },
+        }];
+        let mut output = Message::tool_result("read-original", "available");
+        output.tool_images.push(original.clone());
+        let history = [assistant, output];
+        parent.refresh_tool_images(&history);
+        let args = json!({"evidence_id":id,"transmit_image":true});
+        let read = crate::core::exec_ctx::with_current(parent.clone(), || {
+            fixture.tool().execute_observation(&args)
+        })
+        .unwrap();
+        assert_eq!(read.images[0].metadata().sha256, original.metadata().sha256);
+        let preview =
+            crate::core::exec_ctx::with_current(parent.clone(), || fixture.tool().preview(&args))
+                .unwrap();
+        assert!(preview.lines.join(" ").contains("payload available"));
+        for scope in ["child", "sibling"] {
+            let ctx = parent
+                .with_resource_scope(scope)
+                .with_design(design.fork_child(scope, fixture.0.to_string_lossy()));
+            // Even a copied transcript cannot turn another execution's image into a local handle.
+            ctx.refresh_tool_images(&history);
+            crate::core::exec_ctx::with_current(ctx, || {
+                assert!(fixture.tool().execute_observation(&args).is_err());
+                let preview = fixture.tool().preview(&args).unwrap();
+                assert!(preview
+                    .lines
+                    .join(" ")
+                    .contains("execution-scoped payload unavailable"));
+            });
+        }
+        // Removing the completed positional group also invalidates the parent's local handle.
+        parent.refresh_tool_images(&history[..1]);
+        assert!(crate::core::exec_ctx::with_current(parent, || fixture
+            .tool()
+            .execute_observation(&args))
+        .is_err());
     }
 
     #[test]
@@ -796,7 +872,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("current-session scope"));
+            .contains("unavailable in this execution scope"));
     }
 
     #[test]

@@ -138,6 +138,8 @@ pub enum CommandOrigin {
     Hook,
     /// An MCP stdio server process (configured command; trust-gated per project elsewhere).
     McpStdio,
+    /// An explicitly selected external Memory executable; installation alone never launches it.
+    MemoryProvider,
     /// An Aizen-internal spawn whose program AND arguments are Aizen-controlled (git plumbing,
     /// `systemctl` service management, opening the OAuth browser). Carries a literal reason for
     /// the audit trail. NOT reachable from any tool argument.
@@ -160,6 +162,7 @@ impl CommandOrigin {
             Self::Workflow => "workflow",
             Self::Hook => "hook",
             Self::McpStdio => "mcp_stdio",
+            Self::MemoryProvider => "memory_provider",
             Self::InternalTrusted(_) => "internal_trusted",
         }
     }

@@ -495,11 +495,13 @@ async fn stream_turn_at_projected(
     policy: crate::llm::media::VisionPolicy,
     effort_override: Option<Option<String>>,
 ) -> Result<ChatTurn> {
-    let _request_memory = crate::llm::media::request_memory_lease(messages)?;
     let mut access_account = auth.bearer().await?;
     let (base_model, _) = codex_models::strip_effort_suffix(model);
     let destination = crate::llm::media::destination_key(url, base_model);
+    let _request_memory =
+        crate::llm::media::request_memory_lease(messages, policy, Some(&destination))?;
     crate::llm::media::validate_reference_vision(policy)?;
+    crate::llm::media::prepare_user_images(messages, policy, Some(&destination)).await?;
     let body = build_request_body_projected(
         model,
         messages,
@@ -511,7 +513,13 @@ async fn stream_turn_at_projected(
         Some(&destination),
     );
 
-    let body = serde_json::to_vec(&body)?;
+    let wire = serde_json::to_vec(&body)?;
+    crate::llm::media::stage_wire_json(wire.len());
+    let body = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(wire)
+        .build()?;
     let send_started = Instant::now();
     let send_budget = Duration::from_secs(600);
     // Request-layer retries mirror `send_with_retry`: jittered backoff on 429/5xx, ONE token
@@ -528,14 +536,15 @@ async fn stream_turn_at_projected(
         let remaining = send_budget.saturating_sub(send_started.elapsed());
         crate::llm::media::validate_image_request()?;
         super::delegated::before_send()?;
+        crate::llm::media::record_wire_attempt();
         let resp = tokio::time::timeout(
             remaining,
-            client
-                .post(url)
-                .headers(headers)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body.clone())
-                .send(),
+            reqwest::RequestBuilder::from_parts(
+                client.clone(),
+                body.try_clone().expect("in-memory Codex body is reusable"),
+            )
+            .headers(headers)
+            .send(),
         )
         .await
         .map_err(|_| anyhow!("Codex request timeout (stage=send)"))?
@@ -1656,7 +1665,7 @@ data: {"type":"response.completed","response":{"output":[]}}
 
     #[tokio::test]
     async fn actual_codex_receiver_gets_every_output_before_exact_image_bytes_without_metadata() {
-        use crate::llm::media::{destination_key, tests as media_tests, VisionPolicy};
+        use crate::llm::media::{destination_key, tests as media_tests};
         const REPLY: &str = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"reviewed\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
         let (base, receiver, server) =
             media_tests::request_receiver(REPLY, "text/event-stream").await;
@@ -1676,7 +1685,11 @@ data: {"type":"response.completed","response":{"output":[]}}
             "test-session",
             StreamSink::default(),
             fast_caps(),
-            VisionPolicy::Supported,
+            crate::llm::media::vision_policy_in(
+                &crate::core::cli_config::CliConfig::default(),
+                crate::llm::oauth_codex::CODEX_BASE_URL,
+                "vision-test-high",
+            ),
             Some(Some("low".into())),
         )
         .await
@@ -1702,6 +1715,133 @@ data: {"type":"response.completed","response":{"output":[]}}
             "explicit per-call effort beats model suffix/global"
         );
         media_tests::assert_no_storage_metadata(&wire);
+    }
+
+    #[tokio::test]
+    async fn actual_codex_lifecycle_omits_released_pixels_and_accounts_every_send() {
+        use crate::core::reference_media::{
+            ReferenceDerivatives, ReferenceGrantScope, ReferenceRegistry, ReferenceRoute,
+        };
+        use crate::llm::media::{self, VisionPolicy};
+        const REPLY: &str = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"reviewed\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let original = media::tests::image(74).data_url();
+        let mut messages = vec![Message::user_with_images("inspect", vec![original.clone()])];
+        let registry = ReferenceRegistry::new("codex-lifecycle");
+        let ids = registry
+            .register_loaded(&mut messages)
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.reference_id)
+            .collect::<Vec<_>>();
+        let ctx = crate::core::exec_ctx::ExecutionContext::new(
+            crate::core::convo::ConversationId::new("codex-lifecycle"),
+        );
+        let mut records = Vec::new();
+        let mut visual_id = String::new();
+        for phase in 0..4 {
+            let (base, receiver, server) =
+                media::tests::request_receiver(REPLY, "text/event-stream").await;
+            let url = format!("{base}/codex/responses");
+            let scope = ReferenceGrantScope {
+                owner: "codex-lifecycle".into(),
+                purpose: "owned loopback lifecycle fixture".into(),
+                task_scope: ctx.resource_scope(),
+                route: ReferenceRoute {
+                    destination: media::effective_destination_key(&url, "vision-test"),
+                    account: media::effective_image_route_key(&url, "vision-test", "tok-0"),
+                },
+            };
+            let access = registry
+                .grant(&ids, scope, ReferenceDerivatives::ORIGINAL)
+                .unwrap();
+            let request_ctx = ctx.with_references(access);
+            request_ctx.refresh_visual(&mut messages).unwrap();
+            let (_, receipt) = media::with_image_delivery(
+                &request_ctx,
+                &url,
+                "tok-0",
+                "vision-test",
+                stream_turn_at_projected(
+                    &client,
+                    &url,
+                    &CountingAuth::default(),
+                    "vision-test",
+                    &messages,
+                    &[],
+                    "owned-lifecycle",
+                    StreamSink::default(),
+                    fast_caps(),
+                    VisionPolicy::Supported,
+                    Some(Some("low".into())),
+                ),
+            )
+            .await
+            .unwrap();
+            let body = receiver.await.unwrap();
+            server.await.unwrap();
+            let images: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["content"].as_array())
+                .flatten()
+                .filter(|part| part["type"] == "input_image")
+                .map(|part| part["image_url"].as_str().unwrap())
+                .collect();
+            if phase == 0 || phase == 3 {
+                assert_eq!(images, [original.as_str()]);
+                assert_eq!(receipt.user_images.len(), 1);
+            } else {
+                assert!(images.is_empty());
+                assert!(receipt.user_images.is_empty());
+                assert!(body.to_string().contains("pixels released"));
+            }
+            media::tests::assert_no_storage_metadata(&body);
+            records.push((
+                serde_json::to_vec(&body).unwrap().len(),
+                images.iter().map(|url| url.len()).sum::<usize>(),
+                images.len(),
+            ));
+            if phase == 0 {
+                visual_id = messages[0].visual_context[0].id.clone();
+                request_ctx.visual().begin_group();
+                request_ctx
+                    .visual()
+                    .mutate(
+                        &visual_id,
+                        "release",
+                        Some("One owned fixture pixel"),
+                        None,
+                        true,
+                    )
+                    .unwrap();
+                request_ctx.visual().sync(&mut messages);
+            } else if phase == 2 {
+                let mut reselection = request_ctx
+                    .references()
+                    .unwrap()
+                    .user_message("explicitly reselect the fixture")
+                    .unwrap();
+                // user_message carries validated selected pixels/markers in exact selected order.
+                reselection.image_preferences = vec![crate::core::types::ImagePreference::Original];
+                messages.push(reselection);
+            } else {
+                messages.push(Message::user("continue without needing pixels"));
+            }
+        }
+        assert!(!visual_id.is_empty());
+        let usage = ctx.media().snapshot();
+        assert_eq!(usage.attempts, records.len());
+        assert_eq!(
+            usage.json_bytes,
+            records.iter().map(|record| record.0).sum::<usize>()
+        );
+        assert_eq!(
+            usage.image_uri_bytes,
+            records.iter().map(|record| record.1).sum::<usize>()
+        );
+        assert_eq!(usage.images, 2);
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};

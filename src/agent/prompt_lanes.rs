@@ -11,8 +11,8 @@
 //! retrieves. The stored history keeps the clean text the user typed.
 
 use crate::agent;
+use crate::core::session_mem;
 use crate::core::types::Message;
-use crate::memory;
 use crate::persona;
 use crate::ui::tui;
 use crate::*;
@@ -48,19 +48,8 @@ pub(crate) fn system_prompt_bundle_in(
         model,
         Some(frozen),
     );
-    // L2 session working memory (temporary, budget-capped). It grows as the agent works — the
-    // post-turn learning pass files candidates into it — so on the REPL it rides the USER turn
-    // (`fold_context_into_query`), where the bytes are new anyway, and never the dynamic lane,
-    // which must stay byte-stable for the prefix cache. A hostbot lane has no fold step and no
-    // cached prefix to protect the same way, so it keeps the block here.
-    if root.is_some() {
-        let sess_budget = memory::settings().session_mem_max_tokens;
-        if let Some(block) = memory::session_mem::process_prompt_block(sess_budget) {
-            bundle.dynamic.push('\n');
-            bundle.dynamic.push_str(&block);
-            bundle.dynamic.push('\n');
-        }
-    }
+    // Provider-derived session candidates are lane-owned user-turn evidence, never a shared
+    // process-global block in a hostbot system lane.
     // Recent saved conversations, so "continue the most recent session" is visible to the MODEL —
     // the startup resume hint only ever reached the terminal. REPL surfaces only (`root` is None):
     // a hostbot lane carries its own per-chat history and terminal sessions would be noise there.
@@ -83,16 +72,20 @@ pub(crate) fn refreshed_system_prompt_bundle(model: &str) -> agent::PromptBundle
     // lane is rebuilt from these adopted copies byte-for-byte.
     crate::core::session_store::clear_sessions_block_cache();
     persona::forget_adopted_self();
-    let frozen = memory::refresh_frozen_core();
-    system_prompt_bundle_with_core(model, &frozen)
+    let snapshot = crate::plugin::snapshots::current("repl");
+    crate::plugin::associations::with_affinity(&snapshot, || {
+        system_prompt_bundle_with_core(model, &snapshot.standing)
+    })
 }
 
 /// Same-conversation lane rewrite: reuse the already-adopted core byte-for-byte. A retrieval,
 /// reinforcement, or memory write during this conversation may stage `core.next`, but must not
 /// mutate the cached prefix or promote it before the next conversation boundary.
 pub(crate) fn active_system_prompt_bundle(model: &str) -> agent::PromptBundle {
-    let frozen = memory::active_frozen_core();
-    system_prompt_bundle_with_core(model, &frozen)
+    let snapshot = crate::plugin::snapshots::current("repl");
+    crate::plugin::associations::with_affinity(&snapshot, || {
+        system_prompt_bundle_with_core(model, &snapshot.standing)
+    })
 }
 
 /// The two bundle builders above, parameterized by the hostbot lane's working directory and persona.
@@ -102,15 +95,11 @@ pub(crate) fn hostbot_prompt_bundle(
     model: &str,
     root: &std::path::Path,
     persona: Option<String>,
-    boundary: bool,
+    _boundary: bool,
+    frozen: &str,
 ) -> agent::PromptBundle {
     persona::with_override(persona, || {
-        let frozen = if boundary {
-            memory::refresh_frozen_core()
-        } else {
-            memory::active_frozen_core()
-        };
-        system_prompt_bundle_in(model, &frozen, Some(root))
+        system_prompt_bundle_in(model, frozen, Some(root))
     })
 }
 
@@ -285,11 +274,6 @@ pub(crate) fn fold_retrieval_into_query(query: &str) -> String {
     }
 }
 
-/// Per-turn budget (tokens) for the memory recall block folded into the CURRENT user turn.
-/// Deliberately an order of magnitude under the codebase budget: this carries a handful of
-/// one-line facts, not source, and it is spent on every gated turn.
-pub(crate) const MEMORY_RECALL_BUDGET_TOKENS: usize = 300;
-
 /// Fold BOTH per-turn context blocks into the sent content: memory recall, then codebase RAG.
 ///
 /// Same discipline as [`fold_retrieval_into_query`] and for the same reason — the blocks ride on the
@@ -303,10 +287,6 @@ pub(crate) const MEMORY_RECALL_BUDGET_TOKENS: usize = 300;
 /// `query` itself is never modified: the caller keeps it for checkpoint / display / persisted
 /// history, so the durable transcript holds the user's real words, not our scaffolding.
 pub(crate) fn fold_context_into_query(query: &str) -> String {
-    // The turn counter lives here because this is the one point BOTH REPL loops pass through exactly
-    // once per user message. Counting inside the agent loop would count iterations, and metric 1's
-    // denominator ("live facts per turn") has to mean turns the user drove.
-    memory::stats::note_turn();
     let mut out = fold_retrieval_into_query(query);
     // A pure question — nothing to change — skips the gated-skills and memory-recall blocks: the
     // standing facts already ride the frozen core, and a how-to procedure is for doing, not for
@@ -320,22 +300,21 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
     // budget on the ones that don't. Folded ABOVE the code but BELOW the facts, matching the
     // "standing truth → how-to → source" reading order.
     if !question {
-        if let Some(block) = skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS) {
+        let snapshot = crate::plugin::snapshots::current("repl");
+        if let Some(block) = crate::plugin::associations::with_affinity(&snapshot, || {
+            skills::turn_block(query, skills::SKILL_TURN_BUDGET_TOKENS)
+        }) {
             out = format!("{block}\n\n{out}");
         }
     }
     // L2 session working memory: the notes the learning pass filed during THIS conversation. It
     // changes between turns, which is exactly why it rides here and not in the dynamic lane.
-    if let Some(block) =
-        memory::session_mem::process_prompt_block(memory::settings().session_mem_max_tokens)
-    {
+    if let Some(block) = session_mem::process_prompt_block(300) {
         out = format!("{block}\n\n{out}");
     }
-    if !question {
-        if let Some((block, pairs)) = memory::recall_block(query, MEMORY_RECALL_BUDGET_TOKENS) {
-            memory::pending::open_turn(pairs);
-            out = format!("{block}\n\n{out}");
-        }
+    let block = crate::plugin::snapshots::current("repl").turn_prefix(!question);
+    if !block.is_empty() {
+        out = format!("{block}\n\n{out}");
     }
     out
 }
@@ -350,12 +329,11 @@ pub(crate) fn fold_context_into_query(query: &str) -> String {
 /// anyway: rewriting a user turn at any other time would break cache coverage for the whole tail,
 /// costing more than the tokens it saves.
 ///
-/// Matches on [`memory::RECALL_MARKER`] / [`skills::SKILL_MARKER`] at the start of the content and
-/// cuts through the first blank line. Anything the user actually typed survives, including a message
-/// that merely mentions the phrase — a marker has to be at position 0, which only our own folding
-/// produces. Both are peeled in a loop because a turn carries them stacked (recall, then skills):
-/// removing the outer one promotes the inner one to position 0.
+/// Provider Memory scaffolds require content-bound provenance receipts; a matching phrase alone
+/// never authorizes stripping user text. Core-owned skill, session-note and design prefixes are
+/// peeled separately, repeatedly, because they can be stacked around the user content.
 pub(crate) fn strip_recall_blocks(history: &mut [Message]) {
+    crate::core::memory_context::strip_history(history);
     for m in history.iter_mut() {
         if m.role != "user" {
             continue;
@@ -365,9 +343,9 @@ pub(crate) fn strip_recall_blocks(history: &mut [Message]) {
         };
         let mut cur = content;
         loop {
-            let next = strip_skill_prefix(strip_session_mem_prefix(memory::strip_recall_prefix(
+            let next = strip_skill_prefix(strip_session_mem_prefix(
                 crate::agent::design::prompt::strip_prefix(cur),
-            )));
+            ));
             if next.len() == cur.len() {
                 break;
             }
@@ -379,7 +357,7 @@ pub(crate) fn strip_recall_blocks(history: &mut [Message]) {
     }
 }
 
-/// Peel one leading gated-skill block, mirroring [`memory::strip_recall_prefix`].
+/// Peel one leading gated-skill block. Memory instead requires content-bound message provenance.
 pub(crate) fn strip_skill_prefix(content: &str) -> &str {
     if !content.starts_with(skills::SKILL_MARKER) {
         return content;
@@ -409,11 +387,11 @@ mod lane_stability_tests {
         active_system_prompt_bundle, fold_context_into_query, refreshed_system_prompt_bundle,
         strip_recall_blocks,
     };
-    use crate::core::session_store::{autosave_last, set_session_slug};
-    use crate::core::types::Message;
-    use crate::memory::session_mem::{
+    use crate::core::session_mem::{
         clear_process_session_mem, process_session_mem, SessionNoteKind,
     };
+    use crate::core::session_store::{autosave_last, set_session_slug};
+    use crate::core::types::Message;
 
     /// The invariant every turn relies on: between two conversation boundaries the dynamic lane
     /// is byte-identical, whatever happened in between — this conversation's own autosave (which
@@ -486,11 +464,11 @@ mod lane_stability_tests {
 /// never inherits the previous one's state (the classic leak: a restored conversation still
 /// "allowed" the old thread's destructive ops and showed its cost).
 pub(crate) fn reset_per_session_state() {
-    memory::session_mem::clear_process_session_mem();
+    session_mem::clear_process_session_mem();
     // The new transcript never contained the old recall block, so its handles now point at facts
     // the model cannot see — and a stale `last_ids` would suppress the first block of the new
     // thread as a "duplicate" of one that is no longer in context.
-    memory::pending::clear();
+    crate::plugin::snapshots::reset("repl");
     crate::agent::todo::clear();
     // The next turn decides the conversation's shape (and so its deferred tool set) afresh.
     crate::core::turn_shape::reset_conversation();
@@ -504,11 +482,11 @@ pub(crate) fn reset_per_session_state() {
     crate::agent::browser::release_active();
 }
 
-/// Reset the conversation to just the system prompt (fresh session / model change). Rebuilds the
-/// frozen core from the current memory store so newly added `type=user` facts / STYLE are injected.
-/// Drops session working memory — a new thread does not inherit this session's scratch notes.
+/// Reset the conversation to the current system prompt lanes for a fresh session.
+/// Provider snapshots are prepared separately at valid user-turn boundaries; this does not read
+/// or rebuild a persistent Memory store. A new thread does not inherit session scratch notes.
 pub(crate) fn rebuild_system(history: &mut Vec<Message>, model: &str) {
-    memory::session_mem::clear_process_session_mem();
+    session_mem::clear_process_session_mem();
     seed_prompt_lanes(history, model);
 }
 

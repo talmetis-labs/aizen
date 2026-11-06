@@ -104,11 +104,11 @@ impl LaneStats {
         self.busy.fetch_add(1, Ordering::SeqCst);
     }
     fn leave_turn(&self) {
-        // `fetch_update` rather than `fetch_sub`: an underflow here would wrap to usize::MAX and
+        // `try_update` rather than `fetch_sub`: an underflow here would wrap to usize::MAX and
         // pin the daemon at "busy" forever, which a liveness probe would eventually restart.
         let _ = self
             .busy
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 Some(n.saturating_sub(1))
             });
     }
@@ -118,7 +118,7 @@ impl LaneStats {
     fn drop_lane(&self) {
         let _ = self
             .lanes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 Some(n.saturating_sub(1))
             });
     }

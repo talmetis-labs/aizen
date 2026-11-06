@@ -4,10 +4,12 @@
 pub mod account;
 pub mod client;
 pub mod codex_models;
+pub(crate) mod compact_summary;
 pub(crate) mod delegated;
 pub mod gateway;
 pub mod image_send;
 pub mod media;
+pub(crate) mod model_metadata;
 pub mod oauth_codex;
 pub mod replay;
 pub mod responses_codex;

@@ -5,6 +5,9 @@ use super::*;
 use crate::core::config;
 use anyhow::anyhow; // `main.rs` no longer needs it now that `apps` moved out; these tests still do. // ditto: `main.rs` stopped needing it once the subcommands moved out.
 
+#[path = "memory_boundary.rs"]
+mod memory_boundary;
+
 #[test]
 fn config_provider_subcommands_parse() {
     for argv in [
@@ -213,30 +216,40 @@ fn where_reports_name_every_store_and_flag_missing_dirs() {
     let _g = crate::core::config::TEST_HOME_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let home = std::env::temp_dir().join(format!("aizen-whererep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
+    let old_home = std::env::var_os("AIZEN_HOME");
+    // The helper resolves macOS's /var alias before strict host-storage checks run.
+    let fixture = crate::core::file_placement::tests::TestDir::new();
+    let home = fixture.path().join("home");
     std::env::set_var("AIZEN_HOME", &home);
 
-    let entries = crate::core::config::entries_dir();
+    let entries = crate::legacy_memory_fixture::entries_dir();
     std::fs::create_dir_all(&entries).unwrap();
     std::fs::write(entries.join("a.md"), "---\nname: A\n---\nx").unwrap();
     std::fs::write(entries.join("b.md"), "---\nname: B\n---\ny").unwrap();
     // Not a fact — the count must not include it.
     std::fs::write(entries.join("notes.txt"), "ignore me").unwrap();
 
+    let before: Vec<_> = ["a.md", "b.md", "notes.txt"]
+        .iter()
+        .map(|name| std::fs::read(entries.join(name)).unwrap())
+        .collect();
     let rep = memory_where_report();
-    assert!(rep.contains("2 fact(s)"), "{rep}");
     assert!(
-        rep.contains(&entries.display().to_string()),
-        "entries path missing:\n{rep}"
+        rep.contains("Memory: unavailable") && rep.contains("Selected: none"),
+        "{rep}"
     );
-    // The review dir is the one that matters most — 29 queued items were invisible because
-    // nothing ever said they were on disk.
-    assert!(rep.contains("review"), "{rep}");
     assert!(
-        rep.contains("(not created yet)"),
-        "an absent dir must not read as an empty one:\n{rep}"
+        rep.contains("memory-data") && rep.contains("not inspected or adopted"),
+        "{rep}"
     );
+    assert!(
+        !rep.contains("2 fact(s)"),
+        "Core must not enumerate legacy records: {rep}"
+    );
+    for (name, bytes) in ["a.md", "b.md", "notes.txt"].iter().zip(before) {
+        assert_eq!(std::fs::read(entries.join(name)).unwrap(), bytes);
+    }
+    assert!(!home.join("memory-data").exists());
 
     // Skills live in THREE roots and the list's `[project]`/`[repo]` tags never say where.
     let sk = skill_where_report();
@@ -248,8 +261,11 @@ fn where_reports_name_every_store_and_flag_missing_dirs() {
         "zone slug not spelled out:\n{sk}"
     );
 
-    std::env::remove_var("AIZEN_HOME");
-    let _ = std::fs::remove_dir_all(&home);
+    if let Some(old) = old_home {
+        std::env::set_var("AIZEN_HOME", old);
+    } else {
+        std::env::remove_var("AIZEN_HOME");
+    }
 }
 
 /// Both `where` sub-commands have to be reachable, or the footers point at nothing.
@@ -579,13 +595,9 @@ fn refreshing_prompt_lanes_keeps_the_conversation() {
     );
 }
 
-/// A conversation containing a pasted image must survive save → load.
-///
-/// This is the session-level half of the `Message` round-trip bug: the writer emitted `content`
-/// as a multimodal parts array, `parse_session_bytes` could not read it back, and the file was
-/// reported as "(unreadable)" for the rest of its life with the serde error discarded. Two real
-/// transcripts were lost this way before it was noticed, so the reason string is asserted too —
-/// a silent `None` is what let this hide.
+/// A conversation containing a pasted image must stay readable after save → load, without
+/// retaining input pixels. The live multimodal serializer must still round-trip parts arrays:
+/// that used to make image-bearing transcripts unreadable before the session privacy projection.
 #[test]
 fn a_session_with_images_survives_save_and_load() {
     let _g = crate::core::config::TEST_HOME_LOCK
@@ -605,18 +617,32 @@ fn a_session_with_images_survives_save_and_load() {
         ),
         Message::assistant("it says hello"),
     ];
+    let live: Vec<Message> =
+        serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+    assert_eq!(live[1].content, history[1].content);
+    assert_eq!(live[1].images, history[1].images);
     save_session(&history, "with-image", Some("m")).unwrap();
 
     let bytes = std::fs::read(sessions_dir().join("with-image.json")).unwrap();
     let (msgs, _) =
         parse_session_reason(&bytes).expect("a transcript we wrote ourselves must be readable");
     assert_eq!(msgs.len(), 3);
-    assert_eq!(msgs[1].content.as_deref(), Some("read this screenshot"));
-    assert_eq!(
-        msgs[1].images,
-        vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
-        "image attachments must come back out of the parts array"
+    let restored_text = msgs[1].content.as_deref().unwrap();
+    assert!(restored_text.starts_with("read this screenshot\n"));
+    assert!(restored_text.contains("input-image-not-saved:"));
+    assert!(restored_text.contains("attach the original image again"));
+    assert!(
+        msgs[1].images.is_empty(),
+        "input pixels must not be restored"
     );
+    assert!(msgs[1].image_preferences.is_empty());
+    assert_eq!(msgs[2].content, history[2].content);
+    assert_eq!(
+        history[1].images, live[1].images,
+        "save must not mutate live pixels"
+    );
+    let stored_text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!stored_text.contains("base64") && !stored_text.contains("blob:"));
 
     // The picker must count it as a real conversation, not report it unreadable.
     let (count, _) = read_session_row(&sessions_dir().join("with-image.json"));
@@ -1324,26 +1350,23 @@ fn classify_health_probe_rules() {
 }
 
 #[test]
-fn effort_turn_line_names_the_tier_or_default() {
-    // The per-turn status line must contain the tier name (or "default" when the field is
-    // omitted), regardless of colour stripping under the test harness.
-    assert!(effort_turn_line(Some("high"), None).contains("high"));
-    assert!(effort_turn_line(Some("low"), None).contains("low"));
+fn effort_chip_names_auto_or_default() {
+    // The model-segment chip says "auto" for every resolved rung (tinted by rung; colours are
+    // stripped under the test harness, so we assert the text), "default" when the field is
+    // omitted, and nothing when the caller armed "omit this field".
+    for tier in ["low", "medium", "high", "xhigh", "max"] {
+        assert!(
+            effort_chip_styled(Some(tier)).contains("auto"),
+            "{tier} rung ⇒ ·auto chip"
+        );
+    }
     assert!(
-        effort_turn_line(Some("xhigh"), None).contains("xhigh"),
-        "xhigh rung named"
-    );
-    assert!(
-        effort_turn_line(Some("max"), None).contains("max"),
-        "max rung named"
-    );
-    assert!(
-        effort_turn_line(None, None).contains("default"),
+        effort_chip_styled(None).contains("default"),
         "None ⇒ default"
     );
     assert!(
-        effort_turn_line(Some("high"), None).contains("effort:"),
-        "always prefixed"
+        effort_chip_styled(Some("")).is_empty(),
+        "armed-but-omitted ⇒ bare model name, no chip"
     );
 }
 

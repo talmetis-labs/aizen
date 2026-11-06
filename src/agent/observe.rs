@@ -42,12 +42,34 @@ pub fn evict_tool_images(message: &mut Message, reason: ImageUnavailable) -> usi
 /// Bounded across the canonical conversation, newest payloads first. No request-only synthetic
 /// messages are involved. Unavailable metadata does not consume the decoded-byte/count budget.
 pub fn retain_tool_images(messages: &mut [Message]) -> usize {
+    retain_tool_images_with_pins(messages, &std::collections::BTreeSet::new())
+        .expect("an empty pin set cannot exceed retention limits")
+}
+
+/// Live, controller-validated occurrence coordinates only. Saved pin flags grant no priority.
+/// Refuse over-budget pins before evicting anything, rather than leaving a broken reread handle.
+pub(crate) fn retain_tool_images_with_pins(
+    messages: &mut [Message],
+    pins: &std::collections::BTreeSet<(usize, bool, usize)>,
+) -> anyhow::Result<usize> {
     let mut count = 0usize;
     let mut bytes = 0usize;
+    for &(mi, tool, ii) in pins {
+        if let Some(image) = tool
+            .then(|| messages.get(mi).and_then(|m| m.tool_images.get(ii)))
+            .flatten()
+            .filter(|image| image.is_available())
+        {
+            count += 1;
+            bytes = bytes.saturating_add(image.metadata().byte_len);
+        }
+    }
+    anyhow::ensure!(count <= MAX_TOOL_IMAGES && bytes <= MAX_TOOL_IMAGE_BYTES,
+        "live image pins exceed retained image limits (32 images / 64 MiB); unpin optional images before continuing");
     let mut removed = 0usize;
-    for message in messages.iter_mut().rev() {
-        for image in message.tool_images.iter_mut().rev() {
-            if !image.is_available() {
+    for (mi, message) in messages.iter_mut().enumerate().rev() {
+        for (ii, image) in message.tool_images.iter_mut().enumerate().rev() {
+            if !image.is_available() || pins.contains(&(mi, true, ii)) {
                 continue;
             }
             let size = image.metadata().byte_len;
@@ -64,7 +86,7 @@ pub fn retain_tool_images(messages: &mut [Message]) -> usize {
             }
         }
     }
-    removed
+    Ok(removed)
 }
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -95,15 +117,26 @@ pub struct CollapseStats {
 /// returns where; a body that already carries a spill note reuses that path. Messages other than
 /// tool results, the newest `keep_recent` results, short results, and digests are never touched;
 /// `tool_call_id` always survives, so the assistant/tool pairing strict gateways check stays valid.
+#[cfg(test)]
 pub fn collapse_aged(
     messages: &mut [Message],
     policy: CollapsePolicy,
     spill: &mut dyn FnMut(&str, &str) -> Option<PathBuf>,
 ) -> CollapseStats {
+    collapse_aged_with_pins(messages, policy, spill, &std::collections::BTreeSet::new())
+        .expect("an empty pin set cannot exceed retention limits")
+}
+
+pub(crate) fn collapse_aged_with_pins(
+    messages: &mut [Message],
+    policy: CollapsePolicy,
+    spill: &mut dyn FnMut(&str, &str) -> Option<PathBuf>,
+    pins: &std::collections::BTreeSet<(usize, bool, usize)>,
+) -> anyhow::Result<CollapseStats> {
     let mut stats = CollapseStats::default();
-    retain_tool_images(messages);
+    retain_tool_images_with_pins(messages, pins)?;
     if policy.keep_recent == 0 {
-        return stats;
+        return Ok(stats);
     }
     let tool_idxs: Vec<usize> = messages
         .iter()
@@ -112,7 +145,7 @@ pub fn collapse_aged(
         .map(|(i, _)| i)
         .collect();
     if tool_idxs.len() <= policy.keep_recent {
-        return stats;
+        return Ok(stats);
     }
     let aged = &tool_idxs[..tool_idxs.len() - policy.keep_recent];
     let candidates: Vec<usize> = aged
@@ -121,7 +154,7 @@ pub fn collapse_aged(
         .filter(|&i| is_candidate(&messages[i], policy.min_chars))
         .collect();
     if candidates.len() < policy.batch.max(1) {
-        return stats;
+        return Ok(stats);
     }
     // Pair each result with the call that produced it — the digest names the tool and its target.
     let calls: HashMap<String, (String, String)> = messages
@@ -147,7 +180,18 @@ pub fn collapse_aged(
             None => spill(tool, &body),
         };
         let mut line = digest(tool, args, &body, path.as_deref());
-        let images = evict_tool_images(&mut messages[i], ImageUnavailable::Retention);
+        // Managed visual originals use the explicit lifecycle + hard retention budget, never the
+        // text observation's age. A dormant note must not lose its reread merely after code steps.
+        let managed = pins.iter().any(|&(mi, tool, _)| mi == i && tool)
+            || messages[i]
+                .visual_context
+                .iter()
+                .any(|state| state.tool_image && state.matches_message(&messages[i]));
+        let images = if managed {
+            0
+        } else {
+            evict_tool_images(&mut messages[i], ImageUnavailable::Retention)
+        };
         if images > 0 {
             line.push_str(&format!(
                 " · {images} image payload(s) evicted; typed metadata retained"
@@ -157,10 +201,16 @@ pub fn collapse_aged(
         stats.collapsed += 1;
         messages[i].content = Some(line);
     }
-    stats
+    Ok(stats)
 }
 
 fn is_candidate(m: &Message, min_chars: usize) -> bool {
+    if m.content
+        .as_deref()
+        .is_some_and(|body| body.starts_with(COLLAPSED_PREFIX))
+    {
+        return false;
+    }
     if m.tool_images.iter().any(|image| image.is_available()) {
         return true;
     }
@@ -354,6 +404,34 @@ mod tests {
     }
 
     #[test]
+    fn managed_visual_originals_survive_text_age_collapse() {
+        let mut messages = history(3, 500);
+        let mut provenance = crate::core::tool_media::ImageProvenance::new("image_read", None);
+        provenance.evidence_id = Some("managed-original".into());
+        let image =
+            crate::core::tool_media::ToolImage::from_bytes(b"GIF89a-test", "image/gif", provenance)
+                .unwrap();
+        messages[3].tool_images.push(image.clone());
+        let mut visual = crate::core::visual_context::VisualContext::default();
+        visual.refresh_scoped(&mut messages, None, std::slice::from_ref(&image));
+        assert!(!messages[3].visual_context.is_empty());
+        let stats = collapse_aged(&mut messages, policy(1, 1), &mut fake_spill);
+        assert_eq!(stats.collapsed, 2);
+        assert!(messages[3].tool_images[0].is_available());
+        assert!(messages[3]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with(COLLAPSED_PREFIX));
+        assert!(messages[3].visual_context[0].matches_message(&messages[3]));
+        // Repeating text collapse must remain idempotent even while the managed image is retained.
+        assert_eq!(
+            collapse_aged(&mut messages, policy(1, 1), &mut fake_spill).collapsed,
+            0
+        );
+    }
+
+    #[test]
     fn image_only_observations_collapse_and_payload_retention_keeps_diagnostics() {
         let mut messages = history(3, 0);
         let image = crate::core::tool_media::ToolImage::from_bytes(
@@ -383,6 +461,45 @@ mod tests {
             .collect();
         assert_eq!(retain_tool_images(&mut many), 2);
         assert_eq!(retain_tool_images(&mut many), 0, "idempotent");
+    }
+
+    #[test]
+    fn live_pinned_payload_survives_quota_and_age_without_trusting_saved_flags() {
+        let image = crate::core::tool_media::ToolImage::from_bytes(
+            b"GIF89a-test",
+            "image/gif",
+            crate::core::tool_media::ImageProvenance::new("capture", None),
+        )
+        .unwrap();
+        let mut messages: Vec<_> = (0..MAX_TOOL_IMAGES + 2)
+            .map(|i| {
+                Message::tool_observation(format!("call-{i}"), "x".repeat(500), vec![image.clone()])
+            })
+            .collect();
+        let pins = std::collections::BTreeSet::from([(0, true, 0)]);
+        assert_eq!(
+            retain_tool_images_with_pins(&mut messages, &pins).unwrap(),
+            2
+        );
+        assert!(messages[0].tool_images[0].is_available());
+        assert!(!messages[1].tool_images[0].is_available());
+        collapse_aged_with_pins(&mut messages, policy(1, 1), &mut fake_spill, &pins).unwrap();
+        assert!(messages[0].tool_images[0].is_available());
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with(COLLAPSED_PREFIX));
+        let mut over: Vec<_> = (0..MAX_TOOL_IMAGES + 1)
+            .map(|i| Message::tool_observation(format!("call-{i}"), "", vec![image.clone()]))
+            .collect();
+        let pins = (0..over.len()).map(|mi| (mi, true, 0)).collect();
+        assert!(retain_tool_images_with_pins(&mut over, &pins).is_err());
+        assert!(
+            over.iter()
+                .all(|message| message.tool_images[0].is_available()),
+            "refusal must be atomic"
+        );
     }
 
     #[test]

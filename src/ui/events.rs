@@ -984,6 +984,9 @@ pub fn done_with_verification(
         "session": session,
         "calls": usage.get("calls").cloned().unwrap_or(json!(0)),
     });
+    if let Some(media) = usage.get("media") {
+        fields["media"] = media.clone();
+    }
     if let Some(verification) = verification {
         fields["verification"] = verification;
     }

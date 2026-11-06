@@ -1,69 +1,54 @@
-//! `aizen memory …` — the CLI half of the memory store (the REPL half is `/memory`).
-//!
-//! Both surfaces call the same functions with the same ids, so a fact written from one is visible
-//! and correctable from the other. `reconcile` is the batch pass that retires superseded facts.
+//! Provider-neutral Memory CLI. Persistent storage/learning is owned by the selected executable.
 
-use crate::cli::read_stdin;
-use crate::cli::where_report::memory_where_report;
-use crate::cli_args::*;
-use crate::core::endpoint::{http_client, resolve_endpoint};
-use crate::core::{config, types};
-use crate::memory;
-use crate::repl::postturn::chore_chat;
-use crate::summarizer_endpoint;
-use anyhow::Result;
-use types::Message;
-
-/// `aizen memory reconcile [--apply]` — the M2b batch pass, run by hand.
-///
-/// One model call, at most `MAX_PAIRS` pairs, and **dry-run by default**: the actions this pass
-/// proposes overwrite bodies and retire facts, so the harmless mode has to be the one you get by
-/// typing the short command. `--apply` is the sentence where the user says they read the dry run.
-///
-/// The call is routed through the summarizer role like every other chore call, so a cheap model can
-/// own it without touching the main endpoint.
-async fn run_memory_reconcile(apply: bool) -> Result<()> {
-    let (pairs, live) = memory::reconcile_inputs()?;
-    if pairs.is_empty() {
-        crate::ui::tui::emit_line("no suspicious pairs — nothing to reconcile.");
-        return Ok(());
-    }
-    let (base, key, model) = resolve_endpoint(None, None, None)?;
-    let http = http_client()?;
-    let ep = summarizer_endpoint(&base, &key, &model);
-
-    // `judge` is the ONLY place this pass can reach a model, and it is `FnOnce` — the ≤1-call budget
-    // is enforced by the type, not by remembering to not loop.
-    let judge = |sys: &str, user: &str| -> Option<String> {
-        let msgs = [
-            Message::system(sys.to_string()),
-            Message::user(user.to_string()),
-        ];
-        let fut = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
-        // The surrounding fn is async, but `batch_pass` is sync (so every rail in it stays unit
-        // testable without a runtime). Blocking here is safe: this is a one-shot CLI command with
-        // nothing else on the runtime waiting on us.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(fut)
-                .ok()?
-                .content
-        })
-    };
-
-    let report = memory::learning::reconcile::batch_pass(
-        &pairs,
-        judge,
-        !apply,
-        &memory::learning::default_session_id(),
-        &live,
-    );
-    memory::print_reconcile_report(&report);
-    Ok(())
-}
+use crate::cli_args::MemoryCmd;
+use crate::plugin::{manager, memory_api as api, runtime};
+use anyhow::{ensure, Context, Result};
+use serde_json::{json, Value};
 
 pub(crate) async fn run_memory(cmd: MemoryCmd) -> Result<()> {
-    match cmd {
+    if matches!(&cmd, MemoryCmd::Client) {
+        return super::memory_client::run().await;
+    }
+    if let Some(result) = crate::cli::plugin_cmd::memory_control(&cmd) {
+        return result;
+    }
+    let state = manager::read_state()?;
+    ensure!(state.enabled, "Memory unavailable or disabled. Install a provider, make it eligible, then explicitly select it with `aizen memory use <id>`; no built-in fallback is used.");
+    let (id, _) = manager::selected_at(state.generation)?;
+    let installed = manager::info(&id)?;
+    let invocation = format!(
+        "cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let context = crate::plugin::context::selected(
+        &std::env::current_dir()?,
+        &invocation,
+        &invocation,
+        &invocation,
+    )?
+    .context("Memory was disabled while constructing invocation context")?;
+    ensure!(
+        context.generation == state.generation,
+        "Memory selection changed before dispatch; invocation discarded"
+    );
+    let cancel = crate::core::cancel::TurnCancel::new();
+    let operation_id = |verb: &str| {
+        format!(
+            "{}-{}",
+            verb,
+            crate::plugin::manifest::sha256(invocation.as_bytes())
+        )
+    };
+    let (method, params) = match cmd {
+        MemoryCmd::Client
+        | MemoryCmd::Status { .. }
+        | MemoryCmd::Use { .. }
+        | MemoryCmd::Enable
+        | MemoryCmd::Unselect
+        | MemoryCmd::Disable => unreachable!("handled above"),
         MemoryCmd::Add {
             name,
             description,
@@ -71,55 +56,38 @@ pub(crate) async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             body,
         } => {
             let body = match body {
-                Some(b) => b,
-                None => read_stdin("reading memory body from stdin")?,
+                Some(body) => body,
+                None => super::read_stdin("reading Memory body")?,
             };
-            if body.trim().is_empty() {
-                anyhow::bail!("empty memory body (pass --body or pipe text on stdin)");
-            }
-            memory::cmd_add(&name, &description, &mtype, body.trim())
+            ensure!(!body.trim().is_empty(), "empty Memory content");
+            (
+                api::Method::Store,
+                json!({"operation_id":operation_id("store"),"content":body.trim(),"scope":"project",
+                "metadata":{"name":name,"description":description,"type":mtype}}),
+            )
         }
         MemoryCmd::List {
             scope,
             scope_flag,
             superseded,
-        } => {
-            if superseded {
-                memory::cmd_list_superseded()
-            } else {
-                memory::cmd_list(scope.or(scope_flag).as_deref())
-            }
-        }
-        MemoryCmd::Revive { id } => memory::cmd_revive(&id),
-        MemoryCmd::Show { id } => memory::cmd_show(&id),
+        } => (
+            api::Method::List,
+            json!({"limit":100,"scope":scope.or(scope_flag),"superseded":superseded}),
+        ),
+        MemoryCmd::Show { id } => (api::Method::Get, json!({"id":id})),
         MemoryCmd::Search {
             query,
             k,
             dimension,
             category,
             scope,
-        } => memory::cmd_search(&query, k, dimension, category, scope.as_deref()),
-        MemoryCmd::Frozen { rebuild } => memory::cmd_frozen(rebuild),
-        MemoryCmd::Learn { text, yes, dry_run } => {
-            let text = match text {
-                Some(t) => t,
-                None => read_stdin("reading user turn from stdin")?,
-            };
-            if text.trim().is_empty() {
-                anyhow::bail!("empty turn (pass text or pipe it on stdin)");
-            }
-            memory::cmd_learn(text.trim(), yes, dry_run)
+        } => {
+            ensure!(k <= 100, "Memory result count exceeds host limit (100)");
+            (
+                api::Method::Search,
+                json!({"query":query,"limit":k,"dimension":dimension,"category":category,"scope":scope}),
+            )
         }
-        MemoryCmd::Style => memory::cmd_style(),
-        MemoryCmd::Profile { json } => memory::cmd_profile(json),
-        MemoryCmd::Ask { question, json } => memory::cmd_ask(&question, json),
-        MemoryCmd::Review {
-            promote,
-            drop_key,
-            clear,
-        } => memory::cmd_review(promote, drop_key, clear),
-        MemoryCmd::AsOf { date } => memory::cmd_as_of(date.trim()),
-        MemoryCmd::Supersede { old, new } => memory::cmd_supersede(&old, &new),
         MemoryCmd::Edit {
             id,
             name,
@@ -128,96 +96,234 @@ pub(crate) async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             body,
             scope,
         } => {
-            // `--body -` reads the replacement body from stdin (so a multi-line rewrite can be piped
-            // in); omitting `--body` entirely leaves the body untouched.
-            let body = match body.as_deref() {
-                Some("-") => Some(read_stdin("reading replacement body from stdin")?),
-                _ => body,
+            let previous = call(
+                context.clone(),
+                api::Method::Get,
+                json!({"id":id}),
+                cancel.clone(),
+            )
+            .await?;
+            let record: api::RecordResult =
+                serde_json::from_value(previous).context("provider returned invalid record")?;
+            let content = match body.as_deref() {
+                Some("-") => super::read_stdin("reading replacement Memory body")?,
+                Some(body) => body.to_owned(),
+                None => record.record.content,
             };
-            memory::cmd_edit(&id, name, description, mtype, body, scope)
+            (
+                api::Method::Update,
+                json!({"operation_id":operation_id("update"),"id":id,"expected_revision":record.record.revision,
+                "content":content,"name":name,"description":description,"type":mtype,"scope":scope}),
+            )
         }
-        MemoryCmd::Forget { id } => memory::cmd_forget(&id),
-        MemoryCmd::Purge { id, yes } => {
-            if !yes {
-                anyhow::bail!(
-                    "`memory purge` permanently deletes an archived fact — pass --yes to confirm"
-                );
-            }
-            memory::cmd_purge(&id)
+        MemoryCmd::Forget { id } => {
+            let previous = call(
+                context.clone(),
+                api::Method::Get,
+                json!({"id":id}),
+                cancel.clone(),
+            )
+            .await?;
+            let record: api::RecordResult = serde_json::from_value(previous)?;
+            (
+                api::Method::Forget,
+                json!({"operation_id":operation_id("forget"),"id":id,"expected_revision":record.record.revision}),
+            )
         }
-        MemoryCmd::Archive => memory::cmd_archive_list(),
-        MemoryCmd::Restore { id, as_id } => memory::cmd_restore(&id, as_id.as_deref()),
-        MemoryCmd::Compact => memory::cmd_compact(),
-        MemoryCmd::Consolidate { apply } => memory::cmd_consolidate(apply),
-        MemoryCmd::Reconcile { apply } => run_memory_reconcile(apply).await,
-        MemoryCmd::Doctor => memory::cmd_doctor(),
+        MemoryCmd::Health => (api::Method::Health, json!({})),
         MemoryCmd::Where => {
-            println!("{}", memory_where_report());
-            Ok(())
+            println!(
+                "Package: {}\nData: {}\nLegacy data is not adopted automatically.",
+                installed.directory.display(),
+                manager::data_root(&id)?.display()
+            );
+            return Ok(());
         }
-        MemoryCmd::Health => memory::cmd_health(),
-        MemoryCmd::Neighbors { id, k } => memory::cmd_neighbors(&id, k),
-        MemoryCmd::ModelDownload { name } => memory::model_dl::download(name.as_deref())
-            .await
-            .map(|_| ()),
-        MemoryCmd::ModelList => run_memory_model_list(),
-    }
+        MemoryCmd::Learn { text, yes, dry_run } => {
+            let text = match text {
+                Some(text) => text,
+                None => super::read_stdin("reading Memory learning input")?,
+            };
+            (
+                api::Method::ProcessTurn,
+                json!({"operation_id":operation_id("learn"),"user_text":text,"transcript":"","confirmed":yes,"dry_run":dry_run}),
+            )
+        }
+        MemoryCmd::Frozen { rebuild } => command(
+            "frozen",
+            json!({"rebuild":rebuild}),
+            &operation_id("frozen"),
+        ),
+        MemoryCmd::Style => command("style", json!({}), &operation_id("style")),
+        MemoryCmd::Profile { json } => {
+            command("profile", json!({"json":json}), &operation_id("profile"))
+        }
+        MemoryCmd::Ask { question, json } => command(
+            "ask",
+            json!({"question":question,"json":json}),
+            &operation_id("ask"),
+        ),
+        MemoryCmd::Review {
+            promote,
+            drop_key,
+            clear,
+        } => command(
+            "review",
+            json!({"promote":promote,"drop":drop_key,"clear":clear}),
+            &operation_id("review"),
+        ),
+        MemoryCmd::Revive { id } => command("revive", json!({"id":id}), &operation_id("revive")),
+        MemoryCmd::AsOf { date } => command("as_of", json!({"date":date}), &operation_id("as-of")),
+        MemoryCmd::Supersede { old, new } => command(
+            "supersede",
+            json!({"old":old,"new":new}),
+            &operation_id("supersede"),
+        ),
+        MemoryCmd::Archive => command("archive", json!({}), &operation_id("archive")),
+        MemoryCmd::Restore { id, as_id } => command(
+            "restore",
+            json!({"id":id,"as_id":as_id}),
+            &operation_id("restore"),
+        ),
+        MemoryCmd::Purge { id, yes } => {
+            ensure!(
+                yes,
+                "purge permanently deletes an archived fact; explicit --yes required"
+            );
+            command(
+                "purge",
+                json!({"id":id,"confirmed":true}),
+                &operation_id("purge"),
+            )
+        }
+        MemoryCmd::Compact => command("compact", json!({}), &operation_id("compact")),
+        MemoryCmd::Consolidate { apply } => command(
+            "consolidate",
+            json!({"apply":apply}),
+            &operation_id("consolidate"),
+        ),
+        MemoryCmd::Reconcile { apply, reply } => command(
+            "reconcile",
+            reconcile_arguments(apply, reply.as_deref())?,
+            &operation_id("reconcile"),
+        ),
+        MemoryCmd::Doctor => command("doctor", json!({}), &operation_id("doctor")),
+        MemoryCmd::Neighbors { id, k } => command(
+            "neighbors",
+            json!({"id":id,"limit":k}),
+            &operation_id("neighbors"),
+        ),
+        MemoryCmd::ModelDownload { name } => command(
+            "model_download",
+            json!({"name":name}),
+            &operation_id("model-download"),
+        ),
+        MemoryCmd::ModelList => command("model_list", json!({}), &operation_id("model-list")),
+    };
+    // Pins are checked again by the actor while activation admission is held; this earlier snapshot
+    // is only input/capability selection, never authority to execute stale package bytes.
+    let result = call(context, method, params, cancel).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
 }
 
-/// `aizen memory model-list` — show every model2vec model this machine already has, and which one
-/// the dense tier would pick. Exists because the old failure mode was SILENT: with no model at the
-/// configured name the loader fell back to the (non-semantic) hashing embedder, so a user who had
-/// downloaded a perfectly good model under another name had no way to see why dense wasn't working.
-fn run_memory_model_list() -> Result<()> {
-    let configured = config::embed_model_name();
-    let found = memory::embed::list_local_models();
-    let chosen = memory::embed::discover_local_model();
-    println!("configured model name: {configured}");
-    println!("(override with AIZEN_EMBED_MODEL)");
-    println!();
-    if found.is_empty() {
-        println!("no model2vec models found on this machine.");
-        println!("  looked in: {}", config::models_dir().display());
-        println!("             the Hugging Face hub cache (~/.cache/huggingface/hub, %LOCALAPPDATA%\\huggingface\\hub, $HF_HUB_CACHE)");
-        println!();
-        println!("get one with: aizen memory model-download");
-        return Ok(());
-    }
-    println!(
-        "found {} model2vec model{}:",
-        found.len(),
-        if found.len() == 1 { "" } else { "s" }
+pub(crate) fn reconcile_arguments(apply: bool, path: Option<&std::path::Path>) -> Result<Value> {
+    ensure!(
+        !apply || path.is_some(),
+        "reconcile --apply requires --reply <file>"
     );
-    let chosen_dir = chosen.as_ref().map(|c| c.dir.clone());
-    for c in &found {
-        let marker = if Some(&c.dir) == chosen_dir.as_ref() {
-            "▸"
-        } else {
-            " "
-        };
-        println!("  {marker} {} [{}]  {}", c.name, c.source, c.dir.display());
-    }
-    println!();
-    match &chosen {
-        Some(c) if c.name == configured => {
-            println!("dense would load '{}' (the configured name).", c.name);
+    let mut arguments = json!({"apply":apply});
+    if let Some(path) = path {
+        use std::io::Read;
+        #[derive(serde::Deserialize, serde::Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct Reply {
+            binding_sha256: String,
+            completion: String,
         }
-        Some(c) => {
-            println!(
-                "dense would AUTO-DETECT '{}' from {} — '{configured}' is not present.",
-                c.name, c.source
-            );
-        }
-        None => println!("dense would fall back to the hashing embedder (not semantic)."),
-    }
-    // The weights only LOAD on a `--features dense` build; say so rather than implying the default
-    // binary will use what we just listed.
-    if cfg!(feature = "dense") {
-        println!("this build has the dense feature: the model above will be loaded.");
-    } else {
-        println!(
-            "note: this build has NO dense feature — rebuild with `--features dense` to use it."
+        let file = std::fs::File::open(path).context("opening explicit reconcile reply")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "reconcile reply must be a regular file"
         );
+        let mut bytes = Vec::new();
+        file.take((64 * 1024 + 1) as u64).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 64 * 1024, "reconcile reply exceeds 64 KiB");
+        let reply: Reply = serde_json::from_value(api::strict_json(&bytes)?)
+            .context("invalid explicit reconcile reply schema")?;
+        ensure!(
+            reply.binding_sha256.len() == 64
+                && reply
+                    .binding_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid reconcile binding digest"
+        );
+        api::text(&reply.completion, api::MAX_TEXT, true)?;
+        ensure!(
+            !reply.completion.trim().is_empty(),
+            "empty reconcile completion"
+        );
+        arguments["reply"] = serde_json::to_value(reply)?;
     }
-    Ok(())
+    Ok(arguments)
+}
+
+fn command(name: &str, arguments: Value, operation_id: &str) -> (api::Method, Value) {
+    (
+        api::Method::Command,
+        json!({"command":name,"arguments":arguments,"operation_id":operation_id}),
+    )
+}
+
+async fn call(
+    context: api::ProviderContext,
+    method: api::Method,
+    params: Value,
+    cancel: crate::core::cancel::TurnCancel,
+) -> Result<Value> {
+    runtime::request(
+        runtime::ApprovedInvocation::explicit_cli(),
+        context,
+        method,
+        params,
+        None,
+        cancel,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_reply_is_explicit_bounded_strict_data_not_a_model_route() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let path = fixture.path().join("reply.json");
+        assert_eq!(
+            reconcile_arguments(false, None).unwrap(),
+            json!({"apply":false})
+        );
+        assert!(reconcile_arguments(true, None).is_err());
+        let reply = json!({"binding_sha256":"a".repeat(64),"completion":"{\"pairs\":[]}"});
+        std::fs::write(&path, serde_json::to_vec(&reply).unwrap()).unwrap();
+        assert_eq!(
+            reconcile_arguments(true, Some(&path)).unwrap(),
+            json!({"apply":true,"reply":reply})
+        );
+        for invalid in [
+            json!({"binding_sha256":"bad","completion":"{}"}),
+            json!({"binding_sha256":"a".repeat(64),"completion":""}),
+            json!({"binding_sha256":"a".repeat(64),"completion":"{}","admin":true}),
+            json!({"binding_sha256":"a".repeat(64),"completion":"x".repeat(api::MAX_TEXT+1)}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(reconcile_arguments(false, Some(&path)).is_err());
+        }
+        std::fs::write(&path, b"{\"completion\":\"one\",\"completion\":\"two\"}").unwrap();
+        assert!(reconcile_arguments(false, Some(&path)).is_err());
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        assert!(reconcile_arguments(false, Some(&path)).is_err());
+    }
 }

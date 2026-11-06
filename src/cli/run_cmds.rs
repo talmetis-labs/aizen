@@ -14,7 +14,6 @@ use crate::core::types::ToolDef;
 use crate::core::{cli_config, session_store, types};
 use crate::features::crawl;
 use crate::llm::client;
-use crate::memory;
 use crate::ui::context_report::{resolve_ctx_window, system_block_chars, volatile_markers};
 use crate::{arm_lsp_session, eager_enabled};
 use anyhow::{Context, Result};
@@ -310,7 +309,42 @@ pub(crate) async fn run_agent_capture(
     task: &str,
     approval_mode: ApprovalMode,
 ) -> Result<String> {
-    let frozen = memory::refresh_frozen_core();
+    let context_window = crate::core::model_context::discover(&cli_config::ResolvedEndpoint {
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        model: model.to_string(),
+    })
+    .await
+    .tokens;
+    let root = std::env::current_dir()?;
+    let execution = crate::core::exec_ctx::ExecutionContext::new(
+        crate::core::convo::ConversationId::new(format!(
+            "capture-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        )),
+    );
+    let snapshot_key = execution.conversation().to_string();
+    let user_turn_id = crate::core::types::UserTurnId::new()?;
+    let turn_cancel = crate::core::cancel::TurnCancel::new();
+    let snapshot = match crate::plugin::snapshots::prepare(
+        &snapshot_key,
+        &root,
+        execution.clone(),
+        &user_turn_id,
+        task,
+        true,
+        turn_cancel.clone(),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::plugin::runtime::optional_failure(error)?;
+            Default::default()
+        }
+    };
+    let frozen = &snapshot.standing;
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -324,20 +358,19 @@ pub(crate) async fn run_agent_capture(
         api_key.to_string(),
         model.to_string(),
         approval_mode,
-        resolve_ctx_window(model).0,
+        context_window,
         None, // cwd IS the project on the CLI path
     )?;
-    let system = agent::build_top_level_system_prompt(
-        &cwd,
-        std::env::consts::OS,
-        &date,
-        model,
-        Some(&frozen),
-    );
+    let system = crate::plugin::associations::with_affinity(&snapshot, || {
+        agent::build_top_level_system_prompt(&cwd, std::env::consts::OS, &date, model, Some(frozen))
+    });
     let cfg = AgentConfig {
         approval_mode,
         quiet: true,
+        exec_ctx: execution,
+        cancel: turn_cancel,
         enable_verify_gate: false,
+        context_window,
         ..Default::default()
     };
 
@@ -345,10 +378,47 @@ pub(crate) async fn run_agent_capture(
     let base = base_url;
     let key = api_key;
     let model_ref = model;
-    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| async move {
-        client::chat_with_tools(http_ref, base, key, model_ref, &msgs, &defs).await
+    let learning_config = cli_config::load();
+    let learning_effort =
+        cli_config::resolved_reasoning_effort(learning_config.reasoning_effort.clone());
+    let learning_model = crate::plugin::events::TurnModel::new(
+        &cli_config::ResolvedEndpoint {
+            base_url: base.into(),
+            api_key: key.into(),
+            model: model_ref.into(),
+        },
+        learning_effort.clone(),
+        &learning_config,
+    );
+    let chat = move |msgs: Vec<Message>, defs: Vec<ToolDef>| {
+        let effort = learning_effort.clone();
+        let config = learning_config.clone();
+        async move {
+            client::chat_with_tools_frozen(
+                http_ref, base, key, model_ref, &msgs, &defs, effort, &config,
+            )
+            .await
+        }
     };
-    let outcome = agent::run_agent(chat, &cfg, &registry, &system, task).await?;
+    let sent = if snapshot.recall.is_empty() {
+        task.to_string()
+    } else {
+        format!("{}\n\n{task}", snapshot.recall)
+    };
+    let mut history = vec![Message::system(&system), Message::user(sent)];
+    history[1].user_turn_id = Some(user_turn_id);
+    snapshot.seal_message(&mut history[1]);
+    let result = crate::plugin::associations::scoped(
+        snapshot.clone(),
+        cfg.exec_ctx.clone(),
+        agent::run_agent_loop(chat, &cfg, &registry, &mut history),
+    )
+    .await;
+    let association_result = finish_associations(&snapshot, &result).await;
+    crate::plugin::snapshots::reset(&snapshot_key);
+    let outcome = result?;
+    association_result?;
+    learn_completed_turn(&outcome.stop, &history, &cfg, Some(learning_model)).await?;
     // A `clarify` yield in a captured (non-REPL) run — e.g. `aizen serve` — has no input box to loop
     // back to, so surface the question as the reply itself. Over Telegram the owner just answers
     // with their next message; for a plain capture caller it reads as the agent's question.
@@ -500,11 +570,30 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // billed request. Loud rather than skipped: this is the scripting and CI entry point, and an
     // attachment that quietly vanished would produce a confident answer about an image the model
     // never saw — the one failure mode a vision flag must not have.
+    let requested_images = args.image.len();
+    anyhow::ensure!(
+        args.image_modes.is_empty() || args.image_modes.len() == requested_images,
+        "--image-mode must be omitted or repeated once per --image selection, in that order"
+    );
+    anyhow::ensure!(
+        requested_images <= crate::core::tool_media::MAX_REQUEST_IMAGES,
+        "select at most four images"
+    );
     let images = args
         .image
         .iter()
         .map(|p| crate::ui::image_input::image_file_to_data_url(p))
         .collect::<Result<Vec<_>>>()?;
+    crate::core::tool_media::validate_image_batch_sizes(images.iter().map(|url| {
+        crate::core::tool_media::split_data_url(url)
+            .and_then(|(_, data)| {
+                crate::core::tool_media::base64_decoded_len(
+                    data,
+                    crate::core::tool_media::MAX_IMAGE_BYTES,
+                )
+            })
+            .unwrap_or(usize::MAX)
+    }))?;
     let (base_url, api_key, model) = resolve_endpoint(args.base_url, args.api_key, args.model)?;
     let http = http_client()?;
 
@@ -545,8 +634,35 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         harness_effort.clone(),
         design.clone(),
     );
+    let image_preferences = if args.image_modes.is_empty() {
+        vec![
+            cli_config::load()
+                .image_mode
+                .unwrap_or(crate::core::types::ImagePreference::Auto);
+            images.len()
+        ]
+    } else {
+        args.image_modes.clone()
+    };
     if args.reference_images {
-        crate::repl::turn::seat_loaded_reference_images(&mut resolved, &images)?;
+        crate::repl::turn::seat_loaded_reference_images_with_preferences(
+            &mut resolved,
+            &images,
+            &image_preferences,
+        )?;
+    } else if crate::llm::media::vision_policy_in(
+        &resolved.vision_config,
+        &resolved.endpoint.base_url,
+        &resolved.endpoint.model,
+    ) == crate::llm::media::VisionPolicy::Supported
+    {
+        // Ordinary image inspection needs a reread handle, not a mandatory exact comparison.
+        // Vision defaults on; the resolved snapshot still honors an explicit disable.
+        crate::repl::turn::prepare_current_references_with_preferences(
+            &mut resolved,
+            &images,
+            &image_preferences,
+        )?;
     }
     resolved.freeze_vision_config();
     crate::repl::turn::validate_current_reference_route(&resolved)?;
@@ -575,15 +691,15 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     .await;
     resolved.freeze_vision_config();
     crate::repl::turn::validate_current_reference_route(&resolved)?;
+    let context_window = crate::core::model_context::discover(&resolved.endpoint)
+        .await
+        .tokens;
     let ep = &resolved.endpoint;
     let model = ep.model.clone();
     let base_url = ep.base_url.clone();
     let api_key = ep.api_key.clone();
     agent::query_lang::set_expansion_endpoint(ep);
 
-    // Session start: rebuild the always-on core for THIS project slug (STYLE + global prefs
-    // only). Do not reuse a stale foreign-repo core.active — refresh_frozen_core is slug-aware.
-    let frozen = memory::refresh_frozen_core();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -600,7 +716,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         api_key.clone(),
         model.clone(),
         cli_approval,
-        resolve_ctx_window(&model).0,
+        context_window,
         None, // cwd IS the project on the CLI path
     )?;
     // The first record of a machine-readable run — `system` / `init`: what is about to happen and
@@ -613,13 +729,6 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         &registry.advertised_names(),
         cli_approval.as_str(),
     );
-    let system = agent::build_top_level_system_prompt(
-        &cwd,
-        std::env::consts::OS,
-        &date,
-        &model,
-        Some(&frozen),
-    );
     let max = args.max_iters.unwrap_or(25).max(1);
     let mut cfg = AgentConfig {
         cancel,
@@ -627,7 +736,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         auto_extend_to: max.saturating_mul(2),
         enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
         approval_mode: cli_approval,
-        context_window: resolve_ctx_window(&model).0,
+        context_window,
         compact_at_pct: crate::compact_threshold_pct(),
         enable_lsp: crate::agent::lsp::LSP.is_enabled(),
         nudge_role: agent::NudgeRole::for_base_url(&base_url),
@@ -654,6 +763,8 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     let image_config = cfg.image_config.clone().unwrap_or_else(|| {
         std::sync::Arc::new(cli_config::config_with_session_vision(cli_config::load()))
     });
+    let learning_model =
+        crate::plugin::events::TurnModel::new(ep, wire_effort.clone(), &image_config);
     let streamed_text = std::sync::Mutex::new(None::<String>);
     let streamed_text_ref = &streamed_text;
     let chat = move |mut msgs: Vec<Message>, defs: Vec<ToolDef>| {
@@ -705,17 +816,53 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // handed, and `run_agent` is exactly these two opening messages plus that call.
     // One user turn either way. With attachments it serializes as a parts array (text first, then
     // one image_url part each) instead of a plain string, which is the only difference on the wire.
-    let sent = args.task.trim();
-    let asked = if images.is_empty() {
-        Message::user(sent)
+    crate::core::memory_context::strip_history(&mut history);
+    let snapshot_key = cfg.exec_ctx.conversation().to_string();
+    let user_turn_id = crate::core::types::UserTurnId::new()?;
+    let snapshot = match crate::plugin::snapshots::prepare(
+        &snapshot_key,
+        &cfg.effective_root(),
+        cfg.exec_ctx.clone(),
+        &user_turn_id,
+        args.task.trim(),
+        args.resume.is_none(),
+        cfg.cancel.clone(),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::plugin::runtime::optional_failure(error)?;
+            Default::default()
+        }
+    };
+    let bundle = crate::plugin::associations::with_affinity(&snapshot, || {
+        agent::build_top_level_system_prompt_bundle(
+            &cwd,
+            std::env::consts::OS,
+            &date,
+            &model,
+            Some(&snapshot.standing),
+        )
+    });
+    crate::agent::prompt_lanes::splice_prompt_lanes(&mut history, bundle);
+    let sent = if snapshot.recall.is_empty() {
+        args.task.trim().to_owned()
+    } else {
+        format!("{}\n\n{}", snapshot.recall, args.task.trim())
+    };
+    let mut asked = if images.is_empty() {
+        Message::user(&sent)
     } else {
         status(
             &style(format!("📎 {} image(s) attached", images.len()))
                 .dim()
                 .to_string(),
         );
-        Message::user_with_images(sent, images)
+        Message::user_with_images(&sent, images)
     };
+    asked.image_preferences = image_preferences;
+    asked.user_turn_id = Some(user_turn_id);
     // `--resume SLUG` continues a saved conversation instead of starting one: the stored
     // transcript is the history (its prompt lanes rebuilt for THIS project/model by
     // `load_session`, the same contract as /resume), the new task is the next user turn, and the
@@ -723,11 +870,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // runs into one continuous conversation. `load_session` is headless-safe: its cross-project
     // warning is an `emit_line`, which is an emit-line record when the JSON stream is on and a
     // terminal line otherwise.
-    if history.is_empty() {
-        history.push(Message::system(&system));
-    } else {
-        crate::agent::prompt_lanes::refresh_prompt_lanes_in_place(&mut history, &model);
-    }
+    snapshot.seal_message(&mut asked);
     history.push(asked);
     resolved.seat_reference_markers(&mut history);
     if let Some(plan) = architect_plan {
@@ -737,31 +880,18 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
     // of relying on tool-result clearing alone.
     let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
-    let sum_effort =
-        cli_config::role_reasoning_effort("summarizer", cli_config::load().reasoning_effort);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
-        let effort = sum_effort.clone();
-        async move {
-            tokio::time::timeout(
-                crate::repl::postturn::chore_call_timeout(),
-                client::chat_with_tools_effort(
-                    http_ref,
-                    &ep.base_url,
-                    &ep.api_key,
-                    &ep.model,
-                    &msgs,
-                    &[],
-                    effort,
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("summarizer model call timed out"))?
-            .map(|t| t.content.unwrap_or_default())
-        }
+        async move { crate::llm::compact_summary::summarize(http_ref, &ep, msgs).await }
     };
-    let result =
-        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history).await;
+    let result = crate::plugin::associations::scoped(
+        snapshot.clone(),
+        cfg.exec_ctx.clone(),
+        agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history),
+    )
+    .await;
+    let association_result = finish_associations(&snapshot, &result).await;
+    crate::plugin::snapshots::reset(&snapshot_key);
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
     design.finalize();
@@ -776,6 +906,8 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         None
     };
     let outcome = result?;
+    association_result?;
+    learn_completed_turn(&outcome.stop, &history, &cfg, Some(learning_model)).await?;
     // The user's `stop` hooks see every finished run, however it ended (see `agent::hooks`).
     {
         let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
@@ -798,6 +930,10 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             _ => (None, None),
         };
         let streamed = streamed_text.lock().unwrap_or_else(|e| e.into_inner());
+        let mut usage = usage_since(usage_cursor);
+        let media = cfg.exec_ctx.media().snapshot();
+        usage["media"] = serde_json::json!({"attempts":media.attempts,"json_bytes":media.json_bytes,
+            "image_uri_bytes":media.image_uri_bytes,"images":media.images,"peak_reserved_bytes":media.peak});
         crate::ui::events::done_with_verification(
             outcome.stop.label(),
             outcome.iters,
@@ -805,7 +941,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             question.as_deref(),
             ask,
             saved.as_deref(),
-            usage_since(usage_cursor),
+            usage,
             outcome.verification.clone(),
             streamed.as_deref(),
         );
@@ -853,6 +989,53 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         ),
         // A one-shot run has no thread to refresh into; the model's note is its final answer.
         StopReason::Refresh => {}
+    }
+    Ok(())
+}
+
+async fn finish_associations(
+    snapshot: &crate::plugin::snapshots::Snapshot,
+    result: &Result<agent::AgentOutcome>,
+) -> Result<()> {
+    if result
+        .as_ref()
+        .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
+    {
+        crate::plugin::associations::flush(snapshot).await
+    } else {
+        crate::plugin::associations::discard(snapshot);
+        Ok(())
+    }
+}
+
+/// One-shot surfaces await optional learning before exiting; no detached actor work is abandoned.
+/// An incomplete, paused or cancelled run is not a completed-turn learning event.
+async fn learn_completed_turn(
+    stop: &StopReason,
+    history: &[Message],
+    cfg: &AgentConfig,
+    model: Option<crate::plugin::events::TurnModel>,
+) -> Result<()> {
+    if !matches!(stop, StopReason::Done) {
+        return Ok(());
+    }
+    let result = match crate::plugin::events::prepare(
+        stop,
+        history,
+        &cfg.effective_root(),
+        cfg.exec_ctx.clone(),
+        cfg.cancel.clone(),
+        None, // One-shot snapshots are retired; never recreate ephemeral notes after exit.
+        model,
+    ) {
+        Ok(Some(event)) => crate::plugin::events::dispatch(event).await,
+        Ok(None) => return Ok(()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        // A settled optional failure preserves the answer. Unknown effects still block new work.
+        crate::plugin::runtime::optional_failure(error)?;
+        crate::ui::tui::note_line("Memory provider learning failed; coding result preserved; no automatic retry was attempted.");
     }
     Ok(())
 }
@@ -1162,6 +1345,46 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
 mod tests {
     use super::*;
     use crate::core::session_store::{parse_session_bytes, sessions_dir, set_session_slug};
+
+    #[test]
+    fn incomplete_one_shots_never_prepare_memory_learning() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var_os("AIZEN_HOME");
+        let home = crate::core::file_placement::tests::TestDir::new();
+        let missing = home.path().join("not-initialized");
+        std::env::set_var("AIZEN_HOME", &missing);
+        let mut user = Message::user("Remember this project uses Cargo.");
+        user.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
+        let cfg = AgentConfig::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for stop in [
+            StopReason::Cancelled,
+            StopReason::Deadline,
+            StopReason::MaxIters,
+            StopReason::Divergence,
+            StopReason::VerificationFailed,
+            StopReason::Refresh,
+        ] {
+            runtime
+                .block_on(learn_completed_turn(&stop, &[user.clone()], &cfg, None))
+                .unwrap();
+        }
+        // Even a successful turn with no selected provider creates no optional-memory roots.
+        runtime
+            .block_on(learn_completed_turn(&StopReason::Done, &[user], &cfg, None))
+            .unwrap();
+        assert!(!missing.exists());
+        if let Some(old) = old_home {
+            std::env::set_var("AIZEN_HOME", old);
+        } else {
+            std::env::remove_var("AIZEN_HOME");
+        }
+    }
 
     /// What `--save-session` is FOR: a one-shot run leaves a file the picker can reopen, stamped
     /// with the project it ran in. The provenance is the point — a transcript on disk that cannot

@@ -6,7 +6,7 @@ use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ExtendedColorType, 
 use std::collections::VecDeque;
 use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 const MAX_ENCODED: usize = 8 * 1024 * 1024;
@@ -29,17 +29,29 @@ pub(crate) fn image_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ImageSendPolicy {
     Original,
+    /// Unknown content is pixel-sensitive until an explicit compressible/photo hint is supplied.
+    Auto,
     #[default]
     Balanced,
 }
 impl ImageSendPolicy {
     pub fn snapshot_environment() -> Self {
-        Self::from_environment_value(std::env::var("AIZEN_IMAGE_SEND_MODE").ok().as_deref())
+        let environment = std::env::var("AIZEN_IMAGE_SEND_MODE").ok();
+        if environment.is_some() {
+            return Self::from_environment_value(environment.as_deref());
+        }
+        match crate::core::cli_config::load().image_mode {
+            Some(crate::core::types::ImagePreference::Original) => Self::Original,
+            Some(crate::core::types::ImagePreference::Auto) => Self::Auto,
+            Some(crate::core::types::ImagePreference::Photo) | None => Self::Balanced,
+        }
     }
 
     pub fn from_environment_value(value: Option<&str>) -> Self {
         if value.is_some_and(|v| v.trim().eq_ignore_ascii_case("original")) {
             Self::Original
+        } else if value.is_some_and(|v| v.trim().eq_ignore_ascii_case("auto")) {
+            Self::Auto
         } else {
             Self::Balanced
         }
@@ -57,7 +69,7 @@ pub fn try_image_memory_lease(bytes: usize) -> Option<ImageMemoryLease> {
 }
 fn reserve_memory(bytes: usize) -> bool {
     IMAGE_MEMORY_USED
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes)
                 .filter(|n| *n <= IMAGE_MEMORY_BUDGET)
         })
@@ -190,13 +202,31 @@ struct CacheKey {
     policy: ImageSendPolicy,
     version: u8,
 }
+#[derive(Clone)]
+enum CachedImage {
+    Derivative(Arc<ImageDerivative>),
+    Original,
+}
+impl CachedImage {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Derivative(image) => image.url.len(),
+            Self::Original => 0,
+        }
+    }
+}
 #[derive(Default)]
 struct Cache {
-    entries: VecDeque<(CacheKey, Arc<ImageDerivative>)>,
+    entries: VecDeque<(CacheKey, CachedImage)>,
     bytes: usize,
+    // Weak markers need no cache lock on drop, including early returns and unwinding.
+    // Limit distinct cold work too; cache contention never waits on an async executor thread.
+    in_flight: Vec<(CacheKey, Weak<()>)>,
+    #[cfg(test)]
+    before_work: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
 }
 impl Cache {
-    fn get(&mut self, key: CacheKey) -> Option<Arc<ImageDerivative>> {
+    fn get(&mut self, key: CacheKey) -> Option<CachedImage> {
         let index = self.entries.iter().position(|(k, _)| *k == key)?;
         let entry = self.entries.remove(index)?;
         let image = entry.1.clone();
@@ -204,24 +234,89 @@ impl Cache {
         Some(image)
     }
 
-    fn publish(&mut self, key: CacheKey, image: Arc<ImageDerivative>) {
-        if image.url.len() > CACHE_BYTES || self.entries.iter().any(|(k, _)| *k == key) {
+    fn begin(&mut self, key: CacheKey) -> Option<Arc<()>> {
+        self.in_flight.retain(|(_, work)| work.strong_count() != 0);
+        if self.in_flight.len() >= CACHE_ENTRIES || self.in_flight.iter().any(|(k, _)| *k == key) {
+            return None;
+        }
+        let work = Arc::new(());
+        self.in_flight.push((key, Arc::downgrade(&work)));
+        Some(work)
+    }
+
+    fn publish(&mut self, key: CacheKey, image: CachedImage) {
+        let bytes = image.bytes();
+        if bytes > CACHE_BYTES || self.entries.iter().any(|(k, _)| *k == key) {
             return;
         }
-        while self.entries.len() >= CACHE_ENTRIES
-            || self.bytes.saturating_add(image.url.len()) > CACHE_BYTES
+        while self.entries.len() >= CACHE_ENTRIES || self.bytes.saturating_add(bytes) > CACHE_BYTES
         {
             if let Some((_, old)) = self.entries.pop_front() {
-                self.bytes -= old.url.len();
+                self.bytes -= old.bytes();
             } else {
                 break;
             }
         }
-        self.bytes += image.url.len();
+        self.bytes += bytes;
         self.entries.push_back((key, image));
     }
 }
+fn publish_cached(cache: &Mutex<Cache>, key: CacheKey, image: CachedImage) {
+    if let Ok(mut cache) = cache.try_lock() {
+        cache.publish(key, image);
+    }
+}
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+
+/// Warm/negative/in-flight hits do not need a cloned source or a blocking-pool dispatch.
+/// Contention falls back to original pixels, just like the optimizer's nonblocking cache access.
+pub fn user_image_preparation_needed(data_url: &str, policy: ImageSendPolicy) -> bool {
+    if policy != ImageSendPolicy::Balanced || !data_url.starts_with("data:image/png;base64,") {
+        return false;
+    }
+    let key = CacheKey {
+        source: identity(data_url.as_bytes()),
+        policy,
+        version: CODEC_VERSION,
+    };
+    CACHE
+        .get_or_init(Mutex::default)
+        .try_lock()
+        .is_ok_and(|cache| {
+            !cache.entries.iter().any(|(candidate, _)| *candidate == key)
+                && !cache
+                    .in_flight
+                    .iter()
+                    .any(|(candidate, work)| *candidate == key && work.strong_count() != 0)
+        })
+}
+
+/// Network paths prewarm off-executor. A cold/busy cache must not start codec work in projection.
+pub fn cached_user_image(data_url: &str, policy: ImageSendPolicy) -> ImageSendResult<'_> {
+    let source_identity = identity(data_url.as_bytes());
+    let dimensions = source_png_dimensions(data_url);
+    if policy == ImageSendPolicy::Balanced {
+        let key = CacheKey {
+            source: source_identity,
+            policy,
+            version: CODEC_VERSION,
+        };
+        if let Ok(mut cache) = CACHE.get_or_init(Mutex::default).try_lock() {
+            if let Some(CachedImage::Derivative(image)) = cache.get(key) {
+                return derivative_result(source_identity, image, 0, 0);
+            }
+        }
+    }
+    ImageSendResult {
+        url: ImageSendUrl::Original(data_url),
+        stats: ImageSendStats::default(),
+        source_identity,
+        derivative_identity: source_identity,
+        source_dimensions: dimensions,
+        dimensions,
+        transform: ImageTransform::Original,
+    }
+}
 
 /// Optimize a selected ordinary USER image only. Exact inspection always bypasses this cache.
 /// Remote URLs, unsupported metadata, malformed/oversized inputs and admission failures are no-ops.
@@ -249,7 +344,7 @@ fn optimize_with_cache<'a>(
         dimensions: source_dimensions,
         transform: ImageTransform::Original,
     };
-    if exact || policy == ImageSendPolicy::Original {
+    if exact || matches!(policy, ImageSendPolicy::Original | ImageSendPolicy::Auto) {
         return original();
     }
     let Some(encoded) = data_url.strip_prefix("data:image/png;base64,") else {
@@ -260,20 +355,43 @@ fn optimize_with_cache<'a>(
         policy,
         version: CODEC_VERSION,
     };
-    if let Some(image) = cache.lock().ok().and_then(|mut c| c.get(key)) {
-        return derivative_result(source_identity, image, 0, 0);
+    // Claim a key and release the global lock BEFORE decoding/encoding. A concurrent caller
+    // returns its original immediately; a later request can reuse the completed outcome.
+    let _work = {
+        let Ok(mut cache) = cache.try_lock() else {
+            return original();
+        };
+        if let Some(image) = cache.get(key) {
+            return match image {
+                CachedImage::Derivative(image) => derivative_result(source_identity, image, 0, 0),
+                CachedImage::Original => original(),
+            };
+        }
+        let Some(work) = cache.begin(key) else {
+            return original();
+        };
+        work
+    };
+    #[cfg(test)]
+    if let Some(barriers) = cache.try_lock().ok().and_then(|c| c.before_work.clone()) {
+        barriers.0.wait();
+        barriers.1.wait();
     }
+    let negative = || publish_cached(cache, key, CachedImage::Original);
     let started = Instant::now();
     let Ok(size) = base64_decoded_len(encoded, MAX_ENCODED) else {
+        negative();
         return original();
     };
     let Some(mut lease) = try_image_memory_lease(size) else {
         return original();
     };
     let Ok(bytes) = base64_decode_bounded(encoded, MAX_ENCODED) else {
+        negative();
         return original();
     };
     let Some((width, height, channels)) = supported_png(&bytes) else {
+        negative();
         return original();
     };
     let mut fallback = original();
@@ -284,13 +402,13 @@ fn optimize_with_cache<'a>(
         .and_then(|n| n.checked_mul(channels))
         .filter(|n| *n <= MAX_DECODED)
     else {
+        negative();
         return fallback;
     };
-    // Decoder internal limit, output pixels, two fixed-capacity JPEG candidates and URI+boxed
-    // copy. Reserve worst-case live allocations BEFORE decoder/encoder initialization.
-    let uri_limit = data_url
-        .len()
-        .min(MAX_ENCODED.div_ceil(3) * 4 + JPEG_PREFIX.len());
+    // Two fixed-capacity JPEG candidates, bounded by the largest payload that can beat the
+    // original URI (and 8 MiB). No candidate Vec can grow beyond its admitted capacity.
+    let candidate_limit = useful_jpeg_limit(data_url.len());
+    let uri_limit = uri_len(candidate_limit);
     let rgb_bytes = width as usize * height as usize * 3;
     let normalization_bytes = if matches!(channels, 2 | 4) {
         rgb_bytes
@@ -300,24 +418,27 @@ fn optimize_with_cache<'a>(
     let working = MAX_DECODED
         + pixel_bytes
         + normalization_bytes
-        + 2 * MAX_ENCODED
+        + 2 * candidate_limit
         + 2 * uri_limit
         + 1024 * 1024;
     if !lease.try_grow(working) {
         return fallback;
     }
     let Some((pixels, color)) = decode_pixels(&bytes, width, height, pixel_bytes) else {
+        negative();
         return fallback;
     };
     let mut attempts = 1;
-    let mut best = encode_candidate(&pixels, width, height, color, 88);
+    let mut best = encode_candidate(&pixels, width, height, color, 88, candidate_limit);
     let mut quality = 88;
     if best
         .as_ref()
         .is_none_or(|v| uri_len(v.len()) > SOFT_URI_TARGET)
     {
         attempts += 1;
-        if let Some(candidate) = encode_candidate(&pixels, width, height, color, 82) {
+        if let Some(candidate) =
+            encode_candidate(&pixels, width, height, color, 82, candidate_limit)
+        {
             if best.as_ref().is_none_or(|v| candidate.len() < v.len()) {
                 best = Some(candidate);
                 quality = 82;
@@ -325,6 +446,7 @@ fn optimize_with_cache<'a>(
         }
     }
     let mut dimensions = (width, height);
+    let mut complete = true;
     if best
         .as_ref()
         .is_none_or(|v| uri_len(v.len()) > SOFT_URI_TARGET)
@@ -342,38 +464,46 @@ fn optimize_with_cache<'a>(
             + target.0 as usize * target.1 as usize * 3
             + width.max(height) as usize * 16
             + rgb_extra;
-        if !lease.try_grow(resize_bytes) {
-            fallback.stats.candidates_encoded = attempts;
-            fallback.stats.encode_micros = elapsed_micros(started);
-            return fallback;
-        }
-        let rgb = if color == ExtendedColorType::Rgb8 {
-            RgbImage::from_raw(width, height, pixels)
+        if lease.try_grow(resize_bytes) {
+            let rgb = if color == ExtendedColorType::Rgb8 {
+                RgbImage::from_raw(width, height, pixels)
+            } else {
+                let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+                for value in pixels {
+                    rgb.extend_from_slice(&[value; 3]);
+                }
+                RgbImage::from_raw(width, height, rgb)
+            };
+            let Some(rgb) = rgb else { return fallback };
+            let resized = image::imageops::resize(&rgb, target.0, target.1, FilterType::Lanczos3);
+            attempts += 1;
+            if let Some(candidate) = encode_candidate(
+                resized.as_raw(),
+                target.0,
+                target.1,
+                ExtendedColorType::Rgb8,
+                82,
+                candidate_limit,
+            ) {
+                if best.as_ref().is_none_or(|v| candidate.len() < v.len()) {
+                    best = Some(candidate);
+                    quality = 82;
+                    dimensions = target;
+                }
+            }
         } else {
-            let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for value in pixels {
-                rgb.extend_from_slice(&[value; 3]);
-            }
-            RgbImage::from_raw(width, height, rgb)
-        };
-        let Some(rgb) = rgb else { return fallback };
-        let resized = image::imageops::resize(&rgb, target.0, target.1, FilterType::Lanczos3);
-        attempts += 1;
-        if let Some(candidate) = encode_candidate(
-            resized.as_raw(),
-            target.0,
-            target.1,
-            ExtendedColorType::Rgb8,
-            82,
-        ) {
-            if best.as_ref().is_none_or(|v| candidate.len() < v.len()) {
-                best = Some(candidate);
-                quality = 82;
-                dimensions = target;
-            }
+            // A useful full-resolution candidate still wins over the original. Do not cache
+            // this partial outcome: a later send with available memory should retry resizing.
+            complete = false;
         }
     }
-    let Some(jpeg) = best.filter(|v| uri_len(v.len()) < data_url.len()) else {
+    let Some(jpeg) = best
+        .filter(|v| uri_len(v.len()) < data_url.len())
+        .and_then(|v| v.bytes)
+    else {
+        if complete {
+            negative();
+        }
         fallback.stats.candidates_encoded = attempts;
         fallback.stats.encode_micros = elapsed_micros(started);
         return fallback;
@@ -393,8 +523,8 @@ fn optimize_with_cache<'a>(
         },
         _memory: lease.split(retained),
     });
-    if let Ok(mut c) = cache.lock() {
-        c.publish(key, image.clone());
+    if complete {
+        publish_cached(cache, key, CachedImage::Derivative(image.clone()));
     }
     derivative_result(source_identity, image, elapsed_micros(started), attempts)
 }
@@ -423,14 +553,25 @@ fn elapsed_micros(started: Instant) -> u64 {
 fn uri_len(binary: usize) -> usize {
     JPEG_PREFIX.len() + binary.div_ceil(3) * 4
 }
+fn useful_jpeg_limit(source_uri_len: usize) -> usize {
+    // Base64 is rounded to groups of four; require a STRICTLY smaller final URI.
+    (source_uri_len.saturating_sub(JPEG_PREFIX.len() + 1) / 4)
+        .saturating_mul(3)
+        .min(MAX_ENCODED)
+}
 
 // No codec or allocation: decode only enough canonical base64 for PNG signature + IHDR.
 // Informational dimensions; the full decoder still validates chunk CRCs before conversion.
-fn source_png_dimensions(url: &str) -> Option<(u32, u32)> {
+pub(crate) fn source_png_dimensions(url: &str) -> Option<(u32, u32)> {
     let encoded = url.strip_prefix("data:image/png;base64,")?;
     let prefix = encoded.as_bytes().get(..44)?;
     let mut bytes = [0u8; 33];
-    for (group, out) in prefix.chunks_exact(4).zip(bytes.chunks_exact_mut(3)) {
+    for (group, out) in prefix
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(bytes.as_chunks_mut::<3>().0.iter_mut())
+    {
         let a = base64_sextet(group[0])?;
         let b = base64_sextet(group[1])?;
         let c = base64_sextet(group[2])?;
@@ -543,16 +684,16 @@ fn decode_pixels(
     let (pixels, color) = match frame.color_type {
         png::ColorType::Grayscale => (pixels, ExtendedColorType::L8),
         png::ColorType::Rgb => (pixels, ExtendedColorType::Rgb8),
-        png::ColorType::GrayscaleAlpha if pixels.chunks_exact(2).all(|p| p[1] == 255) => {
+        png::ColorType::GrayscaleAlpha if pixels.as_chunks::<2>().0.iter().all(|p| p[1] == 255) => {
             let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for pixel in pixels.chunks_exact(2) {
+            for pixel in pixels.as_chunks::<2>().0 {
                 rgb.extend_from_slice(&[pixel[0]; 3]);
             }
             (rgb, ExtendedColorType::Rgb8)
         }
-        png::ColorType::Rgba if pixels.chunks_exact(4).all(|p| p[3] == 255) => {
+        png::ColorType::Rgba if pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 255) => {
             let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for pixel in pixels.chunks_exact(4) {
+            for pixel in pixels.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&pixel[..3]);
             }
             (rgb, ExtendedColorType::Rgb8)
@@ -562,13 +703,44 @@ fn decode_pixels(
     reader.finish().ok()?;
     Some((pixels, color))
 }
-struct BoundedJpeg(Vec<u8>);
+struct JpegCandidate {
+    bytes: Option<Vec<u8>>,
+    len: usize,
+}
+impl JpegCandidate {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+struct BoundedJpeg {
+    candidate: JpegCandidate,
+    limit: usize,
+}
+impl BoundedJpeg {
+    fn new(limit: usize) -> Self {
+        Self {
+            candidate: JpegCandidate {
+                bytes: Some(Vec::with_capacity(limit)),
+                len: 0,
+            },
+            limit,
+        }
+    }
+}
 impl Write for BoundedJpeg {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.0.len().saturating_add(bytes.len()) > MAX_ENCODED {
+        let end = self.candidate.len.saturating_add(bytes.len());
+        if end > MAX_ENCODED {
             return Err(std::io::Error::other("JPEG preview exceeds encoded limit"));
         }
-        self.0.extend_from_slice(bytes);
+        self.candidate.len = end;
+        if end > self.limit {
+            // Count without retaining a non-useful JPEG, preserving the existing quality/resize
+            // decisions based on its actual length rather than treating it as a codec failure.
+            self.candidate.bytes = None;
+        } else if let Some(output) = &mut self.candidate.bytes {
+            output.extend_from_slice(bytes);
+        }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -581,12 +753,13 @@ fn encode_candidate(
     height: u32,
     color: ExtendedColorType,
     quality: u8,
-) -> Option<Vec<u8>> {
-    let mut writer = BoundedJpeg(Vec::with_capacity(MAX_ENCODED));
+    limit: usize,
+) -> Option<JpegCandidate> {
+    let mut writer = BoundedJpeg::new(limit);
     JpegEncoder::new_with_quality(&mut writer, quality)
         .encode(pixels, width, height, color)
         .ok()?;
-    Some(writer.0)
+    Some(writer.candidate)
 }
 fn jpeg_url(jpeg: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -703,6 +876,7 @@ mod tests {
         let source = fixture(32, 32, true, png::ColorType::Rgb, png::BitDepth::Eight);
         for (url, policy, exact) in [
             (source.as_str(), ImageSendPolicy::Original, false),
+            (source.as_str(), ImageSendPolicy::Auto, false),
             (source.as_str(), ImageSendPolicy::Balanced, true),
             (
                 "https://example.invalid/private.png",
@@ -724,7 +898,12 @@ mod tests {
             assert_eq!(result.url.as_str(), url);
             assert_eq!(result.stats.candidates_encoded, 0);
         }
-        assert!(cache.lock().unwrap().entries.is_empty());
+        assert!(cache
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .all(|(_, image)| matches!(image, CachedImage::Original)));
         assert_eq!(
             ImageSendPolicy::from_environment_value(Some(" ORIGINAL ")),
             ImageSendPolicy::Original
@@ -791,7 +970,7 @@ mod tests {
         let cache = Mutex::new(Cache::default());
         let mut rgba = vec![0; 640 * 480 * 4];
         let mut seed = 42u32;
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             for byte in &mut pixel[..3] {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;
@@ -868,7 +1047,7 @@ mod tests {
                 transform: ImageTransform::Original,
                 _memory: try_image_memory_lease(3 * 1024 * 1024).unwrap(),
             });
-            cache.publish(key, image);
+            cache.publish(key, CachedImage::Derivative(image));
             assert!(cache.entries.len() <= CACHE_ENTRIES);
             assert!(cache.bytes <= CACHE_BYTES);
         }
@@ -904,7 +1083,7 @@ mod tests {
             if i == 0 {
                 held = Some(image.clone());
             }
-            cache.publish(key, image);
+            cache.publish(key, CachedImage::Derivative(image));
         }
         assert_eq!(cache.entries.len(), CACHE_ENTRIES);
         assert_eq!(
@@ -926,6 +1105,174 @@ mod tests {
         assert!(!debug.contains(source));
         assert!(!debug.contains("secret"));
         assert!(!debug.contains("source_identity"));
+    }
+
+    #[test]
+    fn useful_candidate_storage_is_bounded_without_changing_length_decisions() {
+        let _guard = image_test_lock();
+        for source_len in JPEG_PREFIX.len() + 5..512 {
+            let limit = useful_jpeg_limit(source_len);
+            assert!(uri_len(limit) < source_len);
+            assert!(uri_len(limit + 1) >= source_len);
+        }
+        assert_eq!(useful_jpeg_limit(usize::MAX), MAX_ENCODED);
+        let mut writer = BoundedJpeg::new(7);
+        assert_eq!(writer.candidate.bytes.as_ref().unwrap().capacity(), 7);
+        writer.write_all(&[0; 7]).unwrap();
+        assert_eq!(writer.candidate.bytes.as_ref().unwrap().capacity(), 7);
+        writer.write_all(&[0]).unwrap();
+        assert!(writer.candidate.bytes.is_none());
+        assert_eq!(writer.candidate.len(), 8);
+        writer.write_all(&vec![0; MAX_ENCODED - 8]).unwrap();
+        assert_eq!(writer.candidate.len(), MAX_ENCODED);
+        assert!(writer.write_all(&[0]).is_err());
+        assert_eq!(writer.candidate.len(), MAX_ENCODED);
+
+        let pixels = vec![230; 32 * 32 * 3];
+        let full =
+            encode_candidate(&pixels, 32, 32, ExtendedColorType::Rgb8, 88, MAX_ENCODED).unwrap();
+        let bounded = encode_candidate(&pixels, 32, 32, ExtendedColorType::Rgb8, 88, 1).unwrap();
+        assert_eq!(bounded.len(), full.len());
+        assert!(bounded.bytes.is_none());
+    }
+
+    #[test]
+    fn bypasses_do_not_consult_or_populate_even_a_warm_cache() {
+        let _guard = image_test_lock();
+        let cache = Mutex::new(Cache::default());
+        let source = fixture(64, 64, true, png::ColorType::Rgb, png::BitDepth::Eight);
+        let cold = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert!(matches!(cold.url, ImageSendUrl::Derivative(_)));
+        // Holding the cache lock proves bypasses and lock contention do not wait on it.
+        let locked = cache.lock().unwrap();
+        for (policy, exact) in [
+            (ImageSendPolicy::Original, false),
+            (ImageSendPolicy::Auto, false),
+            (ImageSendPolicy::Balanced, true),
+            (ImageSendPolicy::Balanced, false),
+        ] {
+            let result = optimize_with_cache(&source, policy, exact, &cache);
+            assert_eq!(result.url.as_str(), source);
+            assert_eq!(result.stats.candidates_encoded, 0);
+        }
+        assert_eq!(locked.entries.len(), 1);
+    }
+
+    #[test]
+    fn deterministic_negative_cache_is_warm_and_bounded() {
+        let _guard = image_test_lock();
+        let cache = Mutex::new(Cache::default());
+        let source = fixture(1, 1, false, png::ColorType::Rgb, png::BitDepth::Eight);
+        let cold = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(cold.url.as_str(), source);
+        assert_eq!(cold.stats.candidates_encoded, 1);
+        let warm = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(warm.url.as_str(), source);
+        assert_eq!(warm.stats.candidates_encoded, 0);
+        assert_eq!(warm.stats.encode_micros, 0);
+        for i in 0..CACHE_ENTRIES + 2 {
+            let invalid = format!("data:image/png;base64,invalid{i}");
+            let result = optimize_with_cache(&invalid, ImageSendPolicy::Balanced, false, &cache);
+            assert_eq!(result.url.as_str(), invalid);
+            let c = cache.lock().unwrap();
+            assert!(c.entries.len() <= CACHE_ENTRIES);
+            assert_eq!(c.bytes, 0);
+            assert!(c.in_flight.len() <= CACHE_ENTRIES);
+        }
+        let cold_again = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(cold_again.stats.candidates_encoded, 1);
+    }
+
+    #[test]
+    fn transient_admission_refusals_do_not_poison_the_cache() {
+        let _guard = image_test_lock();
+        let cache = Mutex::new(Cache::default());
+        let source = fixture(64, 64, true, png::ColorType::Rgb, png::BitDepth::Eight);
+        let encoded = source.strip_prefix("data:image/png;base64,").unwrap();
+        let decoded_size = base64_decoded_len(encoded, MAX_ENCODED).unwrap();
+        // Test both initial admission and codec-working-set admission separately.
+        for spare in [0, decoded_size] {
+            let available = IMAGE_MEMORY_BUDGET - IMAGE_MEMORY_USED.load(Ordering::Acquire);
+            let held = try_image_memory_lease(available - spare).unwrap();
+            let refused = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+            assert_eq!(refused.url.as_str(), source);
+            assert_eq!(refused.stats.candidates_encoded, 0);
+            assert!(cache.lock().unwrap().entries.is_empty());
+            drop(held);
+        }
+        let retried = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert!(matches!(retried.url, ImageSendUrl::Derivative(_)));
+        assert!(retried.stats.candidates_encoded > 0);
+    }
+
+    #[test]
+    fn resize_admission_failure_keeps_useful_full_resolution_and_retries() {
+        let _guard = image_test_lock();
+        let cache = Mutex::new(Cache::default());
+        let source = fixture(1536, 1024, true, png::ColorType::Rgb, png::BitDepth::Eight);
+        let size = base64_decoded_len(
+            source.strip_prefix("data:image/png;base64,").unwrap(),
+            MAX_ENCODED,
+        )
+        .unwrap();
+        let limit = useful_jpeg_limit(source.len());
+        let initial =
+            size + MAX_DECODED + 1536 * 1024 * 3 + 2 * limit + 2 * uri_len(limit) + 1024 * 1024;
+        let available = IMAGE_MEMORY_BUDGET - IMAGE_MEMORY_USED.load(Ordering::Acquire);
+        let held = try_image_memory_lease(available - initial).unwrap();
+        let partial = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert!(partial.url.as_str().len() < source.len());
+        assert_eq!(partial.dimensions, Some((1536, 1024)));
+        assert_eq!(partial.stats.candidates_encoded, 2);
+        assert!(matches!(
+            partial.transform,
+            ImageTransform::Jpeg { resized: false, .. }
+        ));
+        assert!(cache.lock().unwrap().entries.is_empty());
+        drop(held);
+        let retry = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(retry.stats.candidates_encoded, 3);
+        assert_eq!(retry.dimensions, Some((1280, 853)));
+        let warm = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(warm.stats.candidates_encoded, 0);
+        assert_eq!(warm.url.as_str(), retry.url.as_str());
+    }
+
+    #[test]
+    fn concurrent_same_key_has_one_encoder_and_never_waits_for_it() {
+        let _guard = image_test_lock();
+        let barriers = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let cache = Mutex::new(Cache {
+            before_work: Some(barriers.clone()),
+            ..Cache::default()
+        });
+        let source = fixture(64, 64, true, png::ColorType::Rgb, png::BitDepth::Eight);
+        std::thread::scope(|scope| {
+            let first = scope
+                .spawn(|| optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache));
+            barriers.0.wait();
+            assert!(
+                cache.try_lock().is_ok(),
+                "encoding must not hold the cache lock"
+            );
+            for _ in 0..4 {
+                let concurrent = scope
+                    .spawn(|| {
+                        optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache)
+                    })
+                    .join()
+                    .unwrap();
+                assert_eq!(concurrent.url.as_str(), source);
+                assert_eq!(concurrent.stats.candidates_encoded, 0);
+            }
+            barriers.1.wait();
+            let cold = first.join().unwrap();
+            assert!(cold.stats.candidates_encoded > 0);
+            assert!(matches!(cold.url, ImageSendUrl::Derivative(_)));
+        });
+        let warm = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(warm.stats.candidates_encoded, 0);
+        assert!(matches!(warm.url, ImageSendUrl::Derivative(_)));
     }
 
     #[test]

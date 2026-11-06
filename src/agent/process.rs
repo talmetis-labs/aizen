@@ -268,22 +268,36 @@ impl<T> SettlementLifetime<T> {
 /// a child nobody can account for keeps blocking.
 #[derive(Default)]
 pub(crate) struct UnsettledOwnership {
+    /// Counters, failure age, and each charge's decision/settlement transitions share this lock.
+    /// A boundary must never subtract counters sampled on opposite sides of a new live start.
+    state: Mutex<UnsettledState>,
+}
+
+#[derive(Default)]
+struct UnsettledState {
     /// Every outstanding charge, in flight or failed.
-    outstanding: AtomicUsize,
+    outstanding: usize,
     /// The subset still being awaited by a live caller. `outstanding - in_flight` is what blocks.
-    in_flight: AtomicUsize,
+    in_flight: usize,
     /// Charges with no proof path at all (a quarantined spawn error, a lost observer task). These
     /// block immediately and are never waited on — nothing is in flight to wait for.
-    permanent: AtomicUsize,
+    permanent: usize,
     /// When the most recent failed charge was taken, so a caller can tell "teardown is probably still
     /// running" from "this will never settle" and wait only in the first case.
-    last_failure: Mutex<Option<Instant>>,
+    last_failure: Option<Instant>,
+}
+
+impl UnsettledState {
+    fn is_unsettled(&self) -> bool {
+        self.outstanding > self.in_flight || self.permanent > 0
+    }
 }
 
 /// One child's settlement charge. Held while the child starts; the holder either retires it (a live
 /// owner took over) or marks it failed (nobody owns it now). Dropping it unresolved marks it failed.
 ///
-/// Two counters move independently, and each moves exactly once:
+/// Two flags each move exactly once, always under the owner's accounting lock together with the
+/// corresponding counter updates:
 /// * `settled` — this charge is done being outstanding. Set by a live owner's release OR by the
 ///   lifetime's proven release, whichever lands first.
 /// * `resolved` — the holder has decided. Set by any of release / mark_failed / unresolved drop.
@@ -299,28 +313,30 @@ pub(crate) struct UnsettledCharge {
 impl UnsettledCharge {
     /// A live, verified owner now holds this child, so it no longer counts as unproven.
     pub(crate) fn release(&self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if !self.resolved.swap(true, Ordering::AcqRel) {
-            self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            state.in_flight -= 1;
         }
-        self.settle();
+        if !self.settled.swap(true, Ordering::AcqRel) {
+            state.outstanding = state.outstanding.saturating_sub(1);
+        }
     }
 
     /// Nobody owns this child now (startup failed or its observer went away). It must block new work
     /// until its lifetime proves the tree exited.
     pub(crate) fn mark_failed(&self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if !self.resolved.swap(true, Ordering::AcqRel) {
-            self.owner.in_flight.fetch_sub(1, Ordering::AcqRel);
-            *self
-                .owner
-                .last_failure
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
-        }
-    }
-
-    fn settle(&self) {
-        if !self.settled.swap(true, Ordering::AcqRel) {
-            self.owner.decrement();
+            state.in_flight -= 1;
+            state.last_failure = Some(Instant::now());
         }
     }
 }
@@ -341,9 +357,10 @@ impl UnsettledOwnership {
     /// Does anything block new work right now? An in-flight start does not: its own caller is
     /// awaiting it and will settle it, so a slow cold index must never block the session.
     pub(crate) fn is_unsettled(&self) -> bool {
-        let outstanding = self.outstanding.load(Ordering::Acquire);
-        let in_flight = self.in_flight.load(Ordering::Acquire);
-        outstanding.saturating_sub(in_flight) > 0 || self.permanent.load(Ordering::Acquire) > 0
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_unsettled()
     }
 
     /// Charge a child as it starts. The returned charge is held by the starter: retire it with
@@ -353,8 +370,11 @@ impl UnsettledOwnership {
         self: &Arc<Self>,
         lifetime: &Arc<SettlementLifetime<T>>,
     ) -> UnsettledCharge {
-        self.outstanding.fetch_add(1, Ordering::AcqRel);
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.outstanding += 1;
+            state.in_flight += 1;
+        }
         let settled = Arc::new(AtomicBool::new(false));
         let resolved = Arc::new(AtomicBool::new(false));
         let hook_settled = Arc::clone(&settled);
@@ -366,12 +386,17 @@ impl UnsettledOwnership {
         // Both outcomes of `on_release` are already correct, so neither needs compensating here: when
         // it parks the hook (true), the later release runs it; when it runs the hook inline (false),
         // the child had already settled and the hook has just undone the increments above.
+        // Do not hold the accounting lock while registering: an inline hook takes it too.
         let _ = lifetime.on_release(move || {
+            let mut state = hook_owner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if !hook_resolved.swap(true, Ordering::AcqRel) {
-                hook_owner.in_flight.fetch_sub(1, Ordering::AcqRel);
+                state.in_flight -= 1;
             }
             if !hook_settled.swap(true, Ordering::AcqRel) {
-                hook_owner.decrement();
+                state.outstanding = state.outstanding.saturating_sub(1);
             }
         });
         UnsettledCharge {
@@ -384,34 +409,28 @@ impl UnsettledOwnership {
     /// Count ownership with no proof path at all (a quarantined spawn error, a lost observer task).
     /// Blocks immediately and is never waited on.
     pub(crate) fn charge_permanent(self: &Arc<Self>) {
-        self.permanent.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn decrement(&self) {
-        // Saturating: a double release must never wrap the count back to "settled".
-        let _ = self
-            .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_sub(1)
-            });
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .permanent += 1;
     }
 
     /// Wait a BOUNDED time for outstanding FAILED charges to clear, but only while they are FRESH: a
     /// start that just failed is usually mid-teardown, whereas an older charge means a quarantined
     /// owner that will never settle. Returns whether nothing is blocking.
     pub(crate) fn wait_for_recent_settlement(&self, budget: Duration) -> bool {
-        if !self.is_unsettled() {
-            return true;
-        }
-        if self.permanent.load(Ordering::Acquire) > 0 {
-            return false; // no proof path at all — waiting could only waste the budget
-        }
-        let failed_at = *self
-            .last_failure
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(failed_at) = failed_at else {
-            return false;
+        let failed_at = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !state.is_unsettled() {
+                return true;
+            }
+            if state.permanent > 0 {
+                return false; // no proof path at all — waiting could only waste the budget
+            }
+            let Some(failed_at) = state.last_failure else {
+                return false;
+            };
+            failed_at
         };
         let age = failed_at.elapsed();
         if age >= budget {
@@ -1473,8 +1492,11 @@ mod tests {
         );
         drop(stderr);
         assert!(!tracker.is_unsettled());
-        assert_eq!(tracker.in_flight.load(Ordering::Acquire), 0);
-        assert_eq!(tracker.outstanding.load(Ordering::Acquire), 0);
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!(state.in_flight, 0);
+            assert_eq!(state.outstanding, 0);
+        }
 
         // Settlement can race the live monitor; its later drop must not poison other charges.
         let lifetime = Arc::new(SettlementLifetime::new((), quarantine));
@@ -1482,7 +1504,10 @@ mod tests {
         lifetime.prove_tree_settled();
         drop(monitor);
         assert!(!tracker.is_unsettled());
-        assert_eq!(tracker.in_flight.load(Ordering::Acquire), 0);
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!(state.in_flight, 0);
+        }
         let unknown = Arc::new(SettlementLifetime::new((), quarantine));
         drop(tracker.track(&unknown));
         assert!(tracker.is_unsettled());
@@ -1491,6 +1516,161 @@ mod tests {
             tracker.is_unsettled(),
             "unproven quarantine never retires a charge"
         );
+    }
+
+    #[test]
+    fn new_in_flight_charge_cannot_hide_a_lost_observer() {
+        fn quarantine(_: ()) {}
+        let tracker = Arc::new(UnsettledOwnership::new());
+        let lost = Arc::new(SettlementLifetime::new((), quarantine));
+        drop(tracker.track(&lost));
+        let live = Arc::new(SettlementLifetime::new((), quarantine));
+
+        // Queue both a new start and a boundary behind the same snapshot lock. Whichever wins,
+        // the boundary must see the lost observer, not outstanding(A) minus in_flight(B).
+        let state = tracker.state.lock().unwrap();
+        assert_eq!((state.outstanding, state.in_flight), (1, 0));
+        let ready = Arc::new(std::sync::Barrier::new(3));
+        let (started, seen_start) = std::sync::mpsc::channel();
+        let (checked, seen_check) = std::sync::mpsc::channel();
+        let start = {
+            let tracker = Arc::clone(&tracker);
+            let lifetime = Arc::clone(&live);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                started.send(tracker.track(&lifetime)).unwrap();
+            })
+        };
+        let boundary = {
+            let tracker = Arc::clone(&tracker);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                checked.send(tracker.is_unsettled()).unwrap();
+            })
+        };
+        ready.wait();
+        assert!(matches!(
+            seen_start.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            seen_check.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(state);
+        let charge = seen_start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(seen_check.recv_timeout(Duration::from_secs(5)).unwrap());
+        start.join().unwrap();
+        boundary.join().unwrap();
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!((state.outstanding, state.in_flight), (2, 1));
+        }
+        lost.prove_tree_settled();
+        assert!(
+            !tracker.is_unsettled(),
+            "only the accountable live start remains"
+        );
+        charge.release();
+        live.prove_tree_settled();
+    }
+
+    #[test]
+    fn concurrent_charge_resolution_and_settlement_cannot_retire_another_child() {
+        fn quarantine(_: ()) {}
+        let tracker = Arc::new(UnsettledOwnership::new());
+        let lost = Arc::new(SettlementLifetime::new((), quarantine));
+        drop(tracker.track(&lost));
+        let lifetime = Arc::new(SettlementLifetime::new((), quarantine));
+        let charge = Arc::new(tracker.track(&lifetime));
+        let ready = Arc::new(std::sync::Barrier::new(4));
+        let release = {
+            let charge = Arc::clone(&charge);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                charge.release();
+            })
+        };
+        let failure = {
+            let charge = Arc::clone(&charge);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                charge.mark_failed();
+            })
+        };
+        let proof = {
+            let lifetime = Arc::clone(&lifetime);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                lifetime.prove_tree_settled();
+            })
+        };
+        ready.wait();
+        release.join().unwrap();
+        failure.join().unwrap();
+        proof.join().unwrap();
+        charge.release(); // Repeated release and the eventual drop must both be harmless.
+        drop(charge);
+        assert!(tracker.is_unsettled());
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!((state.outstanding, state.in_flight), (1, 0));
+        }
+
+        // A verified ownership handoff is sufficient even before physical settlement. Repeated
+        // release and its later lifetime hook must not retire the unrelated lost observer.
+        let handed_off = Arc::new(SettlementLifetime::new((), quarantine));
+        let live_owner = tracker.track(&handed_off);
+        live_owner.release();
+        live_owner.release();
+        assert!(tracker.is_unsettled());
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!((state.outstanding, state.in_flight), (1, 0));
+        }
+        handed_off.prove_tree_settled();
+        drop(live_owner);
+
+        // Registering on an already-settled lifetime runs its hook inline, without deadlock or
+        // cancelling the other child's charge. Later release/failure/drop are all idempotent.
+        let settled = tracker.track(&lifetime);
+        settled.release();
+        settled.release();
+        settled.mark_failed();
+        drop(settled);
+        assert!(tracker.is_unsettled());
+        lost.prove_tree_settled();
+        assert!(!tracker.is_unsettled());
+        let state = tracker.state.lock().unwrap();
+        assert_eq!((state.outstanding, state.in_flight), (0, 0));
+    }
+
+    #[test]
+    fn settlement_wait_stays_bounded_and_permanent_charges_survive_proof() {
+        fn quarantine(_: ()) {}
+        let tracker = Arc::new(UnsettledOwnership::new());
+        let lifetime = Arc::new(SettlementLifetime::new((), quarantine));
+        let charge = tracker.track(&lifetime);
+        assert!(tracker.wait_for_recent_settlement(Duration::ZERO));
+        charge.mark_failed();
+        assert!(!tracker.wait_for_recent_settlement(Duration::ZERO));
+        assert!(!tracker.wait_for_recent_settlement(Duration::from_millis(1)));
+        tracker.state.lock().unwrap().last_failure = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!tracker.wait_for_recent_settlement(Duration::from_millis(1)));
+        lifetime.prove_tree_settled();
+        assert!(tracker.wait_for_recent_settlement(Duration::ZERO));
+
+        tracker.charge_permanent();
+        charge.release();
+        lifetime.prove_tree_settled();
+        assert!(tracker.is_unsettled());
+        assert!(!tracker.wait_for_recent_settlement(Duration::from_millis(1)));
+        assert_eq!(tracker.state.lock().unwrap().permanent, 1);
     }
 
     #[test]

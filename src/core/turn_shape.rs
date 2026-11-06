@@ -28,17 +28,6 @@ pub enum TurnShape {
     Research,
 }
 
-impl TurnShape {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TurnShape::Question => "question",
-            TurnShape::SmallEdit => "small-edit",
-            TurnShape::MultiFile => "multi-file",
-            TurnShape::Research => "research",
-        }
-    }
-}
-
 /// Verbs that mean "change something" (English single words, Vietnamese words/phrases).
 const EDIT_WORDS: &[&str] = &[
     "fix",

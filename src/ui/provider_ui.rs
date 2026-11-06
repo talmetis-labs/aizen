@@ -61,8 +61,8 @@ pub(crate) async fn provider_menu() -> Result<Option<cli_config::ProviderProfile
     }
 }
 
-/// `/model` — fetch the provider's models, pick one (arrow-key), persist it. Also captures the
-/// context window when the provider reports it (→ a real `% context` HUD; else a name heuristic).
+/// `/model` — fetch the provider's models, pick one (arrow-key), persist it. Context metadata stays
+/// advisory: core discovers/caches it on the exact execution route, not as a permanent override.
 pub(crate) async fn slash_model(model_label: &mut String) -> Result<()> {
     let (base, key) = resolve_base_key(None, None)?;
     let http = http_client()?;
@@ -104,8 +104,11 @@ pub(crate) async fn slash_model(model_label: &mut String) -> Result<()> {
     };
     let chosen = &infos[pick];
     let mut cfg = cli_config::load();
+    if cfg.model.as_deref() != Some(chosen.id.as_str()) {
+        cfg.model_context_window = None;
+    }
     cfg.model = Some(chosen.id.clone());
-    cfg.model_context_window = chosen.context_length; // Some ⇒ auto; None ⇒ HUD falls back to heuristic
+    cfg.sync_active_provider();
     cli_config::save(&cfg)?;
     *model_label = chosen.id.clone();
     // Re-pin: the save above sets the default for the NEXT window, the pin makes the switch stick in

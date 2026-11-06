@@ -492,11 +492,23 @@ mod tests {
         let (spec, r) = detect(&main_rs).expect("detect from file");
         assert_eq!(spec.lang, "rust");
         assert_eq!(r, canon);
-        // anchor with no project → None
-        let bare = sandbox("detect-none");
-        assert!(detect(&bare).is_none());
+        // Bound every language's search at a fixture-owned forbidden home. Ambient ancestors may
+        // legitimately contain package.json or another manifest, even when `bare` itself is empty.
+        let home = sandbox("detect-home");
+        for spec in SERVERS {
+            for manifest in spec.manifests {
+                std::fs::write(home.join(manifest), "").unwrap();
+            }
+        }
+        let bare = home.join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        {
+            let _env =
+                crate::core::config::EnvGuard::set([("HOME", &home), ("USERPROFILE", &home)]);
+            assert!(detect(&bare).is_none());
+        }
         let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -355,6 +355,33 @@ fn sync_parent(_path: &Path) {
     }
 }
 
+/// Updater-only checked durability. Unix propagates directory-open/fsync errors. Windows uses
+/// write-through rename; directory fsync is not exposed here. Neither promises storage hardware
+/// honors power-loss flushes; any reported failure after rename is an ambiguous publication.
+pub(crate) fn sync_parent_checked(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path.parent().context("durable path has no parent")?)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+pub(crate) fn atomic_write_owner_only_checked(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = temp_path(path);
+    let result = (|| {
+        write_staged(&tmp, bytes)?;
+        harden_owner_only_checked(&tmp)?;
+        replace_file(&tmp, path)?;
+        sync_parent_checked(path)?;
+        harden_owner_only_checked(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
 /// Atomically replace a sensitive file, hardening the staged bytes before they become visible.
 pub fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path

@@ -47,6 +47,7 @@ pub(crate) async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
             }
             Ok(())
         }
+        Some(AppsCmd::Status { name, json }) => apps_status(name.as_deref(), json),
         Some(AppsCmd::Add { name }) => apps_add(&name).await,
         Some(AppsCmd::Info { name }) => apps_info(&name).await,
         Some(AppsCmd::Login { name }) => {
@@ -72,6 +73,61 @@ pub(crate) async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// HOME-only status: no project resolution, registry request, MCP probe or process launch.
+pub(crate) fn apps_status(key: Option<&str>, json: bool) -> Result<()> {
+    use crate::agent::apps::{jobs::Journal, status};
+
+    let home = crate::core::config::aizen_home();
+    let connectors = status::configured(&home.join("mcp.json"), key)?;
+    let jobs = Journal::new(home.join("app-jobs")).status().map_err(|_| {
+        anyhow!("cannot read app job journal: state is incomplete, invalid or inaccessible; no recovery was attempted")
+    })?;
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "configuration_scope": "home",
+        "project_overrides_checked": false,
+        "live_probe_performed": false,
+        "creative_dispatch_enabled": false,
+        "enrollment_state": "unavailable",
+        "live_app_state": "unknown",
+        "reason": "Creative foundation only; no production adapter is enabled. MCP configuration does not establish app support.",
+        "connectors": connectors,
+        "jobs": jobs,
+        "job_scope": "all_home_operations",
+        "job_state_observation": "last_recorded_not_live",
+        "job_control_authority": false,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Apps status — offline, HOME configuration only (project overrides not checked)");
+        for connector in &connectors {
+            println!(
+                "  {}  {:?}  {}",
+                connector.key,
+                connector.transport,
+                if connector.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        if connectors.is_empty() {
+            println!("  no HOME connectors configured");
+        }
+        println!("Creative adapters: unavailable; live app state: unknown (not probed)");
+        println!(
+            "Durable jobs: {} (last recorded, not live; all HOME operations; IDs do not grant control)",
+            jobs.len()
+        );
+        for job in jobs {
+            println!("  {}", serde_json::to_string(&job)?);
+        }
+    }
+    Ok(())
 }
 
 /// Render the featured catalog with connection badges.

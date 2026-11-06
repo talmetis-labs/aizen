@@ -772,6 +772,62 @@ mod tests {
     }
 
     #[test]
+    fn recovery_checkpoint_keeps_text_but_never_persists_input_pixels() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = ActiveFixture::new();
+        let url = "data:image/gif;base64,R0lGODlh".to_string();
+        let mut compacted = Message::system("compacted text");
+        compacted.images.push(url.clone());
+        let mut reread = Message::tool_result("read", "ROI observation");
+        reread.tool_images.push(
+            crate::core::tool_media::ToolImage::from_bytes(
+                b"GIF89a-private-input",
+                "image/gif",
+                crate::core::tool_media::ImageProvenance::new("reference_read", None),
+            )
+            .unwrap(),
+        );
+        let history = vec![
+            Message::user_with_images("look", vec![url]),
+            compacted,
+            reread,
+        ];
+        let live = serde_json::to_value(&history).unwrap();
+        checkpoint_history_with_design(
+            &history,
+            Some("continue"),
+            RecoveryPhase::WaitingModel,
+            None,
+        )
+        .unwrap();
+        let manifest = fixture.stored();
+        let raw =
+            fs::read_to_string(history_path(&fixture.dir, manifest.sidecar_generation)).unwrap();
+        assert!(
+            !raw.contains("base64") && !raw.contains("blob:") && !raw.contains("visual_assets")
+        );
+        let (restored, _) = read_authoritative_snapshot(&fixture.dir, &manifest).unwrap();
+        assert!(restored.iter().all(|m| m.images.is_empty()));
+        assert!(restored
+            .iter()
+            .flat_map(|m| &m.tool_images)
+            .all(|image| !image.is_available()));
+        assert!(restored[0].content.as_deref().unwrap().starts_with("look"));
+        assert!(restored[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("attach the original"));
+        assert_eq!(serde_json::to_value(&history).unwrap(), live);
+        let blobs = crate::core::config::aizen_home()
+            .join("sessions")
+            .join("blobs");
+        assert!(!blobs.exists());
+    }
+
+    #[test]
     fn idle_autosave_preserves_typed_uncertainty_across_later_turn_and_clean_exit() {
         let _home = crate::core::config::TEST_HOME_LOCK
             .lock()

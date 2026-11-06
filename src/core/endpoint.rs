@@ -52,6 +52,17 @@ pub(crate) fn resolve_endpoint(
     api_key: Option<String>,
     model: Option<String>,
 ) -> Result<(String, String, String)> {
+    resolve_endpoint_with_model_fallback(base_url, api_key, model, None)
+}
+
+/// Like the ordinary resolver, but a saved session can supply a model ONLY after flags, env,
+/// the live window pin and config. Historical provenance must never override today's provider.
+pub(crate) fn resolve_endpoint_with_model_fallback(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    fallback_model: Option<String>,
+) -> Result<(String, String, String)> {
     let cfg = cli_config::load();
     // Precedence: explicit `--flag` (already folded into the args) > env (`AIZEN_*`) > saved config.
     // Reading env here (not just via clap) means the bare REPL honors it too.
@@ -91,6 +102,7 @@ pub(crate) fn resolve_endpoint(
             .or_else(cli_config::session_model)
             .or(cfg.model),
     )
+    .or_else(|| non_empty(fallback_model))
     // Only when the session is what got us here: `auto` is a name the Aizen gateway resolves, and
     // handing it to somebody else's provider would 400 with a model nobody chose.
     .or_else(|| {
@@ -173,6 +185,56 @@ pub(crate) fn http_client() -> Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_session_model_is_only_a_fallback() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("aizen-compact-endpoint-{}", std::process::id()));
+        let previous_home = std::env::var_os("AIZEN_HOME");
+        let previous_model = std::env::var_os("AIZEN_MODEL");
+        let previous_pin = cli_config::session_model();
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("AIZEN_HOME", &home);
+        std::env::remove_var("AIZEN_MODEL");
+        cli_config::clear_session_model();
+        let resolve = |model| {
+            resolve_endpoint_with_model_fallback(
+                Some("https://example.invalid/v1".into()),
+                Some("test-placeholder".into()),
+                model,
+                Some("historical".into()),
+            )
+            .unwrap()
+            .2
+        };
+        assert_eq!(resolve(None), "historical");
+        let cfg = cli_config::CliConfig {
+            model: Some("configured".into()),
+            ..Default::default()
+        };
+        cli_config::save(&cfg).unwrap();
+        assert_eq!(resolve(None), "configured");
+        std::env::set_var("AIZEN_MODEL", "environment");
+        assert_eq!(resolve(None), "environment");
+        assert_eq!(resolve(Some("explicit".into())), "explicit");
+        match previous_pin {
+            Some(model) => cli_config::pin_session_model(&model),
+            None => cli_config::clear_session_model(),
+        }
+        for (key, previous) in [
+            ("AIZEN_HOME", previous_home),
+            ("AIZEN_MODEL", previous_model),
+        ] {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// The session token is a bearer credential good for the account's money. The gate that keeps
     /// it off every other provider is a base-URL check, and this is the half of it that can be

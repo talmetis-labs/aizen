@@ -11,21 +11,20 @@ use crate::core::endpoint::{http_client, resolve_endpoint};
 use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
+use crate::persona;
 use crate::skills as skill;
 use crate::ui::{icons, splash, tui};
 use crate::{
     auto_skill_learn_enabled, extract_json_object, persona_evolve_enabled, summarizer_endpoint,
     COMPACT_KEEP_TURNS,
 };
-use crate::{memory, persona};
 use anyhow::Result;
 use console::style;
 use types::Message;
 
-/// A chore — a compaction summary, the secretary's reading of a turn, a persona reflection, a
-/// reconcile judgement — is one short answer, so it gets a shorter per-call cap than a sub-agent:
-/// a chore still running after a minute is a chore that has hung (quality plan M6 measured them
-/// at 300 s each, three in a row, before the next prompt). `AIZEN_CHORE_CALL_SECS` overrides;
+/// A short background chore (secretary, persona reflection or reconcile judgement) gets a shorter
+/// per-call cap than a sub-agent. Compaction has a separate whole-operation deadline because it may
+/// need several bounded transcript portions. `AIZEN_CHORE_CALL_SECS` overrides either default;
 /// the sub-agent ceiling still bounds it.
 const CHORE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -39,20 +38,22 @@ pub(crate) fn chore_call_timeout() -> std::time::Duration {
         .min(crate::agent::task_tool::subagent_call_timeout())
 }
 
-/// The messages of the most recent user turn: from the last `user` message to the end, empty
-/// when there is none. The background learning passes take a copy of exactly this.
+/// The most recent logical user turn, including synthetic continuations. Legacy unstamped
+/// history keeps its last-user fallback for Core identity learning only.
 pub(crate) fn last_turn_slice(history: &[Message]) -> &[Message] {
-    match history.iter().rposition(|m| m.role == "user") {
-        Some(i) => &history[i..],
-        None => &[],
-    }
+    Message::logical_turn(history).unwrap_or_else(|| {
+        match history.iter().rposition(|m| m.role == "user") {
+            Some(i) => &history[i..],
+            None => &[],
+        }
+    })
 }
 
 /// Wrap a background / chore model call in a per-call wall-clock deadline
 /// ([`chore_call_timeout`], default 60s, `AIZEN_CHORE_CALL_SECS`).
 ///
-/// Every one of these is a NON-streaming `chat_with_tools` call — compaction summaries, the
-/// end-of-turn secretary, persona reflection, memory reconcile, the oracle reviewer, persona distill.
+/// Every one of these is a NON-streaming `chat_with_tools` call — end-of-turn secretary,
+/// persona reflection, memory reconcile, the oracle reviewer and persona distill.
 /// None is streamed, so the streaming path's inter-event stall watchdog never applies; the shared
 /// client carries no total-request ceiling (removed so a long *streamed* turn isn't cut — see
 /// `http_client`); and `read_timeout` resets on every byte, so a gateway that keepalive-drips without
@@ -92,14 +93,7 @@ fn summarizer_is_dedicated(base: &str, key: &str, model: &str) -> bool {
     ep.model != model || ep.base_url != base
 }
 
-/// The end-of-turn secretary: ONE gated model call that files what the turn was worth.
-///
-/// Replaces `maybe_learn_memory` (regex extraction) + `maybe_learn_skill` (a second call) and folds
-/// the persona episode in. Those two ran in OPPOSITE ORDERS in the retained and plain REPL loops,
-/// so which of them saw the turn first depended on which loop you were in; one call cannot disagree
-/// with itself.
-///
-/// Best-effort throughout: any failure means this turn taught nothing, never that the turn broke.
+/// Core Skill/Persona extraction is independent of Memory flags and provider availability.
 pub(crate) async fn maybe_run_secretary(
     history: &[Message],
     http: &reqwest::Client,
@@ -107,187 +101,102 @@ pub(crate) async fn maybe_run_secretary(
     key: &str,
     model: &str,
 ) {
-    use crate::memory::learning::secretary;
+    use crate::core::turn_signals;
+    use crate::persona::secretary;
 
-    if !memory_auto_learn_enabled() {
+    let skills_enabled = auto_skill_learn_enabled();
+    let evolve_enabled = persona_evolve_enabled();
+    let active_persona = if evolve_enabled {
+        persona::active()
+    } else {
+        None
+    };
+    let flags = secretary::IdentityLearning {
+        skills: skills_enabled,
+        persona_evolve: evolve_enabled,
+        persona_active: active_persona.is_some(),
+    };
+    if !flags.enabled() {
         return;
     }
-    let start = match history.iter().rposition(|m| m.role == "user") {
-        Some(i) => i,
-        None => return,
-    };
-    let turn = &history[start..];
-
-    // The user's ACTUAL words: history holds the folded message, so the recall block we injected
-    // this turn has to come off first. Feeding it back would let the secretary re-emit a fact it was
-    // just shown, and local reconciliation would read that as agreement.
+    let turn = last_turn_slice(history);
     let user_text = turn
         .first()
-        .and_then(|m| m.content.as_deref())
-        .map(memory::strip_recall_prefix)
+        .and_then(crate::core::memory_context::clean_content)
         .unwrap_or("")
-        .trim()
-        .to_string();
-    if user_text.is_empty() {
-        return;
-    }
-    // A turn that authored a CHARACTER was describing a fiction, not the user. Mining it leaks a
-    // `persona-…` "fact" into user memory (it did, once — it polluted the verbosity profile).
-    if memory::learning::turn_authored_persona(history) {
-        return;
-    }
-
-    let tool_calls: usize = turn
+        .trim();
+    let tool_calls = turn
         .iter()
         .filter(|m| m.role == "assistant")
         .map(|m| m.tool_calls.len())
         .sum();
-    let reason = secretary::gate(&user_text, tool_calls, turn_recovered_from_dead_end(turn));
+    let authored_persona = turn_signals::turn_authored_persona(turn.iter().map(|m| {
+        (
+            m.role.as_str(),
+            m.user_turn_id.is_some(),
+            m.tool_calls.iter().map(|tc| tc.function.name.as_str()),
+        )
+    }));
+    let recovered = turn_recovered_from_dead_end(turn);
+    let reason =
+        secretary::should_extract(flags, user_text, tool_calls, recovered, authored_persona);
     if !reason.fires() {
-        return; // the common case: no model call at all
+        return;
     }
-
-    // Show the secretary the handles it may cite, with the text each one stood for.
-    let injected: Vec<(String, String)> = {
-        let live = memory::pending::current();
-        if live.is_empty() {
-            Vec::new()
-        } else {
-            let all = memory::store::load_all().unwrap_or_default();
-            live.iter()
-                .filter_map(|p| {
-                    all.iter()
-                        .find(|e| e.id == p.id)
-                        .map(|e| (p.handle.clone(), e.body.clone()))
-                })
-                .collect()
-        }
-    };
-    let injected_ids: Vec<String> = memory::pending::current()
-        .into_iter()
-        .map(|p| p.id)
-        .collect();
-
-    // A signal-only turn gets the SHORT transcript regardless of configuration: the durable content
-    // is in what the user said, and a tool log would crowd it out of the budget.
-    let cap =
-        if reason == secretary::GateReason::Signal || !summarizer_is_dedicated(base, key, model) {
-            secretary::CAP_TOKENS_SHARED_MODEL
-        } else {
-            secretary::CAP_TOKENS_OWN_ROLE
-        };
-    let input = secretary::build_input(&user_text, &render_transcript(turn), &injected, cap);
-
+    let cap = secretary::input_cap(reason, summarizer_is_dedicated(base, key, model));
+    let input = secretary::build_input(user_text, &render_transcript(turn), cap);
     let ep = summarizer_endpoint(base, key, model);
-    let msgs = [
+    let messages = [
         Message::system(secretary::system_prompt()),
         Message::user(input),
     ];
-    // Counted before the call, not after: a call that errors was still billed, and the point of the
-    // number is cost per turn. Counting only successes would understate exactly the spend the gate
-    // exists to control.
-    memory::stats::note_secretary_call();
-    let resp = match chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]).await {
-        Ok(t) => t,
-        Err(_) => return, // best-effort; never disrupt the REPL
-    };
-    // `parse` never errors: garbage in yields an empty output, so a confused model costs one call.
-    let out = secretary::parse(&resp.content.unwrap_or_default());
-
-    // §8 metric 2 (injected-vs-used) is recorded HERE, before the empty-output early return: a gated
-    // turn that was shown five facts and reported none of them useful is the single most informative
-    // sample the ratio has. Dropping it would leave only the turns where recall worked, and the
-    // metric would read high for exactly the store that needs fixing.
-    //
-    // Both halves come from one place so they cannot drift: the denominator is what the ledger
-    // injected this turn, the numerator is the subset of THOSE handles the model cited (invented
-    // handles resolve to nothing). Only gated turns are counted — an ungated turn was never asked.
-    if !injected_ids.is_empty() {
-        let used = memory::pending::resolve_used(&out.used).len() as u64;
-        let shown = injected_ids.len() as u64;
-        memory::stats::note_recall(shown, used);
-        memory::learning::audit::recall(repl_session_id(), shown, used);
-    }
-
-    if out.is_empty() {
+    let response =
+        match chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &messages, &[]).await {
+            Ok(response) => response,
+            Err(_) => return,
+        };
+    let output = flags.parse(&response.content.unwrap_or_default());
+    if output.is_empty() {
         return;
     }
-
-    let report = secretary::apply_facts(&out, &injected_ids, repl_session_id());
-    let confirmed_by_use = secretary::apply_used(&out);
-
-    // Persona episode — CHARACTER only, and only when a character is actually active.
-    if let Some(ep_prop) = out.episode.as_ref() {
-        if persona_evolve_enabled() {
-            if let Some(p) = persona::active() {
-                let slug = skill::sanitize_name(&p.name);
-                let _ = persona::self_mem::record_episode(&slug, &ep_prop.text, ep_prop.importance);
-            }
+    // Owners are rechecked after the await; they still enforce validation and formative floors.
+    if persona_evolve_enabled() {
+        if let (Some(proposal), Some(active)) = (output.episode.as_ref(), persona::active()) {
+            let slug = skill::sanitize_name(&active.name);
+            let _ = persona::self_mem::record_episode(&slug, &proposal.text, proposal.importance);
         }
     }
-
-    // Skill — save fresh, or fold into the existing one when the model asked to refine.
-    // DEDUP (fix C, 2026-08-06): before auto-creating a NEW skill, compare the proposed `when` +
-    // `steps` against every existing skill with `match_similarity`. Three identical "verify GitHub
-    // Actions YAML" skills were observed on the same day because the only collision key was the slug,
-    // and minor wording changes in the name produced different slugs. Now a new skill whose trigger
-    // resembles an existing one gets routed to `refine` instead of spawning a duplicate.
-    if let Some(sk) = out.skill.as_ref() {
-        if auto_skill_learn_enabled() {
-            let all_skills = skill::list();
-            let target = auto_learn_skill_target(&all_skills, &sk.name, &sk.when, &sk.steps);
-            let done = match target {
-                // Only fold an exact collision when the model MEANT to; a same-named skill alone
-                // is not a licence to overwrite the user's procedure.
-                Some((key, true)) => {
-                    sk.refine && skill::refine(key, &sk.steps, None, Some(&sk.when)).is_ok()
-                }
-                Some((key, false)) => skill::refine(key, &sk.steps, None, Some(&sk.when)).is_ok(),
-                None => skill::save_scoped(&sk.name, "", &sk.when, &sk.steps, true).is_ok(),
+    if let Some(proposal) = output.skill.as_ref().filter(|_| auto_skill_learn_enabled()) {
+        let all_skills = skill::list();
+        let target =
+            auto_learn_skill_target(&all_skills, &proposal.name, &proposal.when, &proposal.steps);
+        let done = match target {
+            Some((key, true)) => {
+                proposal.refine
+                    && skill::refine(key, &proposal.steps, None, Some(&proposal.when)).is_ok()
+            }
+            Some((key, false)) => {
+                skill::refine(key, &proposal.steps, None, Some(&proposal.when)).is_ok()
+            }
+            None => skill::save_scoped(&proposal.name, "", &proposal.when, &proposal.steps, true)
+                .is_ok(),
+        };
+        if done {
+            let label = if target.is_some() {
+                "refined"
+            } else {
+                "learned"
             };
-            if done {
-                let label = if target.is_some() {
-                    "refined"
-                } else {
-                    "learned"
-                };
-                let display_name = target.map(|(key, _)| key).unwrap_or(&sk.name);
-                tui::emit_line(
-                    &style(format!(
-                        "{}{label} skill '{display_name}' — /skills to view",
-                        icons::g(icons::learned()),
-                    ))
-                    .color256(splash::ACCENT)
-                    .to_string(),
-                );
-            }
+            let name = target.map(|(key, _)| key).unwrap_or(&proposal.name);
+            tui::emit_line(
+                &style(format!(
+                    "{}{label} skill '{name}' — /skills to view",
+                    icons::g(icons::learned())
+                ))
+                .color256(splash::ACCENT)
+                .to_string(),
+            );
         }
-    }
-
-    let n_new = report.added.len();
-    let n_conf = report.confirmed.len() + confirmed_by_use;
-    let n_queue = report.queued_review.len();
-    if n_new > 0 || n_conf > 0 || n_queue > 0 {
-        let mut parts: Vec<String> = Vec::new();
-        if n_new > 0 {
-            parts.push(format!("remembered {n_new}"));
-        }
-        if n_conf > 0 {
-            parts.push(format!("confirmed {n_conf}"));
-        }
-        if n_queue > 0 {
-            parts.push(format!("{n_queue} to review"));
-        }
-        tui::emit_line(
-            &style(format!(
-                "{}{} — /memory to view",
-                icons::g(icons::learned()),
-                parts.join(", ")
-            ))
-            .color256(splash::ACCENT)
-            .dim()
-            .to_string(),
-        );
     }
 }
 
@@ -299,121 +208,32 @@ fn auto_learn_skill_target<'a>(
     when: &str,
     steps: &str,
 ) -> Option<(&'a str, bool)> {
-    use crate::memory::learning::match_text;
-    let slug = skill::sanitize_name(name);
-    if let Some(existing) = skills.iter().find(|s| s.key() == slug) {
-        return Some((existing.key(), true));
-    }
-    skills
+    use crate::persona::secretary;
+    let views: Vec<_> = skills
         .iter()
-        .find(|s| {
-            // Both trigger AND body must resemble — trigger alone would merge skills that fire in
-            // the same situation but do different things.
-            match_text::match_similarity(when, &s.when) >= 0.45
-                && match_text::match_similarity(steps, &s.body) >= 0.35
+        .map(|skill| secretary::SkillView {
+            key: skill.key(),
+            when: &skill.when,
+            steps: &skill.body,
         })
-        .map(|s| (s.key(), false))
+        .collect();
+    secretary::auto_learn_skill_target(&views, &skill::sanitize_name(name), when, steps)
 }
 
 /// Did this turn RECOVER from a dead end — a tool result errored, then a LATER tool result in the
 /// same turn succeeded? That recovery is a hard-won procedure worth distilling even on a short turn.
 /// Tool errors are fed back as result strings starting with `error:` (the loop's convention).
 pub(crate) fn turn_recovered_from_dead_end(turn: &[Message]) -> bool {
-    let mut saw_error = false;
-    for m in turn.iter().filter(|m| m.role == "tool") {
-        let is_err = m
-            .content
-            .as_deref()
-            .unwrap_or("")
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("error:");
-        if is_err {
-            saw_error = true;
-        } else if saw_error {
-            return true; // a success after an earlier error → the agent worked through a dead end
-        }
-    }
-    false
+    crate::core::turn_signals::recovered_from_dead_end(
+        turn.iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content.as_deref().unwrap_or("")),
+    )
 }
 
-/// One stable session id for the whole REPL process, so per-turn auto-learn reinforces facts
-/// across turns of ONE session (not a fresh "session" each turn, which would over-count
-/// `session_count` and wrongly accelerate review/promotion).
-fn repl_session_id() -> &'static str {
-    use std::sync::OnceLock;
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(crate::memory::learning::default_session_id)
-}
-
+/// The Core settings flag controls only persistent provider learning, never Skills or Persona.
 pub(crate) fn memory_auto_learn_enabled() -> bool {
     cli_config::load().memory_auto_learn.unwrap_or(true)
-}
-
-/// After a completed turn: passively learn durable user/project facts from the user's last message.
-/// FREE — regex extraction, no model call — through the SAME pipeline as `aizen memory learn`
-/// (sanitize-to-fact → write-time threat-scan → confidence-route → consolidate → store, with
-/// anti-bloat). Core promotion stays human-gated (`auto_confirm_core = Some(false)`): a would-be
-/// core fact is downgraded to a normal store entry and NEVER silently mutates the always-on frozen
-/// prefix (prefix-cache byte-stability is sacred). Best-effort + visible; never disrupts the REPL.
-pub(crate) fn maybe_learn_memory(history: &[Message]) {
-    use crate::memory::learning::{self, LearnOptions};
-    if !memory_auto_learn_enabled() {
-        return;
-    }
-    let user_text = match history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.content.clone())
-    {
-        Some(t) => t,
-        None => return,
-    };
-    if user_text.trim().is_empty() {
-        return;
-    }
-    // If THIS turn authored a character (the `persona_create` tool fired), the user's message was
-    // describing a FICTIONAL persona, not stating their own preferences — mining it would leak a
-    // `persona-…` "fact" into user memory. Skip learning for the whole turn. (The regex intent-gate
-    // inside `ingest` is the first, heuristic line of defense; this fact-based gate catches phrasings
-    // it misses. Lives as a unit-tested helper so this loop can't silently drop it in a refactor.)
-    if learning::turn_authored_persona(history) {
-        return;
-    }
-    let opts = LearnOptions {
-        session_id: repl_session_id().to_string(),
-        auto_confirm_core: Some(false), // never auto-mutate the frozen core; downgrade to store
-        dry_run: false,
-    };
-    let report = match learning::ingest(&user_text, &opts) {
-        Ok(r) => r,
-        Err(_) => return, // best-effort; never disrupt the REPL
-    };
-    let n_durable = report.added.len() + report.reinforced.len();
-    let n_session = report.session_notes.len();
-    if n_durable > 0 {
-        tui::emit_line(
-            &style(format!(
-                "{}remembered {n_durable} fact{} — /memory to view",
-                icons::g(icons::learned()),
-                if n_durable == 1 { "" } else { "s" }
-            ))
-            .color256(splash::ACCENT)
-            .dim()
-            .to_string(),
-        );
-    } else if n_session > 0 {
-        // Inferred → session working memory only (not durable). Quiet, dim.
-        tui::emit_line(
-            &style(format!(
-                "{}noted {n_session} for this session (not saved permanently)",
-                icons::g(icons::learned()),
-            ))
-            .dim()
-            .to_string(),
-        );
-    }
 }
 
 /// After a completed turn: if a persona is active, distill its accumulated episodes into durable
@@ -512,7 +332,7 @@ pub(crate) fn render_transcript(msgs: &[Message]) -> String {
 }
 
 /// Summarize older turns to free context. Thin wrapper over [`agent::compact::compact_history`] that
-/// supplies a NON-streaming summarize closure over this session's endpoint. Returns
+/// supplies the shared bounded, NON-streaming summarizer for this session's route. Returns
 /// (tokens_before, tokens_after). Same core the agent loop uses, so the REPL and `aizen serve` compact
 /// identically.
 pub(crate) async fn compact_history(
@@ -525,14 +345,13 @@ pub(crate) async fn compact_history(
     let sum_ep = summarizer_endpoint(base, key, model);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
-        async move {
-            chore_chat(http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[])
-                .await
-                .map(|t| t.content.unwrap_or_default())
-        }
+        async move { crate::llm::compact_summary::summarize(http, &ep, msgs).await }
     };
-    let out = agent::compact::compact_history(history, summarize, COMPACT_KEEP_TURNS).await;
+    // The shared core strips recall before the model call; keep manual failures transactional too.
+    let mut staged = history.clone();
+    let out = agent::compact::compact_history(&mut staged, summarize, COMPACT_KEEP_TURNS).await;
     if out.is_ok() {
+        *history = staged;
         // The recorded real context size predates the cut — let the estimate carry the meter until
         // the next model call reports usage for the compacted history.
         tui::clear_ctx_real_tokens();
@@ -540,11 +359,55 @@ pub(crate) async fn compact_history(
     out
 }
 
-/// `/compact` — resolve the endpoint, then summarize older turns now (manual compaction).
-pub(crate) async fn compact_now(history: &mut Vec<Message>) -> Result<(usize, usize)> {
+/// Commit a manual compact before reporting success: other clients can only resume disk history.
+async fn compact_live_with<F, Fut>(
+    history: &mut Vec<Message>,
+    model: &str,
+    design: Option<&crate::agent::design::TaskDesignState>,
+    compact: F,
+) -> Result<(usize, usize)>
+where
+    F: FnOnce(Vec<Message>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<Message>, (usize, usize))>>,
+{
+    use crate::core::session_store;
+    let saved = session_store::current_session_slug()
+        .map(|slug| {
+            session_store::read_session_for_edit(&slug)
+                .map(|((_, meta, _), revision)| (slug, meta.unwrap_or_default(), revision))
+        })
+        .transpose()?;
+    // Allocate from the original first turn, not the tail that survives compaction.
+    let name = saved
+        .as_ref()
+        .map(|(slug, _, _)| slug.clone())
+        .unwrap_or_else(|| session_store::allocate_session_slug(history));
+    let (staged, counts) = compact(history.clone()).await?;
+    if let Some((_, meta, revision)) = saved {
+        session_store::write_session_if_unchanged(&staged, &name, meta, design, &revision)?;
+    } else {
+        session_store::save_session_with_design(&staged, &name, Some(model), design)?;
+    }
+    *history = staged;
+    session_store::set_session_slug(Some(name));
+    session_store::update_live_history_with_design(history, design);
+    tui::clear_ctx_real_tokens();
+    Ok(counts)
+}
+
+/// `/compact` — summarize, then durably replace the same saved session before returning success.
+pub(crate) async fn compact_now(
+    history: &mut Vec<Message>,
+    model_label: &str,
+    design: Option<&crate::agent::design::TaskDesignState>,
+) -> Result<(usize, usize)> {
     let (base, key, model) = resolve_endpoint(None, None, None)?;
     let http = http_client()?;
-    compact_history(history, &http, &base, &key, &model).await
+    compact_live_with(history, model_label, design, |mut staged| async move {
+        let counts = compact_history(&mut staged, &http, &base, &key, &model).await?;
+        Ok((staged, counts))
+    })
+    .await
 }
 
 /// `/clear` carry-over — distill the WHOLE current conversation into one dense seed note (routed
@@ -571,6 +434,115 @@ pub(crate) async fn refresh_distill_now(history: &[Message]) -> Result<String> {
 }
 
 #[cfg(test)]
+mod compact_persistence_tests {
+    use super::*;
+    use crate::core::{config::EnvGuard, session_store::*};
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "isolated session home and replay state across compact"
+    )]
+    async fn manual_compact_is_durable_before_success_and_transactional_on_failure() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tape = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "aizen-live-compact-{}-{}",
+            std::process::id(),
+            crate::core::persist::unique_sequence()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let env = EnvGuard::set([
+            ("AIZEN_HOME", root.as_os_str()),
+            ("AIZEN_PROJECT_ROOT", root.as_os_str()),
+        ]);
+        let previous = current_session_slug();
+        let mut history = vec![Message::system("fixture instructions")];
+        for i in 0..6 {
+            history.push(Message::user(format!(
+                "Original topic {i}: {}",
+                "older detail ".repeat(80)
+            )));
+            history.push(Message::assistant(format!("Answer {i}")));
+        }
+        save_session(&history, "same-session", Some("historical-model")).unwrap();
+        set_session_slug(Some("same-session".into()));
+        let path = sessions_dir().join("same-session.json");
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let counts = compact_live_with(
+            &mut history,
+            "current-model",
+            None,
+            |mut staged| async move {
+                let counts = agent::compact::compact_history(
+                    &mut staged,
+                    |_| async { Ok("Saved compact summary".into()) },
+                    COMPACT_KEEP_TURNS,
+                )
+                .await?;
+                Ok((staged, counts))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(counts.0 > counts.1);
+        assert_eq!(current_session_slug().as_deref(), Some("same-session"));
+        let (saved, meta, _) = read_session_path_with_design(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+        assert!(saved.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|s| s.contains("Saved compact summary"))));
+        assert_eq!(meta.unwrap().model.as_deref(), Some("historical-model"));
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_ne!(before["generation"], after["generation"]);
+        assert_eq!(before["meta"]["created"], after["meta"]["created"]);
+
+        let unchanged = serde_json::to_value(&history).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let error = compact_live_with(&mut history, "current-model", None, |_| async {
+            anyhow::bail!("summary failed")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("summary failed"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(serde_json::to_value(&history).unwrap(), unchanged);
+
+        let conflict = compact_live_with(&mut history, "current-model", None, |staged| async {
+            save_session(
+                &[Message::user("concurrent writer")],
+                "same-session",
+                Some("other"),
+            )
+            .unwrap();
+            Ok((staged, (1000, 100)))
+        })
+        .await;
+        assert!(
+            conflict.is_err(),
+            "do not overwrite an external save during summarization"
+        );
+        assert_eq!(serde_json::to_value(&history).unwrap(), unchanged);
+        let (disk, _, _) = read_session_path_with_design(&path).unwrap();
+        assert_eq!(disk[0].content.as_deref(), Some("concurrent writer"));
+
+        set_session_slug(previous);
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
 mod learning_tests {
     use super::*;
 
@@ -587,6 +559,35 @@ mod learning_tests {
         assert_eq!(t[0].content.as_deref(), Some("two"));
         assert!(last_turn_slice(&[]).is_empty());
         assert!(last_turn_slice(&[Message::assistant("x".to_string())]).is_empty());
+    }
+
+    #[test]
+    fn logical_turn_keeps_synthetic_continuations_until_the_next_real_user() {
+        let mut user = Message::user("Remember that this project uses Cargo.");
+        user.user_turn_id = Some(types::UserTurnId::new().unwrap());
+        let mut history = vec![
+            Message::user("legacy turn"),
+            user,
+            Message::assistant("Working on it."),
+            Message::user("Internal continuation, not a new user request."),
+            Message::assistant("Done."),
+        ];
+        let turn = last_turn_slice(&history);
+        assert_eq!(turn.len(), 4);
+        assert_eq!(
+            turn[0].content.as_deref(),
+            Some("Remember that this project uses Cargo.")
+        );
+        assert!(turn[0].user_turn_id.is_some());
+        assert!(turn[2].user_turn_id.is_none());
+        let mut next = Message::user("New real request.");
+        next.user_turn_id = Some(types::UserTurnId::new().unwrap());
+        history.push(next);
+        assert_eq!(last_turn_slice(&history).len(), 1);
+        assert_eq!(
+            last_turn_slice(&history)[0].content.as_deref(),
+            Some("New real request.")
+        );
     }
 
     #[test]

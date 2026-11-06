@@ -5939,7 +5939,7 @@ fn restore_in_reported_checked(
         if let Err(apply_error) = apply_staged(ctx, &staged, &target.commit) {
             return Err(rollback(apply_error));
         }
-        let (actual, _) = current_tree(ctx).map_err(&rollback)?;
+        let (actual, _) = current_tree(ctx).map_err(rollback)?;
         if actual != target.tree {
             return Err(rollback(anyhow::anyhow!("restore verification failed")));
         }
