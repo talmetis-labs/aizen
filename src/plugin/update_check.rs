@@ -150,8 +150,9 @@ fn present(
             unavailable_reason: cache
                 .and_then(|c| c.unavailable_reason.clone())
                 .or_else(|| {
-                    Some("No fresh Mnemos update check is available".into())
-                        .filter(|_| cache.is_none())
+                    cache
+                        .is_none()
+                        .then(|| "No fresh Mnemos update check is available".into())
                 }),
             discovery: cache.map_or("incomplete", |c| c.discovery.as_str()).into(),
         },
@@ -321,101 +322,113 @@ mod tests {
             discovery: "complete".into(),
         }
     }
-    #[tokio::test(flavor = "current_thread")]
-    async fn absent_cached_and_opted_out_checks_never_request_or_create_cache() {
+    #[test]
+    fn absent_cached_and_opted_out_checks_never_request_or_create_cache() {
         if manager::host_target().is_err() {
             return;
         }
         let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = TestDir::new();
-        let home = root.path().join("home");
-        let _env = EnvGuard::set([
-            ("AIZEN_HOME", home.as_path()),
-            ("HOME", root.path()),
-            ("USERPROFILE", root.path()),
-            ("AIZEN_NO_UPDATE_CHECK", std::path::Path::new("1")),
-        ]);
-        for mode in [Mode::Cached, Mode::Automatic, Mode::Force] {
-            let result = status_with(mode, || async {
-                panic!("absent Mnemos must not request discovery")
-            })
-            .await
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-            assert!(result.release.installed.is_none());
-        }
-        assert!(!home.exists());
-        install_fixture(root.path());
-        for mode in [Mode::Cached, Mode::Automatic] {
-            let result = status_with(mode, || async {
-                panic!("offline/opt-out must not request discovery")
-            })
-            .await
-            .unwrap();
-            assert!(result.release.installed.unwrap().verified);
-        }
-        assert!(!path().exists());
-        let forced = status_with(Mode::Force, || async { Ok(discovered()) })
-            .await
-            .unwrap();
-        assert_eq!(forced.cache, "network");
-        assert!(!forced.stale);
-        assert!(path().exists());
-        assert!(!manager::transaction_marker().exists());
-        assert!(!manager::default_data_root("mnemos").unwrap().exists());
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn ttl_failure_backoff_and_inflight_lock_share_discovery_without_provider_work() {
-        if manager::host_target().is_err() {
-            return;
-        }
-        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = TestDir::new();
-        let home = root.path().join("home");
-        let _env = EnvGuard::set([
-            ("AIZEN_HOME", home.as_path()),
-            ("HOME", root.path()),
-            ("USERPROFILE", root.path()),
-            ("AIZEN_NO_UPDATE_CHECK", std::path::Path::new("0")),
-        ]);
-        install_fixture(root.path());
-        let first = status_with(Mode::Automatic, || async { Ok(discovered()) })
-            .await
-            .unwrap();
-        assert_eq!(first.cache, "network");
-        assert!(!first.stale);
-        let cached = status_with(Mode::Automatic, || async {
-            panic!("fresh negative result has a one-day TTL")
-        })
-        .await
-        .unwrap();
-        assert_eq!(cached.cache, "cached");
-        assert!(!cached.stale);
-        let failed = status_with(Mode::Force, || async {
-            Err(releases::fail("network_error", "synthetic failure"))
-        })
-        .await
-        .unwrap();
-        assert!(failed.stale && failed.error.is_some());
-        assert_eq!(failed.checked_unix, first.checked_unix);
-        let backed_off = status_with(Mode::Automatic, || async {
-            panic!("failed automatic checks must back off")
-        })
-        .await
-        .unwrap();
-        assert!(backed_off.stale);
-        let lock_path = crate::core::workspace_txn::store_lock("mnemos-updates", "check");
-        let _check_lock =
-            crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&lock_path, Duration::ZERO)
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let home = root.path().join("home");
+            let _env = EnvGuard::set([
+                ("AIZEN_HOME", home.as_path()),
+                ("HOME", root.path()),
+                ("USERPROFILE", root.path()),
+                ("AIZEN_NO_UPDATE_CHECK", std::path::Path::new("1")),
+            ]);
+            for mode in [Mode::Cached, Mode::Automatic, Mode::Force] {
+                let result = status_with(mode, || async {
+                    panic!("absent Mnemos must not request discovery")
+                })
+                .await
                 .unwrap();
-        let pending = status_with(Mode::Force, || async {
-            panic!("another owner already checks discovery")
-        })
-        .await
-        .unwrap();
-        assert!(pending.pending && pending.stale);
-        assert_eq!(pending.cache, "cached");
-        assert!(!manager::transaction_marker().exists());
-        assert!(!manager::default_data_root("mnemos").unwrap().exists());
+                assert!(result.release.installed.is_none());
+            }
+            assert!(!home.exists());
+            install_fixture(root.path());
+            for mode in [Mode::Cached, Mode::Automatic] {
+                let result = status_with(mode, || async {
+                    panic!("offline/opt-out must not request discovery")
+                })
+                .await
+                .unwrap();
+                assert!(result.release.installed.unwrap().verified);
+            }
+            assert!(!path().exists());
+            let forced = status_with(Mode::Force, || async { Ok(discovered()) })
+                .await
+                .unwrap();
+            assert_eq!(forced.cache, "network");
+            assert!(!forced.stale);
+            assert!(path().exists());
+            assert!(!manager::transaction_marker().exists());
+            assert!(!manager::default_data_root("mnemos").unwrap().exists());
+        });
+    }
+    #[test]
+    fn ttl_failure_backoff_and_inflight_lock_share_discovery_without_provider_work() {
+        if manager::host_target().is_err() {
+            return;
+        }
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let home = root.path().join("home");
+            let _env = EnvGuard::set([
+                ("AIZEN_HOME", home.as_path()),
+                ("HOME", root.path()),
+                ("USERPROFILE", root.path()),
+                ("AIZEN_NO_UPDATE_CHECK", std::path::Path::new("0")),
+            ]);
+            install_fixture(root.path());
+            let first = status_with(Mode::Automatic, || async { Ok(discovered()) })
+                .await
+                .unwrap();
+            assert_eq!(first.cache, "network");
+            assert!(!first.stale);
+            let cached = status_with(Mode::Automatic, || async {
+                panic!("fresh negative result has a one-day TTL")
+            })
+            .await
+            .unwrap();
+            assert_eq!(cached.cache, "cached");
+            assert!(!cached.stale);
+            let failed = status_with(Mode::Force, || async {
+                Err(releases::fail("network_error", "synthetic failure"))
+            })
+            .await
+            .unwrap();
+            assert!(failed.stale && failed.error.is_some());
+            assert_eq!(failed.checked_unix, first.checked_unix);
+            let backed_off = status_with(Mode::Automatic, || async {
+                panic!("failed automatic checks must back off")
+            })
+            .await
+            .unwrap();
+            assert!(backed_off.stale);
+            let lock_path = crate::core::workspace_txn::store_lock("mnemos-updates", "check");
+            let _check_lock =
+                crate::core::repo_lock::RepoTxnLock::acquire_exclusive(&lock_path, Duration::ZERO)
+                    .unwrap();
+            let pending = status_with(Mode::Force, || async {
+                panic!("another owner already checks discovery")
+            })
+            .await
+            .unwrap();
+            assert!(pending.pending && pending.stale);
+            assert_eq!(pending.cache, "cached");
+            assert!(!manager::transaction_marker().exists());
+            assert!(!manager::default_data_root("mnemos").unwrap().exists());
+        });
     }
     #[test]
     fn startup_notice_uses_fresh_pinned_manifest_and_never_needs_provider_data() {

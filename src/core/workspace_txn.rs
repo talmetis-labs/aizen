@@ -2196,7 +2196,9 @@ mod tests {
                 reader
                     .join()
                     .map_err(|_| anyhow::anyhow!("child stdout reader panicked"))?;
-                drop(containment);
+                {
+                    let _containment = containment;
+                }
                 anyhow::ensure!(
                     status.success(),
                     "native helper {mode} failed: {status}; stdout: {output}; checks: {checks:?}"

@@ -654,7 +654,7 @@ async fn discover<S: Source>(
     if !complete {
         return Ok((highest, None, false));
     }
-    eligible.sort_by(|a, b| b.0.cmp(&a.0));
+    eligible.sort_by_key(|(order, _)| std::cmp::Reverse(*order));
     let selected = match eligible.first() {
         Some((_, release)) => Some(candidate(source, release, target).await?),
         None => None,

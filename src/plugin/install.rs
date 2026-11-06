@@ -976,7 +976,7 @@ fn finish_prepared(
             path: MANIFEST_NAME.to_string(),
             bytes: bytes.len() as u64,
             sha256: manifest::sha256(bytes),
-            unix_mode: Some(0o600).filter(|_| cfg!(unix)),
+            unix_mode: cfg!(unix).then_some(0o600),
         },
         files,
     };

@@ -663,7 +663,7 @@ pub fn base64_encode(input: &[u8]) -> String {
 pub fn base64_decode_bounded(data: &str, max: usize) -> Result<Vec<u8>> {
     let size = base64_decoded_len(data, max)?;
     let mut out = Vec::with_capacity(size);
-    for c in data.as_bytes().chunks_exact(4) {
+    for c in data.as_bytes().as_chunks::<4>().0 {
         let a = sextet(c[0]).unwrap();
         let b = sextet(c[1]).unwrap();
         let d = sextet(c[2]).unwrap_or(0);

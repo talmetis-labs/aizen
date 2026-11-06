@@ -83,63 +83,70 @@ fn client_local_install_is_offline_expected_identity_and_never_activates() {
     assert_eq!(manager::read_state().unwrap(), state);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn management_stale_preflight_has_no_dispatch_and_outcome_marker_is_read_only() {
+#[test]
+fn management_stale_preflight_has_no_dispatch_and_outcome_marker_is_read_only() {
     let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TestDir::new();
-    let home = root.path().join("home");
-    let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
-    let current = current(root.path());
-    let mut stale = current.clone();
-    stale.generation += 1;
-    let command = rich::Manage {
-        filter: rich::Filter::default(),
-        expected_snapshot: "viewed".into(),
-        action: rich::Action::Worklist,
-    };
-    let error = rich_request(
-        root.path().to_str().unwrap(),
-        &stale,
-        None,
-        Some(("op", &command)),
-        "request",
-    )
-    .await
-    .unwrap_err();
-    let response =
-        serde_json::to_value(failure("request".into(), error, "request_failed")).unwrap();
-    assert_eq!(response["error"]["effects"], "not_dispatched");
-    assert_eq!(response["error"]["code"], "stale");
-    assert!(!home.exists());
-    let marker = manager::transaction_marker();
-    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    let bytes =
-        serde_json::to_vec(&json!({"operation_id":"op","provider":null,"generation":0})).unwrap();
-    std::fs::write(&marker, &bytes).unwrap();
-    let outcome = rich_request(
-        root.path().to_str().unwrap(),
-        &current,
-        Some(&rich::Inspect::Outcome {
-            operation_id: "op".into(),
-        }),
-        None,
-        "outcome",
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome["result"]["status"], "recovery_required");
-    assert_eq!(std::fs::read(&marker).unwrap(), bytes);
-    assert!(rich_request(
-        root.path().to_str().unwrap(),
-        &current,
-        Some(&rich::Inspect::Outcome {
-            operation_id: "foreign".into()
-        }),
-        None,
-        "outcome"
-    )
-    .await
-    .is_err());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = TestDir::new();
+        let home = root.path().join("home");
+        let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
+        let current = current(root.path());
+        let mut stale = current.clone();
+        stale.generation += 1;
+        let command = rich::Manage {
+            filter: rich::Filter::default(),
+            expected_snapshot: "viewed".into(),
+            action: rich::Action::Worklist,
+        };
+        let error = rich_request(
+            root.path().to_str().unwrap(),
+            &stale,
+            None,
+            Some(("op", &command)),
+            "request",
+        )
+        .await
+        .unwrap_err();
+        let response =
+            serde_json::to_value(failure("request".into(), error, "request_failed")).unwrap();
+        assert_eq!(response["error"]["effects"], "not_dispatched");
+        assert_eq!(response["error"]["code"], "stale");
+        assert!(!home.exists());
+        let marker = manager::transaction_marker();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let bytes =
+            serde_json::to_vec(&json!({"operation_id":"op","provider":null,"generation":0}))
+                .unwrap();
+        std::fs::write(&marker, &bytes).unwrap();
+        let outcome = rich_request(
+            root.path().to_str().unwrap(),
+            &current,
+            Some(&rich::Inspect::Outcome {
+                operation_id: "op".into(),
+            }),
+            None,
+            "outcome",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome["result"]["status"], "recovery_required");
+        assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+        assert!(rich_request(
+            root.path().to_str().unwrap(),
+            &current,
+            Some(&rich::Inspect::Outcome {
+                operation_id: "foreign".into()
+            }),
+            None,
+            "outcome"
+        )
+        .await
+        .is_err());
+    });
 }
 
 fn wire(action: Value) -> Value {
@@ -205,66 +212,78 @@ fn release_install_requires_strict_candidate_and_explicit_confirmation() {
     assert!(parse(&serde_json::to_vec(&url).unwrap()).is_err());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn release_stale_and_unconfirmed_preflight_never_network_or_create_home() {
+#[test]
+fn release_stale_and_unconfirmed_preflight_never_network_or_create_home() {
     let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TestDir::new();
-    let home = root.path().join("release-home");
-    let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
-    let expected = current(root.path());
-    let mut stale = expected.clone();
-    stale.generation += 1;
-    let workspace = root.path().to_str().unwrap();
-    assert!(release_check(workspace, &stale).await.is_err());
-    assert!(
-        release_install(workspace, &stale, &release_candidate(), true)
-            .await
-            .is_err()
-    );
-    assert!(
-        release_install(workspace, &expected, &release_candidate(), false)
-            .await
-            .is_err()
-    );
-    assert!(!home.exists(), "rejected release action initialized home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = TestDir::new();
+        let home = root.path().join("release-home");
+        let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
+        let expected = current(root.path());
+        let mut stale = expected.clone();
+        stale.generation += 1;
+        let workspace = root.path().to_str().unwrap();
+        assert!(release_check(workspace, &stale).await.is_err());
+        assert!(
+            release_install(workspace, &stale, &release_candidate(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            release_install(workspace, &expected, &release_candidate(), false)
+                .await
+                .is_err()
+        );
+        assert!(!home.exists(), "rejected release action initialized home");
+    });
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn update_status_modes_are_negotiated_and_absent_package_is_offline() {
+#[test]
+fn update_status_modes_are_negotiated_and_absent_package_is_offline() {
     let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TestDir::new();
-    let home = root.path().join("update-home");
-    let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
-    let expected = current(root.path());
-    for mode in ["cached", "automatic", "force"] {
-        let request = wire(json!({"type":"update_status","binding":expected,"mode":mode}));
-        assert!(parse(&serde_json::to_vec(&request).unwrap()).is_ok());
-    }
-    let bad = wire(json!({"type":"update_status","binding":expected,"mode":"install"}));
-    assert!(parse(&serde_json::to_vec(&bad).unwrap()).is_err());
-    if manager::host_target().is_ok() {
-        for mode in [
-            super::super::update_check::Mode::Cached,
-            super::super::update_check::Mode::Automatic,
-            super::super::update_check::Mode::Force,
-        ] {
-            let status = update_status(root.path().to_str().unwrap(), &expected, mode)
-                .await
-                .unwrap();
-            assert!(status["update"]["release"]["installed"].is_null());
-            assert_eq!(status["update"]["cache"], "empty");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = TestDir::new();
+        let home = root.path().join("update-home");
+        let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
+        let expected = current(root.path());
+        for mode in ["cached", "automatic", "force"] {
+            let request = wire(json!({"type":"update_status","binding":expected,"mode":mode}));
+            assert!(parse(&serde_json::to_vec(&request).unwrap()).is_ok());
         }
-    }
-    let mut stale = expected;
-    stale.generation += 1;
-    assert!(update_status(
-        root.path().to_str().unwrap(),
-        &stale,
-        super::super::update_check::Mode::Force
-    )
-    .await
-    .is_err());
-    assert!(!home.exists(), "absent package check initialized HOME");
+        let bad = wire(json!({"type":"update_status","binding":expected,"mode":"install"}));
+        assert!(parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        if manager::host_target().is_ok() {
+            for mode in [
+                super::super::update_check::Mode::Cached,
+                super::super::update_check::Mode::Automatic,
+                super::super::update_check::Mode::Force,
+            ] {
+                let status = update_status(root.path().to_str().unwrap(), &expected, mode)
+                    .await
+                    .unwrap();
+                assert!(status["update"]["release"]["installed"].is_null());
+                assert_eq!(status["update"]["cache"], "empty");
+            }
+        }
+        let mut stale = expected;
+        stale.generation += 1;
+        assert!(update_status(
+            root.path().to_str().unwrap(),
+            &stale,
+            super::super::update_check::Mode::Force
+        )
+        .await
+        .is_err());
+        assert!(!home.exists(), "absent package check initialized HOME");
+    });
 }
 
 #[test]
@@ -579,30 +598,36 @@ fn recovery_and_busy_never_partially_apply_reviewed_settings() {
     assert!(!crate::core::cli_config::config_path().exists());
 }
 
-#[tokio::test]
-async fn stale_reads_are_rejected_before_context_device_or_launch() {
+#[test]
+fn stale_reads_are_rejected_before_context_device_or_launch() {
     let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let root = TestDir::new();
-    let home = root.path().join("home");
-    let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
-    let mut expected = current(root.path());
-    expected.generation += 1;
-    let response = execute(Request {
-        version: 1,
-        request_id: "read-1".into(),
-        workspace: root.path().to_str().unwrap().into(),
-        action: Action::Read {
-            binding: expected,
-            query: Query::List {
-                scope: api::Scope::Project,
-                limit: 10,
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = TestDir::new();
+        let home = root.path().join("home");
+        let _env = EnvGuard::set([("AIZEN_HOME", home.as_path())]);
+        let mut expected = current(root.path());
+        expected.generation += 1;
+        let response = execute(Request {
+            version: 1,
+            request_id: "read-1".into(),
+            workspace: root.path().to_str().unwrap().into(),
+            action: Action::Read {
+                binding: expected,
+                query: Query::List {
+                    scope: api::Scope::Project,
+                    limit: 10,
+                },
             },
-        },
-    })
-    .await;
-    assert!(!response.ok);
-    assert_eq!(response.error.unwrap().code, "stale");
-    assert!(!home.exists());
+        })
+        .await;
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "stale");
+        assert!(!home.exists());
+    });
 }
 
 #[test]

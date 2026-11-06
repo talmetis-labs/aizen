@@ -2363,8 +2363,8 @@ fn workflow_fingerprint(spec: &WorkflowSpec) -> Result<u64> {
         .iter()
         .map(|task| {
             serde_json::json!({"task": task,
-            "routing": task.prepared.as_deref().map(&dispatch),
-            "recovery_routing": task.prepared_metis.as_deref().map(&dispatch)})
+            "routing": task.prepared.as_deref().map(dispatch),
+            "recovery_routing": task.prepared_metis.as_deref().map(dispatch)})
         })
         .collect();
     let synthesis = spec.prepared_synthesis.as_ref().map(|s| {

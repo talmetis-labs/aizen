@@ -357,7 +357,7 @@ pub fn fs_policy(workspace: &Path, tmp: Option<&Path>, s: &SandboxSettings) -> F
 /// The credential/persistence surfaces a child must never read, workspace aside. Used by macOS
 /// deny rules, by the guarded backend's advisory report, and by doctor's adversarial self-tests.
 pub fn credential_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut v = vec![
+    let v = vec![
         home.join(".aizen"),
         home.join(".ssh"),
         home.join(".aws"),
@@ -374,6 +374,8 @@ pub fn credential_dirs(home: &Path) -> Vec<PathBuf> {
         home.join(".config").join("google-chrome"),
         home.join(".config").join("chromium"),
     ];
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut v = v;
     #[cfg(windows)]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {

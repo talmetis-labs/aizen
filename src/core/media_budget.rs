@@ -75,7 +75,7 @@ impl MediaBudget {
             .ok_or_else(|| anyhow::anyhow!("image request memory budget busy or exceeded; reduce selected images or retry after active image work completes"))?;
         let previous = self
             .reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= crate::llm::image_send::IMAGE_MEMORY_BUDGET)
             })
@@ -96,7 +96,7 @@ impl MediaBudget {
             (&self.image_uri_bytes, image_uri_bytes),
             (&self.images, images),
         ] {
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(old.saturating_add(value))
             });
         }

@@ -101,12 +101,14 @@ pub fn harden(mut cmd: std::process::Command) -> std::process::Command {
 
 /// Apply `CREATE_NO_WINDOW` on Windows; a pass-through elsewhere. Centralizes the flag so every
 /// git spawn in this module (including the `--version` probe) gets it.
-fn no_window(mut cmd: std::process::Command) -> std::process::Command {
+fn no_window(cmd: std::process::Command) -> std::process::Command {
     #[cfg(windows)]
-    {
+    let cmd = {
         use std::os::windows::process::CommandExt;
+        let mut cmd = cmd;
         cmd.creation_flags(crate::core::proctree::CREATE_NO_WINDOW);
-    }
+        cmd
+    };
     cmd
 }
 

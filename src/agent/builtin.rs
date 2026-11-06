@@ -182,10 +182,7 @@ pub fn active_tool_surface() -> Option<Vec<String>> {
 /// Includes DEFERRED tool names: a deferred tool is callable once discovered through `tool_search`,
 /// so a skill that `requires:` one must not be hidden by the deferral.
 pub fn active_tool_names() -> Option<HashSet<String>> {
-    let mut set: HashSet<String> = match active_tool_surface() {
-        Some(v) => v.into_iter().collect(),
-        None => return None,
-    };
+    let mut set: HashSet<String> = active_tool_surface()?.into_iter().collect();
     if let Some((names, _)) = DEFERRED_TOOL_SURFACE
         .lock()
         .unwrap_or_else(|e| e.into_inner())

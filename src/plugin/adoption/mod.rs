@@ -100,7 +100,7 @@ pub(crate) async fn dispatch(request: &Request, workspace: &str, generation: u64
             operation_id: Some(id),
             ..
         } => Ok(View::Operation {
-            operation: store::public(store::load(id)?)?,
+            operation: Box::new(store::public(store::load(id)?)?),
         }),
         Request::Status {
             operation_id: None,
@@ -371,7 +371,7 @@ async fn execute(work: Work, workspace: PathBuf, generation: u64) -> Result<View
                     &crate::core::config::aizen_home(),
                 )?;
                 return Ok(View::Operation {
-                    operation: record.operation,
+                    operation: Box::new(record.operation),
                 });
             }
             if mode == Mode::Apply {
@@ -590,7 +590,7 @@ async fn execute(work: Work, workspace: PathBuf, generation: u64) -> Result<View
     }
     store::save(&record)?;
     Ok(View::Operation {
-        operation: record.operation,
+        operation: Box::new(record.operation),
     })
 }
 

@@ -20,11 +20,13 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
 /// Base64-encode (standard alphabet, padded). Hand-rolled (encode-only) to avoid a dependency.
+#[cfg(any(windows, target_os = "macos", test))]
 pub fn base64_encode(input: &[u8]) -> String {
     crate::core::tool_media::base64_encode(input)
 }
 
 /// Build a `data:<mime>;base64,<…>` URL.
+#[cfg(any(windows, target_os = "macos", test))]
 fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", base64_encode(bytes))
 }

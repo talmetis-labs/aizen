@@ -69,7 +69,7 @@ pub fn try_image_memory_lease(bytes: usize) -> Option<ImageMemoryLease> {
 }
 fn reserve_memory(bytes: usize) -> bool {
     IMAGE_MEMORY_USED
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes)
                 .filter(|n| *n <= IMAGE_MEMORY_BUDGET)
         })
@@ -566,7 +566,12 @@ pub(crate) fn source_png_dimensions(url: &str) -> Option<(u32, u32)> {
     let encoded = url.strip_prefix("data:image/png;base64,")?;
     let prefix = encoded.as_bytes().get(..44)?;
     let mut bytes = [0u8; 33];
-    for (group, out) in prefix.chunks_exact(4).zip(bytes.chunks_exact_mut(3)) {
+    for (group, out) in prefix
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(bytes.as_chunks_mut::<3>().0.iter_mut())
+    {
         let a = base64_sextet(group[0])?;
         let b = base64_sextet(group[1])?;
         let c = base64_sextet(group[2])?;
@@ -679,16 +684,16 @@ fn decode_pixels(
     let (pixels, color) = match frame.color_type {
         png::ColorType::Grayscale => (pixels, ExtendedColorType::L8),
         png::ColorType::Rgb => (pixels, ExtendedColorType::Rgb8),
-        png::ColorType::GrayscaleAlpha if pixels.chunks_exact(2).all(|p| p[1] == 255) => {
+        png::ColorType::GrayscaleAlpha if pixels.as_chunks::<2>().0.iter().all(|p| p[1] == 255) => {
             let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for pixel in pixels.chunks_exact(2) {
+            for pixel in pixels.as_chunks::<2>().0 {
                 rgb.extend_from_slice(&[pixel[0]; 3]);
             }
             (rgb, ExtendedColorType::Rgb8)
         }
-        png::ColorType::Rgba if pixels.chunks_exact(4).all(|p| p[3] == 255) => {
+        png::ColorType::Rgba if pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 255) => {
             let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for pixel in pixels.chunks_exact(4) {
+            for pixel in pixels.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&pixel[..3]);
             }
             (rgb, ExtendedColorType::Rgb8)
@@ -965,7 +970,7 @@ mod tests {
         let cache = Mutex::new(Cache::default());
         let mut rgba = vec![0; 640 * 480 * 4];
         let mut seed = 42u32;
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             for byte in &mut pixel[..3] {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;

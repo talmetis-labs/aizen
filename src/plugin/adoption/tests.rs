@@ -194,6 +194,22 @@ fn fake_record(home: &Path, envelope: &Path, id: &str, published: bool) -> store
     record
 }
 #[test]
+fn operation_view_keeps_the_existing_wire_shape() {
+    let fixture = crate::core::file_placement::tests::TestDir::new();
+    let record = fake_record(
+        &fixture.path().join("host"),
+        &fixture.path().join("operation"),
+        &"c".repeat(32),
+        false,
+    );
+    let expected = json!({"kind": "operation", "operation": &record.operation});
+    let view = View::Operation {
+        operation: Box::new(record.operation),
+    };
+    assert_eq!(serde_json::to_value(view).unwrap(), expected);
+}
+
+#[test]
 fn old_records_default_to_v1_and_failed_previews_do_not_rewrite_history() {
     let f = crate::core::file_placement::tests::TestDir::new();
     let home = f.path().join("host");

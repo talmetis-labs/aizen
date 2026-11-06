@@ -250,7 +250,7 @@ fn new_generation() -> u64 {
         .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(1);
     let old = SEQ
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |last| Some(now.max(last.saturating_add(1))),

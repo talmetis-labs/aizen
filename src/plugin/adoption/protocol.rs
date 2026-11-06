@@ -338,7 +338,7 @@ pub(crate) enum View {
         warnings: Vec<String>,
     },
     Operation {
-        operation: Operation,
+        operation: Box<Operation>,
     },
     History {
         operations: Vec<Operation>,

@@ -416,8 +416,9 @@ impl LinuxSandbox {
         }
     }
 
-    /// Whether any kernel mechanism is armed (drives the runner's backend label).
-    pub fn any_kernel(&self) -> bool {
+    /// Whether a test fixture armed at least one kernel mechanism.
+    #[cfg(test)]
+    fn any_kernel(&self) -> bool {
         self.ruleset.is_some() || self.seccomp.is_some()
     }
 

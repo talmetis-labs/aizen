@@ -541,21 +541,6 @@ impl Validate for RenderedEvidence {
 }
 
 impl RenderedEvidence {
-    pub fn validate_context(&self, provider_id: &str, context: &ProviderContext) -> Result<()> {
-        self.validate()?;
-        if self.provider_id != provider_id
-            || self.generation != context.generation
-            || self.user_id != context.user_id
-            || self.workspace_id != context.workspace_id
-            || self.session_id != context.session_id
-            || self.turn_id != context.turn_id
-            || self.boundary_id != context.boundary_id
-        {
-            return Err(MemoryError::invalid("rendered evidence context mismatch"));
-        }
-        Ok(())
-    }
-
     pub fn validate_used(&self, used: &[String]) -> Result<()> {
         let valid = self
             .facts
@@ -574,80 +559,6 @@ impl RenderedEvidence {
             }
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct UseFeedback {
-    pub exposed: Vec<String>,
-    pub useful: Vec<String>,
-    pub already_useful: Vec<String>,
-}
-
-impl Validate for UseFeedback {
-    fn validate(&self) -> Result<()> {
-        for ids in [&self.exposed, &self.useful, &self.already_useful] {
-            if ids.len() > 64 || ids.iter().any(|id| opaque_id(id).is_err()) {
-                return Err(MemoryError::invalid("invalid useful-use receipt"));
-            }
-            let unique = ids.iter().collect::<BTreeSet<_>>();
-            if unique.len() != ids.len() {
-                return Err(MemoryError::invalid("duplicate useful-use receipt"));
-            }
-        }
-        if self
-            .useful
-            .iter()
-            .any(|id| self.already_useful.contains(id))
-        {
-            return Err(MemoryError::invalid("contradictory useful-use receipt"));
-        }
-        let exposed = self.exposed.iter().collect::<BTreeSet<_>>();
-        if self
-            .useful
-            .iter()
-            .chain(self.already_useful.iter())
-            .any(|id| !exposed.contains(id))
-        {
-            return Err(MemoryError::invalid(
-                "useful-use receipt references an unexposed handle",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfirmUse {
-    pub operation_id: String,
-    pub evidence: RenderedEvidence,
-    pub used: Vec<String>,
-}
-
-impl Validate for ConfirmUse {
-    fn validate(&self) -> Result<()> {
-        opaque_id(&self.operation_id)?;
-        if self.operation_id.trim() != self.operation_id {
-            return Err(MemoryError::invalid("invalid useful-use operation"));
-        }
-        self.evidence.validate()?;
-        self.evidence.validate_used(&self.used)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfirmUseResult {
-    pub operation_id: String,
-    pub feedback: UseFeedback,
-}
-
-impl Validate for ConfirmUseResult {
-    fn validate(&self) -> Result<()> {
-        opaque_id(&self.operation_id)?;
-        self.feedback.validate()
     }
 }
 
