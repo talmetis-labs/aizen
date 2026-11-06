@@ -5,6 +5,9 @@ use super::*;
 use crate::core::config;
 use anyhow::anyhow; // `main.rs` no longer needs it now that `apps` moved out; these tests still do. // ditto: `main.rs` stopped needing it once the subcommands moved out.
 
+#[path = "memory_boundary.rs"]
+mod memory_boundary;
+
 #[test]
 fn config_provider_subcommands_parse() {
     for argv in [
@@ -217,26 +220,34 @@ fn where_reports_name_every_store_and_flag_missing_dirs() {
     let _ = std::fs::remove_dir_all(&home);
     std::env::set_var("AIZEN_HOME", &home);
 
-    let entries = crate::core::config::entries_dir();
+    let entries = crate::legacy_memory_fixture::entries_dir();
     std::fs::create_dir_all(&entries).unwrap();
     std::fs::write(entries.join("a.md"), "---\nname: A\n---\nx").unwrap();
     std::fs::write(entries.join("b.md"), "---\nname: B\n---\ny").unwrap();
     // Not a fact — the count must not include it.
     std::fs::write(entries.join("notes.txt"), "ignore me").unwrap();
 
+    let before: Vec<_> = ["a.md", "b.md", "notes.txt"]
+        .iter()
+        .map(|name| std::fs::read(entries.join(name)).unwrap())
+        .collect();
     let rep = memory_where_report();
-    assert!(rep.contains("2 fact(s)"), "{rep}");
     assert!(
-        rep.contains(&entries.display().to_string()),
-        "entries path missing:\n{rep}"
+        rep.contains("Memory: unavailable") && rep.contains("Selected: none"),
+        "{rep}"
     );
-    // The review dir is the one that matters most — 29 queued items were invisible because
-    // nothing ever said they were on disk.
-    assert!(rep.contains("review"), "{rep}");
     assert!(
-        rep.contains("(not created yet)"),
-        "an absent dir must not read as an empty one:\n{rep}"
+        rep.contains("memory-data") && rep.contains("not inspected or adopted"),
+        "{rep}"
     );
+    assert!(
+        !rep.contains("2 fact(s)"),
+        "Core must not enumerate legacy records: {rep}"
+    );
+    for (name, bytes) in ["a.md", "b.md", "notes.txt"].iter().zip(before) {
+        assert_eq!(std::fs::read(entries.join(name)).unwrap(), bytes);
+    }
+    assert!(!home.join("memory-data").exists());
 
     // Skills live in THREE roots and the list's `[project]`/`[repo]` tags never say where.
     let sk = skill_where_report();

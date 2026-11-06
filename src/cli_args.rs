@@ -24,6 +24,15 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum CodebaseCmd {
+    /// Explicitly download a named Model2Vec model for local Core codebase retrieval.
+    ModelDownload {
+        /// A single model name, such as potion-base-8M; defaults to the configured Core model.
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 #[expect(
     clippy::large_enum_variant,
     reason = "Parsed once per invocation; keep the clap command schema and dispatch types unboxed"
@@ -63,10 +72,20 @@ pub(crate) enum Commands {
         #[arg(long)]
         yes: bool,
     },
-    /// Manage the CLI's memory brain.
+    /// Provision Core's local codebase retrieval models, independently of Memory providers.
+    Codebase {
+        #[command(subcommand)]
+        cmd: CodebaseCmd,
+    },
+    /// Manage optional persistent Memory; a provider is never installed or selected automatically.
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// Install and manage native Memory extensions (separate from the subscription marketplace).
+    Plugin {
+        #[command(subcommand)]
+        cmd: NativeMemoryPluginCmd,
     },
     /// Manage reusable skills (saved step-by-step procedures the agent can load on demand).
     Skill {
@@ -231,7 +250,7 @@ pub(crate) enum Commands {
         /// Path to a foreign transcript (.jsonl). Omit to list candidates for this project.
         path: Option<String>,
     },
-    /// Project zones (the slug keying memory/skills/index): report + merge legacy twins.
+    /// Core project zones (skills/index/sessions): report + merge legacy twins.
     Zone {
         #[command(subcommand)]
         cmd: ZoneCmd,
@@ -1228,6 +1247,8 @@ pub(crate) enum AuthCmd {
     reason = "One-shot config parsing; preserve flag and dispatch types instead of boxing only for lint"
 )]
 pub(crate) enum ConfigCmd {
+    /// Open optional Memory provider settings without requiring a chat model configuration.
+    Memory,
     /// Set one or more config fields (only the flags you pass are changed).
     Set {
         #[arg(long)]
@@ -1257,7 +1278,7 @@ pub(crate) enum ConfigCmd {
         /// Auto-learn memory: passively learn durable facts from each turn (default on).
         #[arg(long)]
         memory_auto_learn: Option<bool>,
-        /// Dense-retrieval model for memory recall: a directory name under `~/.aizen/models/`, or
+        /// Dense-retrieval model for Core codebase search: a directory name under `~/.aizen/models/`, or
         /// an absolute path. Empty clears (auto-detect). Only meaningful on a `dense` build.
         #[arg(long)]
         embed_model: Option<String>,
@@ -1488,34 +1509,6 @@ pub(crate) struct ModelsArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum BenchCmd {
-    /// Anti-oracle memory recall bench.
-    Memory {
-        /// Which query split to run: gate | tune | all.
-        #[arg(long, default_value = "gate")]
-        split: String,
-        /// Capture the current gate metrics as the new baseline.
-        #[arg(long)]
-        update_baseline: bool,
-        /// Also measure the hybrid (lexical + dense) pipeline (uses the pure-Rust hashing
-        /// embedder unless built with the `dense` feature).
-        #[arg(long)]
-        hybrid: bool,
-        /// Also measure the fuzzy (Jaro-Winkler bridge) lexical pipeline (W24) — recall/noise
-        /// delta vs. the exact-BM25 floor, to decide whether `enable_fuzzy` should default on.
-        #[arg(long)]
-        fuzzy: bool,
-        /// Run the EVOLUTION gate (P8): a multi-session reuse simulation proving recall@5 lifts
-        /// ≥5%/session from implicit reinforcement until it plateaus. Standalone (ignores split).
-        #[arg(long)]
-        evolution: bool,
-    },
-    /// Golden-set bench for the derived user PROFILE rollup (B2).
-    Profile,
-    /// Golden-set bench for the DIALECTIC Q&A (B3), incl. abstain-when-unknown.
-    Dialectic,
-    /// Golden-set bench for the §8 HEALTH metrics: does the store saturate, does recall earn its
-    /// budget, do contradictions peak then fall. Reads hand-labeled histories, not the live store.
-    Health,
     /// Offline loop-behavior eval (P4): drive the real agent loop with scripted models over ~15
     /// scenarios and report the Section-10 metrics (steps/task, loop-stop rate, verified-done).
     Loop,
@@ -1658,37 +1651,170 @@ pub(crate) struct WorkflowArgs {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum NativeMemoryPluginCmd {
+    /// Inspect installed packages without executing them.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify and install a local directory/ZIP; does not enable, select or execute it.
+    Install { source: std::path::PathBuf },
+    /// Check the public Mnemos channel without executing or activating a provider.
+    Releases {
+        #[arg(value_parser = ["mnemos"])]
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download and verify a fresh Mnemos package; never replace or activate an installed provider.
+    InstallRelease {
+        #[arg(value_parser = ["mnemos"])]
+        id: String,
+        #[arg(long)]
+        version: Option<String>,
+        /// Pin the archive digest. Required with --version and --yes for noninteractive use.
+        #[arg(long)]
+        sha256: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Review and update installed Mnemos; preserves data and requires fresh execution consent.
+    Update {
+        #[arg(value_parser = ["mnemos"])]
+        id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        sha256: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Inspect an interrupted Mnemos package update offline; --apply explicitly settles it.
+    RecoverUpdate {
+        #[arg(value_parser = ["mnemos"])]
+        id: String,
+        #[arg(long)]
+        apply: bool,
+        /// Pin the inspected recovery operation for noninteractive settlement.
+        #[arg(long, requires = "apply")]
+        operation_id: Option<String>,
+        #[arg(long, requires = "apply")]
+        yes: bool,
+    },
+    /// Reverify a package against host-owned pins, without executing it.
+    Info { id: String },
+    /// Make an installed package eligible; does not select it or launch a process.
+    Enable { id: String },
+    /// Make a package ineligible; also disables Memory when it is selected.
+    Disable { id: String },
+    /// Revoke saved execution/learning/model consent without deleting package or provider data.
+    Revoke { id: String },
+    /// Inspect or choose a dedicated provider data directory; never move or delete existing data.
+    Storage {
+        id: String,
+        #[arg(long, conflicts_with = "default")]
+        path: Option<std::path::PathBuf>,
+        #[arg(long, conflicts_with = "path")]
+        default: bool,
+    },
+    /// Inspect or edit declared nonsecret provider options and host budgets without execution.
+    Configure {
+        id: String,
+        /// Set a manifest-declared option (KEY=JSON_SCALAR). Repeat for multiple options.
+        #[arg(long = "set", value_name = "KEY=JSON_SCALAR")]
+        values: Vec<String>,
+        /// Reset a declared option to its provider default.
+        #[arg(long = "reset", value_name = "KEY")]
+        reset: Vec<String>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=4096))]
+        context_tokens: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=4096))]
+        recall_tokens: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=4096))]
+        recall_inject_tokens: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=100))]
+        recall_limit: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=100))]
+        max_records: Option<u16>,
+    },
+    /// Remove verified package files; provider data is always preserved.
+    Uninstall {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+#[command(
+    after_help = "Record operations require a selected enabled provider. Command extensions, filters and maintenance depend on that provider; unsupported requests fail explicitly. There is no built-in Memory fallback. Inspect `aizen memory status` offline or see docs/MEMORY_PLUGINS.md."
+)]
 pub(crate) enum MemoryCmd {
-    /// Add a new memory (one fact).
+    /// Versioned bounded JSON client bridge on stdin/stdout; no startup migrations.
+    Client,
+    /// Offline provider state; never launches or initializes a Memory store.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly select an eligible installed executable and enable Memory.
+    Use {
+        id: String,
+        /// Accept the displayed executable trust warning for this manifest.
+        #[arg(long)]
+        yes: bool,
+        /// Acknowledge that guarded mode does not confine filesystem/network access.
+        #[arg(long)]
+        allow_guarded: bool,
+        /// Separately authorize declared network access (still intersects global sandbox policy).
+        #[arg(long)]
+        allow_network: bool,
+        /// Allow bounded completed-turn text to be sent to this executable for persistent learning.
+        /// No host model route, credentials or remote transcript sharing is granted.
+        #[arg(long)]
+        allow_learning: bool,
+        /// Allow one extra no-tool learning call using the exact completed turn's model route.
+        /// Includes bounded provider-prepared text, token costs, and future chat route selections.
+        #[arg(long, requires = "allow_learning")]
+        allow_turn_model: bool,
+    },
+    /// Clear provider selection and disable Memory, preserving packages, grants and data.
+    Unselect,
+    /// Reenable the selected provider using its existing manifest-bound execution consent.
+    Enable,
+    /// Disable Memory while preserving provider selection and data.
+    Disable,
+    /// Store a Project fact through the selected provider.
     Add {
-        /// Short, unique name (becomes the file id).
+        /// Display name; the provider chooses the record id.
         name: String,
         /// One-line summary used for ranking/recall.
         #[arg(short, long, default_value = "")]
         description: String,
-        /// user | feedback | project | reference (unknown → reference).
+        /// Record type requested from the provider: user | feedback | project | reference.
         #[arg(short = 't', long = "type", default_value = "reference")]
         mtype: String,
         /// The fact body. If omitted, read from stdin.
         #[arg(short, long)]
         body: Option<String>,
     },
-    /// List all memories.
+    /// List records visible in the selected provider's current context.
     List {
-        /// Workspace view: all (default) | global | current | project | a zone slug.
+        /// Mnemos: current (default), global/user, device, project, all, or an exact legacy scope.
+        /// Cross-workspace inspection (all/legacy) requires explicit human management authority.
         scope: Option<String>,
         /// Same as the positional form. Kept because the flag shipped first and scripts use it.
         #[arg(long = "scope", value_name = "SCOPE", conflicts_with = "scope")]
         scope_flag: Option<String>,
-        /// Show the graveyard instead: facts a correction retired. `revive <id>` brings one back.
+        /// Show retired records instead of live ones; Mnemos requires human management authority.
         #[arg(long)]
         superseded: bool,
     },
     /// Undo a supersession — put a retired fact back in the live view.
     Revive { id: String },
-    /// Show one memory by id or name.
+    /// Fetch a record by its exact provider-owned id.
     Show { id: String },
-    /// Lexically search memories (long tail; excludes frozen-core entries).
+    /// Search the selected provider; filtering/ranking capabilities are provider-specific.
     Search {
         query: String,
         #[arg(short, long, default_value_t = 5)]
@@ -1699,23 +1825,25 @@ pub(crate) enum MemoryCmd {
         /// Restrict to one content category: bug-history|failed-attempt|success-pattern|arch-decision|command|security-rule|deploy-note|codebase.
         #[arg(long)]
         category: Option<String>,
-        /// Workspace view: all (default) | global | current | project | a zone slug.
+        /// Mnemos: current (default), global/user, device, project, all, or an exact legacy scope.
+        /// Cross-workspace inspection (all/legacy) requires explicit human management authority.
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Show the frozen core (the always-on prompt-prefix block); --rebuild stages a refresh.
+    /// Request frozen context; --rebuild persists a fresh snapshot with human management authority.
     Frozen {
         #[arg(long)]
         rebuild: bool,
     },
-    /// Learn from a user turn (free extraction → sanitize → threat-scan → route → store).
+    /// Send explicit user text to the provider's learning operation; Mnemos runs offline.
     Learn {
         /// The user turn text. If omitted, read from stdin.
         text: Option<String>,
-        /// Confirm core (STYLE.md) promotions non-interactively.
+        /// Human confirmation: allow classified style preferences to be promoted to STYLE.md.
+        /// Mnemos requires explicit human management authority; no model route is granted.
         #[arg(short, long)]
         yes: bool,
-        /// Classify + report only; write nothing.
+        /// Request classification without applying learned facts; not a no-process guarantee.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1735,13 +1863,13 @@ pub(crate) enum MemoryCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect the review queue; --promote <id> accepts one, --drop <id> sets one aside,
-    /// --clear sets all aside. Discarded items move to `review/.discarded/`, never deleted.
+    /// Inspect the review queue; --promote <exact-id> accepts one, --drop <exact-id> sets one aside,
+    /// --clear sets all aside. Human management only; discarded items are moved, never deleted.
     Review {
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["drop_key", "clear"])]
         promote: Option<String>,
-        /// Discard a single queued candidate (moved to `review/.discarded/`).
-        #[arg(long = "drop")]
+        /// Discard an exact queued id (moved to `review/.discarded/`; no names or indexes).
+        #[arg(long = "drop", conflicts_with = "clear")]
         drop_key: Option<String>,
         #[arg(long)]
         clear: bool,
@@ -1753,14 +1881,14 @@ pub(crate) enum MemoryCmd {
     },
     /// Supersede one memory with another (history kept, not deleted).
     Supersede {
-        /// The memory (id or name) that is no longer true.
+        /// Exact provider-owned id of the memory that is no longer true.
         old: String,
-        /// The memory (id or name) that replaces it.
+        /// Exact provider-owned id of the memory that replaces it.
         new: String,
     },
-    /// Edit a stored memory in place (only the flags you pass are changed; the id never changes).
+    /// Update a record using its current provider revision; only supplied fields change.
     Edit {
-        /// The memory to edit (id or name; a unique prefix works).
+        /// Exact provider-owned record id.
         id: String,
         /// New display name.
         #[arg(long)]
@@ -1774,22 +1902,21 @@ pub(crate) enum MemoryCmd {
         /// Replace the fact body. If the flag is given with no value, read from stdin.
         #[arg(short, long)]
         body: Option<String>,
-        /// Move zones: global | current | project | a zone slug.
+        /// Move to user/global, device, or project scope with human management authority.
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Forget a memory: move it to the recoverable archive (undo with `memory restore <id>`).
+    /// Forget a record using its current revision; recovery depends on the provider's archive API.
     Forget {
-        /// The memory to forget (id or name; a unique prefix works).
+        /// Exact provider-owned record id.
         id: String,
     },
     /// List archived (LRU-evicted) memories.
     Archive,
-    /// Restore an archived memory back into the live store (keeps its id).
+    /// Restore an exact archived handle into the live store; use --as if its target id is occupied.
     Restore {
         id: String,
-        /// Restore under a DIFFERENT id. Only needed when the original id is taken — and it breaks
-        /// any `supersededBy`/`supersedes` pointer or graph edge that names the old id.
+        /// Explicit destination id. Mnemos otherwise keeps the archive handle, never guesses an origin.
         #[arg(long = "as")]
         as_id: Option<String>,
     },
@@ -1810,44 +1937,37 @@ pub(crate) enum MemoryCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Judge suspicious near-duplicate pairs in one model call (dry run unless `--apply`).
+    /// Prepare provider reconciliation without a model call; submit an explicit offline reply to judge.
     Reconcile {
-        /// Actually write the verdicts. Without this the pass only reports what it would do —
-        /// the default has to be harmless because the actions it proposes overwrite and retire
-        /// facts.
-        #[arg(long)]
+        /// Apply verdicts to facts. Requires --reply. Without --apply, judgements append audit only.
+        #[arg(long, requires = "reply")]
         apply: bool,
+        /// JSON file with binding_sha256 from preparation and an explicitly prepared completion string.
+        /// No model route, credential sharing or automatic retry is granted.
+        #[arg(long)]
+        reply: Option<std::path::PathBuf>,
     },
     /// Report what is structurally wrong (or merely invisible) in the store. Read-only.
     Doctor,
-    /// Print the folders the store lives in, with file counts — for editing or clearing out many
-    /// entries at once, which no per-id command can do.
+    /// Print the selected provider's separate package/data locations without executing it.
     Where,
-    /// Show the three §8 health metrics per week of use (saturation, recall usefulness,
-    /// contradictions found). Read-only; reads `stats.jsonl` + the learning audit.
+    /// Request provider health; returned diagnostics and metrics are provider-specific.
     Health,
     /// Show a fact's strongest co-retrieval associations (the Hebbian graph, P5).
     Neighbors {
-        /// The memory (id or name) whose neighbors to list.
+        /// Exact provider-owned id whose neighbors to list.
         id: String,
         /// Max neighbors to show.
         #[arg(short, long, default_value_t = 10)]
         k: usize,
     },
-    /// Download the dense-tier embedding model into `~/.aizen/models/<name>/` (one-time, P6).
-    /// Fetches the three files the dense backend loads locally; pair with a `--features dense`
-    /// build to actually use them. Re-running only fetches files not already present.
+    /// Provider model-provisioning extension; Mnemos is offline and refuses downloads.
     ModelDownload {
-        /// Model name (a HF `minishlab/<name>` repo). Defaults to the configured embed model.
+        /// Provider-specific model identifier.
         #[arg(long)]
         name: Option<String>,
     },
-    /// Show every model2vec model already on this machine and which one the dense tier would pick.
-    ///
-    /// The dense tier used to look at ONE path (`~/.aizen/models/<configured name>`) and fall back
-    /// to the non-semantic hashing embedder if that exact dir was absent — even with a perfectly
-    /// usable model sitting next to it. This lists what discovery actually finds, so "why is dense
-    /// not using my model?" is answerable without a source dive.
+    /// Provider model-inventory extension; does not inspect Core's codebase retrieval models.
     ModelList,
 }
 
@@ -2104,6 +2224,139 @@ mod agent_reference_args_tests {
         .unwrap();
         assert!(args.reference_images);
         assert_eq!(args.image, ["ref.png"]);
+    }
+}
+
+#[cfg(test)]
+mod memory_management_args_tests {
+    use super::*;
+
+    #[test]
+    fn human_management_flags_preserve_the_existing_cli_surface() {
+        for args in [
+            vec!["list", "all", "--superseded"],
+            vec!["list", "--scope", "user"],
+            vec!["search", "preference", "--scope", "project"],
+            vec!["edit", "exact-id", "--scope", "device"],
+            vec!["learn", "please reply in Vietnamese", "--yes"],
+            vec!["frozen", "--rebuild"],
+            vec!["review", "--promote", "exact-id"],
+            vec!["review", "--drop", "exact-id"],
+            vec!["review", "--clear"],
+            vec!["restore", "archived-id", "--as", "new-id"],
+            vec!["purge", "archived-id", "--yes"],
+            vec!["consolidate", "--apply"],
+            vec!["reconcile"],
+            vec!["reconcile", "--reply", "explicit-reply.json"],
+            vec!["reconcile", "--apply", "--reply", "explicit-reply.json"],
+            vec!["neighbors", "exact-id", "-k", "1"],
+            vec!["model-list"],
+        ] {
+            assert!(Cli::try_parse_from(["aizen", "memory"].into_iter().chain(args)).is_ok());
+        }
+    }
+
+    #[test]
+    fn provider_configuration_entry_points_and_budgets_are_bounded() {
+        for args in [
+            vec!["config", "memory"],
+            vec!["memory", "unselect"],
+            vec!["plugin", "revoke", "fixture"],
+            vec!["plugin", "configure", "fixture"],
+            vec![
+                "plugin",
+                "configure",
+                "fixture",
+                "--set",
+                "enable_fuzzy=false",
+                "--reset",
+                "days",
+                "--context-tokens",
+                "0",
+                "--recall-tokens",
+                "4096",
+                "--recall-inject-tokens",
+                "300",
+                "--recall-limit",
+                "12",
+                "--max-records",
+                "100",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(["aizen"].into_iter().chain(args)).is_ok());
+        }
+        for (flag, value) in [
+            ("--context-tokens", "4097"),
+            ("--recall-tokens", "-1"),
+            ("--recall-inject-tokens", "4097"),
+            ("--recall-limit", "101"),
+            ("--max-records", "101"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "plugin", "configure", "fixture", flag, value])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn storage_inspection_path_and_default_are_explicit_and_mutually_exclusive() {
+        for tail in [vec![], vec!["--default"], vec!["--path", "/fixture/data"]] {
+            assert!(Cli::try_parse_from(
+                ["aizen", "plugin", "storage", "mnemos"]
+                    .into_iter()
+                    .chain(tail)
+            )
+            .is_ok());
+        }
+        assert!(Cli::try_parse_from([
+            "aizen",
+            "plugin",
+            "storage",
+            "mnemos",
+            "--default",
+            "--path",
+            "/fixture/data"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn review_actions_and_scope_spellings_cannot_be_combined() {
+        for args in [
+            vec!["review", "--promote", "one", "--drop", "two"],
+            vec!["review", "--promote", "one", "--clear"],
+            vec!["review", "--drop", "one", "--clear"],
+            vec!["list", "current", "--scope", "all"],
+            vec!["reconcile", "--apply"],
+        ] {
+            assert!(Cli::try_parse_from(["aizen", "memory"].into_iter().chain(args)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod codebase_args_tests {
+    use super::*;
+
+    #[test]
+    fn model_provisioning_is_an_explicit_separate_core_command() {
+        for name in [None, Some("potion-base-8M")] {
+            let mut args = vec!["aizen", "codebase", "model-download"];
+            args.extend(name);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Commands::Codebase {
+                cmd: CodebaseCmd::ModelDownload { name: parsed },
+            }) = cli.command
+            else {
+                panic!("expected explicit Core model provisioning command");
+            };
+            assert_eq!(parsed.as_deref(), name);
+        }
+        assert!(Cli::try_parse_from(["aizen", "codebase"]).is_err());
+        assert!(
+            Cli::try_parse_from(["aizen", "codebase", "model-download", "one", "two"]).is_err()
+        );
     }
 }
 

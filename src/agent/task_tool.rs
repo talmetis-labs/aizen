@@ -345,7 +345,7 @@ static BREAKOUT_TAG_RE: Lazy<regex::Regex> = Lazy::new(|| {
 /// every legitimate persona. Shared (`pub(crate)`) by the persona card and skill render paths, which
 /// carry the same class of untrusted markdown into prompts/tool results.
 pub(crate) fn sanitize_agent_body(s: &str) -> String {
-    let out = crate::memory::render::sanitize_body(s);
+    let out = crate::core::prompt_safety::sanitize_body(s);
     BREAKOUT_TAG_RE
         .replace_all(&out, |caps: &regex::Captures| {
             let m = &caps[0];

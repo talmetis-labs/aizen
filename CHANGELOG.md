@@ -5,6 +5,37 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [0.7.4] — 2026-11-06
+
+### Added
+- **Optional native Memory providers.** Core manages package installation, pinned executable
+  consent, provider settings, storage locations and bounded execution. Mnemos is a separately
+  distributed provider; Runtime, Skills, Persona, Soul, sessions and temporary notes remain in Core.
+- **Mnemos update tracking in CLI and configuration.** Installed packages use bounded background
+  availability checks, the existing update-check preference, a 24-hour cache and failure backoff.
+  `/config → Memory → Provider → Mnemos` and `/update mnemos` offer explicit update review. Bare
+  `/update` continues to update Aizen itself.
+- **Verified replacement and explicit recovery.** Updates pin the exact public package and SHA256,
+  retain old payloads and journal replacement. `aizen plugin recover-update mnemos` inspects
+  interrupted updates offline. Updates preserve Memory data and settings, revoke Mnemos execution
+  and Learning consent, and require separate activation; no provider executes during replacement.
+- **Negotiated Memory client APIs.** Desktop clients can use Core-owned provider management,
+  release discovery and update status without a second downloader. Desktop binaries and Mnemos
+  packages are released separately.
+- **Dormant creative-adapter foundations.** Typed contracts, job ownership and offline status are
+  available for future integrations. This does not enable external creative application control.
+
+### Changed
+- Persistent Memory storage and learning move out of the CLI into optional providers. Installing
+  or updating Core does not automatically install a provider, transfer legacy Memory data, select
+  a provider or enable Learning. Review setup and any explicit adoption before use.
+- The dense feature remains available for Core codebase retrieval, independently of provider-owned
+  Memory models and settings.
+
+### Fixed
+- Harden vision context and image/reference handling across model requests and tool boundaries.
+- Preserve session compaction and keep recovery snapshots consistent with retained history.
+
 ## [0.7.2] — 2026-10-16
 
 ### Changed

@@ -781,23 +781,49 @@ mod tests {
         let mut compacted = Message::system("compacted text");
         compacted.images.push(url.clone());
         let mut reread = Message::tool_result("read", "ROI observation");
-        reread.tool_images.push(crate::core::tool_media::ToolImage::from_bytes(
-            b"GIF89a-private-input", "image/gif",
-            crate::core::tool_media::ImageProvenance::new("reference_read", None),
-        ).unwrap());
-        let history = vec![Message::user_with_images("look", vec![url]), compacted, reread];
+        reread.tool_images.push(
+            crate::core::tool_media::ToolImage::from_bytes(
+                b"GIF89a-private-input",
+                "image/gif",
+                crate::core::tool_media::ImageProvenance::new("reference_read", None),
+            )
+            .unwrap(),
+        );
+        let history = vec![
+            Message::user_with_images("look", vec![url]),
+            compacted,
+            reread,
+        ];
         let live = serde_json::to_value(&history).unwrap();
-        checkpoint_history_with_design(&history, Some("continue"), RecoveryPhase::WaitingModel, None).unwrap();
+        checkpoint_history_with_design(
+            &history,
+            Some("continue"),
+            RecoveryPhase::WaitingModel,
+            None,
+        )
+        .unwrap();
         let manifest = fixture.stored();
-        let raw = fs::read_to_string(history_path(&fixture.dir, manifest.sidecar_generation)).unwrap();
-        assert!(!raw.contains("base64") && !raw.contains("blob:") && !raw.contains("visual_assets"));
+        let raw =
+            fs::read_to_string(history_path(&fixture.dir, manifest.sidecar_generation)).unwrap();
+        assert!(
+            !raw.contains("base64") && !raw.contains("blob:") && !raw.contains("visual_assets")
+        );
         let (restored, _) = read_authoritative_snapshot(&fixture.dir, &manifest).unwrap();
         assert!(restored.iter().all(|m| m.images.is_empty()));
-        assert!(restored.iter().flat_map(|m| &m.tool_images).all(|image| !image.is_available()));
+        assert!(restored
+            .iter()
+            .flat_map(|m| &m.tool_images)
+            .all(|image| !image.is_available()));
         assert!(restored[0].content.as_deref().unwrap().starts_with("look"));
-        assert!(restored[1].content.as_deref().unwrap().contains("attach the original"));
+        assert!(restored[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("attach the original"));
         assert_eq!(serde_json::to_value(&history).unwrap(), live);
-        let blobs = crate::core::config::aizen_home().join("sessions").join("blobs");
+        let blobs = crate::core::config::aizen_home()
+            .join("sessions")
+            .join("blobs");
         assert!(!blobs.exists());
     }
 

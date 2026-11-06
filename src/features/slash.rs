@@ -639,9 +639,9 @@ pub const BUILTINS: &[Builtin] = &[
         aliases: &[],
         hidden_aliases: &[],
         hidden: false,
-        description: "show every aizen version and install the one you pick",
-        argument_hint: "",
-        help: "show the installed version next to every published one and install the one you pick (newer or older) — the new build starts in your NEXT terminal",
+        description: "update Aizen, or review a newer Mnemos package",
+        argument_hint: "[mnemos]",
+        help: "bare /update picks an Aizen version; /update mnemos reviews a strictly newer package, preserves data/settings and requires fresh activation consent",
         stdin: Stdin::Always,
     },
     Builtin {

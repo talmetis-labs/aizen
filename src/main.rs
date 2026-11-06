@@ -2,15 +2,15 @@
 //!
 //! Subcommands:
 //!   aizen chat    — OpenAI-compatible streaming chat (the v0 "call API like hermes" layer)
-//!   aizen memory  — the standalone, best-for-CLI memory brain (see linked-riding-mochi.md)
+//!   aizen memory  — manage the explicitly selected optional Memory provider
 
 // ─── module tree ────────────────────────────────────────────────────────────
-// Domains that own a folder: the agent loop, the memory brain, personas, benches.
+// Domains that own a folder: the agent loop, personas, optional Memory providers, benches.
 mod agent;
 mod agents; // delegatable specialist sub-agent library (agency-agents format)
 mod bench;
-mod memory;
 mod persona;
+mod plugin;
 // Grouped by role (the src/ reorg — see each folder's mod.rs for what it holds):
 mod channels; // notify + shared channel glue
 mod core; // types · config · cli_config · approval · net_guard
@@ -24,6 +24,7 @@ mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
 mod cli; // one module per `aizen <subcommand>` — the behaviour behind `cli_args`
 mod cli_args; // declaration-only: the command-line surface (clap derive types)
 mod repl; // the interactive loop's phases: startup · input_pre · turn · postturn · background
+mod retrieval; // Core codebase/Skill ranking, independent of optional persistent Memory
 
 // The reorg moved 23 top-level files into the folders above. These re-exports keep the
 // call sites in THIS file referring to the modules by their short names (no behavior
@@ -165,9 +166,31 @@ async fn main() -> Result<()> {
     if let Some(mode) = cli.sandbox {
         sandbox::set_mode(mode);
     }
-    // Before ANY command touches the store: ids the old slugifier cut mid-word are re-slugged whole.
-    // Ahead of the `match` so the CLI paths (`memory list`, `memory show`) and the REPL see the same
-    // ids — see `run_id_migration_once`.
+    // The client bridge must precede management dispatch and all startup migrations.
+    if matches!(
+        &cli.command,
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Client
+        })
+    ) {
+        return cli::memory_client::run().await;
+    }
+    // Package administration and offline Memory controls never run legacy store migrations.
+    if let Some(Commands::Plugin { cmd }) = &cli.command {
+        return cli::plugin_cmd::run(cmd).await;
+    }
+    if let Some(Commands::Memory { cmd }) = &cli.command {
+        if let Some(result) = cli::plugin_cmd::memory_control(cmd) {
+            return result;
+        }
+    }
+    if matches!(cli.command.as_ref(), Some(Commands::Memory { .. })) {
+        let Some(Commands::Memory { cmd }) = cli.command else {
+            unreachable!()
+        };
+        return run_memory(cmd).await;
+    }
+    // Persona-owned migration remains separate; persistent Memory is never migrated at startup.
     run_id_migration_once();
     let command = match cli.command {
         Some(c) => c,
@@ -183,27 +206,13 @@ async fn main() -> Result<()> {
         Commands::Resume { run_id, spec, yes } => {
             crate::cli::run_cmds::run_run_resume(&run_id, spec.as_deref(), yes).await
         }
+        Commands::Codebase { cmd } => cli::codebase_cmd::run(cmd).await,
         Commands::Memory { cmd } => run_memory(cmd).await,
+        Commands::Plugin { cmd } => cli::plugin_cmd::run(&cmd).await,
         Commands::Skill { cmd } => run_skill(cmd).await,
         Commands::Persona { cmd } => run_persona(cmd),
         Commands::Soul { cmd } => run_soul(cmd),
         Commands::Bench { cmd } => match cmd {
-            BenchCmd::Memory {
-                split,
-                update_baseline,
-                hybrid,
-                fuzzy,
-                evolution,
-            } => {
-                if evolution {
-                    bench::run_evolution()
-                } else {
-                    bench::run(&split, update_baseline, hybrid, fuzzy)
-                }
-            }
-            BenchCmd::Profile => bench::brain::run_profile(),
-            BenchCmd::Dialectic => bench::brain::run_dialectic(),
-            BenchCmd::Health => bench::brain::run_health(),
             BenchCmd::Loop => bench::loop_eval::run().await,
             BenchCmd::Sessions { json } => bench::sessions_stats::run(json),
             BenchCmd::Tasks {
@@ -494,8 +503,8 @@ fn status_text(history: &[Message], model: &str) -> String {
             .map(|c| c.servers.len())
             .unwrap_or(0),
         lsp: crate::agent::lsp::LSP.status().chip(),
-        memory_facts: crate::memory::live_fact_count(),
-        memory_recalled: crate::memory::stats::session_counters().0 as usize,
+        memory_facts: 0, // Corpus telemetry belongs to the external provider, not a Core store read.
+        memory_recalled: crate::plugin::snapshots::current("repl").ids.len(),
     });
     // Re-arm for the next call, then compose: the chip owns the model segment's effort part — a
     // routed model (models_by_effort) plus the tinted `·auto` (or the pinned tier at idle) land
@@ -768,7 +777,6 @@ async fn run_menu_sticky() -> Result<()> {
     // GET /models probe every 60s (plus once immediately). Independent of the chat HTTP client so a
     // long-running turn's keep-alive doesn't share the short health timeout.
     spawn_health_poller();
-    spawn_reconcile_pass();
     let mut input = tui::spawn_input();
     // Off-to-the-side Q&A: a long-lived worker answers `?`-prefixed questions on its OWN thread,
     // reading a read-only snapshot of the live conversation, WITHOUT touching the turn in flight
@@ -884,7 +892,7 @@ async fn run_menu_sticky() -> Result<()> {
                 // / `!shell-escape` run no turn; a normal message has its `@file`·`` !`cmd` `` expanded.
                 let echo_src = line.clone();
                 if images.is_empty() {
-                    match preprocess_input(&line) {
+                    match preprocess_input(&line).await {
                         InputPre::Handled => continue,
                         InputPre::Send(expanded) => line = expanded,
                     }
@@ -1054,8 +1062,10 @@ async fn run_menu_sticky() -> Result<()> {
                 // lane) so index 1 stays byte-stable and the transcript-tail prefix cache holds.
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
+                let mut cfg = turn_agent_config(turn_cancel.clone(), &ep.model, true);
+                resolved.configure(&mut cfg, true);
                 resolved.refresh_prompt(&mut history, &mut effective_model);
-                seat_user_message(&line, images, &mut history, &ep.model, &design);
+                seat_user_message(&line, images, &mut history, &ep.model, &design, &cfg).await?;
                 resolved.seat_reference_markers(&mut history);
                 update_live_history_with_design(&history, Some(&design.snapshot()));
                 if let Some(plan) = &resolved.architect_plan {
@@ -1065,9 +1075,6 @@ async fn run_menu_sticky() -> Result<()> {
                         plan.path.as_deref(),
                     );
                 }
-                let mut cfg = turn_agent_config(turn_cancel.clone(), &ep.model, true);
-                resolved.configure(&mut cfg, true);
-
                 // Esc pressed DURING prep already cancelled this token — honour it instead of firing
                 // the request anyway. Without this, cancelling in the prep window (the very thing the
                 // early arm above made possible) would still send the turn to the model.
@@ -1221,13 +1228,21 @@ async fn run_menu_sticky() -> Result<()> {
                                     );
                                     // Re-seat the original request so the fresh thread continues
                                     // the SAME work, not a blank "what do you want?" prompt.
+                                    let mut cfg2 =
+                                        turn_agent_config(turn_cancel.clone(), &ep.model, true);
+                                    resolved.configure(&mut cfg2, true);
+                                    cfg2.exec_ctx = cfg2
+                                        .exec_ctx
+                                        .with_recovery(cfg.exec_ctx.recovery().clone());
                                     seat_user_message(
                                         &line,
                                         Vec::new(),
                                         &mut history,
                                         &ep.model,
                                         &design,
-                                    );
+                                        &cfg2,
+                                    )
+                                    .await?;
                                     if let Some(plan) = &resolved.architect_plan {
                                         crate::agent::architect::attach_plan(
                                             &mut history,
@@ -1235,12 +1250,6 @@ async fn run_menu_sticky() -> Result<()> {
                                             plan.path.as_deref(),
                                         );
                                     }
-                                    let mut cfg2 =
-                                        turn_agent_config(turn_cancel.clone(), &ep.model, true);
-                                    resolved.configure(&mut cfg2, true);
-                                    cfg2.exec_ctx = cfg2
-                                        .exec_ctx
-                                        .with_recovery(cfg.exec_ctx.recovery().clone());
                                     let r2 =
                                         run_agent_turn(&http, ep, &cfg2, &registry, &mut history)
                                             .await;
@@ -1253,6 +1262,7 @@ async fn run_menu_sticky() -> Result<()> {
                                                 &http,
                                                 ep,
                                                 &design,
+                                                &cfg2,
                                             )
                                             .await;
                                         }
@@ -1301,8 +1311,16 @@ async fn run_menu_sticky() -> Result<()> {
                             // tree is remembered as a finished task. The one-shot `aizen agent` path has
                             // reported these since it was written (see the `match outcome.stop` in
                             // `run_agent_cmd`); the REPL — where the user actually lives — never did.
-                            finish_turn(&outcome, persona_before, &mut history, &http, ep, &design)
-                                .await;
+                            finish_turn(
+                                &outcome,
+                                persona_before,
+                                &mut history,
+                                &http,
+                                ep,
+                                &design,
+                                &cfg,
+                            )
+                            .await;
                         }
                     }
                     Some(Err(e)) => {
@@ -1457,7 +1475,7 @@ async fn run_menu_plain() -> Result<()> {
                     }
                     features::slash::Verdict::Chat => {
                         typed_src = line.clone();
-                        match preprocess_input(&line) {
+                        match preprocess_input(&line).await {
                             InputPre::Handled => continue, // #remember / !shell-escape — no turn
                             InputPre::Send(expanded) => line = expanded,
                         }
@@ -1573,15 +1591,15 @@ async fn run_menu_plain() -> Result<()> {
         // Fold memory recall + codebase-index retrieval into the SENT content (not the cached
         // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
         // history / display.
+        let mut cfg = turn_agent_config(turn_cancel, &ep.model, false);
+        resolved.configure(&mut cfg, true);
         resolved.refresh_prompt(&mut history, &mut effective_model);
-        seat_user_message(&line, images, &mut history, &ep.model, &design);
+        seat_user_message(&line, images, &mut history, &ep.model, &design, &cfg).await?;
         resolved.seat_reference_markers(&mut history);
         update_live_history_with_design(&history, Some(&design.snapshot()));
         if let Some(plan) = &resolved.architect_plan {
             crate::agent::architect::attach_plan(&mut history, &plan.text, plan.path.as_deref());
         }
-        let mut cfg = turn_agent_config(turn_cancel, &ep.model, false);
-        resolved.configure(&mut cfg, true);
         match run_agent_turn(&http, ep, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
@@ -1594,7 +1612,16 @@ async fn run_menu_plain() -> Result<()> {
                 // mirror of the sticky path: a paused turn is still a transcript
             }
             Ok(outcome) => {
-                finish_turn(&outcome, persona_before, &mut history, &http, ep, &design).await;
+                finish_turn(
+                    &outcome,
+                    persona_before,
+                    &mut history,
+                    &http,
+                    ep,
+                    &design,
+                    &cfg,
+                )
+                .await;
             }
             Err(e) => {
                 tui::note_line(&format!("{} {}", style("error:").red(), one_line_error(&e)));
@@ -1791,6 +1818,10 @@ pub(crate) fn elide(s: &str, max: usize) -> String {
     let head: String = flat.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", head.trim_end())
 }
+
+#[cfg(test)]
+#[path = "tests/legacy_memory.rs"]
+pub(crate) mod legacy_memory_fixture;
 
 #[cfg(test)]
 #[path = "tests/main_suite.rs"]

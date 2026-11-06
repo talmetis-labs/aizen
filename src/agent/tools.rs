@@ -413,6 +413,8 @@ pub struct PreparedToolCall {
     pub preview: Option<ApprovalPreview>,
     pub file: Option<FilePreparation>,
     pub(crate) footprint: Option<PreparedFootprint>,
+    /// Host-frozen external Memory dispatch; never reconstructed from model JSON.
+    pub(crate) memory_provider: Option<crate::plugin::tool_support::FrozenCall>,
     /// Placement-bound UI aliases; execution, approval and wire results retain absolute paths.
     pub(crate) display_paths: Vec<crate::core::file_placement::DisplayPath>,
     /// Frozen delegation resolution, internal only; never read from model arguments.
@@ -441,6 +443,7 @@ impl PreparedToolCall {
             preview: None,
             file: None,
             footprint: None,
+            memory_provider: None,
             display_paths: Vec::new(),
             delegation: None,
             workspace_changes: None,
@@ -506,6 +509,11 @@ pub trait Tool: Send + Sync {
     ) -> Option<crate::core::native_scope::NativeWriteScope> {
         None
     }
+    /// External Memory transactions own opaque admission before generic native/body leases.
+    fn is_memory_provider(&self) -> bool {
+        false
+    }
+
     /// Read-only & side-effect-free → eligible for concurrent execution in a parallel batch.
     /// Destructive tools also set this `false`.
     fn is_concurrency_safe(&self) -> bool {

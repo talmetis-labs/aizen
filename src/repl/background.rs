@@ -4,17 +4,12 @@
 //! Every one of these is best-effort and must never block or fail a turn. They own their own
 //! short-timeout HTTP client precisely so a dead endpoint degrades a chip instead of a request.
 
-use crate::core::endpoint::{http_client, resolve_base_key, resolve_endpoint};
+use crate::core::endpoint::{resolve_base_key, resolve_endpoint};
 use crate::core::session_store::live_history_slot;
-use crate::core::types;
 use crate::llm::client;
-use crate::memory;
-use crate::repl::postturn::{chore_chat, memory_auto_learn_enabled};
-use crate::summarizer_endpoint;
 use crate::ui::{theme, tui};
 use anyhow::{Context, Result};
 use console::style;
-use types::Message;
 
 /// Short-timeout client for the health probe only — a dead endpoint must fail the chip fast, not
 /// wait out the chat client's 300s read timeout. Connect + total request each capped at 4s.
@@ -58,100 +53,6 @@ pub(crate) fn classify_health_probe(
             client::ApiErrorKind::ContextOverflow => tui::HealthKind::Unstable,
         },
     }
-}
-
-/// Spawn the once-per-session batch reconciliation (M2b), off the hot path.
-///
-/// Three properties make an automatic pass that RETIRES facts acceptable here:
-///
-/// - **It fires rarely.** `should_run` gates on ≥8 waiting pairs or ≥7 days since the last pass, so a
-///   store with nothing to resolve never pays a call.
-/// - **It cannot run twice.** `batch_pass` takes the judge as `FnOnce`, and this task is spawned once
-///   per REPL start, so "≤1 model call per session" is structural rather than remembered.
-/// - **Everything it does is reversible.** Retirement is `supersedes:` + `revive`, never a delete, and
-///   the summary line names what changed so the user can see it happened at all — a silent pass that
-///   rewrites memory is the thing this design refuses.
-///
-/// Fully best-effort: any failure leaves the store exactly as it was and says nothing.
-pub(crate) fn spawn_reconcile_pass() {
-    tokio::spawn(async move {
-        if !memory_auto_learn_enabled() {
-            return; // the same switch that governs learning governs correcting
-        }
-        let Ok((pairs, live)) = memory::reconcile_inputs() else {
-            return;
-        };
-        let today = memory::bloat::decay::today();
-        if !memory::learning::reconcile::should_run(
-            pairs.len(),
-            memory::learning::reconcile::last_run().as_deref(),
-            &today,
-        ) {
-            return;
-        }
-        let Ok((base, key, model)) = resolve_endpoint(None, None, None) else {
-            return;
-        };
-        let Ok(http) = http_client() else { return };
-        let ep = summarizer_endpoint(&base, &key, &model);
-        let judge = |sys: &str, user: &str| -> Option<String> {
-            let msgs = [
-                Message::system(sys.to_string()),
-                Message::user(user.to_string()),
-            ];
-            let fut = chore_chat(&http, &ep.base_url, &ep.api_key, &ep.model, &msgs, &[]);
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(fut)
-                    .ok()?
-                    .content
-            })
-        };
-        let report = memory::learning::reconcile::batch_pass(
-            &pairs,
-            judge,
-            false, // this path APPLIES; the CLI is the dry-run surface
-            &memory::learning::default_session_id(),
-            &live,
-        );
-        // One line, and only when something actually changed. A background pass that narrates itself
-        // every session is noise; one that changes memory in silence is worse.
-        let acted = report
-            .applied
-            .iter()
-            .filter(|a| !matches!(a.action, memory::learning::reconcile::Action::Review { .. }))
-            .count();
-        // Retirements are counted separately: "reconciled 3 facts" reads like bookkeeping, but a row
-        // leaving the active view is the change a user would want to know about, and it is the half
-        // that needs the undo hint. Only removals that reported no failure are counted.
-        let dropped = report
-            .applied
-            .iter()
-            .filter(|a| {
-                matches!(
-                    &a.action,
-                    memory::learning::reconcile::Action::Confirm {
-                        redundant: Some(_),
-                        ..
-                    }
-                ) && !a.note.contains("kept")
-            })
-            .count();
-        if acted > 0 {
-            let what = if dropped > 0 {
-                format!("reconciled {acted} memory fact(s), retiring {dropped} duplicate(s)")
-            } else {
-                format!("reconciled {acted} memory fact(s)")
-            };
-            tui::emit_line(
-                &style(format!(
-                    "⚖ {what} — `aizen memory list --superseded` to review, `revive <id>` to undo"
-                ))
-                .dim()
-                .to_string(),
-            );
-        }
-    });
 }
 
 /// Probe the newly selected provider immediately instead of waiting for the next 60-second poll tick.

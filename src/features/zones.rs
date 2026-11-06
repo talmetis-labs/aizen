@@ -1,13 +1,12 @@
 //! Project-zone inventory + migration (`aizen zone migrate`, the startup legacy-zone hint).
 //!
 //! The slug keying changed 2026-07: the old key preferred `remote.origin.url` and fell back to a
-//! raw `canonicalize` string, so *whether git spawned* (PATH luck) silently picked the key — one
-//! checkout accumulated TWIN zones (memory scope tags, skills dir, codebase index, frozen core)
-//! under different slugs. This module finds every artifact keyed by a legacy slug of the CURRENT
-//! project and merges it into the current slug. Dry-run by default, `--apply` to execute, every
-//! action reported. Nothing is destroyed: name clashes are moved aside with a `premigrated`
-//! marker, never overwritten — the one exception is the codebase-index cache (derivable via
-//! `/init`), where the older of two copies is dropped and the drop is reported.
+//! raw `canonicalize` string, so *whether git spawned* (PATH luck) silently picked the key. This
+//! module merges Core-owned skills, codebase indexes and saved-session provenance from legacy
+//! slugs into the current slug. Provider-owned and legacy Memory stores are not inspected or moved.
+//! Dry-run by default, `--apply` to execute, every action reported. Name clashes are moved aside,
+//! never overwritten — the one exception is the codebase-index cache (derivable via `/init`),
+//! where the older of two copies is dropped and the drop is reported.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +14,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::core::config;
-use crate::memory::store;
 
 /// Everything found on disk under one legacy slug.
 pub struct LegacyZone {
@@ -23,11 +21,6 @@ pub struct LegacyZone {
     pub skills_dir: Option<PathBuf>,
     pub skills_files: usize,
     pub codebase_index: Option<PathBuf>,
-    pub core_active: Option<PathBuf>,
-    pub core_next: Option<PathBuf>,
-    pub entries: usize,
-    pub review: usize,
-    pub archive: usize,
     /// Saved sessions whose in-file provenance still names this legacy slug. Sessions are a FLAT
     /// pool (one dir for every project) keyed by metadata inside each file, so they are invisible to
     /// the per-slug directory sweep every other artifact here uses.
@@ -36,14 +29,7 @@ pub struct LegacyZone {
 
 impl LegacyZone {
     fn is_empty(&self) -> bool {
-        self.skills_dir.is_none()
-            && self.codebase_index.is_none()
-            && self.core_active.is_none()
-            && self.core_next.is_none()
-            && self.entries == 0
-            && self.review == 0
-            && self.archive == 0
-            && self.sessions == 0
+        self.skills_dir.is_none() && self.codebase_index.is_none() && self.sessions == 0
     }
 
     /// One human line for the plan listing: which artifact kinds exist under this slug.
@@ -55,26 +41,11 @@ impl LegacyZone {
         if self.codebase_index.is_some() {
             parts.push("codebase index".to_string());
         }
-        if self.core_active.is_some() {
-            parts.push("frozen core (active)".to_string());
-        }
-        if self.core_next.is_some() {
-            parts.push("frozen core (staged)".to_string());
-        }
         if self.sessions > 0 {
             parts.push(format!(
                 "{} saved conversation{}",
                 self.sessions,
                 if self.sessions == 1 { "" } else { "s" }
-            ));
-        }
-        if self.entries + self.review + self.archive > 0 {
-            parts.push(format!(
-                "memory: {} entr{}, {} review, {} archived",
-                self.entries,
-                if self.entries == 1 { "y" } else { "ies" },
-                self.review,
-                self.archive
             ));
         }
         format!("{}  —  {}", self.slug, parts.join(" · "))
@@ -109,22 +80,9 @@ pub fn plan() -> Result<ZonePlan> {
 /// machinery on any host (on Unix, canonicalize has no verbatim spelling, so a sandbox often has
 /// ZERO real legacy candidates — the machinery still has to be provable there).
 fn plan_for(current_slug: String, candidates: Vec<String>) -> Result<ZonePlan> {
-    let stores = [
-        store::load_from(&config::entries_dir())?,
-        store::load_from(&config::review_dir())?,
-        store::load_from(&config::archive_dir())?,
-    ];
     let mut legacy = Vec::new();
     for slug in candidates {
         let skills = skills_zone_dir(&slug);
-        let counts: Vec<usize> = stores
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .filter(|e| e.scope.as_deref() == Some(slug.as_str()))
-                    .count()
-            })
-            .collect();
         let z = LegacyZone {
             skills_files: if skills.is_dir() {
                 dir_file_count(&skills)
@@ -133,11 +91,6 @@ fn plan_for(current_slug: String, candidates: Vec<String>) -> Result<ZonePlan> {
             },
             skills_dir: Some(skills).filter(|p| p.is_dir()),
             codebase_index: Some(config::codebase_index_path(&slug)).filter(|p| p.is_file()),
-            core_active: Some(config::core_active_path(&slug)).filter(|p| p.is_file()),
-            core_next: Some(config::core_next_path(&slug)).filter(|p| p.is_file()),
-            entries: counts[0],
-            review: counts[1],
-            archive: counts[2],
             sessions: crate::core::session_store::count_sessions_of_slug(&slug),
             slug,
         };
@@ -151,16 +104,12 @@ fn plan_for(current_slug: String, candidates: Vec<String>) -> Result<ZonePlan> {
     })
 }
 
-/// Existence-only probe for the startup hint — file/dir checks, no store scan (a zone whose only
-/// artifacts are entry tags still shows up in `aizen zone migrate`'s full plan). Returns the
-/// first legacy slug with anything on disk.
+/// Existence-only probe for the startup hint — Core-owned file/dir checks, no Memory store scan.
+/// Returns the first legacy slug with a skill directory or codebase index.
 pub fn quick_legacy_probe() -> Option<String> {
-    config::legacy_slug_candidates().into_iter().find(|slug| {
-        skills_zone_dir(slug).is_dir()
-            || config::codebase_index_path(slug).is_file()
-            || config::core_active_path(slug).is_file()
-            || config::core_next_path(slug).is_file()
-    })
+    config::legacy_slug_candidates()
+        .into_iter()
+        .find(|slug| skills_zone_dir(slug).is_dir() || config::codebase_index_path(slug).is_file())
 }
 
 /// Execute the merge. Per-artifact failures become warnings (the report says exactly what moved
@@ -179,23 +128,6 @@ pub fn apply(plan: &ZonePlan) -> MigrateReport {
             let dst = config::codebase_index_path(&plan.current_slug);
             merge_index_cache(src, &dst, &mut rep);
         }
-        for (src, dst, label) in [
-            (
-                &z.core_active,
-                config::core_active_path(&plan.current_slug),
-                "frozen core (active)",
-            ),
-            (
-                &z.core_next,
-                config::core_next_path(&plan.current_slug),
-                "frozen core (staged)",
-            ),
-        ] {
-            if let Some(src) = src {
-                merge_keep_current(src, &dst, label, &mut rep);
-            }
-        }
-        retag_store_scope(&z.slug, &plan.current_slug, &mut rep);
         // Sessions are the one artifact keyed INSIDE the file rather than by directory. Without this
         // leg a renamed/moved checkout kept every pre-move conversation labeled "from <old dir>" and
         // made `/resume` warn that the user's own transcripts belonged to another project — with no
@@ -336,88 +268,6 @@ fn merge_index_cache(src: &Path, dst: &Path, rep: &mut MigrateReport) {
     }
 }
 
-/// Frozen-core files are distilled state, so a clash keeps the CURRENT zone's file and moves the
-/// legacy one aside with a `premigrated` marker for the user to review — never silently merged.
-fn merge_keep_current(src: &Path, dst: &Path, label: &str, rep: &mut MigrateReport) {
-    if !dst.exists() {
-        let moved = dst
-            .parent()
-            .map(|p| fs::create_dir_all(p).context("creating core dir"))
-            .unwrap_or(Ok(()))
-            .and_then(|_| fs::rename(src, dst).context("renaming core file"));
-        match moved {
-            Ok(_) => rep
-                .actions
-                .push(format!("{label}: {} → {}", src.display(), dst.display())),
-            Err(e) => rep
-                .warnings
-                .push(format!("{label}: could not move {}: {e:#}", src.display())),
-        }
-        return;
-    }
-    let aside = match unique_path(&PathBuf::from(format!("{}.premigrated", src.display()))) {
-        Some(p) => p,
-        None => {
-            rep.warnings.push(format!(
-                "{label}: no free aside name — legacy left in place at {}",
-                src.display()
-            ));
-            return;
-        }
-    };
-    match fs::rename(src, &aside) {
-        Ok(_) => rep.actions.push(format!(
-            "{label}: kept the current zone's file; legacy moved aside → {} (review, then delete by hand)",
-            aside.display()
-        )),
-        Err(e) => rep.warnings.push(format!("{label}: could not move {} aside: {e:#}", src.display())),
-    }
-}
-
-/// Rewrite `scope: <legacy>` → `scope: <current>` across entries/review/archive via the
-/// field-map-preserving `store::update`, so unknown frontmatter keys survive verbatim.
-fn retag_store_scope(legacy_slug: &str, current_slug: &str, rep: &mut MigrateReport) {
-    for (dir, label) in [
-        (config::entries_dir(), "entries"),
-        (config::review_dir(), "review"),
-        (config::archive_dir(), "archive"),
-    ] {
-        let loaded = match store::load_from(&dir) {
-            Ok(l) => l,
-            Err(e) => {
-                rep.warnings.push(format!(
-                    "memory {label}: could not read {}: {e:#}",
-                    dir.display()
-                ));
-                continue;
-            }
-        };
-        let mut n = 0usize;
-        for e in loaded
-            .iter()
-            .filter(|e| e.scope.as_deref() == Some(legacy_slug))
-        {
-            let patch = store::EntryPatch {
-                scope: Some(Some(current_slug.to_string())),
-                // Bookkeeping-only: the fact didn't change, so its aging clock must not either.
-                preserve_updated: true,
-                ..Default::default()
-            };
-            match store::update(e, &patch) {
-                Ok(_) => n += 1,
-                Err(err) => rep
-                    .warnings
-                    .push(format!("memory {label}: {} not retagged: {err:#}", e.id)),
-            }
-        }
-        if n > 0 {
-            rep.actions.push(format!(
-                "memory {label}: retagged {n} fact(s) {legacy_slug} → {current_slug}"
-            ));
-        }
-    }
-}
-
 fn dir_file_count(dir: &Path) -> usize {
     fs::read_dir(dir)
         .map(|rd| rd.flatten().count())
@@ -445,9 +295,9 @@ fn unique_path(p: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_memory_fixture as legacy_memory;
 
-    // The env-sandbox helpers mirror memory::store tests: pin AIZEN_HOME + AIZEN_PROJECT_ROOT under
-    // a temp dir while holding the process-wide TEST_HOME_LOCK.
+    // Pin AIZEN_HOME + AIZEN_PROJECT_ROOT under a temp dir while holding TEST_HOME_LOCK.
     fn with_sandbox<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
@@ -481,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_moves_skills_index_core_and_retags_entries() {
+    fn migrate_moves_core_assets_but_preserves_legacy_memory() {
         with_sandbox(|_root| {
             let current = config::project_slug();
             // A fabricated legacy twin, injected via `plan_for` — host-independent (on Unix the
@@ -499,27 +349,23 @@ mod tests {
             let lindex = config::codebase_index_path(&legacy);
             std::fs::create_dir_all(lindex.parent().unwrap()).unwrap();
             std::fs::write(&lindex, "{}").unwrap();
-            let lcore = config::core_active_path(&legacy);
+            let lcore = legacy_memory::frozen_active_path(&legacy);
             std::fs::create_dir_all(lcore.parent().unwrap()).unwrap();
             std::fs::write(&lcore, "core\n").unwrap();
-            store::add_scoped(
-                "fact one",
-                "",
-                store::MemoryType::Project,
-                "the body",
-                Some(&legacy),
-            )
-            .expect("seed scoped entry");
+            let legacy_entry = legacy_memory::entries_dir().join("fixture.md");
+            std::fs::create_dir_all(legacy_entry.parent().unwrap()).unwrap();
+            let legacy_bytes = format!("---\nname: untouched\nscope: {legacy}\n---\nlegacy fact\n");
+            std::fs::write(&legacy_entry, &legacy_bytes).unwrap();
 
             let p = plan_for(current.clone(), vec![legacy.clone()]).expect("plan");
             assert_eq!(p.current_slug, current);
             assert_eq!(p.legacy.len(), 1, "exactly the fabricated legacy zone");
             let z = &p.legacy[0];
             assert_eq!(z.slug, legacy);
-            assert!(
-                z.skills_dir.is_some() && z.codebase_index.is_some() && z.core_active.is_some()
-            );
-            assert_eq!(z.entries, 1);
+            assert!(z.skills_dir.is_some() && z.codebase_index.is_some());
+            let summary = z.summary();
+            assert!(summary.contains("skills: 1 file(s)") && summary.contains("codebase index"));
+            assert!(!summary.contains("memory") && !summary.contains("frozen"));
 
             let rep = apply(&p);
             assert!(rep.warnings.is_empty(), "warnings: {:?}", rep.warnings);
@@ -530,15 +376,41 @@ mod tests {
             );
             assert!(config::codebase_index_path(&current).is_file());
             assert!(!lindex.exists());
-            assert!(config::core_active_path(&current).is_file());
-            assert!(!lcore.exists());
-            let entries = store::load_from(&config::entries_dir()).unwrap();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].scope.as_deref(), Some(current.as_str()));
+            assert!(!legacy_memory::frozen_active_path(&current).exists());
+            assert_eq!(std::fs::read_to_string(&lcore).unwrap(), "core\n");
+            assert_eq!(
+                std::fs::read_to_string(&legacy_entry).unwrap(),
+                legacy_bytes
+            );
 
             // Second plan is clean: migration converges to nothing-to-do.
             let p2 = plan_for(current.clone(), vec![legacy.clone()]).expect("second plan");
             assert!(p2.legacy.is_empty(), "no legacy artifacts after apply");
+        });
+    }
+
+    #[test]
+    fn memory_only_zone_is_not_a_core_migration_candidate() {
+        with_sandbox(|_root| {
+            let current = config::project_slug();
+            let legacy = format!("{current}-memory-only");
+            let frozen = legacy_memory::frozen_active_path(&legacy);
+            std::fs::create_dir_all(frozen.parent().unwrap()).unwrap();
+            std::fs::write(&frozen, "legacy frozen canary\n").unwrap();
+            let entry = legacy_memory::entries_dir().join("legacy-only.md");
+            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            let bytes = format!("---\nname: untouched\nscope: {legacy}\n---\nlegacy fact\n");
+            std::fs::write(&entry, &bytes).unwrap();
+
+            let plan = plan_for(current, vec![legacy]).unwrap();
+            assert!(plan.legacy.is_empty());
+            let report = apply(&plan);
+            assert!(report.actions.is_empty() && report.warnings.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(&frozen).unwrap(),
+                "legacy frozen canary\n"
+            );
+            assert_eq!(std::fs::read_to_string(&entry).unwrap(), bytes);
         });
     }
 
@@ -587,7 +459,7 @@ mod tests {
             }
             // Frozen core in both zones.
             for (slug, body) in [(&current, "core cur"), (&legacy, "core old")] {
-                let p = config::core_active_path(slug);
+                let p = legacy_memory::frozen_active_path(slug);
                 std::fs::create_dir_all(p.parent().unwrap()).unwrap();
                 std::fs::write(&p, body).unwrap();
             }
@@ -601,16 +473,20 @@ mod tests {
             );
             let renamed = dst.join(format!("deploy.from-{legacy}.md"));
             assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "legacy body");
-            // Core: current kept, legacy moved aside with the premigrated marker.
+            // Legacy Memory is outside this migration: both frozen files stay in place.
             assert_eq!(
-                std::fs::read_to_string(config::core_active_path(&current)).unwrap(),
+                std::fs::read_to_string(legacy_memory::frozen_active_path(&current)).unwrap(),
                 "core cur"
             );
             let aside = PathBuf::from(format!(
                 "{}.premigrated",
-                config::core_active_path(&legacy).display()
+                legacy_memory::frozen_active_path(&legacy).display()
             ));
-            assert_eq!(std::fs::read_to_string(&aside).unwrap(), "core old");
+            assert!(!aside.exists());
+            assert_eq!(
+                std::fs::read_to_string(legacy_memory::frozen_active_path(&legacy)).unwrap(),
+                "core old"
+            );
         });
     }
 }

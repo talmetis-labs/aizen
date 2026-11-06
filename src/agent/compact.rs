@@ -122,7 +122,9 @@ pub fn render_transcript(msgs: &[Message]) -> String {
     let mut out = String::new();
     let mut visual_budget = crate::llm::media::VisualDescriptorBudget::default();
     for m in msgs {
-        let body = m.content.as_deref().unwrap_or("").trim();
+        let body = crate::core::memory_context::clean_content(m)
+            .unwrap_or("")
+            .trim();
         match m.role.as_str() {
             "user" => out.push_str(&format!("User: {body}\n")),
             "assistant" if !m.tool_calls.is_empty() => {
@@ -376,6 +378,11 @@ pub fn splice_compacted_keeping(
             .flat_map(|(start, end, _)| start..=end)
             .collect();
     let mut kept = Vec::new();
+    // Harness user-role nudges are not a new logical turn. Preserve the current host-seated
+    // occurrence even when the ordinary multi-turn cut would summarize its root away.
+    let logical_root = history
+        .iter()
+        .rposition(|message| message.role == "user" && message.user_turn_id.is_some());
     for (mi, message) in history[..cut].iter().enumerate().skip(lead) {
         let has_active = message.images.iter().enumerate().any(|(ii, url)| {
             !message
@@ -384,6 +391,7 @@ pub fn splice_compacted_keeping(
                 .any(|state| state.matches(ii, url) && state.releases_pixels())
         });
         if keep_verbatim == Some(mi)
+            || logical_root == Some(mi)
             || active_groups.contains(&mi)
             || (message.role == "user" && has_active)
         {
@@ -571,6 +579,34 @@ mod tests {
     }
     fn asst(s: &str) -> Message {
         Message::assistant(s.to_string())
+    }
+
+    #[test]
+    fn transcript_omits_only_verified_memory_scaffolds_without_mutating_history() {
+        let prefix = "Recalled memory\n[m1] provider-only canary";
+        let original = format!("{prefix}\n\nactual request");
+        let mut marked = user(&original);
+        crate::core::memory_context::seal(&mut marked, prefix, "fixture", 1, "session", "turn");
+        let unmarked = "Recalled memory\n\nuser-authored heading";
+        let mut tampered = marked.clone();
+        tampered.content = Some(format!("{prefix}-edited\n\nkeep this"));
+        let history = vec![marked, user(unmarked), tampered];
+        let before: Vec<_> = history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect();
+        let transcript = render_transcript(&history);
+        assert!(transcript.starts_with("User: actual request\n"));
+        assert!(transcript.contains(unmarked));
+        assert!(transcript.contains(&format!("{prefix}-edited")));
+        assert_eq!(
+            before,
+            history
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(history[0].memory_scaffold.is_some());
     }
 
     #[tokio::test]
@@ -864,6 +900,51 @@ mod tests {
             !h[2..].iter().any(|m| m.role == "tool"),
             "no dangling tool result in the tail"
         );
+    }
+
+    #[test]
+    fn repeated_compaction_preserves_only_the_current_logical_user_root() {
+        let mut old = user("same request");
+        old.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
+        let old_id = old.user_turn_id.clone();
+        let mut current = user("same request");
+        current.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
+        let current_id = current.user_turn_id.clone();
+        let mut h = vec![
+            Message::system("SYS"),
+            old,
+            asst("old answer"),
+            current,
+            asst("working"),
+            user("synthetic continuation"),
+            asst("more work"),
+        ];
+        splice_compacted(&mut h, 5, "FIRST_SUMMARY").unwrap();
+        assert_eq!(
+            Message::logical_turn(&h).unwrap()[0].user_turn_id,
+            current_id
+        );
+        assert_eq!(h.iter().filter(|m| m.user_turn_id == current_id).count(), 1);
+        assert!(!h.iter().any(|m| m.user_turn_id == old_id));
+        let stored = crate::core::session_store::stored_history(&h).unwrap();
+        let mut h =
+            crate::core::session_store::parse_stored_history(&serde_json::to_vec(&stored).unwrap())
+                .unwrap();
+        h.push(user("another synthetic continuation"));
+        h.push(asst("finished"));
+        let cut = h.len() - 2;
+        splice_compacted(&mut h, cut, "SECOND_SUMMARY").unwrap();
+        let turn = Message::logical_turn(&h).unwrap();
+        assert_eq!(turn[0].content.as_deref(), Some("same request"));
+        assert_eq!(turn[0].user_turn_id, current_id);
+        assert_eq!(
+            turn[1].content.as_deref(),
+            Some("another synthetic continuation")
+        );
+        assert_eq!(h.iter().filter(|m| m.user_turn_id == current_id).count(), 1);
+        assert!(!serde_json::to_string(&h)
+            .unwrap()
+            .contains(current_id.as_ref().unwrap().as_str()));
     }
 
     #[tokio::test]

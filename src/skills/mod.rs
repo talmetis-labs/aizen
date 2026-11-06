@@ -663,7 +663,7 @@ fn bump_usage(location: &SkillLocation) -> Result<bool> {
     let sk = read_location(location.clone())?;
     let mut state = SkillState::from_skill(&sk);
     state.uses = state.uses.saturating_add(1);
-    state.updated = crate::memory::bloat::decay::today();
+    state.updated = crate::core::dates::today();
     storage::write_state(&location.root, &location.slug, &state)?;
     Ok(true)
 }
@@ -703,7 +703,7 @@ pub fn refine(
     let old_state = SkillState::from_skill(&sk);
     let mut state = old_state.clone();
     state.version = state.version.saturating_add(1);
-    state.updated = crate::memory::bloat::decay::today();
+    state.updated = crate::core::dates::today();
     crate::core::persist::atomic_write(
         &stage.join("old-state.json"),
         &serde_json::to_vec_pretty(&old_state)?,
@@ -755,18 +755,7 @@ pub fn refine(
 /// "no signal this turn", never an error — the same posture as `record_retrieval`. Fewer than one
 /// fact in the ledger is a no-op, since an edge needs two endpoints.
 pub fn note_skill_cofire(name: &str) {
-    if !crate::memory::graph::recording_enabled() {
-        return;
-    }
-    let facts = crate::memory::pending::current();
-    if facts.is_empty() {
-        return;
-    }
-    let node = crate::memory::graph::node_skill(name);
-    let mut ids: Vec<&str> = vec![node.as_str()];
-    ids.extend(facts.iter().map(|p| p.id.as_str()));
-    let today = crate::memory::bloat::decay::today();
-    let _ = crate::memory::graph::record_coretrieval(&ids, &today);
+    crate::plugin::associations::note(format!("skill:{name}"));
 }
 
 /// Skills associated with the facts recalled THIS turn, strongest first (name → edge weight).
@@ -775,33 +764,10 @@ pub fn note_skill_cofire(name: &str) {
 /// graph reorder the always-on index is opt-in until a bench earns it — the same discipline the
 /// dense tier and `AIZEN_GRAPH_EXPAND` follow.
 fn graph_affinity() -> std::collections::HashMap<String, f64> {
-    let mut out = std::collections::HashMap::new();
     if !crate::core::config::skill_graph_rank_enabled() {
-        return out;
+        return Default::default();
     }
-    let facts = crate::memory::pending::current();
-    if facts.is_empty() {
-        return out;
-    }
-    let today = crate::memory::bloat::decay::today();
-    for p in facts {
-        for (node, w) in crate::memory::graph::neighbors_of_kind(
-            &p.id,
-            crate::memory::graph::SKILL_PREFIX,
-            &today,
-            8,
-            0.35,
-        ) {
-            let slug = node
-                .strip_prefix(crate::memory::graph::SKILL_PREFIX)
-                .unwrap_or(&node)
-                .to_string();
-            // A skill linked to SEVERAL recalled facts is more relevant than one linked strongly to
-            // a single fact, so accumulate rather than take the max.
-            *out.entry(slug).or_insert(0.0) += w;
-        }
-    }
-    out
+    crate::plugin::associations::skill_affinity()
 }
 
 /// Retire a skill by name — the current zone's copy first, else the global one. `Ok(true)` if a
@@ -980,18 +946,16 @@ pub fn list_archive() -> Vec<Skill> {
 const INDEX_MAX_LINES: usize = 15;
 
 /// Minimum share of the user's query tokens a skill's trigger text must cover before the skill is
-/// named on the turn. Deliberately the same constant as the memory recall gate
-/// ([`crate::memory::RECALL_GATE_COVERAGE`]) — it is the same question ("does this actually bear on
-/// what was asked?") answered over the same tokenizer, and two different numbers would only mean one
-/// of them was unmeasured.
+/// named on the turn. This Core-owned relevance gate uses the codebase/Skill tokenizer and is
+/// independent of a persistent Memory provider's ranking policy.
 const SKILL_GATE_COVERAGE: f64 = 0.34;
 
 /// Per-turn ceiling on the gated skill block. A trigger line is ~25 tokens, so this admits a handful
 /// of genuinely-matching procedures and refuses to become a second always-on index.
 pub const SKILL_TURN_BUDGET_TOKENS: usize = 160;
 
-/// Marker opening the per-turn skill block, mirroring [`crate::memory::RECALL_MARKER`]. Matched at
-/// position 0 when stripping stale blocks, so a user who merely types the phrase is unaffected.
+/// Marker opening the Core-owned per-turn skill block. Matched at position 0 when stripping
+/// stale skill blocks; optional provider Memory uses its own content-bound provenance instead.
 pub const SKILL_MARKER: &str = "Saved procedures that may fit this turn";
 
 /// How many chars of a trigger hint reach the prompt, in the index and in the gated block alike.
@@ -1034,21 +998,19 @@ fn index_line(sk: &Skill) -> String {
 /// This is the *relevance* gate the always-on index never had. [`prompt_index`] filters on
 /// **applicability** (right OS, required tools present) and then lists everything that survives, on
 /// every turn, whether or not it bears on the request — 19 saved skills render a ~640-token index
-/// that is mostly about other work. Scoring the query against each trigger with the same tokenizer
-/// and threshold the memory recall block uses turns that into "name the procedures that fit *this*
-/// question".
+/// that is mostly about other work. Scoring the query against each trigger with Core's tokenizer
+/// and relevance threshold turns that into "name the procedures that fit *this* question".
 ///
-/// Rides on the **user turn**, exactly like [`crate::memory::recall_block`] and for the same reason:
-/// a per-query block in the system lane would rewrite lane 1 every turn and force the whole
-/// transcript after it to re-bill uncached. The always-on index stays byte-stable and cheap; the
-/// query-shaped part is folded where the bytes are already volatile.
+/// Rides on the **user turn**: a per-query block in the system lane would rewrite lane 1 every turn
+/// and force the whole transcript after it to re-bill uncached. The always-on index stays byte-stable
+/// and cheap; the query-shaped part is folded where the bytes are already volatile.
 ///
 /// `None` when nothing clears the gate — which is most turns, and is the point.
 pub fn turn_block(query: &str, budget_tokens: usize) -> Option<String> {
     if query.trim().is_empty() {
         return None;
     }
-    let q: std::collections::HashSet<String> = crate::memory::tokenize::tokenize(query)
+    let q: std::collections::HashSet<String> = crate::retrieval::tokenize::tokenize(query)
         .into_iter()
         .collect();
     if q.is_empty() {
@@ -1062,7 +1024,7 @@ pub fn turn_block(query: &str, budget_tokens: usize) -> Option<String> {
         }
         // Score the trigger against the query, NOT the query against the trigger: a long `when:`
         // must not be penalised for saying more than the user did.
-        let toks = crate::memory::tokenize::tokenize(trigger);
+        let toks = crate::retrieval::tokenize::tokenize(trigger);
         if toks.is_empty() {
             continue;
         }
@@ -1086,11 +1048,12 @@ pub fn turn_block(query: &str, budget_tokens: usize) -> Option<String> {
     });
 
     let header = format!("{SKILL_MARKER} (call skill_load(\"<name>\") to get the steps):");
-    let mut budget = budget_tokens.saturating_sub(crate::memory::render::est_tokens(&header) + 1);
+    let mut budget =
+        budget_tokens.saturating_sub(crate::core::tokens::estimate_str_ceil(&header) + 1);
     let mut lines = String::new();
     for (_, sk) in &scored {
         let line = index_line(sk);
-        let cost = crate::memory::render::est_tokens(&line);
+        let cost = crate::core::tokens::estimate_str_ceil(&line);
         if cost > budget {
             break;
         }
@@ -1857,7 +1820,7 @@ mod tests {
             assert_eq!(sk.uses, 1, "one load → uses 1");
             assert_eq!(
                 sk.updated,
-                crate::memory::bloat::decay::today(),
+                crate::core::dates::today(),
                 "use is date-stamped"
             );
             record_use("hot").unwrap();

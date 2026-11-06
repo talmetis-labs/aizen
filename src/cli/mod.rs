@@ -4,14 +4,17 @@
 pub mod account_cmd;
 pub mod agents_cmd;
 pub mod apps;
+pub mod codebase_cmd;
 pub mod compact;
 pub mod coop_cmd;
 pub mod custom_cmd;
 pub mod files_cmd;
 pub mod init_cmd;
 pub mod key_cmd;
+pub mod memory_client;
 pub mod memory_cmd;
 pub mod persona_cmd;
+pub mod plugin_cmd;
 pub mod run_cmds;
 pub mod sandbox_cmd;
 pub mod sessions;

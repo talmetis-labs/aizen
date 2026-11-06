@@ -555,13 +555,14 @@ fn nudge_role_for_endpoint() -> crate::agent::NudgeRole {
 /// lane is refreshed AFTER the fold, never before: recall seats this turn's handle→id ledger and the
 /// `<skills>` lane ranks itself by affinity to exactly those facts, so refreshing first would build
 /// the index against the PREVIOUS turn's recall.
-pub(crate) fn seat_user_message(
+pub(crate) async fn seat_user_message(
     line: &str,
     images: Vec<String>,
     history: &mut Vec<Message>,
     model: &str,
     design: &DesignContext,
-) {
+    cfg: &AgentConfig,
+) -> Result<()> {
     // Every model call from here until the next seated user message — the loop, its sub-agents,
     // the post-turn chores — is billed to this turn in the usage ledger.
     client::cost_meter().begin_turn();
@@ -570,6 +571,29 @@ pub(crate) fn seat_user_message(
     // `finish_turn` says otherwise, so a turn that errors out keeps its plan for the retry.
     crate::agent::todo::begin_user_turn();
     crate::agent::todo::end_turn(true);
+    // Retire only content-bound host scaffolds at a valid user boundary. Saved source files and
+    // unmarked text remain unchanged. The actual turn carrier/cancel token survives provider IO.
+    crate::core::memory_context::strip_history(history);
+    let root = cfg.effective_root();
+    let user_turn_id = crate::core::types::UserTurnId::new()?;
+    if let Err(error) = crate::plugin::snapshots::prepare(
+        "repl",
+        &root,
+        cfg.exec_ctx.clone(),
+        &user_turn_id,
+        if crate::core::turn_shape::classify(line) == crate::core::turn_shape::TurnShape::Question {
+            "" // Question turns do not render recall; do not attribute unseen hits to this turn.
+        } else {
+            line
+        },
+        false,
+        cfg.cancel.clone(),
+    )
+    .await
+    {
+        crate::plugin::runtime::optional_failure(error)?;
+        tui::note_line("Memory context unavailable; continuing without optional Memory.");
+    }
     let sent = fold_context_into_query(line);
     refresh_dynamic_prompt_lane(history, model);
     if images.is_empty() {
@@ -582,9 +606,14 @@ pub(crate) fn seat_user_message(
         );
         history.push(Message::user_with_images(sent, images));
     }
+    if let Some(message) = history.last_mut() {
+        message.user_turn_id = Some(user_turn_id);
+        crate::plugin::snapshots::current("repl").seal_message(message);
+    }
     // Refresh the exit-flush snapshot the moment the user turn lands, so an abrupt window close
     // mid-turn still persists the question (the per-turn autosave only runs on success).
     crate::core::session_store::update_live_history_with_design(history, Some(&design.snapshot()));
+    Ok(())
 }
 
 // ── the shared turn: everything both REPL surfaces do identically ─────────────────────────────
@@ -727,7 +756,16 @@ pub(crate) async fn run_agent_turn(
                 }
             }
         });
-    let result = agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history).await;
+    let association_snapshot = crate::plugin::snapshots::current("repl");
+    let result = crate::plugin::associations::scoped(
+        association_snapshot.clone(),
+        cfg.exec_ctx.clone(),
+        agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history),
+    )
+    .await;
+    if result.is_err() {
+        crate::plugin::associations::discard(&association_snapshot);
+    }
     if result.as_ref().err().is_some_and(|error| {
         agent::tool_error_effect_state(error) != agent::tools::ToolEffectState::Settled
     }) {
@@ -773,6 +811,7 @@ pub(crate) async fn finish_turn(
     http: &reqwest::Client,
     ep: &cli_config::ResolvedEndpoint,
     design: &DesignContext,
+    cfg: &AgentConfig,
 ) {
     design.finalize();
     crate::core::session_store::update_live_history_with_design(history, Some(&design.snapshot()));
@@ -846,11 +885,53 @@ pub(crate) async fn finish_turn(
     // (`compact_at_pct`), so a long turn shrinks mid-flight instead of after it ends.
     {
         let turn = last_turn_slice(history).to_vec();
+        let root = cfg.effective_root();
+        let execution = cfg.exec_ctx.clone();
+        let association_snapshot = crate::plugin::snapshots::current("repl");
+        let learning_model = cfg.image_config.as_deref().and_then(|config| {
+            cfg.wire_reasoning_effort
+                .as_ref()
+                .map(|effort| crate::plugin::events::TurnModel::new(ep, effort.clone(), config))
+        });
+        let memory_event = match crate::plugin::events::prepare(
+            &outcome.stop,
+            history,
+            &root,
+            execution.clone(),
+            cfg.cancel.clone(),
+            Some(&association_snapshot),
+            learning_model,
+        ) {
+            Ok(event) => event,
+            Err(_) => {
+                tui::note_line("Memory provider learning unavailable; coding result preserved.");
+                None
+            }
+        };
         let http = http.clone();
         let ep = ep.clone();
         crate::repl::learning_queue::LEARNING.spawn(async move {
-            maybe_run_secretary(&turn, &http, &ep.base_url, &ep.api_key, &ep.model).await;
-            maybe_evolve_persona(&http, &ep.base_url, &ep.api_key, &ep.model).await;
+            crate::plugin::associations::scoped(association_snapshot.clone(), execution, async {
+                maybe_run_secretary(&turn, &http, &ep.base_url, &ep.api_key, &ep.model).await;
+                maybe_evolve_persona(&http, &ep.base_url, &ep.api_key, &ep.model).await;
+            })
+            .await;
+            if crate::plugin::associations::flush(&association_snapshot)
+                .await
+                .is_err()
+            {
+                tui::note_line(
+                    "Memory associations did not settle; further optional learning skipped.",
+                );
+                return;
+            }
+            if let Some(event) = memory_event {
+                if crate::plugin::events::dispatch(event).await.is_err() {
+                    tui::note_line(
+                        "Memory provider learning failed; no automatic retry was attempted.",
+                    );
+                }
+            }
         });
     }
     // Persistence is NOT optional: a cancelled learning pass must still leave the conversation on

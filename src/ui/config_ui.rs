@@ -10,12 +10,13 @@ use crate::cli_args::{AuthCmd, ConfigCmd, ProviderConfigCmd};
 use crate::core::approval::ApprovalMode;
 use crate::core::cli_config;
 use crate::llm::client;
-use crate::memory;
 use crate::ui::{icons, splash, theme, tui};
 use crate::{effective_ctx_window, http_client, ui_theme};
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+
+mod memory;
 
 fn parse_toolset_list(s: &str) -> Option<Vec<String>> {
     let mut values: Vec<String> = s
@@ -200,6 +201,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
         None => return config_wizard().await, // bare `aizen config` → interactive setup
     };
     match cmd {
+        ConfigCmd::Memory => memory::edit(&mut cli_config::load()).await,
         ConfigCmd::Set {
             base_url,
             api_key,
@@ -539,7 +541,7 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 cfg.detach_provider_if_url_changed(previous_url.as_deref());
             }
             cfg.sync_active_provider();
-            cli_config::save(&cfg)?;
+            cli_config::save_with_memory_policy(&cfg, memory_auto_learn)?;
             println!(
                 "{} {}",
                 crate::ui::theme::ok("✓"),
@@ -1009,46 +1011,24 @@ fn print_config(cfg: &cli_config::CliConfig) {
         theme::warn("unavailable on Windows").to_string(),
     );
 
-    // ── Memory ──
-    // Reports the tier that will ACTUALLY run, not the config flag: `settings()` folds in the cargo
-    // feature, `AIZEN_MEM_DENSE`, and whether a model is installed. Printing the flag alone would
-    // claim dense recall on a build that has no semantic backend.
-    section("Memory");
-    row("auto-learn", on(cfg.memory_auto_learn.unwrap_or(true)));
+    section("Memory (optional executable)");
+    match crate::plugin::manager::status() {
+        Ok(status) => {
+            row("provider", status.selected.unwrap_or_else(|| "none".into()));
+            row("state", status.state.into());
+        }
+        Err(_) => row(
+            "state",
+            "unavailable (configuration needs inspection)".into(),
+        ),
+    }
     row(
-        "recall",
-        if memory::settings().enable_dense {
-            format!("{}  {}", theme::accent("lexical + dense"), theme::ok("✓"))
-        } else if cfg!(feature = "dense") {
-            format!(
-                "{}  {}",
-                theme::accent("lexical"),
-                theme::faint("· no embedding model installed")
-            )
-        } else {
-            format!(
-                "{}  {}",
-                theme::accent("lexical"),
-                theme::faint("· this build has no semantic backend")
-            )
-        },
+        "learning",
+        memory::summary()
+            .map(|(_, learning)| on(learning))
+            .unwrap_or_else(|_| "unavailable".into()),
     );
-    row(
-        "embed model",
-        match cfg.embed_model.as_deref() {
-            Some(m) => theme::accent(m).to_string(),
-            None => format!(
-                "{}  {}",
-                theme::faint("auto"),
-                theme::faint(format!(
-                    "· {}",
-                    memory::embed::discover_local_model()
-                        .map(|c| c.name)
-                        .unwrap_or_else(|| "none found".into())
-                ))
-            ),
-        },
-    );
+    row("model access", "not granted by this editor".into());
 
     // ── Web search ──
     // Both keys are listed because `/config` now edits both, and because the "needs a key" warning is
@@ -2077,42 +2057,58 @@ fn prompt_provider(
     Ok(PROVIDER_PRESETS.get(pick))
 }
 
-/// The config HUB: a `Select` of sections, each row showing its current value so the panel reads as a
-/// live dashboard. Pick a section → edit just that → it saves immediately → back to the menu. Esc or
-/// "Done" exits. Every field here is also scriptable via `aizen config set`, so nothing depends on it.
-async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
-    let theme = ui_theme();
-    loop {
-        // Glanceable current-value hints, one per row.
-        let model_h = cfg.model.clone().unwrap_or_else(|| "not set".into());
-        let tavily_h = if cfg
-            .reach
-            .as_ref()
-            .and_then(|r| r.resolved_tavily_key())
-            .is_some()
-        {
-            "set"
-        } else {
-            "none"
-        };
-        let compact_h = match cfg.compact_threshold_pct.unwrap_or(80) {
-            0 => "off".to_string(),
-            t => format!("{t}%"),
-        };
-        let effort_h = if cfg.ultimate.unwrap_or(false) {
-            "ultimate".to_string()
-        } else if cfg.auto_effort == Some(false) {
-            cfg.reasoning_effort
-                .clone()
-                .unwrap_or_else(|| "fixed".into())
-        } else {
-            "auto".to_string()
-        };
-        let approval_h = cfg.persisted_approval_mode().to_string();
-        let icons_h = cfg.icons.clone().unwrap_or_else(|| "nerd".into());
-        let visuals_h = cfg.response_visuals().to_string();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSection {
+    Providers,
+    Model,
+    Subagents,
+    WebSearch,
+    Memory,
+    Codebase,
+    Session,
+    Reasoning,
+    Approval,
+    Display,
+    Vision,
+    Sandbox,
+    Context,
+    Show,
+    Done,
+}
 
-        let items = vec![
+fn config_rows(cfg: &cli_config::CliConfig) -> Vec<(ConfigSection, String)> {
+    let model_h = cfg.model.clone().unwrap_or_else(|| "not set".into());
+    let tavily_h = if cfg
+        .reach
+        .as_ref()
+        .and_then(|r| r.resolved_tavily_key())
+        .is_some()
+    {
+        "set"
+    } else {
+        "none"
+    };
+    let compact_h = match cfg.compact_threshold_pct.unwrap_or(80) {
+        0 => "off".to_string(),
+        t => format!("{t}%"),
+    };
+    let effort_h = if cfg.ultimate.unwrap_or(false) {
+        "ultimate".to_string()
+    } else if cfg.auto_effort == Some(false) {
+        cfg.reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "fixed".into())
+    } else {
+        "auto".to_string()
+    };
+    let approval_h = cfg.persisted_approval_mode().to_string();
+    let icons_h = cfg.icons.clone().unwrap_or_else(|| "nerd".into());
+    let visuals_h = cfg.response_visuals().to_string();
+
+    use ConfigSection as S;
+    vec![
+        (
+            S::Providers,
             format!(
                 "Providers & connection · {} · {}",
                 cfg.active_provider
@@ -2120,18 +2116,34 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
                     .unwrap_or("unsaved connection"),
                 model_h
             ),
+        ),
+        (
+            S::Model,
             format!(
                 "Main model & context · {}",
                 cfg.model.as_deref().unwrap_or("not set")
             ),
-            format!("Sub-agents      · {}", subagent_hint(&cfg)),
-            format!("Web search      · tavily {tavily_h}"),
-            format!("Memory          · {}", memory_hint(&cfg)),
-            format!("Session         · compact {compact_h}"),
-            format!("Reasoning       · {effort_h}"),
-            format!("Approval        · {approval_h}"),
+        ),
+        (
+            S::Subagents,
+            format!("Sub-agents      · {}", subagent_hint(cfg)),
+        ),
+        (S::WebSearch, format!("Web search      · tavily {tavily_h}")),
+        (S::Memory, format!("Memory          · {}", memory_hint(cfg))),
+        (S::Codebase, "Codebase        · local embedding".into()),
+        (S::Session, format!("Session         · compact {compact_h}")),
+        (S::Reasoning, format!("Reasoning       · {effort_h}")),
+        (S::Approval, format!("Approval        · {approval_h}")),
+        (
+            S::Display,
             format!("Display         · icons {icons_h} · visuals {visuals_h}"),
-            "Vision          · enabled by default · optional overrides".to_string(),
+        ),
+        (
+            S::Vision,
+            "Vision          · enabled by default · optional overrides".into(),
+        ),
+        (
+            S::Sandbox,
             format!(
                 "Sandbox         · {} · network {}",
                 cfg.sandbox
@@ -2143,10 +2155,20 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
                     .and_then(|s| s.network.as_deref())
                     .unwrap_or("deny")
             ),
-            "Context window override (optional)".to_string(),
-            "Show full config".to_string(),
-            "Done".to_string(),
-        ];
+        ),
+        (S::Context, "Context window override (optional)".into()),
+        (S::Show, "Show full config".into()),
+        (S::Done, "Done".into()),
+    ]
+}
+
+/// The config HUB: each named section keeps navigation independent of display-row ordering.
+async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
+    let theme = ui_theme();
+    loop {
+        use ConfigSection as S;
+        let rows = config_rows(&cfg);
+        let items: Vec<_> = rows.iter().map(|(_, label)| label.as_str()).collect();
         let pick = match Select::with_theme(&theme)
             .with_prompt("Config — pick a section (Esc when done)")
             .report(false)
@@ -2157,31 +2179,45 @@ async fn config_menu(mut cfg: cli_config::CliConfig) -> Result<()> {
             Some(i) => i,
             None => break,
         };
-        // Vision saves only on its separate explicit persistence action, never the hub auto-save.
-        if pick == 9 {
+        let section = rows[pick].0;
+        // These hubs save only explicitly confirmed actions, never on navigation/exit.
+        if section == S::Memory {
+            if let Err(e) = config_edit_memory(&mut cfg).await {
+                tui::note_line("Memory setup failed; no automatic recovery performed.");
+                memory::report_error(&e);
+            }
+            continue;
+        }
+        if section == S::Codebase {
+            if let Err(e) = memory::codebase(&mut cfg) {
+                memory::report_error(&e);
+            }
+            continue;
+        }
+        if section == S::Vision {
             if let Err(e) = config_edit_vision(&mut cfg) {
                 tui::note_line(&format!("vision setup: {e}"));
             }
             continue;
         }
         let mut apply_sandbox_mode = false;
-        let edited = match pick {
-            0 => config_edit_providers(&mut cfg).await,
-            1 => config_edit_model(&mut cfg).await,
-            2 => config_edit_subagents(&mut cfg).await,
-            3 => config_edit_websearch(&mut cfg).await,
-            4 => config_edit_memory(&mut cfg),
-            5 => config_edit_session(&mut cfg),
-            6 => config_edit_reasoning(&mut cfg),
-            7 => config_edit_approval(&mut cfg),
-            8 => config_edit_display(&mut cfg),
-            10 => config_edit_sandbox(&mut cfg).map(|changed| apply_sandbox_mode = changed),
-            11 => prompt_context_window(&theme, &mut cfg),
-            12 => {
+        let edited = match section {
+            S::Providers => config_edit_providers(&mut cfg).await,
+            S::Model => config_edit_model(&mut cfg).await,
+            S::Subagents => config_edit_subagents(&mut cfg).await,
+            S::WebSearch => config_edit_websearch(&mut cfg).await,
+            S::Session => config_edit_session(&mut cfg),
+            S::Reasoning => config_edit_reasoning(&mut cfg),
+            S::Approval => config_edit_approval(&mut cfg),
+            S::Display => config_edit_display(&mut cfg),
+            S::Sandbox => config_edit_sandbox(&mut cfg).map(|changed| apply_sandbox_mode = changed),
+            S::Context => prompt_context_window(&theme, &mut cfg),
+            S::Show => {
                 print_config(&cfg);
                 continue;
             }
-            _ => break,
+            S::Done => break,
+            S::Memory | S::Codebase | S::Vision => unreachable!("independently saved hub"),
         };
         match edited {
             Ok(()) => match cli_config::save(&cfg) {
@@ -3906,105 +3942,15 @@ async fn config_edit_websearch(cfg: &mut cli_config::CliConfig) -> Result<()> {
 }
 
 /// One-line Memory summary for the hub row: what recall is doing right now.
-fn memory_hint(cfg: &cli_config::CliConfig) -> String {
-    let learn = if cfg.memory_auto_learn.unwrap_or(true) {
-        "auto-learn on"
-    } else {
-        "auto-learn off"
-    };
-    // Report the tier that will ACTUALLY run, not the flag: `settings()` already folds in the cargo
-    // feature, the env override, and whether a model exists on disk.
-    let tier = if memory::settings().enable_dense {
-        "lexical + dense"
-    } else {
-        "lexical"
-    };
-    format!("{learn} · {tier}")
+fn memory_hint(_cfg: &cli_config::CliConfig) -> String {
+    memory::summary()
+        .map(|(provider, _)| provider)
+        .unwrap_or_else(|_| "unavailable".into())
 }
 
-/// Section editor: memory — what gets learned, and which retrieval tiers run.
-///
-/// The dense half is reported before it is offered, because three independent things decide whether
-/// semantic recall runs at all (the `dense` cargo feature, an installed model, `AIZEN_MEM_DENSE`), and
-/// a menu that hid that would let someone "pick a model" on a build that can never use one.
-fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
-    let theme = ui_theme();
-
-    cfg.memory_auto_learn = Some(yn(
-        &theme,
-        "Auto-learn durable facts from each turn?",
-        cfg.memory_auto_learn.unwrap_or(true),
-    )?);
-
-    // ── dense (semantic) recall status ──
-    let dense_built = cfg!(feature = "dense");
-    let models = memory::embed::list_local_models();
-    let active = memory::settings().enable_dense;
-
-    if !dense_built {
-        line_warn("this build has no semantic backend — recall is lexical only");
-        tui::emit_line(&format!(
-            "  {}",
-            style("(a `--features dense` build adds embedding-based recall for paraphrases)").dim()
-        ));
-        return Ok(());
-    }
-    if let Ok(v) = std::env::var("AIZEN_MEM_DENSE") {
-        line_warn(&format!(
-            "$AIZEN_MEM_DENSE={v} overrides the dense decision below"
-        ));
-    }
-    if models.is_empty() {
-        line_warn("no embedding model installed — dense recall is off");
-        tui::emit_line(&format!(
-            "  {}",
-            style("get one with: aizen memory model-download").dim()
-        ));
-        return Ok(());
-    }
-    if active {
-        line_ok("dense recall is on");
-    } else {
-        line_warn("dense recall is off");
-    }
-
-    // Which model, out of what is actually on disk. Auto is first so the default choice stays
-    // "whatever discovery ranks best" rather than freezing today's pick into the config file.
-    let current = cfg.embed_model.clone();
-    let mut items = vec![format!(
-        "auto — best installed ({})",
-        memory::embed::discover_local_model()
-            .map(|c| c.name)
-            .unwrap_or_else(|| "none".into())
-    )];
-    for m in &models {
-        items.push(format!("{}  ({})", m.name, m.source));
-    }
-    let default = current
-        .as_deref()
-        .and_then(|c| models.iter().position(|m| m.name == c).map(|i| i + 1))
-        .unwrap_or(0);
-    if let Some(pick) = Select::with_theme(&theme)
-        .with_prompt("Embedding model (Esc keeps current)")
-        .items(&items)
-        .default(default)
-        .interact_opt()?
-    {
-        // 0 = auto ⇒ clear the pin so discovery decides again.
-        cfg.embed_model = if pick == 0 {
-            None
-        } else {
-            Some(models[pick - 1].name.clone())
-        };
-        if let Some(name) = cfg.embed_model.clone() {
-            if std::env::var("AIZEN_EMBED_MODEL").is_ok_and(|v| !v.trim().is_empty()) {
-                line_warn(&format!(
-                    "$AIZEN_EMBED_MODEL is set — it overrides this choice of {name}"
-                ));
-            }
-        }
-    }
-    Ok(())
+/// Persistent Memory belongs to the selected plugin; Core embedding settings serve codebase RAG.
+async fn config_edit_memory(cfg: &mut cli_config::CliConfig) -> Result<()> {
+    memory::edit(cfg).await
 }
 
 /// Ask at what fill level older turns get summarized away. `off` (or 0) disables auto-compaction;
@@ -4529,7 +4475,7 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
     };
     icons::set_tier(cfg.icons.as_deref()); // apply immediately for the "Saved" preview below
 
-    cli_config::save(cfg)?;
+    cli_config::save_with_memory_policy(cfg, cfg.memory_auto_learn)?;
     tui::emit_line(&format!(
         "\n{} {}",
         crate::ui::theme::ok("✓"),

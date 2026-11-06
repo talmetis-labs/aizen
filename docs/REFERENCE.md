@@ -92,7 +92,7 @@ passed in the same command takes precedence. `--context-window 0` returns to aut
 | `/login` | sign in to Aizen in a browser — the session opens the gateway, so nothing is stored but the token |
 | `/logout` | leave Aizen here: the session **and** the pinned key. Revokes neither |
 | `/config` | provider-first settings: add/edit/switch connections, then assign providers/models to roles and specialists |
-| `/memory [query]` | show your profile, or search memory |
+| `/memory [query]` | offline provider status, or search the explicitly selected Memory provider |
 | `/persona` | character the agent plays + its evolving self-memory: select · new · paste-to-create · view/reset self-memory · `coding on\|off` keeps it on coding turns |
 | `/skills` | saved procedures the agent can load: list · view · new · delete |
 | `/commands` | your **custom slash commands** — markdown macros you fire (see below) |
@@ -115,7 +115,7 @@ passed in the same command takes precedence. `--context-window 0` returns to aut
 
 | type | does |
 | --- | --- |
-| `#<text>` | **remember** `<text>` as a durable memory fact in one keystroke (straight into the brain the agent reads) — sends no turn |
+| `#<text>` | save a durable fact through the selected, enabled Memory provider — sends no agent turn; unavailable without a provider |
 | `!<cmd>` | **shell escape** — run `<cmd>` and show its output (the hard safety floor still blocks catastrophic commands) — sends no turn |
 | `@<path>` | inline that file's contents into your message (only when the file exists — `@handle` in prose is left alone) |
 | `` !`<cmd>` `` | splice a **read-only** command's output into your message (same gate as custom commands) |
@@ -176,7 +176,8 @@ aizen serve              # start listening (Ctrl-C to stop)
 ```
 In a chat: a plain message runs read-only-safe (destructive ops prompt you here); prefix `/agent `
 to run fully autonomously. **Follow-ups keep context** — "now fix it" works because each chat's
-conversation is carried across messages (memory + SOUL + persona seeded once per session). `/new`
+conversation is carried across messages (SOUL and persona remain built in; persistent Memory is
+optional and comes only from the explicitly selected provider). `/new`
 (or `/reset`) starts fresh; `/resume` reports how much context is kept. If the agent needs to
 disambiguate it asks (the `clarify` tool) and your next message is the answer. Token lives in
 `~/.aizen/cli-config.json` (or `AIZEN_TELEGRAM_TOKEN`); only `allowed_chat_ids` may talk to it. The
@@ -235,8 +236,8 @@ stamps from inside its own event loop, and distinguishes idle from busy — so a
 notice a wedged loop won't restart a container that's ten minutes into a legitimate build. Raise
 `AIZEN_HEALTH_MAX_BUSY_SECS` if your turns routinely run longer than 30 minutes.
 
-Build without the dense retrieval tier by passing `FEATURES=` (empty) — a smaller image, at the cost
-of the embedding-based memory tier.
+Build without the dense retrieval tier by passing `FEATURES=` (empty) — a smaller Core image without
+semantic codebase retrieval. A separately installed Memory provider has its own build features.
 
 ### Host it on Kubernetes
 
@@ -602,34 +603,62 @@ servers, `cache_control` on some gateways, `reasoning_effort` out of range): the
 field is dropped or renamed (`max_tokens` → `max_completion_tokens`), the request is re-sent, and
 the model is remembered for the session so it costs one failed call per model, once.
 
+For a route that requires `max_completion_tokens`, set `"output_token_parameter":
+"max_completion_tokens"` in the Core JSON config; `"max_tokens"` explicitly selects the older wire
+field, and omission retains ordinary chat's reactive compatibility. This is a config-wide setting,
+not endpoint discovery or a provider-profile override. It chooses the field, not the cap: `max_tokens`
+continues to set the numerical ceiling. Prepared Memory model jobs do not probe or retry, so a cold
+route requiring the newer field needs this explicit setting. Those jobs honor the tighter of the
+captured turn's cap and the job cap, and refuse HTTP dispatch during tape replay/strict mode.
+
 ### `aizen models` — list the provider's models
 ```bash
 aizen models                       # GET {base}/models, marks your default
 aizen config set --model <id>      # pick one as the default
 ```
 
-The memory brain lives under `~/.aizen/cli-memory/` (override the root with `AIZEN_HOME`).
-Memory commands are fully offline — no creds needed.
+### `aizen codebase model-download` — explicit local model provisioning
 
-Retrieval is **Unicode-aware**: the lexical tokenizer NFC-normalizes before lowercasing and
-splits on `\p{L}\p{N}_`, so Vietnamese (and any accented script) is matched whole instead of
-being shredded to ASCII fragments. This is pure-Rust and adds no dependency to the static binary.
-Measured on the recall bench, Vietnamese paraphrase recall@5 went 0.00 → 1.00 with literal/English
-recall unchanged. Verify with `aizen bench memory --split all`.
+```bash
+aizen codebase model-download potion-base-8M
+aizen codebase model-download                 # uses Core's configured embed_model name
+```
 
-Ranking is **BM25** (Okapi k1=1.2, b=0.75, floored IDF over the active corpus + length
-normalization) — term rarity and doc length now shape relevance, so concise on-point facts beat
-verbose keyword-stuffed ones. A pure-Rust Jaro-Winkler fuzzy bridge for typo'd query terms is
-implemented + unit-tested but **off by default** (on the current corpus it adds candidate noise
-without a recall gain; one flag from on).
+This host command provisions Core codebase retrieval, independently of any Memory provider. It is
+never invoked automatically by startup or retrieval. Only a single portable `minishlab` model name
+is accepted; configured absolute local model paths remain loader inputs, not download destinations.
+The command downloads three Model2Vec assets from Hugging Face into Core's model directory. Loading
+requires a `dense` build. Existing nonempty regular assets are retained; size/path checks are **not**
+a cryptographic integrity check. New assets use bounded transfers and no-overwrite publication.
+Unsupported filesystems fail rather than replacing an existing file.
 
-The store **evolves from reuse** — no LLM, zero extra tokens. Every fact the agent retrieves into
-context is reinforced (at most once/day); ranking is `bm25 · decay · salience`, where reused facts
-decay slower (`half_life·(1+ln1p(reinforced))`) and gain salience (`0.5 + 0.3·reuse + 0.2·recency`,
-capped so BM25 stays dominant), and the always-on frozen core is packed salience-greedy so the
-prompt prefix holds the facts you actually use. This is provable, not marketing: `aizen bench memory
---evolution` runs a 6-session reuse simulation and **fails** unless recall@5 climbs ≥5%/session
-until it plateaus.
+Persistent User/Project Memory is an **optional external executable**, not a built-in store. Without
+a selected enabled provider, ordinary coding, Skills, Persona/Self-memory, Soul, saved conversations
+and ephemeral session notes still work. There is no automatic legacy fallback or provider launch.
+
+Core keeps packages under `<AIZEN_HOME>/plugins/<id>/` and provider data separately under
+`<AIZEN_HOME>/memory-data/<id>/` (the default home is `~/.aizen`). Installation alone never enables,
+selects or executes a provider. `aizen memory status` is offline and does not initialize a store.
+
+Mnemos is the independently built `aizen-mnemos` implementation of the existing persistent engine:
+Unicode-aware lexical matching, BM25/ranking, frozen facts, profiles, learning and maintenance belong
+to that package, not Core. Its default operation is offline; optional semantic retrieval requires
+its own build/model configuration. Core's `dense` feature remains for codebase retrieval. See
+[Memory plugins](MEMORY_PLUGINS.md) for trust, protocol and current implementation limits, and
+[verification](MNEMOS_VERIFICATION.md) for measured coverage. No public Mnemos package is assumed.
+
+**Existing users:** Desktop Memory settings offers an explicit legacy-transfer flow with an
+`AIZEN_HOME`-aware source and a new managed destination, plus optional alternate source/destination
+locations. Preview first, stop old writers, then confirm backup and transfer. The old source and any
+current Mnemos store remain untouched; a separate **Use imported memory** confirmation selects the
+new store without changing Learning. Interrupted work has explicit status/recovery, never automatic
+replay. Import is whole-store and byte-preserving, not a merge or automatic project-scope repair.
+A compatible package declaring `legacy_adoption_v1` is required. V2 additionally advertises
+`legacy_adoption_v2`, supporting bounded streaming backups of large derived caches and exact reviewed
+archive attachments (backup-only, never Memory). The normal wizard has three steps: **Check**, **Back
+up and transfer** with one stopped-writers acknowledgement, then a separate **Use this store** click.
+Failed checks without a plan offer rechecking, not Resume. See
+[legacy transfer and its limits](MEMORY_PLUGINS.md#transferring-legacy-aizen-memory).
 
 ## Commands
 
@@ -640,7 +669,8 @@ echo "summarize this" | aizen chat        # prompt from stdin
 ```
 
 ### `aizen agent` — the tool-using loop
-The model reads/edits files, runs shell, and uses memory to finish a task end-to-end.
+The model reads/edits files and runs shell to finish a task end-to-end. Persistent Memory tools and
+context are available only from an explicitly selected, enabled provider with the relevant capabilities.
 ```bash
 aizen agent "add a --version flag and update the help text"
 aizen agent --yes "fix the failing test in src/parse.rs"   # pre-approve file/shell ops
@@ -782,8 +812,9 @@ Behavior worth knowing:
   generated from that same registry, never the schemas. So `/tools`, `/lsp off`, `/apps`, a missing
   Telegram token or a build without `--features browser` all remove a tool from the prompt and the
   request together, and the model is never told about a tool it cannot call.
-- **Parallel reads** — when a turn only reads (file_read/glob/memory), the calls run
-  concurrently; any turn that edits or runs shell stays serial (and approval-gated).
+- **Parallel reads** — eligible native file reads/globs may run concurrently; edits and shell work
+  follow their own approval/admission rules. External Memory calls remain serialized opaque
+  transactions, including searches that may update retrieval caches or reinforcement state.
 - **Continuing earlier work** — a fresh conversation's prompt lists this project's recent saved
   conversations in a `<sessions>` block, and the read-only `session_recall` tool returns a clipped
   digest (opening request + latest exchanges) so "continue the most recent session" resumes the
@@ -1460,8 +1491,9 @@ recent-catalogue fallback cannot recover every older skill during an index outag
 **Self-learning** — after a completed multi-step task, the REPL distills a *generalizable* procedure
 into a new skill automatically (conservative: skips one-offs and duplicates; prints `↯ learned skill
 '…'`). It fires when a turn did real work (**≥4 tool calls**) **or recovered from a dead end** (a tool
-errored, then a later call succeeded — that hard-won path is worth saving). It's like memory's
-self-learning, but for how-to. Toggle in `/config` (default on) or `aizen config set --auto-skill-learn false`.
+errored, then a later call succeeded — that hard-won path is worth saving). This Core policy is
+independent of persistent Memory and `memory_auto_learn`. Toggle in `/config` (default on) or
+`aizen config set --auto-skill-learn false`.
 
 ### Custom slash commands — markdown macros you fire
 Where a **skill** is something the *agent* pulls when relevant, a **custom command** is a prompt-macro
@@ -1479,8 +1511,8 @@ Review this staged diff and flag bugs, security issues, and risky changes:
 !`git diff --cached $ARGUMENTS`
 ```
 
-The body is expanded at fire time, then submitted as a normal chat turn (full agent loop + tools +
-memory apply):
+The body is expanded at fire time, then submitted as a normal chat turn (full agent loop/tools and,
+only when explicitly enabled, external Memory context):
 - **`$ARGUMENTS`** → everything you typed after the command; **`$1`..`$9`** → positional words.
 - **`@<path>`** → inlines that file's contents (confined to the working dir; only at a word boundary,
   so emails/handles pass through).
@@ -1848,74 +1880,162 @@ once after a transport failure; navigate/click/type/eval are never replayed afte
 Still a **pure-Rust static binary, no bundled browser/Node/Playwright/CEF**. An absent browser returns
 an actionable error, not a crash.
 
-### `aizen memory` — the self-learning brain
+### `aizen memory` — optional persistent Memory
+
+Native Memory installation is separate from marketplace `aizen sub plugin`. Generic providers use
+local directories/ZIPs. Mnemos also has a fixed anonymous public binary release channel, shared
+background availability tracking and explicitly reviewed first installation or installed updates:
+
 ```bash
-aizen memory add "prefer-pnpm" -t feedback -b "I prefer pnpm over npm"
-aizen memory list [current|global|project|<zone>]   # narrow a long listing to one workspace view
-aizen memory search "package manager" [--dimension tooling]
-aizen memory profile [--json]      # derived preferences rollup (verbosity/tooling/stack/…)
-aizen memory ask "which package manager should I use?"   # abstains rather than guessing
-aizen memory learn "<a user turn>"  # free extraction → threat-scan → route → store
-aizen memory frozen                 # the always-on prompt-prefix core
-aizen memory style | review | as-of <date> | supersede <old> <new> | archive | restore <id> | compact
-aizen memory consolidate [--apply]  # merge near-duplicates locally (lexical, then MinHash + normalised tokens); dry run by default
-aizen memory reconcile [--apply]    # the model-judged pass for the pairs consolidate leaves in the review band
-aizen memory where                  # the folders + counts, for editing or clearing out many at once
+aizen config memory                                      # offline provider hub; no chat credentials needed
+aizen plugin list --json
+aizen plugin install /path/to/verified-local-package.zip   # no execution or activation
+aizen plugin releases mnemos --json                       # explicit public check; no installation
+aizen plugin install-release mnemos                      # default-No reviewed download/install
+aizen plugin install-release mnemos --version X.Y.Z --sha256 <64-lowercase-hex> --yes
+aizen plugin update mnemos                               # newer package; activation required afterward
+aizen plugin update mnemos --version X.Y.Z --sha256 <64-lowercase-hex> --yes
+aizen plugin recover-update mnemos                       # offline inspection; --apply requires consent
+aizen plugin info mnemos
+aizen plugin enable mnemos                                # eligibility only
+aizen memory use mnemos                                   # explicit executable trust consent
+aizen memory status --json                                # offline; never starts a provider
+aizen memory disable                                     # preserves selection and data
+aizen memory enable                                      # reuses saved consent if still eligible
+aizen plugin storage mnemos                              # inspect effective path; no execution
+aizen plugin storage mnemos --path /absolute/dedicated-directory
+aizen plugin storage mnemos --default                     # does not move or delete old data
+aizen plugin configure mnemos                            # declared options and host budgets; no execution
+aizen plugin configure mnemos --set enable_fuzzy=false --recall-inject-tokens 200
+aizen plugin revoke mnemos                               # removes grant; selected Memory is disabled
+aizen memory unselect                                    # clears selection; saved grants/data remain
+aizen plugin uninstall mnemos                            # removes package, preserves data
 ```
 
-Ids are whole words. A fact named "Người dùng giao tiếp bằng tiếng Việt" files as
-`nguoi-dung-giao-tiep-bang-tieng-viet` — accents are folded off each letter, and `-` marks a word
-boundary and nothing else. An earlier slugifier tested one codepoint at a time, so every accented
-letter became a separator and cut inside words: the same name came out `ng-i-d-ng-giao-ti-p…`. Stores
-written by that version are re-slugged once, automatically, on the first run of a build that has this
-— the old→new table is left in `cli-memory/.id-migration-<date>.tsv`, and graph edges are re-pointed
-in the same pass. Set `AIZEN_NO_ID_MIGRATE=1` to skip it.
+The four states are independent: installed, eligible, selected, Memory enabled. `memory use` selects
+and enables; installation/eligibility alone do neither. A hash proves integrity, not publisher trust.
+On Windows, selection additionally needs informed `--allow-guarded` consent: Job containment and
+scrubbed environment do **not** confine filesystem/network access. Strict refuses unsupported
+isolation; native providers refuse sandbox `off`. Declared network access needs a separate saved
+`--allow-network` grant **and** the global child-network policy must allow it. Offline Mnemos requests
+no network. See [sandbox limits](SANDBOX.md#native-memory-provider-policy).
 
-A fact's id comes from its display `name`, which is the first 60 characters of the fact — so that cut
-has to land on a word too. It used to cut anywhere: 73 entries on one store had names ending in a
-one- or two-letter fragment, and the id inherited it (`…-la-khe-uoc-lam-viec-l`, where `l` began
-`lâu`). New facts back the cut up to the last word; the names already written are left alone, since
-their bodies still hold the full text and a second automatic rewrite of a store belongs behind a
-command you type, not a startup pass.
+The `/config` → Memory hub has five entries: **Provider**, **Learning**, **Storage**, **Advanced** and
+**Back**. Mnemos always has a highlighted row and textual status; its setup offers an explicit
+release check plus expected-ID local import, never an automatic download. The fixed public channel
+is `talmetis-labs/aizen-mnemos-releases`; metadata-only releases are not installable. Release
+installation pins version, target and mandatory checksum before publication and never activates it.
+Installed Mnemos follows Aizen's 24-hour background-check policy (`update_check: false` or
+`AIZEN_NO_UPDATE_CHECK=1` opts out); no automatic package download/replacement occurs. `/update mnemos`
+and Desktop **Settings → Updates** review a strictly newer package. Bare `/update` remains Aizen-only.
+Updates retain selection, options, budgets, data-root and data, but revoke Mnemos execution/Learning
+consent and disable selected Mnemos until separately activated. Busy providers refuse replacement.
+Interrupted updates require explicit inspected recovery; no automatic retry or data rollback. See
+[package update/recovery details](MEMORY_PLUGINS.md#package-contract). Installed custom providers appear by verified
+name. No Obsidian adapter is currently implemented. Advanced holds lifecycle, options/budgets,
+diagnostics and explicit consent/revocation. Learning On reflects the active provider's capability,
+valid execution/sharing grant and automatic policy; the first On asks for sharing and optional model
+assistance separately. Off keeps recall, records and saved grants. Storage selects the default
+`<AIZEN_HOME>/memory-data/<id>/` or a dedicated custom absolute directory. Saving/resetting paths never
+moves, copies, adopts or deletes data; future operations use the chosen location.
 
-The same rule now governs every name derived from free text — memory ids, `#remember` captures,
-persona self-memories, session saves, and the project zone key all share one implementation:
+Configuration discovery is manifest-only, never provider execution. Options need a bounded
+manifest-declared scalar schema; no secrets, arbitrary JSON, independent model routes or file-access
+grants. Draft edits save only after explicit confirmation. Active configuration changes apply at the
+next valid user-turn boundary; switching never copies data or options. See
+[settings schema and budgets](MEMORY_PLUGINS.md#configuration-ui-and-per-provider-options).
 
-| Surface | Where | Migrated? |
-|---|---|---|
-| memory entry id | `cli-memory/entries/` | yes — `.id-migration-<date>.tsv` |
-| `#remember` id | same | yes, same pass |
-| persona self-memory | `personas/<slug>.self/` | yes — `.stem-migration-<persona>-<date>.tsv` |
-| session save name | `sessions/` | no — existing files keep working, see below |
-| project zone key | `skills/p/<slug>`, index | only if the checkout path is non-ASCII |
+Default standing allowance is 1024 tokens. Recall response allowance is 1024, but actual chat injection
+is only 300, with 12 requested records and at most 100 response records. Per-provider host overrides
+remain bounded to 4096 tokens / 100 records. Zero skips the corresponding automatic operation.
+The separate `/config` → Codebase entry controls local Core embedding, not a Memory model.
 
-**Persona self-memories** get one extra thing: a short content hash on the end
-(`ep-hoan-thien-landing-install-tabs-os-85ed`). Every episode body opens with its own type label, so a
-stem taken from the first few words described the format rather than the memory — twelve files on one
-store all read `ep-correction-user-redirected-me-todo`, separated only by a counter. The stem now skips
-the label and carries a hash, so it identifies one memory.
+With a selected enabled provider, Core forwards bounded typed operations and prints JSON results:
 
-**Session names** are derived, not migrated. New saves fold to ASCII whole words; files already saved
-with accents keep their names and stay loadable, listable and deletable. Two guards on derivation:
-credential-shaped tokens are dropped before the name exists (a key pasted as the first line of a chat
-used to become the filename — and `/sessions` prints filenames), and a name is never cut mid-word.
-The credential guard covers name derivation only: it does not redact what is inside a saved transcript,
-so a key pasted into a chat is still in that file's message text.
-
-### `aizen bench` — anti-oracle benches
 ```bash
-aizen bench memory [--split gate|tune|all] [--hybrid]   # retrieval recall vs a baseline
-aizen bench memory --evolution                          # multi-session reuse gate (≥5%/session lift)
-aizen bench profile                                     # golden set for the profile rollup (+ tier hints)
+aizen memory add prefer-pnpm -t feedback -b "Use pnpm for this project."
+aizen memory list current
+aizen memory show <opaque-id>
+aizen memory search "package manager"
+aizen memory edit <opaque-id> -b "Use pnpm, not npm, for this project."
+aizen memory forget <opaque-id>                            # provider archive semantics
+aizen memory health
+aizen memory where                                       # separate package/data locations
+```
+
+Record IDs/revisions are provider-owned. Core performs get-then-revision-checked update/forget;
+it does not read record files or guess archive handles. REPL `/memory` (or `/memory status`) is
+offline status; a query searches the provider. `#<fact>` and `/memory remember <fact>` store a Project
+fact; `#global: <fact>` stores a User fact. No provider means an actionable unavailable error, not a
+hidden built-in store. Hosted `/memory` uses its explicit chat/workspace context for data operations,
+but refuses `enable`, `disable` and `use`: change host-global activation from the local CLI. Changes to
+activation/trust are not granted by provider output.
+
+Uninstall never deletes provider data or executes a recovery hook. A missing package directory can
+be unregistered. A corrupt or partial remaining package is disabled, but removal fails with host
+pins retained; unknown files are not swept. Inspect/repair that payload explicitly before retrying.
+A physical recovery barrier still blocks uninstall, even if its package is missing.
+
+Mnemos currently supports CRUD, current-scope search/list, standing context/recall, and human-management inspection through Core. With the sealed human `Management` grant, Core forwards the provider's typed scope/dimension/category filters, superseded listings, review promote/drop/clear, revive, supersede, permitted scope moves, archive/restore/purge, compact/consolidate, doctor, neighbors, model inventory, and prepared offline reconciliation. `reconcile` uses an explicit bounded reply file (`--reply`), never a model route; `--apply` requires that reply and stale bindings fail closed. `model-download` remains an honest unsupported refusal because Mnemos is offline and has no bundled downloader. Core's parser may expose a command before a selected provider advertises the corresponding capability; provider validation remains authoritative.
+Its independent native CLI has the same broader maintenance/archive surface; inspect that package's help and supply its explicit data/context options. Human inspection is distinct from model-visible reads: Management originates only in the sealed local CLI/manual path, never from provider JSON, settings or model output. Core still keeps activation host-global and refuses hosted `enable`, `disable` and `use`.
+
+Completed-turn auto-learning needs **separate** saved `--allow-learning` consent at `memory use`, plus
+`memory_auto_learn` enabled. It sends bounded user/transcript content to the selected executable,
+not credentials or permission to use a host model route. Only successful `Done` turns qualify;
+clarification, cancellation and exhausted budgets do not. Mnemos's offline path extracts from user text,
+not assistant/tool instructions. Explicit human `memory learn <text> --yes` is a management operation
+for bounded STYLE promotion; it is not the same grant as completed-turn auto-learning, and provider
+validation remains authoritative. Core Skill learning and Persona evolution remain independently
+controlled when Memory is absent or disabled.
+
+The `--allow-turn-model` flag is a separate opt-in, requires `--allow-learning`, and only applies
+to a provider declaring `host_llm`. It authorizes an additional bounded no-tool call on the completed
+turn's captured chat endpoint/model, with possible remote transmission of provider-prepared Memory/conversation
+text and extra token costs. Keys stay in Core; no summarizer, alternate model, redirect or retry fallback
+is used. Mnemos now advertises `host_llm` and accepts this route only with the separate Learning grant,
+the exact prepared-job marker and captured binding; offline/strict/replay paths do not use HTTP. Revocation,
+cancellation, timeout and malformed-completion cases remain tested negative paths, not a semantic-quality
+claim. See [prepared continuation status](MEMORY_PLUGINS.md#prepared-same-turn-model-continuation-partial-source-implementation).
+
+`memory status --json` also reports bounded host learning-outbox inventory without exposing text or
+starting a provider. Receipts are not automatically replayed or pruned; capacity exhaustion stops
+new learning, and corrupt inventory is reported as invalid rather than empty. Physical recovery
+barriers are independent. This is not exactly-once delivery. See [protocol/learning](MEMORY_PLUGINS.md)
+and [verification/open gates](MNEMOS_VERIFICATION.md).
+
+Legacy `~/.aizen/cli-memory/` is **not** automatically adopted, converted, re-slugged or deleted by
+startup, installation or selection. It can contain Core codebase indexes alongside old facts; never
+copy the entire tree into a provider. The standalone Mnemos CLI now has explicit `adoption plan`
+(with required `--dry-run`), reviewed-digest-bound `apply`, verified `resume`, and full-backup `restore`
+into a **new** directory. Planning does not initialize Engine; apply preserves source bytes, backs up
+exclusions too, and refuses occupied/unknown/corrupt layouts. No ID conversion or real-data adoption
+is automatic. Consult Mnemos's `docs/ADOPTION.md` and the [verification record](MNEMOS_VERIFICATION.md)
+before use. Windows fixture coverage does not establish non-Windows or power-loss safety. Uninstall
+preserves original and provider data.
+
+### Core Persona and session names
+
+Persona self-memory remains built in under `personas/<slug>.self/`, independent of a Memory provider.
+Episode stems skip the type label and include a short content hash. Core's Persona stem migration is
+separate from any provider-owned fact/graph migration.
+
+New session names fold to ASCII whole words; existing accented names remain loadable, listable and
+deletable. Credential-shaped tokens are dropped during name derivation, and names are not cut
+mid-word. This does **not** redact message text inside a saved transcript.
+
+### `aizen bench` — Core loop/task/session benches
+```bash
 aizen bench loop                                        # loop discipline on scripted models, no key
-aizen bench tasks [--json] [--record --task <id>]       # the six-task suite on recorded tapes (see bench-tasks/)
-aizen bench sessions [--json]                           # turn-shape statistics of your saved conversations
-aizen bench dialectic                                   # golden set incl. abstain-when-unknown
-aizen bench loop                                        # loop discipline vs a scripted model (offline)
-aizen bench tasks [--task <id>] [--json]                # task suite: real loop + real tools on fixture crates
-aizen bench tasks --record [--task <id>]                # record the model's answers once (spends tokens)
-aizen bench tasks --update-baseline                     # capture steps/tokens per task as the baseline
+aizen bench tasks [--task <id>] [--json]                 # real loop/tools on disposable fixture crates
+aizen bench tasks --record [--task <id>]                 # record model answers once (spends tokens)
+aizen bench tasks --update-baseline                      # explicitly replace task baseline measurements
+aizen bench sessions [--json]                            # statistics of saved Core conversations
 ```
+
+Persistent Memory/profile/dialectic/health benchmarks moved to the independent `aizen-mnemos` CLI.
+Core's compatibility commands report that move; they do not start a built-in engine. Use the Mnemos
+package's benchmark help and isolated fixture roots. Scripted/hash-model results are not semantic
+model-quality evidence.
 
 `bench tasks` runs each `bench-tasks/<id>/` (a prompt plus a dependency-free cargo crate) through
 the real agent loop with the verify gate on and every tool rooted in a throwaway copy, then checks

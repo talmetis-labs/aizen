@@ -303,7 +303,7 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     // advertised tool schemas remain pinned for the duration of that run.
     crate::agent::mcp::prepare_fresh_turn();
     let mut r = ToolRegistry::new();
-    r.register(Box::new(MemorySearch));
+    crate::plugin::tools::register(&mut r);
     r.register(Box::new(crate::agent::design::DesignBriefTool));
     r.register(Box::new(crate::agent::design::DesignGuideTool));
     r.register(Box::new(crate::agent::design::DesignReviewTool));
@@ -313,9 +313,6 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     r.register(Box::new(crate::agent::image_read::ReferenceRead::new(
         root.to_path_buf(),
     )));
-    r.register(Box::new(MemoryList));
-    r.register(Box::new(MemoryProfile));
-    r.register(Box::new(MemoryAsk));
     // Top-level only, like the `<sessions>` block that advertises it: a sub-agent serves one
     // stated task and has no business rummaging through the user's other conversations.
     r.register(Box::new(SessionRecall));
@@ -357,12 +354,8 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     // `subagent_read_only_base` would pay its schema on every delegated run for an answer the parent
     // is the one acting on.
     r.register(Box::new(crate::features::coop::TeamStatus));
-    // Memory WRITE surface — top-level only. A sub-agent gets `memory_list`/`memory_search` but may
-    // never mutate the user's long-term store: a specialist run is short-lived and unsupervised, so a
-    // wrong write there would outlive the run it came from with no one having seen it.
-    r.register(Box::new(MemorySave));
-    r.register(Box::new(MemoryUpdate));
-    r.register(Box::new(MemoryForget));
+    // Coordinating-parent write tools. Optional Memory provider tools are registered separately;
+    // the sub-agent base does not grant access to the persistent Memory provider.
     r.register(Box::new(FileEdit::new(root.to_path_buf())));
     r.register(Box::new(FileWrite::new(root.to_path_buf())));
     r.register(Box::new(FileMove::new(root.to_path_buf())));
@@ -713,7 +706,6 @@ fn should_register_workflow() -> bool {
 ///   (see [`agent_registry`]).
 fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     let mut r = ToolRegistry::new();
-    r.register(Box::new(MemorySearch));
     r.register(Box::new(crate::agent::design::DesignBriefTool));
     r.register(Box::new(crate::agent::design::DesignGuideTool));
     r.register(Box::new(crate::agent::design::DesignReviewTool));
@@ -723,12 +715,8 @@ fn subagent_read_only_base(root: &Path) -> ToolRegistry {
     r.register(Box::new(crate::agent::image_read::ReferenceRead::new(
         root.to_path_buf(),
     )));
-    // `memory_list` is read-only, so a sub-agent may inventory what is stored (that's what stops it
-    // guessing) — but the WRITE trio (save/update/forget) is top-level only, registered in
-    // `default_registry_in` and deliberately absent here.
-    r.register(Box::new(MemoryList));
-    r.register(Box::new(MemoryProfile));
-    r.register(Box::new(MemoryAsk));
+    // Persistent Memory provider tools are intentionally absent from the sub-agent base.
+    // Core-owned codebase retrieval and Skill reads remain available independently.
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::search::SearchFiles::new(
@@ -1740,185 +1728,6 @@ fn display_path(root: &Path, p: &Path) -> String {
     }
 }
 
-// ── memory_search ──────────────────────────────────────────────────────────
-
-struct MemorySearch;
-impl Tool for MemorySearch {
-    fn name(&self) -> &str {
-        "memory_search"
-    }
-    fn description(&self) -> &str {
-        "Find user/project facts by lexical/semantic match; default workspace + global. \
-         <user_memory> holds style/global prefs only; overall preferences -> memory_profile. Read-only."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "what to recall"},
-                "limit": {"type": "integer", "description": "max hits (default 5)"},
-                "scope": {"type": "string", "enum": ["current", "all", "global"], "description": "current project + global (default), all zones, or global only"},
-                "category": {"type": "string", "enum": ["bug-history", "failed-attempt", "success-pattern", "arch-decision", "command", "security-rule", "deploy-note", "codebase"], "description": "filter project knowledge by kind"}
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        })
-    }
-    // NOT concurrency-safe: memory::search has a WRITE side effect (record_reuse → record_retrieval,
-    // a read-modify-write of per-fact files, plus the shared embedding cache under `dense`). Two
-    // parallel searches would race and lose reinforcement counts / clobber the cache, so keep it on
-    // the serial path even though it reads like a read-only tool.
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let query = str_arg(args, "query")?;
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5)
-            .clamp(1, 20) as usize;
-        let sel = match args
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("current")
-        {
-            "" | "current" => crate::memory::ScopeSel::default_view(),
-            "all" => crate::memory::ScopeSel::All,
-            "global" => crate::memory::ScopeSel::Global,
-            other => {
-                return Ok(format!(
-                    "error: unknown scope '{other}' (use current|all|global)"
-                ))
-            }
-        };
-        let cat = match args
-            .get("category")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            None => None,
-            Some(s) => match crate::memory::category::Category::parse(s) {
-                Some(c) => Some(c),
-                None => return Ok(format!("error: unknown category '{s}'")),
-            },
-        };
-        // record_reuse (the reinforcement write side-effect) is intentionally kept on the unfiltered
-        // `search_scoped` path; a category-filtered recall is an inspection, not organic reuse.
-        let hits = if cat.is_some() {
-            crate::memory::search_filtered_scoped_cat(query, limit, None, cat, &sel)?
-        } else {
-            crate::memory::search_scoped(query, limit, &sel)?
-        };
-        if hits.is_empty() {
-            return Ok(format!("(no memory matches '{query}')"));
-        }
-        Ok(format_memory_hits(
-            &hits,
-            crate::memory::settings().search_max_tokens,
-        ))
-    }
-}
-
-/// Render search hits under a hard token budget (chars/4, same estimator as the frozen core):
-/// hits are already best-first, so trailing ones are cut and counted rather than blowing the turn.
-fn format_memory_hits(hits: &[crate::memory::Hit], max_tokens: usize) -> String {
-    let mut s = String::new();
-    let mut used = 0usize;
-    for (shown, h) in hits.iter().enumerate() {
-        let body: String = h.entry.body.chars().take(200).collect();
-        let zone = match h.entry.scope.as_deref() {
-            Some(z) => format!(" [p:{z}]"),
-            None => String::new(),
-        };
-        // Surface the CoALA content type when the fact HAS one, tagged with its neural bucket
-        // (episodic/semantic/procedural) so the agent can weight a past bug vs a durable decision.
-        let cat = match h.entry.category {
-            crate::memory::category::Category::None => String::new(),
-            c => format!(" [{}/{}]", c.kind().as_str(), c.as_str()),
-        };
-        let line = format!(
-            "[{:.2}] {} ({}){}{} — {}\n",
-            h.score,
-            h.entry.name,
-            h.entry.mtype.as_str(),
-            zone,
-            cat,
-            body.replace('\n', " ")
-        );
-        let cost = crate::memory::render::est_tokens(&line);
-        if used + cost > max_tokens && shown > 0 {
-            s.push_str(&format!(
-                "(+{} more hit(s) over the token budget — narrow the query)\n",
-                hits.len() - shown
-            ));
-            break;
-        }
-        used += cost;
-        s.push_str(&line);
-    }
-    s.trim_end().to_string()
-}
-
-// ── memory_profile (B2) ──────────────────────────────────────────────────────
-
-struct MemoryProfile;
-impl Tool for MemoryProfile {
-    fn name(&self) -> &str {
-        "memory_profile"
-    }
-    fn description(&self) -> &str {
-        "Read the user's working profile: verbosity/autonomy/tools/stack/language/frustrations, \
-         per-dimension confidence and cited facts. Use for defaults; fact lookup -> memory_search. Read-only."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
-    }
-    fn execute(&self, _args: &Value) -> Result<String> {
-        let p = crate::memory::build_profile()?;
-        Ok(serde_json::to_string(&p)?)
-    }
-}
-
-// ── memory_ask (B3 dialectic) ─────────────────────────────────────────────────
-
-struct MemoryAsk;
-impl Tool for MemoryAsk {
-    fn name(&self) -> &str {
-        "memory_ask"
-    }
-    fn description(&self) -> &str {
-        "Answer one question about the user from memory; abstain rather than guess. \
-         General fact lookup -> memory_search. Read-only."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {"question": {"type": "string"}},
-            "required": ["question"],
-            "additionalProperties": false
-        })
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let q = str_arg(args, "question")?;
-        let a = crate::memory::answer_about_user(q)?;
-        let mut s = a.text.clone();
-        if !a.basis.is_empty() {
-            let cited: Vec<String> = a.basis.iter().take(3).map(|b| b.name.clone()).collect();
-            s.push_str(&format!("\n(based on: {})", cited.join("; ")));
-        }
-        Ok(s)
-    }
-}
-
-// ── memory_list ───────────────────────────────────────────────────────────────
-
-/// Inventory of what is stored, WITHOUT a query. `memory_search` needs a query, so before this tool
-/// existed the agent had no way to answer "what do you remember about me?" — it could only guess
-/// query terms and report whatever happened to match, which reads as confidently not knowing its
-/// own state. This is the tool that makes the store legible.
 /// The fetch half of "continue the most recent session": a clipped digest of one saved
 /// conversation from the pool the `<sessions>` block lists. Read-only by design — restoring a full
 /// transcript rewrites live history, which stays a USER move (`/resume`), never a tool's.
@@ -1942,292 +1751,6 @@ impl Tool for SessionRecall {
     }
     fn execute(&self, args: &Value) -> Result<String> {
         crate::core::session_store::session_digest(args.get("name").and_then(|v| v.as_str()))
-    }
-}
-
-struct MemoryList;
-impl Tool for MemoryList {
-    fn name(&self) -> &str {
-        "memory_list"
-    }
-    fn description(&self) -> &str {
-        "List fact id/type/zone/category/summary without a query; audit or obtain \
-         memory_update/memory_forget ids. Topic search -> memory_search. Read-only."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "scope": {"type": "string", "enum": ["current", "all", "global", "project"], "description": "current project + global (default), all zones, global only, or project only"},
-                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "optional memory type filter"},
-                "limit": {"type": "integer", "description": "max entries (default 50, max 200)"},
-                "include_archived": {"type": "boolean", "description": "recoverable archive, not live store (default false)"}
-            },
-            "additionalProperties": false
-        })
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50)
-            .clamp(1, 200) as usize;
-        let archived = args
-            .get("include_archived")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let mtype = match args
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            None => None,
-            Some(s) => match crate::memory::store::MemoryType::parse_strict(s) {
-                Some(t) => Some(t),
-                None => {
-                    return Ok(format!(
-                        "error: unknown type '{s}' (user|feedback|project|reference)"
-                    ))
-                }
-            },
-        };
-        let sel = match args
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("current")
-        {
-            "" | "current" => crate::memory::ScopeSel::default_view(),
-            "all" => crate::memory::ScopeSel::All,
-            "global" => crate::memory::ScopeSel::Global,
-            "project" => crate::memory::ScopeSel::Project(crate::core::config::project_slug()),
-            other => {
-                return Ok(format!(
-                    "error: unknown scope '{other}' (use current|all|global|project)"
-                ))
-            }
-        };
-        crate::memory::inventory(&sel, mtype, limit, archived)
-    }
-}
-
-// ── memory_save ───────────────────────────────────────────────────────────────
-
-/// Deliberate write. Distinct from the passive learning pipeline: when the user says "remember
-/// this", the agent should be able to act on it in the same turn instead of hoping an extractor
-/// picks it up later.
-struct MemorySave;
-impl Tool for MemorySave {
-    fn name(&self) -> &str {
-        "memory_save"
-    }
-    fn description(&self) -> &str {
-        "Save durable user-requested/project fact, not turn notes. Check memory_list/memory_search; \
-         existing topic -> memory_update. Default project; global for universal facts."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "short unique kebab-case title; becomes id"},
-                "body": {"type": "string", "description": "self-contained fact; absolute dates, not relative dates"},
-                "description": {"type": "string", "description": "optional one-line recall-ranking summary"},
-                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "user=identity; feedback=work preferences; project=codebase state/goals (default); reference=external pointers"},
-                "scope": {"type": "string", "description": "global=all workspaces; omitted/project=current project"}
-            },
-            "required": ["name", "body"],
-            "additionalProperties": false
-        })
-    }
-    // Writes a file + is the kind of thing the user wants to see; keep it off the parallel path.
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let name = str_arg(args, "name")?;
-        let body = str_arg(args, "body")?;
-        if body.trim().is_empty() {
-            return Ok("error: empty body — nothing to remember".to_string());
-        }
-        let desc = args
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let t = match args
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            None => crate::memory::store::MemoryType::Project,
-            Some(s) => match crate::memory::store::MemoryType::parse_strict(s) {
-                Some(t) => t,
-                None => {
-                    return Ok(format!(
-                        "error: unknown type '{s}' (user|feedback|project|reference)"
-                    ))
-                }
-            },
-        };
-        // Global only when explicitly asked; anything else (absent, "project", "current") stays in
-        // this workspace's zone — a fact learned here must not leak into unrelated projects.
-        let scope = match args.get("scope").and_then(|v| v.as_str()).map(str::trim) {
-            Some(s) if s.eq_ignore_ascii_case("global") => None,
-            _ => Some(crate::core::config::project_slug()),
-        };
-        match crate::memory::store::add_scoped(name, desc, t, body.trim(), scope.as_deref()) {
-            Ok(id) => Ok(format!(
-                "saved memory '{id}' (type={}, {}). Use memory_update to revise it.",
-                t.as_str(),
-                scope
-                    .as_deref()
-                    .map(|s| format!("zone {s}"))
-                    .unwrap_or_else(|| "global".into())
-            )),
-            // The store refuses to overwrite; surface the "update instead" path rather than failing.
-            Err(e) => Ok(format!("error: {e}")),
-        }
-    }
-}
-
-// ── memory_update ─────────────────────────────────────────────────────────────
-
-struct MemoryUpdate;
-impl Tool for MemoryUpdate {
-    fn name(&self) -> &str {
-        "memory_update"
-    }
-    fn description(&self) -> &str {
-        "Revise fact by memory_list id; only supplied fields change, id stays fixed. \
-         Correct wording/type/global-project scope here, not with duplicate memory_save."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "id or exact name from memory_list"},
-                "body": {"type": "string", "description": "full replacement fact"},
-                "description": {"type": "string", "description": "replacement summary; empty clears"},
-                "name": {"type": "string", "description": "replacement title; id unchanged"},
-                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
-                "scope": {"type": "string", "description": "global=everywhere; project=current workspace"}
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        })
-    }
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let id = str_arg(args, "id")?;
-        let mtype = match args
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            None => None,
-            Some(s) => match crate::memory::store::MemoryType::parse_strict(s) {
-                Some(t) => Some(t),
-                None => {
-                    return Ok(format!(
-                        "error: unknown type '{s}' (user|feedback|project|reference)"
-                    ))
-                }
-            },
-        };
-        let scope = args
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .map(|s| {
-                if s.eq_ignore_ascii_case("global") || s.is_empty() {
-                    None
-                } else {
-                    Some(crate::core::config::project_slug())
-                }
-            });
-        let patch = crate::memory::store::EntryPatch {
-            name: args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            description: args
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            mtype,
-            body: args
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            scope,
-            preserve_updated: false, // a content update IS a touch — stamp the aging clock
-            // Not exposed to the model: dropping a `supersedes:` claim revives a retired fact, which
-            // is `aizen memory revive` — a human decision with its own audit line, not a field an
-            // edit tool gets to flip as a side effect of rewording a body.
-            clear_supersede: false,
-        };
-        if patch.is_empty() {
-            return Ok(
-                "error: nothing to update — pass at least one of body/description/name/type/scope"
-                    .to_string(),
-            );
-        }
-        let e = match crate::memory::resolve_entry(id) {
-            Ok(e) => e,
-            Err(err) => return Ok(format!("error: {err}")),
-        };
-        match crate::memory::store::update(&e, &patch) {
-            Ok(()) => Ok(format!("updated memory '{}'", e.id)),
-            Err(err) => Ok(format!("error: {err}")),
-        }
-    }
-}
-
-// ── memory_forget ─────────────────────────────────────────────────────────────
-
-/// Retire a fact. Deliberately a SOFT delete (archive, restorable by the human) and
-/// approval-gated: the store's premise is that a fact is never lost, and a model concluding
-/// something is obsolete is exactly the case where that premise earns its keep.
-struct MemoryForget;
-impl Tool for MemoryForget {
-    fn name(&self) -> &str {
-        "memory_forget"
-    }
-    fn description(&self) -> &str {
-        "Retire a user-identified wrong/obsolete fact to a user-restorable archive, not erase. \
-         Prefer memory_update if outdated; forget only if it should stop applying. Ids from memory_list."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "id or exact name from memory_list"},
-                "reason": {"type": "string", "description": "why it should stop applying; shown at approval"}
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        })
-    }
-    fn is_destructive(&self) -> bool {
-        true
-    }
-    fn execute(&self, args: &Value) -> Result<String> {
-        let id = str_arg(args, "id")?;
-        let e = match crate::memory::resolve_entry(id) {
-            Ok(e) => e,
-            Err(err) => return Ok(format!("error: {err}")),
-        };
-        match crate::memory::store::retire(&e) {
-            Ok(archived) => Ok(format!(
-                "retired memory '{}' → archived as '{archived}' (user can restore: `aizen memory restore {archived}`)",
-                e.id
-            )),
-            Err(err) => Ok(format!("error: {err}")),
-        }
     }
 }
 
@@ -6605,37 +6128,6 @@ mod tests {
     }
 
     #[test]
-    fn format_memory_hits_respects_the_token_budget() {
-        use crate::memory::store::{MemoryEntry, MemoryType};
-        let hit = |id: &str, scope: Option<&str>| crate::memory::Hit {
-            entry: MemoryEntry {
-                id: id.into(),
-                name: id.into(),
-                mtype: MemoryType::Reference,
-                body: "word ".repeat(40),
-                scope: scope.map(str::to_string),
-                ..Default::default()
-            },
-            score: 1.0,
-        };
-        let hits: Vec<_> = (0..20).map(|i| hit(&format!("fact-{i}"), None)).collect();
-        // Each line ≈ 55 tokens; a 120-token budget fits ~2 lines then cuts with a counted tail.
-        let out = format_memory_hits(&hits, 120);
-        assert!(out.contains("fact-0"), "{out}");
-        assert!(out.contains("more hit(s) over the token budget"), "{out}");
-        assert!(
-            crate::memory::render::est_tokens(&out) <= 160,
-            "output stays near the budget: {out}"
-        );
-        // zone tag renders for project-scoped hits
-        let tagged = format_memory_hits(&[hit("zoned", Some("proj-00000001"))], 1200);
-        assert!(tagged.contains("[p:proj-00000001]"), "{tagged}");
-        // and the first hit always renders even when it alone exceeds the budget
-        let one = format_memory_hits(&[hit("big", None)], 1);
-        assert!(one.contains("big"));
-    }
-
-    #[test]
     fn glob_to_regex_matches_expected() {
         let re = regex::Regex::new(&glob_to_regex("src/**/*.rs")).unwrap();
         assert!(re.is_match("src/a.rs"));
@@ -10810,19 +10302,34 @@ mod deferral_tests {
 
     #[test]
     fn coding_shape_defers_the_rare_builtins_behind_tool_search() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
         let mut r = default_registry_in(&root("coding"));
         r.register(Box::new(PersonaCreate));
         let before = r.advertised_names().len();
         defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
-        for n in [
-            "checkpoint",
-            "memory_save",
-            "skill_save",
-            "persona_create",
-            "web_crawl",
-        ] {
+        for n in ["checkpoint", "skill_save", "persona_create", "web_crawl"] {
             assert!(!adv(&r, n), "{n} must not ride the request");
             assert!(r.get(n).is_some(), "{n} stays dispatchable");
+        }
+        for n in [
+            "memory_search",
+            "memory_list",
+            "memory_save",
+            "memory_update",
+            "memory_forget",
+            "memory_profile",
+            "memory_ask",
+        ] {
+            assert!(!adv(&r, n), "{n} is not advertised without a provider");
+            assert!(
+                r.get(n).is_none(),
+                "{n} is not registered without a provider"
+            );
         }
         for n in [
             "file_read",
@@ -10830,7 +10337,6 @@ mod deferral_tests {
             "shell_run",
             "process",
             "file_move",
-            "memory_search",
         ] {
             assert!(adv(&r, n), "{n} stays advertised on a coding turn");
         }

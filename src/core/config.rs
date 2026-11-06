@@ -1,9 +1,7 @@
-//! Path + settings resolution for the standalone CLI memory brain.
+//! Core-owned home, workspace identity, and codebase retrieval configuration.
 //!
-//! Memory is the CLI's OWN, under `~/.aizen/cli-memory/` — no byte-for-byte
-//! interop requirement with the VS Code extension (owner decision 2026-06-20).
-//! The home root is `~/.aizen` (renamed from the pre-rebrand `~/.aizen`, which is
-//! auto-migrated on first run so an upgrading user keeps all their data).
+//! Persistent User Memory belongs to the selected provider. The historical
+//! `cli-memory/codebase` and dense cache locations remain Core-owned for compatibility.
 
 use std::path::{Path, PathBuf};
 
@@ -192,21 +190,8 @@ pub fn project_root() -> PathBuf {
         .unwrap_or_else(|| cwd.clone())
 }
 
-/// Workspace-scoping kill-switch: `AIZEN_NO_SCOPE=1` collapses memory back to one global pool
-/// (every scope filter passes everything). Escape hatch, not a config field — scoping is the
-/// intended default and this exists only to debug/compare.
-pub fn scope_disabled() -> bool {
-    matches!(
-        std::env::var("AIZEN_NO_SCOPE")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
-/// True when an env var is set to a truthy token (`1`/`true`/`yes`/`on`). Shared by the
-/// memory kill-switches so they parse identically.
+/// True when an env var is set to a truthy token (`1`/`true`/`yes`/`on`).
+/// Core Skill-affinity switches share this parser.
 fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref().map(str::trim),
@@ -214,26 +199,21 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-/// Hebbian co-retrieval graph kill-switch. `AIZEN_NO_GRAPH=1` turns OFF both edge *recording*
-/// (retrieval writes nothing to `graph.tsv`) and edge *reading* (neighbor expansion is skipped),
-/// collapsing retrieval to the pre-P5 lexical/salience path. Escape hatch for debugging/benching.
+/// Compatibility kill-switch for Core Skill affinity: `AIZEN_NO_GRAPH=1` disables
+/// provider-assisted graph ranking. This does not open or write a legacy Memory graph.
 pub fn graph_disabled() -> bool {
     env_flag("AIZEN_NO_GRAPH")
 }
 
-/// Opt-IN switch for graph neighbor-expansion in PRODUCTION retrieval. `AIZEN_GRAPH_EXPAND=1` lets a
-/// strong lexical hit pull in its most-associated neighbors (spreading activation). Default OFF —
-/// same posture as the dense/fuzzy moat tiers: the edge graph is always *recorded* (cheap, builds
-/// the corpus), but *reading* it into results waits until the bench proves net recall value.
+/// Explicit provider policy for Memory graph expansion; Core never opens the graph itself.
+/// Recording must remain enabled and expansion stays opt-in.
 pub fn graph_expand_enabled() -> bool {
     !graph_disabled() && env_flag("AIZEN_GRAPH_EXPAND")
 }
 
-/// Opt-IN switch for ranking the always-on `<skills>` index by graph affinity to the facts recalled
-/// this turn — i.e. "which procedure historically fired alongside what we're talking about now",
-/// instead of "which procedure is used most overall". Default OFF for the same reason as
-/// [`graph_expand_enabled`]: the cross-kind edges are always recorded, but letting them reorder what
-/// the model sees waits until a bench shows it beats the plain usage ordering.
+/// Opt-in switch for ranking the Core `<skills>` index by graph affinity.
+/// The selected provider supplies affinity through its explicit capability contract;
+/// this flag neither opens nor records a legacy Memory graph.
 pub fn skill_graph_rank_enabled() -> bool {
     !graph_disabled() && env_flag("AIZEN_SKILL_GRAPH_RANK")
 }
@@ -466,23 +446,6 @@ pub fn git_remote_origin(root: &Path) -> Option<String> {
     }
 }
 
-/// Where inside the project the user is working right now: cwd relative to the project root,
-/// `/`-normalized. `None` at the root (or outside it) — only a real subdir is a "region".
-///
-/// The memory tiers compute their own region from a `Lineage`, which they need anyway; this is the
-/// standalone answer for anything that just wants the current subpath.
-#[allow(dead_code)]
-pub fn current_subpath() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let rel = cwd.strip_prefix(project_root()).ok()?;
-    let s = rel.to_string_lossy().replace('\\', "/");
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
 /// The project-local customization dir a cloned repo ships (skills / mcp.json / personas /
 /// commands), merged OVER the home dir by each resolver: always `<root>/.aizen`. Like
 /// [`resolve_default_home`], this carries no legacy-name fallback — one name, everywhere.
@@ -501,55 +464,6 @@ pub fn harden_file(path: &Path) {
 #[cfg(not(unix))]
 pub fn harden_file(_path: &Path) {}
 
-/// Normalize an arbitrary path to the canonical anchor form used by the tier/place system:
-/// canonicalize (fallback raw) → normalize_path_key → to_ascii_lowercase (Windows segment-safe).
-pub fn anchor_of(path: &Path) -> String {
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut key = normalize_path_key(&canon);
-    // ascii-lowercase: sigma-final-form / İ must not break prefix matching
-    key = key.to_ascii_lowercase();
-    key
-}
-
-/// The current working directory as a normalized anchor string (the anchor a `place` fact
-/// would get if the user didn't specify one).
-pub fn current_anchor() -> String {
-    match std::env::current_dir() {
-        Ok(p) => anchor_of(&p),
-        Err(_) => String::new(),
-    }
-}
-
-/// A human-friendly label for the current project (the git remote origin when available,
-/// else the directory name). Used in prompts and `/where`.
-///
-/// Both of those now print the resolved project ROOT rather than a derived label — after the slug
-/// rework, showing the path the identity actually keys on beats showing a prettier name that could
-/// disagree with it.
-#[allow(dead_code)]
-pub fn project_label() -> Option<String> {
-    // Prefer the git remote origin
-    let root = project_root();
-    if let Some(url) = git_remote_origin(&root) {
-        // Extract a readable name from the URL
-        let label = url
-            .trim_end_matches(".git")
-            .rsplit('/')
-            .next()
-            .or_else(|| url.rsplit(':').next())
-            .unwrap_or(&url)
-            .to_string();
-        if !label.is_empty() {
-            return Some(label);
-        }
-    }
-    // Fallback: the directory name
-    root.file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Tighten a directory holding secrets to owner-only (0700) on Unix; a no-op on Windows.
 #[cfg(unix)]
 pub fn harden_dir(path: &Path) {
@@ -559,19 +473,9 @@ pub fn harden_dir(path: &Path) {
 #[cfg(not(unix))]
 pub fn harden_dir(_path: &Path) {}
 
-/// The CLI-owned memory directory. The markdown files here are the source of truth.
+/// Historical Core cache namespace, retained so codebase indexes keep their on-disk location.
 pub fn cli_memory_dir() -> PathBuf {
     aizen_home().join("cli-memory")
-}
-
-/// Long-tail entry store (one fact per `*.md`).
-pub fn entries_dir() -> PathBuf {
-    cli_memory_dir().join("entries")
-}
-
-/// The always-on user-style profile rendered into the frozen core.
-pub fn style_path() -> PathBuf {
-    cli_memory_dir().join("STYLE.md")
 }
 
 /// Per-repo codebase index (`/init`). Layout: `cli-memory/codebase/<slug>.json`.
@@ -603,58 +507,14 @@ fn safe_core_slug(slug: &str) -> String {
     }
 }
 
-/// Per-repo always-on frozen core (active). Layout: `cli-memory/core/active/<slug>.md`.
-/// Isolates prefix cache so repo A's core never injects into repo B.
-pub fn core_active_path(slug: &str) -> PathBuf {
-    cli_memory_dir()
-        .join("core")
-        .join("active")
-        .join(format!("{}.md", safe_core_slug(slug)))
-}
-
-/// Per-repo staged core for next session. Layout: `cli-memory/core/next/<slug>.md`.
-pub fn core_next_path(slug: &str) -> PathBuf {
-    cli_memory_dir()
-        .join("core")
-        .join("next")
-        .join(format!("{}.md", safe_core_slug(slug)))
-}
-
-/// Legacy single-file active core (pre per-repo layout). Read-once fallback only.
-pub fn legacy_core_active_path() -> PathBuf {
-    cli_memory_dir().join("core.active.md")
-}
-
-/// Legacy single-file staged core (pre per-repo layout).
-pub fn legacy_core_next_path() -> PathBuf {
-    cli_memory_dir().join("core.next.md")
-}
-
-/// Mid-confidence learned candidates land here for `aizen memory review` (P3).
-pub fn review_dir() -> PathBuf {
-    cli_memory_dir().join("review")
-}
-
-/// Recoverable archive of evicted / superseded rows (P4).
-pub fn archive_dir() -> PathBuf {
-    cli_memory_dir().join("archive")
-}
-
-/// Cached embeddings (P5), keyed by content hash.
+/// Core codebase chunk embeddings (`code-*` namespace), keyed by content hash.
+#[cfg(feature = "dense")]
 pub fn embed_cache_dir() -> PathBuf {
     cli_memory_dir().join("embed-cache")
 }
 
-/// The Hebbian co-retrieval graph (P5 — neuron-link associations between facts). A single
-/// plain-text edge file next to the entry store; the ONE piece of memory state that is not
-/// derivable from fact content (which facts get recalled together over time).
-pub fn graph_path() -> PathBuf {
-    cli_memory_dir().join("graph.tsv")
-}
-
-/// Local model store (P5 dense backend). Shared `~/.aizen/models/` (NOT under cli-memory)
-/// so other Aizen tooling can reuse a downloaded model. Consumed by the `dense` feature build.
-#[allow(dead_code)] // used by `--features dense` (model2vec loader); inert in the default build
+/// Local Core embedding model store. Shared `~/.aizen/models/` (NOT under cli-memory)
+/// so explicit provisioning and model inventory work without a `dense` build.
 pub fn models_dir() -> PathBuf {
     aizen_home().join("models")
 }
@@ -662,13 +522,10 @@ pub fn models_dir() -> PathBuf {
 /// The dense embedding model: a subdir name of `models_dir()`, or an absolute path to a model dir.
 ///
 /// Precedence `AIZEN_EMBED_MODEL` → the saved `embed_model` in cli-config → the benched default.
-/// The env var stays on top so a one-off `AIZEN_EMBED_MODEL=… aizen …` still wins over the file, and
-/// the file exists so the `/config` Memory section can make a durable choice instead of asking the
-/// user to keep an env var set forever.
+/// The saved choice belongs to Core codebase retrieval, not the provider's Memory settings.
 ///
 /// No recursion risk in reading cli-config from here: `cli_config::load` only reaches back into
 /// `config_path()` → `aizen_home()`, neither of which consults this function.
-#[allow(dead_code)] // used by `--features dense` (model2vec loader); inert in the default build
 pub fn embed_model_name() -> String {
     std::env::var("AIZEN_EMBED_MODEL")
         .ok()
@@ -684,100 +541,6 @@ pub fn embed_model_name() -> String {
         // LIFTING paraphrase recall@5 more than the ~18x-larger multilingual model (+0.231 vs
         // +0.154) on the bilingual En-Vi fixtures, so it's the default. `AIZEN_EMBED_MODEL` overrides.
         .unwrap_or_else(|| "potion-base-8M".to_string())
-}
-
-/// Verified-good defaults adopted from the retrieval/anti-bloat research.
-/// These are *starting points* the bench can retune — not a binding contract.
-#[derive(Debug, Clone)]
-pub struct MemorySettings {
-    /// Frozen-core hard cap (tokens, chars/4 estimate). Prefix-stability budget.
-    /// Always-on is STYLE + global user prefs only — keep this tight to save tokens.
-    pub frozen_core_max_tokens: usize,
-    /// Session working-memory inject cap (tokens, chars/4). 0 disables inject.
-    pub session_mem_max_tokens: usize,
-    // Reserved tuning knobs: callers currently pass `k` per-call and `lexical_score_tokens` uses the
-    // research-fixed 0.7/0.3 blend, so these defaults aren't read yet (kept for the bench grid-search).
-    /// Lazy `search_memory` injection.
-    #[allow(dead_code)]
-    pub search_top_k: usize,
-    /// Hard output budget of one `memory_search` tool call (chars/4 estimate).
-    pub search_max_tokens: usize,
-    /// Lexical blend weights.
-    #[allow(dead_code)]
-    pub w_jaccard: f64,
-    #[allow(dead_code)]
-    pub w_tf: f64,
-    /// Recency half-life (days) for the learned-store decay (exp(-age/30)).
-    pub recency_half_life_days: f64,
-    // ── learning pipeline (P3) ──
-    /// Below this confidence a candidate is dropped entirely.
-    pub learn_min_confidence: f64,
-    /// `[learn_min_confidence, learn_store_confidence)` → review queue (human gate).
-    pub learn_store_confidence: f64,
-    /// Style candidates at/above this confidence are eligible for core promotion (gated by confirm).
-    pub learn_core_confidence: f64,
-    /// Lexical near-duplicate threshold for consolidation (UPDATE-reinforce instead of ADD).
-    /// Reworded restatements of one fact land ~0.78–1.0; different-topic facts ≤~0.55,
-    /// so this cleanly absorbs dups without false-merging distinct facts. Paraphrase-level
-    /// and contradiction handling are P5 (cosine) / P4 (supersession).
-    pub learn_dedup_threshold: f64,
-    /// MinHash near-duplicate threshold (char-5-gram Jaccard) for the write-path dedup guard.
-    pub minhash_dup_threshold: f64,
-    // ── anti-bloat (P4) ──
-    /// Max INFERRED active facts before the LRU cap archives the oldest. Curated facts exempt.
-    pub learn_inferred_cap: usize,
-    // ── dense tier (P5) ──
-    /// Reciprocal Rank Fusion constant (bench-tuned 10, not the literature default 60).
-    pub rrf_k: f64,
-    /// Embedding dimensionality for the fallback hashing embedder (HashEmbedder picks its own
-    /// default; this knob is reserved for tuning the dense backend dim).
-    #[allow(dead_code)]
-    pub embed_dim: usize,
-    /// Enable the Jaro-Winkler fuzzy bridge in PRODUCTION retrieval (typo/morphology recall the
-    /// exact BM25 floor misses). Default OFF — the lexical floor ships alone; flip on once a
-    /// typo-heavy corpus proves net value. When on, `search_filtered` scores via `score_fuzzy`.
-    pub enable_fuzzy: bool,
-    /// Enable the dense (embedding) tier fused with lexical via RRF in PRODUCTION retrieval.
-    /// Default OFF; the real semantic backend needs `--features dense` (else the pure-Rust hashing
-    /// embedder, which exercises the path but isn't semantic). When on, `search_filtered` routes
-    /// through `search_hybrid_gated_in` with a persistent per-fact embedding cache.
-    pub enable_dense: bool,
-    /// Dense query-level GATE (P6): fuse the dense tier only when the best lexical hit covers FEWER
-    /// than this fraction of the query's tokens — i.e. BM25 is ambiguous (paraphrase / cross-lingual).
-    /// A confident, high-coverage literal match skips dense entirely, preserving its precision (the
-    /// bench showed always-on fusion lifts paraphrase recall but wrecks literal precision/noise).
-    /// `0.0` ⇒ never gate open (dense off in practice); `≥1.0` ⇒ always fuse (the always-on ceiling).
-    pub dense_gate_coverage: f64,
-}
-
-impl Default for MemorySettings {
-    fn default() -> Self {
-        Self {
-            frozen_core_max_tokens: 800,
-            session_mem_max_tokens: 300,
-            search_top_k: 5,
-            search_max_tokens: 1200,
-            w_jaccard: 0.7,
-            w_tf: 0.3,
-            recency_half_life_days: 30.0,
-            learn_min_confidence: 0.5,
-            learn_store_confidence: 0.7,
-            learn_core_confidence: 0.85,
-            learn_dedup_threshold: 0.78,
-            minhash_dup_threshold: 0.8,
-            learn_inferred_cap: 500,
-            rrf_k: 10.0,
-            embed_dim: 256,
-            enable_fuzzy: false,
-            enable_dense: false,
-            // Gate open when the best lexical hit covers <60% of the query tokens. Tuned so a
-            // clean literal match (full coverage) skips dense while a paraphrase/cross-lingual
-            // query (low lexical overlap) opens it. The bench (`--split tune --hybrid`) is what
-            // re-tunes this: it must keep the paraphrase recall lift without the literal-slice
-            // precision/noise hit that always-on fusion showed.
-            dense_gate_coverage: 0.60,
-        }
-    }
 }
 
 #[cfg(test)]

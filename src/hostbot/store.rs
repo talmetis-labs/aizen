@@ -56,9 +56,9 @@ pub struct HostedBot {
     /// Per-bot allowlist override. Empty ⇒ inherit the primary bot's `allowed_chat_ids`.
     #[serde(default)]
     pub allowed_chat_ids: Vec<i64>,
-    /// Persona this sub-bot wears (name of a persona card). `None` ⇒ the daemon's global persona (the
-    /// "default" bot's voice). Only the `<persona>`/`<self>` blocks change per bot — `<user_memory>`
-    /// (the frozen core) stays global, so the owner's memory is shared, "driven by default".
+    /// Persona this sub-bot wears (name of a persona card). `None` ⇒ the daemon's global persona
+    /// (the "default" bot's voice). Persistent Memory is separate: any context comes from the
+    /// selected provider under its configured scope and grants, not a built-in global frozen store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     /// This bot answers to its OWN owner instead of inheriting the primary's allowlist.
@@ -231,6 +231,12 @@ struct SessionFile {
     platform: String,
     route: String,
     chat: String,
+    // Explicit Core storage projection also removes input pixels and bounds tool-media retention.
+    // Generic Message serde is the model-wire shape and intentionally drops host turn identity.
+    #[serde(
+        serialize_with = "crate::core::session_store::serialize_stored_messages",
+        deserialize_with = "crate::core::session_store::deserialize_stored_messages"
+    )]
     messages: Vec<Message>,
 }
 
@@ -373,6 +379,34 @@ pub fn gc_sessions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_storage_round_trip_preserves_turn_identity_and_projects_input_pixels() {
+        let mut message =
+            Message::user_with_images("request", vec!["data:image/png;base64,AAAA".into()]);
+        message.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
+        let id = message.user_turn_id.clone();
+        let session = SessionFile {
+            platform: "fixture".into(),
+            route: "default".into(),
+            chat: "1".into(),
+            messages: vec![message],
+        };
+        let bytes = serde_json::to_vec(&session).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            stored["messages"][0]["aizen_user_turn_id"],
+            id.as_ref().unwrap().as_str()
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("data:image/png"));
+        let loaded: SessionFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.messages[0].user_turn_id, id);
+        assert!(loaded.messages[0].images.is_empty());
+        let legacy: SessionFile = serde_json::from_str(
+            r#"{"platform":"fixture","route":"default","chat":"1","messages":[{"role":"user","content":"legacy"}]}"#,
+        ).unwrap();
+        assert!(legacy.messages[0].user_turn_id.is_none());
+    }
 
     /// Pin `AIZEN_HOME` to a fresh tempdir so the store reads/writes there, not the real `~/.aizen`.
     /// Returns the guard dir (kept alive for the test's lifetime). Serialized via the SHARED

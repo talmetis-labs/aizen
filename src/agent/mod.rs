@@ -1041,9 +1041,10 @@ fn design_evidence_summary(cfg: &AgentConfig, build_passed: bool, edited: bool) 
     out
 }
 
-/// Run the agent loop to completion.
+/// Test convenience wrapper around the conversation-preserving agent loop.
 ///
-/// `chat(messages, tool_defs) -> ChatTurn` is the model call (injected for testability).
+/// `chat(messages, tool_defs) -> ChatTurn` is the injected model call.
+#[cfg(test)]
 pub async fn run_agent<F, Fut>(
     chat: F,
     cfg: &AgentConfig,
@@ -1066,7 +1067,7 @@ type NoSummarizer = fn(Vec<Message>) -> std::future::Ready<Result<String>>;
 /// The agent loop over an EXISTING conversation: `messages` already holds the system prompt and
 /// every turn so far (the unified chat+agent REPL appends a user turn then calls this). Drives
 /// tool calls to a final answer; on Done the final assistant text is pushed onto `messages` so a
-/// multi-turn caller keeps context. Single-shot callers go through `run_agent`. No mid-loop
+/// multi-turn caller keeps context. Single-shot callers retain their own conversation too. No mid-loop
 /// compaction (tool-result clearing + the wrap-up nudge still apply) — see
 /// [`run_agent_loop_compacting`].
 pub async fn run_agent_loop<F, Fut>(
@@ -2744,6 +2745,8 @@ where
                     tool_images: Vec::new(),
                     visual_context: Vec::new(),
                     image_preferences: Vec::new(),
+                    user_turn_id: None,
+                    memory_scaffold: None,
                     cache_control: None,
                 });
                 let combined = if demands.len() == 1 {
@@ -2810,6 +2813,8 @@ where
                         tool_images: Vec::new(),
                         visual_context: Vec::new(),
                         image_preferences: Vec::new(),
+                        user_turn_id: None,
+                        memory_scaffold: None,
                         cache_control: None,
                     });
                     messages.push(Message::user(format!(
@@ -2856,6 +2861,8 @@ where
                         tool_images: Vec::new(),
                         visual_context: Vec::new(),
                         image_preferences: Vec::new(),
+                        user_turn_id: None,
+                        memory_scaffold: None,
                         cache_control: None,
                     });
                     messages.push(Message::user(crate::core::steer::format_injection(&steers)));
@@ -2966,6 +2973,8 @@ where
             tool_images: Vec::new(),
             visual_context: Vec::new(),
             image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         });
         let base = messages.len();
@@ -5779,6 +5788,9 @@ fn run_prepared_tool_body_cached(
         // Hooks and approval have completed. Resource ownership ends before post hooks, output
         // formatting and spill storage; only the actual read/apply runs under these locks.
         (|| -> anyhow::Result<ToolObservation> {
+            if tool.is_memory_provider() {
+                return tool.execute_prepared(prepared);
+            }
             let root = match exec_ctx.placement() {
                 Some(placement) => placement.workspace_root().to_path_buf(),
                 None => std::env::current_dir()?,
@@ -5991,6 +6003,7 @@ fn check_background_effects() -> anyhow::Result<()> {
     // LSP and MCP stdio pool one sidecar admission gate, so they share one settlement charge: this
     // single check covers both. Calling it twice would also double the bounded wait.
     crate::agent::mcp::check_startup_effects()?;
+    crate::plugin::runtime::check_effects()?;
     crate::core::proctree::check_bounded_effects().map_err(|error| {
         anyhow::Error::new(tools::ToolEffectsUnsettled(
             tools::ToolEffectState::UnknownWorker,
@@ -8198,7 +8211,7 @@ fn review_is_blocking(review: &str) -> bool {
 fn clean_review_user_text(content: &str) -> &str {
     let mut current = content;
     loop {
-        let next = codebase::strip_retrieval_prefix(crate::memory::strip_recall_prefix(current));
+        let next = codebase::strip_retrieval_prefix(current);
         if next == current {
             return current;
         }
@@ -8214,7 +8227,7 @@ fn capture_review_request(messages: &[Message]) -> String {
         .enumerate()
         .rev()
         .find(|(_, m)| m.role == "user")
-        .and_then(|(i, m)| m.content.as_deref().map(|c| (i, c)))
+        .and_then(|(i, m)| crate::core::memory_context::clean_content(m).map(|c| (i, c)))
     else {
         return String::new();
     };
@@ -8226,7 +8239,7 @@ fn capture_review_request(messages: &[Message]) -> String {
             .iter()
             .rev()
             .find(|m| m.role == "user")
-            .and_then(|m| m.content.as_deref())
+            .and_then(crate::core::memory_context::clean_content)
         {
             return format!(
                 "{}\n\nClarification answer:\n{}",
@@ -13276,7 +13289,7 @@ mod tests {
         };
         let recalled = format!(
             "{} (may be stale):\n[m1] prefers pnpm\n\nold task",
-            crate::memory::RECALL_MARKER
+            crate::core::memory_context::RECALL_MARKER
         );
         let mut messages = vec![
             Message::system("sys"),
@@ -14602,18 +14615,30 @@ mod tests {
 
     #[test]
     fn review_request_uses_newest_real_turn_and_strips_injected_prefixes() {
+        let prefix = "Recalled memory\n[m1] fixture";
+        let mut answer = Message::user(format!(
+            "{prefix}\n\n<codebase_context>\nretrieved source\n</codebase_context>\n\noption 2"
+        ));
+        crate::core::memory_context::seal(&mut answer, prefix, "fixture", 1, "session", "turn");
         let messages = vec![
             Message::user("old request"),
             Message::tool_result("clarify-1", "question"),
-            Message::user(
-                "<codebase_context>\nretrieved source\n</codebase_context>\n\nRecalled memory\n\noption 2",
-            ),
+            answer,
         ];
         let request = capture_review_request(&messages);
         assert!(request.contains("old request"));
         assert!(request.contains("option 2"));
         assert!(!request.contains("retrieved source"));
         assert!(!request.contains("Recalled memory"));
+    }
+
+    #[test]
+    fn review_request_preserves_user_authored_memory_markers() {
+        let text = "Recalled memory\n\nplease document this exact heading";
+        assert_eq!(capture_review_request(&[Message::user(text)]), text);
+        let text = "<codebase_context>\nretrieved source\n</codebase_context>\n\nRecalled memory\n\nuser-authored heading";
+        let request = capture_review_request(&[Message::user(text)]);
+        assert_eq!(request, "Recalled memory\n\nuser-authored heading");
     }
 
     #[test]

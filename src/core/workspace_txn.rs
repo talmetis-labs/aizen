@@ -1069,6 +1069,48 @@ impl SidecarEffectLease {
     }
 }
 
+/// One opaque Memory-provider transaction, admitted before generic native tool-body locks.
+/// Every acquisition is zero-wait: callers may already own a legitimate ancestor writer lease.
+/// Physical ownership is always fresh, never borrowed from that ancestor or a sibling.
+pub(crate) struct MemoryProviderLease {
+    _workspace: WorkspaceWriterLease,
+    _physical: PhysicalEffectLease,
+    _sidecar: SidecarEffectLease,
+    _global: std::sync::Arc<LockSet>,
+}
+
+impl MemoryProviderLease {
+    pub(crate) fn acquire(
+        root: &Path,
+        scope: &str,
+        cancel: Option<&crate::core::cancel::TurnCancel>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            crate::core::exec_ctx::current().is_none_or(|ctx| ctx.native_scope().is_none()),
+            "Memory provider cannot reenter a native-scoped body"
+        );
+        anyhow::ensure!(
+            !scope.is_empty() && scope.len() <= 4096,
+            "invalid provider resource scope"
+        );
+        let operation = "Memory provider transaction";
+        let global = exclusive_global_gate(scope, operation, Duration::ZERO, cancel)?;
+        let sidecar = SidecarEffectLease::acquire(SidecarKind::McpServer, Duration::ZERO, cancel)?;
+        let background = BackgroundProcessBarrier::acquire(cancel)?;
+        let mut physical =
+            PhysicalEffectLease::exclusive(Duration::ZERO, cancel, operation, scope)?;
+        physical._background = Some(background);
+        let workspace =
+            WorkspaceWriterLease::acquire_scoped(root, Duration::ZERO, cancel, operation, scope)?;
+        Ok(Self {
+            _workspace: workspace,
+            _physical: physical,
+            _sidecar: sidecar,
+            _global: global,
+        })
+    }
+}
+
 /// Independent SHARED admission for one scoped native body. It takes all sidecar gates at SHARED:
 /// an MCP server (EXCLUSIVE) is excluded, while a language server (SHARED) coexists — so an
 /// LSP-attached session can still run scoped native children instead of starving every native body
@@ -1676,6 +1718,51 @@ mod tests {
         let a = NativeResource::resolve(&temp.path().join("workspace/a.txt")).unwrap();
         let b = NativeResource::resolve(&temp.path().join("workspace/b.txt")).unwrap();
         (temp, a, b)
+    }
+
+    #[test]
+    fn memory_provider_lease_keeps_fresh_physical_and_scoped_ancestor_ownership() -> Result<()> {
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root)?;
+        with_test_lock_home(temp.path(), || -> Result<()> {
+            let parent = WorkspaceWriterLease::acquire_scoped(
+                &root,
+                Duration::ZERO,
+                None,
+                "parent",
+                "parent",
+            )?;
+            let lease = MemoryProviderLease::acquire(&root, "parent/provider", None)?;
+            assert!(
+                MemoryProviderLease::acquire(&root, "parent/provider", None).is_err(),
+                "physical bodies never reenter"
+            );
+            assert!(
+                MemoryProviderLease::acquire(&root, "unrelated", None).is_err(),
+                "siblings cannot borrow ancestor admission"
+            );
+            assert!(
+                PhysicalEffectLease::exclusive(Duration::ZERO, None, "other", "parent/other")
+                    .is_err()
+            );
+            drop(lease);
+            let physical = PhysicalEffectLease::exclusive(
+                Duration::ZERO,
+                None,
+                "existing body",
+                "parent/body",
+            )?;
+            assert!(MemoryProviderLease::acquire(&root, "parent/provider", None).is_err());
+            drop(physical);
+            drop(MemoryProviderLease::acquire(
+                &root,
+                "parent/provider",
+                None,
+            )?);
+            drop(parent);
+            Ok(())
+        })
     }
 
     #[test]

@@ -2050,8 +2050,20 @@ pub(crate) fn build_chat_body_for_destination(
         messages: msgs,
         stream,
         temperature: None,
-        max_tokens: cfg.max_tokens,
-        max_completion_tokens: None,
+        max_tokens: if cfg.output_token_parameter
+            == Some(crate::core::cli_config::OutputTokenParameter::MaxCompletionTokens)
+        {
+            None
+        } else {
+            cfg.max_tokens
+        },
+        max_completion_tokens: if cfg.output_token_parameter
+            == Some(crate::core::cli_config::OutputTokenParameter::MaxCompletionTokens)
+        {
+            cfg.max_tokens
+        } else {
+            None
+        },
         tools: tool_defs,
         tool_choice: if tools.is_empty() {
             None
@@ -2235,6 +2247,121 @@ async fn chat_with_tools_effort_live(
         empty_wire_raw,
         eager: Vec::new(),
     })
+}
+
+/// One bounded, no-tool model request for an explicitly authorized extension job. The caller
+/// supplies the completed turn's frozen route/config; there is no role resolution or retry.
+pub(crate) async fn extension_completion(
+    endpoint: &crate::core::cli_config::ResolvedEndpoint,
+    effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
+    messages: &[Message],
+    max_output_tokens: u32,
+) -> Result<String> {
+    if matches!(
+        crate::llm::replay::mode(),
+        crate::llm::replay::Mode::Replay | crate::llm::replay::Mode::Strict
+    ) {
+        bail!("prepared Memory model learning is disabled during tape replay");
+    }
+    // OAuth's Responses transport owns a separate credential lifecycle. Never silently substitute
+    // another endpoint or use a freshly resolved account for this captured-route operation.
+    if crate::llm::oauth_codex::is_codex_base_url(&endpoint.base_url) {
+        bail!("prepared Memory learning is not supported on the Codex OAuth transport");
+    }
+    if !(1..=2048).contains(&max_output_tokens) {
+        bail!("invalid Memory learning output-token limit");
+    }
+    let mut bounded = cfg.clone();
+    bounded.max_tokens = Some(
+        cfg.max_tokens
+            .map_or(max_output_tokens, |cap| cap.min(max_output_tokens)),
+    );
+    if bounded.max_tokens == Some(0) {
+        bail!("invalid configured Memory learning output-token limit");
+    }
+    let mut body = build_chat_body_for_destination(
+        &bounded,
+        &endpoint.model,
+        messages,
+        &[],
+        false,
+        effort,
+        crate::llm::media::VisionPolicy::Unsupported,
+        None,
+    );
+    apply_known_quirks(&mut body);
+    // A learned provider quirk must never remove this job's spending bound.
+    if body.max_tokens.is_none() && body.max_completion_tokens.is_none() {
+        bail!("model transport cannot enforce the Memory output-token limit");
+    }
+    let wire = serde_json::to_vec(&body)?;
+    let url = format!(
+        "{}/chat/completions",
+        endpoint.base_url.trim_end_matches('/')
+    );
+    // Only the endpoint/auth/model/config are captured, not a potentially redirect-following client.
+    // This transport deliberately refuses redirects of provider-prepared Memory text.
+    let bounded_http = reqwest::Client::builder()
+        .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|_| anyhow!("cannot build Memory learning HTTP transport"))?;
+    let response = with_provider_auth(bounded_http.post(&url), &url, &endpoint.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(wire)
+        .send()
+        .await
+        .map_err(|_| anyhow!("Memory learning model transport failed; no retry"))?;
+    ensure_extension_status(response.status())?;
+    let mut stream = response.bytes_stream();
+    let mut raw = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| anyhow!("Memory learning model response interrupted"))?;
+        if raw.len().saturating_add(chunk.len()) > 256 * 1024 {
+            bail!("Memory learning model response exceeds 256 KiB");
+        }
+        raw.extend_from_slice(&chunk);
+    }
+    let mut parsed: ChatResponse = serde_json::from_slice(&raw)
+        .map_err(|_| anyhow!("invalid Memory learning model response"))?;
+    if let Some(usage) = &parsed.usage {
+        cost_meter().record(usage);
+    }
+    let choice = parsed
+        .choices
+        .first_mut()
+        .context("model returned no choices")?;
+    if !choice.message.tool_calls.is_empty()
+        || choice.message.extra.contains_key("function_call")
+        || matches!(choice.finish_reason.as_deref(), Some(reason) if reason != "stop")
+    {
+        bail!("Memory learning model returned tool calls or an incomplete response");
+    }
+    let content = choice
+        .message
+        .content
+        .as_deref()
+        .unwrap_or_default()
+        .to_owned();
+    if content.len() > 32 * 1024
+        || content
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+    {
+        bail!("Memory learning completion exceeds text limits");
+    }
+    Ok(content)
+}
+
+fn ensure_extension_status(status: reqwest::StatusCode) -> Result<()> {
+    if !status.is_success() {
+        // Do not log an endpoint, key, prompt or arbitrary provider body on this optional path.
+        bail!("Memory learning model returned HTTP {}", status.as_u16());
+    }
+    Ok(())
 }
 
 /// A printable prefix of a response body: ASCII as-is (escaped), non-ASCII as `len=N bytes`.
@@ -3268,6 +3395,10 @@ fn key_probe_prefers_free_pricing_over_paid() {
         .unwrap();
     assert_eq!(picked, "openrouter/free");
 }
+
+#[cfg(test)]
+#[path = "extension_tests.rs"]
+mod extension_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

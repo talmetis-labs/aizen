@@ -4,6 +4,42 @@
 use super::*;
 
 #[test]
+fn config_navigation_pairs_each_label_with_its_named_destination() {
+    let _guard = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fixture = crate::core::file_placement::tests::TestDir::new();
+    let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
+    let rows = config_rows(&cli_config::CliConfig::default());
+    use ConfigSection as S;
+    let expected = [
+        (S::Providers, "Providers & connection"),
+        (S::Model, "Main model & context"),
+        (S::Subagents, "Sub-agents"),
+        (S::WebSearch, "Web search"),
+        (S::Memory, "Memory"),
+        (S::Codebase, "Codebase"),
+        (S::Session, "Session"),
+        (S::Reasoning, "Reasoning"),
+        (S::Approval, "Approval"),
+        (S::Display, "Display"),
+        (S::Vision, "Vision"),
+        (S::Sandbox, "Sandbox"),
+        (S::Context, "Context window"),
+        (S::Show, "Show full config"),
+        (S::Done, "Done"),
+    ];
+    assert_eq!(rows.len(), expected.len());
+    for ((destination, label), (expected, prefix)) in rows.iter().zip(expected) {
+        assert_eq!(*destination, expected);
+        assert!(label.starts_with(prefix), "{label}");
+    }
+    assert!(!fixture.path().join("cli-config.json").exists());
+    assert!(!fixture.path().join("memory-data").exists());
+    assert!(!fixture.path().join("plugin-temp").exists());
+}
+
+#[test]
 fn context_override_is_retained_only_on_the_same_main_route() {
     let original = cli_config::CliConfig {
         base_url: Some("https://fixture.invalid/v1".into()),

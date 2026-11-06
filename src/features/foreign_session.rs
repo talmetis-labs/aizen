@@ -745,6 +745,8 @@ fn claude_assistant(msg: &serde_json::Value) -> Option<Message> {
         tool_images: Vec::new(),
         visual_context: Vec::new(),
         image_preferences: Vec::new(),
+        user_turn_id: None,
+        memory_scaffold: None,
         cache_control: None,
     })
 }
@@ -882,6 +884,8 @@ fn attach_or_push_call(out: &mut Vec<Message>, call: ToolCall) {
         tool_images: Vec::new(),
         visual_context: Vec::new(),
         image_preferences: Vec::new(),
+        user_turn_id: None,
+        memory_scaffold: None,
         cache_control: None,
     });
 }
@@ -1236,6 +1240,8 @@ mod tests {
                 tool_images: Vec::new(),
                 visual_context: Vec::new(),
                 image_preferences: Vec::new(),
+                user_turn_id: None,
+                memory_scaffold: None,
                 cache_control: None,
             });
             msgs.push(Message::tool_result(id, body));
@@ -1312,6 +1318,8 @@ mod tests {
                 tool_images: Vec::new(),
                 visual_context: Vec::new(),
                 image_preferences: Vec::new(),
+                user_turn_id: None,
+                memory_scaffold: None,
                 cache_control: None,
             },
         ];
@@ -1343,6 +1351,8 @@ mod tests {
                 tool_images: Vec::new(),
                 visual_context: Vec::new(),
                 image_preferences: Vec::new(),
+                user_turn_id: None,
+                memory_scaffold: None,
                 cache_control: None,
             },
             Message::tool_result("c", "done"),

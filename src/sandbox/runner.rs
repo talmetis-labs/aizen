@@ -12,9 +12,7 @@ use super::policy::{self, SandboxSettings};
 use super::request::{CommandSpec, SandboxRequest};
 use super::SandboxMode;
 use anyhow::{anyhow, Result};
-#[cfg(not(windows))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// How one finished (or failed) spawn is reported to the audit log.
@@ -419,104 +417,149 @@ fn refusal(req: &SandboxRequest, settings: &SandboxSettings, msg: &str) -> anyho
 }
 
 fn resolve(req: &SandboxRequest, settings: &SandboxSettings) -> Result<Resolution> {
-    let requested = super::mode();
+    resolve_mode(req, settings, super::mode())
+}
+
+fn resolve_mode(
+    req: &SandboxRequest,
+    settings: &SandboxSettings,
+    requested: SandboxMode,
+) -> Result<Resolution> {
+    req.validate_restricted()?;
     let report = capabilities::probe();
+    let restricted = req.restricted_policy().is_some();
     let broad_ok = settings.dangerous_allow_broad_workspace.unwrap_or(false);
 
-    match requested {
-        SandboxMode::Off => Ok(Resolution {
-            effective: "off",
-            backend: "disabled",
-            guard: false,
-            kernel: false,
-            degraded: vec![],
-        }),
-        SandboxMode::Guarded => Ok(Resolution {
-            effective: "guarded",
-            backend: BackendKind::Guarded.as_str(),
-            guard: true,
-            kernel: false,
-            degraded: vec![],
-        }),
-        SandboxMode::Strict => {
-            if policy::workspace_too_broad(&req.workspace_root) && !broad_ok {
-                return Err(refusal(
+    let mut resolution = (|| -> Result<Resolution> {
+        match requested {
+            SandboxMode::Off => Ok(Resolution {
+                effective: "off",
+                backend: "disabled",
+                guard: false,
+                kernel: false,
+                degraded: vec![],
+            }),
+            SandboxMode::Guarded => Ok(Resolution {
+                effective: "guarded",
+                backend: BackendKind::Guarded.as_str(),
+                guard: true,
+                kernel: false,
+                degraded: vec![],
+            }),
+            SandboxMode::Strict => {
+                if policy::workspace_too_broad(&req.workspace_root) && !broad_ok {
+                    return Err(refusal(
                     req,
                     settings,
                     "strict: the workspace is a root/home/system directory — a workspace-write \
                      sandbox over it protects nothing. Narrow the workspace, or set \
                      sandbox.dangerous_allow_broad_workspace",
                 ));
-            }
-            if !report.fs_write.kernel_backed() {
-                return Err(refusal(
-                    req,
-                    settings,
-                    "strict: this platform cannot kernel-enforce the filesystem policy (no \
+                }
+                if !report.fs_write.kernel_backed() {
+                    return Err(refusal(
+                        req,
+                        settings,
+                        "strict: this platform cannot kernel-enforce the filesystem policy (no \
                      AppContainer backend on Windows). Use `--sandbox guarded` for software \
                      guards, or run on Linux/macOS for kernel enforcement",
-                ));
-            }
-            let deny_net = !(req.network || policy::network_default_allow(settings));
-            if deny_net && !report.network_deny.kernel_backed() {
-                return Err(refusal(
+                    ));
+                }
+                let deny_net = !(policy::network_allowed(req, settings));
+                if deny_net && !report.network_deny.kernel_backed() {
+                    return Err(refusal(
                     req,
                     settings,
                     "strict: network deny cannot be kernel-enforced here — refusing rather than \
                      pretending",
                 ));
-            }
-            Ok(Resolution {
-                effective: "strict",
-                backend: report.backend.as_str(),
-                guard: true,
-                kernel: true,
-                degraded: vec![],
-            })
-        }
-        SandboxMode::Auto => {
-            if kernel_sandbox_available() {
-                if policy::workspace_too_broad(&req.workspace_root) && !broad_ok {
-                    warn_once(
-                        "workspace is a root/home/system directory — the filesystem sandbox \
-                         around it is nearly meaningless. Narrow the workspace (see `aizen \
-                         sandbox status`)",
-                    );
                 }
-                return Ok(Resolution {
-                    effective: "auto",
+                Ok(Resolution {
+                    effective: "strict",
                     backend: report.backend.as_str(),
                     guard: true,
                     kernel: true,
                     degraded: vec![],
-                });
+                })
             }
-            // No kernel sandbox on this host. Unattended origins fail closed unless the user
-            // opted into the software fallback; interactive sessions degrade to guarded. The
-            // degradation is recorded in `degraded` (surfaced by `aizen sandbox status`) but not
-            // announced as a boot line: on Windows the kernel backend never exists, so the warning
-            // is permanent noise at every startup rather than a signal.
-            if (req.origin.unattended() || super::process_unattended())
-                && !settings.allow_guarded_fallback.unwrap_or(false)
-            {
-                return Err(refusal(
-                    req,
-                    settings,
-                    "no kernel sandbox on this platform and this is an unattended run (cron / \
+            SandboxMode::Auto => {
+                if kernel_sandbox_available() {
+                    if policy::workspace_too_broad(&req.workspace_root) && !broad_ok {
+                        warn_once(
+                            "workspace is a root/home/system directory — the filesystem sandbox \
+                         around it is nearly meaningless. Narrow the workspace (see `aizen \
+                         sandbox status`)",
+                        );
+                    }
+                    return Ok(Resolution {
+                        effective: "auto",
+                        backend: report.backend.as_str(),
+                        guard: true,
+                        kernel: true,
+                        degraded: vec![],
+                    });
+                }
+                // No kernel sandbox on this host. Unattended origins fail closed unless the user
+                // opted into the software fallback; interactive sessions degrade to guarded. The
+                // degradation is recorded in `degraded` (surfaced by `aizen sandbox status`) but not
+                // announced as a boot line: on Windows the kernel backend never exists, so the warning
+                // is permanent noise at every startup rather than a signal.
+                if (req.origin.unattended() || super::process_unattended())
+                    && !settings.allow_guarded_fallback.unwrap_or(false)
+                {
+                    return Err(refusal(
+                        req,
+                        settings,
+                        "no kernel sandbox on this platform and this is an unattended run (cron / \
                      hosted bot). Refusing per fail-closed policy — set \
                      sandbox.allow_guarded_fallback=true to accept software guards for \
                      unattended runs",
-                ));
+                    ));
+                }
+                Ok(Resolution {
+                    effective: "guarded",
+                    backend: report.backend.as_str(),
+                    guard: true,
+                    kernel: false,
+                    degraded: vec![
+                        "auto degraded to guarded: no kernel sandbox backend".to_string()
+                    ],
+                })
             }
-            Ok(Resolution {
-                effective: "guarded",
-                backend: report.backend.as_str(),
-                guard: true,
-                kernel: false,
-                degraded: vec!["auto degraded to guarded: no kernel sandbox backend".to_string()],
-            })
+        }
+    })()?;
+    if restricted {
+        if requested == SandboxMode::Off {
+            return Err(refusal(
+                req,
+                settings,
+                "native plugins require at least guarded policy; sandbox off cannot disable \
+                 their environment isolation. Guarded still needs explicit host authorization \
+                 and does not enforce filesystem/network confinement",
+            ));
+        }
+        // Auto may not silently run a half-armed restrictive policy. Explicit guarded remains a
+        // host-consent path; a saved network grant still does not imply guarded consent.
+        if resolution.kernel
+            && (!report.fs_write.kernel_backed()
+                || (!policy::network_allowed(req, settings)
+                    && !report.network_deny.kernel_backed()))
+        {
+            return Err(refusal(req, settings,
+                "native plugin requires filesystem and requested network enforcement; use an explicitly authorized guarded mode rather than partial auto confinement"));
+        }
+        // The restrictive environment also applies in guarded mode; normal off-mode children
+        // retain their historical inherited environment.
+        resolution.guard = true;
+        if !resolution.kernel {
+            resolution.degraded.push(
+                "native plugin: filesystem/network policy is advisory; host must require informed \
+                 guarded authorization (environment isolation is not filesystem isolation)"
+                    .into(),
+            );
         }
     }
+    Ok(resolution)
 }
 
 fn base_record(
@@ -554,7 +597,7 @@ fn base_record(
         mode_requested: super::mode().as_str(),
         mode_effective: effective,
         backend,
-        network: req.network || policy::network_default_allow(settings),
+        network: policy::network_allowed(req, settings),
         env_scrubbed,
         degraded,
         outcome: String::new(),
@@ -623,17 +666,86 @@ fn grant_program_execution(fs: &mut policy::FsPolicy, program: &Path) {
     }
 }
 
+/// Resolve filesystem intent without ever turning a plugin cwd/model into a write root. The
+/// legacy branch is intentionally unchanged (including toolchain/cache/config grants).
+#[cfg_attr(windows, allow(dead_code))]
+fn request_fs(
+    req: &SandboxRequest,
+    tmp: Option<&Path>,
+    settings: &SandboxSettings,
+) -> policy::FsPolicy {
+    if let Some(plugin) = req.restricted_policy() {
+        policy::native_plugin_fs(plugin)
+    } else {
+        let mut fs = policy::fs_policy(&req.workspace_root, tmp, settings);
+        fs.read_write.push(req.cwd.clone());
+        fs
+    }
+}
+
+/// Unlike the general macOS profile, this does not allow ambient reads, `/dev` subtree writes or
+/// `/private/var/folders` writes. Runtime metadata is allowed, but file contents stay allowlisted.
+#[cfg(any(target_os = "macos", test))]
+fn native_plugin_macos_profile(fs: &policy::FsPolicy, deny_network: bool) -> String {
+    fn escaped(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+    let mut profile = String::from(
+        "(version 1)\n(allow default)\n(deny file-read*)\n(deny file-write*)\n(allow file-read-metadata)\n",
+    );
+    if deny_network {
+        profile.push_str("(deny network*)\n");
+    }
+    for root in fs.read_only.iter().chain(&fs.read_write) {
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            escaped(root)
+        ));
+    }
+    for root in &fs.read_write {
+        profile.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            escaped(root)
+        ));
+    }
+    for file in &fs.exec_files {
+        profile.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            escaped(file)
+        ));
+    }
+    for device in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (literal \"{device}\"))\n"
+        ));
+    }
+    profile
+}
+
 macro_rules! build_prepared {
-    ($fn_name:ident, $cmd_ty:ty, $new:expr, $proctree_prepare:path, $apply_kernel:ident) => {
+    ($fn_name:ident, $with_policy:ident, $cmd_ty:ty, $new:expr, $proctree_prepare:path, $apply_kernel:ident) => {
         /// Build a sandboxed command of this flavor. Returns `Err` when policy refuses the spawn
         /// (strict without kernel backing, unattended without fallback, broad workspace).
         pub fn $fn_name(req: SandboxRequest) -> Result<Sandboxed<$cmd_ty>> {
             let settings = policy::settings();
             let res = resolve(&req, &settings)?;
+            $with_policy(req, settings, res)
+        }
+
+        // Kept private: tests exercise command construction without reading real HOME/config or
+        // changing the process-global mode. Production always resolves current host settings.
+        fn $with_policy(
+            req: SandboxRequest,
+            settings: SandboxSettings,
+            res: Resolution,
+        ) -> Result<Sandboxed<$cmd_ty>> {
+            req.validate_restricted()?;
 
             #[allow(unused_mut)]
             let (mut program, mut args) = resolve_argv(&req.spec);
-            let tmp = if res.guard && req.private_tmp {
+            let tmp = if res.guard && req.private_tmp && req.restricted_policy().is_none() {
                 PrivateTmp::create(&req.scope)
             } else {
                 None
@@ -645,15 +757,14 @@ macro_rules! build_prepared {
             #[cfg(target_os = "macos")]
             {
                 if res.kernel && super::backend::macos::available() {
-                    let deny_net = !(req.network || policy::network_default_allow(&settings));
-                    let mut fs = policy::fs_policy(
-                        &req.workspace_root,
-                        tmp.as_ref().map(|t| t.path()),
-                        &settings,
-                    );
-                    fs.read_write.push(req.cwd.clone());
+                    let deny_net = !policy::network_allowed(&req, &settings);
+                    let mut fs = request_fs(&req, tmp.as_ref().map(|t| t.path()), &settings);
                     grant_program_execution(&mut fs, &program);
-                    let prof = super::backend::macos::profile(&fs, deny_net);
+                    let prof = if req.restricted_policy().is_some() {
+                        native_plugin_macos_profile(&fs, deny_net)
+                    } else {
+                        super::backend::macos::profile(&fs, deny_net)
+                    };
                     let (p, a) = super::backend::macos::wrap(&program, &args, &prof);
                     program = p;
                     args = a;
@@ -684,7 +795,12 @@ macro_rules! build_prepared {
             command.current_dir(&req.cwd);
 
             let mut env_scrubbed = 0usize;
-            if res.guard {
+            if let Some(plugin) = req.restricted_policy() {
+                command.env_clear();
+                command.envs(policy::native_plugin_env(plugin));
+                // Count withheld variables for audit only; their names/values never enter policy.
+                env_scrubbed = std::env::vars_os().count();
+            } else if res.guard {
                 env_scrubbed = policy::scrubbed_count(&settings.pass_env);
                 guarded::apply_env(
                     &mut command,
@@ -701,17 +817,14 @@ macro_rules! build_prepared {
             #[cfg(target_os = "linux")]
             {
                 if res.kernel {
-                    let deny_net = !(req.network || policy::network_default_allow(&settings));
-                    let mut fs = policy::fs_policy(
-                        &req.workspace_root,
-                        tmp.as_ref().map(|t| t.path()),
-                        &settings,
-                    );
-                    fs.read_write.push(req.cwd.clone());
+                    let deny_net = !policy::network_allowed(&req, &settings);
+                    let mut fs = request_fs(&req, tmp.as_ref().map(|t| t.path()), &settings);
                     grant_program_execution(&mut fs, &program);
                     let limits = settings.limits.clone().unwrap_or_default();
                     let sbx = super::backend::linux::LinuxSandbox::build(&fs, deny_net, &limits);
-                    if res.effective == "strict" && !sbx.degraded.is_empty() {
+                    if (res.effective == "strict" || req.restricted_policy().is_some())
+                        && !sbx.degraded.is_empty()
+                    {
                         return Err(refusal(
                             &req,
                             &settings,
@@ -771,6 +884,7 @@ fn new_tokio(p: &PathBuf) -> tokio::process::Command {
 
 build_prepared!(
     prepare_std,
+    prepare_std_with_policy,
     std::process::Command,
     new_std,
     crate::core::proctree::prepare,
@@ -778,6 +892,7 @@ build_prepared!(
 );
 build_prepared!(
     prepare_tokio,
+    prepare_tokio_with_policy,
     tokio::process::Command,
     new_tokio,
     crate::core::proctree::prepare_tokio,
@@ -801,6 +916,179 @@ mod tests {
     fn req(origin: CommandOrigin) -> SandboxRequest {
         let cwd = std::env::current_dir().unwrap();
         SandboxRequest::shell(origin, "echo sandboxed", cwd.clone(), cwd)
+    }
+
+    #[test]
+    fn native_plugin_preparation_excludes_pass_env_and_global_cache_roots() {
+        let (fixture, plugin, program) = super::super::request::native_plugin_fixture();
+        let request =
+            SandboxRequest::native_plugin(CommandOrigin::McpStdio, program, vec![], plugin.clone())
+                .unwrap()
+                .private_tmp(true)
+                .network(true);
+        let ambient = fixture.path().join("ambient-cache");
+        let settings = SandboxSettings {
+            pass_env: vec![
+                "*".into(),
+                "OPENAI_API_KEY".into(),
+                "CARGO_HOME".into(),
+                "HTTP_PROXY".into(),
+            ],
+            writable_roots: vec![ambient.to_string_lossy().into_owned()],
+            read_only_roots: vec![fixture.path().to_string_lossy().into_owned()],
+            network: Some("allow".into()),
+            ..SandboxSettings::default()
+        };
+        let fs = request_fs(&request, Some(&ambient), &settings);
+        assert_eq!(
+            fs.read_write,
+            vec![plugin.data_root.clone(), plugin.private_temp.clone()]
+        );
+        assert!(!fs.read_write.contains(&plugin.package_root));
+        assert!(!fs.read_only.contains(&fixture.path().to_path_buf()));
+        let resolution = resolve_mode(&request, &settings, SandboxMode::Guarded).unwrap();
+        assert!(resolution.guard && !resolution.kernel);
+        assert!(resolution.degraded.iter().any(|m| m.contains("advisory")));
+        let command = prepare_std_with_policy(request, settings, resolution).unwrap();
+        assert_eq!(
+            command.command.get_current_dir(),
+            Some(plugin.package_root.as_path())
+        );
+        let env: Vec<_> = command
+            .command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k, v?)))
+            .collect();
+        assert_eq!(env.len(), policy::native_plugin_env(&plugin).len());
+        for name in [
+            "OPENAI_API_KEY",
+            "HTTP_PROXY",
+            "CARGO_HOME",
+            "PATH",
+            "AIZEN_HOME",
+        ] {
+            assert!(!env.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)));
+        }
+        assert!(
+            command.state.tmp.is_none(),
+            "caller-owned temp must not be replaced or deleted"
+        );
+        drop(command);
+        assert!(plugin.private_temp.is_dir());
+    }
+
+    #[test]
+    fn native_plugin_macos_profile_does_not_restore_ambient_access() {
+        let (_fixture, plugin, _program) = super::super::request::native_plugin_fixture();
+        let fs = policy::native_plugin_fs(&plugin);
+        let profile = native_plugin_macos_profile(&fs, true);
+        assert!(profile.contains("(deny file-read*)"));
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(deny network*)"));
+        assert!(!profile.contains("(subpath \"/dev\")"));
+        assert!(!profile.contains("/private/var/folders"));
+        let escaped = |path: &Path| {
+            path.to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        };
+        assert!(!profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            escaped(&plugin.package_root)
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            escaped(&plugin.data_root)
+        )));
+        assert!(!native_plugin_macos_profile(&fs, false).contains("(deny network*)"));
+    }
+
+    #[test]
+    fn native_plugin_command_ignores_pass_env_and_broad_config_roots() {
+        use crate::sandbox::request::{native_plugin_fixture, NativePluginNetworkGrant};
+        let (fixture, policy, program) = native_plugin_fixture();
+        let settings = SandboxSettings {
+            network: Some("allow".into()),
+            pass_env: vec!["OPENAI_API_KEY".into(), "HTTP_PROXY".into(), "*".into()],
+            writable_roots: vec![fixture.path().display().to_string()],
+            read_only_roots: vec![fixture.path().display().to_string()],
+            ..Default::default()
+        };
+        let req = SandboxRequest::native_plugin(
+            CommandOrigin::McpStdio,
+            program.clone(),
+            vec![],
+            policy.clone(),
+        )
+        .unwrap()
+        .network(true)
+        .private_tmp(true);
+        // Explicit mode/settings avoid ambient config, HOME inspection and global mode mutation.
+        let res = resolve_mode(&req, &settings, SandboxMode::Guarded).unwrap();
+        assert!(!policy::network_allowed(&req, &settings));
+        assert!(res.degraded.iter().any(|note| note.contains("advisory")));
+        let fs = request_fs(&req, Some(fixture.path()), &settings);
+        assert_eq!(
+            fs.read_write,
+            vec![policy.data_root.clone(), policy.private_temp.clone()]
+        );
+        assert!(!fs.read_only.contains(&fixture.path().to_path_buf()));
+        let prepared = prepare_std_with_policy(req, settings, res).unwrap();
+        assert_eq!(
+            prepared.command.get_current_dir(),
+            Some(policy.package_root.as_path())
+        );
+        assert_eq!(
+            prepared.command.get_program(),
+            program.canonicalize().unwrap().as_os_str()
+        );
+        let env: Vec<_> = prepared.command.get_envs().collect();
+        assert_eq!(env.len(), policy::native_plugin_env(&policy).len());
+        for name in [
+            "OPENAI_API_KEY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "PATH",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "AIZEN_HOME",
+        ] {
+            assert!(!env.iter().any(|(key, _)| key.eq_ignore_ascii_case(name)));
+        }
+        assert!(
+            prepared.state.tmp.is_none(),
+            "caller-owned private temp must not be replaced or cleaned by the runner"
+        );
+        drop(prepared);
+        assert!(
+            policy.private_temp.is_dir(),
+            "manager owns temp through settlement"
+        );
+        let _ = NativePluginNetworkGrant::Denied;
+    }
+
+    #[test]
+    fn native_plugin_macos_profile_has_no_ambient_read_or_scratch_writes() {
+        let (_fixture, policy, _program) = crate::sandbox::request::native_plugin_fixture();
+        let fs = policy::native_plugin_fs(&policy);
+        let profile = native_plugin_macos_profile(&fs, true);
+        assert!(profile.contains("(deny file-read*)"));
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(deny network*)"));
+        assert!(!profile.contains("subpath \"/private/var/folders\""));
+        assert!(!profile.contains("subpath \"/dev\""));
+        assert_eq!(profile.matches("(allow file-write* (subpath").count(), 2);
+        assert!(!native_plugin_macos_profile(&fs, false).contains("(deny network*)"));
+    }
+
+    #[test]
+    fn native_plugin_does_not_downgrade_off_or_windows_strict() {
+        let (_fixture, policy, program) = crate::sandbox::request::native_plugin_fixture();
+        let req = SandboxRequest::native_plugin(CommandOrigin::McpStdio, program, vec![], policy)
+            .unwrap();
+        assert!(resolve_mode(&req, &SandboxSettings::default(), SandboxMode::Off).is_err());
+        #[cfg(windows)]
+        assert!(resolve_mode(&req, &SandboxSettings::default(), SandboxMode::Strict).is_err());
     }
 
     #[test]
