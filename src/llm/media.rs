@@ -1798,6 +1798,8 @@ pub(crate) mod tests {
 
     #[test]
     fn live_pinned_tool_occurrence_wins_over_newer_optional_images() {
+        // Admission shares a process-wide budget with deliberate exhaustion tests.
+        let _guard = crate::llm::image_send::image_test_lock();
         let destination = "a".repeat(64);
         let mut messages = Vec::new();
         for i in 0..6 {
@@ -1820,8 +1822,9 @@ pub(crate) mod tests {
         let plan = ImageSelectionPlan::new(&messages, VisionPolicy::Supported, Some(&destination));
         assert_eq!(plan.tool_images.len(), MAX_REQUEST_IMAGES);
         assert_eq!(plan.tool_images[0].message_index, 1);
-        assert!(
-            request_memory_lease(&messages, VisionPolicy::Supported, Some(&destination)).is_ok()
+        drop(
+            request_memory_lease(&messages, VisionPolicy::Supported, Some(&destination))
+                .expect("one required image with optional images should fit the request budget"),
         );
         // Saved model pin flags do not acquire live request-selection priority.
         let restored: Vec<Message> =
@@ -1837,9 +1840,14 @@ pub(crate) mod tests {
             context.mutate(&id, "pin", None, None, false).unwrap();
         }
         context.sync(&mut messages);
+        let error =
+            match request_memory_lease(&messages, VisionPolicy::Supported, Some(&destination)) {
+                Err(error) => error,
+                Ok(_) => panic!("required images must not be silently omitted by request limits"),
+            };
         assert!(
-            request_memory_lease(&messages, VisionPolicy::Supported, Some(&destination)).is_err(),
-            "required images must not be silently omitted by request limits"
+            error.to_string().contains("required image pins exceed"),
+            "{error:#}"
         );
     }
 
