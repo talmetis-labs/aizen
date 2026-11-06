@@ -175,29 +175,9 @@ pub(crate) fn identity_banner() -> (String, Vec<String>) {
     (main, notes)
 }
 
-/// Re-slug memory ids the old ASCII-only slugifier shredded (76% of a measured real store), once per
-/// home, before any command reads the store.
-///
-/// Called from `main` rather than the REPL banner: `aizen memory list` is a CLI path that never
-/// builds a banner, so migrating there would have left the two surfaces disagreeing about what an id
-/// is — the CLI printing shredded names while the REPL printed readable ones, and `memory show <id>`
-/// working with only one of them.
-///
-/// It renames the user's files without asking, which they chose; it does not do so silently, which
-/// they did not. The count and the old→new map's path go to stderr so a piped `memory list` stays
-/// machine-readable.
+/// Persona-owned stem migration. Persistent Memory migration belongs to an explicitly selected
+/// provider and is never an automatic Core startup action.
 pub(crate) fn run_id_migration_once() {
-    if let Some(rep) = crate::memory::migrate_ids::run_once_at_startup() {
-        if let Some(n) = rep.notice() {
-            eprintln!("{}", style(n).dim());
-        }
-        for w in rep.warnings.iter().take(3) {
-            eprintln!(
-                "{} {w}",
-                style("⚠ memory id migration:").color256(theme::WARN)
-            );
-        }
-    }
     // Persona self-memory filenames had the same defect, worse in proportion (45 of 89 files on the
     // measured store) and less visible, because `/persona self` renders bodies rather than names.
     // Separate pass, separate per-persona flag: a character created later still gets migrated.
@@ -229,6 +209,10 @@ pub(crate) fn startup_update_probe() {
     if let Some(notice) = features::update::cached_notice() {
         tui::emit_line(&style(notice).dim().to_string());
     }
+    if let Some(notice) = crate::plugin::update_check::cached_notice() {
+        tui::emit_line(&style(notice).dim().to_string());
+    }
+    crate::plugin::update_check::spawn_background_check();
 }
 
 /// The "⟲ last conversation ..." line both REPLs offer at startup, or `None` when this project

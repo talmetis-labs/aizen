@@ -1,5 +1,6 @@
 //! Bounded, validated image payloads. Metadata and bytes travel as one value; payloads never
-//! appear in Debug output. Only PNG is decoded locally (other supported formats are magic-checked).
+//! appear in Debug output. PNG is validated locally; JPEG decoding is bounded and used only for ROI.
+//! Other supported originals are magic-checked and passed through without conversion.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,28 @@ pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REQUEST_IMAGES: usize = 4;
 pub const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PNG_DECODE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Shared intake guard. Reject an excess selection; never silently truncate a user's batch.
+pub fn validate_image_batch_sizes(sizes: impl IntoIterator<Item = usize>) -> Result<usize> {
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for size in sizes {
+        count += 1;
+        ensure!(count <= MAX_REQUEST_IMAGES, "select at most four images");
+        ensure!(
+            size > 0 && size <= MAX_IMAGE_BYTES,
+            "each image must contain 1 byte to 8 MiB"
+        );
+        total = total
+            .checked_add(size)
+            .context("image batch size overflow")?;
+        ensure!(
+            total <= MAX_REQUEST_IMAGE_BYTES,
+            "selected images exceed 16 MiB total"
+        );
+    }
+    Ok(total)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelRect {
@@ -332,45 +355,104 @@ impl ToolImage {
         base64_decode_bounded(&self.base64, MAX_IMAGE_BYTES)
     }
 
-    /// Crop in PNG pixel coordinates. Bounds are checked before output allocation; non-PNGs
-    /// explicitly fail rather than claiming a decoded/cropped JPEG/GIF/WebP.
+    /// Legacy strict PNG entry point; generalized callers should use original-raster crop_pixels.
+    #[cfg(test)]
     pub fn crop_png(&self, rect: PixelRect) -> Result<Self> {
         ensure!(
             self.metadata.mime == "image/png",
             "local crop supports PNG only"
         );
+        self.crop_pixels(rect)
+    }
+
+    /// Lossless output in original raster coordinates. Refuse animation, profiles and ambiguous
+    /// orientation rather than silently changing their meaning. Original bytes are never mutated.
+    pub fn crop_pixels(&self, rect: PixelRect) -> Result<Self> {
+        ensure!(
+            self.metadata.provenance.crop.is_none(),
+            "nested crops are unavailable; select the original"
+        );
+        let encoded_peak = self
+            .metadata
+            .byte_len
+            .checked_mul(2)
+            .context("image size overflow")?;
+        let mut lease = crate::llm::image_send::try_image_memory_lease(encoded_peak)
+            .context("image crop memory budget busy")?;
         let bytes = self.bytes()?;
-        let (info, pixels) = decode_png(&bytes)?;
+        let (width, height, channels, pixels) = match self.metadata.mime.as_str() {
+            "image/png" => {
+                crop_png_preflight(&bytes)?;
+                let width = u32::from_be_bytes(bytes[16..20].try_into()?);
+                let height = u32::from_be_bytes(bytes[20..24].try_into()?);
+                let decoded = rgba_size(width, height)?;
+                ensure!(
+                    lease.try_grow(MAX_PNG_DECODE_BYTES + decoded * 2 + MAX_IMAGE_BYTES),
+                    "image crop memory budget busy"
+                );
+                let (info, pixels) = decode_png(&bytes)?;
+                let channels = match info.color_type {
+                    png::ColorType::Grayscale => 1,
+                    png::ColorType::GrayscaleAlpha => 2,
+                    png::ColorType::Rgb => 3,
+                    png::ColorType::Rgba => 4,
+                    _ => bail!("unsupported PNG crop color type"),
+                };
+                (info.width, info.height, channels, pixels)
+            }
+            "image/jpeg" => {
+                use image::ImageDecoder;
+                let (width, height, channels) = crop_jpeg_preflight(&bytes)?;
+                let decoded = rgba_size(width, height)?;
+                ensure!(
+                    lease.try_grow(MAX_PNG_DECODE_BYTES + decoded * 2 + MAX_IMAGE_BYTES),
+                    "image crop memory budget busy"
+                );
+                let mut decoder =
+                    image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes))?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(MAX_PNG_DECODE_BYTES as u64);
+                limits.max_image_width = Some(width);
+                limits.max_image_height = Some(height);
+                decoder.set_limits(limits)?;
+                ensure!(
+                    decoder.dimensions() == (width, height),
+                    "JPEG dimensions changed"
+                );
+                ensure!(
+                    matches!(
+                        decoder.color_type(),
+                        image::ColorType::L8 | image::ColorType::Rgb8
+                    ),
+                    "unsupported JPEG crop color type"
+                );
+                ensure!(
+                    decoder.total_bytes() <= MAX_PNG_DECODE_BYTES as u64,
+                    "JPEG decode exceeds 64 MiB"
+                );
+                let mut pixels = vec![0; decoder.total_bytes() as usize];
+                ensure!(
+                    pixels.len() == width as usize * height as usize * channels,
+                    "unsupported JPEG layout"
+                );
+                decoder.read_image(&mut pixels)?;
+                (width, height, channels, pixels)
+            }
+            _ => bail!(
+                "local crop supports PNG/JPEG only; GIF/WebP originals can be read without crop"
+            ),
+        };
         ensure!(
             rect.width > 0
                 && rect.height > 0
-                && rect
-                    .x
-                    .checked_add(rect.width)
-                    .is_some_and(|x| x <= info.width)
-                && rect
-                    .y
-                    .checked_add(rect.height)
-                    .is_some_and(|y| y <= info.height),
+                && rect.x.checked_add(rect.width).is_some_and(|x| x <= width)
+                && rect.y.checked_add(rect.height).is_some_and(|y| y <= height),
             "crop is outside image bounds"
         );
-        let channels = match info.color_type {
-            png::ColorType::Grayscale => 1,
-            png::ColorType::GrayscaleAlpha => 2,
-            png::ColorType::Rgb => 3,
-            png::ColorType::Rgba => 4,
-            _ => bail!("unsupported PNG color type after expansion"),
-        };
-        ensure!(
-            info.bit_depth == png::BitDepth::Eight,
-            "unsupported PNG bit depth after expansion"
-        );
-        let size = rgba_size(rect.width, rect.height)?;
-        let mut out = vec![0u8; size];
+        let mut out = vec![0u8; rgba_size(rect.width, rect.height)?];
         for y in 0..rect.height as usize {
             for x in 0..rect.width as usize {
-                let src =
-                    ((rect.y as usize + y) * info.width as usize + rect.x as usize + x) * channels;
+                let src = ((rect.y as usize + y) * width as usize + rect.x as usize + x) * channels;
                 let dst = (y * rect.width as usize + x) * 4;
                 let p = &pixels[src..src + channels];
                 let rgba = match channels {
@@ -388,6 +470,130 @@ impl ToolImage {
         provenance.crop = Some(rect);
         Self::from_bytes(&png, "image/png", provenance)
     }
+}
+
+fn crop_png_preflight(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() >= 33
+            && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+            && &bytes[12..16] == b"IHDR"
+            && bytes[24] == 8,
+        "crop requires an 8-bit PNG original"
+    );
+    let mut offset = 8usize;
+    let mut data = false;
+    while offset < bytes.len() {
+        let header = bytes
+            .get(offset..offset.saturating_add(8))
+            .context("truncated PNG chunk")?;
+        let length = u32::from_be_bytes(header[..4].try_into()?) as usize;
+        let end = offset
+            .checked_add(12)
+            .and_then(|n| n.checked_add(length))
+            .context("PNG chunk overflow")?;
+        ensure!(end <= bytes.len(), "truncated PNG chunk");
+        match &header[4..8] {
+            b"acTL" | b"fcTL" | b"fdAT" => {
+                bail!("animated PNG crop unavailable; read the original")
+            }
+            b"eXIf" | b"iCCP" | b"gAMA" | b"cHRM" | b"sRGB" | b"cICP" | b"mDCv" | b"cLLi" => {
+                bail!("profiled/oriented PNG crop unavailable; read the original")
+            }
+            b"IDAT" => data = true,
+            b"IEND" => {
+                ensure!(
+                    length == 0 && data && end == bytes.len(),
+                    "invalid PNG crop trailer"
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    bail!("missing PNG end marker")
+}
+
+/// Scan every JPEG marker, including markers between progressive scans. APP metadata and non-RGB
+/// layouts are conservatively refused; even orientation=1 EXIF may carry unhandled color semantics.
+fn crop_jpeg_preflight(bytes: &[u8]) -> Result<(u32, u32, usize)> {
+    ensure!(bytes.starts_with(&[0xff, 0xd8]), "invalid JPEG start");
+    let mut offset = 2usize;
+    let mut frame = None;
+    let mut scanned = false;
+    while offset < bytes.len() {
+        ensure!(bytes[offset] == 0xff, "invalid JPEG marker");
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset).context("truncated JPEG marker")?;
+        offset += 1;
+        if marker == 0xd9 {
+            ensure!(scanned && offset == bytes.len(), "invalid JPEG trailer");
+            return frame.context("missing JPEG frame");
+        }
+        ensure!(
+            !matches!(marker, 0 | 0xd8 | 0xd0..=0xd7 | 0x01),
+            "unsupported JPEG standalone marker"
+        );
+        let size = bytes
+            .get(offset..offset.saturating_add(2))
+            .context("truncated JPEG segment")?;
+        let length = u16::from_be_bytes(size.try_into()?) as usize;
+        ensure!(length >= 2, "invalid JPEG segment length");
+        let end = offset
+            .checked_add(length)
+            .context("JPEG segment overflow")?;
+        let segment = bytes
+            .get(offset + 2..end)
+            .context("truncated JPEG segment")?;
+        match marker {
+            0xc0..=0xc2 => {
+                ensure!(
+                    frame.is_none() && segment.len() >= 6 && segment[0] == 8,
+                    "unsupported JPEG frame"
+                );
+                let height = u16::from_be_bytes(segment[1..3].try_into()?) as u32;
+                let width = u16::from_be_bytes(segment[3..5].try_into()?) as u32;
+                let channels = segment[5] as usize;
+                ensure!(
+                    matches!(channels, 1 | 3) && segment.len() == 6 + channels * 3,
+                    "unsupported JPEG color layout"
+                );
+                rgba_size(width, height)?;
+                frame = Some((width, height, channels));
+            }
+            0xe0 => ensure!(segment.starts_with(b"JFIF\0"), "unknown JPEG APP0 metadata"),
+            0xe1..=0xef => {
+                bail!("profiled/oriented/multiframe JPEG crop unavailable; read the original")
+            }
+            0xda => {
+                ensure!(frame.is_some(), "JPEG scan precedes frame");
+                scanned = true;
+            }
+            0xdb | 0xc4 | 0xdd | 0xfe => {}
+            _ => bail!("unsupported JPEG crop marker"),
+        }
+        offset = end;
+        if marker == 0xda {
+            loop {
+                let value = *bytes.get(offset).context("truncated JPEG scan")?;
+                if value != 0xff {
+                    offset += 1;
+                    continue;
+                }
+                let mut next = offset + 1;
+                while bytes.get(next) == Some(&0xff) {
+                    next += 1;
+                }
+                match *bytes.get(next).context("truncated JPEG scan marker")? {
+                    0 | 0xd0..=0xd7 => offset = next + 1,
+                    _ => break,
+                }
+            }
+        }
+    }
+    bail!("missing JPEG end marker")
 }
 
 pub fn sha256(bytes: &[u8]) -> String {
@@ -457,7 +663,7 @@ pub fn base64_encode(input: &[u8]) -> String {
 pub fn base64_decode_bounded(data: &str, max: usize) -> Result<Vec<u8>> {
     let size = base64_decoded_len(data, max)?;
     let mut out = Vec::with_capacity(size);
-    for c in data.as_bytes().chunks_exact(4) {
+    for c in data.as_bytes().as_chunks::<4>().0 {
         let a = sextet(c[0]).unwrap();
         let b = sextet(c[1]).unwrap();
         let d = sextet(c[2]).unwrap_or(0);
@@ -771,6 +977,87 @@ mod tests {
         let (_, pixels) = decode_png(&cropped.bytes().unwrap()).unwrap();
         assert_eq!(pixels, [0, 0, 255, 255]);
     }
+    #[test]
+    fn batch_limits_reject_excess_and_accept_boundaries() {
+        assert_eq!(
+            validate_image_batch_sizes([MAX_IMAGE_BYTES; 2]).unwrap(),
+            MAX_REQUEST_IMAGE_BYTES
+        );
+        assert!(validate_image_batch_sizes([1; 5]).is_err());
+        assert!(validate_image_batch_sizes([MAX_IMAGE_BYTES; 3]).is_err());
+        assert!(validate_image_batch_sizes([0]).is_err());
+        assert!(validate_image_batch_sizes([MAX_IMAGE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn jpeg_roi_is_lossless_relative_to_decoded_original_and_never_mutates_source() {
+        use image::{codecs::jpeg::JpegEncoder, ImageDecoder};
+        let mut jpeg = Vec::new();
+        let pixels = [120, 20, 30].repeat(16 * 12);
+        JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(&pixels, 16, 12, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let original =
+            ToolImage::from_bytes(&jpeg, "image/jpeg", ImageProvenance::new("test", None)).unwrap();
+        let decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&jpeg)).unwrap();
+        let mut decoded = vec![0; decoder.total_bytes() as usize];
+        decoder.read_image(&mut decoded).unwrap();
+        let rect = PixelRect {
+            x: 3,
+            y: 4,
+            width: 5,
+            height: 2,
+        };
+        let roi = original.crop_pixels(rect).unwrap();
+        let (_, actual) = decode_png(&roi.bytes().unwrap()).unwrap();
+        let mut expected = Vec::new();
+        for y in 4..6usize {
+            for x in 3..8usize {
+                expected.extend_from_slice(&decoded[(y * 16 + x) * 3..(y * 16 + x) * 3 + 3]);
+                expected.push(255);
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(original.bytes().unwrap(), jpeg);
+        assert_eq!(
+            roi.metadata().provenance.parent_sha256.as_ref(),
+            Some(&original.metadata().sha256)
+        );
+        assert_eq!(roi.metadata().provenance.crop, Some(rect));
+        assert!(roi.crop_pixels(rect).is_err());
+        for marker in [0xe1, 0xe2] {
+            let mut profiled = jpeg[..2].to_vec();
+            profiled.extend_from_slice(&[0xff, marker, 0, 4, 0, 0]);
+            profiled.extend_from_slice(&jpeg[2..]);
+            let image =
+                ToolImage::from_bytes(&profiled, "image/jpeg", ImageProvenance::new("test", None))
+                    .unwrap();
+            assert!(image
+                .crop_pixels(rect)
+                .unwrap_err()
+                .to_string()
+                .contains("profiled/oriented"));
+            assert_eq!(image.bytes().unwrap(), profiled);
+        }
+        assert!(crop_jpeg_preflight(&jpeg[..jpeg.len() - 2]).is_err());
+        let mut trailing = jpeg.clone();
+        trailing.push(0);
+        assert!(crop_jpeg_preflight(&trailing).is_err());
+    }
+
+    #[test]
+    fn png_roi_refuses_late_profile_and_animation_metadata() {
+        let bytes = image().bytes().unwrap();
+        for tag in [*b"gAMA", *b"acTL", *b"eXIf"] {
+            let mut modified = bytes[..bytes.len() - 12].to_vec();
+            modified.extend_from_slice(&0u32.to_be_bytes());
+            modified.extend_from_slice(&tag);
+            modified.extend_from_slice(&0u32.to_be_bytes());
+            modified.extend_from_slice(&bytes[bytes.len() - 12..]);
+            assert!(crop_png_preflight(&modified).is_err());
+        }
+    }
+
     #[test]
     fn non_png_has_no_claimed_dimensions_or_crop() {
         let image = ToolImage::from_bytes(

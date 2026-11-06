@@ -152,6 +152,112 @@ pub fn scrubbed_count(pass: &[String]) -> usize {
         .count()
 }
 
+// ── restrictive native plugins ────────────────────────────────────────────────
+
+/// A plugin needs a saved explicit grant AND global network allow. Neither a legacy
+/// `.network(true)` nor the global setting substitutes for that grant. Missing/deny global policy
+/// remains a ceiling. Ordinary callers retain the existing config-default rule.
+pub(super) fn network_allowed(
+    req: &super::request::SandboxRequest,
+    settings: &SandboxSettings,
+) -> bool {
+    match req.restricted_policy() {
+        Some(policy) => {
+            policy.network == super::request::NativePluginNetworkGrant::Granted
+                && network_default_allow(settings)
+        }
+        None => req.network || network_default_allow(settings),
+    }
+}
+
+/// Construct from constants and host-owned typed paths only; never enumerate/copy ambient values,
+/// `pass_env`, proxy settings, provider credentials, toolchain paths or the full Core config.
+pub(super) fn native_plugin_env(
+    policy: &super::request::NativePluginPolicy,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::ffi::OsString;
+    let mut env = Vec::new();
+    let home = &policy.synthetic_home;
+    for name in ["HOME", "USERPROFILE"] {
+        env.push((OsString::from(name), home.as_os_str().to_owned()));
+    }
+    for name in ["TMP", "TEMP", "TMPDIR"] {
+        env.push((
+            OsString::from(name),
+            policy.private_temp.as_os_str().to_owned(),
+        ));
+    }
+    // These convenience directories need not exist yet. They are all beneath synthetic HOME,
+    // itself beneath temp, and cannot grant access to any ambient cache/config directory.
+    for (name, child) in [
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("APPDATA", "AppData/Roaming"),
+        ("LOCALAPPDATA", "AppData/Local"),
+    ] {
+        env.push((OsString::from(name), home.join(child).into_os_string()));
+    }
+    env.push((OsString::from("LANG"), OsString::from("C")));
+    env.push((OsString::from("LC_ALL"), OsString::from("C")));
+    #[cfg(windows)]
+    for name in ["SystemRoot", "windir"] {
+        env.push((
+            OsString::from(name),
+            policy.platform_env.system_root().as_os_str().to_owned(),
+        ));
+    }
+    env
+}
+
+/// No default workspace, HOME credential exclusions, cache writes or config extra roots: package
+/// and explicit models are RO, only provider data and caller-owned temp are RW. The generic Linux
+/// backend additionally permits exact pseudo-device files; guarded platforms report intent only.
+/// Runtime library reads are narrowly fixed platform paths, not `/etc`, `/usr`, `/proc` or HOME.
+pub(super) fn native_plugin_fs(policy: &super::request::NativePluginPolicy) -> FsPolicy {
+    let mut read_only = vec![policy.package_root.clone()];
+    read_only.extend(policy.model_roots.iter().cloned());
+    #[cfg(target_os = "linux")]
+    for runtime in [
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib",
+        "/lib64",
+        "/etc/ld.so.cache",
+    ] {
+        // System library symlinks are a platform dependency, not a model-selected grant. Do not
+        // canonicalize model/package roots without their no-link preflight.
+        if let Ok(path) = Path::new(runtime).canonicalize() {
+            if !read_only.contains(&path) {
+                read_only.push(path);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for runtime in ["/System/Library", "/usr/lib"] {
+        if let Ok(path) = Path::new(runtime).canonicalize() {
+            read_only.push(path);
+        }
+    }
+    #[cfg(windows)]
+    read_only.push(policy.platform_env.system_root().to_path_buf());
+    let mut read_write = vec![policy.data_root.clone(), policy.private_temp.clone()];
+    if let Some(adoption) = &policy.adoption {
+        read_only.extend(adoption.read_files.iter().cloned());
+        if !adoption.write_envelope {
+            read_write = vec![policy.private_temp.clone()];
+            read_only.push(policy.data_root.clone());
+        }
+    }
+    FsPolicy {
+        read_write,
+        read_only,
+        exec_files: Vec::new(),
+        deny: Vec::new(),
+    }
+}
+
 // ── filesystem roots ─────────────────────────────────────────────────────────
 
 /// The filesystem shape of one sandboxed run. Kernel backends enforce it (Linux Landlock, macOS
@@ -162,6 +268,12 @@ pub struct FsPolicy {
     pub read_write: Vec<PathBuf>,
     /// Read(+execute)-only roots: system and toolchain directories.
     pub read_only: Vec<PathBuf>,
+    /// Exact programs the child must be able to execute even though they sit outside every root
+    /// (a helper binary under `target/debug/deps`, a bundled tool). Granted READ+EXECUTE on the
+    /// FILE only — never its directory, so this cannot widen access to unrelated siblings. Only the
+    /// Unix kernel backends read it; Windows has no filesystem backend to feed.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub exec_files: Vec<PathBuf>,
     /// Directories that must stay UNREADABLE even where broad reads are otherwise allowed
     /// (macOS deny rules; doctor's adversarial checks everywhere). On Linux the allow-list
     /// already excludes them.
@@ -237,6 +349,7 @@ pub fn fs_policy(workspace: &Path, tmp: Option<&Path>, s: &SandboxSettings) -> F
     FsPolicy {
         read_write: rw,
         read_only: ro,
+        exec_files: Vec::new(),
         deny: credential_dirs(&home),
     }
 }
@@ -244,7 +357,7 @@ pub fn fs_policy(workspace: &Path, tmp: Option<&Path>, s: &SandboxSettings) -> F
 /// The credential/persistence surfaces a child must never read, workspace aside. Used by macOS
 /// deny rules, by the guarded backend's advisory report, and by doctor's adversarial self-tests.
 pub fn credential_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut v = vec![
+    let v = vec![
         home.join(".aizen"),
         home.join(".ssh"),
         home.join(".aws"),
@@ -261,6 +374,8 @@ pub fn credential_dirs(home: &Path) -> Vec<PathBuf> {
         home.join(".config").join("google-chrome"),
         home.join(".config").join("chromium"),
     ];
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut v = v;
     #[cfg(windows)]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {
@@ -464,6 +579,275 @@ mod tests {
                 dirs.iter().any(|d| d.ends_with(want)),
                 "{want} missing from the deny list"
             );
+        }
+    }
+
+    #[test]
+    fn native_plugin_network_requires_saved_grant_and_global_allow() {
+        use super::super::request::{
+            native_plugin_fixture, NativePluginNetworkGrant, SandboxRequest,
+        };
+        let (_fixture, policy, program) = native_plugin_fixture();
+        for global in [None, Some("deny"), Some("allow")] {
+            for grant in [
+                NativePluginNetworkGrant::Missing,
+                NativePluginNetworkGrant::Denied,
+                NativePluginNetworkGrant::Granted,
+            ] {
+                let mut policy = policy.clone();
+                policy.network = grant;
+                let req = SandboxRequest::native_plugin(
+                    super::super::CommandOrigin::McpStdio,
+                    program.clone(),
+                    vec![],
+                    policy,
+                )
+                .unwrap()
+                .network(true);
+                let settings = SandboxSettings {
+                    network: global.map(str::to_string),
+                    ..SandboxSettings::default()
+                };
+                assert_eq!(
+                    network_allowed(&req, &settings),
+                    grant == NativePluginNetworkGrant::Granted && global == Some("allow")
+                );
+            }
+        }
+        let ordinary = SandboxRequest::exec(
+            super::super::CommandOrigin::McpStdio,
+            program,
+            vec![],
+            policy.package_root.clone(),
+            policy.package_root,
+        );
+        assert!(network_allowed(
+            &ordinary.network(true),
+            &SandboxSettings::default()
+        ));
+    }
+
+    #[test]
+    fn native_plugin_environment_has_no_inherited_or_pass_env_values() {
+        let (_fixture, plugin, _program) = super::super::request::native_plugin_fixture();
+        let env = native_plugin_env(&plugin);
+        let names: Vec<_> = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().to_ascii_uppercase())
+            .collect();
+        for forbidden in [
+            "PATH",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "AIZEN_HOME",
+            "FULL_CONFIG",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "NPM_CONFIG_CACHE",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            assert!(!names.iter().any(|k| k == forbidden), "{forbidden} leaked");
+        }
+        for name in ["HOME", "USERPROFILE"] {
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == name && v == plugin.synthetic_home.as_os_str()));
+        }
+        for name in ["TMP", "TEMP", "TMPDIR"] {
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == name && v == plugin.private_temp.as_os_str()));
+        }
+    }
+
+    #[test]
+    fn native_plugin_filesystem_has_only_explicit_write_roots() {
+        let (_fixture, plugin, _program) = super::super::request::native_plugin_fixture();
+        let fs = native_plugin_fs(&plugin);
+        assert_eq!(fs.read_write, vec![plugin.data_root, plugin.private_temp]);
+        assert!(fs.read_only.contains(&plugin.package_root));
+        assert!(plugin.model_roots.iter().all(|p| fs.read_only.contains(p)));
+        assert!(fs.exec_files.is_empty());
+        assert!(fs.deny.is_empty());
+    }
+
+    #[test]
+    fn adoption_policy_keeps_source_plan_and_recovery_envelope_read_only() {
+        use crate::sandbox::request::{NativeAdoptionPolicy, SandboxRequest};
+        let f = crate::core::file_placement::tests::TestDir::new();
+        let package = f.path().join("package");
+        let source = f.path().join("legacy");
+        let envelope = f.path().join("operation");
+        let temp = envelope.join("temp");
+        for path in [&package, &source, &temp.join("home")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let plan = f.path().join("plan.json");
+        std::fs::write(&plan, b"{}").unwrap();
+        let program = package.join("provider.exe");
+        std::fs::write(&program, b"fixture").unwrap();
+        for writes in [false, true] {
+            let policy = NativeAdoptionPolicy::new(
+                package.clone(),
+                Some(source.clone()),
+                Some(plan.clone()),
+                envelope.clone(),
+                temp.clone(),
+                writes,
+            )
+            .unwrap();
+            let req = SandboxRequest::native_adoption(program.clone(), vec![], policy)
+                .unwrap()
+                .network(true);
+            let fs = native_plugin_fs(req.restricted_policy().unwrap());
+            assert!(fs.read_only.contains(&source.canonicalize().unwrap()));
+            assert!(fs.read_only.contains(&plan.canonicalize().unwrap()));
+            assert!(!fs
+                .read_write
+                .iter()
+                .any(|p| super::super::request::paths_overlap(p, &source)));
+            assert_eq!(
+                fs.read_write.contains(&envelope.canonicalize().unwrap()),
+                writes
+            );
+            assert_eq!(
+                fs.read_only.contains(&envelope.canonicalize().unwrap()),
+                !writes
+            );
+            assert!(!network_allowed(
+                &req,
+                &SandboxSettings {
+                    network: Some("allow".into()),
+                    ..Default::default()
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn native_plugin_network_requires_saved_grant_and_global_ceiling() {
+        use crate::sandbox::request::{
+            native_plugin_fixture, NativePluginNetworkGrant, SandboxRequest,
+        };
+        let (_fixture, base, program) = native_plugin_fixture();
+        for global in [None, Some("deny"), Some("allow")] {
+            let settings = SandboxSettings {
+                network: global.map(str::to_owned),
+                ..Default::default()
+            };
+            for grant in [
+                NativePluginNetworkGrant::Missing,
+                NativePluginNetworkGrant::Denied,
+                NativePluginNetworkGrant::Granted,
+            ] {
+                let mut policy = base.clone();
+                policy.network = grant;
+                let req = SandboxRequest::native_plugin(
+                    crate::sandbox::CommandOrigin::McpStdio,
+                    program.clone(),
+                    vec![],
+                    policy,
+                )
+                .unwrap()
+                .network(true);
+                assert_eq!(
+                    network_allowed(&req, &settings),
+                    global == Some("allow") && grant == NativePluginNetworkGrant::Granted
+                );
+            }
+        }
+        // Existing callers keep the old explicit-grant OR global-default behavior.
+        let req = SandboxRequest::exec(
+            crate::sandbox::CommandOrigin::McpStdio,
+            program,
+            vec![],
+            base.package_root.clone(),
+            base.package_root,
+        );
+        assert!(!network_allowed(&req, &SandboxSettings::default()));
+        assert!(network_allowed(
+            &req.network(true),
+            &SandboxSettings::default()
+        ));
+    }
+
+    #[test]
+    fn native_plugin_environment_is_allowlist_only() {
+        use crate::sandbox::request::native_plugin_fixture;
+        let (_fixture, policy, _program) = native_plugin_fixture();
+        let env = native_plugin_env(&policy);
+        let names: Vec<_> = env
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().to_ascii_uppercase())
+            .collect();
+        for forbidden in [
+            "PATH",
+            "PATHEXT",
+            "COMSPEC",
+            "OPENAI_API_KEY",
+            "AIZEN_CONFIG",
+            "AIZEN_HOME",
+            "GITHUB_TOKEN",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "ambient {forbidden} leaked"
+            );
+        }
+        for name in [
+            "HOME",
+            "USERPROFILE",
+            "TMP",
+            "TEMP",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            let (_, value) = env.iter().find(|(key, _)| key == name).unwrap();
+            assert!(Path::new(value).starts_with(&policy.private_temp));
+        }
+        assert_eq!(
+            env.iter().find(|(key, _)| key == "HOME").unwrap().1,
+            policy.synthetic_home.as_os_str()
+        );
+    }
+
+    #[test]
+    fn native_plugin_filesystem_only_writes_data_and_private_temp() {
+        let (_fixture, policy, _program) = crate::sandbox::request::native_plugin_fixture();
+        let fs = native_plugin_fs(&policy);
+        assert_eq!(
+            fs.read_write,
+            vec![policy.data_root.clone(), policy.private_temp.clone()]
+        );
+        assert!(fs.read_only.contains(&policy.package_root));
+        for model in &policy.model_roots {
+            assert!(fs.read_only.contains(model));
+            assert!(!fs
+                .read_write
+                .iter()
+                .any(|root| model.starts_with(root) || root.starts_with(model)));
+        }
+        assert!(!fs
+            .read_write
+            .iter()
+            .any(|root| policy.package_root.starts_with(root)));
+        assert!(fs.exec_files.is_empty());
+        // Synthetic HOME conveniences cannot resurrect the normal policy's build caches.
+        for cache in [".cargo", ".npm", ".cache", ".rustup"] {
+            assert!(!fs.read_write.contains(&policy.synthetic_home.join(cache)));
         }
     }
 

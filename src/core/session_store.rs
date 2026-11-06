@@ -8,9 +8,8 @@
 
 use crate::agent::design::TaskDesignState;
 use crate::core::tool_media::{ImageUnavailable, ToolImage, MAX_IMAGE_BYTES};
-use crate::core::types::{Message, UsageRow};
+use crate::core::types::{Message, UsageRow, UserTurnId};
 use crate::core::{cli_config, config};
-use crate::memory;
 use crate::ui::{theme, tui};
 use crate::{fmt_time_ago, refresh_prompt_lanes_for_thread_switch};
 use anyhow::{Context, Result};
@@ -230,6 +229,7 @@ struct SessionFile {
     generation: u64,
     #[serde(default)]
     design_state: Option<TaskDesignState>,
+    #[serde(deserialize_with = "deserialize_stored_messages")]
     messages: Vec<Message>,
 }
 
@@ -250,7 +250,7 @@ fn new_generation() -> u64 {
         .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(1);
     let old = SEQ
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |last| Some(now.max(last.saturating_add(1))),
@@ -259,10 +259,6 @@ fn new_generation() -> u64 {
     now.max(old.saturating_add(1))
 }
 
-/// An image data URL at or above this size is stored once under `sessions/blobs/<sha256>` and
-/// referenced from the transcript as `blob:<sha256>`; smaller ones stay inline (E5.3, quality plan
-/// S3: base64 screenshots were rewritten into the transcript on every turn).
-const BLOB_INLINE_MAX: usize = 4 * 1024;
 /// The per-turn autosave appends to `<slug>.jsonl` until the delta holds this many lines or bytes;
 /// then the envelope is rewritten in full and the delta starts over.
 const DELTA_MAX_LINES: usize = 20;
@@ -287,8 +283,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Maximum encoded user-image blob size. Tool-image blobs hold raw bytes and use MAX_IMAGE_BYTES.
-const MAX_USER_BLOB_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4 + 256;
+/// Bound the full serialized transcript before parsing or allocating media.
 const MAX_HISTORY_BYTES: usize = 128 * 1024 * 1024;
 
 fn valid_blob_id(id: &str) -> bool {
@@ -346,69 +341,129 @@ fn write_blob(id: &str, bytes: &[u8], limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn image_diagnostic(message: &mut Value, id: &str, reason: ImageUnavailable) {
-    let note = format!("[image unavailable: {reason:?}; blob:{id}]");
-    let content = message.get_mut("content");
-    match content {
-        Some(Value::String(s)) => {
-            s.push('\n');
-            s.push_str(&note);
+/// Remove input pixels before any CAS access, including legacy inline, compacted and ROI forms.
+/// Historical observations are bounded untrusted text, never structured attachment handles.
+fn strip_stored_input_images(value: &mut Value) {
+    let mut removed = false;
+    if let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) {
+        parts.retain(|part| {
+            let input = part.get("type").and_then(Value::as_str) == Some("image_url")
+                || part.get("image_url").is_some();
+            removed |= input;
+            !input
+        });
+    }
+    if let Some(object) = value.as_object_mut() {
+        removed |= object.remove("visual_assets").is_some();
+        object.remove("image_preferences");
+        // Some older producers used a separate images field instead of content parts.
+        removed |= object.remove("images").is_some();
+    }
+    let mut input_tools = std::collections::BTreeSet::new();
+    if let Some(images) = value.get_mut("tool_images").and_then(Value::as_array_mut) {
+        for (index, image) in images.iter_mut().enumerate() {
+            if matches!(
+                image
+                    .pointer("/metadata/provenance/source")
+                    .and_then(Value::as_str),
+                Some("user_reference" | "reference_read")
+            ) {
+                removed = true;
+                input_tools.insert(index);
+                if let Some(object) = image.as_object_mut() {
+                    object.remove("base64");
+                    object.remove("blob");
+                    object.insert("unavailable".into(), Value::String("metadata_only".into()));
+                }
+                if let Some(provenance) = image
+                    .pointer_mut("/metadata/provenance")
+                    .and_then(Value::as_object_mut)
+                {
+                    provenance.remove("approved_destination");
+                }
+            }
         }
-        Some(Value::Array(parts)) => parts.push(serde_json::json!({"type":"text", "text":note})),
-        _ => {
-            message["content"] = Value::String(note);
+    }
+    let mut observations = Vec::new();
+    if let Some(notes) = value
+        .get_mut("visual_context")
+        .and_then(Value::as_array_mut)
+    {
+        let mut budget = crate::core::visual_context::MAX_NOTES;
+        notes.retain(|note| {
+            let tool = note.get("tool_image").and_then(Value::as_bool).unwrap_or(false);
+            let index = note.get("image_index").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
+            if tool && !input_tools.contains(&index) { return true; }
+            removed = true;
+            if budget > 0 {
+                budget -= 1;
+                let text: String = note.get("note").and_then(Value::as_str).unwrap_or("").chars().take(768).collect();
+                let uncertainty: String = note.get("uncertainty").and_then(Value::as_str).unwrap_or("").chars().take(256).collect();
+                if !text.trim().is_empty() || !uncertainty.trim().is_empty() {
+                    observations.push(format!("[Untrusted historical visual observation; pixels unavailable] {text} (uncertainty: {uncertainty})"));
+                }
+            }
+            false
+        });
+    }
+    if removed
+        && !value
+            .get("content")
+            .is_some_and(|content| content.to_string().contains("input-image-not-saved:"))
+    {
+        observations.push("[input-image-not-saved: input pixels are not saved; attach the original image again to inspect or verify visual details.]".into());
+    }
+    if !observations.is_empty() {
+        let note = observations.join("\n");
+        match value.get_mut("content") {
+            Some(Value::String(text)) => {
+                text.push('\n');
+                text.push_str(&note);
+            }
+            Some(Value::Array(parts)) => {
+                parts.push(serde_json::json!({"type":"text", "text":note}))
+            }
+            _ => value["content"] = Value::String(note),
         }
     }
 }
 
-/// Shared durable representation for session envelopes, deltas and recovery generations. Media is
-/// content-addressed once; history carries metadata + a pointer, never repeated screenshot base64.
-/// Payload retention is applied across the WHOLE transcript before an append decision is made.
+/// Shared durable projection for envelopes, deltas and recovery. Input pixels never enter CAS;
+/// unrelated tool captures retain their existing bounded content-addressed storage policy.
 pub(crate) fn stored_history(history: &[Message]) -> Result<Vec<Value>> {
     let mut count = 0usize;
     let mut bytes = 0usize;
     let mut out = Vec::with_capacity(history.len());
     for m in history.iter().rev() {
         let mut value = serde_json::to_value(m)?;
-        let mut oversized = Vec::new();
-        if let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) {
-            for part in parts {
-                let Some(url) = part
-                    .pointer("/image_url/url")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                else {
-                    continue;
-                };
-                if url.starts_with("blob:") || url.len() < BLOB_INLINE_MAX {
-                    continue;
-                }
-                let id = sha256_hex(url.as_bytes());
-                if url.len() > MAX_USER_BLOB_BYTES {
-                    *part = Value::Null;
-                    oversized.push(id);
-                    // No allocation/write for oversized image data; keep an explicit diagnostic.
-                } else {
-                    write_blob(&id, url.as_bytes(), MAX_USER_BLOB_BYTES)?;
-                    part["image_url"]["url"] = Value::String(format!("blob:{id}"));
-                }
+        if m.role == "user" {
+            if let Some(id) = &m.user_turn_id {
+                value["aizen_user_turn_id"] = Value::String(id.as_str().to_owned());
             }
         }
-        if let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) {
-            parts.retain(|part| !part.is_null());
+        if !m.images.is_empty() {
+            value["images"] = serde_json::json!([]);
         }
-        for id in oversized {
-            image_diagnostic(&mut value, &id, ImageUnavailable::Oversize);
+        strip_stored_input_images(&mut value);
+        // Privacy projection may append an image-unavailable notice to the user text. Bind the
+        // receipt to that durable text, not to the live message's now-unsaved pixels/text shape.
+        if m.memory_scaffold.is_some() {
+            if let Some(projected) = stored_text_view(&value) {
+                if let Some(receipt) =
+                    crate::core::memory_context::projected_receipt(m, projected.content.as_deref())
+                {
+                    value["memory_scaffold"] = serde_json::to_value(receipt)?;
+                }
+            }
         }
         if !m.tool_images.is_empty() {
             let mut images = Vec::with_capacity(m.tool_images.len());
             for image in m.tool_images.iter().rev() {
-                if m.role == "user"
-                    && image.metadata().provenance.source
-                        == crate::core::reference_media::REFERENCE_SOURCE
-                {
-                    // Reference identity sidecars share the canonical user URL/blob. Never write a
-                    // second raw-image blob or persist any volatile use/transmission grant here.
+                if matches!(
+                    image.metadata().provenance.source.as_str(),
+                    "user_reference" | "reference_read"
+                ) {
+                    // Both original sidecars and ROI rereads are input pixels, regardless of role.
                     images.push(serde_json::to_value(
                         image.without_payload(ImageUnavailable::MetadataOnly),
                     )?);
@@ -441,6 +496,23 @@ pub(crate) fn stored_history(history: &[Message]) -> Result<Vec<Value>> {
             images.reverse();
             value["tool_images"] = Value::Array(images);
         }
+        // The loop above uses original typed images; clear disclosure metadata once more without
+        // adding another diagnostic or touching unrelated captures.
+        if let Some(images) = value.get_mut("tool_images").and_then(Value::as_array_mut) {
+            for image in images {
+                if let Some(provenance) = image
+                    .pointer_mut("/metadata/provenance")
+                    .and_then(Value::as_object_mut)
+                {
+                    if matches!(
+                        provenance.get("source").and_then(Value::as_str),
+                        Some("user_reference" | "reference_read")
+                    ) {
+                        provenance.remove("approved_destination");
+                    }
+                }
+            }
+        }
         out.push(value);
     }
     out.reverse();
@@ -450,37 +522,8 @@ pub(crate) fn stored_history(history: &[Message]) -> Result<Vec<Value>> {
 /// Hydrate bounded, hash-verified media before Message deserialization. A missing/corrupt payload
 /// keeps its typed metadata and diagnostic instead of making the whole session unreadable.
 fn resolve_stored_message(value: &mut Value) {
-    let mut unavailable = Vec::new();
-    if let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) {
-        parts.retain_mut(|part| {
-            let Some(url) = part.pointer("/image_url/url").and_then(Value::as_str) else {
-                return true;
-            };
-            let Some(id) = url.strip_prefix("blob:") else {
-                return true;
-            };
-            let id = id.to_owned();
-            match read_blob(&id, MAX_USER_BLOB_BYTES)
-                .and_then(|b| String::from_utf8(b).map_err(|_| ImageUnavailable::Corrupt))
-            {
-                Ok(url) if url.starts_with("data:image/") => {
-                    part["image_url"]["url"] = Value::String(url);
-                    true
-                }
-                Ok(_) => {
-                    unavailable.push((id, ImageUnavailable::Corrupt));
-                    false
-                }
-                Err(reason) => {
-                    unavailable.push((id, reason));
-                    false
-                }
-            }
-        });
-    }
-    for (id, reason) in unavailable {
-        image_diagnostic(value, &id, reason);
-    }
+    // Strip legacy input CAS pointers BEFORE hydration. No file deletion or migration is needed.
+    strip_stored_input_images(value);
     if let Some(images) = value.get_mut("tool_images").and_then(Value::as_array_mut) {
         for stored in images {
             let Some(reference) = stored
@@ -515,19 +558,87 @@ fn resolve_stored_message(value: &mut Value) {
     }
 }
 
+/// Read only the text/role used for provenance, never legacy pixels or other storage metadata.
+fn stored_text_view(value: &Value) -> Option<Message> {
+    let content = match value.get("content") {
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .cloned()
+                .collect(),
+        ),
+        content => content.cloned().unwrap_or(Value::Null),
+    };
+    serde_json::from_value(serde_json::json!({
+        "role": value.get("role"),
+        "content": content,
+    }))
+    .ok()
+}
+
+/// Explicit storage boundary: generic Message deserialization never accepts a recall receipt.
+/// Validate against the stored text BEFORE media migration can append diagnostic text. Rebind only
+/// a verified receipt to that privacy projection; malformed/copied receipts leave the text intact.
+fn parse_stored_message(mut value: Value) -> serde_json::Result<Message> {
+    let user_turn_id = value
+        .as_object_mut()
+        .and_then(|object| object.remove("aizen_user_turn_id"))
+        .and_then(|value| value.as_str().and_then(UserTurnId::parse));
+    let receipt = value
+        .as_object_mut()
+        .and_then(|object| object.remove("memory_scaffold"));
+    let verified = if let Some(receipt) = receipt {
+        stored_text_view(&value).and_then(|mut original| {
+            crate::core::memory_context::restore_stored_receipt(&mut original, receipt);
+            original.memory_scaffold.is_some().then_some(original)
+        })
+    } else {
+        None
+    };
+    resolve_stored_message(&mut value);
+    let mut message: Message = serde_json::from_value(value)?;
+    if message.role == "user" {
+        message.user_turn_id = user_turn_id;
+    }
+    if let Some(original) = verified {
+        message.memory_scaffold =
+            crate::core::memory_context::projected_receipt(&original, message.content.as_deref());
+    }
+    Ok(message)
+}
+
+fn parse_stored_messages(values: Vec<Value>) -> serde_json::Result<Vec<Message>> {
+    values.into_iter().map(parse_stored_message).collect()
+}
+
+/// Explicit persistence adapter, including input-image privacy and bounded tool-media retention.
+pub(crate) fn serialize_stored_messages<S>(
+    messages: &[Message],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let stored = stored_history(messages).map_err(serde::ser::Error::custom)?;
+    serde::Serialize::serialize(&stored, serializer)
+}
+
+pub(crate) fn deserialize_stored_messages<'de, D>(deserializer: D) -> Result<Vec<Message>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = <Vec<Value> as serde::Deserialize>::deserialize(deserializer)?;
+    parse_stored_messages(values).map_err(serde::de::Error::custom)
+}
+
 pub(crate) fn parse_stored_history(bytes: &[u8]) -> Result<Vec<Message>> {
     anyhow::ensure!(
         bytes.len() <= MAX_HISTORY_BYTES,
         "history exceeds storage size limit"
     );
-    let mut values: Vec<Value> = serde_json::from_slice(bytes)?;
-    for value in &mut values {
-        resolve_stored_message(value);
-    }
-    let mut messages: Vec<Message> = values
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<std::result::Result<_, _>>()?;
+    let values: Vec<Value> = serde_json::from_slice(bytes)?;
+    let mut messages = parse_stored_messages(values)?;
     crate::agent::observe::retain_tool_images(&mut messages);
     Ok(messages)
 }
@@ -551,7 +662,7 @@ pub(crate) fn read_session_path_with_design(
     if let Ok(bytes) = read_bounded(&delta_path(path), MAX_HISTORY_BYTES) {
         if let Ok(text) = std::str::from_utf8(&bytes) {
             for line in text.lines().filter(|s| !s.trim().is_empty()) {
-                let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
                     break;
                 };
                 let line_generation = value
@@ -561,8 +672,7 @@ pub(crate) fn read_session_path_with_design(
                 if line_generation != generation {
                     continue;
                 }
-                resolve_stored_message(&mut value);
-                match serde_json::from_value::<Message>(value) {
+                match parse_stored_message(value) {
                     Ok(message) => msgs.push(message),
                     Err(_) => break,
                 }
@@ -815,24 +925,17 @@ fn parse_session_full(bytes: &[u8]) -> Result<SessionGeneration, String> {
     if bytes.len() > MAX_HISTORY_BYTES {
         return Err("session exceeds storage size limit".into());
     }
-    let mut value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let messages = if value.is_array() {
-        &mut value
-    } else {
-        value
-            .get_mut("messages")
-            .ok_or_else(|| "missing messages".to_owned())?
-    };
-    let array = messages
-        .as_array_mut()
-        .ok_or_else(|| "messages must be an array".to_owned())?;
-    for message in array {
-        resolve_stored_message(message);
-    }
-    if value.is_array() {
-        let mut msgs: Vec<Message> = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if let Value::Array(values) = value {
+        let mut msgs = parse_stored_messages(values).map_err(|e| e.to_string())?;
         crate::agent::observe::retain_tool_images(&mut msgs);
         return Ok((msgs, None, None, 0));
+    }
+    let messages = value
+        .get("messages")
+        .ok_or_else(|| "missing messages".to_owned())?;
+    if !messages.is_array() {
+        return Err("messages must be an array".into());
     }
     let mut file: SessionFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
     crate::agent::observe::retain_tool_images(&mut file.messages);
@@ -979,11 +1082,88 @@ pub(crate) fn write_session(history: &[Message], name: &str, meta: SessionMeta) 
     write_session_with_design(history, name, meta, None)
 }
 
+/// Byte-level optimistic revision for an out-of-process edit. Both the envelope AND its delta
+/// participate: a turn appended while the summarizer runs must not be silently overwritten.
+pub(crate) struct SessionRevision {
+    envelope: String,
+    delta: Option<String>,
+}
+
+impl SessionRevision {
+    fn read(path: &std::path::Path) -> Result<Self> {
+        fn digest(path: &std::path::Path, optional: bool) -> Result<Option<String>> {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e).context("saved session is missing or unavailable"),
+            };
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "session must be a regular file"
+            );
+            let bytes = read_bounded(path, MAX_HISTORY_BYTES).map_err(|_| {
+                anyhow::anyhow!("saved session is unreadable or exceeds the size limit")
+            })?;
+            Ok(Some(sha256_hex(&bytes)))
+        }
+        Ok(Self {
+            envelope: digest(path, false)?.expect("required envelope"),
+            delta: digest(&delta_path(path), true)?,
+        })
+    }
+
+    fn check(&self, path: &std::path::Path) -> Result<()> {
+        let current = Self::read(path).context("session changed while compacting; retry")?;
+        anyhow::ensure!(
+            self.envelope == current.envelope && self.delta == current.delta,
+            "session changed while compacting; retry"
+        );
+        Ok(())
+    }
+}
+
+/// Strict, non-aliasing lookup for noninteractive edits: never sanitize an invalid slug into
+/// a different conversation, and never rebuild its system lanes for the caller's cwd.
+pub(crate) fn read_session_for_edit(name: &str) -> Result<(SessionSnapshot, SessionRevision)> {
+    anyhow::ensure!(
+        !name.is_empty() && sanitize_name(name) == name,
+        "invalid session slug (use the saved filename without .json)"
+    );
+    let path = sessions_dir().join(format!("{name}.json"));
+    let revision = SessionRevision::read(&path)?;
+    let snapshot = read_session_path_with_design(&path)
+        .map_err(|_| anyhow::anyhow!("saved session is unreadable"))?;
+    revision.check(&path)?;
+    Ok((snapshot, revision))
+}
+
+/// Commit only if no envelope replacement, delta append, deletion or creation happened since load.
+/// Optimistic, not a cross-process lock: unrelated writers do not take a shared lease.
+pub(crate) fn write_session_if_unchanged(
+    history: &[Message],
+    name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+    revision: &SessionRevision,
+) -> Result<String> {
+    write_session_checked(history, name, meta, design, Some(revision))
+}
+
 pub(crate) fn write_session_with_design(
+    history: &[Message],
+    name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+) -> Result<String> {
+    write_session_checked(history, name, meta, design, None)
+}
+
+fn write_session_checked(
     history: &[Message],
     name: &str,
     mut meta: SessionMeta,
     design: Option<&TaskDesignState>,
+    revision: Option<&SessionRevision>,
 ) -> Result<String> {
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1024,6 +1204,9 @@ pub(crate) fn write_session_with_design(
     };
     let mut bytes = serde_json::to_vec_pretty(&file)?;
     bytes.push(b'\n');
+    if let Some(revision) = revision {
+        revision.check(&path)?;
+    }
     crate::core::persist::atomic_write(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
     // The transcript can contain pasted secrets / .env contents → owner-only.
@@ -1760,6 +1943,7 @@ pub(crate) fn update_live_history_with_design(
 /// Read one retained payload only from an explicitly matching coherent conversation publication.
 /// This is not a fallback for a missing ExecutionContext: owner/task/workspace and image provenance
 /// must all match. A delegated run cannot read a parent or another window's screenshot.
+#[cfg(test)]
 pub(crate) fn scoped_live_tool_image(
     design: &crate::agent::design::DesignContext,
     evidence_id: &str,
@@ -1815,29 +1999,7 @@ pub(crate) fn flush_live_session_on_exit() {
         .clone();
     // No REPL model label on this thread — `save_session` falls back to the configured model.
     autosave_last_with_design(&snapshot.history, None, snapshot.design_state.as_ref());
-    append_memory_stats_sample();
     EXIT_FLUSHING.store(false, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Append this session's §8 sample to `cli-memory/stats.jsonl`.
-///
-/// Runs on the exit path rather than per turn for two reasons: the populations are a directory scan
-/// (three `load_*` calls) that has no business inside a turn, and one line per session keeps the
-/// series readable by hand. The in-process counters are cumulative across the session, so a single
-/// line at the end loses nothing but the intra-session shape — which no metric asks about.
-///
-/// Wholly best-effort. A failure to read the store means no sample, never a failed exit; and
-/// `stats::append` itself declines to write when the session ran zero turns.
-pub(crate) fn append_memory_stats_sample() {
-    let all = memory::store::load_all().unwrap_or_default();
-    let live = memory::bloat::supersede::active(&all).len();
-    let archived = memory::bloat::caps::list_archive()
-        .unwrap_or_default()
-        .len();
-    let review = memory::store::load_from(&crate::core::config::review_dir())
-        .unwrap_or_default()
-        .len();
-    memory::stats::append(live, archived, all.len().saturating_sub(live), review);
 }
 
 /// Set while the exit-flush path is writing, so autosave stays silent during teardown.
@@ -1989,6 +2151,61 @@ pub(crate) fn autosave_last_with_design(
 /// Latch so a persistent autosave failure warns ONCE per streak instead of every turn (and reports
 /// once when writes start working again).
 static AUTOSAVE_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod user_turn_identity_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_storage_preserves_user_turn_identity_and_ignores_invalid_metadata() {
+        let mut user = Message::user("same request");
+        user.user_turn_id = Some(UserTurnId::new().unwrap());
+        let id = user.user_turn_id.clone();
+        let mut assistant = Message::assistant("answer");
+        assistant.user_turn_id = id.clone();
+        let stored = stored_history(&[user.clone(), assistant]).unwrap();
+        assert_eq!(
+            stored[0]["aizen_user_turn_id"],
+            id.as_ref().unwrap().as_str()
+        );
+        assert!(stored[1].get("aizen_user_turn_id").is_none());
+        let loaded = parse_stored_history(&serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert_eq!(loaded[0].user_turn_id, id);
+        assert!(loaded[1].user_turn_id.is_none());
+        assert!(!serde_json::to_string(&loaded)
+            .unwrap()
+            .contains("aizen_user_turn_id"));
+
+        for value in [
+            Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!("not-a-uuid"),
+            serde_json::json!("x".repeat(4096)),
+        ] {
+            let mut injected = stored[0].clone();
+            injected["aizen_user_turn_id"] = value;
+            let loaded = parse_stored_message(injected).unwrap();
+            assert!(loaded.user_turn_id.is_none());
+            assert_eq!(loaded.content, user.content);
+        }
+        for role in ["assistant", "system", "tool"] {
+            let mut injected = stored[0].clone();
+            injected["role"] = serde_json::json!(role);
+            assert!(parse_stored_message(injected)
+                .unwrap()
+                .user_turn_id
+                .is_none());
+        }
+        let legacy = br#"[{"role":"user","content":"legacy request"}]"#;
+        assert!(parse_stored_history(legacy).unwrap()[0]
+            .user_turn_id
+            .is_none());
+        let envelope = serde_json::json!({"version":2,"messages":stored});
+        let (loaded, _) = parse_session_bytes(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert_eq!(loaded[0].user_turn_id, id);
+    }
+}
 
 #[cfg(test)]
 mod sessions_block_tests {
@@ -2176,6 +2393,302 @@ mod usage_ledger_tests {
 }
 
 #[cfg(test)]
+mod recall_storage_tests {
+    use super::*;
+    use crate::core::memory_context::{clean_content, seal, strip_history};
+
+    const PREFIX: &str = "Recalled memory\n[m1] storage fixture";
+
+    fn recalled(text: &str) -> Message {
+        let mut message = Message::user(format!("{PREFIX}\n\n{text}"));
+        message.user_turn_id = Some(UserTurnId::new().unwrap());
+        seal(&mut message, PREFIX, "fixture", 7, "session", "turn");
+        message
+    }
+
+    fn assert_recalled(message: &Message, expected: &str) {
+        assert!(message.memory_scaffold.is_some());
+        assert_eq!(clean_content(message), Some(expected));
+        assert!(serde_json::to_value(message)
+            .unwrap()
+            .get("memory_scaffold")
+            .is_none());
+    }
+
+    fn with_transcript_files(f: impl FnOnce(&std::path::Path)) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aizen-recall-storage-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        f(&dir.join("transcript.json"));
+    }
+
+    #[test]
+    fn recall_receipt_round_trips_full_legacy_and_recovery_history() {
+        let history = vec![Message::system("lane"), recalled("actual request")];
+        let stored = stored_history(&history).unwrap();
+        let legacy = serde_json::to_vec_pretty(&stored).unwrap();
+        let full = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 2,
+            "generation": 7,
+            "meta": {"model": "fixture"},
+            "messages": stored,
+        }))
+        .unwrap();
+        let (full_messages, meta) = parse_session_reason(&full).unwrap();
+        assert_eq!(meta.unwrap().model.as_deref(), Some("fixture"));
+        let (legacy_messages, meta) = parse_session_reason(&legacy).unwrap();
+        assert!(meta.is_none());
+        let recovery_messages = parse_stored_history(&legacy).unwrap();
+        for mut messages in [full_messages, legacy_messages, recovery_messages] {
+            assert_recalled(&messages[1], "actual request");
+            assert_eq!(messages[1].user_turn_id, history[1].user_turn_id);
+            strip_history(&mut messages);
+            strip_history(&mut messages);
+            assert_eq!(messages[1].content.as_deref(), Some("actual request"));
+            assert!(messages[1].memory_scaffold.is_none());
+        }
+        assert_recalled(&history[1], "actual request");
+        assert_eq!(serde_json::to_vec_pretty(&stored).unwrap(), legacy);
+    }
+
+    #[test]
+    fn recall_receipt_round_trips_delta_without_rewriting_source_files() {
+        with_transcript_files(|path| {
+            for generation in [0, 37] {
+                let first = stored_history(&[recalled("envelope request")]).unwrap();
+                let envelope = if generation == 0 {
+                    serde_json::to_vec_pretty(&first).unwrap()
+                } else {
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "version": 2, "generation": generation, "messages": first,
+                    }))
+                    .unwrap()
+                };
+                let mut stale = stored_history(&[recalled("stale request")])
+                    .unwrap()
+                    .remove(0);
+                stale["_session_generation"] = serde_json::json!(generation + 1);
+                let mut appended = stored_history(&[recalled("delta request")])
+                    .unwrap()
+                    .remove(0);
+                if generation != 0 {
+                    appended["_session_generation"] = serde_json::json!(generation);
+                }
+                let delta = format!(
+                    "{}\r\n{}\r\n",
+                    serde_json::to_string(&stale).unwrap(),
+                    serde_json::to_string(&appended).unwrap()
+                );
+                std::fs::write(path, &envelope).unwrap();
+                std::fs::write(delta_path(path), delta.as_bytes()).unwrap();
+                let (mut messages, _, _) = read_session_path_with_design(path).unwrap();
+                assert_eq!(messages.len(), 2);
+                assert_recalled(&messages[0], "envelope request");
+                assert_recalled(&messages[1], "delta request");
+                assert_eq!(
+                    messages[0].user_turn_id.as_ref().unwrap().as_str(),
+                    first[0]["aizen_user_turn_id"].as_str().unwrap()
+                );
+                assert_eq!(
+                    messages[1].user_turn_id.as_ref().unwrap().as_str(),
+                    appended["aizen_user_turn_id"].as_str().unwrap()
+                );
+                strip_history(&mut messages);
+                assert_eq!(messages[1].content.as_deref(), Some("delta request"));
+                assert_eq!(std::fs::read(path).unwrap(), envelope);
+                assert_eq!(std::fs::read(delta_path(path)).unwrap(), delta.as_bytes());
+            }
+        });
+    }
+
+    #[test]
+    fn malformed_tampered_and_copied_receipts_preserve_all_storage_transcripts() {
+        let valid = stored_history(&[recalled("original request")])
+            .unwrap()
+            .remove(0);
+        let mut fixtures = Vec::new();
+        for receipt in [
+            Value::Null,
+            serde_json::json!("receipt"),
+            serde_json::json!({"version":"bad", "prefix_bytes":false}),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["memory_scaffold"] = receipt;
+            fixtures.push(malformed);
+        }
+        for (field, value) in [
+            ("version", serde_json::json!(99)),
+            ("prefix_bytes", serde_json::json!(usize::MAX)),
+            ("prefix_sha256", serde_json::json!("0".repeat(64))),
+            ("content_sha256", serde_json::json!("0".repeat(64))),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["memory_scaffold"][field] = value;
+            fixtures.push(malformed);
+        }
+        let mut legacy_receipt = valid.clone();
+        legacy_receipt["memory_scaffold"]["version"] = serde_json::json!(1);
+        legacy_receipt["memory_scaffold"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_sha256");
+        fixtures.push(legacy_receipt);
+        for text in [
+            format!("changed {PREFIX}\n\noriginal request"),
+            format!("{PREFIX}\n\nother user request"),
+            format!("{PREFIX}\n\noriginal request with extra text"),
+        ] {
+            let mut copied = valid.clone();
+            copied["content"] = Value::String(text);
+            fixtures.push(copied);
+        }
+        let mut assistant = valid.clone();
+        assistant["role"] = serde_json::json!("assistant");
+        fixtures.push(assistant);
+        let mut unmarked = valid;
+        unmarked.as_object_mut().unwrap().remove("memory_scaffold");
+        fixtures.push(unmarked);
+        let expected: Vec<_> = fixtures
+            .iter()
+            .map(|value| value["content"].as_str().unwrap())
+            .collect();
+        let tail = serde_json::json!({"role":"assistant", "content":"tail survives"});
+        let mut all = fixtures.clone();
+        all.push(tail.clone());
+        let legacy = serde_json::to_vec(&all).unwrap();
+        let full = serde_json::to_vec(&serde_json::json!({"version":2, "messages":all})).unwrap();
+        let assert_preserved = |mut messages: Vec<Message>| {
+            assert_eq!(messages.len(), expected.len() + 1);
+            assert!(messages
+                .iter()
+                .all(|message| message.memory_scaffold.is_none()));
+            strip_history(&mut messages);
+            for (message, expected) in messages.iter().zip(&expected) {
+                assert_eq!(message.content.as_deref(), Some(*expected));
+            }
+            assert_eq!(
+                messages.last().unwrap().content.as_deref(),
+                Some("tail survives")
+            );
+        };
+        assert_preserved(parse_session_reason(&full).unwrap().0);
+        assert_preserved(parse_session_reason(&legacy).unwrap().0);
+        assert_preserved(parse_stored_history(&legacy).unwrap());
+        with_transcript_files(|path| {
+            let envelope = b"{\"version\":2, \"generation\":12, \"messages\": []}\n";
+            let mut lines = String::new();
+            for mut value in fixtures.iter().cloned().chain(std::iter::once(tail)) {
+                value["_session_generation"] = serde_json::json!(12);
+                lines.push_str(&serde_json::to_string(&value).unwrap());
+                lines.push('\n');
+            }
+            std::fs::write(path, envelope).unwrap();
+            std::fs::write(delta_path(path), lines.as_bytes()).unwrap();
+            assert_preserved(read_session_path_with_design(path).unwrap().0);
+            assert_eq!(std::fs::read(path).unwrap(), envelope);
+            assert_eq!(std::fs::read(delta_path(path)).unwrap(), lines.as_bytes());
+        });
+    }
+
+    #[test]
+    fn storage_projection_does_not_reseal_copied_or_tampered_live_receipts() {
+        let original = recalled("original request");
+        for text in [
+            format!("{PREFIX}\n\ndifferent request"),
+            format!("changed {PREFIX}\n\noriginal request"),
+        ] {
+            let mut copied = Message::user(text.clone());
+            copied.memory_scaffold = original.memory_scaffold.clone();
+            let values = stored_history(&[copied]).unwrap();
+            assert!(values[0].get("memory_scaffold").is_none());
+            let mut messages = parse_stored_history(&serde_json::to_vec(&values).unwrap()).unwrap();
+            strip_history(&mut messages);
+            assert_eq!(messages[0].content.as_deref(), Some(text.as_str()));
+        }
+    }
+
+    #[test]
+    fn recall_receipts_survive_image_privacy_projection_and_legacy_image_migration() {
+        let mut message = recalled("inspect this image");
+        let pixels = "data:image/png;base64,cHJpdmF0ZS1waXhlbHM=";
+        message.images.push(pixels.into());
+        let mut legacy_inline = serde_json::to_value(&message).unwrap();
+        legacy_inline["memory_scaffold"] =
+            serde_json::to_value(message.memory_scaffold.as_ref().unwrap()).unwrap();
+        let stored = stored_history(&[message.clone()]).unwrap();
+        assert!(stored[0].get("memory_scaffold").is_some());
+        assert!(!serde_json::to_string(&stored).unwrap().contains("base64"));
+        assert!(message.images.iter().any(|image| image == pixels));
+        assert_recalled(&message, "inspect this image");
+        let original = message.content.clone().unwrap();
+        let mut tampered_inline = legacy_inline.clone();
+        tampered_inline["content"][0]["text"] =
+            Value::String(format!("{original} with additional user text"));
+        let loaded =
+            parse_stored_history(&serde_json::to_vec(&vec![tampered_inline]).unwrap()).unwrap();
+        assert!(loaded[0].images.is_empty());
+        assert!(loaded[0].memory_scaffold.is_none());
+        let before = loaded[0].content.clone();
+        let mut loaded = loaded;
+        strip_history(&mut loaded);
+        assert_eq!(loaded[0].content, before);
+        assert!(loaded[0].content.as_deref().unwrap().starts_with(PREFIX));
+        for values in [stored, vec![legacy_inline]] {
+            let bytes = serde_json::to_vec(&values).unwrap();
+            let full =
+                serde_json::to_vec(&serde_json::json!({"version":2, "messages":values})).unwrap();
+            let loaded = parse_stored_history(&bytes).unwrap();
+            let migrated = parse_session_reason(&full).unwrap().0;
+            for mut messages in [loaded, migrated] {
+                assert!(messages[0].images.is_empty());
+                let content = messages[0].content.clone().unwrap();
+                let clean = content
+                    .strip_prefix(PREFIX)
+                    .unwrap()
+                    .strip_prefix("\n\n")
+                    .unwrap();
+                assert!(clean.starts_with("inspect this image\n"));
+                assert_eq!(clean.matches("input-image-not-saved:").count(), 1);
+                assert_recalled(&messages[0], clean);
+                let clean = clean.to_owned();
+                let saved_again = stored_history(&messages).unwrap();
+                assert_recalled(
+                    &parse_stored_history(&serde_json::to_vec(&saved_again).unwrap()).unwrap()[0],
+                    &clean,
+                );
+                strip_history(&mut messages);
+                assert_eq!(messages[0].content.as_deref(), Some(clean.as_str()));
+            }
+            with_transcript_files(|path| {
+                std::fs::write(path, &full).unwrap();
+                let delta = format!("{}\n", serde_json::to_string(&values[0]).unwrap());
+                std::fs::write(delta_path(path), delta.as_bytes()).unwrap();
+                let (messages, _, _) = read_session_path_with_design(path).unwrap();
+                assert_eq!(messages.len(), 2);
+                assert!(messages.iter().all(|message| message.images.is_empty()));
+                assert!(messages
+                    .iter()
+                    .all(|message| message.memory_scaffold.is_some()));
+                assert_eq!(std::fs::read(path).unwrap(), full);
+                assert_eq!(std::fs::read(delta_path(path)).unwrap(), delta.as_bytes());
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 mod bounded_sessions_tests {
     use super::*;
 
@@ -2255,43 +2768,177 @@ mod bounded_sessions_tests {
         read_session_path(json).map(|(m, _)| m.len()).unwrap_or(0)
     }
 
+    fn input_fixture() -> Vec<Message> {
+        let tiny = "data:image/gif;base64,R0lGODlh".to_string();
+        let large = format!("data:image/png;base64,{}", "Q".repeat(6000));
+        let mut compacted = Message::system("compacted text");
+        compacted.images.push(large.clone());
+        compacted
+            .image_preferences
+            .push(crate::core::types::ImagePreference::Original);
+        compacted
+            .visual_context
+            .push(crate::core::visual_context::VisualNote {
+                id: "visual-history".into(),
+                image_index: 0,
+                tool_image: false,
+                source_sha256: crate::core::tool_media::sha256(large.as_bytes()),
+                note: "Possibly a red icon".into(),
+                uncertainty: "Small text unresolved".into(),
+                dormant: true,
+                pinned: false,
+                runtime_pinned: false,
+            });
+        let mut reread = Message::tool_result("read", "ROI observation");
+        for source in ["user_reference", "reference_read"] {
+            let mut provenance = crate::core::tool_media::ImageProvenance::new(source, None);
+            provenance.parent_sha256 = Some("b".repeat(64));
+            provenance.approved_destination = Some("a".repeat(64));
+            reread.tool_images.push(
+                ToolImage::from_bytes(b"GIF89a-private-input", "image/gif", provenance).unwrap(),
+            );
+        }
+        vec![
+            Message::system("lane"),
+            Message::user_with_images("look", vec![tiny, large]),
+            compacted,
+            reread,
+        ]
+    }
+
+    fn assert_no_input_pixels(messages: &[Message]) {
+        assert!(messages
+            .iter()
+            .all(|m| m.images.is_empty() && m.image_preferences.is_empty()));
+        assert!(messages
+            .iter()
+            .flat_map(|m| &m.visual_context)
+            .all(|n| n.tool_image));
+        assert!(messages
+            .iter()
+            .flat_map(|m| &m.tool_images)
+            .all(|image| !image.is_available()));
+        assert!(messages[1].content.as_deref().unwrap().starts_with("look"));
+        assert!(messages[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Untrusted historical visual observation"));
+        assert!(messages[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Possibly a red icon"));
+        assert!(messages[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("attach the original"));
+    }
+
     #[test]
-    fn large_images_live_in_blobs_and_come_back_on_read() {
-        with_pool("blobs", || {
-            let big = format!(
-                "data:image/png;base64,{}",
-                "A".repeat(BLOB_INLINE_MAX + 100)
-            );
-            let h = vec![
-                Message::system("lane"),
-                Message::user_with_images("look", vec![big.clone()]),
-                Message::assistant("ok"),
-            ];
-            save_session(&h, "img-0915", Some("m")).unwrap();
-            let json = sessions_dir().join("img-0915.json");
-            let raw = std::fs::read_to_string(&json).unwrap();
+    fn input_pixels_never_enter_full_delta_or_recovery_projection() {
+        with_pool("input-not-saved", || {
+            let history = input_fixture();
+            let live = serde_json::to_value(&history).unwrap();
+            let original_pixels: Vec<_> = history
+                .iter()
+                .flat_map(|m| {
+                    m.images
+                        .iter()
+                        .cloned()
+                        .chain(m.tool_images.iter().map(|image| image.data_url()))
+                })
+                .collect();
+            save_session(&history, "private-full", None).unwrap();
+            let full = sessions_dir().join("private-full.json");
+            let full_raw = std::fs::read_to_string(&full).unwrap();
             assert!(
-                raw.contains("blob:") && !raw.contains(&big),
-                "the transcript holds a reference, not the bytes"
+                !full_raw.contains("base64")
+                    && !full_raw.contains("blob:")
+                    && !full_raw.contains("visual_assets")
             );
-            assert_eq!(std::fs::read_dir(blobs_dir()).unwrap().count(), 1);
-            let (msgs, _) = read_session_path(&json).unwrap();
-            assert_eq!(msgs[1].images, vec![big.clone()], "resolved on read");
-            // The same image again is the same blob (content-addressed) …
-            save_session(&h, "img2-0915", Some("m")).unwrap();
-            assert_eq!(std::fs::read_dir(blobs_dir()).unwrap().count(), 1);
-            // … and a blob that is gone drops the image, never the conversation.
-            for e in std::fs::read_dir(blobs_dir()).unwrap().flatten() {
-                std::fs::remove_file(e.path()).unwrap();
+            assert_no_input_pixels(&read_session_path(&full).unwrap().0);
+            autosave_session_delta(&history[..2], "private-input", None).unwrap();
+            autosave_session_delta(&history, "private-input", None).unwrap();
+            let path = sessions_dir().join("private-input.json");
+            assert!(delta_path(&path).exists());
+            for path in [&path, &delta_path(&path)] {
+                let raw = std::fs::read_to_string(path).unwrap();
+                assert!(
+                    !raw.contains("blob:")
+                        && !raw.contains("base64")
+                        && !raw.contains("visual_assets")
+                );
+                assert!(original_pixels.iter().all(|pixels| !raw.contains(pixels)));
             }
-            let (msgs, _) = read_session_path(&json).unwrap();
-            assert!(msgs[1].images.is_empty());
-            assert!(msgs[1]
-                .content
-                .as_deref()
+            assert_no_input_pixels(&read_session_path(&path).unwrap().0);
+            // Recovery's HistoryGeneration.messages uses this exact shared durable projection.
+            let projected = stored_history(&history).unwrap();
+            let recovery = serde_json::json!({"generation":1,"messages":projected});
+            let raw = serde_json::to_string(&recovery).unwrap();
+            assert!(
+                !raw.contains("blob:") && !raw.contains("base64") && !raw.contains("visual_assets")
+            );
+            assert_no_input_pixels(
+                &parse_stored_history(&serde_json::to_vec(&recovery["messages"]).unwrap()).unwrap(),
+            );
+            assert!(
+                !blobs_dir().exists() || std::fs::read_dir(blobs_dir()).unwrap().next().is_none()
+            );
+            assert_eq!(
+                serde_json::to_value(&history).unwrap(),
+                live,
+                "storage never mutates live history/wire"
+            );
+            assert!(live.to_string().contains("base64"));
+        });
+    }
+
+    #[test]
+    fn legacy_input_inline_and_cas_are_dropped_without_blob_access_or_deletion() {
+        with_pool("legacy-private-input", || {
+            let mut legacy = serde_json::to_value(input_fixture()).unwrap();
+            let id = "c".repeat(64);
+            std::fs::create_dir_all(blobs_dir()).unwrap();
+            let blob = blobs_dir().join(&id);
+            std::fs::write(&blob, b"do not read or delete this legacy file").unwrap();
+            legacy[1]["content"][1]["image_url"]["url"] = serde_json::json!(format!("blob:{id}"));
+            legacy[2]["visual_assets"]["images"][0] = serde_json::json!(format!("blob:{id}"));
+            legacy[3]["tool_images"][0]["blob"] = serde_json::json!(format!("blob:{id}"));
+            let loaded = parse_stored_history(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+            assert_no_input_pixels(&loaded);
+            assert_eq!(
+                std::fs::read(&blob).unwrap(),
+                b"do not read or delete this legacy file"
+            );
+            assert!(loaded.iter().flat_map(|m| &m.tool_images).all(|image| image
+                .metadata()
+                .provenance
+                .approved_destination
+                .is_none()));
+            assert!(!serde_json::to_string(&loaded)
                 .unwrap()
-                .contains("image unavailable: Missing"));
-            assert!(msgs[1].content.as_deref().unwrap().starts_with("look"));
+                .contains("image unavailable: Corrupt"));
+        });
+    }
+
+    #[test]
+    fn unrelated_tool_capture_keeps_its_payload_alongside_stripped_inputs() {
+        with_pool("capture-not-input", || {
+            let mut history = input_fixture();
+            history.push(image_message());
+            let stored = stored_history(&history).unwrap();
+            let loaded = parse_stored_history(&serde_json::to_vec(&stored).unwrap()).unwrap();
+            assert_eq!(
+                loaded.last().unwrap().tool_images,
+                history.last().unwrap().tool_images
+            );
+            assert!(loaded[3]
+                .tool_images
+                .iter()
+                .all(|image| !image.is_available()));
+            assert_eq!(std::fs::read_dir(blobs_dir()).unwrap().count(), 1);
         });
     }
 
@@ -2337,43 +2984,6 @@ mod bounded_sessions_tests {
             assert_eq!(saved.unwrap().render_revision, 9);
             let legacy = serde_json::to_vec(&talk("old")).unwrap();
             assert!(parse_session_full(&legacy).unwrap().2.is_none());
-        });
-    }
-
-    #[test]
-    fn user_reference_sidecars_never_duplicate_original_blob_or_restore_consent() {
-        with_pool("reference-sidecar", || {
-            let png = crate::core::tool_media::encode_rgba_png(&[1, 3, 5, 255], 1, 1).unwrap();
-            let image = ToolImage::from_bytes(
-                &png,
-                "image/png",
-                crate::core::tool_media::ImageProvenance::new("fixture", None),
-            )
-            .unwrap();
-            let mut messages = vec![Message::user_with_images(
-                "reference",
-                vec![image.data_url()],
-            )];
-            let registry = crate::core::reference_media::ReferenceRegistry::new("owner");
-            let descriptor = registry.register_loaded(&mut messages).unwrap().remove(0);
-            // Even a live hydrated sidecar must be persisted metadata-only, sharing the user URL.
-            messages[0].tool_images[0] = messages[0].tool_images[0].hydrate(&png).unwrap();
-            save_session(&messages, "reference-sidecar", None).unwrap();
-            assert!(!blobs_dir().join(&descriptor.original.sha256).exists());
-            let mut loaded = read_session_path(&sessions_dir().join("reference-sidecar.json"))
-                .unwrap()
-                .0;
-            assert!(!loaded[0].tool_images[0].is_available());
-            let restored = crate::core::reference_media::ReferenceRegistry::new("owner");
-            assert_eq!(
-                restored.register_loaded(&mut loaded).unwrap(),
-                vec![descriptor]
-            );
-            assert!(crate::core::exec_ctx::ExecutionContext::new(
-                crate::core::convo::ConversationId::new("owner")
-            )
-            .references()
-            .is_none());
         });
     }
 

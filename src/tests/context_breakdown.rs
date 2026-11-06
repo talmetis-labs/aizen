@@ -115,15 +115,21 @@ fn strip_recall_blocks_drops_our_block_but_keeps_what_the_user_typed() {
     let typed = "why is the build slow";
     let folded = format!(
         "{} (may be stale…):\n[m1] (about you) prefers pnpm\n\n{typed}",
-        memory::RECALL_MARKER
+        crate::core::memory_context::RECALL_MARKER
     );
+    let prefix = folded.split_once("\n\n").unwrap().0.to_owned();
+    let mut recalled = Message::user(folded);
+    crate::core::memory_context::seal(&mut recalled, &prefix, "fixture", 1, "session", "turn");
     let mut history = vec![
         Message::system("lane"),
-        Message::user(folded),
+        recalled,
         Message::assistant("some reply"),
         // A user message that merely MENTIONS the phrase mid-sentence must be left alone: only
         // our own folding puts the marker at position 0.
-        Message::user(format!("tell me about {} handling", memory::RECALL_MARKER)),
+        Message::user(format!(
+            "tell me about {} handling",
+            crate::core::memory_context::RECALL_MARKER
+        )),
     ];
     strip_recall_blocks(&mut history);
 
@@ -158,12 +164,15 @@ fn strip_peels_stacked_recall_and_skill_blocks() {
     let typed = "deploy the staging service please";
     let folded = format!(
             "{} (may be stale…):\n[m1] (about you) prefers pnpm\n\n{} (call skill_load…):\n- deploy-vps: asked to deploy\n\n{typed}",
-            memory::RECALL_MARKER,
+            crate::core::memory_context::RECALL_MARKER,
             skills::SKILL_MARKER
         );
+    let prefix = folded.split_once("\n\n").unwrap().0.to_owned();
+    let mut recalled = Message::user(folded);
+    crate::core::memory_context::seal(&mut recalled, &prefix, "fixture", 1, "session", "turn");
     let mut history = vec![
         Message::system("lane"),
-        Message::user(folded),
+        recalled,
         // Skill block alone, no recall above it — the other stacking order must work too.
         Message::user(format!(
             "{} (call skill_load…):\n- deploy-vps: asked to deploy\n\nship it",

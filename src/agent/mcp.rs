@@ -859,14 +859,38 @@ pub(crate) fn local_sidecar_lifetime(
 /// starting it. Runtime/task cancellation drops an UNPROVEN lifetime into quarantine; neither an
 /// abort, `kill_on_drop`, nor a successful termination request is tree-settlement proof.
 pub(crate) fn monitor_local_sidecar(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     containment: Arc<crate::core::proctree::Containment>,
     lifetime: Arc<LocalSidecarLifetime>,
+) -> tokio::sync::oneshot::Sender<()> {
+    monitor_contained_settlement(child, containment, lifetime)
+}
+
+/// Shared physical monitor for opaque local extensions. Admission owners are caller-specific;
+/// tree proof and pipe-drain accounting follow exactly the existing MCP settlement rule.
+pub(crate) fn monitor_contained_settlement<T: Send + 'static>(
+    child: tokio::process::Child,
+    containment: Arc<crate::core::proctree::Containment>,
+    lifetime: Arc<crate::agent::process::SettlementLifetime<T>>,
+) -> tokio::sync::oneshot::Sender<()> {
+    monitor_contained_settlement_status(child, containment, lifetime, None)
+}
+
+pub(crate) fn monitor_contained_settlement_status<T: Send + 'static>(
+    mut child: tokio::process::Child,
+    containment: Arc<crate::core::proctree::Containment>,
+    lifetime: Arc<crate::agent::process::SettlementLifetime<T>>,
+    exit_success: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> tokio::sync::oneshot::Sender<()> {
     let (stop, stopped) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let reaped = tokio::select! {
-            status = child.wait() => status.is_ok(),
+            status = child.wait() => {
+                if let (Ok(status), Some(success)) = (&status, &exit_success) {
+                    success.store(status.success(), std::sync::atomic::Ordering::Release);
+                }
+                status.is_ok()
+            },
             _ = stopped => {
                 crate::core::proctree::terminate_tree(&containment);
                 let _ = child.start_kill();

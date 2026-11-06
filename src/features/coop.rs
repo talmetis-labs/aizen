@@ -183,6 +183,9 @@ pub struct SessionManifest {
     /// repository) — per-session diff is unavailable and the reason is worth showing.
     #[serde(default)]
     pub degraded: Option<String>,
+    /// An uncovered interval cannot be repaired retroactively by a later checkpoint.
+    #[serde(default)]
+    pub coverage_gap: bool,
     pub started_unix: u64,
     pub updated_unix: u64,
 }
@@ -399,6 +402,7 @@ pub fn begin(session_name: Option<String>) {
         files: Vec::new(),
         truncated_files: 0,
         degraded: None,
+        coverage_gap: false,
         started_unix: now_unix(),
         updated_unix: now_unix(),
     };
@@ -475,12 +479,30 @@ pub fn suggest_task(text: &str) {
 /// measured from.
 pub fn note_turn_base(checkpoint: u32) {
     update(|m| {
-        // First writing tool of the turn wins: later tools in the same turn share that pre-image.
-        if m.base_checkpoint.is_none() {
-            m.base_checkpoint = Some(checkpoint);
-        }
-        m.degraded = None;
+        record_turn_base(m, checkpoint);
     });
+}
+
+fn record_turn_base(m: &mut SessionManifest, checkpoint: u32) {
+    // First writing tool of the turn wins: later tools share that pre-image.
+    if m.base_checkpoint.is_none() {
+        m.base_checkpoint = Some(checkpoint);
+    }
+    if !m.coverage_gap {
+        m.degraded = None;
+    }
+}
+
+/// Record an opaque background interval without attributing its writes to this session.
+/// Historical file entries remain, but a later snapshot cannot fill the missing interval.
+pub fn note_background_coverage_gap() {
+    update(record_background_coverage_gap);
+}
+
+fn record_background_coverage_gap(m: &mut SessionManifest) {
+    m.base_checkpoint = None;
+    m.coverage_gap = true;
+    m.degraded = Some("managed background effects: session attribution is incomplete".into());
 }
 
 /// Record that a turn wrote to the workspace with no checkpoint available (no git, or not a
@@ -497,6 +519,25 @@ pub fn note_checkpoint_unavailable(reason: &str) {
 /// cancelled turn can still have written files, and forgetting them is what makes a coordinator's
 /// commit incomplete.
 pub fn seal_turn() -> Vec<String> {
+    let _background = match crate::core::workspace_txn::BackgroundProcessBarrier::acquire(None) {
+        Ok(guard) => guard,
+        Err(error) => {
+            if error
+                .downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>()
+                .is_some()
+            {
+                note_background_coverage_gap();
+            } else {
+                let reason = safe_text(&format!("session attribution unavailable: {error:#}"), 120);
+                update(|m| {
+                    m.base_checkpoint = None;
+                    m.coverage_gap = true;
+                    m.degraded = Some(reason.clone());
+                });
+            }
+            return Vec::new();
+        }
+    };
     let (repo_id, session_id, base, turn) = {
         let guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(a) = guard.as_ref() else {
@@ -1962,6 +2003,7 @@ mod tests {
             files: Vec::new(),
             truncated_files: 0,
             degraded: None,
+            coverage_gap: false,
             // NOW, not a fixed epoch: `list_in` sweeps terminal manifests past `RETENTION_SECS`,
             // so a hardcoded old timestamp would make every Finished/Done/Failed fixture vanish
             // before the assertion ran. Tests that care about staleness set this explicitly.
@@ -2352,6 +2394,26 @@ mod tests {
         let count = git_ok(&root, &["rev-list".into(), "--count".into(), "HEAD".into()]).unwrap();
         assert_eq!(count.trim(), "2");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn background_gap_preserves_history_without_certifying_missing_interval() {
+        let mut m = manifest("repo-gap", "session-gap", SessionState::Working);
+        merge_touched(&mut m.files, &[('M', "historical.rs".into())], 4, 1);
+        record_turn_base(&mut m, 8);
+        record_background_coverage_gap(&mut m);
+        assert!(m.base_checkpoint.is_none());
+        assert_eq!(m.files[0].base, 4);
+        let mut m: SessionManifest =
+            serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        record_turn_base(&mut m, 12);
+        assert_eq!(m.base_checkpoint, Some(12), "fresh coverage may resume");
+        assert!(m.coverage_gap);
+        assert!(
+            m.degraded.is_some(),
+            "a fresh base cannot repair missing history"
+        );
+        assert_eq!(m.files[0].base, 4);
     }
 
     #[test]

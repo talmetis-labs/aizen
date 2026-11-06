@@ -5,7 +5,8 @@
 //!   across EVERY persona and project — durable values/policies the operator sets once (e.g.
 //!   "always run tests before claiming done", "reply in Vietnamese", "never push without asking").
 //! - **`<persona>`** = a swappable costume (character voice) — `crate::persona`.
-//! - **`<user_memory>` / STYLE.md** = who the USER is — `crate::memory`.
+//! - **Persistent User/Project Memory** = user facts/context supplied by an optional provider;
+//!   neither provider installation nor selection changes Core's Soul ownership.
 //!
 //! HOME-only (NEVER cwd): the operating identity belongs to the operator, not to whatever repo you
 //! `cd` into — a cwd-scoped SOUL.md would let any cloned project silently rewrite the agent's rules
@@ -15,7 +16,7 @@
 //! tripped line drops the WHOLE block — fail-closed, a poisoned identity is never injected.
 
 use crate::core::config::aizen_home;
-use crate::memory::learning::sanitize_facts::threat_scan;
+use crate::core::prompt_safety::threat_scan;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 

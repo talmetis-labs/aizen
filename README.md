@@ -1,16 +1,11 @@
 <div align="center">
-
 <img width="200" height="200" alt="image" src="https://github.com/user-attachments/assets/3fc117bb-84cf-4b85-8302-7bec1eabb65e" />
 
-
 ### The terminal-native coding agent that actually *lives* on your machine.
-
 **One static binary. No Node. No Python. No Docker. No cloud account.**
 
 Point it at any OpenAI-compatible endpoint and you have a coding partner that reads and edits your
-code, runs your shell, verifies its own work, and remembers how *you* like things.
-
-<br/>
+code, runs your shell, verifies its own work, and can recall user/project facts through an optional Memory provider.
 
 [![Latest release](https://img.shields.io/github/v/release/talmetis-labs/aizen?style=for-the-badge&label=release&color=6c5ce7)](https://github.com/talmetis-labs/aizen/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-00b894?style=for-the-badge)](LICENSE)
@@ -24,33 +19,25 @@ code, runs your shell, verifies its own work, and remembers how *you* like thing
 ![10 ms](https://img.shields.io/badge/startup-10%20ms-6c5ce7?style=flat-square)
 
 **English** · [Tiếng Việt](README.vi.md) · [简体中文](README.zh-CN.md)
-
 </div>
 
 https://github.com/user-attachments/assets/45bbdfc8-09a3-4995-870f-eb92452743c9
 
----
-
 ## Install
-
 ```powershell
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.ps1 | iex
 ```
-
 ```bash
 # Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/talmetis-labs/aizen/main/install.sh | sh
 ```
-
 Then open a new terminal:
-
 ```bash
 aizen account login   # on an Aizen plan? sign in — no key to fetch, nothing to paste
 aizen config          # or bring your own: base URL → API key → pick a model
 aizen                 # land in the REPL and start typing
 ```
-
 That's the whole setup. No env vars, no config file to hand-edit.
 
 An Aizen plan is bought by signing in: the session opens the gateway on its own, and nothing but the
@@ -63,16 +50,11 @@ instead with `aizen login`, which approves a short code and comes back with a ke
 `aizen update`. The Windows `.exe` is unsigned, so SmartScreen will ask: *More info → Run anyway*.</sub>
 
 ## System Architecture
-
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/6bc4fb5e-ae8b-4aab-9aef-bbd1004bb095" />
-
 ## Persona & Self‑Evolution
-
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/03f96b4b-c587-4426-8f4d-c7ef1945b521" />
-
 ## Knowledge System
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/6d004bcc-15d4-450f-9beb-652d8633777a" />
-
 ## Cobase index && Sematic && Lsp server
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/211027cf-cbd2-4675-be00-ff6c616f900a" />
 
@@ -83,18 +65,16 @@ instead with `aizen login`, which approves a short code and comes back with a ke
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/10582817-8ec4-4924-ae78-b1151c041d05" />
 
 ## Why Aizen
-
 |  | |
 |---|---|
 | **One file, no runtime** | 34 MB static binary, ~10 ms cold start. No Node, no Python, no 2 GB virtualenv. Runs on a 512 MB VPS, a scratch container, a CI runner, or a Pi. |
 | **Bring your own model** | Any OpenAI-style `/chat/completions` endpoint — OpenAI, OpenRouter, a local llama.cpp/vLLM, an Anthropic gateway. Never locked to one lab. |
 | **It finishes the job** | Reads, edits, runs your shell — then **verifies before claiming done**: it runs your typecheck and tests, and fixes what it broke. |
-| **It remembers you** | An offline, BM25-ranked memory brain that learns from reuse — plus a persona, a durable SOUL identity, and skills it writes for itself after real work. |
+| **Optional persistent Memory** | Install and explicitly select a compatible provider such as Mnemos; Core works without one. Persona, SOUL, Skills and session working notes remain built in. See [Memory providers](docs/MEMORY_PLUGINS.md). |
 | **It runs where you aren't** | `aizen serve` drives the agent from Telegram or Discord and asks your phone to approve risky edits. Host it on systemd, Docker, or Kubernetes — behind NAT, no inbound port. |
 | **Safe by construction** | An OS sandbox under the approval layer: children never inherit your API keys, network is deny-by-default, and the filesystem policy is kernel-enforced on Linux (Landlock+seccomp) and macOS (Seatbelt) — Windows gets Job-Object containment and honest `partial` reporting, not pretend enforcement. A hard command floor refuses catastrophic commands **even under auto-approve**. `aizen sandbox status` shows exactly what *your* machine enforces — see [docs/SANDBOX.md](docs/SANDBOX.md). |
 
 ## What it can do
-
 ```
   aizen agent "fix the failing parse test"
 
@@ -104,7 +84,6 @@ instead with `aizen login`, which approves a short code and comes back with a ke
   ⚙ shell_run     cargo test               ✓ 0 failed · 1.18s
                                            verify gate passed
 ```
-
 | **Unified REPL** | One chat + agent loop, no mode switch. Live HUD: model · tokens · turn · `% context`. Markdown, tables, diagrams, image input. |
 | **Agent loop** | Parallel reads, approval-gated writes, LSP-powered symbolic edits, sub-agent dispatch, and a verify gate that must pass before "done". |
 | **Multi-agent** | The Pantheon: seven capability-scoped sub-agents (`argus` finds · `metis` plans · `daedalus` builds · `nemesis` reviews · `themis` tests · `clio` researches · `mnemosyne` recalls); `aizen workflow` fans them out and synthesises one answer. |
@@ -114,22 +93,17 @@ instead with `aizen login`, which approves a short code and comes back with a ke
 
 **→ [Full reference](docs/REFERENCE.md)** — every command, the REPL surface, self-hosting, MCP,
 browser tools, and the safety model in detail.
-
 <img width="1920" height="1280" alt="image" src="https://github.com/user-attachments/assets/b9f7b0c1-de15-458d-bc98-437fddfbaa8b" />
 
-
 ## Contributing
-
 Issues and PRs are welcome. Contributors agree to the [CLA](CLA.md) once — the project stays
 Apache-2.0, and §3 also grants the maintainer the right to license contributions commercially. Read it
 before you sign. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
-
 **[Apache License 2.0](LICENSE)** — open source, commercial use allowed. Keep the license and
 copyright notices, state your changes, and pass along the [NOTICE](NOTICE) file. Includes an express
 patent grant (§3).
-
 "Aizen" and the logo are trademarks of the Aizen authors; §6 grants no trademark rights, so a fork
 must not present itself as Aizen. Rebranding a fork is allowed — the code is yours — but it means
 following the checklist in [TRADEMARK.md](TRADEMARK.md), not running a find-and-replace. Releases up

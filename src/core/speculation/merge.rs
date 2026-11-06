@@ -285,7 +285,7 @@ pub(crate) fn merge(
         for variant in &mut variants {
             budget
                 .work(change.result.len().saturating_add(1))
-                .map_err(&fail)?;
+                .map_err(fail)?;
             if variant.result == change.result {
                 variant.rewrite |= change.operation == Operation::Rewrite;
                 found = true;
@@ -336,7 +336,7 @@ pub(crate) fn merge(
             }
             result => result,
         };
-        diffs.push(hunks.map_err(&fail)?);
+        diffs.push(hunks.map_err(fail)?);
     }
     if variants.len() == 1 {
         return Ok(candidate(variants[0].result.to_vec()));
@@ -351,11 +351,11 @@ pub(crate) fn merge(
     {
         return Err(fail(ConflictKind::WholeRewrite));
     }
-    let original = scan_rust(base, &mut budget).map_err(&fail)?;
+    let original = scan_rust(base, &mut budget).map_err(fail)?;
     let mut edits: Vec<Edit<'_>> = Vec::new();
     for (owner, (variant, hunks)) in variants.iter().zip(&diffs).enumerate() {
-        let parsed = scan_rust(variant.result, &mut budget).map_err(&fail)?;
-        if !same_shell(base, &original, variant.result, &parsed, &mut budget).map_err(&fail)? {
+        let parsed = scan_rust(variant.result, &mut budget).map_err(fail)?;
+        if !same_shell(base, &original, variant.result, &parsed, &mut budget).map_err(fail)? {
             return Err(fail(ConflictKind::OutsideFunction));
         }
         for hunk in hunks {
@@ -435,8 +435,8 @@ pub(crate) fn merge(
     bytes.extend_from_slice(&base[cursor..]);
     // Independently rescan the composition: separate valid edits can change lexing
     // across a boundary. Its immutable shell must still be exactly the same.
-    let parsed = scan_rust(&bytes, &mut budget).map_err(&fail)?;
-    if !same_shell(base, &original, &bytes, &parsed, &mut budget).map_err(&fail)? {
+    let parsed = scan_rust(&bytes, &mut budget).map_err(fail)?;
+    if !same_shell(base, &original, &bytes, &parsed, &mut budget).map_err(fail)? {
         return Err(fail(ConflictKind::AmbiguousRust));
     }
     Ok(candidate(bytes))

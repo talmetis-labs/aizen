@@ -4,7 +4,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use serde::Deserialize;
 
 use crate::core::types::{
     CacheControl, ChatChunk, ChatRequest, ChatResponse, FunctionCall, Message, StreamOptions,
@@ -493,7 +492,7 @@ pub fn is_free_model_id(id: &str) -> bool {
 /// Anthropic's native pair when the host is theirs. Sending both is safe — each side ignores the
 /// header it doesn't use — and it means one code path serves both wire dialects. OpenCode's gateway
 /// gets its client-identification header the same way.
-fn with_provider_auth(
+pub(crate) fn with_provider_auth(
     rb: reqwest::RequestBuilder,
     base_url: &str,
     api_key: &str,
@@ -698,66 +697,30 @@ pub async fn fetch_models_info(
 /// it — a validator that accepts a narrower set of providers than the real fetch would reject
 /// endpoints that actually work.
 async fn parse_models_body(resp: reqwest::Response) -> Result<Vec<ModelInfo>> {
-    #[derive(Deserialize)]
-    struct ModelsResp {
-        #[serde(default)]
-        data: Vec<ModelEntry>,
-    }
-    #[derive(Deserialize)]
-    struct TopProvider {
-        #[serde(default)]
-        context_length: Option<usize>,
-    }
-    #[derive(Deserialize)]
-    struct ModelEntry {
-        id: String,
-        // OpenRouter: `context_length`; others: `context_window` / `max_context_length`.
-        #[serde(default)]
-        context_length: Option<usize>,
-        #[serde(default)]
-        context_window: Option<usize>,
-        #[serde(default)]
-        max_context_length: Option<usize>,
-        // Anthropic's native `/v1/models` names it `max_input_tokens`. Without this the Claude models
-        // would all fall back to the name heuristic even though the provider stated the real number.
-        #[serde(default)]
-        max_input_tokens: Option<usize>,
-        // OpenRouter nests it here too: `top_provider.context_length`.
-        #[serde(default)]
-        top_provider: Option<TopProvider>,
-        #[serde(default)]
-        pricing: Option<Pricing>,
-    }
-    #[derive(Deserialize)]
-    struct Pricing {
-        #[serde(default)]
-        prompt: String,
-        #[serde(default)]
-        completion: String,
-    }
-
-    let parsed: ModelsResp = resp.json().await.context("parsing models response")?;
-    Ok(parsed
-        .data
-        .into_iter()
-        .map(|m| {
-            let ctx = m
-                .context_length
-                .or(m.context_window)
-                .or(m.max_context_length)
-                .or(m.max_input_tokens)
-                .or_else(|| m.top_provider.and_then(|t| t.context_length))
-                .filter(|&n| n > 0);
-            let is_free = m
-                .pricing
-                .as_ref()
-                .map(|p| pricing_is_free(&p.prompt, &p.completion))
+    let value: serde_json::Value = resp.json().await.context("parsing models response")?;
+    let rows = value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .context("models response has no data array")?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.to_string();
+            let context_length = super::model_metadata::model_limits(row).effective_window();
+            let pricing = row.get("pricing");
+            let is_free = pricing
+                .and_then(|p| {
+                    Some(pricing_is_free(
+                        p.get("prompt")?.as_str()?,
+                        p.get("completion")?.as_str()?,
+                    ))
+                })
                 .unwrap_or(false);
-            ModelInfo {
-                id: m.id,
-                context_length: ctx,
+            Some(ModelInfo {
+                id,
+                context_length,
                 is_free,
-            }
+            })
         })
         .collect())
 }
@@ -1250,6 +1213,7 @@ where
         }
         crate::llm::media::validate_image_request()?;
         super::delegated::before_send()?;
+        crate::llm::media::record_wire_attempt();
         match tokio::time::timeout(remaining, build().send()).await {
             Err(_) => bail!(
                 "request exceeded the {}s total send budget (no response headers) — timeout",
@@ -1614,18 +1578,26 @@ fn body_blames_effort(detail: &str) -> bool {
 struct PreparedChatRequest {
     body: ChatRequest,
     wire: Vec<u8>,
+    request: Option<reqwest::Request>,
 }
 
 impl PreparedChatRequest {
     fn new(mut body: ChatRequest) -> Result<Self> {
         apply_known_quirks(&mut body);
         let wire = serde_json::to_vec(&body)?;
-        Ok(Self { body, wire })
+        crate::llm::media::stage_wire_json(wire.len());
+        Ok(Self {
+            body,
+            wire,
+            request: None,
+        })
     }
 
     fn apply_quirk(&mut self, quirk: Quirk) -> Result<()> {
         apply_quirk(&mut self.body, quirk);
         self.wire = serde_json::to_vec(&self.body)?;
+        crate::llm::media::stage_wire_json(self.wire.len());
+        self.request = None;
         Ok(())
     }
 }
@@ -1654,11 +1626,28 @@ async fn send_prepared_chat(
         // `/models` probe already sent them — the actual chat traffic must not be the one path
         // that forgets. The host test parses the host out of the full URL, so passing the chat
         // URL (not the base) is fine.
-        let err = match send_with_retry_render(
-            || {
+        // The request owns a reusable Bytes-backed body. Retry clones share those bytes, including
+        // blank-stream retries; only a provider quirk creates a new logical wire body.
+        if prepared.request.is_none() {
+            prepared.request = Some(
                 with_provider_auth(client.post(url), url, api_key)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(prepared.wire.clone())
+                    .body(std::mem::take(&mut prepared.wire))
+                    .build()?,
+            );
+        }
+        let request = prepared
+            .request
+            .as_ref()
+            .expect("prepared reusable request");
+        let err = match send_with_retry_render(
+            || {
+                reqwest::RequestBuilder::from_parts(
+                    client.clone(),
+                    request
+                        .try_clone()
+                        .expect("in-memory request body is reusable"),
+                )
             },
             render,
         )
@@ -1856,9 +1845,12 @@ async fn stream_chat_with_visual_contract_live(
         .map(|turn| turn.content.unwrap_or_default());
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let _request_memory = crate::llm::media::request_memory_lease(&messages)?;
     let policy = crate::core::cli_config::vision_support_in(cfg, base_url, model).into();
+    let destination = crate::llm::media::destination_key(base_url, model);
+    let _request_memory =
+        crate::llm::media::request_memory_lease(&messages, policy, Some(&destination))?;
     crate::llm::media::validate_reference_vision(policy)?;
+    crate::llm::media::prepare_user_images(&messages, policy, Some(&destination)).await?;
     // The ONE body builder, like the tool-calling paths: this surface used to hand-roll its
     // request without `stream_options.include_usage`, then read `chunk.usage` — so `aizen chat`
     // turns never reached `/cost` on providers that only send usage when asked.
@@ -2058,8 +2050,20 @@ pub(crate) fn build_chat_body_for_destination(
         messages: msgs,
         stream,
         temperature: None,
-        max_tokens: cfg.max_tokens,
-        max_completion_tokens: None,
+        max_tokens: if cfg.output_token_parameter
+            == Some(crate::core::cli_config::OutputTokenParameter::MaxCompletionTokens)
+        {
+            None
+        } else {
+            cfg.max_tokens
+        },
+        max_completion_tokens: if cfg.output_token_parameter
+            == Some(crate::core::cli_config::OutputTokenParameter::MaxCompletionTokens)
+        {
+            cfg.max_tokens
+        } else {
+            None
+        },
         tools: tool_defs,
         tool_choice: if tools.is_empty() {
             None
@@ -2172,9 +2176,12 @@ async fn chat_with_tools_effort_live(
         .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let _request_memory = crate::llm::media::request_memory_lease(messages)?;
     let policy = crate::core::cli_config::vision_support_in(cfg, base_url, model).into();
+    let destination = crate::llm::media::destination_key(base_url, model);
+    let _request_memory =
+        crate::llm::media::request_memory_lease(messages, policy, Some(&destination))?;
     crate::llm::media::validate_reference_vision(policy)?;
+    crate::llm::media::prepare_user_images(messages, policy, Some(&destination)).await?;
     let body = build_chat_body_for_destination(
         cfg,
         model,
@@ -2240,6 +2247,121 @@ async fn chat_with_tools_effort_live(
         empty_wire_raw,
         eager: Vec::new(),
     })
+}
+
+/// One bounded, no-tool model request for an explicitly authorized extension job. The caller
+/// supplies the completed turn's frozen route/config; there is no role resolution or retry.
+pub(crate) async fn extension_completion(
+    endpoint: &crate::core::cli_config::ResolvedEndpoint,
+    effort: Option<String>,
+    cfg: &crate::core::cli_config::CliConfig,
+    messages: &[Message],
+    max_output_tokens: u32,
+) -> Result<String> {
+    if matches!(
+        crate::llm::replay::mode(),
+        crate::llm::replay::Mode::Replay | crate::llm::replay::Mode::Strict
+    ) {
+        bail!("prepared Memory model learning is disabled during tape replay");
+    }
+    // OAuth's Responses transport owns a separate credential lifecycle. Never silently substitute
+    // another endpoint or use a freshly resolved account for this captured-route operation.
+    if crate::llm::oauth_codex::is_codex_base_url(&endpoint.base_url) {
+        bail!("prepared Memory learning is not supported on the Codex OAuth transport");
+    }
+    if !(1..=2048).contains(&max_output_tokens) {
+        bail!("invalid Memory learning output-token limit");
+    }
+    let mut bounded = cfg.clone();
+    bounded.max_tokens = Some(
+        cfg.max_tokens
+            .map_or(max_output_tokens, |cap| cap.min(max_output_tokens)),
+    );
+    if bounded.max_tokens == Some(0) {
+        bail!("invalid configured Memory learning output-token limit");
+    }
+    let mut body = build_chat_body_for_destination(
+        &bounded,
+        &endpoint.model,
+        messages,
+        &[],
+        false,
+        effort,
+        crate::llm::media::VisionPolicy::Unsupported,
+        None,
+    );
+    apply_known_quirks(&mut body);
+    // A learned provider quirk must never remove this job's spending bound.
+    if body.max_tokens.is_none() && body.max_completion_tokens.is_none() {
+        bail!("model transport cannot enforce the Memory output-token limit");
+    }
+    let wire = serde_json::to_vec(&body)?;
+    let url = format!(
+        "{}/chat/completions",
+        endpoint.base_url.trim_end_matches('/')
+    );
+    // Only the endpoint/auth/model/config are captured, not a potentially redirect-following client.
+    // This transport deliberately refuses redirects of provider-prepared Memory text.
+    let bounded_http = reqwest::Client::builder()
+        .user_agent(concat!("aizen/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|_| anyhow!("cannot build Memory learning HTTP transport"))?;
+    let response = with_provider_auth(bounded_http.post(&url), &url, &endpoint.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(wire)
+        .send()
+        .await
+        .map_err(|_| anyhow!("Memory learning model transport failed; no retry"))?;
+    ensure_extension_status(response.status())?;
+    let mut stream = response.bytes_stream();
+    let mut raw = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| anyhow!("Memory learning model response interrupted"))?;
+        if raw.len().saturating_add(chunk.len()) > 256 * 1024 {
+            bail!("Memory learning model response exceeds 256 KiB");
+        }
+        raw.extend_from_slice(&chunk);
+    }
+    let mut parsed: ChatResponse = serde_json::from_slice(&raw)
+        .map_err(|_| anyhow!("invalid Memory learning model response"))?;
+    if let Some(usage) = &parsed.usage {
+        cost_meter().record(usage);
+    }
+    let choice = parsed
+        .choices
+        .first_mut()
+        .context("model returned no choices")?;
+    if !choice.message.tool_calls.is_empty()
+        || choice.message.extra.contains_key("function_call")
+        || matches!(choice.finish_reason.as_deref(), Some(reason) if reason != "stop")
+    {
+        bail!("Memory learning model returned tool calls or an incomplete response");
+    }
+    let content = choice
+        .message
+        .content
+        .as_deref()
+        .unwrap_or_default()
+        .to_owned();
+    if content.len() > 32 * 1024
+        || content
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+    {
+        bail!("Memory learning completion exceeds text limits");
+    }
+    Ok(content)
+}
+
+fn ensure_extension_status(status: reqwest::StatusCode) -> Result<()> {
+    if !status.is_success() {
+        // Do not log an endpoint, key, prompt or arbitrary provider body on this optional path.
+        bail!("Memory learning model returned HTTP {}", status.as_u16());
+    }
+    Ok(())
 }
 
 /// A printable prefix of a response body: ASCII as-is (escaped), non-ASCII as `len=N bytes`.
@@ -2786,9 +2908,12 @@ async fn stream_chat_with_tools_eager_live(
         .await;
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let _request_memory = crate::llm::media::request_memory_lease(messages)?;
     let policy = crate::core::cli_config::vision_support_in(cfg, base_url, model).into();
+    let destination = crate::llm::media::destination_key(base_url, model);
+    let _request_memory =
+        crate::llm::media::request_memory_lease(messages, policy, Some(&destination))?;
     crate::llm::media::validate_reference_vision(policy)?;
+    crate::llm::media::prepare_user_images(messages, policy, Some(&destination)).await?;
     // The caller freezes config for the entire dispatch, including Codex/media routing.
     let body = build_chat_body_for_destination(
         cfg,
@@ -3270,6 +3395,10 @@ fn key_probe_prefers_free_pricing_over_paid() {
         .unwrap();
     assert_eq!(picked, "openrouter/free");
 }
+
+#[cfg(test)]
+#[path = "extension_tests.rs"]
+mod extension_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

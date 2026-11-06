@@ -23,10 +23,11 @@
 //! body…
 //! ```
 
-use crate::memory::frontmatter;
-use crate::memory::learning::signals::{self, SignalKind};
-use crate::memory::render::{est_tokens, sanitize_body};
-use crate::memory::score::recency_factor;
+use crate::core::dates::recency_factor;
+use crate::core::frontmatter;
+use crate::core::prompt_safety::sanitize_body;
+use crate::core::tokens::estimate_str_ceil as est_tokens;
+use crate::core::turn_signals::{self as signals, SignalKind};
 use crate::persona::personas_dir;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -411,18 +412,7 @@ pub fn save_insight(persona_slug: &str, body: &str, importance: u8) -> Result<St
 /// graph, simply means no signal. What it buys is the ability to ask later "which of this character's
 /// lessons belong to the situation we are in now" from the facts alone.
 pub fn note_insight_cofire(persona_slug: &str, insight_id: &str) {
-    if !crate::memory::graph::recording_enabled() {
-        return;
-    }
-    let facts = crate::memory::pending::current();
-    if facts.is_empty() {
-        return;
-    }
-    let node = crate::memory::graph::node_persona(persona_slug, insight_id);
-    let mut ids: Vec<&str> = vec![node.as_str()];
-    ids.extend(facts.iter().map(|p| p.id.as_str()));
-    let today = crate::memory::bloat::decay::today();
-    let _ = crate::memory::graph::record_coretrieval(&ids, &today);
+    crate::plugin::associations::note(format!("persona:{persona_slug}/{insight_id}"));
 }
 
 fn normalize(s: &str) -> String {
@@ -771,7 +761,7 @@ fn rank(m: &SelfMemory, today: chrono::NaiveDate) -> f64 {
 ///
 /// This rides the **dynamic system lane**, which carries its own cache breakpoint, so its steady-state
 /// cost is a cache read rather than fresh tokens. That is why it is deliberately NOT gated on the
-/// user's query the way [`crate::skills::turn_block`] and [`crate::memory::recall_block`] are: a
+/// user's query the way [`crate::skills::turn_block`] and optional provider recall are: a
 /// per-turn selection here would rewrite lane 1 every turn and force the whole transcript after it
 /// to re-bill uncached, costing far more than a tighter block could save.
 ///
@@ -883,7 +873,7 @@ fn prune_kind(persona_slug: &str, kind: Kind, cap: usize) {
     for victim in of_kind.into_iter().skip(cap) {
         // `unique_in` uniquifies on collision: two victims sharing a stem must not overwrite
         // each other, and neither may overwrite an item archived on an earlier turn.
-        let dest = crate::memory::bloat::caps::unique_in(&adir, &victim.id);
+        let dest = crate::core::archive_path::unique_in(&adir, &victim.id);
         let _ = fs::rename(&victim.path, &dest);
     }
 }
@@ -902,7 +892,7 @@ pub fn forget(persona_slug: &str, id: &str) -> Result<PathBuf> {
     }
     let adir = archive_dir(persona_slug);
     fs::create_dir_all(&adir).with_context(|| format!("creating {}", adir.display()))?;
-    let dest = crate::memory::bloat::caps::unique_in(&adir, id);
+    let dest = crate::core::archive_path::unique_in(&adir, id);
     fs::rename(&src, &dest).with_context(|| format!("retiring {}", src.display()))?;
     Ok(dest)
 }

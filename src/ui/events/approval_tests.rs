@@ -308,7 +308,9 @@ fn fixture(
         .unwrap_or_else(|e| e.into_inner());
     let directory = crate::core::file_placement::tests::TestDir::new();
     let root: PathBuf = directory.path().join("workspace");
-    let home = directory.path().join("home");
+    // The sandbox grants workspace writes, not writes to a sibling fixture HOME. Real tool
+    // execution creates workspace locks there after approval, including under Linux Landlock.
+    let home = root.join("home");
     std::fs::create_dir(&root)?;
     std::fs::create_dir(&home)?;
     let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
@@ -443,6 +445,7 @@ fn identical_calls(first_allowed: bool) -> anyhow::Result<()> {
                         assert_eq!(
                             block["is_error"],
                             (label == "a" && !first_allowed) || label == "cancelled",
+                            "unexpected result for {label}: {record}",
                         );
                         if label == "cancelled" {
                             assert!(!block["content"].as_str().unwrap().contains("body ran"));

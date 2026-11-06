@@ -397,11 +397,15 @@ async fn real_speculative_tasks(planned: bool, reader: bool, same_function: bool
     }));
     let observed_bodies = bodies.clone();
     let rendezvous_root = root.clone();
+    let deadline = tokio::time::Instant::from_std(cfg.deadline.unwrap());
     let controller = tokio::spawn(async move {
         let _release_on_return = ReleaseOnDrop(release);
         let mut entered = Vec::new();
-        for _ in 0..2 {
-            entered.push(tokio::time::timeout(WAIT, rx.recv()).await.expect("both actual overlay mutation bodies must overlap").expect("actual native body sender"));
+        for index in 0..2 {
+            // Capture, baseline verification and provider setup precede the first native body.
+            // Only the gap between actual bodies measures overlap; the run bounds first arrival.
+            let arrival_deadline = if index == 0 { deadline } else { deadline.min(tokio::time::Instant::now() + WAIT) };
+            entered.push(tokio::time::timeout_at(arrival_deadline, rx.recv()).await.expect("both actual overlay mutation bodies must overlap").expect("actual native body sender"));
         }
         assert_eq!(entered[0].path, entered[1].path);
         assert_eq!(entered[0].path, rendezvous_root.canonicalize().unwrap().join(FILE));
@@ -433,12 +437,12 @@ async fn real_speculative_tasks(planned: bool, reader: bool, same_function: bool
         let mut handlers = Vec::new();
         let mut accept_error = None;
         for _ in 0..expected_requests {
-            match tokio::time::timeout(Duration::from_secs(20), listener.accept()).await {
+            match tokio::time::timeout_at(deadline, listener.accept()).await {
                 Ok(Ok((socket, peer))) => {
                     assert!(peer.ip().is_loopback());
                     let state = server_state.clone();
                     handlers.push(tokio::spawn(async move {
-                        tokio::time::timeout(Duration::from_secs(25), provider_request(socket, state))
+                        tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + Duration::from_secs(25)), provider_request(socket, state))
                             .await
                             .expect("bounded owned provider handler")
                     }));

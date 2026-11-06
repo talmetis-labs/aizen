@@ -42,14 +42,18 @@ pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
     // BOM-based detection (unambiguous).
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         let u16s: Vec<u16> = rest
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         return Some(String::from_utf16_lossy(&u16s));
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let u16s: Vec<u16> = rest
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         return Some(String::from_utf16_lossy(&u16s));
@@ -69,14 +73,18 @@ pub(crate) fn decode_text(bytes: &[u8]) -> Option<String> {
     let even_nul = head.iter().step_by(2).filter(|&&b| b == 0).count();
     if odd_nul * 10 >= half * 8 {
         let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         return Some(String::from_utf16_lossy(&u16s));
     }
     if even_nul * 10 >= half * 8 {
         let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         return Some(String::from_utf16_lossy(&u16s));

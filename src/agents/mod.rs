@@ -35,7 +35,7 @@
 //! allowlist gates *advertising only*; [`load`] resolves ANY installed slug, enabled or not.
 
 use crate::core::config::{aizen_home, project_aizen_dir, project_root};
-use crate::memory::frontmatter;
+use crate::core::frontmatter;
 use crate::skills::sanitize_name;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};

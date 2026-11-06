@@ -1,6 +1,6 @@
 [package]
 name = "aizen"
-version = "0.7.2"
+version = "0.7.4"
 edition = "2021"
 description = "Aizen first-party agentic coding CLI — OpenAI-compatible, hermes-style provider-agnostic API client"
 license = "Apache-2.0"
@@ -26,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
-# Memory subsystem (all pure-Rust / static — preserves single-binary, rustls-only posture)
+# Shared Core text matching (pure Rust / static; independent of optional Memory providers)
 regex = "1"
 once_cell = "1"
 # Fuzzy near-match bridge for the BM25 lexical floor (P6.5/P7): Jaro-Winkler over tokens to
@@ -84,6 +84,8 @@ memchr = "2"
 # loopback redirect catcher uses tokio's `net` feature (added above) — still one pure-Rust static binary.
 ring = "0.17"
 getrandom = "0.2"
+# Memory package integrity only; no native crypto build is introduced.
+sha2 = { version = "0.10", default-features = false }
 
 # Dense semantic tier (P5) — OPT-IN only. The default build stays pure-Rust (lexical floor).
 # `local-only` drops hf-hub/TLS so models load from a local dir we manage. We do NOT enable
@@ -184,6 +186,9 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 # static binary preserved. PINNED to 0.59: 0.60+ switched to `windows-link` raw-dylib linking, which
 # needs MinGW `dlltool.exe` on the *-windows-gnu toolchain (not present here); 0.59 ships classic
 # prebuilt import libs and builds everywhere.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Features cover: Job Objects (LSP tree-kill), console mode restore (TUI), atomic MoveFileEx +
 # ACL owner-only writes (persist), exclusive file locks (repo_lock), reparse-point checks (TM),

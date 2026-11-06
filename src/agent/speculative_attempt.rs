@@ -23,6 +23,7 @@ use tokio::time::Instant;
 /// certified release.  In particular, the raw slot and activity must not be dropped while
 /// a detached worker or an executable context can still exist.
 struct State {
+    _background: crate::core::workspace_txn::BackgroundProcessBarrier,
     slot: SubagentSlot,
     activity: Arc<WorkspaceActivity>,
     overlay: OverlayHandle,
@@ -68,6 +69,9 @@ impl AttemptOwner {
         for resource in scope.resources() {
             overlay.resolve(root, resource.path())?;
         }
+        let background = crate::core::workspace_txn::BackgroundProcessBarrier::acquire(
+            crate::core::cancel::current().as_ref(),
+        )?;
         let activity = WorkspaceActivity::begin(root, owner_scope)
             .context("native speculative workspace activity unavailable")?;
         let lifecycle = overlay.lifecycle().cloned();
@@ -80,6 +84,7 @@ impl AttemptOwner {
         let carriers = AttemptCarrierRegistry::new();
         Ok(Self {
             state: Some(State {
+                _background: background,
                 slot,
                 activity,
                 overlay,
@@ -183,6 +188,7 @@ impl AttemptOwner {
             .take()
             .expect("attempt state remains present until release proof completes");
         let State {
+            _background,
             slot,
             activity,
             overlay,

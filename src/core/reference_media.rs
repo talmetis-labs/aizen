@@ -5,7 +5,7 @@
 use crate::core::tool_media::{
     ImageMetadata, ImageProvenance, ImageUnavailable, PixelRect, ToolImage,
 };
-use crate::core::types::Message;
+use crate::core::types::{ImagePreference, Message};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,9 +58,15 @@ impl ReferenceDerivatives {
 }
 
 #[derive(Debug)]
+struct ReferenceEntry {
+    image: ToolImage,
+    preference: ImagePreference,
+}
+
+#[derive(Debug)]
 struct Catalog {
     epoch: u64,
-    entries: BTreeMap<String, ToolImage>,
+    entries: BTreeMap<String, ReferenceEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,14 +214,24 @@ impl ReferenceRegistry {
                 message
                     .tool_images
                     .push(original.without_payload(ImageUnavailable::MetadataOnly));
-                entries.insert(id, original);
+                entries.insert(
+                    id,
+                    ReferenceEntry {
+                        image: original,
+                        preference: message
+                            .image_preferences
+                            .get(index)
+                            .copied()
+                            .unwrap_or(ImagePreference::Auto),
+                    },
+                );
             }
         }
         let descriptors = entries
             .iter()
             .map(|(id, image)| ReferenceDescriptor {
                 reference_id: id.clone(),
-                original: image.metadata().clone(),
+                original: image.image.metadata().clone(),
             })
             .collect();
         let mut catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
@@ -257,7 +273,7 @@ impl ReferenceRegistry {
         let selected_bytes: usize = ids
             .iter()
             .filter_map(|id| catalog.entries.get(id))
-            .map(|image| image.metadata().byte_len)
+            .map(|entry| entry.image.metadata().byte_len)
             .sum();
         ensure!(
             selected_bytes <= crate::core::tool_media::MAX_REQUEST_IMAGE_BYTES,
@@ -364,7 +380,7 @@ impl ReferenceAccess {
             .filter_map(|id| {
                 catalog.entries.get(id).map(|image| ReferenceDescriptor {
                     reference_id: id.clone(),
-                    original: image.metadata().clone(),
+                    original: image.image.metadata().clone(),
                 })
             })
             .collect())
@@ -388,7 +404,7 @@ impl ReferenceAccess {
         catalog
             .entries
             .get(id)
-            .cloned()
+            .map(|entry| entry.image.clone())
             .context("reference original payload unavailable")
     }
 
@@ -399,10 +415,27 @@ impl ReferenceAccess {
             self.derivatives.original,
             "whole-reference handoff requires an original grant; preview-only grants need a bounded preview projector"
         );
+        // Snapshot pixels and their occurrence preferences under the same live grant check.
+        // Preferences select transport only; they never add IDs or derivative permissions.
+        self.validate_scope(&self.scope.owner, &self.scope.task_scope)?;
+        let catalog = self
+            .registry
+            .catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            self.live.load(Ordering::Acquire) && catalog.epoch == self.epoch,
+            "reference grant revoked or expired"
+        );
         let mut message = Message::user(text);
         for (index, id) in self.ids.iter().enumerate() {
-            let image = self.original(id)?;
+            let entry = catalog
+                .entries
+                .get(id)
+                .context("reference original payload unavailable")?;
+            let image = &entry.image;
             message.images.push(image.data_url());
+            message.image_preferences.push(entry.preference);
             let mut metadata = image.metadata().clone();
             metadata.provenance.locator = Some(format!("attachment:{index}"));
             message.tool_images.push(ToolImage::unavailable(
@@ -424,7 +457,7 @@ impl ReferenceAccess {
         );
         let original = self.original(id)?;
         let image = match crop {
-            Some(rect) => original.crop_png(rect)?,
+            Some(rect) => original.crop_pixels(rect)?,
             None => original.clone(),
         };
         let mut provenance = image.metadata().provenance.clone();
@@ -522,6 +555,74 @@ mod tests {
         child.revoke();
         assert!(access.original(&ids[0]).is_err());
     }
+    #[test]
+    fn selected_reference_preferences_follow_occurrences_not_pixels_or_order() {
+        use crate::core::types::ImagePreference::{Auto, Original, Photo};
+        let registry = ReferenceRegistry::new("owner");
+        let mut message = attachment();
+        message.images = vec![message.images[0].clone(); 3];
+        message.image_preferences = vec![Auto, Photo, Original];
+        registry
+            .register_loaded(std::slice::from_mut(&mut message))
+            .unwrap();
+        let id_at = |index| {
+            message
+                .tool_images
+                .iter()
+                .find(|image| marker_index(image) == Some(index))
+                .unwrap()
+                .metadata()
+                .provenance
+                .evidence_id
+                .clone()
+                .unwrap()
+        };
+        let ids = vec![id_at(2), id_at(0), id_at(1)];
+        let access = registry
+            .grant(&ids, scope(), ReferenceDerivatives::ALL)
+            .unwrap();
+        assert_eq!(
+            access.user_message("reordered").unwrap().image_preferences,
+            [Original, Auto, Photo]
+        );
+        let selected = vec![ids[2].clone(), ids[0].clone()];
+        let child = access
+            .select_child(&selected, "owner", "parent", "child", &scope().route)
+            .unwrap();
+        let output = child.user_message("subset").unwrap();
+        assert_eq!(output.image_preferences, [Photo, Original]);
+        assert_eq!(output.images.len(), 2);
+        assert_eq!(child.ids(), selected);
+        assert_eq!(child.derivatives(), access.derivatives());
+        assert!(child.original(&ids[1]).is_err());
+        assert!(child.validate_scope("owner", "sibling").is_err());
+        for (index, id) in selected.iter().enumerate() {
+            assert_eq!(
+                output.tool_images[index]
+                    .metadata()
+                    .provenance
+                    .evidence_id
+                    .as_ref(),
+                Some(id)
+            );
+            assert_eq!(marker_index(&output.tool_images[index]), Some(index));
+        }
+        // The unconditional rollback still wins over a Photo preference after a child handoff.
+        let (_, receipt) = crate::llm::media::project_messages_for_send(
+            &[output],
+            crate::llm::media::VisionPolicy::Supported,
+            None,
+            crate::llm::image_send::ImageSendPolicy::Original,
+        );
+        assert_eq!(receipt.user_images.len(), 2);
+        assert!(receipt
+            .user_images
+            .iter()
+            .all(|sent| sent.original && sent.source_sha256 == sent.wire_sha256));
+        access.revoke();
+        assert!(child.user_message("revoked").is_err());
+    }
+
     #[test]
     fn metadata_cannot_hydrate_other_occurrences_and_tool_images_are_not_references() {
         let registry = ReferenceRegistry::new("owner");

@@ -366,9 +366,8 @@ impl Tool for WorkflowTool {
         "workflow"
     }
     fn description(&self) -> &str {
-        "Fanout tasks; after passes reports. Native exact scopes overlap; opaque work serializes. \
-         Parent verifies. implement: daedalus→themis→nemesis + one FAIL retry; \
-         verify: read-only refuter. One child→task; no restore/undo."
+        "Fanout after reports; implement edit→test→review + one FAIL retry; verify refuters. \
+         Parent verifies edits; opaque work serializes. No restore/undo."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -382,11 +381,11 @@ impl Tool for WorkflowTool {
                     "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "nemesis=read(default); daedalus=edit; themis=test"},
                     "agent": {"type": "string", "description": "<agents> slug"},
                     "model": {"type": "string"},
-                    "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Native text files only; private same-base edits, parent integrates/verifies; no hooks/shell/media."},
+                    "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Private native edits; parent integrates/verifies. No hooks/shell/media."},
                     "reference_ids": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","maxLength":128},"description":"Conversation refs; live grant."},
-                    "return_evidence": {"type":"array","maxItems":4,"items":{"type":"string","maxLength":128}},
+                    "return_evidence": {"type":"array","maxItems":4,"items":{"type":"string","maxLength":128},"description":"Final child captures or @latest_capture (one screenshot); no inherited refs"},
                     "boundaries": {"type": "string"},
-                    "read_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"reads; without write_paths read-only; union <=32 native files"},
+                    "read_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"Exact native reads; read-only without write_paths; union <=32 files"},
                     "write_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"read/write union; parent integrates"},
                     "expected_output": {"type": "string"},
                     "context": {"type": "array", "items": {"type": "string"}, "description":"known findings, <=10 lines"},

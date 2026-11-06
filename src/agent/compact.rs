@@ -14,7 +14,7 @@
 
 use crate::agent::design::DesignContext;
 use crate::core::types::Message;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::future::Future;
 
 /// User turns kept verbatim at the tail; everything older is summarized.
@@ -120,8 +120,11 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 /// truncated so the summary call stays cheap.
 pub fn render_transcript(msgs: &[Message]) -> String {
     let mut out = String::new();
+    let mut visual_budget = crate::llm::media::VisualDescriptorBudget::default();
     for m in msgs {
-        let body = m.content.as_deref().unwrap_or("").trim();
+        let body = crate::core::memory_context::clean_content(m)
+            .unwrap_or("")
+            .trim();
         match m.role.as_str() {
             "user" => out.push_str(&format!("User: {body}\n")),
             "assistant" if !m.tool_calls.is_empty() => {
@@ -151,6 +154,22 @@ pub fn render_transcript(msgs: &[Message]) -> String {
             // decisions one 600-char cut at a time.
             "system" => out.push_str(&format!("Note: {}\n", truncate_chars(body, 2400))),
             other => out.push_str(&format!("{other}: {body}\n")),
+        }
+        for descriptor in crate::llm::media::visual_descriptors(m, &mut visual_budget) {
+            out.push_str(&descriptor);
+            out.push('\n');
+        }
+        for (index, url) in m.images.iter().enumerate() {
+            if !m
+                .visual_context
+                .iter()
+                .any(|state| state.matches(index, url))
+            {
+                if let Some(descriptor) = visual_budget.take("[Image attachment available only in this live session; no saved visual observation. After resume, attach the original again before relying on unresolved detail.]".into()) {
+                    out.push_str(&descriptor);
+                    out.push('\n');
+                }
+            }
         }
     }
     out
@@ -319,28 +338,140 @@ fn marker_text(seq: usize, summary: &str) -> String {
 /// summarized into this one) and incremented, so the count accumulates across successive
 /// compactions even though each old boundary note is folded into the next summary.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn splice_compacted(history: &mut Vec<Message>, cut: usize, summary: &str) {
-    splice_compacted_keeping(history, cut, summary, None);
+pub fn splice_compacted(history: &mut Vec<Message>, cut: usize, summary: &str) -> Result<()> {
+    splice_compacted_keeping(history, cut, summary, None)
 }
 
-/// [`splice_compacted`] that re-seats `keep_verbatim` (the single-turn prompt) right after the
-/// boundary note, so the task statement survives its own compaction word for word.
+/// Re-seat the exact single-turn prompt occurrence, not every message with matching text/pixels.
+/// Active attachments stay verbatim; only explicitly dormant assets move to storage-only roots.
 pub fn splice_compacted_keeping(
     history: &mut Vec<Message>,
     cut: usize,
     summary: &str,
-    keep_verbatim: Option<Message>,
-) {
+    keep_verbatim: Option<usize>,
+) -> Result<()> {
+    anyhow::ensure!(cut <= history.len(), "invalid compaction boundary");
     let seq = compaction_count(history) + 1;
     let lead = leading_system_count(history).min(cut);
-    let prefix: Vec<Message> = history[..lead].to_vec();
-    let tail: Vec<Message> = history[cut..].to_vec();
-    let mut rebuilt = Vec::with_capacity(prefix.len() + 2 + tail.len());
-    rebuilt.extend(prefix);
-    rebuilt.push(Message::system(marker_text(seq, summary)));
-    rebuilt.extend(keep_verbatim);
-    rebuilt.extend(tail);
+    let mut boundary = Message::system(marker_text(seq, summary));
+    let mut retained_bytes = 0usize;
+    let active_groups: std::collections::BTreeSet<_> =
+        crate::llm::media::completed_tool_groups(history)
+            .into_iter()
+            .filter(|(_, end, outputs)| {
+                *end < cut
+                    && outputs.iter().any(|&mi| {
+                        history[mi]
+                            .tool_images
+                            .iter()
+                            .enumerate()
+                            .any(|(ii, image)| {
+                                image.is_available()
+                                    && image.metadata().provenance.source
+                                        != crate::core::reference_media::REFERENCE_SOURCE
+                                    && !history[mi].visual_context.iter().any(|state| {
+                                        state.matches_tool(ii, image) && state.releases_pixels()
+                                    })
+                            })
+                    })
+            })
+            .flat_map(|(start, end, _)| start..=end)
+            .collect();
+    let mut kept = Vec::new();
+    // Harness user-role nudges are not a new logical turn. Preserve the current host-seated
+    // occurrence even when the ordinary multi-turn cut would summarize its root away.
+    let logical_root = history
+        .iter()
+        .rposition(|message| message.role == "user" && message.user_turn_id.is_some());
+    for (mi, message) in history[..cut].iter().enumerate().skip(lead) {
+        let has_active = message.images.iter().enumerate().any(|(ii, url)| {
+            !message
+                .visual_context
+                .iter()
+                .any(|state| state.matches(ii, url) && state.releases_pixels())
+        });
+        if keep_verbatim == Some(mi)
+            || logical_root == Some(mi)
+            || active_groups.contains(&mi)
+            || (message.role == "user" && has_active)
+        {
+            kept.push(message.clone());
+            continue;
+        }
+        for (ii, image) in message.tool_images.iter().enumerate().filter(|(_, image)| {
+            image.metadata().provenance.source != crate::core::reference_media::REFERENCE_SOURCE
+        }) {
+            let Some(mut note) = message
+                .visual_context
+                .iter()
+                .find(|state| state.matches_tool(ii, image) && state.releases_pixels())
+                .cloned()
+            else {
+                continue;
+            };
+            anyhow::ensure!(
+                boundary.images.len() + boundary.tool_images.len()
+                    < crate::core::visual_context::MAX_NOTES
+                    && retained_bytes
+                        .saturating_add(image.metadata().byte_len.saturating_mul(4).div_ceil(3))
+                        <= 96 * 1024 * 1024,
+                "compaction visual retention quota exceeded; originals were not removed"
+            );
+            note.image_index = boundary.tool_images.len();
+            retained_bytes += image.metadata().byte_len.saturating_mul(4).div_ceil(3);
+            boundary.tool_images.push(image.clone());
+            boundary.visual_context.push(note);
+        }
+        anyhow::ensure!(!has_active,
+            "compaction cannot hide active retained images; reselect and inspect/release them first");
+        for (ii, url) in message.images.iter().enumerate() {
+            anyhow::ensure!(
+                boundary.images.len() < crate::core::visual_context::MAX_NOTES
+                    && retained_bytes.saturating_add(url.len()) <= 96 * 1024 * 1024,
+                "compaction visual retention quota exceeded; originals were not removed"
+            );
+            let index = boundary.images.len();
+            let mut note = message
+                .visual_context
+                .iter()
+                .find(|state| state.matches(ii, url))
+                .cloned()
+                .expect("dormant asset has a validated note");
+            note.image_index = index;
+            for image in &message.tool_images {
+                if image.metadata().provenance.source
+                    == crate::core::reference_media::REFERENCE_SOURCE
+                    && image.metadata().provenance.locator.as_deref()
+                        == Some(format!("attachment:{ii}").as_str())
+                {
+                    let mut metadata = image.metadata().clone();
+                    metadata.provenance.locator = Some(format!("attachment:{index}"));
+                    boundary
+                        .tool_images
+                        .push(crate::core::tool_media::ToolImage::unavailable(
+                            metadata,
+                            crate::core::tool_media::ImageUnavailable::MetadataOnly,
+                        ));
+                }
+            }
+            retained_bytes += url.len();
+            boundary.images.push(url.clone());
+            if let Some(preference) = message.image_preferences.get(ii) {
+                boundary
+                    .image_preferences
+                    .resize(index + 1, crate::core::types::ImagePreference::Auto);
+                boundary.image_preferences[index] = *preference;
+            }
+            boundary.visual_context.push(note);
+        }
+    }
+    let mut rebuilt = Vec::with_capacity(lead + 1 + kept.len() + history.len() - cut);
+    rebuilt.extend_from_slice(&history[..lead]);
+    rebuilt.push(boundary);
+    rebuilt.extend(kept);
+    rebuilt.extend_from_slice(&history[cut..]);
     *history = rebuilt;
+    Ok(())
 }
 
 /// The touchpoints of the summarized block, as the first lines of the summary — the paths and
@@ -410,7 +541,12 @@ where
     // Single-turn shape (cut on an assistant step): the prompt is inside the summarized block —
     // it goes into the transcript so the summary knows the task, AND is re-seated verbatim.
     let keep_prompt = (history[cut].role == "assistant")
-        .then(|| older.iter().find(|m| m.role == "user").cloned())
+        .then(|| {
+            older
+                .iter()
+                .position(|m| m.role == "user")
+                .map(|index| lead + index)
+        })
         .flatten();
     // Harvest what the block touched BEFORE it collapses: once summarized the tool calls are gone.
     let tp = context_touchpoints(older);
@@ -421,7 +557,7 @@ where
     ];
     let summary = summarize(prompt)
         .await
-        .map_err(|e| anyhow!("summarization call failed: {e}"))?;
+        .context("summarization call failed")?;
     if summary.trim().is_empty() {
         anyhow::bail!("the model returned an empty summary");
     }
@@ -429,7 +565,7 @@ where
     // Do not graft volatile design evidence onto stable system lanes or ask the prose summary to
     // carry typed state. Keep the owning handle untouched; request projection re-seats its capsule.
     let _design_capsule = design.map(DesignContext::snapshot);
-    splice_compacted_keeping(history, cut, &summary, keep_prompt);
+    splice_compacted_keeping(history, cut, &summary, keep_prompt)?;
     Ok((before, approx_tokens(history)))
 }
 
@@ -443,6 +579,34 @@ mod tests {
     }
     fn asst(s: &str) -> Message {
         Message::assistant(s.to_string())
+    }
+
+    #[test]
+    fn transcript_omits_only_verified_memory_scaffolds_without_mutating_history() {
+        let prefix = "Recalled memory\n[m1] provider-only canary";
+        let original = format!("{prefix}\n\nactual request");
+        let mut marked = user(&original);
+        crate::core::memory_context::seal(&mut marked, prefix, "fixture", 1, "session", "turn");
+        let unmarked = "Recalled memory\n\nuser-authored heading";
+        let mut tampered = marked.clone();
+        tampered.content = Some(format!("{prefix}-edited\n\nkeep this"));
+        let history = vec![marked, user(unmarked), tampered];
+        let before: Vec<_> = history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect();
+        let transcript = render_transcript(&history);
+        assert!(transcript.starts_with("User: actual request\n"));
+        assert!(transcript.contains(unmarked));
+        assert!(transcript.contains(&format!("{prefix}-edited")));
+        assert_eq!(
+            before,
+            history
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(history[0].memory_scaffold.is_some());
     }
 
     #[tokio::test]
@@ -470,6 +634,200 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("<design")));
+    }
+
+    fn visual_message(dormant: bool) -> Message {
+        let url = crate::llm::media::tests::image(47).data_url();
+        let mut message = Message::user_with_images("same attachment", vec![url.clone()]);
+        message
+            .visual_context
+            .push(crate::core::visual_context::VisualNote {
+                id: format!("visual-fixture-{}", crate::core::persist::unique_sequence()),
+                image_index: 0,
+                tool_image: false,
+                source_sha256: crate::core::tool_media::sha256(url.as_bytes()),
+                note: "Red pixel; no unread text.".into(),
+                uncertainty: String::new(),
+                dormant,
+                pinned: false,
+                runtime_pinned: false,
+            });
+        message
+    }
+
+    #[test]
+    fn compaction_preserves_active_tool_groups_and_dormant_tool_originals() {
+        use crate::core::tool_media::{encode_rgba_png, ImageProvenance, ToolImage};
+        let mut provenance = ImageProvenance::new("browser_screenshot", None);
+        provenance.evidence_id = Some("compact-capture".into());
+        provenance.design_scope = Some("compact-scope".into());
+        provenance.approved_destination = Some("a".repeat(64));
+        let image = ToolImage::from_bytes(
+            &encode_rgba_png(&[3, 2, 1, 255], 1, 1).unwrap(),
+            "image/png",
+            provenance,
+        )
+        .unwrap();
+        let mut history = vec![
+            Message::system("SYS"),
+            user("inspect"),
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "capture".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "browser_screenshot".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            Message::tool_observation("capture", "captured", vec![image.clone()]),
+            user("continue"),
+        ];
+        let mut context = crate::core::visual_context::VisualContext::default();
+        context.refresh_scoped(&mut history, None, std::slice::from_ref(&image));
+        let id = history[3].visual_context[0].id.clone();
+        let mut active = history.clone();
+        splice_compacted(&mut active, 4, "summary").unwrap();
+        let groups = crate::llm::media::completed_tool_image_occurrences(&active);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(active[groups[0].message_index].tool_images[0], image);
+        let (_, receipt) = crate::llm::media::project_messages_for_send(
+            &history,
+            crate::llm::media::VisionPolicy::Supported,
+            Some(&"a".repeat(64)),
+            crate::llm::image_send::ImageSendPolicy::Original,
+        );
+        context.record_delivery(&receipt);
+        context
+            .mutate(
+                &id,
+                "release",
+                Some("One colored pixel, not acceptance evidence"),
+                None,
+                true,
+            )
+            .unwrap();
+        context.sync(&mut history);
+        splice_compacted(&mut history, 4, "summary").unwrap();
+        assert!(crate::llm::media::completed_tool_image_occurrences(&history).is_empty());
+        assert_eq!(history[1].tool_images, vec![image]);
+        assert_eq!(history[1].visual_context[0].id, id);
+        assert!(history[1].visual_context[0].releases_pixels());
+        let restored: Vec<Message> =
+            serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+        assert!(restored[1].visual_context[0].matches_message(&restored[1]));
+        assert!(crate::llm::media::project_messages_for_destination(
+            &restored,
+            crate::llm::media::VisionPolicy::Supported,
+            Some(&"a".repeat(64))
+        )
+        .messages
+        .iter()
+        .all(|message| message.images.is_empty()));
+    }
+
+    #[test]
+    fn compaction_keeps_active_pixels_and_retains_distinct_dormant_occurrences() {
+        let first = visual_message(true);
+        let second = visual_message(true);
+        let active = visual_message(false);
+        let ids = [
+            first.visual_context[0].id.clone(),
+            second.visual_context[0].id.clone(),
+        ];
+        let mut history = vec![
+            Message::system("SYS"),
+            first,
+            second,
+            active.clone(),
+            user("next"),
+        ];
+        splice_compacted(&mut history, 4, "summary").unwrap();
+        assert_eq!(history[1].images.len(), 2);
+        assert_eq!(
+            history[1]
+                .visual_context
+                .iter()
+                .map(|state| state.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(history[2].images, active.images);
+        let saved = serde_json::to_string(&history).unwrap();
+        let mut restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored[1].images.len(), 2);
+        splice_compacted(&mut restored, 3, "second summary").unwrap();
+        assert_eq!(restored[1].images.len(), 2);
+        assert_eq!(restored[1].visual_context[0].id, ids[0]);
+        let projected = crate::llm::media::project_messages(
+            &restored,
+            crate::llm::media::VisionPolicy::Supported,
+        );
+        assert!(projected.messages[1].images.is_empty());
+        assert_eq!(projected.messages[2].images, active.images);
+        assert!(!render_transcript(&restored).contains("base64,"));
+    }
+
+    #[test]
+    fn compact_transcript_shares_one_visual_budget_across_notes_and_legacy_images() {
+        use crate::core::visual_context::{MAX_DESCRIPTOR_CHARS, MAX_DESCRIPTOR_TOKENS};
+
+        let mut noted = (0..32)
+            .map(|_| {
+                let mut message = visual_message(true);
+                message.content = None;
+                message.visual_context[0].note = "ế".repeat(768);
+                message.visual_context[0].uncertainty = "漢".repeat(256);
+                message
+            })
+            .collect::<Vec<_>>();
+        let url = noted[0].images[0].clone();
+        let legacy = (0..128)
+            .map(|_| Message::user_with_images("", vec![url.clone()]))
+            .collect::<Vec<_>>();
+        for messages in [&noted, &legacy] {
+            let transcript = render_transcript(messages);
+            let descriptors = transcript
+                .lines()
+                .filter(|line| !line.starts_with("User:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(descriptors.chars().count() <= MAX_DESCRIPTOR_CHARS);
+            assert!(crate::core::tokens::estimate_str_ceil(&descriptors) <= MAX_DESCRIPTOR_TOKENS);
+            assert_eq!(
+                descriptors.matches("omitted by the context budget").count(),
+                1
+            );
+            assert!(!transcript.contains("base64,"));
+        }
+        noted.extend(legacy);
+        let transcript = render_transcript(&noted);
+        let descriptors = transcript
+            .lines()
+            .filter(|line| !line.starts_with("User:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(descriptors.chars().count() <= MAX_DESCRIPTOR_CHARS);
+        assert!(crate::core::tokens::estimate_str_ceil(&descriptors) <= MAX_DESCRIPTOR_TOKENS);
+        assert_eq!(
+            descriptors.matches("omitted by the context budget").count(),
+            1
+        );
+        assert!(descriptors.contains("untrusted"));
+        assert!(!transcript.contains("base64,"));
+    }
+
+    #[test]
+    fn compaction_quota_failure_is_atomic_and_never_drops_originals() {
+        let mut history = vec![Message::system("SYS")];
+        history.extend((0..=crate::core::visual_context::MAX_NOTES).map(|_| visual_message(true)));
+        let cut = history.len();
+        history.push(user("next"));
+        let before = serde_json::to_vec(&history).unwrap();
+        assert!(splice_compacted(&mut history, cut, "summary")
+            .unwrap_err()
+            .to_string()
+            .contains("quota"));
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
     }
 
     #[test]
@@ -521,7 +879,7 @@ mod tests {
             asst("a2"),
         ];
         let cut = 4; // index of u2
-        splice_compacted(&mut h, cut, "DENSE_SUMMARY");
+        splice_compacted(&mut h, cut, "DENSE_SUMMARY").unwrap();
         assert_eq!(
             h[0].content.as_deref(),
             Some("SYS"),
@@ -542,6 +900,51 @@ mod tests {
             !h[2..].iter().any(|m| m.role == "tool"),
             "no dangling tool result in the tail"
         );
+    }
+
+    #[test]
+    fn repeated_compaction_preserves_only_the_current_logical_user_root() {
+        let mut old = user("same request");
+        old.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
+        let old_id = old.user_turn_id.clone();
+        let mut current = user("same request");
+        current.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
+        let current_id = current.user_turn_id.clone();
+        let mut h = vec![
+            Message::system("SYS"),
+            old,
+            asst("old answer"),
+            current,
+            asst("working"),
+            user("synthetic continuation"),
+            asst("more work"),
+        ];
+        splice_compacted(&mut h, 5, "FIRST_SUMMARY").unwrap();
+        assert_eq!(
+            Message::logical_turn(&h).unwrap()[0].user_turn_id,
+            current_id
+        );
+        assert_eq!(h.iter().filter(|m| m.user_turn_id == current_id).count(), 1);
+        assert!(!h.iter().any(|m| m.user_turn_id == old_id));
+        let stored = crate::core::session_store::stored_history(&h).unwrap();
+        let mut h =
+            crate::core::session_store::parse_stored_history(&serde_json::to_vec(&stored).unwrap())
+                .unwrap();
+        h.push(user("another synthetic continuation"));
+        h.push(asst("finished"));
+        let cut = h.len() - 2;
+        splice_compacted(&mut h, cut, "SECOND_SUMMARY").unwrap();
+        let turn = Message::logical_turn(&h).unwrap();
+        assert_eq!(turn[0].content.as_deref(), Some("same request"));
+        assert_eq!(turn[0].user_turn_id, current_id);
+        assert_eq!(
+            turn[1].content.as_deref(),
+            Some("another synthetic continuation")
+        );
+        assert_eq!(h.iter().filter(|m| m.user_turn_id == current_id).count(), 1);
+        assert!(!serde_json::to_string(&h)
+            .unwrap()
+            .contains(current_id.as_ref().unwrap().as_str()));
     }
 
     #[tokio::test]
@@ -755,7 +1158,7 @@ mod tests {
         };
         let mut h = base();
         assert_eq!(compaction_count(&h), 0, "no boundary yet");
-        splice_compacted(&mut h, 3, "SUMMARY_1");
+        splice_compacted(&mut h, 3, "SUMMARY_1").unwrap();
         assert_eq!(compaction_count(&h), 1, "first compaction → #1");
         assert!(
             h[1].content
@@ -771,7 +1174,7 @@ mod tests {
         h.push(user("u5"));
         h.push(asst("a5"));
         let cut = plan_compact_cut(&h, 1).expect("compactable");
-        splice_compacted(&mut h, cut, "SUMMARY_2");
+        splice_compacted(&mut h, cut, "SUMMARY_2").unwrap();
         assert_eq!(
             compaction_count(&h),
             2,
@@ -839,6 +1242,26 @@ mod tests {
         // Malformed JSON arguments must not panic — they just yield nothing.
         let garbled = vec![tool_call("file_read", "not json{")];
         assert_eq!(context_touchpoints(&garbled), Touchpoints::default());
+    }
+
+    #[tokio::test]
+    async fn failed_summary_preserves_the_entire_live_history() {
+        let mut history = vec![
+            Message::system("SYS"),
+            user("old request"),
+            asst("old answer"),
+            user("continue"),
+            asst("tail"),
+        ];
+        let original = serde_json::to_value(&history).unwrap();
+        let result = compact_history(
+            &mut history,
+            |_| async { Err(anyhow!("upstream returned HTTP 401: fixture")) },
+            1,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(serde_json::to_value(history).unwrap(), original);
     }
 
     #[tokio::test]

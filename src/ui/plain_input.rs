@@ -16,12 +16,12 @@ use console::style;
 ///   already empty); **Ctrl-C/Ctrl-D** quit.
 /// - **Attach an image** (vision) two ways (Ctrl-V can't be used — Windows Terminal eats it):
 ///   **Ctrl-O** grabs a copied screenshot from the clipboard (Win+Shift+S), or **drag an image file
-///   onto the window** (the terminal pastes its path; the caller turns image-file paths on the line
-///   into attachments on Enter). An `[N img]` tag shows in the top border; **Ctrl-X** removes the
+///   onto the window** (the terminal pastes its path; Enter validates and attaches selected image
+///   files before consuming the draft). An `[N img]` tag shows in the top border; **Ctrl-X** removes the
 ///   most recent attachment (keeps your text).
 ///
-/// Returns `Some((line, images))` on Enter (`images` = `data:` URLs of clipboard attachments; the
-/// caller adds any file-path attachments), or `None` to quit (Esc-empty / Ctrl-C/D / EOF / non-TTY).
+/// Returns `Some((line, images))` on Enter after validating clipboard and file-path attachments,
+/// or `None` to quit (Esc-empty / Ctrl-C/D / EOF / non-TTY). Refused intake stays editable.
 /// The visible window scrolls horizontally so the cursor stays in view on long lines.
 pub(crate) fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<String>)>> {
     use console::{Key, Term};
@@ -126,6 +126,21 @@ pub(crate) fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<S
         match key {
             Key::Enter => {
                 let text: String = chars.iter().collect();
+                let (cleaned, from_line) =
+                    match image_input::prepare_image_attachments(&text, &images) {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            let message = format!("image refused: {error:#}; draft kept");
+                            redraw_top(&top_bar(&console::truncate_str(&message, W - 3, "…")));
+                            continue;
+                        }
+                    };
+                let submitted = if from_line.is_empty() {
+                    text.clone()
+                } else {
+                    cleaned
+                };
+                images.extend(from_line);
                 // Collapse the 3-line box into a single compact `> …` echo (nothing when empty), so
                 // the scrollback reads as a clean transcript instead of a stack of empty boxes — AND
                 // so the box's presence is the unambiguous "your turn to type" signal (no box +
@@ -152,16 +167,19 @@ pub(crate) fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<S
                     );
                 }
                 std::io::stdout().flush().ok();
-                return Ok(Some((text, images)));
+                return Ok(Some((submitted, images)));
             }
             Key::Char('\u{f}') => {
                 // Ctrl-O: grab a copied screenshot from the clipboard (Win+Shift+S / "Copy image").
                 // Explicit, so it works in Windows Terminal (which eats Ctrl-V but forwards Ctrl-O).
                 let tag = match image_input::clipboard_image_data_url() {
-                    Ok(Some(url)) => {
-                        images.push(url);
-                        count_tag(images.len())
-                    }
+                    Ok(Some(url)) => match image_input::append_clipboard_image(&mut images, url) {
+                        Ok(()) => count_tag(images.len()),
+                        Err(error) => {
+                            console::truncate_str(&format!("image refused: {error}"), W - 3, "…")
+                                .into_owned()
+                        }
+                    },
                     Ok(None) => "no image".to_string(),
                     Err(_) => "clip error".to_string(),
                 };

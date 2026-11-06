@@ -53,3 +53,8 @@ bench-tasks/*/repo/Cargo.lock
 # src/agent/hooks_executor_tests.rs); they are scratch output, never source.
 /hook-pre.txt
 /hook-post.txt
+
+# Disposable verification homes/artifacts and Python bytecode are not release source.
+/test-tmp/
+/scripts/__pycache__/
+/examples/*/target/

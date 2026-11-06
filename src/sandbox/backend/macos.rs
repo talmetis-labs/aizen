@@ -112,6 +112,7 @@ mod tests {
         let fs = FsPolicy {
             read_write: vec!["/ws/proj".into(), "/tmp/aizen-sbx-1".into()],
             read_only: vec![],
+            exec_files: vec![],
             deny: vec!["/Users/u/.ssh".into(), "/Users/u/.aws".into()],
         };
         let p = profile(&fs, true);

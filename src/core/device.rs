@@ -37,7 +37,7 @@
 //!
 //! The raw `MachineGuid` / `machine-id` / hardware UUID is **never** logged or
 //! displayed. Only the hash `dev-{hex8}` form appears in user-facing output.
-//! See [`id()`] for the format.
+//! See [`current()`] for the resolved identity.
 
 use crate::core::config;
 use anyhow::Result;
@@ -64,8 +64,6 @@ pub struct DeviceRecord {
 pub struct DeviceIdent {
     /// Stable id: `dev-{hex8(fnv1a64(raw_secret))}`.
     pub id: String,
-    /// Human-readable source description (e.g. `"windows-registry"`, `"machine-id"`, `"fallback"`).
-    pub source: String,
     /// Human-readable label for display (e.g. `"DESKTOP-ABC123"`).
     pub label: String,
     /// Device ids that are NOT current but whose tagged facts should still be readable.
@@ -308,7 +306,6 @@ fn resolve() -> DeviceIdent {
 
     DeviceIdent {
         id,
-        source: source_label.to_string(),
         label: hostname,
         also_read,
     }
@@ -333,17 +330,6 @@ fn hostname() -> Option<String> {
 /// The current device identity, computed once per process lifetime.
 pub fn current() -> &'static DeviceIdent {
     DEVICE.get_or_init(resolve)
-}
-
-/// Shortcut: the stable device id string (`dev-{hex8}`).
-pub fn id() -> &'static str {
-    &current().id
-}
-
-/// Device ids that are NOT the current identity but whose tagged facts should
-/// still be readable (historical ids from this machine).
-pub fn also_read() -> &'static [String] {
-    &current().also_read
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -374,19 +360,12 @@ mod tests {
                 ident.id
             );
         }
-        // Source should be one of the known values
-        assert!(
-            ["windows-registry", "machine-id", "ioreg-uuid", "fallback"]
-                .contains(&ident.source.as_str()),
-            "unexpected source: {}",
-            ident.source
-        );
     }
 
     #[test]
     fn current_returns_consistent_id() {
-        let a = id().to_string();
-        let b = id().to_string();
+        let a = current().id.clone();
+        let b = current().id.clone();
         assert_eq!(a, b, "id must be stable within a process");
     }
 

@@ -16,14 +16,6 @@
 //! The fix is the ORDER of operations, not the character set. Fold the accent off the letter FIRST,
 //! then decide where words end. This module owns that order so the surfaces cannot drift again.
 
-/// Cap on a slug's length in CHARACTERS.
-///
-/// Matches the 60 that `learning::secretary::fact_name` cuts display names to, so a learned fact's
-/// id is the whole of its name rather than a second, shorter guess at it. Folding to ASCII keeps
-/// chars and bytes equal, so this is also the byte length — comfortably inside the Windows 260
-/// limit even when the store path is nested.
-pub const MAX_ID_CHARS: usize = 60;
-
 /// Lowercase and strip diacritics, leaving the base letters joined to their word.
 ///
 /// 1. NFD-decompose: a precomposed `ế` splits into `e` plus two combining marks. `is_alphanumeric`
@@ -85,18 +77,6 @@ pub fn slug_words(text: &str, max_chars: usize) -> String {
         }
     }
     truncate_at_word(s.trim_matches('-'), max_chars)
-}
-
-/// Like [`slug_words`] but stops after `max_words` whole words — for stems that want a fixed number
-/// of words rather than a character budget.
-pub fn slug_first_words(text: &str, max_words: usize, max_chars: usize) -> String {
-    let full = slug_words(text, usize::MAX);
-    let head: Vec<&str> = full
-        .split('-')
-        .filter(|w| !w.is_empty())
-        .take(max_words)
-        .collect();
-    truncate_at_word(&head.join("-"), max_chars)
 }
 
 /// Vendor key prefixes, checked on the RAW token — stripping `-`/`_` first would erase the very
@@ -207,6 +187,8 @@ pub fn looks_like_credential(raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MAX_ID_CHARS: usize = 60;
 
     /// The defect this module exists to prevent: accented text cut into one-letter fragments.
     #[test]
@@ -324,17 +306,6 @@ mod tests {
     #[test]
     fn non_latin_collapses_without_eating_neighbours() {
         assert_eq!(slug_words("deploy 部署 pipeline", 60), "deploy-pipeline");
-    }
-
-    #[test]
-    fn first_words_takes_whole_words_only() {
-        assert_eq!(
-            slug_first_words("Người dùng giao tiếp bằng tiếng Việt", 3, MAX_ID_CHARS),
-            "nguoi-dung-giao"
-        );
-        // Fewer words available than asked for is not an error.
-        assert_eq!(slug_first_words("hai tu", 5, MAX_ID_CHARS), "hai-tu");
-        assert_eq!(slug_first_words("!!!", 5, MAX_ID_CHARS), "");
     }
 
     /// Credential shapes a derived filename must never carry.

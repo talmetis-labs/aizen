@@ -69,7 +69,8 @@ src/sandbox/
 
 Every model- or repository-influenced spawn goes through `runner::prepare_std` /
 `prepare_tokio`: `shell_run`, `process start`, the verify gate, LSP servers, MCP stdio servers,
-custom-command `` !`cmd` `` expansion, the REPL `!cmd` escape, and hosted-bot `/sh`. Call sites
+native Memory providers, custom-command `` !`cmd` `` expansion, the REPL `!cmd` escape, and hosted-bot
+`/sh`. Call sites
 choose a `CommandOrigin`; the model only ever supplies command strings. There is no
 `bypass_sandbox` flag, and `InternalTrusted` is constructible only from Aizen's own code with a
 literal reason recorded in the audit log.
@@ -89,8 +90,21 @@ device probe on macOS. None of them execute model-supplied strings.
 | `guarded` | software guards only: approval, `cmd_guard`, env scrubbing, private temp, timeouts, tree-kill, and the resource ceilings the OS offers. Reported as software, never as a kernel sandbox. |
 | `off` | the sandbox subsystem stands down: children inherit the full environment and no resource ceilings are applied. The `cmd_guard` hard floor, approval, process-tree containment, timeouts, and the audit log still apply. User-only — no model output can select it. |
 
-Set the mode with `--sandbox <mode>`, `AIZEN_SANDBOX=<mode>`, `/sandbox <mode>` in the REPL, or
-`"sandbox": { "mode": "…" }` in `~/.aizen/cli-config.json` (that order wins).
+Choose the overall level in **`/config` → Sandbox → Mode**, or persist it explicitly:
+
+```sh
+aizen config set --sandbox-mode auto     # default: strongest available with interactive fallback
+aizen config set --sandbox-mode strict   # kernel enforcement or refusal
+aizen config set --sandbox-mode guarded  # software guards only
+aizen config set --sandbox-mode off      # no isolation, env scrub or resource ceilings
+```
+
+The menu asks for confirmation before choosing `guarded`/`off` or relaxing `strict` to `auto`.
+After a successful save, an explicit mode selection also applies to future children in the current
+session (including replacing a current session override); it does not resandbox existing processes.
+A new invocation resolves `--sandbox <mode>` before `AIZEN_SANDBOX=<mode>`, persisted config, and
+finally `auto`. `/sandbox <mode>` changes the current session and saves the default as well.
+Network is a separate capability under **Sandbox → Child network**, not the sandbox level itself.
 
 ## Platform capability matrix
 
@@ -146,10 +160,18 @@ accepts verification or clears pending guards. Publication failures retain evide
 cleanup/retry. Safe terminal reconciliation, selective inverse and checkpoint/authorship linkage are
 unfinished. This does not change the process capability matrix or imply release/install verification.
 
-Live shell/build/process work stays an opaque exclusive barrier. In particular, Windows Job
-Objects provide containment and resource limits, **not filesystem/network isolation**; shell
-and build commands do not overlap live native editors. Copying the checkout or changing `cwd`
-does not prevent absolute-path access, inherited handles, daemon/cache access or IPC escapes.
+Foreground shell/build work stays an opaque exclusive barrier against scoped native editors.
+Managed background `process` commands instead retain a separate lifetime barrier, allowing ordinary
+sequential tools in the same authorized writer scope to continue while a dev server lives. This is
+an explicit compatibility exception, **not filesystem/build isolation**: a background command may
+write arbitrary reachable paths while those tools run. Scoped native work, speculative cohorts,
+coherent checkpoints, recovery/undo and certified verification remain excluded. Automatic coverage
+is deferred during that interval; no protected/verified claim is earned. Lost observer/tree proof
+blocks ordinary effects with typed uncertainty until actual tree and pipe settlement is proven.
+
+Windows Job Objects provide containment and resource limits, **not filesystem/network isolation**.
+Copying the checkout or changing `cwd` does not prevent absolute-path access, inherited handles,
+daemon/cache access or IPC escapes.
 The ordinary Linux profile retains local IPC and writable host caches; the ordinary macOS
 profile permits broad reads. Neither is an isolated-build profile.
 
@@ -197,9 +219,76 @@ directory, `core.fsmonitor=false`, an emptied `credential.helper`, and `GIT_TERM
 a checkout's `.git/hooks` never executes because Aizen made a checkpoint. Git aliases cannot
 shadow builtin commands, so aliased-command injection does not apply to internal plumbing.
 
+## Native Memory provider policy
+
+Memory plugins are potentially untrusted native executables, not ordinary workspace build tools.
+Installation, eligibility and explicit executable consent are separate; none of them alone starts a
+provider. Disabled or unselected Memory starts no provider. Package integrity pins do not establish
+publisher trust. The selected executable launches through `runner::prepare_tokio` and contained spawn,
+not a shell or a PATH lookup. Full package/protocol details: [Memory plugins](MEMORY_PLUGINS.md).
+
+The request carries a **restrictive override**, not the generic workspace-write profile below:
+
+- Read-only package root; read-write provider data and one private transaction temp directory.
+  Fixed platform runtime/library reads are included. No ambient workspace, toolchain/build-cache or
+  extra user-configured writable roots are inherited. The policy can represent explicit local-model
+  read roots, but the current runtime supplies no additional model roots.
+- A strict environment allowlist of host-generated paths/platform constants: synthetic HOME and
+  USERPROFILE, temp/config/cache paths beneath the private root, fixed locale and required Windows
+  platform directory values. No inherited PATH, `sandbox.pass_env`, API keys, full Core config,
+  proxy credentials or toolchain homes. Explicit bounded identity/context is sent in the protocol.
+- Network requires **all three**: package declaration, saved manifest-bound executable network grant,
+  and global child-network `allow`. Global allow is not a plugin grant; global deny is not overridden
+  by the saved plugin grant. These are policy checks, not network enforcement on guarded backends.
+- Sandbox `off` is refused for these requests. Strict still refuses unsupported kernel confinement.
+  An `auto` backend with partial filesystem/network enforcement is refused rather than silently
+  claiming the restrictive roots are enforced. A guarded fallback additionally needs saved informed
+  consent for the package; ordinary unattended fallback policy still applies.
+
+**Windows guarded is not filesystem/network isolation.** Job Objects/resource limits and environment
+controls do not stop a malicious provider reading/writing files or networking as the current user.
+`--allow-guarded` acknowledges that limitation, not a secret-safe sandbox guarantee. Linux/macOS
+provider runtime behavior has not been locally verified; the generic matrix is not a passing plugin
+test on those platforms.
+
+All provider calls, including searches that may reinforce/cache, use serial opaque admission. A
+bounded actor owns one transaction-lifetime process: initialize → one operation → shutdown/drain.
+Capacity, exclusive sidecar admission, workspace/physical ownership and activation generation remain
+held through process-tree exit and pipe settlement. A reply, timeout, requested kill or dropped future
+is not settlement proof. Uncertain cleanup retains a physical recovery barrier; switching/disabling
+must not silently redirect queued work or release it. Optional context failures may continue without
+Memory only when physically settled. Learning receipts/outbox inventory are independent of this
+barrier and cannot clear it. See [current verification](MNEMOS_VERIFICATION.md) for actual Windows
+coverage and unverified crash/platform cases.
+
+### Explicit legacy adoption
+
+The `legacy_adoption_v1` and `legacy_adoption_v2` declarations advertise versioned offline migration
+facilities, not ordinary provider-context grants. A human-reviewed adoption invocation still requires the selected, enabled,
+pinned package and executable consent. It has no network or host-model grant even when broader
+permissions were saved for ordinary Memory work.
+
+Adoption uses a dedicated restrictive path policy: package, explicitly selected source and immutable
+plan are read-only; only one new operation envelope and private temp are writable. It never receives
+write access to the old store, current provider store, HOME, the chosen external parent or the whole
+managed namespace. The destination and journal are fresh siblings inside the envelope. Host plans,
+operation records and published-root registration are kept separately from provider-writable data.
+Normal calls after an explicit storage switch receive only the registered data leaf, not its backup.
+V2 preview receives an exact host-authored attachment authorization file through the existing read-only
+plan slot, outside its writable envelope. It does not gain write access to host records or broader
+filesystem roots. Streaming backup bounds do not enlarge IPC or process deadlines. Reports are accepted
+only after zero exit and proven tree/pipe settlement; raw stderr never supplies a public diagnostic.
+
+Offline status does not execute a provider. An interrupted import with confirmed physical settlement
+may be resumed explicitly; an unresolved process tree remains a recovery barrier. Adoption recovery
+cannot bypass an unrelated provider transaction marker. Source drift, missing receipts and unknown
+settlement are not interpreted as success or permission to replay. The Windows guarded limitations
+above apply unchanged to adoption. See [the migration workflow](MEMORY_PLUGINS.md#transferring-legacy-aizen-memory).
+
 ## Environment isolation
 
-Children never inherit Aizen's environment wholesale. The scrub drops, case-insensitively:
+For ordinary sandboxed children, the scrub drops, case-insensitively (native Memory providers use
+the stricter allowlist above; ordinary `off` mode bypasses the scrub):
 
 - any name containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH`;
 - everything under the `AWS_*` and `AIZEN_*` prefixes (`SSH_AUTH_SOCK` falls to the `AUTH` rule).
@@ -222,6 +311,21 @@ Default: **deny**. `shell_run` and `process start` accept `network: true|false` 
 `false`); requesting it is a capability escalation — it always surfaces in the approval flow,
 `smart` never auto-clears a command that asked for network, and `/yolo` (which only skips
 prompts) still gets the caution line printed.
+
+Change the child-network default in **`/config` → Sandbox → Child network** (also available through
+`aizen config`), or explicitly persist it from the CLI:
+
+```sh
+aizen config set --sandbox-network deny   # default: per-command network:true grants
+aizen config set --sandbox-network allow  # broader ordinary-child default; not a Memory plugin grant
+```
+
+`allow` does not approve the command itself or disable the sandbox/hard command guard. The menu
+requires confirmation before widening the default. Changes apply to newly started children, not
+already running servers. Port binding for a dev server also needs network capability. This setting
+does not control Aizen's own provider/API or web-search connections. `deny` is not a non-overridable
+ban: an approved `network:true` command may still use the network. Kernel deny also requires a
+supporting backend in `auto`/`strict`; `guarded` and `off` do not enforce network isolation.
 
 - Linux: enforced by seccomp — `socket(AF_INET/AF_INET6)` returns `EACCES`; UNIX sockets stay
   usable so local IPC and build tooling keep working. A denied `cargo build` that needs to

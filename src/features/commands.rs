@@ -28,7 +28,7 @@
 //! - `` !`cmd` `` → run a **read-only** shell command and splice its output (gated by the same
 //!   `cmd_guard` floor as the agent; non-read-only / blocked commands are refused, never run).
 
-use crate::memory::frontmatter;
+use crate::core::frontmatter;
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;

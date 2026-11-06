@@ -1030,12 +1030,14 @@ pub(super) fn draw_footer(
     let right_plain: String = right_spans.iter().map(|s| s.content.as_ref()).collect();
     let right_w = console::measure_text_width(&right_plain);
     let left_budget = width.saturating_sub(right_w + 1);
-    let left = clip_to(&state.input.status, left_budget);
-    let gap = width.saturating_sub(console::measure_text_width(&left) + right_w);
-    let mut hud_spans = vec![
-        Span::styled(left, Style::default().fg(Color::DarkGray)),
-        Span::raw(" ".repeat(gap)),
-    ];
+    let left = clip_keep_sgr(&state.input.status, left_budget);
+    let mut hud_spans = ansi_spans(&left, Style::default().fg(Color::DarkGray));
+    let left_w: usize = hud_spans
+        .iter()
+        .map(|span| crate::ui::links::display_width(&span.content))
+        .sum();
+    let gap = width.saturating_sub(left_w + right_w);
+    hud_spans.push(Span::raw(" ".repeat(gap)));
     hud_spans.extend(right_spans);
     frame.render_widget(Paragraph::new(Line::from(hud_spans)), rows[0]);
     // Framing rules. When the draft is taller than the box, the rule on that side carries the count

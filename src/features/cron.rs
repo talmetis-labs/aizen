@@ -102,7 +102,7 @@ fn add(name: &str, schedule: &str, task: &str) -> Result<()> {
         task: task.to_string(),
         model: cfg.model.clone(),
         base_url: cfg.base_url.clone(),
-        created: crate::memory::learning::default_session_id(),
+        created: chrono::Local::now().format("%Y%m%dT%H%M%S").to_string(),
     };
     // E5.4 (quality plan S7): the spec is on disk, atomically, BEFORE the OS entry exists. A
     // scheduler that fires between the two steps finds a job to run, and a failure between them
@@ -192,7 +192,7 @@ async fn run(name: &str) -> Result<()> {
     )
     .await;
 
-    let stamp = crate::memory::learning::default_session_id();
+    let stamp = chrono::Local::now().format("%Y%m%dT%H%M%S").to_string();
     let entry = match &result {
         Ok(out) => format!("\n===== {stamp} =====\n{out}\n"),
         Err(e) => format!("\n===== {stamp} (ERROR) =====\n{e}\n"),

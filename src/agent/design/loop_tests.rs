@@ -221,7 +221,6 @@ async fn current_reference_child_wire_receipt_requires_exact_scoped_repair() {
     };
     parent_design.apply_brief(brief, false).unwrap();
     let mut source_cfg = CliConfig::default();
-    cli_config::set_vision_support_in(&mut source_cfg, &base, MODEL, Some(true)).unwrap();
     let endpoint = ResolvedEndpoint {
         base_url: base.clone(),
         api_key: KEY.into(),

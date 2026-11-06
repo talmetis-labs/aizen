@@ -18,8 +18,8 @@ use crate::agent::search::decode_text;
 use crate::agent::tools::Tool;
 use crate::core::repo_lock::RepoTxnLock;
 use crate::core::{config, persist};
-use crate::memory::score::Bm25Index;
-use crate::memory::tokenize::tokenize;
+use crate::retrieval::score::Bm25Index;
+use crate::retrieval::tokenize::tokenize;
 use anyhow::{anyhow, Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use once_cell::sync::Lazy;
@@ -1765,17 +1765,29 @@ fn fuse_dense<'a>(
     if top_cov >= code_dense_gate_coverage() {
         return scored;
     }
-    let embedder = crate::memory::embed::default_dense_embedder();
-    // Separate cache namespace so code-chunk vectors never collide with memory-fact vectors even
-    // though both are content-hash keyed under the same embedder id.
-    let mut cache = crate::memory::embed::EmbeddingCache::load(&format!("code-{}", embedder.id()));
+    let paths = crate::retrieval::embed::DiscoveryPaths {
+        preferred_name: config::embed_model_name(),
+        models_dir: config::models_dir(),
+        hf_roots: crate::retrieval::embed::host_hf_roots(),
+    };
+    let embedder =
+        crate::retrieval::embed::default_dense_embedder(&paths, crate::ui::tui::note_line);
+    // Preserve Core's existing code-* cache location; explicit legacy adoption excludes these files.
+    let cache_dir = config::embed_cache_dir();
+    let mut cache = crate::retrieval::embed::EmbeddingCache::load(
+        &cache_dir,
+        &format!("code-{}", embedder.id()),
+    );
     let qv = embedder.embed(query);
     let lexical: Vec<String> = scored.iter().map(|h| h.chunk.id.clone()).collect();
     let mut dense: Vec<(String, f32)> = scored
         .iter()
         .map(|h| {
             let cv = cache.get_or_compute(&h.chunk.content, embedder.as_ref());
-            (h.chunk.id.clone(), crate::memory::embed::cosine(&qv, &cv))
+            (
+                h.chunk.id.clone(),
+                crate::retrieval::embed::cosine(&qv, &cv),
+            )
         })
         .filter(|(_, s)| *s > 0.0)
         .collect();
@@ -1786,7 +1798,7 @@ fn fuse_dense<'a>(
             .then(a.0.cmp(&b.0))
     });
     let dense_ids: Vec<String> = dense.into_iter().map(|(id, _)| id).collect();
-    let fused = crate::memory::fuse::rrf(&[lexical, dense_ids], 10.0);
+    let fused = crate::retrieval::fuse::rrf(&[lexical, dense_ids], 10.0);
     let rank: HashMap<&str, usize> = fused
         .iter()
         .enumerate()

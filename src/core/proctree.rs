@@ -69,13 +69,19 @@ impl Containment {
         !matches!(self, Self::None)
     }
 
-    /// Read-only proof that every contained process has exited. A Unix process group cannot prove
-    /// that detached descendants are gone, and absent containment is likewise unknown. Callers must
+    /// Read-only proof that the containment we created holds no live process. A Windows job object
+    /// accounts for every descendant; a Unix process group is the containment boundary we actually
+    /// establish (`setsid` at spawn), so an empty group is the strongest proof available there. A
+    /// descendant that deliberately leaves that group is outside the containment boundary — no
+    /// portable mechanism observes it — and absent containment is likewise unknown. Callers must
     /// retain physical-effect ownership for `None` or errors rather than trusting wrapper exit.
     pub(crate) fn known_quiescent(&self) -> std::io::Result<Option<bool>> {
         match self {
             #[cfg(windows)]
             Self::Job(job) => job.known_quiescent(),
+            #[cfg(unix)]
+            Self::Group(pgid) if *pgid > 0 => Ok(Some(group_is_empty(*pgid))),
+            // A non-positive group id cannot be one we created; never signal the caller's own group.
             #[cfg(unix)]
             Self::Group(_) => Ok(None),
             Self::None => Ok(None),
@@ -91,11 +97,11 @@ pub fn prepare(cmd: &mut Command) {
         use std::os::unix::process::CommandExt;
         // SAFETY: `setsid` is async-signal-safe and is the documented way to detach a child into a
         // new session/group from the post-fork, pre-exec hook. It touches no allocator or lock.
+        // A failure fails the spawn: without a group of its own, `Containment::Group(child.id())`
+        // would name a group that does not exist, and settlement would read as proven while the
+        // child still runs.
         unsafe {
-            cmd.pre_exec(|| {
-                libc_setsid();
-                Ok(())
-            });
+            cmd.pre_exec(libc_setsid);
         }
     }
     #[cfg(windows)]
@@ -337,11 +343,47 @@ impl std::error::Error for BoundedExecutionError {
 
 pub(crate) type BoundedOwner = Box<dyn Send + Sync + 'static>;
 static BOUNDED_QUARANTINE: std::sync::Mutex<Vec<BoundedOwner>> = std::sync::Mutex::new(Vec::new());
+#[cfg(not(test))]
 static BOUNDED_UNKNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// In tests one process hosts many independent fixtures. A body that cannot prove settlement
+/// belongs to the fixture that spawned it, so the latch is kept per lock namespace — the same rule
+/// the lock registries follow. Otherwise one fixture's unprovable body makes every later test in
+/// the run refuse to start work ("tool effects are not settled"), which is cross-test interference,
+/// not the fail-closed behavior the latch exists for.
+#[cfg(test)]
+static BOUNDED_UNKNOWN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn bounded_unknown_latched() -> bool {
+    #[cfg(not(test))]
+    {
+        BOUNDED_UNKNOWN.load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(test)]
+    {
+        let namespace = crate::core::workspace_txn::test_namespace_key();
+        BOUNDED_UNKNOWN
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|latched| latched.contains(&namespace))
+    }
+}
+
+fn latch_bounded_unknown_now() {
+    #[cfg(not(test))]
+    BOUNDED_UNKNOWN.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    BOUNDED_UNKNOWN
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(crate::core::workspace_txn::test_namespace_key());
+}
 
 /// Only strict bounded bodies latch this; legacy serial UNKNOWN results never block new work.
 pub(crate) fn check_bounded_effects() -> Result<(), BoundedExecutionError> {
-    if BOUNDED_UNKNOWN.load(std::sync::atomic::Ordering::Acquire) {
+    if bounded_unknown_latched() {
         Err(BoundedExecutionError {
             cause: std::io::Error::other(
                 "a bounded child has unverified physical effects until CLI exit",
@@ -355,7 +397,7 @@ pub(crate) fn check_bounded_effects() -> Result<(), BoundedExecutionError> {
 
 pub(crate) fn latch_bounded_unknown(strict: bool) {
     if strict {
-        BOUNDED_UNKNOWN.store(true, std::sync::atomic::Ordering::Release);
+        latch_bounded_unknown_now();
         crate::core::recovery::mark_effects_unsettled();
     }
 }
@@ -822,11 +864,10 @@ pub fn prepare_tokio(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     {
         // SAFETY: as `prepare` — `setsid` is async-signal-safe and touches no allocator or lock.
+        // A failed `setsid` fails the spawn rather than leaving an uncontained child that would
+        // later read as settled.
         unsafe {
-            cmd.pre_exec(|| {
-                libc_setsid();
-                Ok(())
-            });
+            cmd.pre_exec(libc_setsid);
         }
     }
     #[cfg(windows)]
@@ -868,13 +909,30 @@ extern "C" {
     fn c_killpg(pgrp: i32, sig: i32) -> i32;
 }
 
+/// `ESRCH` is 3 on both Linux and Darwin. A process group we created with `setsid` reports it once
+/// its last member is gone; `EPERM` (or any other failure) means "may still exist" and keeps
+/// ownership charged.
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+/// Is the process group we created empty? Signal 0 performs only the existence/permission check.
+#[cfg(unix)]
+fn group_is_empty(pgid: i32) -> bool {
+    // SAFETY: signal 0 sends nothing; the only effect is the kernel's group lookup.
+    let result = unsafe { c_killpg(pgid, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH)
+}
+
 // Thin wrappers so the `unsafe` call sites above read as one operation each. Declared rather than
 // pulled from `libc`: these two symbols are all we need, and the crate is not in the dependency
 // tree (single static binary posture — see Cargo.toml).
 #[cfg(unix)]
-fn libc_setsid() {
-    // SAFETY: no arguments, no memory touched; a failure (already a leader) is ignored by design.
-    unsafe { c_setsid() };
+fn libc_setsid() -> std::io::Result<()> {
+    // SAFETY: no arguments, no memory touched.
+    if unsafe { c_setsid() } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1564,8 +1622,34 @@ mod tests {
     #[test]
     fn missing_containment_never_proves_physical_settlement() {
         assert_eq!(Containment::None.known_quiescent().unwrap(), None);
+        // A group id we could not have created must never be signalled.
         #[cfg(unix)]
         assert_eq!(Containment::Group(0).known_quiescent().unwrap(), None);
+    }
+
+    /// The Unix counterpart of the Job Object proof: settlement is reported only once the group we
+    /// created is empty, never on wrapper exit alone. Before this, every Unix strict body reported
+    /// UNKNOWN forever, so hooks discarded their verdicts and process fixtures aborted at teardown.
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_proves_settlement_only_after_its_members_exit() {
+        let mut cmd = shell("sleep 5");
+        prepare(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn shell");
+        let containment = contain(&child);
+        assert!(
+            matches!(containment.known_quiescent().unwrap(), Some(false)),
+            "a live group must not read as settled: {containment:?}"
+        );
+        kill_tree(&mut child, &containment);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while containment.known_quiescent().unwrap() != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed group never settled: {containment:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The shell wrapper Aizen actually uses, so the test exercises the real spawn shape.

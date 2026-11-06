@@ -21,8 +21,11 @@
 //! stream of episodes → periodic reflection into higher-level insights). Self-memory lives in a
 //! sibling `~/.aizen/personas/<slug>.self/` directory, so each character grows independently.
 
+#[cfg(test)]
+mod identity_contract;
 pub mod migrate_stems;
 pub mod reflect;
+pub(crate) mod secretary;
 pub mod self_mem;
 
 /// The persona gate (E4.7, quality plan M11): the costume, the character's self-memory and the
@@ -55,8 +58,8 @@ impl Drop for SuppressGuard {
 pub mod soul;
 
 use crate::core::config::aizen_home;
-use crate::memory::frontmatter;
-use crate::memory::learning::sanitize_facts::threat_scan;
+use crate::core::frontmatter;
+use crate::core::prompt_safety::threat_scan;
 use crate::skills::sanitize_name; // shared slug rule
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
@@ -212,7 +215,7 @@ pub fn save(name: &str, role: &str, voice: &str, body: &str) -> Result<PathBuf> 
         if std::fs::create_dir_all(&adir).is_ok() {
             // `unique_in` suffixes on collision, so each successive overwrite keeps its own copy
             // instead of the newest one flattening the history.
-            let dest = crate::memory::bloat::caps::unique_in(&adir, &sanitize_name(name));
+            let dest = crate::core::archive_path::unique_in(&adir, &sanitize_name(name));
             let _ = std::fs::rename(&path, &dest);
         }
     }
@@ -259,7 +262,7 @@ pub fn delete(name: &str) -> Result<bool> {
     let removed_card = if p.exists() {
         let adir = archive_dir();
         if std::fs::create_dir_all(&adir).is_ok() {
-            let dest = crate::memory::bloat::caps::unique_in(&adir, &slug);
+            let dest = crate::core::archive_path::unique_in(&adir, &slug);
             let _ = std::fs::rename(&p, &dest);
         }
         // Fall back to a plain remove only if archiving could not take the file.

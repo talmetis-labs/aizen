@@ -148,6 +148,61 @@ pub struct PromptTokensDetails {
     pub cached_tokens: Option<u64>,
 }
 
+/// Controller-selected transport preference, never image access or a retention pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePreference {
+    /// Preserve unknown/text/UI content; use an explicit ROI when detail is needed.
+    Auto,
+    Original,
+    /// Explicitly compressible photographic content; never overrides exact/grant restrictions.
+    Photo,
+}
+
+/// Host-minted logical user-turn identity. Only explicit storage adapters restore it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserTurnId(String);
+
+impl UserTurnId {
+    pub(crate) fn new() -> anyhow::Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("system RNG unavailable: {error}"))?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let mut id = String::with_capacity(36);
+        for (index, byte) in bytes.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                id.push('-');
+            }
+            id.push_str(&format!("{byte:02x}"));
+        }
+        Ok(Self(id))
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 36
+            || !bytes.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+                }
+            })
+            || bytes[14] != b'4'
+            || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        {
+            return None;
+        }
+        Some(Self(value.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A chat message. Carries optional `tool_calls` (assistant turn) and `tool_call_id`
 /// (tool-result turn) so one Vec<Message> models the whole tool-calling history.
 ///
@@ -172,6 +227,14 @@ pub struct Message {
     /// Storage-only tool observations. Actual request builders clear these and project validated
     /// images into a synthetic user turn AFTER the entire matching tool-result group.
     pub tool_images: Vec<crate::core::tool_media::ToolImage>,
+    /// Storage-only per-occurrence visual notes. Request projection clears this metadata.
+    pub visual_context: Vec<crate::core::visual_context::VisualNote>,
+    /// Storage-only preferences aligned with attachment indices. Missing entries inherit config.
+    pub image_preferences: Vec<ImagePreference>,
+    /// Storage-only identity of the canonical host-seated user occurrence, never model metadata.
+    pub(crate) user_turn_id: Option<UserTurnId>,
+    /// Storage-only proof of a host-inserted Memory prefix; never read or emitted by generic serde.
+    pub(crate) memory_scaffold: Option<crate::core::memory_context::RecallScaffold>,
     /// Anthropic prompt-cache breakpoint, set on a stable message just before the volatile turn so
     /// the provider caches the prefix up to here. Write-only: emitted by the custom `Serialize`,
     /// never read from the wire (a stale breakpoint from a saved transcript must not be replayed).
@@ -240,7 +303,8 @@ struct ImageUrlPart {
 
 /// Mirror of the deserialized field set. `images`/`cache_control` are deliberately absent: images
 /// arrive inside `content` parts (see [`ContentField`]), and a cache breakpoint is per-request state
-/// that must be recomputed, never replayed from disk.
+/// that must be recomputed, never replayed from disk. `user_turn_id` and `memory_scaffold` are also
+/// deliberately absent: only explicit session-storage adapters may restore host-owned metadata.
 #[derive(Deserialize)]
 struct MessageWire {
     role: String,
@@ -252,6 +316,18 @@ struct MessageWire {
     tool_call_id: Option<String>,
     #[serde(default)]
     tool_images: Vec<crate::core::tool_media::ToolImage>,
+    #[serde(default)]
+    visual_context: Vec<crate::core::visual_context::VisualNote>,
+    #[serde(default)]
+    image_preferences: Vec<ImagePreference>,
+    #[serde(default)]
+    visual_assets: Option<VisualAssets>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VisualAssets {
+    version: u8,
+    images: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -261,7 +337,7 @@ impl<'de> Deserialize<'de> for Message {
         // text in `content`, image data URLs in `images`. Keeping images OUT of `content` is load
         // bearing — the `chars/4` token HUD and auto-compact measure `content` only, so folding a
         // multi-MB base64 URL into it would blow up both (see the struct doc above).
-        let (content, images) = match wire.content {
+        let (content, mut images) = match wire.content {
             None => (None, Vec::new()),
             Some(ContentField::Text(s)) => (Some(s), Vec::new()),
             Some(ContentField::Parts(parts)) => {
@@ -284,13 +360,26 @@ impl<'de> Deserialize<'de> for Message {
                 (Some(text), images)
             }
         };
+        if wire.role != "user" {
+            if let Some(assets) = wire.visual_assets.filter(|assets| assets.version == 1) {
+                images = assets.images;
+            }
+        }
         Ok(Message {
             role: wire.role,
             content,
             tool_calls: wire.tool_calls,
             tool_call_id: wire.tool_call_id,
-            images,
             tool_images: wire.tool_images,
+            visual_context: wire.visual_context,
+            image_preferences: wire
+                .image_preferences
+                .into_iter()
+                .take(images.len())
+                .collect(),
+            images,
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         })
     }
@@ -304,14 +393,26 @@ impl Serialize for Message {
         let mut map = ser.serialize_map(None)?;
         map.serialize_entry("role", &self.role)?;
         if self.role == "user" && !self.images.is_empty() {
-            let mut parts: Vec<serde_json::Value> = Vec::with_capacity(self.images.len() + 1);
-            if let Some(text) = &self.content {
-                if !text.is_empty() {
-                    parts.push(serde_json::json!({"type": "text", "text": text}));
-                }
+            #[derive(Serialize)]
+            #[serde(tag = "type")]
+            enum Part<'a> {
+                #[serde(rename = "text")]
+                Text { text: &'a str },
+                #[serde(rename = "image_url")]
+                Image { image_url: Url<'a> },
+            }
+            #[derive(Serialize)]
+            struct Url<'a> {
+                url: &'a str,
+            }
+            let mut parts = Vec::with_capacity(self.images.len() + 1);
+            if let Some(text) = self.content.as_deref().filter(|text| !text.is_empty()) {
+                parts.push(Part::Text { text });
             }
             for url in &self.images {
-                parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+                parts.push(Part::Image {
+                    image_url: Url { url },
+                });
             }
             map.serialize_entry("content", &parts)?;
         } else {
@@ -327,6 +428,26 @@ impl Serialize for Message {
         if !self.tool_images.is_empty() {
             map.serialize_entry("tool_images", &self.tool_images)?;
         }
+        if !self.image_preferences.is_empty() {
+            map.serialize_entry("image_preferences", &self.image_preferences)?;
+        }
+        if !self.visual_context.is_empty() {
+            map.serialize_entry("visual_context", &self.visual_context)?;
+            if self.role != "user" && !self.images.is_empty() {
+                #[derive(Serialize)]
+                struct Assets<'a> {
+                    version: u8,
+                    images: &'a [String],
+                }
+                map.serialize_entry(
+                    "visual_assets",
+                    &Assets {
+                        version: 1,
+                        images: &self.images,
+                    },
+                )?;
+            }
+        }
         // Prompt-cache breakpoint (omitted entirely when None → byte-identical for non-cache providers).
         if let Some(cc) = &self.cache_control {
             map.serialize_entry("cache_control", cc)?;
@@ -336,6 +457,15 @@ impl Serialize for Message {
 }
 
 impl Message {
+    /// The newest canonical user turn, including synthetic user-role continuations after its root.
+    /// Unstamped legacy messages are not evidence of a logical user boundary.
+    pub(crate) fn logical_turn(history: &[Self]) -> Option<&[Self]> {
+        history
+            .iter()
+            .rposition(|message| message.role == "user" && message.user_turn_id.is_some())
+            .map(|index| &history[index..])
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
@@ -344,6 +474,10 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
@@ -355,6 +489,10 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
@@ -367,6 +505,10 @@ impl Message {
             tool_call_id: None,
             images,
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
@@ -379,6 +521,10 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
@@ -394,6 +540,10 @@ impl Message {
             tool_call_id: None,
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
@@ -417,6 +567,10 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
@@ -704,6 +858,67 @@ pub struct FunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_user_turn_ids_distinguish_occurrences_and_survive_clone() {
+        let mut first = Message::user("same request");
+        first.user_turn_id = Some(UserTurnId::new().unwrap());
+        let mut second = Message::user("same request");
+        second.user_turn_id = Some(UserTurnId::new().unwrap());
+        assert_ne!(first.user_turn_id, second.user_turn_id);
+        assert_eq!(first.user_turn_id, first.clone().user_turn_id);
+        let id = first.user_turn_id.as_ref().unwrap();
+        assert_eq!(UserTurnId::parse(id.as_str()).as_ref(), Some(id));
+        for invalid in [
+            "",
+            "00000000-0000-0000-0000-000000000000",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "00000000-0000-4000-c000-000000000000",
+            "00000000000040008000000000000000",
+        ] {
+            assert!(UserTurnId::parse(invalid).is_none());
+        }
+        let mut nonuser = Message::assistant("not a user boundary");
+        nonuser.user_turn_id = first.user_turn_id.clone();
+        let history = [
+            first,
+            second,
+            Message::user("synthetic continuation"),
+            nonuser,
+        ];
+        let turn = Message::logical_turn(&history).unwrap();
+        assert_eq!(turn.len(), 3);
+        assert_eq!(turn[0].user_turn_id, history[1].user_turn_id);
+        assert!(Message::logical_turn(&[Message::user("legacy")]).is_none());
+        assert!(Message::logical_turn(&[]).is_none());
+    }
+
+    #[test]
+    fn user_turn_identity_is_neither_emitted_nor_accepted_by_generic_serde() {
+        let mut message = Message::user("request");
+        message.user_turn_id = Some(UserTurnId::new().unwrap());
+        let id = message.user_turn_id.as_ref().unwrap().as_str();
+        let mut wire = serde_json::to_value(&message).unwrap();
+        assert!(wire.get("aizen_user_turn_id").is_none());
+        assert!(wire.get("user_turn_id").is_none());
+        assert!(!serde_json::to_string(&message).unwrap().contains(id));
+        wire["aizen_user_turn_id"] = serde_json::json!(id);
+        wire["user_turn_id"] = serde_json::json!(id);
+        let restored: Message = serde_json::from_value(wire).unwrap();
+        assert!(restored.user_turn_id.is_none());
+        assert_eq!(restored.content.as_deref(), Some("request"));
+        assert!(Message::user_with_images("", Vec::new())
+            .user_turn_id
+            .is_none());
+        assert!(Message::system("system").user_turn_id.is_none());
+        assert!(Message::assistant("assistant").user_turn_id.is_none());
+        assert!(Message::assistant_tool_calls(Vec::new())
+            .user_turn_id
+            .is_none());
+        assert!(Message::tool_result("call", "result")
+            .user_turn_id
+            .is_none());
+    }
 
     #[test]
     fn parses_tool_call_response() {
@@ -1025,6 +1240,36 @@ mod tests {
         assert_eq!(back.role, "user");
         assert_eq!(back.content.as_deref(), Some("what is in this screenshot?"));
         assert_eq!(back.images, original.images);
+    }
+
+    #[test]
+    fn generic_message_serde_ignores_recall_receipts_and_never_emits_them() {
+        let prefix = "Recalled memory wire-only fixture";
+        let text = format!("{prefix}\n\nkeep my request");
+        let mut original =
+            Message::user_with_images(text.clone(), vec!["data:image/png;base64,AAAA".into()]);
+        crate::core::memory_context::seal(&mut original, prefix, "fixture", 7, "session", "turn");
+        let receipt = serde_json::to_value(original.memory_scaffold.as_ref().unwrap()).unwrap();
+        let wire = serde_json::to_value(&original).unwrap();
+        assert!(wire.get("memory_scaffold").is_none());
+        for receipt in [
+            receipt,
+            serde_json::json!({"version":"malformed", "prefix_bytes":false}),
+            serde_json::json!(["not", "a", "receipt"]),
+            serde_json::Value::Null,
+        ] {
+            let mut injected = wire.clone();
+            injected["memory_scaffold"] = receipt;
+            let mut back: Message = serde_json::from_value(injected).unwrap();
+            assert!(back.memory_scaffold.is_none());
+            assert_eq!(back.images, original.images);
+            crate::core::memory_context::strip_message(&mut back);
+            assert_eq!(back.content.as_deref(), Some(text.as_str()));
+            assert!(serde_json::to_value(&back)
+                .unwrap()
+                .get("memory_scaffold")
+                .is_none());
+        }
     }
 
     /// The image-only case: no text part is emitted at all, so the array is images end to end.

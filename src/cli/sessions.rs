@@ -106,13 +106,17 @@ async fn sessions_menu_scoped(
                         update_live_history_with_design(history, Some(&design.snapshot()));
                     }
                     reset_per_session_state(); // thread switch — same contract as /resume
-                    println!(
-                        "{}",
-                        style(format!(
+
+                    // Route through emit_line, not println! — the retained render thread is already
+                    // live again by the time we return, and a raw print behind its back corrupts the
+                    // frame (see the raw-print memory note).
+                    tui::emit_line(
+                        &style(format!(
                             "restored '{}' ({n} messages)",
                             pretty_session_name(name)
                         ))
                         .color256(splash::ACCENT)
+                        .to_string(),
                     );
                     agent::replay_transcript(history);
                     return Ok(());

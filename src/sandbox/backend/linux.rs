@@ -346,6 +346,12 @@ fn build_ruleset(fs: &FsPolicy) -> Result<Option<OwnedFd>, String> {
     ] {
         add(std::path::Path::new(dev), dev_access);
     }
+    // The program being spawned may live outside every granted root (a helper under
+    // `target/debug/deps`). Landlock needs read+execute on that FILE; without it the exec itself
+    // fails with EACCES before the child ever runs.
+    for file in &fs.exec_files {
+        add(file, ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE);
+    }
     Ok(Some(ruleset))
 }
 
@@ -410,8 +416,9 @@ impl LinuxSandbox {
         }
     }
 
-    /// Whether any kernel mechanism is armed (drives the runner's backend label).
-    pub fn any_kernel(&self) -> bool {
+    /// Whether a test fixture armed at least one kernel mechanism.
+    #[cfg(test)]
+    fn any_kernel(&self) -> bool {
         self.ruleset.is_some() || self.seccomp.is_some()
     }
 
@@ -542,6 +549,7 @@ mod tests {
                 "/proc".into(),
                 "/dev".into(),
             ],
+            exec_files: vec![],
             deny: vec![],
         };
         let sbx = LinuxSandbox::build(&fs, false, &SandboxLimits::default());
@@ -585,6 +593,7 @@ mod tests {
                 "/dev".into(),
                 "/proc".into(),
             ],
+            exec_files: vec![],
             deny: vec![],
         };
         let sbx = LinuxSandbox::build(&fs, true, &SandboxLimits::default());

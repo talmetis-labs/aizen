@@ -2,15 +2,15 @@
 //!
 //! Subcommands:
 //!   aizen chat    — OpenAI-compatible streaming chat (the v0 "call API like hermes" layer)
-//!   aizen memory  — the standalone, best-for-CLI memory brain (see linked-riding-mochi.md)
+//!   aizen memory  — manage the explicitly selected optional Memory provider
 
 // ─── module tree ────────────────────────────────────────────────────────────
-// Domains that own a folder: the agent loop, the memory brain, personas, benches.
+// Domains that own a folder: the agent loop, personas, optional Memory providers, benches.
 mod agent;
 mod agents; // delegatable specialist sub-agent library (agency-agents format)
 mod bench;
-mod memory;
 mod persona;
+mod plugin;
 // Grouped by role (the src/ reorg — see each folder's mod.rs for what it holds):
 mod channels; // notify + shared channel glue
 mod core; // types · config · cli_config · approval · net_guard
@@ -24,6 +24,7 @@ mod ui; // tui · theme · markdown · spinner · splash · icons · image_input
 mod cli; // one module per `aizen <subcommand>` — the behaviour behind `cli_args`
 mod cli_args; // declaration-only: the command-line surface (clap derive types)
 mod repl; // the interactive loop's phases: startup · input_pre · turn · postturn · background
+mod retrieval; // Core codebase/Skill ranking, independent of optional persistent Memory
 
 // The reorg moved 23 top-level files into the folders above. These re-exports keep the
 // call sites in THIS file referring to the modules by their short names (no behavior
@@ -153,14 +154,43 @@ async fn main() -> Result<()> {
     // can neither see nor dismiss; with it the child just returns a status we handle. Idempotent.
     suppress_hard_error_dialogs();
     let cli = Cli::parse();
+    // Offline Apps status must not run store migrations or resolve project configuration.
+    if let Some(Commands::Apps {
+        cmd: Some(AppsCmd::Status { name, json }),
+    }) = &cli.command
+    {
+        return apps_status(name.as_deref(), *json);
+    }
     // `--sandbox` pins the process-wide sandbox mode before anything can spawn a child. User-only:
     // nothing the model outputs can reach this flag (or the env/config it overrides).
     if let Some(mode) = cli.sandbox {
         sandbox::set_mode(mode);
     }
-    // Before ANY command touches the store: ids the old slugifier cut mid-word are re-slugged whole.
-    // Ahead of the `match` so the CLI paths (`memory list`, `memory show`) and the REPL see the same
-    // ids — see `run_id_migration_once`.
+    // The client bridge must precede management dispatch and all startup migrations.
+    if matches!(
+        &cli.command,
+        Some(Commands::Memory {
+            cmd: MemoryCmd::Client
+        })
+    ) {
+        return cli::memory_client::run().await;
+    }
+    // Package administration and offline Memory controls never run legacy store migrations.
+    if let Some(Commands::Plugin { cmd }) = &cli.command {
+        return cli::plugin_cmd::run(cmd).await;
+    }
+    if let Some(Commands::Memory { cmd }) = &cli.command {
+        if let Some(result) = cli::plugin_cmd::memory_control(cmd) {
+            return result;
+        }
+    }
+    if matches!(cli.command.as_ref(), Some(Commands::Memory { .. })) {
+        let Some(Commands::Memory { cmd }) = cli.command else {
+            unreachable!()
+        };
+        return run_memory(cmd).await;
+    }
+    // Persona-owned migration remains separate; persistent Memory is never migrated at startup.
     run_id_migration_once();
     let command = match cli.command {
         Some(c) => c,
@@ -169,33 +199,20 @@ async fn main() -> Result<()> {
     };
     match command {
         Commands::Chat(args) => run_chat(args).await,
+        Commands::Compact(args) => crate::cli::compact::run(args).await,
         Commands::Agent(args) => run_agent_cmd(args).await,
         Commands::Workflow(args) => run_workflow_cmd(args).await,
         Commands::Status { run_id } => crate::cli::run_cmds::run_run_status(&run_id),
         Commands::Resume { run_id, spec, yes } => {
             crate::cli::run_cmds::run_run_resume(&run_id, spec.as_deref(), yes).await
         }
+        Commands::Codebase { cmd } => cli::codebase_cmd::run(cmd).await,
         Commands::Memory { cmd } => run_memory(cmd).await,
+        Commands::Plugin { cmd } => cli::plugin_cmd::run(&cmd).await,
         Commands::Skill { cmd } => run_skill(cmd).await,
         Commands::Persona { cmd } => run_persona(cmd),
         Commands::Soul { cmd } => run_soul(cmd),
         Commands::Bench { cmd } => match cmd {
-            BenchCmd::Memory {
-                split,
-                update_baseline,
-                hybrid,
-                fuzzy,
-                evolution,
-            } => {
-                if evolution {
-                    bench::run_evolution()
-                } else {
-                    bench::run(&split, update_baseline, hybrid, fuzzy)
-                }
-            }
-            BenchCmd::Profile => bench::brain::run_profile(),
-            BenchCmd::Dialectic => bench::brain::run_dialectic(),
-            BenchCmd::Health => bench::brain::run_health(),
             BenchCmd::Loop => bench::loop_eval::run().await,
             BenchCmd::Sessions { json } => bench::sessions_stats::run(json),
             BenchCmd::Tasks {
@@ -406,7 +423,15 @@ async fn run_menu() -> Result<()> {
 /// optional persona / todo / agents chip. The raw token + turn counts are back on the row (the
 /// mockup shows them); the graphical context meter is still fed via `tui::set_ctx_permille` and the
 /// retained backend's footer tints the mode/persona chips as it draws the row.
+///
+/// The effort chip rides on the model segment via a side channel: `effort_ui` arms it per turn
+/// (see `apply_turn_effort_hud`) through `tui::status_chip_arm`, this takes it back out, splices
+/// the styled chip onto the model name, and re-arms so the NEXT rebuild carries it too. Keeping
+/// the chip out of the signature keeps the four call sites (activate / resume / post-slash /
+/// post-turn) untouched; a plain-REPL just never arms it.
 fn status_text(history: &[Message], model: &str) -> String {
+    // An armed chip owns the model segment — name plus effort tier.
+    let chip = tui::status_chip_take().unwrap_or_default();
     // The meter + token chip prefer the provider-reported size of this conversation's most recent
     // request (recorded by the turn's chat closure) over the chars/4 estimate — the estimate only
     // carries a fresh thread, or one whose provider never reports usage. The real number is
@@ -478,10 +503,17 @@ fn status_text(history: &[Message], model: &str) -> String {
             .map(|c| c.servers.len())
             .unwrap_or(0),
         lsp: crate::agent::lsp::LSP.status().chip(),
-        memory_facts: crate::memory::live_fact_count(),
-        memory_recalled: crate::memory::stats::session_counters().0 as usize,
+        memory_facts: 0, // Corpus telemetry belongs to the external provider, not a Core store read.
+        memory_recalled: crate::plugin::snapshots::current("repl").ids.len(),
     });
-    format!("{model}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
+    // Re-arm for the next call, then compose: the chip owns the model segment's effort part — a
+    // routed model (models_by_effort) plus the tinted `·auto` (or the pinned tier at idle) land
+    // there, while the token/turn/persona lanes are always rebuilt from live state.
+    if !chip.is_empty() {
+        tui::status_chip_arm(chip.clone());
+    }
+    let model_chip = format!("{model}{chip}");
+    format!("{model_chip}{tok_chip}{turns_chip}{persona}{mode}{todos}{agents}")
 }
 
 /// The summarizer endpoint: `roles.summarizer` routing (env > config > main endpoint). Chore
@@ -685,6 +717,9 @@ async fn run_menu_sticky() -> Result<()> {
     // The retained backend is the only interactive surface. If it can't take the terminal (alt-screen
     // refused), there is no second renderer to degrade into — hand off to the plain line-REPL rather
     // than run this loop headless, which would queue keystrokes against a UI that never painted.
+    // Arm the idle chip first so the very first status row already shows the tier (`·auto` or the
+    // pinned effort) next to the model name.
+    refresh_effort_hud();
     if !tui::activate(&intro, &status_text(&history, &model_label)) {
         return run_menu_plain().await;
     }
@@ -742,7 +777,6 @@ async fn run_menu_sticky() -> Result<()> {
     // GET /models probe every 60s (plus once immediately). Independent of the chat HTTP client so a
     // long-running turn's keep-alive doesn't share the short health timeout.
     spawn_health_poller();
-    spawn_reconcile_pass();
     let mut input = tui::spawn_input();
     // Off-to-the-side Q&A: a long-lived worker answers `?`-prefixed questions on its OWN thread,
     // reading a read-only snapshot of the live conversation, WITHOUT touching the turn in flight
@@ -758,6 +792,9 @@ async fn run_menu_sticky() -> Result<()> {
             }
         };
         tui::note_submission_dequeued();
+        // Only injected/clarify text needs path lifting here. Keyboard submissions already
+        // validated before clearing the draft; parsing cleaned prose twice can select new paths.
+        let prepared_images = matches!(&sub, tui::Submission::PreparedChat(..));
         match sub {
             tui::Submission::Quit => {
                 drain_learning_before_exit().await;
@@ -779,6 +816,9 @@ async fn run_menu_sticky() -> Result<()> {
                         let _ = input.resume.send(());
                         break;
                     }
+                    // A slider pick just re-armed the idle chip (`refresh_effort_hud` in
+                    // `apply_effort_choice`); `status_text` takes and re-arms it, so the row the
+                    // menu hands back to carries the new tier immediately.
                     tui::resume(&status_text(&history, &model_label));
                     let _ = input.resume.send(()); // unpark the keyboard thread
                                                    // A custom command expanded to a prompt → re-inject it as a chat submission so the
@@ -805,10 +845,18 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 }
             }
-            tui::Submission::Chat(line, images) => {
+            tui::Submission::Chat(line, images) | tui::Submission::PreparedChat(line, images) => {
                 let mut line = line.trim().to_string();
                 let mut images = images;
-                lift_image_attachments(&mut line, &mut images);
+                if !prepared_images {
+                    if let Err(error) = lift_image_attachments(&mut line, &mut images) {
+                        tui::emit_line(
+                            &theme::warn(&format!("image selection refused: {error:#}"))
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                }
                 if line.is_empty() && images.is_empty() {
                     continue;
                 }
@@ -844,7 +892,7 @@ async fn run_menu_sticky() -> Result<()> {
                 // / `!shell-escape` run no turn; a normal message has its `@file`·`` !`cmd` `` expanded.
                 let echo_src = line.clone();
                 if images.is_empty() {
-                    match preprocess_input(&line) {
+                    match preprocess_input(&line).await {
                         InputPre::Handled => continue,
                         InputPre::Send(expanded) => line = expanded,
                     }
@@ -921,11 +969,12 @@ async fn run_menu_sticky() -> Result<()> {
                 let mut resolved = ResolvedTurn::new(&ep, eff.clone(), eff.clone(), design.clone());
                 let routed =
                     (resolved.endpoint.model != model).then_some(resolved.endpoint.model.as_str());
-                tui::emit_line(&format!(
-                    "{} {}",
-                    effort_turn_line(eff.as_deref(), routed),
-                    theme::faint(&format!("· {}", shape.as_str()))
-                ));
+                // The effort state lives on the HUD's model segment now, not in a transcript
+                // line — push the composed chip (routed model + tinted `·auto`; the chip alone
+                // otherwise) straight into the status row, then rebuild the row right away so
+                // the chip is on screen before the first request leaves.
+                apply_turn_effort_hud(&eff, routed);
+                tui::set_status(&status_text(&history, &model_label));
                 if !images.is_empty() {
                     match crate::repl::turn::guided_vision_preflight(&resolved, true).await {
                         Ok(true) => {}
@@ -1013,8 +1062,10 @@ async fn run_menu_sticky() -> Result<()> {
                 // lane) so index 1 stays byte-stable and the transcript-tail prefix cache holds.
                 // `line` itself is unchanged → checkpoint / display / persisted history keep the
                 // clean user text.
+                let mut cfg = turn_agent_config(turn_cancel.clone(), &ep.model, true);
+                resolved.configure(&mut cfg, true);
                 resolved.refresh_prompt(&mut history, &mut effective_model);
-                seat_user_message(&line, images, &mut history, &ep.model, &design);
+                seat_user_message(&line, images, &mut history, &ep.model, &design, &cfg).await?;
                 resolved.seat_reference_markers(&mut history);
                 update_live_history_with_design(&history, Some(&design.snapshot()));
                 if let Some(plan) = &resolved.architect_plan {
@@ -1024,9 +1075,6 @@ async fn run_menu_sticky() -> Result<()> {
                         plan.path.as_deref(),
                     );
                 }
-                let mut cfg = turn_agent_config(turn_cancel.clone(), &ep.model, true);
-                resolved.configure(&mut cfg, true);
-
                 // Esc pressed DURING prep already cancelled this token — honour it instead of firing
                 // the request anyway. Without this, cancelling in the prep window (the very thing the
                 // early arm above made possible) would still send the turn to the model.
@@ -1180,13 +1228,21 @@ async fn run_menu_sticky() -> Result<()> {
                                     );
                                     // Re-seat the original request so the fresh thread continues
                                     // the SAME work, not a blank "what do you want?" prompt.
+                                    let mut cfg2 =
+                                        turn_agent_config(turn_cancel.clone(), &ep.model, true);
+                                    resolved.configure(&mut cfg2, true);
+                                    cfg2.exec_ctx = cfg2
+                                        .exec_ctx
+                                        .with_recovery(cfg.exec_ctx.recovery().clone());
                                     seat_user_message(
                                         &line,
                                         Vec::new(),
                                         &mut history,
                                         &ep.model,
                                         &design,
-                                    );
+                                        &cfg2,
+                                    )
+                                    .await?;
                                     if let Some(plan) = &resolved.architect_plan {
                                         crate::agent::architect::attach_plan(
                                             &mut history,
@@ -1194,12 +1250,6 @@ async fn run_menu_sticky() -> Result<()> {
                                             plan.path.as_deref(),
                                         );
                                     }
-                                    let mut cfg2 =
-                                        turn_agent_config(turn_cancel.clone(), &ep.model, true);
-                                    resolved.configure(&mut cfg2, true);
-                                    cfg2.exec_ctx = cfg2
-                                        .exec_ctx
-                                        .with_recovery(cfg.exec_ctx.recovery().clone());
                                     let r2 =
                                         run_agent_turn(&http, ep, &cfg2, &registry, &mut history)
                                             .await;
@@ -1212,6 +1262,7 @@ async fn run_menu_sticky() -> Result<()> {
                                                 &http,
                                                 ep,
                                                 &design,
+                                                &cfg2,
                                             )
                                             .await;
                                         }
@@ -1260,8 +1311,16 @@ async fn run_menu_sticky() -> Result<()> {
                             // tree is remembered as a finished task. The one-shot `aizen agent` path has
                             // reported these since it was written (see the `match outcome.stop` in
                             // `run_agent_cmd`); the REPL — where the user actually lives — never did.
-                            finish_turn(&outcome, persona_before, &mut history, &http, ep, &design)
-                                .await;
+                            finish_turn(
+                                &outcome,
+                                persona_before,
+                                &mut history,
+                                &http,
+                                ep,
+                                &design,
+                                &cfg,
+                            )
+                            .await;
                         }
                     }
                     Some(Err(e)) => {
@@ -1341,17 +1400,15 @@ async fn run_menu_plain() -> Result<()> {
     loop {
         icons::set_tier(cli_config::load().icons.as_deref()); // refresh after a possible /config change
         print_status_line(&history, &model_label);
-        let (line, mut images) = match read_input_box(&input_history)? {
+        let (line, images) = match read_input_box(&input_history)? {
             Some(l) => l,
             None => {
                 drain_learning_before_exit().await;
                 break;
             }
         };
+        // The input box validates clipboard/path attachments before consuming the draft.
         let mut line = line.trim().to_string();
-        // Drag-drop / typed / pasted image-file paths on the line → vision attachments (the other
-        // half of Ctrl-O clipboard attach). Only real image files are pulled; prose is preserved.
-        lift_image_attachments(&mut line, &mut images);
         if line.is_empty() && images.is_empty() {
             continue;
         }
@@ -1418,7 +1475,7 @@ async fn run_menu_plain() -> Result<()> {
                     }
                     features::slash::Verdict::Chat => {
                         typed_src = line.clone();
-                        match preprocess_input(&line) {
+                        match preprocess_input(&line).await {
                             InputPre::Handled => continue, // #remember / !shell-escape — no turn
                             InputPre::Send(expanded) => line = expanded,
                         }
@@ -1461,11 +1518,10 @@ async fn run_menu_plain() -> Result<()> {
         design.begin_turn(format!("turn:{}", history.len()), design_workspace());
         let mut resolved = ResolvedTurn::new(&ep, eff.clone(), eff.clone(), design.clone());
         let routed = (resolved.endpoint.model != model).then_some(resolved.endpoint.model.as_str());
-        println!(
-            "{} {}",
-            effort_turn_line(eff.as_deref(), routed),
-            theme::faint(&format!("· {}", shape.as_str()))
-        );
+        // No status row to host the tier here — but the HUD channel is shared, so arming the chip
+        // keeps the effort visible when a retained surface is driving this REPL (and is a no-op
+        // where it is not).
+        apply_turn_effort_hud(&eff, routed);
         let turn_cancel = crate::core::cancel::TurnCancel::new();
         if !images.is_empty() {
             match crate::repl::turn::guided_vision_preflight(&resolved, true).await {
@@ -1535,15 +1591,15 @@ async fn run_menu_plain() -> Result<()> {
         // Fold memory recall + codebase-index retrieval into the SENT content (not the cached
         // system lane) — see `fold_context_into_query`. `line` stays the original for persisted
         // history / display.
+        let mut cfg = turn_agent_config(turn_cancel, &ep.model, false);
+        resolved.configure(&mut cfg, true);
         resolved.refresh_prompt(&mut history, &mut effective_model);
-        seat_user_message(&line, images, &mut history, &ep.model, &design);
+        seat_user_message(&line, images, &mut history, &ep.model, &design, &cfg).await?;
         resolved.seat_reference_markers(&mut history);
         update_live_history_with_design(&history, Some(&design.snapshot()));
         if let Some(plan) = &resolved.architect_plan {
             crate::agent::architect::attach_plan(&mut history, &plan.text, plan.path.as_deref());
         }
-        let mut cfg = turn_agent_config(turn_cancel, &ep.model, false);
-        resolved.configure(&mut cfg, true);
         match run_agent_turn(&http, ep, &cfg, &registry, &mut history).await {
             // `clarify` paused the turn — show the question, loop back for the answer (the next
             // typed message continues this conversation). No post-turn learning: not done yet.
@@ -1556,7 +1612,16 @@ async fn run_menu_plain() -> Result<()> {
                 // mirror of the sticky path: a paused turn is still a transcript
             }
             Ok(outcome) => {
-                finish_turn(&outcome, persona_before, &mut history, &http, ep, &design).await;
+                finish_turn(
+                    &outcome,
+                    persona_before,
+                    &mut history,
+                    &http,
+                    ep,
+                    &design,
+                    &cfg,
+                )
+                .await;
             }
             Err(e) => {
                 tui::note_line(&format!("{} {}", style("error:").red(), one_line_error(&e)));
@@ -1753,6 +1818,10 @@ pub(crate) fn elide(s: &str, max: usize) -> String {
     let head: String = flat.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", head.trim_end())
 }
+
+#[cfg(test)]
+#[path = "tests/legacy_memory.rs"]
+pub(crate) mod legacy_memory_fixture;
 
 #[cfg(test)]
 #[path = "tests/main_suite.rs"]

@@ -727,12 +727,18 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aizen-raw-skill-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        // macOS temp paths commonly traverse /var -> /private/var. The store refuses any symlinked
+        // ancestor, so the fixture must be canonical before it becomes AIZEN_HOME — canonicalizing
+        // the test root never relaxes that production guard.
+        #[cfg(unix)]
+        let path = std::fs::canonicalize(&path).unwrap();
         let fixture = Fixture {
-            path: std::env::temp_dir()
-                .join(format!("aizen-raw-skill-{}-{nonce}", std::process::id())),
+            path,
             previous_home: std::env::var_os("AIZEN_HOME"),
         };
-        std::fs::create_dir(&fixture.path).unwrap();
         std::env::set_var("AIZEN_HOME", &fixture.path);
         let alias = format!("import-alias-{nonce}");
         let raw = "---\r\nname: Upstream title\r\ndescription: >-\r\n  Folded summary\r\n  preserved\r\nrequires: [file_read]\r\nplatforms: [windows, unix]\r\nextra:\r\n  retained: true\r\n---\r\nRead references/guide.md.\r\n";

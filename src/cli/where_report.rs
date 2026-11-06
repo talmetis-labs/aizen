@@ -38,52 +38,14 @@ fn dir_count_line(label: &str, p: &std::path::Path, unit: &str) -> String {
     format!("  {label:<8}: {}   {n} {unit}", p.display())
 }
 
-/// Where the memory store physically lives, per directory, with counts.
-///
-/// `memory list` names three commands and every one of them edits a SINGLE entry by id. Bulk work —
-/// deleting forty near-duplicates, fixing a wrong word across many facts — is a file-manager job, and
-/// until now the only place any path appeared was `memory show <id>`'s `file:` line, one entry at a
-/// time. Naming the review dir matters most: 29 queued candidates sat there unreadable because
-/// nothing said they were on disk at all.
+/// Provider status projection, without opening a provider corpus or legacy storage.
 pub(crate) fn memory_where_report() -> String {
-    use std::fmt::Write as _;
-    let mut s = String::new();
-    let _ = writeln!(
-        s,
-        "{}",
-        dir_count_line("entries", &crate::core::config::entries_dir(), "fact(s)")
-    );
-    let _ = writeln!(
-        s,
-        "{}",
-        dir_count_line("review", &crate::core::config::review_dir(), "awaiting")
-    );
-    let _ = writeln!(
-        s,
-        "{}",
-        dir_count_line("archive", &crate::core::config::archive_dir(), "retired")
-    );
-    let graph = crate::core::config::graph_path();
-    let edges = std::fs::read_to_string(&graph)
-        .map(|r| r.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0);
-    let _ = writeln!(s, "  {:<8}: {}   {edges} edge(s)", "graph", graph.display());
-    let _ = writeln!(
-        s,
-        "  {:<8}: {}",
-        "core",
-        crate::core::config::style_path().display()
-    );
-    let _ = write!(
-        s,
-        "{}",
-        style(
-            "\nEdit or delete files directly — they are plain markdown with a frontmatter header.\n\
-             Re-run `aizen memory doctor` afterwards to catch anything left dangling."
-        )
-        .dim()
-    );
-    s
+    match crate::plugin::manager::status() {
+        Ok(status) => format!("Memory: {}\nSelected: {}\nPackages: {}\nData root: {}\nLegacy entries/review/archive are not inspected or adopted automatically.",
+            status.state,status.selected.as_deref().unwrap_or("none"),crate::plugin::manager::packages_root().display(),
+            crate::core::config::aizen_home().join("memory-data").display()),
+        Err(_) => "Memory unavailable; inspect provider configuration. Legacy data was not opened.".into(),
+    }
 }
 
 /// Where skills are read from — all three roots, because `skill list`'s `[project]`/`[repo]` tags
@@ -147,7 +109,7 @@ pub(crate) fn where_report() -> String {
     );
     let _ = writeln!(
         s,
-        "zone slug    : {slug}   (keys memory scope · skills · codebase index · frozen core)"
+        "zone slug    : {slug}   (keys Core skills and codebase index; provider scopes are explicit)"
     );
     if let Some(url) = crate::core::config::git_remote_origin(&root) {
         let _ = writeln!(
@@ -182,11 +144,7 @@ pub(crate) fn where_report() -> String {
         }
     };
     let _ = writeln!(s, "home         : {}", home.display());
-    let _ = writeln!(
-        s,
-        "memory store : {}",
-        crate::core::config::cli_memory_dir().display()
-    );
+    let _ = writeln!(s, "{}", memory_where_report());
     let _ = writeln!(
         s,
         "skills zone  : {}{}",

@@ -27,8 +27,8 @@
 //! | `graph.tsv` `persona:<slug>/<id>` | capability exists; **0 such edges** on the measured store |
 //! | anything persisted elsewhere | no — ids are returned to the caller and dropped |
 //!
-//! The `persona:` namespace is still re-pointed when edges exist, because "zero today" is a fact about
-//! one machine and `note_insight_cofire` can write them at any time.
+//! Provider graph endpoints are deliberately not inspected or rewritten here. The durable pre-rename
+//! mapping is the input for a separately authorized provider-owned remap after explicit adoption.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,7 +55,6 @@ pub struct Rename {
 #[derive(Debug, Default)]
 pub struct Report {
     pub renamed: usize,
-    pub edges_rewritten: usize,
     pub mapping_path: Option<PathBuf>,
     pub warnings: Vec<String>,
 }
@@ -70,12 +69,6 @@ impl Report {
             "persona: renamed {} self-memory file(s) so they read as whole words",
             self.renamed
         );
-        if self.edges_rewritten > 0 {
-            s.push_str(&format!(
-                "; {} graph edge(s) re-pointed",
-                self.edges_rewritten
-            ));
-        }
         if let Some(p) = &self.mapping_path {
             s.push_str(&format!(" — old→new map: {}", p.display()));
         }
@@ -194,23 +187,8 @@ pub fn apply_for(persona_slug: &str, plan: &[Rename]) -> Report {
                 .push(format!("could not rename '{}': {e}", r.old)),
         }
     }
-    // `persona:<slug>/<id>` endpoints. Zero exist on the measured store, but `note_insight_cofire`
-    // can write them at any time, so the pass re-points rather than assuming.
-    let by_old: HashMap<String, String> = plan
-        .iter()
-        .map(|r| {
-            (
-                format!("persona:{persona_slug}/{}", r.old),
-                format!("persona:{persona_slug}/{}", r.new),
-            )
-        })
-        .collect();
-    match rewrite_graph(&by_old) {
-        Ok(n) => rep.edges_rewritten = n,
-        Err(e) => rep
-            .warnings
-            .push(format!("graph.tsv: could not re-point edges: {e:#}")),
-    }
+    // Provider graphs are not Core-owned. The pre-rename mapping remains available for an
+    // explicitly authorized provider remap; startup must not inspect or rewrite legacy graph.tsv.
     rep
 }
 
@@ -219,7 +197,7 @@ fn write_mapping(persona_slug: &str, plan: &[Rename]) -> anyhow::Result<PathBuf>
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!(
         ".stem-migration-{persona_slug}-{}.tsv",
-        crate::memory::bloat::decay::today()
+        crate::core::dates::today()
     ));
     let mut s = String::with_capacity(plan.len() * 64);
     s.push_str("# old_stem\tnew_stem\tdir — written before any rename\n");
@@ -233,44 +211,6 @@ fn write_mapping(persona_slug: &str, plan: &[Rename]) -> anyhow::Result<PathBuf>
     }
     crate::core::persist::atomic_write(&path, s.as_bytes())?;
     Ok(path)
-}
-
-/// Re-point both endpoints of every edge whose id appears in the table. Endpoints absent from it are
-/// copied byte-for-byte, which is what keeps memory ids and `skill:` endpoints intact.
-fn rewrite_graph(by_old: &HashMap<String, String>) -> anyhow::Result<usize> {
-    if by_old.is_empty() {
-        return Ok(0);
-    }
-    let path = config::graph_path();
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Ok(0);
-    };
-    let mut out = String::with_capacity(raw.len());
-    let mut changed = 0usize;
-    for line in raw.lines() {
-        let mut cols: Vec<String> = line.split('\t').map(str::to_string).collect();
-        if cols.len() < 2 {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        let mut touched = false;
-        for col in cols.iter_mut().take(2) {
-            if let Some(new) = by_old.get(col.trim()) {
-                *col = new.clone();
-                touched = true;
-            }
-        }
-        if touched {
-            changed += 1;
-        }
-        out.push_str(&cols.join("\t"));
-        out.push('\n');
-    }
-    if changed > 0 {
-        crate::core::persist::atomic_write(&path, out.as_bytes())?;
-    }
-    Ok(changed)
 }
 
 fn opted_out() -> bool {
@@ -301,15 +241,10 @@ pub fn run_once_at_startup() -> Option<Report> {
         let plan = plan_for(&dir);
         let rep = apply_for(&slug, &plan);
         if rep.warnings.is_empty() || rep.renamed > 0 {
-            let body = format!(
-                "{}\trenamed={}\n",
-                crate::memory::bloat::decay::today(),
-                rep.renamed
-            );
+            let body = format!("{}\trenamed={}\n", crate::core::dates::today(), rep.renamed);
             let _ = crate::core::persist::atomic_write(&dir.join(DONE_FLAG), body.as_bytes());
         }
         total.renamed += rep.renamed;
-        total.edges_rewritten += rep.edges_rewritten;
         total.warnings.extend(rep.warnings);
         if total.mapping_path.is_none() {
             total.mapping_path = rep.mapping_path;
@@ -325,6 +260,7 @@ pub fn run_once_at_startup() -> Option<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_memory_fixture as legacy_memory;
 
     fn write_mem(dir: &Path, stem: &str, kind: &str, body: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -335,10 +271,9 @@ mod tests {
         .unwrap();
     }
 
-    /// The shredded-name case, on the exact shape found on disk, plus an archive row and a
-    /// `persona:` graph edge that has to follow the rename.
+    /// Renames Core-owned stems but preserves external provider/legacy graph bytes.
     #[test]
-    fn migrates_shredded_stems_and_repoints_persona_edges() {
+    fn migrates_shredded_stems_without_touching_provider_graphs() {
         let _g = config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -362,9 +297,9 @@ mod tests {
             "work: handled \"bây giờ chạy build\" via 3 tool steps",
         );
         // `graph_path()` lives under `cli-memory/`, which a persona-only temp home has not created.
-        std::fs::create_dir_all(config::graph_path().parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy_memory::graph_path().parent().unwrap()).unwrap();
         std::fs::write(
-            config::graph_path(),
+            legacy_memory::graph_path(),
             format!(
                 "persona:kira/{shredded}\tsome-memory-id\t1.0000\t2026-08-01\n\
                  skill:do-a-thing\tsome-memory-id\t0.5000\t2026-08-02\n"
@@ -372,6 +307,7 @@ mod tests {
         )
         .unwrap();
 
+        let graph_before = std::fs::read(legacy_memory::graph_path()).unwrap();
         let plan = plan_for(&dir);
         assert_eq!(plan.len(), 2, "{plan:?}");
         let rep = apply_for("kira", &plan);
@@ -400,20 +336,10 @@ mod tests {
             "still shredded: {got}"
         );
 
-        let graph = std::fs::read_to_string(config::graph_path()).unwrap();
-        assert!(
-            !graph.contains(shredded),
-            "old persona endpoint survives: {graph}"
+        assert_eq!(
+            std::fs::read(legacy_memory::graph_path()).unwrap(),
+            graph_before
         );
-        assert!(
-            graph.contains("persona:kira/in-nguoi-dung-giao"),
-            "edge not re-pointed: {graph}"
-        );
-        assert!(
-            graph.contains("skill:do-a-thing"),
-            "unrelated namespace mangled: {graph}"
-        );
-        assert_eq!(rep.edges_rewritten, 1);
 
         let map = std::fs::read_to_string(rep.mapping_path.as_ref().unwrap()).unwrap();
         assert!(map.contains(shredded), "map missing the old stem: {map}");

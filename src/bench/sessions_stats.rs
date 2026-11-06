@@ -233,6 +233,10 @@ tail{}",
             tool_call_id: Some("c".to_string()),
             images: Vec::new(),
             tool_images: Vec::new(),
+            visual_context: Vec::new(),
+            image_preferences: Vec::new(),
+            user_turn_id: None,
+            memory_scaffold: None,
             cache_control: None,
         }
     }
