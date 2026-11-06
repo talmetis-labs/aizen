@@ -315,94 +315,277 @@ fn import(expected: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogAction {
+    Review(releases::CatalogEntry),
+    Refresh,
+    Back,
+}
+
+fn catalog_view(
+    result: Result<&releases::ReleaseCatalog, &anyhow::Error>,
+) -> (String, Vec<(CatalogAction, String)>) {
+    let mut rows = Vec::new();
+    let summary = match result {
+        Ok(catalog) => {
+            rows.extend(catalog.entries.iter().map(|entry| {
+                (
+                    CatalogAction::Review(entry.clone()),
+                    format!("{} · {}", safe(&entry.version), entry.availability.label()),
+                )
+            }));
+            let completeness = if catalog.complete {
+                "complete"
+            } else {
+                "partial: page limit reached; not authoritative latest"
+            };
+            if catalog.entries.is_empty() {
+                format!(
+                    "No stable releases found · {completeness}\nTarget: {}",
+                    safe(&catalog.target)
+                )
+            } else {
+                format!(
+                    "{} stable version(s) · {completeness}\nTarget: {}",
+                    catalog.entries.len(),
+                    safe(&catalog.target)
+                )
+            }
+        }
+        Err(error) => format!("Check failed: {}", safe(&format!("{error:#}"))),
+    };
+    rows.push((
+        CatalogAction::Refresh,
+        if result.is_err() { "Retry" } else { "Refresh" }.into(),
+    ));
+    rows.push((CatalogAction::Back, "Back".into()));
+    (
+        format!(
+            "Mnemos public versions · {}\n{summary}",
+            releases::REPOSITORY
+        ),
+        rows,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseBaseline {
+    generation: u64,
+    installed: Option<(String, crate::plugin::install::InstallPins)>,
+}
+
+impl ReleaseBaseline {
+    fn capture() -> Result<Self> {
+        ensure!(
+            !manager::transaction_marker().try_exists()?
+                && !crate::plugin::update::recovery_required()?,
+            "Memory recovery is required; preserve all evidence before trying again"
+        );
+        let state = manager::read_state()?;
+        let installed = if state.packages.contains_key("mnemos") {
+            // A damaged registered package is never treated as a fresh install.
+            let review = manager::review("mnemos")
+                .context("Installed Mnemos is damaged or unverifiable; replacement is blocked")?;
+            ensure!(
+                review.generation == state.generation,
+                "Memory changed; review again"
+            );
+            Some((review.package.manifest.version, review.package.pins))
+        } else {
+            match std::fs::symlink_metadata(manager::packages_root().join("mnemos")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Inspecting existing Mnemos package path"),
+                Ok(_) => anyhow::bail!(
+                    "Unregistered Mnemos package path exists; preserve it for manual recovery"
+                ),
+            }
+            None
+        };
+        Ok(Self {
+            generation: state.generation,
+            installed,
+        })
+    }
+
+    fn validate_current(&self, current: &Self) -> Result<()> {
+        ensure!(
+            self == current,
+            "Memory configuration or package changed; review again"
+        );
+        Ok(())
+    }
+}
+
+struct ReleaseReview {
+    baseline: ReleaseBaseline,
+    candidate: releases::Candidate,
+}
+
+impl ReleaseReview {
+    fn prepare(
+        baseline: ReleaseBaseline,
+        status: releases::ReleaseStatus,
+        exact: Option<&str>,
+    ) -> Result<Self> {
+        ensure!(
+            status.discovery == "complete",
+            "Release check is incomplete; choose an exact version"
+        );
+        let candidate = status.candidate.context(
+            status
+                .unavailable_reason
+                .unwrap_or_else(|| "No installable public Mnemos package is available".into()),
+        )?;
+        candidate.validate()?;
+        ensure!(
+            exact.is_none_or(|v| candidate.version == v),
+            "Selected release changed; review again"
+        );
+        ensure!(
+            candidate.target == status.target,
+            "Release targets another platform"
+        );
+        if let Some((installed, pins)) = &baseline.installed {
+            ensure!(
+                pins.target == candidate.target,
+                "Installed package targets another platform"
+            );
+            match releases::version(&candidate.version)?.cmp(&releases::version(installed)?) {
+                std::cmp::Ordering::Equal => {
+                    anyhow::bail!("Already installed: Mnemos {installed}. No replacement needed")
+                }
+                std::cmp::Ordering::Less => anyhow::bail!(
+                    "Downgrade unsupported: installed {installed}, selected {}",
+                    candidate.version
+                ),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        Ok(Self {
+            baseline,
+            candidate,
+        })
+    }
+
+    fn prompt(&self) -> String {
+        let c = &self.candidate;
+        let (operation, consequences) = match &self.baseline.installed {
+            Some((old, _)) => (
+                format!("Update Mnemos {} -> {}?", safe(old), safe(&c.version)),
+                "Preserves settings, budgets, selection and data location.\nDisables Mnemos; revokes execution and Learning consent.\nIf selected, Memory is disabled. Activation is required again.",
+            ),
+            None => (
+                format!("Download and install Mnemos {}?", safe(&c.version)),
+                "Installs disabled, unselected and without execution consent.\nActivation remains a separate choice.",
+            ),
+        };
+        // Only interpolate sanitized fields: sanitizing the whole prompt would strip its
+        // line breaks and truncate the consent disclosures while dialoguer owns the screen.
+        format!(
+            "{operation}\nSource: {}\nTarget: {}\nArchive: {}\nSize: {} bytes\nSHA256: {}\nHashes verify integrity, not publisher trust.\n{consequences}\nNo provider execution, data transfer or migration.",
+            releases::REPOSITORY, safe(&c.target), safe(&c.filename), c.bytes, safe(&c.sha256),
+        )
+    }
+}
+
+// Keep the confirmation boundary and exact install/update routing independently testable.
+async fn confirm_release<I, U, IFut, UFut, T>(
+    review: ReleaseReview,
+    ask: impl FnOnce(&str) -> Result<bool>,
+    install: I,
+    update: U,
+) -> Result<Option<T>>
+where
+    I: FnOnce(releases::Candidate, u64) -> IFut,
+    U: FnOnce(releases::Candidate, u64, crate::plugin::install::InstallPins) -> UFut,
+    IFut: std::future::Future<Output = Result<T>>,
+    UFut: std::future::Future<Output = Result<T>>,
+{
+    if !ask(&review.prompt())? {
+        return Ok(None);
+    }
+    let generation = review.baseline.generation;
+    match review.baseline.installed {
+        None => install(review.candidate, generation).await.map(Some),
+        Some((_, pins)) => update(review.candidate, generation, pins).await.map(Some),
+    }
+}
+
+async fn review_mnemos_release(exact: Option<&str>) -> Result<()> {
+    let result: Result<Option<crate::plugin::install::InstalledPackage>> = async {
+        let baseline = ReleaseBaseline::capture()?;
+        let status = releases::check(exact).await?;
+        baseline.validate_current(&ReleaseBaseline::capture()?)?;
+        let review = ReleaseReview::prepare(baseline, status, exact)?;
+        confirm_release(
+            review,
+            confirm,
+            |candidate, generation| async move { releases::install(&candidate, generation).await },
+            |candidate, generation, pins| async move {
+                releases::update_checked(&candidate, generation, &pins, || Ok(())).await
+            },
+        )
+        .await
+    }
+    .await;
+    let message = match result {
+        Ok(None) => return Ok(()),
+        Ok(Some(package)) => format!(
+            "Mnemos {} installed successfully.\nActivation is a separate choice. No provider was executed.",
+            safe(&package.manifest.version),
+        ),
+        Err(error) => format!("Mnemos release not completed\n{}\nReview again before retrying; preserve any recovery evidence.", safe(&format!("{error:#}"))),
+    };
+    let _ = choose(&message, &["Back".into()])?;
+    Ok(())
+}
+
+async fn browse_public_catalog() -> Result<()> {
+    loop {
+        // A failed refresh replaces, rather than silently reusing, the last successful list.
+        let result = releases::catalog().await;
+        let (prompt, rows) = catalog_view(result.as_ref());
+        loop {
+            match action(&prompt, rows.clone())? {
+                Some(CatalogAction::Review(entry)) => {
+                    review_mnemos_release(Some(&entry.version)).await?;
+                }
+                Some(CatalogAction::Refresh) => break,
+                Some(CatalogAction::Back) | None => return Ok(()),
+            }
+        }
+    }
+}
+
 async fn mnemos_setup() -> Result<()> {
-    let mut release: Option<(releases::ReleaseStatus, u64)> = None;
     loop {
         let state = manager::read_state()?;
         let installed = state.packages.contains_key("mnemos");
-        note("Mnemos · installed packages follow the shared cached update check; downloading and replacement always require confirmation.");
-        match manager::info("mnemos") {
-            Ok(package) => note(&format!("Installed: {}", package.manifest.version)),
-            Err(_) if installed => note(
-                "Installed package is damaged or unverifiable; no replacement will be attempted.",
-            ),
-            Err(_) => note("Installed: none"),
-        }
-        if release
-            .as_ref()
-            .is_some_and(|(_, generation)| *generation != state.generation)
-        {
-            release = None;
-        }
-        let mut rows = vec![(0, "Check public Mnemos release".into())];
-        if let Some((status, _)) = &release {
-            note(&format!("Source: {}", releases::REPOSITORY));
-            if let Some(version) = &status.highest_seen_version {
-                note(&format!(
-                    "Highest published: {version} (metadata may have no installable package)"
-                ));
-            }
-            if let Some(candidate) = &status.candidate {
-                note(&format!(
-                    "Downloadable: {} · {} · {}",
-                    candidate.version, candidate.target, status.comparison
-                ));
-                note(&format!(
-                    "Package: {} ({} bytes)",
-                    candidate.filename, candidate.bytes
-                ));
-                note(&format!("SHA256: {}", candidate.sha256));
-                if !installed {
-                    rows.push((1, "Download and install reviewed release".into()));
+        let summary = if installed {
+            match manager::info("mnemos") {
+                Ok(package) => format!("Installed: {}", safe(&package.manifest.version)),
+                Err(_) => {
+                    "Installed package is damaged or unverifiable; replacement is blocked".into()
                 }
-            } else {
-                note("No installable package is available. Local ZIP/directory installation remains available.");
             }
-        }
+        } else {
+            "Installed: none".into()
+        };
+        let mut rows = vec![
+            (0, "List public Mnemos versions".into()),
+            (1, "Check latest installable release".into()),
+        ];
         if installed {
             rows.push((2, "Review provider activation (separate consent)".into()));
-            rows.push((5, "Check and review a newer Mnemos update".into()));
-            note("Updates preserve settings/data but revoke execution and Learning consent. Activation is required again.");
         } else {
             rows.push((3, "Install local directory / ZIP".into()));
         }
         rows.push((4, "Back".into()));
-        match action("Mnemos", rows)? {
-            Some(0) => {
-                let status = releases::check(None).await?;
-                ensure!(
-                    manager::read_state()?.generation == state.generation,
-                    "Memory configuration changed during release check; check again"
-                );
-                release = Some((status, state.generation));
-            }
-            Some(1) => {
-                let (status, generation) = release.take().context("Check a release first")?;
-                let candidate = status.candidate.context("No installable Mnemos package")?;
-                note(
-                    "Download and install only. Integrity hashes do not establish publisher trust.",
-                );
-                note("No provider will be executed, authorized, selected or enabled. No data will be transferred.");
-                if confirm("Download and install this exact release?")? {
-                    let package = releases::install(&candidate, generation).await?;
-                    note(&format!(
-                        "Installed Mnemos {}. Activation remains a separate choice.",
-                        package.manifest.version
-                    ));
-                }
-            }
-            Some(2) => {
-                activate("mnemos")?;
-                release = None;
-            }
-            Some(3) => {
-                import(Some("mnemos"))?;
-                release = None;
-            }
-            Some(5) => {
-                crate::cli::plugin_cmd::update_mnemos(None, None, false).await?;
-                release = None;
-            }
+        match action(&format!("Mnemos\n{summary}"), rows)? {
+            Some(0) => browse_public_catalog().await?,
+            Some(1) => review_mnemos_release(None).await?,
+            Some(2) => activate("mnemos")?,
+            Some(3) => import(Some("mnemos"))?,
             Some(4) | None => return Ok(()),
             _ => unreachable!("fixed Mnemos setup actions"),
         }
@@ -1126,6 +1309,313 @@ pub(super) async fn edit(cfg: &mut cli_config::CliConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release_fixture(installed: Option<&str>) -> (ReleaseBaseline, releases::ReleaseStatus) {
+        use crate::plugin::install::{FilePin, InstallPins};
+        let target = "x86_64-pc-windows-msvc".to_owned();
+        let pin = FilePin {
+            path: "plugin.json".into(),
+            bytes: 73,
+            sha256: "a".repeat(64),
+            unix_mode: None,
+        };
+        let baseline = ReleaseBaseline {
+            generation: 42,
+            installed: installed.map(|v| {
+                (
+                    v.into(),
+                    InstallPins {
+                        schema_version: 1,
+                        id: "mnemos".into(),
+                        target: target.clone(),
+                        manifest: pin.clone(),
+                        files: vec![FilePin {
+                            path: "provider.exe".into(),
+                            ..pin
+                        }],
+                    },
+                )
+            }),
+        };
+        let status = releases::ReleaseStatus {
+            repository: releases::REPOSITORY.into(),
+            target: target.clone(),
+            installed: None,
+            highest_seen_version: Some("9.0.0".into()),
+            comparison: "unknown".into(),
+            candidate: Some(releases::Candidate {
+                release_id: 123,
+                version: "0.10.0".into(),
+                target,
+                asset_id: 456,
+                filename: "mnemos-0.10.0-x86_64-pc-windows-msvc.zip".into(),
+                bytes: 12345,
+                sha256: "b".repeat(64),
+                checksums_asset_id: 789,
+                checksums_sha256: "c".repeat(64),
+            }),
+            unavailable_reason: None,
+            discovery: "complete".into(),
+        };
+        (baseline, status)
+    }
+
+    #[test]
+    fn release_review_blocks_same_older_incomplete_missing_and_changed_selection() {
+        for (old, message) in [
+            ("0.10.0", "Already installed"),
+            ("0.11.0", "Downgrade unsupported"),
+        ] {
+            let (baseline, status) = release_fixture(Some(old));
+            let error = ReleaseReview::prepare(baseline, status, Some("0.10.0"))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        for mutation in 0..4 {
+            let (baseline, mut status) = release_fixture(None);
+            let exact = match mutation {
+                0 => {
+                    status.discovery = "incomplete".into();
+                    Some("0.10.0")
+                }
+                1 => {
+                    status.candidate = None;
+                    Some("0.10.0")
+                }
+                2 => Some("0.1.0"),
+                _ => {
+                    status.candidate.as_mut().unwrap().sha256 = "invalid".into();
+                    None
+                }
+            };
+            assert!(ReleaseReview::prepare(baseline, status, exact).is_err());
+        }
+    }
+
+    #[test]
+    fn release_baseline_rejects_generation_registration_version_and_payload_drift() {
+        let (baseline, _) = release_fixture(Some("0.9.0"));
+        baseline.validate_current(&baseline).unwrap();
+        for mutation in 0..5 {
+            let mut current = baseline.clone();
+            match mutation {
+                0 => current.generation += 1,
+                1 => current.installed = None,
+                2 => current.installed.as_mut().unwrap().0 = "0.9.1".into(),
+                3 => current.installed.as_mut().unwrap().1.manifest.sha256 = "d".repeat(64),
+                _ => current.installed.as_mut().unwrap().1.files[0].bytes += 1,
+            }
+            assert!(baseline.validate_current(&current).is_err());
+        }
+    }
+
+    #[test]
+    fn release_baseline_refuses_recovery_orphans_and_damaged_registration() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("home");
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.as_path()),
+            ("HOME", fixture.path()),
+            ("USERPROFILE", fixture.path()),
+        ]);
+        assert!(ReleaseBaseline::capture().unwrap().installed.is_none());
+        assert!(!home.exists(), "reading an absent baseline mutated HOME");
+        std::fs::create_dir_all(home.join("plugin-state")).unwrap();
+        for marker in [
+            manager::transaction_marker(),
+            home.join("plugin-state/mnemos-update.json"),
+        ] {
+            std::fs::write(&marker, b"preserve recovery evidence").unwrap();
+            assert!(ReleaseBaseline::capture()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery"));
+            assert_eq!(
+                std::fs::read(&marker).unwrap(),
+                b"preserve recovery evidence"
+            );
+            std::fs::remove_file(marker).unwrap();
+        }
+        std::fs::create_dir_all(manager::packages_root()).unwrap();
+        let orphan = manager::packages_root().join("mnemos");
+        std::fs::write(&orphan, b"orphan evidence").unwrap();
+        assert!(ReleaseBaseline::capture()
+            .unwrap_err()
+            .to_string()
+            .contains("Unregistered"));
+        assert_eq!(std::fs::read(&orphan).unwrap(), b"orphan evidence");
+        std::fs::remove_file(orphan).unwrap();
+        let (baseline, _) = release_fixture(Some("0.9.0"));
+        let (_, pins) = baseline.installed.unwrap();
+        cli_config::edit_memory_plugins(|state| state.record_install(pins)).unwrap();
+        let before = manager::read_state().unwrap();
+        assert!(ReleaseBaseline::capture()
+            .unwrap_err()
+            .to_string()
+            .contains("damaged or unverifiable"));
+        assert_eq!(manager::read_state().unwrap(), before);
+        assert!(!home.join("memory-data").exists());
+    }
+
+    #[tokio::test]
+    async fn selected_release_consent_routes_frozen_candidate_and_original_pins() {
+        for installed in [None, Some("0.9.0")] {
+            let (baseline, status) = release_fixture(installed);
+            let candidate = status.candidate.clone().unwrap();
+            let pins = baseline.installed.as_ref().map(|(_, pins)| pins.clone());
+            let review = ReleaseReview::prepare(baseline.clone(), status, Some("0.10.0")).unwrap();
+            let prompt = review.prompt();
+            for field in [
+                "0.10.0",
+                &candidate.target,
+                &candidate.filename,
+                "12345 bytes",
+                &candidate.sha256,
+                "not publisher trust",
+                "No provider execution, data transfer or migration.",
+            ] {
+                assert!(prompt.contains(field), "missing {field}: {prompt}");
+            }
+            assert!(prompt.lines().count() >= 10);
+            if installed.is_some() {
+                assert!(prompt.contains("0.9.0 -> 0.10.0"));
+                assert!(prompt.contains("revokes execution and Learning consent"));
+                assert!(prompt.contains("Preserves settings, budgets, selection and data location"));
+            } else {
+                assert!(prompt.contains("disabled, unselected and without execution consent"));
+            }
+            let calls = std::cell::Cell::new(0);
+            let result = confirm_release(
+                review,
+                |_| Ok(true),
+                |actual, generation| {
+                    assert!(installed.is_none());
+                    assert_eq!(actual, candidate);
+                    assert_eq!(generation, 42);
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok("install"))
+                },
+                |actual, generation, actual_pins| {
+                    assert!(installed.is_some());
+                    assert_eq!(actual, candidate);
+                    assert_eq!(generation, 42);
+                    assert_eq!(Some(actual_pins), pins);
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok("update"))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                Some(if installed.is_some() {
+                    "update"
+                } else {
+                    "install"
+                })
+            );
+            assert_eq!(calls.get(), 1);
+
+            for confirmation in [Ok(false), Err(anyhow::anyhow!("prompt closed"))] {
+                let (baseline, status) = release_fixture(installed);
+                let review = ReleaseReview::prepare(baseline, status, Some("0.10.0")).unwrap();
+                let result: Result<Option<()>> = confirm_release(
+                    review,
+                    |_| confirmation,
+                    |_, _| {
+                        calls.set(calls.get() + 1);
+                        std::future::ready(Ok(()))
+                    },
+                    |_, _, _| {
+                        calls.set(calls.get() + 1);
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await;
+                assert!(!matches!(result, Ok(Some(_))));
+                assert_eq!(calls.get(), 1, "cancellation reached a downloader");
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_rows_carry_exact_entries_and_refresh_back() {
+        let catalog = releases::ReleaseCatalog {
+            target: "fixture-target".into(),
+            entries: vec![
+                releases::CatalogEntry {
+                    version: "1.0.0".into(),
+                    availability: releases::CatalogAvailability::MetadataOnly,
+                },
+                releases::CatalogEntry {
+                    version: "0.1.0".into(),
+                    availability: releases::CatalogAvailability::PackageMetadata,
+                },
+            ],
+            complete: true,
+        };
+        let (prompt, rows) = catalog_view(Ok(&catalog));
+        assert!(prompt.contains(releases::REPOSITORY));
+        assert!(prompt.contains("2 stable version(s) · complete"));
+        assert_eq!(
+            rows[0],
+            (
+                CatalogAction::Review(catalog.entries[0].clone()),
+                "1.0.0 · metadata-only".into()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                CatalogAction::Review(catalog.entries[1].clone()),
+                "0.1.0 · package metadata present".into()
+            )
+        );
+        assert_eq!(rows[2].0, CatalogAction::Refresh);
+        assert_eq!(rows[3].0, CatalogAction::Back);
+        // Selection carries the exact version, not a latest-release candidate.
+        assert_eq!(catalog.entries[1].version, "0.1.0");
+    }
+
+    #[test]
+    fn catalog_empty_partial_and_error_views_are_honest_and_retryable() {
+        let mut catalog = releases::ReleaseCatalog {
+            target: "fixture".into(),
+            entries: vec![],
+            complete: true,
+        };
+        let (prompt, rows) = catalog_view(Ok(&catalog));
+        assert!(prompt.contains("No stable releases found · complete"));
+        assert_eq!(
+            rows,
+            vec![
+                (CatalogAction::Refresh, "Refresh".into()),
+                (CatalogAction::Back, "Back".into())
+            ]
+        );
+        catalog.complete = false;
+        let (prompt, _) = catalog_view(Ok(&catalog));
+        assert!(prompt.contains("partial: page limit reached; not authoritative latest"));
+        let error = anyhow::anyhow!("network\n\u{1b}[2J\u{202e}failed");
+        let (prompt, rows) = catalog_view(Err(&error));
+        assert!(prompt.contains("Check failed:"));
+        assert!(
+            !prompt.contains("No stable releases")
+                && !prompt.contains("\u{1b}")
+                && !prompt.contains("\u{202e}")
+        );
+        assert_eq!(
+            rows,
+            vec![
+                (CatalogAction::Refresh, "Retry".into()),
+                (CatalogAction::Back, "Back".into())
+            ]
+        );
+    }
 
     #[test]
     fn untrusted_terminal_text_is_bounded_and_cannot_inject_controls() {

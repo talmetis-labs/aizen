@@ -147,6 +147,35 @@ pub(crate) struct InstalledVersion {
     pub verified: bool,
     pub error: Option<String>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatalogAvailability {
+    PackageMetadata,
+    MetadataOnly,
+    InvalidPackageMetadata,
+}
+impl CatalogAvailability {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::PackageMetadata => "package metadata present",
+            Self::MetadataOnly => "metadata-only",
+            Self::InvalidPackageMetadata => "invalid package metadata",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogEntry {
+    pub(crate) version: String,
+    pub(crate) availability: CatalogAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseCatalog {
+    pub(crate) target: String,
+    pub(crate) entries: Vec<CatalogEntry>,
+    pub(crate) complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReleaseStatus {
     pub repository: String,
@@ -603,11 +632,10 @@ async fn candidate<S: Source>(source: &S, release: &Release, target: &str) -> Re
     }
     Ok(result)
 }
-async fn discover<S: Source>(
+async fn listed_releases<S: Source>(
     source: &S,
-    target: &str,
     exact: Option<&str>,
-) -> Result<(Option<String>, Option<Candidate>, bool)> {
+) -> Result<(Vec<Release>, bool)> {
     let mut releases = Vec::new();
     let mut complete = true;
     if let Some(value) = exact {
@@ -631,8 +659,7 @@ async fn discover<S: Source>(
             }
         }
     }
-    let mut highest = None::<([u32; 3], String)>;
-    let mut eligible = Vec::new();
+    let mut stable = Vec::new();
     let mut seen = BTreeSet::new();
     for release in releases {
         let Some(value) = release.stable_version() else {
@@ -643,20 +670,72 @@ async fn discover<S: Source>(
             seen.insert(value.to_owned()),
             "Duplicate stable Mnemos release versions",
         )?;
-        if highest.as_ref().is_none_or(|(v, _)| order > *v) {
-            highest = Some((order, value.into()));
-        }
-        if release.inventory().is_ok() {
-            eligible.push((order, release));
-        }
+        stable.push((order, release));
     }
-    let highest = highest.map(|(_, value)| value);
+    stable.sort_by_key(|(order, _)| std::cmp::Reverse(*order));
+    Ok((
+        stable.into_iter().map(|(_, release)| release).collect(),
+        complete,
+    ))
+}
+
+async fn catalog_with<S: Source>(source: &S, target: &str) -> Result<ReleaseCatalog> {
+    let (releases, complete) = listed_releases(source, None).await?;
+    let entries = releases
+        .iter()
+        .map(|release| CatalogEntry {
+            version: release
+                .stable_version()
+                .expect("validated stable release")
+                .into(),
+            availability: if release.assets.is_empty() {
+                CatalogAvailability::MetadataOnly
+            } else if release.inventory().is_ok() {
+                CatalogAvailability::PackageMetadata
+            } else {
+                CatalogAvailability::InvalidPackageMetadata
+            },
+        })
+        .collect();
+    Ok(ReleaseCatalog {
+        target: target.into(),
+        entries,
+        complete,
+    })
+}
+
+/// Read-only catalog: asset metadata is not a checksum-verified installation candidate.
+pub(crate) async fn catalog() -> Result<ReleaseCatalog> {
+    let target = manager::host_target().map_err(|_| {
+        fail(
+            "unsupported_target",
+            "Mnemos packages are unavailable for this Core platform",
+        )
+    })?;
+    let http = Http::new(CHECK_SECONDS)?;
+    tokio::time::timeout(
+        Duration::from_secs(CHECK_SECONDS),
+        catalog_with(&http, target),
+    )
+    .await
+    .map_err(|_| fail("network_error", "Mnemos release list check timed out"))?
+}
+
+async fn discover<S: Source>(
+    source: &S,
+    target: &str,
+    exact: Option<&str>,
+) -> Result<(Option<String>, Option<Candidate>, bool)> {
+    let (releases, complete) = listed_releases(source, exact).await?;
+    let highest = releases
+        .first()
+        .and_then(|release| release.stable_version())
+        .map(str::to_owned);
     if !complete {
         return Ok((highest, None, false));
     }
-    eligible.sort_by_key(|(order, _)| std::cmp::Reverse(*order));
-    let selected = match eligible.first() {
-        Some((_, release)) => Some(candidate(source, release, target).await?),
+    let selected = match releases.iter().find(|release| release.inventory().is_ok()) {
+        Some(release) => Some(candidate(source, release, target).await?),
         None => None,
     };
     Ok((highest, selected, true))

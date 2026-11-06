@@ -138,8 +138,17 @@ Local install never selects or runs the package. No provider is a normal state.
 **Provider** always lists Mnemos with an accent color and textual status, even when not installed.
 Absent Mnemos opens setup with an explicit public-release check and local directory/ZIP import;
 both installation paths verify the package ID before publication. Opening setup does not download.
-Release setup displays installed/downloadable versions and requires separate confirmation to download
-and install. Installed custom providers use verified manifest names. Choosing activation for a
+Release setup includes **List public Mnemos versions**, with per-version package-metadata status,
+refresh and back. Listing alone fetches neither checksums nor ZIPs. Metadata-only or invalid-asset
+releases remain visible; a partial list is labeled explicitly. Selecting a version checks **that exact
+release**, without falling back to latest, and shows its target, archive size and SHA256 before a
+default-No confirmation. Confirmation downloads and installs an absent package, or transactionally
+updates an installed older version. Same-version replacement, downgrade and damaged-package repair
+are not offered. First installation stays disabled, unselected and ungranted. Updates preserve settings,
+budgets, selection and data location but disable Mnemos and revoke execution/Learning consent; selected
+Memory is disabled until separate activation. No provider executes and no data is transferred or
+migrated. **Check latest installable release** uses the same review and confirmation flow for the latest
+available package. Installed custom providers use verified manifest names. Choosing activation for a
 provider asks for execution/platform/network consent if missing, then atomically makes it eligible,
 selects it and enables Memory after confirmation. Saved valid consent can be reused. Obsidian is not
 an implemented provider: using a vault would require a separate, explicitly installed adapter.
