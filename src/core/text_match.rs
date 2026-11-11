@@ -121,6 +121,7 @@ static PHRASES: Lazy<Vec<(Vec<&'static str>, &'static str)>> = Lazy::new(|| {
         (vec!["trao", "doi"], "giaotiep"),
         (vec!["noi", "chuyen"], "giaotiep"),
         (vec!["tieng", "viet"], "tiengviet"),
+        (vec!["tieng", "anh"], "tienganh"),
         (vec!["ngon", "ngu"], "ngonngu"),
         (vec!["bien", "dich"], "build"),
     ];
@@ -194,6 +195,7 @@ static SYNONYMS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
         ("compile", "build"),
         ("language", "ngonngu"),
         ("vietnamese", "tiengviet"),
+        ("english", "tienganh"),
         ("host", "machine"),
         ("may", "machine"),
     ]
@@ -440,6 +442,28 @@ mod tests {
         assert!(
             s < SAME_MIN,
             "but it must NOT confirm — that would drop 'for staging and production' (got {s:.2})"
+        );
+    }
+
+    /// `anh` is a referent, so without a phrase entry `tiếng Anh` (English) lost its language and
+    /// read as `tiếng` + the subject: an English-preference fact looked like a strict subset of any
+    /// other-language fact, and one with an extra clause confirmed (was dropped) against it.
+    #[test]
+    fn tieng_anh_keeps_its_language() {
+        assert!(match_tokens("tiếng Anh").contains(&"tienganh".to_string()));
+        assert_eq!(match_tokens("English"), match_tokens("tiếng Anh"));
+        let s = match_similarity(
+            "Người dùng giao tiếp bằng tiếng Anh",
+            "Người dùng giao tiếp bằng tiếng Pháp",
+        );
+        assert!(s < JUDGEMENT_MIN, "English vs French queued at {s:.2}");
+        let s = match_similarity(
+            "Người dùng muốn trả lời bằng tiếng Anh, giao tiếp bằng tiếng Anh",
+            "Người dùng muốn trả lời, giao tiếp bằng tiếng Nhật",
+        );
+        assert!(
+            s < SAME_MIN,
+            "English fact confirmed into a Japanese one at {s:.2}"
         );
     }
 
