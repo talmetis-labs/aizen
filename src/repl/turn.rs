@@ -709,7 +709,8 @@ pub(crate) async fn run_agent_turn(
             let (turn, receipt) =
                 crate::llm::media::with_image_delivery(&cfg.exec_ctx, base, key, model, async {
                     let starter = eager_on.then(|| agent::eager_starter(registry, cfg));
-                    client::stream_chat_with_tools_sink_frozen(
+                    // Keep the streaming future out of the enclosing REPL and loop futures.
+                    Box::pin(client::stream_chat_with_tools_sink_frozen(
                         http,
                         base,
                         key,
@@ -725,7 +726,7 @@ pub(crate) async fn run_agent_turn(
                         },
                         wire_effort,
                         &image_config,
-                    )
+                    ))
                     .await
                 })
                 .await?;

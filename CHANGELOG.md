@@ -30,7 +30,7 @@ development log lives in that monorepo's history.
 ### Fixed
 - Preserve workspace and session bindings across resumed plans and delegated work, with shared
   deadlines and clearer handling of interrupted runs.
-- Prevent stack overflows when parallel Task and Workflow workers stream model responses.
+- Prevent stack overflows while streaming model responses in the REPL, Task, and Workflow.
 - Keep linked Unix worktree metadata accessible to Git and allow clean managed worktree removal
   under Linux Landlock.
 
