@@ -871,7 +871,7 @@ fn print_config(cfg: &cli_config::CliConfig) {
             row("model", theme::accent(m).to_string());
             let (w, was_cfg) = effective_ctx_window(m, cfg.model_context_window);
             let note = if was_cfg {
-                "from provider"
+                "configured override"
             } else {
                 "estimated by name"
             };
@@ -3663,14 +3663,10 @@ async fn config_edit_model(cfg: &mut cli_config::CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Optional manual context override. Core normally discovers the actual route's provider metadata
-/// and falls back to a labelled estimate; `auto`/blank clears this override.
-///
-/// A no-op when no model is set: the prompt shows the CURRENT model's window, so asking without one
-/// would be asking about nothing.
+/// Set or clear the optional context override for the saved main model.
 fn prompt_context_window(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig) -> Result<()> {
     let Some(model) = cfg.model.clone() else {
-        return Ok(());
+        anyhow::bail!("Select a main model before setting its context window.");
     };
     let (shown, was_cfg) = effective_ctx_window(&model, cfg.model_context_window);
     let ctx_default = cfg
@@ -3690,21 +3686,40 @@ fn prompt_context_window(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig)
         .dim()
     ));
     let ctx_in = Input::<String>::with_theme(theme)
-        .with_prompt("Context window (tokens, e.g. 200000 / 128k, or `auto`)")
+        .with_prompt("Context window in tokens (200,000 / 128k / 1M / auto)")
         .default(ctx_default)
         .allow_empty(true)
+        .validate_with(|input: &String| parse_context_window(input).map(|_| ()))
         .interact_text()?;
-    cfg.model_context_window = match ctx_in
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', "")
-        .replace('k', "000")
-        .parse::<usize>()
-    {
-        Ok(n) if n >= 1000 => Some(n),
-        _ => None, // "auto"/blank/garbage → detect-or-heuristic
-    };
+    apply_context_window_override(cfg, &ctx_in)
+}
+
+fn apply_context_window_override(cfg: &mut cli_config::CliConfig, input: &str) -> Result<()> {
+    cfg.model_context_window = parse_context_window(input).map_err(anyhow::Error::msg)?;
+    cfg.sync_active_provider();
     Ok(())
+}
+
+fn parse_context_window(input: &str) -> std::result::Result<Option<usize>, &'static str> {
+    let input = input.trim().to_ascii_lowercase();
+    if matches!(input.as_str(), "" | "auto" | "0") {
+        return Ok(None);
+    }
+    let (digits, scale) = if let Some(prefix) = input.strip_suffix('k') {
+        (prefix, 1_000)
+    } else if let Some(prefix) = input.strip_suffix('m') {
+        (prefix, 1_000_000)
+    } else {
+        (input.as_str(), 1)
+    };
+    digits
+        .replace([',', '_'], "")
+        .parse::<usize>()
+        .ok()
+        .and_then(|tokens| tokens.checked_mul(scale))
+        .filter(|tokens| *tokens >= 1_000)
+        .map(Some)
+        .ok_or("Enter at least 1,000 tokens, a value like 128k or 1M, or auto.")
 }
 
 /// What the user decided about one search key.

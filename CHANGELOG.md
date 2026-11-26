@@ -30,6 +30,8 @@ development log lives in that monorepo's history.
   approval policy.
 
 ### Fixed
+- Keep context window overrides in sync with the active provider profile. The context editor
+  accepts values such as `200,000` and `1M`, and switching to Auto clears the saved override.
 - Preserve workspace and session bindings across resumed plans and delegated work, with shared
   deadlines and clearer handling of interrupted runs.
 - Prevent stack overflows while streaming model responses in the REPL, Task, and Workflow.
