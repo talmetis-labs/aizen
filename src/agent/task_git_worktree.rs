@@ -329,21 +329,14 @@ mod tests {
     fn rejects_delegated_and_native_scoped_parents() {
         let parent = ExecutionContext::default();
         assert!(validate(&args(), &parent.without_workspace_restore()).is_err());
-        let root = std::env::temp_dir().join(format!(
-            "aizen-worktree-input-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        let scope =
-            crate::core::native_scope::NativeWriteScope::resolve(&root, &["file.rs".to_owned()])
-                .unwrap();
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        let scope = crate::core::native_scope::NativeWriteScope::resolve(
+            temp.path(),
+            &["file.rs".to_owned()],
+        )
+        .unwrap();
         let scoped = parent.with_native_scope(scope).unwrap();
         assert!(scoped.can_restore_workspace());
         assert!(validate(&args(), &scoped).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

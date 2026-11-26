@@ -1,5 +1,5 @@
 use super::*;
-use crate::core::file_placement::PlacementContext;
+use crate::core::file_placement::{tests::TestDir, PlacementContext};
 use crate::core::workspace_txn::TestLockNamespace;
 use crate::core::{
     cancel::{self, TurnCancel},
@@ -9,22 +9,6 @@ use anyhow::Context;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-struct Retained<T>(Option<T>);
-impl<T> Retained<T> {
-    fn new(value: T) -> Self {
-        Self(Some(value))
-    }
-    fn release(mut self) {
-        drop(self.0.take());
-    }
-}
-impl<T> Drop for Retained<T> {
-    fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
-            std::mem::forget(value);
-        }
-    }
-}
 fn fixture(body: impl FnOnce(&ExecutionContext, &TurnCancel) -> Result<()>) -> Result<()> {
     fixture_with_policy(true, body)
 }
@@ -32,27 +16,20 @@ fn fixture_with_policy(
     admit_policy: bool,
     body: impl FnOnce(&ExecutionContext, &TurnCancel) -> Result<()>,
 ) -> Result<()> {
-    let runner = Retained::new(crate::sandbox::runner::tests::lock());
-    let home_lock = Retained::new(
-        crate::core::config::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    );
+    let _runner = crate::sandbox::runner::tests::lock();
+    let _home_lock = crate::core::config::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     struct Mode(crate::sandbox::SandboxMode);
     impl Drop for Mode {
         fn drop(&mut self) {
             crate::sandbox::set_mode(self.0);
         }
     }
-    let mode = Retained::new(Mode(crate::sandbox::mode()));
+    let _mode = Mode(crate::sandbox::mode());
     crate::sandbox::set_mode(crate::sandbox::SandboxMode::Guarded);
-    let base = std::env::temp_dir().join(format!(
-        "aizen-workflow-tool-origin-{}-{}",
-        std::process::id(),
-        crate::core::persist::unique_sequence()
-    ));
-    std::fs::create_dir(&base)?;
-    eprintln!("retained workflow tool origin fixture: {}", base.display());
+    let temp = TestDir::new();
+    let base = temp.path();
     let root = base.join("workspace");
     let home = base.join("home");
     std::fs::create_dir(&root)?;
@@ -60,17 +37,17 @@ fn fixture_with_policy(
     std::fs::write(root.join("fixture.txt"), b"frozen reader fixture\n")?;
     let empty_git_config = home.join("empty.gitconfig");
     std::fs::write(&empty_git_config, b"")?;
-    let env = Retained::new(crate::core::config::EnvGuard::set([
+    let _env = crate::core::config::EnvGuard::set([
         ("AIZEN_HOME", home.as_os_str()),
         ("HOME", home.as_os_str()),
         ("USERPROFILE", home.as_os_str()),
         ("GIT_CONFIG_GLOBAL", empty_git_config.as_os_str()),
         ("GIT_CONFIG_NOSYSTEM", std::ffi::OsStr::new("1")),
-    ]));
+    ]);
     let parent = ExecutionContext::default()
         .with_resource_scope("workflow-tool-origin")
         .with_placement(PlacementContext::new(root, home)?)
-        .with_test_lock_namespace(TestLockNamespace::fixture(&base));
+        .with_test_lock_namespace(TestLockNamespace::fixture(base));
     // Match the actual driver's task binding and policy admission before dispatch.
     // Resource scope creates the private task, but does not admit its policy.
     let actual_task = parent.task().unwrap().clone();
@@ -87,8 +64,8 @@ fn fixture_with_policy(
         parent
     };
     let token = TurnCancel::new();
-    let result = crate::core::workspace_txn::with_test_lock_home(&base, || -> Result<()> {
-        // Save through the actual public configuration API in this retained private home.
+    crate::core::workspace_txn::with_test_lock_home(base, || -> Result<()> {
+        // Save through the actual public configuration API in this private home.
         // No private ResolvedSynthesis fields or classification flags are fabricated.
         crate::core::cli_config::save(&crate::core::cli_config::CliConfig {
             response_visuals: Some(crate::core::cli_config::ResponseVisuals::Off),
@@ -101,14 +78,9 @@ fn fixture_with_policy(
         );
         body(&parent, &token)?;
         // Read the latch under the same test namespace, before restoring controls.
-        Ok(crate::core::proctree::check_bounded_effects()?)
-    });
-    result?;
-    env.release();
-    mode.release();
-    home_lock.release();
-    runner.release();
-    Ok(())
+        crate::core::proctree::check_bounded_effects()
+            .context("workflow fixture left unsettled process effects")
+    })
 }
 fn enter<T>(ctx: &ExecutionContext, token: &TurnCancel, body: impl FnOnce() -> T) -> T {
     cancel::with_current(token.clone(), || exec_ctx::with_current(ctx.clone(), body))
@@ -165,8 +137,8 @@ fn adaptive_workflow_observer_covers_frozen_dependency_workload_and_parent() -> 
         let until =
             super::super::prepared_tool_deadline(&crate::agent::AgentConfig::default(), &call)
                 .into_std();
-        assert!(until.duration_since(before) >= Duration::from_secs(6719));
-        assert!(until.duration_since(before) <= Duration::from_secs(6721));
+        let budget = Duration::from_secs(6720);
+        assert!((before + budget..=Instant::now() + budget).contains(&until));
         let cap = Instant::now() + Duration::from_secs(15);
         let cfg = crate::agent::AgentConfig {
             deadline: Some(cap),
@@ -193,8 +165,8 @@ fn adaptive_workflow_observer_keeps_fixed_override_and_opt_out() -> Result<()> {
         let call = adaptive_observer_call(parent, token)?;
         let before = Instant::now();
         let until = prepared_wall_deadline(&call).unwrap();
-        assert!(until.duration_since(before) >= Duration::from_secs(7259));
-        assert!(until.duration_since(before) <= Duration::from_secs(7261));
+        let budget = Duration::from_secs(7260);
+        assert!((before + budget..=Instant::now() + budget).contains(&until));
         let _zero = crate::core::config::EnvGuard::set([("AIZEN_SUBAGENT_WALL_SECS", "0")]);
         assert!(
             prepared_wall_deadline(&call).is_none(),

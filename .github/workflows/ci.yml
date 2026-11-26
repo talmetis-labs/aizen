@@ -47,6 +47,7 @@ jobs:
         run: cargo build --bin aizen
 
       - name: Test
+        timeout-minutes: 40
         run: cargo test --bin aizen
 
       # What the sandbox can actually enforce on THIS runner, in the job log — the per-platform
