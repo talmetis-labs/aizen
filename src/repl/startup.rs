@@ -17,6 +17,10 @@ use dialoguer::Confirm;
 /// and load them, or dismiss (won't nag again — `aizen mcp trust` re-enables). MCP servers can run
 /// commands, hence the explicit gate before auto-arming a stranger's repo.
 pub(crate) fn prompt_mcp_trust(server_count: usize) {
+    let ctx = crate::agent::hooks::automation_context(None);
+    let Ok(_admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+        return;
+    };
     let theme = ui_theme();
     println!(
         "\n{}",
@@ -84,6 +88,10 @@ pub(crate) fn needs_onboarding() -> bool {
 /// an optional messaging-app connect — finally dropping into the normal chat TUI. Marks `onboarded`
 /// up front so it shows exactly once (even if the user Ctrl-C's mid-setup); `aizen config` reruns setup.
 pub(crate) async fn first_run_onboarding() {
+    let ctx = crate::agent::hooks::automation_context(None);
+    let Ok(_admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+        return;
+    };
     // Persist the "seen it" flag immediately so this intro never nags on a later launch.
     let mut cfg = cli_config::load();
     cfg.onboarded = Some(true);
@@ -178,6 +186,10 @@ pub(crate) fn identity_banner() -> (String, Vec<String>) {
 /// Persona-owned stem migration. Persistent Memory migration belongs to an explicitly selected
 /// provider and is never an automatic Core startup action.
 pub(crate) fn run_id_migration_once() {
+    let ctx = crate::agent::hooks::automation_context(None);
+    let Ok(_admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+        return;
+    };
     // Persona self-memory filenames had the same defect, worse in proportion (45 of 89 files on the
     // measured store) and less visible, because `/persona self` renders bodies rather than names.
     // Separate pass, separate per-persona flag: a character created later still gets migrated.
@@ -194,26 +206,56 @@ pub(crate) fn run_id_migration_once() {
     }
 }
 
+/// Capture admission on the settled caller, before Tokio drops its task-local owner. The spawned
+/// future owns that admission until settlement; suppressed work is dropped, never queued for exit.
+fn spawn_startup_automation<F>(future: F) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let ctx = crate::agent::hooks::automation_context(None);
+    let admitted = crate::agent::hooks::admit_automation(&ctx).ok()?;
+    Some(tokio::spawn(crate::core::exec_ctx::with_current_future(
+        admitted, future,
+    )))
+}
+
 /// Startup update housekeeping, shared by both REPL surfaces.
 ///
 /// Sweeps the `.old-*` backups an earlier `/update` left behind (nothing holds them once that
 /// process exited), arms the silent 24h check, and surfaces whatever the *previous* check cached —
 /// so the notice never costs this launch a network round-trip.
 pub(crate) fn startup_update_probe() {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            features::update::cleanup_stale_backups(dir, &exe);
+    let ctx = crate::agent::hooks::automation_context(None);
+    let Ok(admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+        return;
+    };
+    crate::core::exec_ctx::with_current(admitted, || {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                features::update::cleanup_stale_backups(dir, &exe);
+            }
         }
-    }
-    features::update::spawn_background_check();
-    if let Some(notice) = features::update::cached_notice() {
-        tui::emit_line(&style(notice).dim().to_string());
-    }
-    if let Some(notice) = crate::plugin::update_check::cached_notice() {
-        tui::emit_line(&style(notice).dim().to_string());
-    }
-    crate::plugin::update_check::spawn_background_check();
+        let _ = spawn_startup_automation(features::update::background_check());
+        if let Some(notice) = features::update::cached_notice() {
+            tui::emit_line(&style(notice).dim().to_string());
+        }
+        if let Some(notice) = crate::plugin::update_check::cached_notice() {
+            tui::emit_line(&style(notice).dim().to_string());
+        }
+        if cli_config::update_check_enabled(&cli_config::load()) {
+            let _ = spawn_startup_automation(async {
+                let _ = crate::plugin::update_check::status(
+                    crate::plugin::update_check::Mode::Automatic,
+                )
+                .await;
+            });
+        }
+    });
 }
+
+#[cfg(test)]
+#[path = "startup_control_tests.rs"]
+mod startup_control_tests;
 
 /// The "⟲ last conversation ..." line both REPLs offer at startup, or `None` when this project
 /// has nothing saved to come back to.

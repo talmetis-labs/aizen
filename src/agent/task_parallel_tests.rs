@@ -53,6 +53,27 @@ fn native_call(id: &str, name: &str, args: Value) -> String {
     )
 }
 
+fn assert_workflow_child_statuses(text: &str, expected: &[(&str, &str)]) {
+    for (id, status) in expected {
+        let prefix = format!("  • {id} (");
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing workflow child outcome for {id}: {text}"));
+        assert!(
+            line.contains(&format!(" — {status} [")),
+            "workflow must preserve each child's verification state: {line}"
+        );
+    }
+    assert_eq!(
+        text.contains("[Workflow incomplete:"),
+        expected
+            .iter()
+            .any(|(_, status)| !workflow::completed_status(status)),
+        "synthesis must not promote an unverified handoff to workflow success: {text}"
+    );
+}
+
 /// Inspect only bounded metadata from the owned journal; do not surface source images.
 fn journal_metadata(home: &std::path::Path) -> Vec<Value> {
     let bytes = std::fs::read(home.join("native-journal-v1/records.bin")).unwrap();
@@ -370,7 +391,7 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
         .iter()
         .map(|c| Message::tool_result(&c.id, "pending"))
         .collect();
-    let (mut checkpointed, mut lease, mut baseline) = (false, None, None);
+    let (mut lease, mut baseline) = (None, None);
     let records = execute_execution_calls(
         &registry,
         &calls,
@@ -379,7 +400,6 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
         &cfg,
         &mut sink,
         Vec::new(),
-        &mut checkpointed,
         &mut lease,
         &mut baseline,
         &[],
@@ -398,11 +418,35 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
     for (index, record) in records.iter().enumerate() {
         assert_eq!(record.call_id, calls[index].id);
         assert_eq!(record.outcome.effect_state, tools::ToolEffectState::Settled);
-        assert!(
-            record.outcome.failure.is_none(),
-            "{}",
+        assert_eq!(
+            record.outcome.failure.is_some(),
+            workflow && !shared,
+            "settled workflow writes remain unverified until the parent checks them: {}",
             record.outcome.observation.text
         );
+        if workflow {
+            assert_workflow_child_statuses(
+                &record.outcome.observation.text,
+                &[
+                    (
+                        "first",
+                        if shared {
+                            "done"
+                        } else {
+                            "incomplete-unverified-handoff"
+                        },
+                    ),
+                    (
+                        "reader",
+                        if cross {
+                            "incomplete-unverified-handoff"
+                        } else {
+                            "done"
+                        },
+                    ),
+                ],
+            );
+        }
         let tool = registry
             .get(if workflow { "workflow" } else { "task" })
             .unwrap();
@@ -419,7 +463,7 @@ async fn real_mixed_access(planned: bool, workflow: bool, case: AccessCase) {
         std::fs::read_to_string(root.join("b.txt")).unwrap(),
         if cross { "after-b" } else { "before-b" }
     );
-    assert!(!checkpointed);
+    assert!(!home.join("timemachine").exists());
     assert!(baseline.is_none());
 }
 
@@ -707,6 +751,7 @@ async fn real_native_dispatch_case(
             let turn = turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let next = if turn == 1 {
                 ChatTurn {
+                    speech_final_verified: false,
                     content: None,
                     tool_calls: parent_calls.clone(),
                     finish_reason: Some("tool_calls".into()),
@@ -738,6 +783,21 @@ async fn real_native_dispatch_case(
                     check.contains("passed after this edit batch"),
                     "owned parent verification observation: {check}"
                 );
+                if workflow {
+                    let report = messages
+                        .iter()
+                        .filter(|message| message.role == "tool")
+                        .filter_map(|message| message.content.as_deref())
+                        .find(|text| text.contains("[workflow:"))
+                        .expect("parent retains the incomplete workflow handoff report");
+                    assert_workflow_child_statuses(
+                        report,
+                        &[
+                            ("task-a", "incomplete-unverified-handoff"),
+                            ("task-b", "incomplete-unverified-handoff"),
+                        ],
+                    );
+                }
                 if fail_after_edit {
                     assert!(messages.iter().any(|message| message.role == "tool"
                         && message
@@ -765,7 +825,6 @@ async fn real_native_dispatch_case(
         .iter()
         .map(|call| Message::tool_result(&call.id, "pending"))
         .collect();
-    let mut checkpointed = false;
     let mut lease = None;
     let mut baseline = None;
     let records = if parent_verify {
@@ -779,7 +838,6 @@ async fn real_native_dispatch_case(
             &c,
             &mut sink,
             Vec::new(),
-            &mut checkpointed,
             &mut lease,
             &mut baseline,
             &[],
@@ -806,11 +864,21 @@ async fn real_native_dispatch_case(
     for (index, (record, call)) in records.iter().zip(&calls).enumerate() {
         assert_eq!(record.call_id, call.id);
         assert_eq!(record.outcome.effect_state, tools::ToolEffectState::Settled);
-        assert!(
-            record.outcome.failure.is_none(),
-            "{}",
+        assert_eq!(
+            record.outcome.failure.is_some(),
+            workflow,
+            "native workflow edits without a parent check are settled handoffs, not success: {}",
             record.outcome.observation.text
         );
+        if workflow {
+            assert_workflow_child_statuses(
+                &record.outcome.observation.text,
+                &[
+                    ("task-a", "incomplete-unverified-handoff"),
+                    ("task-b", "incomplete-unverified-handoff"),
+                ],
+            );
+        }
         assert!(
             record.changed_workspace(tool),
             "actual child changes must arm the parent"
@@ -833,8 +901,8 @@ async fn real_native_dispatch_case(
         );
     }
     assert!(
-        !checkpointed,
-        "scoped children must not create whole-worktree checkpoints"
+        !home.join("timemachine").exists(),
+        "dispatch must not create a private snapshot directory"
     );
     assert!(
         baseline.is_none(),

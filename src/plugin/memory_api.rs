@@ -1031,6 +1031,12 @@ pub fn decode_reply<T: DeserializeOwned>(frame: &[u8], expected_id: u64) -> Resu
 
 // The seed enforces nesting before recursion and refuses duplicate keys before decoding typed data.
 pub fn strict_json(bytes: &[u8]) -> Result<Value> {
+    strict_json_bounded(bytes, MAX_FRAME)
+}
+
+/// The same duplicate/depth checks for host metadata with its own byte bound. The provider wire
+/// still uses `strict_json` and its fixed frame limit.
+pub(crate) fn strict_json_bounded(bytes: &[u8], max_bytes: usize) -> Result<Value> {
     struct Seed(usize);
     impl<'de> DeserializeSeed<'de> for Seed {
         type Value = Value;
@@ -1100,7 +1106,7 @@ pub fn strict_json(bytes: &[u8]) -> Result<Value> {
             Ok(Value::Object(values))
         }
     }
-    if bytes.len() > MAX_FRAME {
+    if bytes.len() > max_bytes {
         return Err(MemoryError::invalid("JSON frame exceeds limit"));
     }
     let mut decoder = serde_json::Deserializer::from_slice(bytes);

@@ -9,6 +9,9 @@
 pub mod background;
 pub mod input_pre;
 pub mod learning_queue;
+pub(crate) mod planning;
+pub(crate) mod planning_migration;
 pub mod postturn;
 pub mod startup;
 pub mod turn;
+pub(crate) mod workspace;

@@ -60,8 +60,7 @@ pub enum VerifyCommand {
     Unittest { py: String, files: Vec<String> },
     /// `go test <pkgs>`: the packages whose files were edited and that carry `_test.go` files.
     GoTest(Vec<String>),
-    /// `npx vitest run <files>` / `npx jest <files>`: the sibling test files of the edited
-    /// JS/TS files under the runner `package.json` declares.
+    /// Targeted test files under the Node test runner declared in package.json.
     NodeTest { runner: String, files: Vec<String> },
     /// The project's whole test suite — detected from the manifest, or `suite` in a trusted
     /// `.aizen/verify.json`. The last rung of the ladder; see [`plan_ladder`].
@@ -105,6 +104,7 @@ impl VerifyCommand {
             }
             VerifyCommand::GoTest(pkgs) => format!("go test {}", pkgs.join(" ")),
             VerifyCommand::NodeTest { runner, files } => match runner.as_str() {
+                "node" => format!("node --test {}", quote_all(files)),
                 "vitest" => format!("npx vitest run {}", quote_all(files)),
                 _ => format!("npx jest {}", quote_all(files)),
             },
@@ -136,13 +136,32 @@ fn quote_all(files: &[String]) -> String {
 pub const ABSENCE_DEMAND: &str = "[verify] No build or test command could be run for this project \
     (looked for Cargo.toml, package.json, tsconfig.json, go.mod, pom.xml, build.gradle, a .csproj/.sln, \
     pyproject.toml/setup.py and .aizen/verify.json — or the toolchain is not installed here). You edited \
-    files: before finishing, run the project's own build or test command with shell_run and quote its \
-    exit code and any failing lines, or state plainly that no such command exists. Do not report done \
-    on an unverified change.";
+    files: use a supported runtime verification command (or a trusted .aizen/verify.json), or state \
+    plainly that verification is unavailable. Shell stdout and a quoted exit code do not certify \
+    completion; unverified changes remain incomplete.";
+
+/// Termination is captured at the process boundary, never inferred from compiler prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyTermination {
+    Passed,
+    Failed,
+    Unavailable,
+    Cancelled,
+    TimedOut,
+    Deferred,
+    Unstable,
+    Unsettled,
+}
 
 /// The outcome of one verify-gate run.
 #[derive(Debug, Clone)]
 pub struct VerifyGateResult {
+    pub termination: VerifyTermination,
+    /// Source identity captured before execution and revalidated after the last rung.
+    pub source_identity: Option<[u8; 32]>,
+    /// Only commands which actually passed; skipped ladder rungs are never included.
+    pub passed_commands: Vec<String>,
     pub background_deferred: bool,
     pub passed: bool,
     pub command: String,
@@ -154,7 +173,8 @@ pub struct VerifyGateResult {
 
 impl VerifyGateResult {
     pub fn accepted(&self) -> bool {
-        !self.background_deferred
+        self.termination == VerifyTermination::Passed
+            && !self.background_deferred
             && self.passed
             && self.stable
             && self.effect_state == crate::agent::tools::ToolEffectState::Settled
@@ -330,7 +350,7 @@ pub fn detect_verify_commands(cwd: &Path) -> Vec<VerifyCommand> {
 /// `None` ⇒ no usable custom file (missing / untrusted / unparseable).
 fn load_custom_verify(cwd: &Path) -> Option<Vec<VerifyCommand>> {
     let text = std::fs::read_to_string(cwd.join(".aizen").join("verify.json")).ok()?;
-    if !crate::agent::mcp::project_trusted() {
+    if !crate::agent::mcp::project_trusted_at(cwd) {
         return None; // untrusted repo → the file is inert
     }
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -354,7 +374,7 @@ fn load_custom_verify(cwd: &Path) -> Option<Vec<VerifyCommand>> {
 /// The custom file's per-command timeout (clamped [10, 600]); `None` when absent/untrusted.
 fn custom_verify_timeout(cwd: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(cwd.join(".aizen").join("verify.json")).ok()?;
-    if !crate::agent::mcp::project_trusted() {
+    if !crate::agent::mcp::project_trusted_at(cwd) {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -607,7 +627,7 @@ pub fn narrow_tests(root: &Path, edited: &[PathBuf]) -> Vec<VerifyCommand> {
                     let dir = p.parent().unwrap_or(root);
                     let mut cands: Vec<PathBuf> = Vec::new();
                     for kind in ["test", "spec"] {
-                        for e in ["ts", "tsx", "js", "jsx", "mjs"] {
+                        for e in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
                             cands.push(dir.join(format!("{s}.{kind}.{e}")));
                             cands.push(dir.join("__tests__").join(format!("{s}.{kind}.{e}")));
                             cands.push(dir.join("__tests__").join(format!("{s}.{e}")));
@@ -615,7 +635,17 @@ pub fn narrow_tests(root: &Path, edited: &[PathBuf]) -> Vec<VerifyCommand> {
                     }
                     cands.into_iter().find(|c| c.is_file())
                 };
-                if let Some(r) = hit.as_deref().and_then(rel) {
+                if let Some(r) = hit.as_deref().and_then(rel).filter(|r| {
+                    runner != "node"
+                        || (matches!(ext(Path::new(r)).as_str(), "js" | "mjs" | "cjs")
+                            && r.chars()
+                                .all(|c| c.is_alphanumeric() || "/_-. ".contains(c)))
+                }) {
+                    let r = if runner == "node" {
+                        format!("./{r}")
+                    } else {
+                        r
+                    };
                     push_unique(&mut files, r);
                 }
             }
@@ -654,7 +684,7 @@ fn uses_pytest(root: &Path) -> bool {
         || has("dev-requirements.txt", "pytest")
 }
 
-/// The test runner `package.json` declares: `vitest` or `jest` among the dependencies.
+/// The built-in Node runner in a plain test script, or Vitest/Jest among the dependencies.
 fn node_test_runner(root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(root.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -663,7 +693,26 @@ fn node_test_runner(root: &Path) -> Option<String> {
             .iter()
             .any(|k| json.get(k).and_then(|d| d.get(name)).is_some())
     };
-    if declared("vitest") {
+    // Preserve flags, env setup and shell composition in custom scripts by leaving them to the
+    // normal suite rung. A bare runner with optional literal file operands can be narrowed.
+    let plain_node = json["scripts"]["test"].as_str().is_some_and(|script| {
+        let mut words = script.split_ascii_whitespace();
+        words.next() == Some("node")
+            && words.next() == Some("--test")
+            && words.all(|file| {
+                !file.starts_with('-')
+                    && matches!(
+                        Path::new(file).extension().and_then(|e| e.to_str()),
+                        Some("js" | "cjs" | "mjs")
+                    )
+                    && file
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "/_-. ".contains(c))
+            })
+    });
+    if plain_node {
+        Some("node".to_string())
+    } else if declared("vitest") {
         Some("vitest".to_string())
     } else if declared("jest") {
         Some("jest".to_string())
@@ -766,7 +815,7 @@ pub fn suite_command(root: &Path) -> Option<VerifyCommand> {
 /// The `suite` of a trusted `./.aizen/verify.json`, unless `cmd_guard` blocks it.
 fn custom_suite(root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(root.join(".aizen").join("verify.json")).ok()?;
-    if !crate::agent::mcp::project_trusted() {
+    if !crate::agent::mcp::project_trusted_at(root) {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -868,12 +917,13 @@ pub async fn run_verify_ladder(
     edited: &[PathBuf],
     quiet: bool,
 ) -> Option<VerifyGateResult> {
-    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    let ctx = super::hooks::automation_context(None);
     run_verify_ladder_in_context(root, timeout_secs, edited, quiet, &ctx).await
 }
 
 /// Driver entry point: its context is not installed in the synchronous tool thread-local.
 /// No writer or physical lease is held between ladder rungs or across the model's fix turn.
+#[cfg(test)]
 pub async fn run_verify_ladder_in_context(
     root: &Path,
     timeout_secs: u64,
@@ -881,26 +931,94 @@ pub async fn run_verify_ladder_in_context(
     quiet: bool,
     ctx: &ExecutionContext,
 ) -> Option<VerifyGateResult> {
+    run_completion_ladder_in_context(root, timeout_secs, edited, quiet, ctx, &[]).await
+}
+
+/// Explicit checklist checks may select only commands already known to the trusted verifier.
+/// They do not introduce a second shell-execution surface or inherit optional-suite skipping.
+pub async fn run_completion_ladder_in_context(
+    root: &Path,
+    timeout_secs: u64,
+    edited: &[PathBuf],
+    quiet: bool,
+    ctx: &ExecutionContext,
+    requested: &[String],
+) -> Option<VerifyGateResult> {
+    let ctx = super::hooks::automation_context(Some(ctx));
+    let ctx = match super::hooks::admit_automation(&ctx) {
+        Ok(ctx) => ctx,
+        Err(error) => return automation_refusal(error),
+    };
+    let ctx = &ctx;
+    let mut commands = Vec::new();
+    for command in requested {
+        if !commands.contains(&command) {
+            commands.push(command);
+            if commands.len() > 8 {
+                return verify_terminated(
+                    "verify",
+                    Instant::now(),
+                    VerifyTermination::Unavailable,
+                    "too many explicit check commands for one bounded completion attempt",
+                );
+            }
+        }
+    }
     let _background = match background_admission() {
         Ok(guard) => guard,
         Err(error) => return background_refusal(error),
     };
     let baseline = source_fingerprint(root);
     let record = load_record(root);
-    let ladder = plan_ladder(root, edited, timeout_secs, &record.measured_ms);
+    let mut ladder = plan_ladder(root, edited, timeout_secs, &record.measured_ms);
+    let mut known = detect_verify_commands(root);
+    known.extend(suite_command(root));
+    for command in commands {
+        if let Some(step) = ladder
+            .steps
+            .iter_mut()
+            .find(|s| s.cmd.command_line() == *command)
+        {
+            // An explicit suite obligation cannot be silently skipped after a timeout.
+            step.rung = Rung::NarrowTest;
+        } else if let Some(cmd) = known.iter().find(|cmd| cmd.command_line() == *command) {
+            ladder.steps.push(Step {
+                rung: Rung::NarrowTest,
+                cmd: cmd.clone(),
+            });
+        } else {
+            return verify_terminated(
+                command,
+                Instant::now(),
+                VerifyTermination::Unavailable,
+                "requested check is not a supported runtime verification command",
+            );
+        }
+    }
     if !quiet {
         for note in &ladder.skipped {
             crate::ui::tui::verify_line("verify", note);
         }
     }
     if ladder.steps.is_empty() {
-        return None;
+        return verify_terminated(
+            "verify",
+            Instant::now(),
+            VerifyTermination::Unavailable,
+            "no supported verification command is available",
+        );
     }
     let custom_timeout = custom_verify_timeout(root);
     let mut last_pass: Option<VerifyGateResult> = None;
+    let mut passed_commands = Vec::new();
     for step in ladder.steps {
         if crate::core::cancel::current().is_some_and(|c| c.is_cancelled()) {
-            return None;
+            return verify_terminated(
+                "verify",
+                Instant::now(),
+                VerifyTermination::Cancelled,
+                "verification cancelled before the next command",
+            );
         }
         // A pass that is about to be superseded by the next rung is reported here; the loop
         // reports the final result itself.
@@ -922,7 +1040,7 @@ pub async fn run_verify_ladder_in_context(
         if r.effect_state != crate::agent::tools::ToolEffectState::Settled {
             return Some(r);
         }
-        let timed_out = r.output.starts_with(TIMED_OUT_PREFIX);
+        let timed_out = r.termination == VerifyTermination::TimedOut;
         record_duration(
             root,
             &r.command,
@@ -951,6 +1069,10 @@ pub async fn run_verify_ladder_in_context(
             return Some(r);
         }
         last_pass = Some(r);
+        passed_commands.push(step.cmd.command_line());
+    }
+    if let Some(result) = last_pass.as_mut() {
+        result.passed_commands = passed_commands;
     }
     validate_final_result(last_pass, root, baseline)
 }
@@ -958,11 +1080,15 @@ pub async fn run_verify_ladder_in_context(
 /// `/init`'s share of verification: detect the commands and the suite, time the fast rung once,
 /// and keep the result in HOME. Returns the lines to show the user.
 pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
+    let ctx = super::hooks::automation_context(None);
+    let ctx = match super::hooks::admit_automation(&ctx) {
+        Ok(ctx) => ctx,
+        Err(error) => return vec![format!("verify suppressed: {error:#}")],
+    };
     let _background = match background_admission() {
         Ok(guard) => guard,
         Err(error) => return vec![format!("verify unavailable: {error:#}")],
     };
-    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
     let baseline = source_fingerprint(root);
     let cmds = detect_verify_commands(root);
     let suite = suite_command(root);
@@ -995,7 +1121,7 @@ pub async fn init_verify(root: &Path, timeout_secs: u64) -> Vec<String> {
                     lines.push(format!("verify: `{}` discarded: {}", r.command, r.output));
                     return lines;
                 }
-                let timed_out = r.output.starts_with(TIMED_OUT_PREFIX);
+                let timed_out = r.termination == VerifyTermination::TimedOut;
                 record.measured_ms.insert(
                     r.command.clone(),
                     if timed_out {
@@ -1080,8 +1206,9 @@ fn sandboxed_verify(
 /// Run the project's verify command LIST in order, stopping at the first failure (its result is
 /// the gate result); all-pass returns the last pass. Returns `None` when there is nothing to run
 /// (unknown project) or nothing could even be spawned (best-effort no-op).
+#[cfg(test)]
 pub async fn run_verify_gate(cwd: &Path, timeout_secs: u64) -> Option<VerifyGateResult> {
-    let ctx = crate::core::exec_ctx::current().unwrap_or_default();
+    let ctx = super::hooks::automation_context(None);
     run_verify_gate_in_context(cwd, timeout_secs, &ctx).await
 }
 
@@ -1092,6 +1219,12 @@ pub async fn run_verify_gate_in_context(
     timeout_secs: u64,
     ctx: &ExecutionContext,
 ) -> Option<VerifyGateResult> {
+    let ctx = super::hooks::automation_context(Some(ctx));
+    let ctx = match super::hooks::admit_automation(&ctx) {
+        Ok(ctx) => ctx,
+        Err(error) => return automation_refusal(error),
+    };
+    let ctx = &ctx;
     let _background = match background_admission() {
         Ok(guard) => guard,
         Err(error) => return background_refusal(error),
@@ -1099,16 +1232,24 @@ pub async fn run_verify_gate_in_context(
     let baseline = source_fingerprint(cwd);
     let cmds = detect_verify_commands(cwd);
     if cmds.is_empty() {
-        return None;
+        return verify_terminated(
+            "verify",
+            Instant::now(),
+            VerifyTermination::Unavailable,
+            "no supported verification command is available",
+        );
     }
     let custom_timeout = custom_verify_timeout(cwd);
     let mut last_pass: Option<VerifyGateResult> = None;
+    let mut passed_commands = Vec::new();
     for cmd in cmds {
-        // The gate can hold the turn for minutes per command; it must not be the one region Esc
-        // cannot reach. Between commands is the cheap, safe boundary — `run_one_verify` also
-        // races its wait against this token.
         if crate::core::cancel::current().is_some_and(|c| c.is_cancelled()) {
-            return None; // best-effort by contract; the loop's own cancel check ends the run
+            return verify_terminated(
+                "verify",
+                Instant::now(),
+                VerifyTermination::Cancelled,
+                "verification cancelled before the next command",
+            );
         }
         let secs = match cmd {
             VerifyCommand::Custom(_) => custom_timeout.unwrap_or(timeout_secs),
@@ -1121,15 +1262,16 @@ pub async fn run_verify_gate_in_context(
                     return Some(r);
                 }
                 validate_source_result(&mut r, cwd, baseline);
-                if !r.stable {
+                if !r.stable || !r.passed {
                     return Some(r);
                 }
-                if !r.passed {
-                    return Some(r);
-                }
+                passed_commands.push(r.command.clone());
                 last_pass = Some(r);
             }
         }
+    }
+    if let Some(result) = last_pass.as_mut() {
+        result.passed_commands = passed_commands;
     }
     validate_final_result(last_pass, cwd, baseline)
 }
@@ -1143,6 +1285,7 @@ struct VerifyOwnership {
     _activity: Arc<crate::core::workspace_txn::WorkspaceActivity>,
     _containment: Arc<crate::core::proctree::Containment>,
     _sandbox: Arc<Mutex<crate::sandbox::runner::SpawnGuard>>,
+    _operation_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 fn quarantine_verify(ownership: VerifyOwnership) {
@@ -1153,6 +1296,9 @@ fn quarantine_verify(ownership: VerifyOwnership) {
 
 fn verify_failed(command: &str, start: Instant, output: String) -> Option<VerifyGateResult> {
     Some(VerifyGateResult {
+        termination: VerifyTermination::Failed,
+        source_identity: None,
+        passed_commands: Vec::new(),
         background_deferred: false,
         passed: false,
         command: command.to_string(),
@@ -1161,6 +1307,27 @@ fn verify_failed(command: &str, start: Instant, output: String) -> Option<Verify
         stable: true,
         effect_state: crate::agent::tools::ToolEffectState::Settled,
     })
+}
+
+fn verify_terminated(
+    command: &str,
+    start: Instant,
+    termination: VerifyTermination,
+    note: impl Into<String>,
+) -> Option<VerifyGateResult> {
+    let mut result = verify_failed(command, start, note.into())?;
+    result.termination = termination;
+    Some(result)
+}
+
+/// A policy refusal is not a deferred job and cannot carry any successful check evidence.
+fn automation_refusal(error: anyhow::Error) -> Option<VerifyGateResult> {
+    verify_terminated(
+        "verify",
+        Instant::now(),
+        VerifyTermination::Unavailable,
+        format!("verification suppressed: {error:#}"),
+    )
 }
 
 fn background_admission() -> anyhow::Result<crate::core::workspace_txn::BackgroundProcessBarrier> {
@@ -1179,6 +1346,13 @@ fn background_refusal(error: anyhow::Error) -> Option<VerifyGateResult> {
         format!("verification unavailable: {error:#}"),
     )?;
     result.effect_state = super::tool_error_effect_state(&error);
+    result.termination = if deferred {
+        VerifyTermination::Deferred
+    } else if result.effect_state != crate::agent::tools::ToolEffectState::Settled {
+        VerifyTermination::Unsettled
+    } else {
+        VerifyTermination::Unavailable
+    };
     result.background_deferred = deferred;
     result.stable = false;
     Some(result)
@@ -1187,6 +1361,7 @@ fn background_refusal(error: anyhow::Error) -> Option<VerifyGateResult> {
 fn verify_unsettled(command: &str, start: Instant, output: String) -> Option<VerifyGateResult> {
     let mut result = verify_failed(command, start, output)?;
     result.effect_state = crate::agent::tools::ToolEffectState::UnknownWorker;
+    result.termination = VerifyTermination::Unsettled;
     Some(result)
 }
 
@@ -1210,6 +1385,15 @@ async fn await_verify_tree(
     }
 }
 
+#[path = "verify_frozen.rs"]
+mod frozen;
+pub(crate) use frozen::FrozenVerifyPlan;
+
+/// The per-command budget for a trusted project verify list, else the shared gate default.
+pub(crate) fn destination_verify_timeout(root: &Path) -> u64 {
+    custom_verify_timeout(root).unwrap_or(DEFAULT_TIMEOUT_SECS)
+}
+
 /// Run ONE verify command in `cwd` with a wall-clock timeout.
 async fn run_one_verify(
     cwd: &Path,
@@ -1217,10 +1401,27 @@ async fn run_one_verify(
     timeout_secs: u64,
     ctx: &ExecutionContext,
 ) -> Option<VerifyGateResult> {
+    run_one_verify_owned(cwd, cmd, timeout_secs, ctx, None).await
+}
+
+async fn run_one_verify_owned(
+    cwd: &Path,
+    cmd: &VerifyCommand,
+    timeout_secs: u64,
+    ctx: &ExecutionContext,
+    operation_owner: Option<Arc<dyn Send + Sync>>,
+) -> Option<VerifyGateResult> {
+    let ctx = super::hooks::automation_context(Some(ctx));
+    let ctx = match super::hooks::admit_automation(&ctx) {
+        Ok(ctx) => ctx,
+        Err(error) => return automation_refusal(error),
+    };
+    let ctx = &ctx;
     let command_line = cmd.command_line();
     let start = Instant::now();
     let cancel = crate::core::cancel::current();
-    let strict = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
+    let strict =
+        operation_owner.is_some() || crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
     let mut sbx = match sandboxed_verify(cwd, &command_line, timeout_secs) {
         Ok(sbx) => sbx,
         Err(error) => {
@@ -1267,6 +1468,8 @@ async fn run_one_verify(
         None
     };
     sbx.command
+        // Desktop owns its stdin for host control messages. Verification commands are noninteractive.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -1277,14 +1480,19 @@ async fn run_one_verify(
                 let note = error.to_string();
                 // Do not let a missing-toolchain skip or an earlier passing ladder result erase
                 // unproven cleanup of an actual owned child. Preserve admission until CLI exit.
-                std::mem::forget((error, admission, ctx.clone(), sbx));
+                std::mem::forget((error, admission, ctx.clone(), sbx, operation_owner));
                 return verify_unsettled(
                     &command_line,
                     start,
                     format!("verification incomplete: {note}; physical ownership quarantined until CLI exit"),
                 );
             }
-            return None; // No remaining physical body; missing toolchain remains a skip.
+            return verify_terminated(
+                &command_line,
+                start,
+                VerifyTermination::Unavailable,
+                "verification command could not be spawned; no process remains",
+            );
         }
     };
     let containment = Arc::new(containment);
@@ -1298,6 +1506,7 @@ async fn run_one_verify(
                 _activity: activity,
                 _containment: Arc::clone(&containment),
                 _sandbox: Arc::clone(&sandbox),
+                _operation_owner: operation_owner,
             },
             quarantine_verify,
         ))
@@ -1371,7 +1580,12 @@ async fn run_one_verify(
         }
     }
     let Some(outcome) = outcome else {
-        return None; // The loop's own cancel check ends the turn.
+        return verify_terminated(
+            &command_line,
+            start,
+            VerifyTermination::Cancelled,
+            "verification cancelled after process settlement",
+        );
     };
     match outcome {
         Ok(Ok(output)) => {
@@ -1392,9 +1606,25 @@ async fn run_one_verify(
             }
             if !output.status.success() && looks_like_missing_tool(output.status.code(), &combined)
             {
-                return None;
+                return verify_terminated(
+                    &command_line,
+                    start,
+                    VerifyTermination::Unavailable,
+                    "verification toolchain is unavailable",
+                );
             }
             Some(VerifyGateResult {
+                termination: if output.status.success() {
+                    VerifyTermination::Passed
+                } else {
+                    VerifyTermination::Failed
+                },
+                source_identity: None,
+                passed_commands: if output.status.success() {
+                    vec![command_line.clone()]
+                } else {
+                    Vec::new()
+                },
                 background_deferred: false,
                 passed: output.status.success(),
                 command: command_line,
@@ -1409,9 +1639,10 @@ async fn run_one_verify(
             start,
             format!("verify output could not be drained: {error}"),
         ),
-        Err(_) => verify_failed(
+        Err(_) => verify_terminated(
             &command_line,
             start,
+            VerifyTermination::TimedOut,
             format!("{TIMED_OUT_PREFIX}{timeout_secs}s (tree termination requested)"),
         ),
     }
@@ -1431,8 +1662,18 @@ fn validate_source_result(result: &mut VerifyGateResult, root: &Path, baseline: 
         && result.effect_state == crate::agent::tools::ToolEffectState::Settled
         && baseline.is_some()
         && baseline == source_fingerprint(root);
-    if !result.stable {
+    if result.stable {
+        result.source_identity = baseline;
+    } else {
         result.passed = false;
+        if matches!(
+            result.termination,
+            VerifyTermination::Passed | VerifyTermination::Failed
+        ) {
+            result.termination = VerifyTermination::Unstable;
+        }
+        result.source_identity = None;
+        result.passed_commands.clear();
         result.output = "verification result ignored: local source identity changed or could not be captured completely within its limits. No success was reported; retry after the other writer finishes".to_string();
     }
 }
@@ -1574,10 +1815,9 @@ fn parse_cargo_diagnostics(raw: &str) -> Option<Vec<Diagnostic>> {
 pub fn baseline_from_result(result: &VerifyGateResult) -> VerifyBaseline {
     VerifyBaseline {
         command: result.command.clone(),
-        passed: result.passed
-            && result.stable
-            && result.effect_state == crate::agent::tools::ToolEffectState::Settled,
+        passed: result.accepted(),
         diagnostics: (!result.passed
+            && result.termination == VerifyTermination::Failed
             && result.stable
             && result.effect_state == crate::agent::tools::ToolEffectState::Settled)
             .then(|| parse_diagnostics(&result.output))
@@ -1591,7 +1831,13 @@ pub fn baseline_from_result(result: &VerifyGateResult) -> VerifyBaseline {
 /// baseline, unparseable failing output, command mismatch, timeout, or unstable result stays
 /// conservative and requires a clean exit.
 pub fn compare_to_baseline(baseline: &VerifyBaseline, current: &VerifyGateResult) -> VerifyDelta {
-    if !current.stable || current.effect_state != crate::agent::tools::ToolEffectState::Settled {
+    if !current.stable
+        || current.effect_state != crate::agent::tools::ToolEffectState::Settled
+        || !matches!(
+            current.termination,
+            VerifyTermination::Passed | VerifyTermination::Failed
+        )
+    {
         return VerifyDelta {
             passed: false,
             preexisting: 0,
@@ -1796,6 +2042,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn planning_and_stale_verification_stop_before_preparation() {
+        use crate::core::session_control::ExecutionMode;
+        let directory = crate::core::file_placement::tests::TestDir::new();
+        let task = super::super::todo::TaskContext::private();
+        let control = task.control();
+        let stale = ExecutionContext::default().with_task(task.clone());
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let planning = ExecutionContext::default().with_task(task.clone());
+        let before = task.snapshot();
+        for ctx in [&stale, &planning] {
+            for result in [
+                run_verify_gate_in_context(directory.path(), 1, ctx).await,
+                run_completion_ladder_in_context(directory.path(), 1, &[], true, ctx, &[]).await,
+                run_one_verify(
+                    directory.path(),
+                    &VerifyCommand::Custom("exit 0".into()),
+                    1,
+                    ctx,
+                )
+                .await,
+            ] {
+                let result = result.unwrap();
+                assert_eq!(result.termination, VerifyTermination::Unavailable);
+                assert!(result.output.contains("verification suppressed"));
+                assert!(result.source_identity.is_none());
+                assert!(result.passed_commands.is_empty());
+                assert!(!result.background_deferred);
+                assert!(!result.accepted());
+            }
+        }
+        assert_eq!(task.snapshot(), before);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn init_verifier_uses_bound_policy_instead_of_unrestricted_default() {
+        use crate::core::session_control::ExecutionMode;
+        let task = super::super::todo::TaskContext::private();
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let directory = crate::core::file_placement::tests::TestDir::new();
+        super::super::todo::with_context(task, async {
+            let lines = init_verify(directory.path(), 1).await;
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].starts_with("verify suppressed:"));
+            let gate = run_verify_gate(directory.path(), 1).await.unwrap();
+            assert!(gate.output.contains("verification suppressed"));
+        })
+        .await;
     }
 
     #[test]
@@ -2147,6 +2448,28 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         );
     }
 
+    #[tokio::test]
+    async fn distinct_explicit_commands_keep_the_completion_bound() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let requested = (0..9)
+            .map(|i| format!("echo check-{i}"))
+            .collect::<Vec<_>>();
+        let gate = run_completion_ladder_in_context(
+            fixture.path(),
+            1,
+            &[],
+            true,
+            &ExecutionContext::default(),
+            &requested,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gate.termination, VerifyTermination::Unavailable);
+        assert!(gate.output.contains("too many explicit check commands"));
+        assert!(gate.passed_commands.is_empty());
+        assert!(gate.source_identity.is_none());
+    }
+
     #[test]
     fn custom_verify_requires_trust_gate() {
         // An untrusted repo's verify.json must be INERT. Sandbox AIZEN_HOME so the developer's
@@ -2174,10 +2497,67 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     }
 
     #[test]
+    fn custom_verification_trust_follows_checked_root_not_active_project() {
+        use crate::core::config::{EnvGuard, TEST_HOME_LOCK};
+        use crate::core::file_placement::{tests::TestDir, PlacementContext};
+
+        let _home = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = TestDir::new();
+        let root = fixture.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let _env = EnvGuard::set([("AIZEN_HOME", &home)]);
+        let first = root.join("trusted");
+        let second = root.join("untrusted");
+        for (project, command, suite, seconds) in [
+            (&first, "exit 11", "exit 12", 31),
+            (&second, "exit 21", "exit 22", 47),
+        ] {
+            std::fs::create_dir_all(project.join(".aizen")).unwrap();
+            std::fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(
+                project.join(".aizen/verify.json"),
+                serde_json::json!({"commands": [command], "suite": suite, "timeout_secs": seconds})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        let context = |project: &Path| {
+            ExecutionContext::default()
+                .with_placement(PlacementContext::new(project.to_path_buf(), home.clone()).unwrap())
+        };
+        crate::core::exec_ctx::with_current(context(&first), || {
+            crate::agent::mcp::trust_project().unwrap();
+            assert_eq!(
+                detect_verify_commands(&first),
+                vec![VerifyCommand::Custom("exit 11".into())]
+            );
+            assert_eq!(custom_suite(&first).as_deref(), Some("exit 12"));
+            assert_eq!(custom_verify_timeout(&first), Some(31));
+            assert_eq!(detect_verify_commands(&second), vec![VerifyCommand::Cargo]);
+            assert!(custom_suite(&second).is_none());
+            assert!(custom_verify_timeout(&second).is_none());
+        });
+        crate::core::exec_ctx::with_current(context(&second), || {
+            assert_eq!(
+                detect_verify_commands(&first),
+                vec![VerifyCommand::Custom("exit 11".into())]
+            );
+            assert_eq!(custom_suite(&first).as_deref(), Some("exit 12"));
+            assert_eq!(custom_verify_timeout(&first), Some(31));
+            assert_eq!(detect_verify_commands(&second), vec![VerifyCommand::Cargo]);
+            assert!(custom_suite(&second).is_none());
+            assert!(custom_verify_timeout(&second).is_none());
+        });
+    }
+
+    #[test]
     fn accepted_verification_requires_pass_stability_and_actual_settlement() {
         use crate::agent::tools::ToolEffectState;
 
         let mut result = VerifyGateResult {
+            termination: VerifyTermination::Passed,
+            source_identity: None,
+            passed_commands: Vec::new(),
             background_deferred: false,
             passed: true,
             command: "owned verify".into(),
@@ -2187,6 +2567,22 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
             effect_state: ToolEffectState::Settled,
         };
         assert!(result.accepted());
+        for termination in [
+            VerifyTermination::Cancelled,
+            VerifyTermination::TimedOut,
+            VerifyTermination::Unavailable,
+            VerifyTermination::Deferred,
+            VerifyTermination::Unstable,
+            VerifyTermination::Unsettled,
+            VerifyTermination::Failed,
+        ] {
+            result.termination = termination;
+            assert!(
+                !result.accepted(),
+                "pass bits must not override {termination:?}"
+            );
+        }
+        result.termination = VerifyTermination::Passed;
         result.passed = false;
         assert!(!result.accepted());
         result.passed = true;
@@ -2224,6 +2620,9 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     #[test]
     fn stale_pass_and_stale_red_baseline_are_never_reused() {
         let mut result = VerifyGateResult {
+            termination: VerifyTermination::Passed,
+            source_identity: None,
+            passed_commands: Vec::new(),
             background_deferred: false,
             passed: true,
             command: "cargo check".into(),
@@ -2235,6 +2634,7 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         assert!(!baseline_from_result(&result).passed);
         assert!(!compare_to_baseline(&baseline_from_result(&result), &result).passed);
         result.passed = false;
+        result.termination = VerifyTermination::Failed;
         assert!(baseline_from_result(&result).diagnostics.is_none());
         result.stable = true;
         let red = baseline_from_result(&result);
@@ -2253,6 +2653,9 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
         let baseline = source_fingerprint(root);
         assert!(baseline.is_some());
         let pass = VerifyGateResult {
+            termination: VerifyTermination::Passed,
+            source_identity: None,
+            passed_commands: Vec::new(),
             background_deferred: false,
             passed: true,
             command: "owned verify".into(),
@@ -2323,6 +2726,9 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
     #[test]
     fn format_failure_includes_command_and_output() {
         let r = VerifyGateResult {
+            termination: VerifyTermination::Failed,
+            source_identity: None,
+            passed_commands: Vec::new(),
             background_deferred: false,
             passed: false,
             command: "cargo check".into(),
@@ -2458,6 +2864,24 @@ src/lib.ts(3,1): error TS2304: Cannot find name 'foo'.
             }]
         );
         assert_eq!(cmds[0].command_line(), "npx vitest run src/a.test.ts");
+    }
+
+    #[test]
+    fn single_node_edit_runs_its_native_test_after_typecheck() {
+        let root = temp_dir("narrow-node-native");
+        write(
+            &root.join("package.json"),
+            r#"{"scripts":{"typecheck":"node --check calc.cjs","test":"node --test calc.test.cjs"}}"#,
+        );
+        write(&root.join("calc.test.cjs"), "");
+        let steps = plan_ladder(&root, &[root.join("calc.cjs")], 90, &BTreeMap::new()).steps;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| s.cmd.command_line())
+                .collect::<Vec<_>>(),
+            ["npm run typecheck", "node --test ./calc.test.cjs"]
+        );
     }
 
     #[test]

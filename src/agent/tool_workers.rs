@@ -4,9 +4,11 @@
 //! It is not an attempt/resource-release receipt and cannot certify processes or durable effects.
 
 use super::{ToolEffectState, ToolEffectsUnsettled, ToolOutcome};
-use crate::core::speculation::lifecycle::{AttemptLifecycle, WorkerJoinFact};
-use crate::core::speculation::verification::DurableEffectState;
-use crate::core::speculation::workers::{NativeWorkerKind, WorkerResult};
+use crate::core::exec_ctx::WorkspaceBinding;
+use crate::core::git_ops::{GitNativeAttempt, GitNativeLaunchTicket as LaunchTicket};
+use crate::core::worker_evidence::{
+    DurableEffectState, NativeWorkerKind, WorkerJoinFact, WorkerResult,
+};
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::oneshot;
@@ -14,6 +16,19 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 const MAX_BODIES: usize = 128;
+
+/// Exact live Git publisher and the immutable workspace generation it admitted.
+#[derive(Clone, Debug)]
+struct LifecycleBinding {
+    attempt: GitNativeAttempt,
+    binding: WorkspaceBinding,
+}
+
+impl LifecycleBinding {
+    fn reserve_launch(&self) -> Result<LaunchTicket> {
+        self.attempt.reserve_launch()
+    }
+}
 
 pub(crate) struct JoinedBody {
     pub(crate) completed: Instant,
@@ -25,38 +40,24 @@ struct BodyClosure {
     fact: Option<WorkerJoinFact>,
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct WorkerJoinTestProbe(Arc<dyn Fn(usize) + Send + Sync>);
-
-#[cfg(test)]
-impl WorkerJoinTestProbe {
-    pub(crate) fn new(probe: impl Fn(usize) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(probe))
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for WorkerJoinTestProbe {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkerJoinTestProbe")
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Default)]
 struct Admission {
     closed: bool,
     handles: Vec<JoinHandle<BodyClosure>>,
-    #[cfg(test)]
-    join_probe: Option<WorkerJoinTestProbe>,
 }
 
 /// The context carries only a weak producer, never ownership of its own join supervisor.
 #[derive(Clone, Debug)]
 pub(crate) struct ToolWorkerProducer {
     admission: Weak<Mutex<Admission>>,
-    lifecycle: Option<AttemptLifecycle>,
+    lifecycle: Option<LifecycleBinding>,
+}
+
+impl ToolWorkerProducer {
+    pub(crate) fn git_binding(&self) -> Option<(&GitNativeAttempt, &WorkspaceBinding)> {
+        let lifecycle = self.lifecycle.as_ref()?;
+        Some((&lifecycle.attempt, &lifecycle.binding))
+    }
 }
 
 pub(crate) struct ToolWorkerOwner {
@@ -65,7 +66,7 @@ pub(crate) struct ToolWorkerOwner {
     joined: usize,
     unsettled: bool,
     facts: Vec<WorkerJoinFact>,
-    lifecycle: Option<AttemptLifecycle>,
+    lifecycle: Option<LifecycleBinding>,
 }
 
 /// Body quiescence only. Full attempt closure additionally requires explicit resource releases.
@@ -77,15 +78,19 @@ pub(crate) struct JoinedToolBodies {
 }
 
 impl ToolWorkerOwner {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::new_with_optional_lifecycle(None)
     }
 
-    pub(crate) fn new_with_lifecycle(lifecycle: AttemptLifecycle) -> Self {
-        Self::new_with_optional_lifecycle(Some(lifecycle))
+    pub(crate) fn new_with_git_lifecycle(
+        attempt: GitNativeAttempt,
+        binding: WorkspaceBinding,
+    ) -> Self {
+        Self::new_with_optional_lifecycle(Some(LifecycleBinding { attempt, binding }))
     }
 
-    fn new_with_optional_lifecycle(lifecycle: Option<AttemptLifecycle>) -> Self {
+    fn new_with_optional_lifecycle(lifecycle: Option<LifecycleBinding>) -> Self {
         Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             pending: Vec::new(),
@@ -101,16 +106,6 @@ impl ToolWorkerOwner {
             admission: Arc::downgrade(&self.admission),
             lifecycle: self.lifecycle.clone(),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn observe_joins(&mut self, probe: WorkerJoinTestProbe) {
-        let mut admission = self.admission.lock().unwrap();
-        assert!(
-            !admission.closed && admission.handles.is_empty(),
-            "join probe must precede launch"
-        );
-        admission.join_probe = Some(probe);
     }
 
     /// Close launch admission without discarding any physical joins.
@@ -180,12 +175,12 @@ pub(crate) fn launch_prepared(
     body: impl FnOnce() -> ToolOutcome + Send + 'static,
     panic_effect: ToolEffectState,
 ) -> Result<oneshot::Receiver<JoinedBody>> {
-    match crate::agent::builtin::prepared_native_worker(prepared)? {
+    match crate::agent::builtin::prepared_git_native_worker(prepared)? {
         Some(worker) => {
             let lifecycle = producer
                 .and_then(|producer| producer.lifecycle.clone())
-                .context("native worker producer has no live lifecycle controller")?;
-            worker.check_lifecycle(&lifecycle)?;
+                .context("Git-native worker has no live lifecycle controller")?;
+            worker.check_lifecycle(&lifecycle.attempt, &lifecycle.binding)?;
             launch_inner(
                 producer,
                 Some((lifecycle, worker.kind(), worker.digest())),
@@ -210,14 +205,14 @@ pub(crate) fn launch(
 }
 
 struct NativeLaunch {
-    ticket: crate::core::speculation::lifecycle::LaunchTicket,
+    ticket: LaunchTicket,
     kind: NativeWorkerKind,
     prepared_sha256: [u8; 32],
 }
 
 fn launch_inner(
     producer: Option<&ToolWorkerProducer>,
-    native: Option<(AttemptLifecycle, NativeWorkerKind, [u8; 32])>,
+    native: Option<(LifecycleBinding, NativeWorkerKind, [u8; 32])>,
     body: impl FnOnce() -> ToolOutcome + Send + 'static,
     panic_effect: ToolEffectState,
 ) -> Result<oneshot::Receiver<JoinedBody>> {
@@ -257,12 +252,6 @@ fn launch_inner(
             })
         })
         .transpose()?;
-    #[cfg(test)]
-    let join_probe = gate.as_ref().and_then(|gate| {
-        gate.join_probe
-            .clone()
-            .map(|probe| (probe, gate.handles.len()))
-    });
     let (send, receive) = oneshot::channel();
     let delivery = Arc::new(Mutex::new(Some(send)));
     let body_delivery = delivery.clone();
@@ -298,11 +287,7 @@ fn launch_inner(
             (effect, result)
         }).await;
         let (effect, result) = match result {
-            Ok(closed) => {
-                #[cfg(test)]
-                if let Some((probe, index)) = join_probe { (probe.0)(index); }
-                closed
-            }
+            Ok(closed) => closed,
             Err(_) => {
                 deliver(&delivery, ToolOutcome::failed_with_effect_state(
                     "error: tool body panicked; effects may be unsettled; inspect before retrying",

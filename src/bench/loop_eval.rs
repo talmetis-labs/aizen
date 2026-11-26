@@ -14,11 +14,13 @@
 //! sequence of turns regardless of the messages it's handed, so a scenario is a pure fixture:
 //! "given these model turns, the loop must reach this outcome in this many steps."
 
+use crate::agent::todo::{Requirement, TaskContext, Todo};
 use crate::agent::tools::{Tool, ToolRegistry};
 use crate::agent::{AgentConfig, StopReason};
 use crate::core::types::{FunctionCall, Message, ToolCall, ToolDef};
 use crate::llm::client::ChatTurn;
-use anyhow::Result;
+use crate::sandbox::backend::guarded::PrivateTmp;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +59,7 @@ fn scripted(
 
 fn tool_turn(name: &str, args: &str) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: None,
         tool_calls: vec![ToolCall {
             id: format!("call_{name}"),
@@ -76,6 +79,7 @@ fn tool_turn(name: &str, args: &str) -> ChatTurn {
 
 fn final_turn(text: &str) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: Some(text.into()),
         tool_calls: vec![],
         finish_reason: Some("stop".into()),
@@ -90,6 +94,7 @@ fn final_turn(text: &str) -> ChatTurn {
 /// successful one to "look busy" (the W3/W4 anti-pattern).
 fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: None,
         tool_calls: calls
             .iter()
@@ -197,14 +202,19 @@ struct Scenario {
     /// Upper bound on iterations — a healthy loop must not exceed this (catches the "wandered for
     /// 25 steps" regression). `None` skips the check.
     max_iters: Option<usize>,
-    /// Optional seed for the process-global todo list (P0 persistence scenarios).
-    seed_todos: Option<Vec<crate::agent::todo::Todo>>,
+    /// Initial todos with a matching observation for the first row.
+    task_seed: Option<TaskSeed>,
     /// When set, merge onto eval_cfg (P0 flags etc.).
     cfg_overlay: Option<PersistOverlay>,
     /// User task text (default "loop eval task").
     user_task: &'static str,
     /// Substring that must appear in some user/system message (optional assert).
     expect_msg_contains: Option<&'static str>,
+}
+
+struct TaskSeed {
+    todos: Vec<Todo>,
+    observed_target: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -228,7 +238,7 @@ fn scen(
         turns,
         expect_stop,
         max_iters,
-        seed_todos: None,
+        task_seed: None,
         cfg_overlay: None,
         user_task: "loop eval task",
         expect_msg_contains: None,
@@ -240,7 +250,7 @@ fn scen(
 /// the "verified-done" metric is measured structurally by the healthy-Done scenarios reaching Done
 /// within budget, not by running `cargo check`.
 fn scenarios() -> Vec<Scenario> {
-    use crate::agent::todo::{Status, Todo};
+    use crate::agent::todo::Status;
 
     let mut out = vec![
         // ── quick answer: no tools, straight to a final answer ──
@@ -442,7 +452,7 @@ fn scenarios() -> Vec<Scenario> {
         ),
     ];
 
-    // ── P0.1: incomplete todos block Done until poke budget exhausts ──
+    // Exhausting the nudge budget never authorizes unfinished work as Done.
     out.push(Scenario {
         name: "poke_blocks_early_done",
         shape: "persist",
@@ -451,12 +461,15 @@ fn scenarios() -> Vec<Scenario> {
             final_turn("still claiming done"),
             final_turn("exhausted poke budget"),
         ],
-        expect_stop: StopReason::Done,
+        expect_stop: StopReason::Incomplete,
         max_iters: Some(3),
-        seed_todos: Some(vec![
-            Todo::new("done-bit", Status::Done),
-            Todo::new("still-open", Status::Pending),
-        ]),
+        task_seed: Some(TaskSeed {
+            todos: vec![
+                Todo::new("done-bit", Status::Done),
+                Todo::new("still-open", Status::Pending),
+            ],
+            observed_target: "completed fixture step",
+        }),
         cfg_overlay: Some(PersistOverlay {
             enable_todo_poke: true,
             max_todo_poke_attempts: 2,
@@ -474,7 +487,7 @@ fn scenarios() -> Vec<Scenario> {
         turns: vec![tool_turn("echo", r#"{"text":"edit"}"#), final_turn("done")],
         expect_stop: StopReason::Done,
         max_iters: Some(2),
-        seed_todos: Some(vec![]),
+        task_seed: None,
         cfg_overlay: Some(PersistOverlay {
             enable_todo_poke: true,
             max_todo_poke_attempts: 2,
@@ -503,7 +516,10 @@ fn scenarios() -> Vec<Scenario> {
         ],
         expect_stop: StopReason::Done,
         max_iters: Some(4),
-        seed_todos: Some(vec![]),
+        task_seed: Some(TaskSeed {
+            todos: vec![Todo::new("ship it", Status::Pending)],
+            observed_target: "confidence fixture result",
+        }),
         cfg_overlay: Some(PersistOverlay {
             enable_todo_poke: false,
             max_todo_poke_attempts: 0,
@@ -524,7 +540,7 @@ fn scenarios() -> Vec<Scenario> {
         ],
         expect_stop: StopReason::Done,
         max_iters: Some(2),
-        seed_todos: None,
+        task_seed: None,
         cfg_overlay: Some(PersistOverlay {
             enable_todo_poke: false,
             max_todo_poke_attempts: 0,
@@ -579,9 +595,8 @@ fn eval_cfg() -> AgentConfig {
         auto_extend_to: 20,
         quiet: true,
         enable_verify_gate: false, // no real toolchain in the harness — this measures LOOP shape
-        auto_checkpoint: false,    // cwd may be a real repo — no checkpoint pollution
         context_window: 0,         // guard off — scripts are short and synthetic
-        todo_reminder_every: 0,    // recitation reads the process-global list; irrelevant here
+        todo_reminder_every: 0,    // isolate the nudges selected by each scenario
         // P0 harness: off by default in eval_cfg; persistence scenarios opt in explicitly.
         enable_todo_poke: false,
         enable_confidence_gate: false,
@@ -596,28 +611,35 @@ fn eval_cfg() -> AgentConfig {
     }
 }
 
-/// Run one scenario against the REAL loop, return its health verdict, outcome, and measurements.
-#[expect(
-    clippy::await_holding_lock,
-    reason = "Sequential offline scenarios must isolate global todos through the entire scripted loop"
-)]
-async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) {
-    // Serialize process-global todo mutations through seed, execution, assertions and cleanup.
-    // `run` awaits scenarios sequentially on main's multi-thread runtime (this future is not spawned).
-    // The scripted model returns Ready; fixture tools and todo helpers never acquire TEST_LOCK,
-    // including tool bodies awaited on the blocking pool. They use their own short-lived locks.
-    // Dropping this guard before await would let another fixture overwrite the scenario's todos.
-    let _g = crate::agent::todo::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(todos) = &s.seed_todos {
-        crate::agent::todo::set(todos.clone());
+/// Run one scenario against the REAL loop with its own checklist authority.
+async fn run_scenario(s: &Scenario) -> Result<(bool, usize, StopReason, ScenarioStats)> {
+    let task = TaskContext::private();
+    let _fixture = if let Some(seed) = &s.task_seed {
+        let fixture = PrivateTmp::create(s.name).context("create loop benchmark fixture")?;
+        let path = fixture.path().join("observation.txt");
+        std::fs::write(&path, seed.observed_target)?;
+        let fingerprint = crate::core::persist::fingerprint(&path)?;
+        task.replace_with_requirements(
+            seed.todos.clone(),
+            vec![(
+                "@index:0".into(),
+                Requirement::Observe {
+                    target: seed.observed_target.into(),
+                },
+            )],
+        )?;
+        let capture = task
+            .observation_capture(seed.observed_target)
+            .context("loop fixture declares this observation")?;
+        task.record_file_observation(capture, seed.observed_target, &path, &fingerprint)?;
+        Some(fixture)
     } else {
-        crate::agent::todo::clear();
-    }
+        None
+    };
 
     let registry = eval_registry();
     let mut cfg = eval_cfg();
+    cfg.exec_ctx = cfg.exec_ctx.with_task(task);
     if let Some(o) = s.cfg_overlay {
         cfg.enable_todo_poke = o.enable_todo_poke;
         cfg.max_todo_poke_attempts = o.max_todo_poke_attempts;
@@ -651,7 +673,6 @@ async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) 
         true
     };
 
-    crate::agent::todo::clear();
     let mut stats = ScenarioStats {
         model_calls: call_stats.model_calls.load(Ordering::Relaxed),
         ..Default::default()
@@ -685,12 +706,12 @@ async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) 
             stats.nudges += 1;
         }
     }
-    (
+    Ok((
         stop_ok && iters_ok && msg_ok && no_spurious_poke,
         outcome.iters,
         outcome.stop,
         stats,
-    )
+    ))
 }
 
 /// `ChatTurn` doesn't derive `Clone` (it carries JoinHandles); scenarios are re-run at most once
@@ -700,6 +721,7 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
     turns
         .iter()
         .map(|t| ChatTurn {
+            speech_final_verified: false,
             content: t.content.clone(),
             tool_calls: t.tool_calls.clone(),
             finish_reason: t.finish_reason.clone(),
@@ -770,7 +792,7 @@ pub async fn run() -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
     for s in &scens {
-        let (passed, iters, stop, stats) = run_scenario(s).await;
+        let (passed, iters, stop, stats) = run_scenario(s).await?;
         m.model_calls += stats.model_calls;
         m.tool_calls += stats.tool_calls;
         m.repeated_tool_turns += stats.repeated_tool_turns;

@@ -93,6 +93,115 @@ fn summarizer_is_dedicated(base: &str, key: &str, model: &str) -> bool {
     ep.model != model || ep.base_url != base
 }
 
+/// The local stores still resolve through the process workspace. Capture that ownership before
+/// running/queueing a turn and fail closed if a concurrent lane or later directory change differs.
+/// This does not install a process-global cwd/persona override around an async model call.
+pub(crate) struct LocalLearningContext {
+    execution: crate::core::exec_ctx::ExecutionContext,
+    workspace: Option<std::path::PathBuf>,
+    project: Option<std::path::PathBuf>,
+    persona: Option<persona::Persona>,
+}
+
+impl LocalLearningContext {
+    #[cfg(test)]
+    pub(crate) fn capture(workspace: &std::path::Path, persona: Option<persona::Persona>) -> Self {
+        let execution = agent::hooks::automation_context(None);
+        Self::capture_in_context(workspace, persona, &execution)
+    }
+
+    /// Capture the driver's original policy before the turn ends or a background task is spawned.
+    pub(crate) fn capture_in_context(
+        workspace: &std::path::Path,
+        persona: Option<persona::Persona>,
+        execution: &crate::core::exec_ctx::ExecutionContext,
+    ) -> Self {
+        Self {
+            execution: agent::hooks::automation_context(Some(execution)),
+            workspace: workspace.canonicalize().ok(),
+            project: crate::core::exec_ctx::with_current(execution.clone(), || {
+                crate::core::config::project_root().canonicalize().ok()
+            }),
+            persona,
+        }
+    }
+
+    fn owns_current_workspace(&self) -> bool {
+        if !self.execution.permits_automation() {
+            return false;
+        }
+        let workspace = crate::core::exec_ctx::current()
+            .and_then(|ctx| {
+                ctx.placement()
+                    .map(|placement| placement.workspace_root().to_path_buf())
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .and_then(|root| root.canonicalize().ok());
+        let project = crate::core::config::project_root().canonicalize().ok();
+        self.workspace.is_some()
+            && self.project.is_some()
+            && self.workspace == workspace
+            && self.project == project
+    }
+
+    fn flags(&self) -> persona::secretary::IdentityLearning {
+        let owned = self.owns_current_workspace();
+        persona::secretary::IdentityLearning {
+            skills: owned && auto_skill_learn_enabled(),
+            persona_evolve: owned && persona_evolve_enabled(),
+            persona_active: self.persona.as_ref().is_some_and(persona_still_current),
+        }
+    }
+
+    pub(crate) async fn run_completed(
+        &self,
+        stop: &agent::StopReason,
+        history: &[Message],
+        http: &reqwest::Client,
+        endpoint: &cli_config::ResolvedEndpoint,
+    ) {
+        if matches!(stop, agent::StopReason::Done) {
+            self.run(
+                history,
+                http,
+                &endpoint.base_url,
+                &endpoint.api_key,
+                &endpoint.model,
+            )
+            .await;
+        }
+    }
+
+    /// One overall budget for the serial secretary/reflection pair. One-shot surfaces await this
+    /// beside provider learning, not behind it, and no local task survives their process exit.
+    pub(crate) async fn run(
+        &self,
+        history: &[Message],
+        http: &reqwest::Client,
+        base: &str,
+        key: &str,
+        model: &str,
+    ) {
+        let Ok(_admitted) = agent::hooks::admit_automation(&self.execution) else {
+            return;
+        };
+        if !self.flags().enabled() {
+            return;
+        }
+        if tokio::time::timeout(CHORE_CALL_TIMEOUT, async {
+            maybe_run_secretary(history, http, base, key, model, self).await;
+            if self.owns_current_workspace() {
+                maybe_evolve_persona(http, base, key, model, self).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            tui::note_line("Skill/Persona learning timed out; coding result preserved.");
+        }
+    }
+}
+
 /// Core Skill/Persona extraction is independent of Memory flags and provider availability.
 pub(crate) async fn maybe_run_secretary(
     history: &[Message],
@@ -100,22 +209,19 @@ pub(crate) async fn maybe_run_secretary(
     base: &str,
     key: &str,
     model: &str,
+    learning: &LocalLearningContext,
 ) {
     use crate::core::turn_signals;
     use crate::persona::secretary;
 
-    let skills_enabled = auto_skill_learn_enabled();
-    let evolve_enabled = persona_evolve_enabled();
-    let active_persona = if evolve_enabled {
-        persona::active()
-    } else {
-        None
+    let Ok(_admitted) = agent::hooks::admit_automation(&learning.execution) else {
+        return;
     };
-    let flags = secretary::IdentityLearning {
-        skills: skills_enabled,
-        persona_evolve: evolve_enabled,
-        persona_active: active_persona.is_some(),
-    };
+    let flags = learning.flags();
+    let active_persona = learning
+        .persona
+        .as_ref()
+        .filter(|expected| persona_still_current(expected));
     if !flags.enabled() {
         return;
     }
@@ -156,15 +262,12 @@ pub(crate) async fn maybe_run_secretary(
             Err(_) => return,
         };
     let output = flags.parse(&response.content.unwrap_or_default());
-    if output.is_empty() {
+    if output.is_empty() || !learning.owns_current_workspace() {
         return;
     }
-    // Owners are rechecked after the await; they still enforce validation and formative floors.
-    if persona_evolve_enabled() {
-        if let (Some(proposal), Some(active)) = (output.episode.as_ref(), persona::active()) {
-            let slug = skill::sanitize_name(&active.name);
-            let _ = persona::self_mem::record_episode(&slug, &proposal.text, proposal.importance);
-        }
+    // Never redirect a completed turn's experience into a persona selected during the model call.
+    if let (Some(proposal), Some(expected)) = (output.episode.as_ref(), active_persona) {
+        record_persona_episode(expected, proposal);
     }
     if let Some(proposal) = output.skill.as_ref().filter(|_| auto_skill_learn_enabled()) {
         let all_skills = skill::list();
@@ -197,6 +300,20 @@ pub(crate) async fn maybe_run_secretary(
                 .to_string(),
             );
         }
+    }
+}
+
+fn persona_still_current(expected: &persona::Persona) -> bool {
+    persona_evolve_enabled() && persona::active().as_ref() == Some(expected)
+}
+
+fn record_persona_episode(
+    expected: &persona::Persona,
+    proposal: &persona::secretary::EpisodeProposal,
+) {
+    if persona_still_current(expected) {
+        let slug = skill::sanitize_name(&expected.name);
+        let _ = persona::self_mem::record_episode(&slug, &proposal.text, proposal.importance);
     }
 }
 
@@ -251,17 +368,21 @@ pub(crate) async fn maybe_evolve_persona(
     base: &str,
     key: &str,
     model: &str,
+    learning: &LocalLearningContext,
 ) {
-    if !persona_evolve_enabled() {
+    let Ok(_admitted) = agent::hooks::admit_automation(&learning.execution) else {
         return;
-    }
-    let persona = match persona::active() {
-        Some(p) => p,
-        None => return, // no character active → nothing to evolve
+    };
+    let Some(persona) = learning
+        .persona
+        .as_ref()
+        .filter(|expected| persona_still_current(expected))
+    else {
+        return;
     };
     let slug = skill::sanitize_name(&persona.name);
     if persona::self_mem::should_reflect(&slug) {
-        run_persona_reflection(&persona, &slug, http, base, key, model).await;
+        run_persona_reflection(persona, &slug, http, base, key, model, learning).await;
     }
 }
 
@@ -273,6 +394,7 @@ async fn run_persona_reflection(
     base: &str,
     key: &str,
     model: &str,
+    learning: &LocalLearningContext,
 ) {
     let episodes = persona::self_mem::recent_episode_bodies(slug, 20);
     if episodes.len() < persona::self_mem::REFLECT_MIN_EPISODES {
@@ -295,6 +417,9 @@ async fn run_persona_reflection(
         Ok(t) => t,
         Err(_) => return, // best-effort; never disrupt the REPL
     };
+    if !learning.owns_current_workspace() || !persona_still_current(persona) {
+        return;
+    }
     let content = resp.content.unwrap_or_default();
     let json = match extract_json_object(&content) {
         Some(j) => j,
@@ -546,6 +671,60 @@ mod compact_persistence_tests {
 mod learning_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn planning_learning_retains_origin_and_never_replays_after_exit() {
+        use crate::core::session_control::ExecutionMode;
+        let task = agent::todo::TaskContext::private();
+        let control = task.control();
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let learning =
+            agent::todo::with_context(task, async { LocalLearningContext::capture(&cwd, None) })
+                .await;
+        assert!(learning.execution.is_planning());
+        assert!(!learning.owns_current_workspace());
+        assert!(!learning.flags().enabled());
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        assert!(!learning.execution.permits_automation());
+        // Even after exit, no network request/secretary/store work may start for this old turn.
+        let http = reqwest::Client::new();
+        learning
+            .run(
+                &[Message::user("Remember this instruction for later.")],
+                &http,
+                "invalid-no-network",
+                "",
+                "fixture",
+            )
+            .await;
+        assert!(!learning.flags().enabled());
+    }
+
+    #[test]
+    fn blocked_local_learning_does_not_borrow_a_fresh_policy() {
+        use crate::core::{exec_ctx::ExecutionContext, session_control::ExecutionMode};
+        let task = agent::todo::TaskContext::private();
+        let control = task.control();
+        let execution = ExecutionContext::default().with_task(task);
+        let cwd = std::env::current_dir().unwrap();
+        let learning = LocalLearningContext::capture_in_context(&cwd, None, &execution);
+        assert!(control
+            .transition(ExecutionMode::Planning, None, |_| {
+                anyhow::bail!("fixture disk failure")
+            })
+            .is_err());
+        assert!(!learning.owns_current_workspace());
+        assert!(!learning.flags().enabled());
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        assert!(!learning.execution.permits_automation());
+    }
+
     #[test]
     fn the_last_turn_slice_starts_at_the_last_user_message() {
         let h = vec![
@@ -588,6 +767,105 @@ mod learning_tests {
             last_turn_slice(&history)[0].content.as_deref(),
             Some("New real request.")
         );
+    }
+
+    #[test]
+    fn local_learning_rejects_other_roots_and_honors_independent_owner_flags() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.path().as_os_str()),
+            ("AIZEN_PROJECT_ROOT", home.path().as_os_str()),
+        ]);
+        persona::save("Local", "guide", "terse", "Keep a steady voice.").unwrap();
+        persona::set_active("Local").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let local = LocalLearningContext::capture(&cwd, persona::active());
+        let elsewhere = LocalLearningContext::capture(home.path(), persona::active());
+        assert!(local.owns_current_workspace());
+        assert!(!elsewhere.owns_current_workspace());
+        assert!(!elsewhere.flags().enabled());
+        let mut config = cli_config::load();
+        config.auto_skill_learn = Some(true);
+        config.persona_evolve = Some(false);
+        cli_config::save(&config).unwrap();
+        assert!(local.flags().skills);
+        assert!(!local.flags().persona_evolve);
+        config.auto_skill_learn = Some(false);
+        config.persona_evolve = Some(true);
+        cli_config::save(&config).unwrap();
+        assert!(!local.flags().skills);
+        assert!(local.flags().enabled());
+        let without_persona = LocalLearningContext::capture(&cwd, None);
+        assert!(!without_persona.flags().enabled());
+        config.persona_evolve = Some(false);
+        cli_config::save(&config).unwrap();
+        assert!(!local.flags().enabled());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let http = reqwest::Client::new();
+        let ep = cli_config::ResolvedEndpoint {
+            base_url: "invalid-no-network".into(),
+            api_key: String::new(),
+            model: "fixture".into(),
+        };
+        let history = [Message::user("Remember to stay concise.")];
+        runtime.block_on(local.run_completed(&agent::StopReason::Done, &history, &http, &ep));
+        config.auto_skill_learn = Some(true);
+        cli_config::save(&config).unwrap();
+        runtime.block_on(elsewhere.run_completed(&agent::StopReason::Done, &history, &http, &ep));
+        runtime.block_on(local.run_completed(&agent::StopReason::Cancelled, &history, &http, &ep));
+        runtime.block_on(local.run_completed(&agent::StopReason::Incomplete, &history, &http, &ep));
+        assert_eq!(persona::self_mem::counts("local"), (0, 0));
+        assert!(!skill::project_zone_dir().exists());
+    }
+
+    #[test]
+    fn queued_persona_learning_never_moves_to_a_new_active_character() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([
+            ("AIZEN_HOME", home.path().as_os_str()),
+            ("AIZEN_PROJECT_ROOT", home.path().as_os_str()),
+        ]);
+        persona::save("First", "reviewer", "terse", "Stay concise.").unwrap();
+        persona::save("Second", "guide", "warm", "Explain patiently.").unwrap();
+        persona::set_active("First").unwrap();
+        let original = persona::active().unwrap();
+        assert!(persona_still_current(&original));
+        let proposal = persona::secretary::EpisodeProposal {
+            text: "I stayed concise while discussing a difficult disagreement.".into(),
+            importance: 7,
+        };
+        persona::set_active("Second").unwrap();
+        assert!(!persona_still_current(&original));
+        record_persona_episode(&original, &proposal);
+        assert_eq!(persona::self_mem::counts("first"), (0, 0));
+        assert_eq!(persona::self_mem::counts("second"), (0, 0));
+        persona::set_active("First").unwrap();
+        record_persona_episode(&original, &proposal);
+        assert_eq!(persona::self_mem::counts("first"), (1, 0));
+        persona::save(
+            "First",
+            "reviewer",
+            "new voice",
+            "A changed character card.",
+        )
+        .unwrap();
+        assert!(
+            !persona_still_current(&original),
+            "same name does not authorize a replaced card"
+        );
+        let mut config = cli_config::load();
+        config.persona_evolve = Some(false);
+        cli_config::save(&config).unwrap();
+        assert!(!persona_still_current(&persona::active().unwrap()));
     }
 
     #[test]

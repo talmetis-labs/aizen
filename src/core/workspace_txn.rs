@@ -53,7 +53,8 @@ impl TestLockNamespace {
             "lock home must be an existing owned fixture"
         );
         Self {
-            root: std::fs::canonicalize(root).expect("canonical fixture lock home"),
+            root: crate::core::file_placement::path_canonicalize(root)
+                .expect("canonical fixture lock home"),
             _owner: None,
         }
     }
@@ -211,6 +212,20 @@ impl WorkspaceIdentity {
             .map(|p| canonical_existing_or_parent(&p))
             .transpose()?;
 
+        Ok(Self::from_bound_paths(
+            canonical_root,
+            canonical_git_dir,
+            canonical_common_git_dir,
+        ))
+    }
+
+    /// Derive the existing lock-domain keys from independently checked paths, without launching
+    /// inherited-environment Git discovery. This is identity only, never filesystem or write authority.
+    pub(crate) fn from_bound_paths(
+        canonical_root: PathBuf,
+        canonical_git_dir: Option<PathBuf>,
+        canonical_common_git_dir: Option<PathBuf>,
+    ) -> Self {
         let repo_key = canonical_common_git_dir
             .as_ref()
             .or(canonical_git_dir.as_ref())
@@ -224,13 +239,13 @@ impl WorkspaceIdentity {
                 .map(|p| normalized_path(p))
                 .unwrap_or_else(|| "non-git".to_string())
         ));
-        Ok(Self {
+        Self {
             repo_id,
             worktree_id,
             canonical_root,
             canonical_git_dir,
             canonical_common_git_dir,
-        })
+        }
     }
 
     pub fn lock_root(&self) -> PathBuf {
@@ -251,17 +266,41 @@ impl WorkspaceIdentity {
             .join(&self.worktree_id)
             .join("workspace.lock")
     }
+}
 
-    /// Path of the per-worktree Time Machine lock. Reached only through
-    /// `WorkspaceWriterLease::time_machine_lock`, which is itself unused — Time Machine still takes
-    /// its lock via the older `RepoTxnLock::acquire` path.
-    #[allow(dead_code)]
-    pub fn timemachine_lock(&self) -> PathBuf {
-        self.lock_root()
-            .join("worktrees")
-            .join(&self.worktree_id)
-            .join("timemachine.lock")
+/// Lease bookkeeping only: planning may not run Git discovery. The synthetic identity never
+/// enters snapshot/store/activity metadata; global and exact-file locks still exclude real writers.
+fn lease_identity(root: &Path) -> Result<WorkspaceIdentity> {
+    if let Some(policy) = crate::agent::planning::current_policy() {
+        policy.validate_current()?;
+        if policy.is_planning() {
+            let before = native_ancestors(root)?;
+            let canonical_root = crate::core::file_placement::path_canonicalize(root)?;
+            anyhow::ensure!(
+                native_path_key(root)? == native_path_key(&canonical_root)?,
+                "planning lease requires canonical workspace spelling"
+            );
+            let after = native_ancestors(&canonical_root)?;
+            anyhow::ensure!(
+                before.len() == after.len()
+                    && before
+                        .iter()
+                        .zip(&after)
+                        .all(|(a, b)| a.identity == b.identity && a.created == b.created),
+                "planning workspace ancestry changed"
+            );
+            verify_native_ancestors(&before)?;
+            let key = normalized_path(&canonical_root);
+            return Ok(WorkspaceIdentity {
+                repo_id: stable_key(&format!("planning-native-repo:{key}")),
+                worktree_id: stable_key(&format!("planning-native-worktree:{key}")),
+                canonical_root,
+                canonical_git_dir: None,
+                canonical_common_git_dir: None,
+            });
+        }
     }
+    WorkspaceIdentity::discover_cached(root)
 }
 
 // Worktree ids whose workspace lease THIS process already holds, keyed by the scope that took it.
@@ -419,7 +458,7 @@ impl WorkspaceWriterLease {
         cancel: Option<&crate::core::cancel::TurnCancel>,
         operation: &str,
     ) -> Result<Self> {
-        let identity = WorkspaceIdentity::discover_cached(root)?;
+        let identity = lease_identity(root)?;
         Self::acquire_identity(identity, timeout, cancel, operation)
     }
 
@@ -432,7 +471,7 @@ impl WorkspaceWriterLease {
         operation: &str,
         scope: &str,
     ) -> Result<Self> {
-        let identity = WorkspaceIdentity::discover_cached(root)?;
+        let identity = lease_identity(root)?;
         Self::acquire_identity_scoped(identity, timeout, cancel, operation, scope)
     }
 
@@ -528,13 +567,6 @@ impl WorkspaceWriterLease {
         held_map(|m| m.contains_key(&workspace_key))
     }
 
-    /// Deprecated compatibility shim. Time Machine's real transaction lock is owned by its
-    /// namespace adapter; this path is not a valid integration lock domain.
-    #[allow(dead_code)]
-    pub fn time_machine_lock(&self) -> Result<RepoTxnLock> {
-        anyhow::bail!("use the Time Machine namespace transaction lock adapter")
-    }
-
     /// The workspace this lease was taken for.
     #[allow(dead_code)]
     pub fn identity(&self) -> &WorkspaceIdentity {
@@ -625,6 +657,9 @@ impl NativeResource {
     }
 
     pub(crate) fn resolve(path: &Path) -> Result<Self> {
+        #[cfg(test)]
+        let _cost =
+            super::io_attribution::Span::begin(super::io_attribution::Event::ResourceResolve);
         Self::validate_spelling(path)?;
         if !path.is_absolute() {
             anyhow::bail!("native resource needs a bounded absolute exact-file path");
@@ -636,9 +671,10 @@ impl NativeResource {
             .parent()
             .context("native resource needs an existing parent")?;
         let supplied = native_ancestors(parent)?;
-        let canonical_parent = std::fs::canonicalize(parent).with_context(|| {
-            format!("canonicalizing native resource parent {}", parent.display())
-        })?;
+        let canonical_parent = crate::core::file_placement::path_canonicalize(parent)
+            .with_context(|| {
+                format!("canonicalizing native resource parent {}", parent.display())
+            })?;
         if native_path_key(parent)? != native_path_key(&canonical_parent)? {
             anyhow::bail!(
                 "native resource parent has an ambiguous alias; use its canonical spelling"
@@ -656,6 +692,34 @@ impl NativeResource {
         Ok(resource)
     }
 
+    /// Bind one sibling using this resource's original canonical parent identity. This reuses
+    /// identity evidence, not a cached safety verdict: the complete retained ancestor chain and
+    /// the new leaf are checked again. In particular, never rebind a replaced parent directory.
+    pub(crate) fn resolve_sibling(&self, name: &std::ffi::OsStr) -> Result<Self> {
+        let sibling = self.sibling(name)?;
+        sibling.verify()?;
+        Ok(sibling)
+    }
+
+    // Constructs spelling/retained identity only; resolve_sibling verifies before exposing it.
+    fn sibling(&self, name: &std::ffi::OsStr) -> Result<Self> {
+        let name = Path::new(name);
+        let mut components = name.components();
+        anyhow::ensure!(
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none(),
+            "native sibling requires exactly one file basename"
+        );
+        Self::validate_spelling(name)?;
+        let path = self.path.with_file_name(name);
+        Self::validate_spelling(&path)?;
+        Ok(Self {
+            key: stable_key(&format!("native-file:{}", native_path_key(&path)?)),
+            path,
+            ancestors: self.ancestors.clone(),
+        })
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -667,17 +731,27 @@ impl NativeResource {
     /// Revalidate ancestors and leaf safety, accepting regular-file replacement or creation/deletion.
     /// Content drift is the prepared tool's separate fingerprint responsibility.
     pub(crate) fn verify(&self) -> Result<()> {
+        #[cfg(test)]
+        let _cost =
+            super::io_attribution::Span::begin(super::io_attribution::Event::ResourceVerify);
         verify_native_ancestors(&self.ancestors)?;
-        match std::fs::symlink_metadata(&self.path) {
-            Ok(md) => {
-                if crate::core::file_placement::is_link_or_reparse(&md) || !md.is_file() {
+        self.verify_leaf()?;
+        // Do not silently bind an ancestor swapped during the leaf inspection.
+        verify_native_ancestors(&self.ancestors)
+    }
+
+    fn verify_leaf(&self) -> Result<()> {
+        #[cfg(test)]
+        let _cost = super::io_attribution::Span::begin(super::io_attribution::Event::LeafVerify);
+        match observe_native_node(&self.path) {
+            Ok(node) => {
+                if node.reparse || !node.regular {
                     anyhow::bail!("native resource destination must be a regular non-link file");
                 }
-                let (_, links) = native_node_identity(&self.path, &md)?;
-                if links != 1 {
+                if node.links != 1 {
                     anyhow::bail!("native resource refuses hardlinked or ambiguous destinations");
                 }
-                let canonical = std::fs::canonicalize(&self.path)?;
+                let canonical = crate::core::file_placement::path_canonicalize(&self.path)?;
                 if native_path_key(&canonical)? != native_path_key(&self.path)? {
                     anyhow::bail!("native resource destination has an ambiguous alias");
                 }
@@ -685,8 +759,7 @@ impl NativeResource {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("reading native resource destination"),
         }
-        // Do not silently bind an ancestor swapped during the leaf inspection.
-        verify_native_ancestors(&self.ancestors)
+        Ok(())
     }
 }
 
@@ -722,16 +795,15 @@ fn native_ancestors(parent: &Path) -> Result<Vec<NativeAncestor>> {
         if ancestors.len() == MAX_NATIVE_ANCESTORS {
             anyhow::bail!("native resource ancestry exceeds safety bound");
         }
-        let md = std::fs::symlink_metadata(path)
+        let node = observe_native_node(path)
             .with_context(|| format!("native resource parent must exist: {}", path.display()))?;
-        if crate::core::file_placement::is_link_or_reparse(&md) || !md.is_dir() {
+        if node.reparse || !node.directory {
             anyhow::bail!("native resource ancestors must be existing non-link directories");
         }
-        let (identity, _) = native_node_identity(path, &md)?;
         ancestors.push(NativeAncestor {
             path: path.to_path_buf(),
-            identity,
-            created: md.created().ok(),
+            identity: node.identity,
+            created: node.created,
         });
     }
     Ok(ancestors)
@@ -739,43 +811,77 @@ fn native_ancestors(parent: &Path) -> Result<Vec<NativeAncestor>> {
 
 fn verify_native_ancestors(ancestors: &[NativeAncestor]) -> Result<()> {
     for ancestor in ancestors {
-        let md = std::fs::symlink_metadata(&ancestor.path).with_context(|| {
-            format!(
-                "native resource ancestor drift: {}",
-                ancestor.path.display()
-            )
-        })?;
-        if crate::core::file_placement::is_link_or_reparse(&md)
-            || !md.is_dir()
-            || native_node_identity(&ancestor.path, &md)?.0 != ancestor.identity
-            || md.created().ok() != ancestor.created
-        {
-            anyhow::bail!("native resource ancestor changed; resolve and approve again");
-        }
+        verify_native_ancestor(ancestor)?;
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn native_node_identity(_path: &Path, md: &std::fs::Metadata) -> Result<((u64, u64), u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(((md.dev(), md.ino()), md.nlink()))
+fn verify_native_ancestor(ancestor: &NativeAncestor) -> Result<()> {
+    #[cfg(test)]
+    let _cost = super::io_attribution::Span::begin(super::io_attribution::Event::AncestorVerify);
+    let node = observe_native_node(&ancestor.path).with_context(|| {
+        format!(
+            "native resource ancestor drift: {}",
+            ancestor.path.display()
+        )
+    })?;
+    if node.reparse
+        || !node.directory
+        || node.identity != ancestor.identity
+        || node.created != ancestor.created
+    {
+        anyhow::bail!("native resource ancestor changed; resolve and approve again");
+    }
+    Ok(())
 }
 
+/// One no-follow observation of a native path component. Capture and every verification use the
+/// same primitive, so witnesses compare like-for-like. This is a fresh observation per call, never
+/// a cached verdict.
+struct NativeNode {
+    identity: (u64, u64),
+    links: u64,
+    directory: bool,
+    regular: bool,
+    reparse: bool,
+    created: Option<SystemTime>,
+}
+
+/// One lstat already supplies every field.
+#[cfg(unix)]
+fn observe_native_node(path: &Path) -> std::io::Result<NativeNode> {
+    use std::os::unix::fs::MetadataExt;
+    let md = crate::core::file_placement::path_metadata(path)?;
+    Ok(NativeNode {
+        identity: (md.dev(), md.ino()),
+        links: md.nlink(),
+        directory: md.is_dir(),
+        regular: md.is_file(),
+        reparse: crate::core::file_placement::is_link_or_reparse(&md),
+        created: md.created().ok(),
+    })
+}
+
+/// Type, reparse flag, identity, link count and creation time all come from ONE attribute-only,
+/// no-follow handle, rather than a `symlink_metadata` open plus a second identity open of the same
+/// pathname. The handle keeps std's read/write/delete sharing; it is not a lock.
 #[cfg(windows)]
-fn native_node_identity(path: &Path, _md: &std::fs::Metadata) -> Result<((u64, u64), u64)> {
+fn observe_native_node(path: &Path) -> std::io::Result<NativeNode> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     let name: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    #[cfg(test)]
+    let _cost = super::io_attribution::Span::begin(super::io_attribution::Event::PathIdentityOpen);
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -788,32 +894,57 @@ fn native_node_identity(path: &Path, _md: &std::fs::Metadata) -> Result<((u64, u
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error()).context("opening native resource identity");
+        return Err(std::io::Error::last_os_error());
     }
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(test)]
+    let _identity_cost =
+        super::io_attribution::Span::begin(super::io_attribution::Event::DescriptorIdentity);
     let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
     let error = (ok == 0).then(std::io::Error::last_os_error);
     unsafe {
         CloseHandle(handle);
     }
     if let Some(error) = error {
-        return Err(error).context("reading native resource identity");
+        return Err(error);
     }
-    if info.dwFileAttributes & 0x400 != 0 {
-        anyhow::bail!("native resource identity traverses a reparse point");
-    }
-    Ok((
-        (
-            info.dwVolumeSerialNumber as u64,
-            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    let directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let reparse = info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    Ok(NativeNode {
+        identity: (
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         ),
-        info.nNumberOfLinks as u64,
-    ))
+        links: u64::from(info.nNumberOfLinks),
+        directory,
+        regular: !directory && !reparse,
+        reparse,
+        created: native_creation_time(&info.ftCreationTime),
+    })
+}
+
+/// Exact 100 ns FILETIME conversion; both capture and verification use it.
+#[cfg(windows)]
+fn native_creation_time(time: &windows_sys::Win32::Foundation::FILETIME) -> Option<SystemTime> {
+    const UNIX_EPOCH_INTERVALS: u64 = 116_444_736_000_000_000;
+    let intervals = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    let offset = |delta: u64| {
+        let nanos = u32::try_from(delta % 10_000_000).ok()? * 100;
+        Some(Duration::new(delta / 10_000_000, nanos))
+    };
+    if intervals >= UNIX_EPOCH_INTERVALS {
+        UNIX_EPOCH.checked_add(offset(intervals - UNIX_EPOCH_INTERVALS)?)
+    } else {
+        UNIX_EPOCH.checked_sub(offset(UNIX_EPOCH_INTERVALS - intervals)?)
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn native_node_identity(_path: &Path, _md: &std::fs::Metadata) -> Result<((u64, u64), u64)> {
-    anyhow::bail!("native resource identity is unavailable on this platform")
+fn observe_native_node(_path: &Path) -> std::io::Result<NativeNode> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native resource identity is unavailable on this platform",
+    ))
 }
 
 /// Exclusion for an ACTUAL physical effect, separate from reentrant dispatch bookkeeping. Every
@@ -941,13 +1072,13 @@ impl SidecarKind {
     }
 }
 
-/// An opaque managed background excludes coherent snapshots and recovery, but not ordinary IO.
+/// An opaque managed background excludes Git mutation, recovery and certified verification, not ordinary IO.
 #[derive(Debug)]
 pub(crate) struct BackgroundProcessBusy;
 
 impl std::fmt::Display for BackgroundProcessBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("managed background process is active; stop it and wait for settlement before checkpoint, recovery or certified verification")
+        f.write_str("managed background process is active; stop it and wait for settlement before Git mutation, recovery or certified verification")
     }
 }
 
@@ -1186,7 +1317,7 @@ impl NativeResourceLease {
         for (resource, _) in resources {
             resource.verify()?;
         }
-        let identity = WorkspaceIdentity::discover_cached(root)?;
+        let identity = lease_identity(root)?;
         // The holder's exact scope or a '/' descendant may borrow its exclusive gate. The Arc
         // owns the OS handles even if the ancestor/observer disappears during this worker's run.
         let workspace_key = held_workspace_key(&identity);
@@ -1425,6 +1556,22 @@ pub(crate) struct WorkspaceRestoreGuard {
 }
 
 impl WorkspaceRestoreGuard {
+    /// Extend the same held activity barrier to another already-bound worktree. No second mutex
+    /// acquisition and no opportunity for a new delegated start between the check and activation.
+    pub(crate) fn require_identity_quiescent(&self, identity: &WorkspaceIdentity) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                ._activities
+                .as_ref()
+                .and_then(|map| map.get(&identity.worktree_id))
+                .is_some_and(|activities| activities
+                    .iter()
+                    .any(|activity| activity.strong_count() > 0)),
+            "workspace focus refused while delegated activity is live"
+        );
+        Ok(())
+    }
+
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
         let background =
             BackgroundProcessBarrier::acquire(crate::core::cancel::current().as_ref())?;
@@ -1467,7 +1614,6 @@ pub enum LockClass {
     RepositoryStore = 4,
     Workspace = 5,
     Resource = 6,
-    TimeMachine = 7,
     Journal = 8,
 }
 
@@ -1636,7 +1782,14 @@ fn mode_rank(mode: LockMode) -> u8 {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static GIT_DISCOVERY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn git_path<const N: usize>(root: &Path, args: [&str; N]) -> Option<PathBuf> {
+    #[cfg(test)]
+    GIT_DISCOVERY_CALLS.with(|calls| calls.set(calls.get() + 1));
     let out = crate::core::gitx::command()
         .ok()?
         .current_dir(root)
@@ -1653,14 +1806,14 @@ fn git_path<const N: usize>(root: &Path, args: [&str; N]) -> Option<PathBuf> {
 
 fn canonical_existing_or_parent(path: &Path) -> Result<PathBuf> {
     if path.exists() {
-        return std::fs::canonicalize(path)
+        return crate::core::file_placement::path_canonicalize(path)
             .with_context(|| format!("canonicalizing {}", path.display()));
     }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let canonical_parent = std::fs::canonicalize(parent)
+    let canonical_parent = crate::core::file_placement::path_canonicalize(parent)
         .with_context(|| format!("canonicalizing parent {}", parent.display()))?;
     Ok(path
         .file_name()
@@ -1703,6 +1856,14 @@ fn now_unix() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "workspace_txn_planning_tests.rs"]
+mod planning_tests;
+
+#[cfg(test)]
+#[path = "workspace_txn_node_observation_tests.rs"]
+mod node_observation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1843,6 +2004,79 @@ mod tests {
     }
 
     #[test]
+    fn native_sibling_matches_fresh_resolution_without_rebinding_ancestors() {
+        let (temp, resource, _) = native_fixture();
+        for name in ["missing.txt", "present.txt"] {
+            if name == "present.txt" {
+                std::fs::write(resource.path().with_file_name(name), b"bytes").unwrap();
+            }
+            let sibling = resource
+                .resolve_sibling(std::ffi::OsStr::new(name))
+                .unwrap();
+            assert_eq!(sibling, NativeResource::resolve(sibling.path()).unwrap());
+        }
+        let parent = resource.path().parent().unwrap();
+        std::fs::rename(parent, temp.path().join("old-workspace")).unwrap();
+        std::fs::create_dir(parent).unwrap();
+        assert!(resource
+            .resolve_sibling(std::ffi::OsStr::new("missing.txt"))
+            .is_err());
+    }
+
+    #[test]
+    fn native_sibling_rechecks_leaf_and_refuses_non_basename_spelling() {
+        let (temp, resource, _) = native_fixture();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "nested/file",
+            "nested\\file",
+            "file/",
+            "[ab].txt",
+            "CON",
+            "stream:ads",
+        ] {
+            assert!(
+                resource
+                    .resolve_sibling(std::ffi::OsStr::new(name))
+                    .is_err(),
+                "{name}"
+            );
+        }
+        assert!(resource.resolve_sibling(temp.path().as_os_str()).is_err());
+        let leaf = resource.path().with_file_name("object");
+        std::fs::write(&leaf, b"original").unwrap();
+        resource
+            .resolve_sibling(std::ffi::OsStr::new("object"))
+            .unwrap();
+        std::fs::hard_link(&leaf, temp.path().join("alias")).unwrap();
+        assert!(resource
+            .resolve_sibling(std::ffi::OsStr::new("object"))
+            .is_err());
+        std::fs::remove_file(&leaf).unwrap();
+        std::fs::create_dir(&leaf).unwrap();
+        assert!(resource
+            .resolve_sibling(std::ffi::OsStr::new("object"))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_sibling_refuses_leaf_symlink() {
+        let (temp, resource, _) = native_fixture();
+        std::os::unix::fs::symlink(
+            temp.path().join("absent"),
+            resource.path().with_file_name("link"),
+        )
+        .unwrap();
+        assert!(resource
+            .resolve_sibling(std::ffi::OsStr::new("link"))
+            .is_err());
+    }
+
+    #[test]
     fn native_resources_refuse_unsafe_and_ambiguous_destinations() {
         let (temp, resource, _) = native_fixture();
         assert!(NativeResource::resolve(Path::new("relative.txt")).is_err());
@@ -1966,8 +2200,8 @@ mod tests {
         {
             return Ok(());
         }
-        let root = std::fs::canonicalize(PathBuf::from(root))?;
-        let temp = std::fs::canonicalize(std::env::temp_dir())?;
+        let root = crate::core::file_placement::path_canonicalize(PathBuf::from(root))?;
+        let temp = crate::core::file_placement::path_canonicalize(std::env::temp_dir())?;
         anyhow::ensure!(
             root.starts_with(&temp) && root != temp,
             "child needs an owned temp root"
@@ -2684,35 +2918,43 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let temp = crate::core::file_placement::tests::TestDir::new();
-        let identity = WorkspaceIdentity::discover_cached(temp.path()).unwrap();
-        let restore = WorkspaceRestoreGuard::acquire(temp.path()).unwrap();
-        assert!(
-            matches!(
-                ACTIVITIES.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ),
-            "guard must retain the same registry mutex used by begin"
-        );
-        let (started, ready) = std::sync::mpsc::channel();
-        let (seated, registered) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            started.send(()).unwrap();
-            // Public begin uses this same registration path after read-only identity discovery.
-            let activity = begin_activity_identity(identity.worktree_id, "new-task").unwrap();
-            seated.send(activity).unwrap();
+        with_test_lock_home(temp.path(), || {
+            // A real same-domain background owner still refuses restore admission.
+            let background =
+                SidecarEffectLease::acquire(SidecarKind::BackgroundProcess, Duration::ZERO, None)
+                    .unwrap();
+            assert!(WorkspaceRestoreGuard::acquire(temp.path()).is_err());
+            drop(background);
+            let identity = WorkspaceIdentity::discover_cached(temp.path()).unwrap();
+            let restore = WorkspaceRestoreGuard::acquire(temp.path()).unwrap();
+            assert!(
+                matches!(
+                    ACTIVITIES.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "guard must retain the same registry mutex used by begin"
+            );
+            let (started, ready) = std::sync::mpsc::channel();
+            let (seated, registered) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                // Public begin uses this same registration path after read-only identity discovery.
+                let activity = begin_activity_identity(identity.worktree_id, "new-task").unwrap();
+                seated.send(activity).unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Mutex ownership, not a timed absence claim, proves begin cannot seat before release.
+            assert!(matches!(
+                registered.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(restore);
+            let activity = registered.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert!(WorkspaceRestoreGuard::acquire(temp.path()).is_err());
+            drop(activity);
+            WorkspaceRestoreGuard::acquire(temp.path()).unwrap();
         });
-        ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        // Mutex ownership, not a timed absence claim, proves begin cannot seat before release.
-        assert!(matches!(
-            registered.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        drop(restore);
-        let activity = registered.recv_timeout(Duration::from_secs(5)).unwrap();
-        worker.join().unwrap();
-        assert!(WorkspaceRestoreGuard::acquire(temp.path()).is_err());
-        drop(activity);
-        WorkspaceRestoreGuard::acquire(temp.path()).unwrap();
     }
 
     #[test]
@@ -3114,7 +3356,6 @@ mod tests {
         assert!(LockClass::RepositoryStore < LockClass::Workspace);
         assert!(LockClass::Workspace < LockClass::Resource);
         assert!(LockClass::Resource < LockClass::Journal);
-        assert!(LockClass::Resource < LockClass::TimeMachine);
     }
 
     #[test]

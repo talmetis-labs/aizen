@@ -1,49 +1,17 @@
 //! Durable verifier lifecycle evidence. Records never recreate execution or recovery authority.
 
+pub(crate) use crate::core::worker_evidence::DurableEffectState;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU64;
 
-use super::store::InspectedRecord;
+use super::evidence::InspectedRecord;
 
 pub(crate) const START_LABEL: &str = "integration-verification-started";
 pub(crate) const FINISH_LABEL: &str = "integration-verification";
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_METADATA_BYTES: usize = 128 * 1024;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub(crate) enum DurableEffectState {
-    Settled,
-    PossiblyApplied { record: Option<NonZeroU64> },
-    UnknownWorker,
-}
-
-impl<'de> Deserialize<'de> for DurableEffectState {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Empty struct variants reject extra fields; internally tagged unit variants ignore them.
-        #[derive(Deserialize)]
-        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-        enum Evidence {
-            Settled {},
-            PossiblyApplied {
-                #[serde(deserialize_with = "required_option")]
-                record: Option<NonZeroU64>,
-            },
-            UnknownWorker {},
-        }
-        Ok(match Evidence::deserialize(deserializer)? {
-            Evidence::Settled {} => Self::Settled,
-            Evidence::PossiblyApplied { record } => Self::PossiblyApplied { record },
-            Evidence::UnknownWorker {} => Self::UnknownWorker,
-        })
-    }
-}
 
 fn required_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
@@ -153,8 +121,8 @@ fn distinct_ids(ids: &[&str]) -> Result<()> {
 
 fn details(paths: &[String], dependencies: &[Value], status: &str, scope: &str) -> Result<()> {
     ensure!(
-        paths.len() <= super::store::MAX_COHORT_FILES
-            && dependencies.len() <= 32 * super::store::MAX_COHORT_FILES,
+        paths.len() <= super::evidence::MAX_COHORT_FILES
+            && dependencies.len() <= 32 * super::evidence::MAX_COHORT_FILES,
         "verification evidence count exceeds bound"
     );
     let mut unique = BTreeSet::new();
@@ -737,7 +705,7 @@ mod tests {
         assert!(!valid_summary(value));
         let mut value = summary();
         value["applied_paths"] =
-            serde_json::json!(vec!["x"; super::super::store::MAX_COHORT_FILES + 1]);
+            serde_json::json!(vec!["x"; super::super::evidence::MAX_COHORT_FILES + 1]);
         assert!(!valid_summary(value));
         let mut value = summary();
         value["read_dependencies"] = serde_json::json!([{}]);

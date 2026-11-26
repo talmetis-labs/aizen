@@ -44,7 +44,7 @@ pub enum Lane {
     Coordination,
     Todo,
     Clarify,
-    Checkpoint,
+    Recovery,
     Messaging,
     Persona,
     Mcp,
@@ -68,7 +68,7 @@ impl Lane {
             Lane::Delegation | Lane::Coordination => "delegation",
             Lane::Todo => "todo",
             Lane::Clarify => "clarify",
-            Lane::Checkpoint => "checkpoint",
+            Lane::Recovery => "recovery",
             Lane::Messaging => "messaging",
             Lane::Persona => "persona",
             Lane::Mcp => "mcp",
@@ -93,7 +93,7 @@ impl Lane {
             Lane::Coordination => Group::Coordination,
             Lane::Clarify => Group::Clarify,
             Lane::Skills => Group::Skills,
-            Lane::Checkpoint => Group::Checkpoint,
+            Lane::Recovery => Group::Recovery,
             Lane::Messaging => Group::Channels,
             Lane::Persona => Group::Persona,
             Lane::Mcp => Group::Mcp,
@@ -120,7 +120,7 @@ enum Group {
     Coordination,
     Clarify,
     Skills,
-    Checkpoint,
+    Recovery,
     Channels,
     Persona,
     Mcp,
@@ -144,7 +144,7 @@ const ORDER: &[Group] = &[
     Group::Coordination,
     Group::Clarify,
     Group::Skills,
-    Group::Checkpoint,
+    Group::Recovery,
     Group::Channels,
     Group::Persona,
     Group::Mcp,
@@ -168,7 +168,7 @@ impl Group {
             Group::Coordination => "multi-window coordination",
             Group::Clarify => "asking the user",
             Group::Skills => "skills (reusable procedures)",
-            Group::Checkpoint => "checkpoints (time machine)",
+            Group::Recovery => "owned edit recovery",
             Group::Channels => "reaching the user elsewhere",
             Group::Persona => "persona",
             Group::Mcp => "connected integrations (MCP)",
@@ -228,9 +228,10 @@ impl Group {
                  cannot perform."
             }
             Group::Planning => {
-                "plan by blast radius, not step count: multiple files or hard to undo earns a short \
-                 visible list (<=5 items, exactly one in progress). A long but single-file, easily \
-                 reversible edit does not. Execute the list; don't re-plan it every turn."
+                "plan by blast radius: small reversible edits stay direct; multiple steps in one \
+                 system use <=5 TODOs. Migrations, public API plus callers, multiple systems or hard-to-undo \
+                 work need a saved plan, then TODOs. A draft/list is not a saved plan or permission. \
+                 Reuse a relevant validated plan; don't recreate it every turn."
             }
             Group::Delegation => {
                 "hand a child ONE complete, self-contained job and get back only its result. Fan out \
@@ -250,11 +251,10 @@ impl Group {
                 "look for an existing procedure before building one from scratch; capture a newly \
                  worked-out, reusable one after."
             }
-            Group::Checkpoint => {
-                "inspect what changed before you undo anything — a rewind discards every change since \
-                 the anchor. The runtime already snapshots before the first destructive op and at \
-                 phase boundaries, so add one only for risk it cannot see. None of this restores chat \
-                 history."
+            Group::Recovery => {
+                "inspect ownership and current content before undoing selected native edits. \
+                 Exact postimages and settled effects are required; mixed or unattributed changes \
+                 are not covered. No automatic source snapshots or chat-history restore."
             }
             Group::Channels => {
                 "use sparingly — a needless ping is worse than silence."
@@ -296,7 +296,9 @@ pub fn lane_for(name: &str) -> Option<Lane> {
         "shell_run" => Lane::Shell,
         "process" => Lane::Process,
         "web_search" | "web_fetch" | "web_crawl" => Lane::Web,
-        "browser_navigate"
+        "computer_observe"
+        | "computer_act"
+        | "browser_navigate"
         | "browser_snapshot"
         | "browser_click"
         | "browser_type"
@@ -311,7 +313,7 @@ pub fn lane_for(name: &str) -> Option<Lane> {
             Lane::Todo
         }
         "clarify" => Lane::Clarify,
-        "checkpoint" | "checkpoint_view" | "native_owner_undo" => Lane::Checkpoint,
+        "native_owner_undo" | "git_change" => Lane::Recovery,
         "telegram_send" | "telegram_ask" | "bot_admin" | "notify" => Lane::Messaging,
         "persona_create" => Lane::Persona,
         // `git_inspect` is read-only repo intel (status/log/diff/blame), not command execution —
@@ -383,10 +385,8 @@ fn render(names: &[String]) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str(ROUTING_HEADING);
     out.push_str(
-        "\nThese are the only tools you can call, and their exact names. Full argument schemas ride \
-         on the request — read those there; never guess an argument or invent a tool. A capability \
-         missing below is not available this session: say so instead of pretending, and never claim \
-         a tool was blocked unless a result said so.\n",
+        "\nUse the exact names and schemas attached to this request. When tool_search is available, \
+         call an already advertised tool directly and search only for missing capabilities.\n",
     );
     for (g, tools) in buckets.iter().filter(|(_, t)| !t.is_empty()) {
         out.push_str("- ");
@@ -492,7 +492,7 @@ mod tests {
             "team_status",
             "clarify",
             "skill_load",
-            "checkpoint",
+            "native_owner_undo",
             "notify",
             "persona_create",
             "mcp_db_query",
@@ -599,8 +599,7 @@ mod tests {
             "skill_refine",
             "skill_forget",
             "skill_install",
-            "checkpoint",
-            "checkpoint_view",
+            "native_owner_undo",
             "notify",
             "telegram_send",
             "telegram_ask",
@@ -638,7 +637,7 @@ mod tests {
             Lane::Coordination,
             Lane::Todo,
             Lane::Clarify,
-            Lane::Checkpoint,
+            Lane::Recovery,
             Lane::Messaging,
             Lane::Persona,
             Lane::Mcp,

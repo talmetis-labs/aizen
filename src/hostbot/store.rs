@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::core::config;
+use crate::core::session_control::SessionControl;
+use crate::core::session_store::{PersistenceSnapshot, SaveControl};
 use crate::core::types::Message;
 
 /// `~/.aizen/hostbot/` — created + hardened to 0700 on first touch. Best-effort hardening (never fails
@@ -178,13 +180,47 @@ pub fn drop_lane(route: &str) {
     }
 }
 
-/// Load the hosted-bot list. A missing / unreadable / corrupt file → `vec![]` (never fails — a fresh
-/// install simply has no extra bots).
-pub fn load_bots() -> Vec<HostedBot> {
-    match std::fs::read_to_string(bots_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Vec::new(),
+/// The daemon writes an array. Older desktop versions wrote keyed maps, optionally under "bots".
+fn decode_bots(raw: &str) -> Result<Vec<HostedBot>> {
+    let root: serde_json::Value = serde_json::from_str(raw)?;
+    if root.is_array() {
+        return Ok(serde_json::from_value(root)?);
     }
+    let mut map = root
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("invalid bot registry"))?;
+    if map.len() == 1
+        && map
+            .get("bots")
+            .is_some_and(|entry| entry.is_object() && entry.get("token").is_none())
+    {
+        map = map
+            .remove("bots")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap();
+    }
+    map.into_iter()
+        .map(|(name, mut entry)| {
+            let obj = entry
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("invalid hosted bot"))?;
+            obj.insert("name".into(), name.into());
+            Ok(serde_json::from_value(entry)?)
+        })
+        .collect()
+}
+
+fn read_bots(path: &std::path::Path) -> Result<Vec<HostedBot>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => decode_bots(&raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn load_bots() -> Vec<HostedBot> {
+    read_bots(&bots_path()).unwrap_or_default()
 }
 
 pub fn update_bots<T>(mutate: impl FnOnce(&mut Vec<HostedBot>) -> Result<T>) -> Result<T> {
@@ -194,10 +230,7 @@ pub fn update_bots<T>(mutate: impl FnOnce(&mut Vec<HostedBot>) -> Result<T>) -> 
         &lock_path,
         std::time::Duration::from_secs(5),
     )?;
-    let mut bots = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    let mut bots = read_bots(&path)?;
     let result = mutate(&mut bots)?;
     let json = serde_json::to_string_pretty(&bots)?;
     crate::core::persist::atomic_write_owner_only(&path, (json + "\n").as_bytes())?;
@@ -228,6 +261,13 @@ pub fn save_bots(bots: &[HostedBot]) -> Result<()> {
 /// out of the file NAME — the filename is just a sanitized, collision-free handle.
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(
+        default,
+        deserialize_with = "crate::core::session_store::deserialize_session_control"
+    )]
+    session_control: Option<SessionControl>,
     platform: String,
     route: String,
     chat: String,
@@ -238,6 +278,23 @@ struct SessionFile {
         deserialize_with = "crate::core::session_store::deserialize_stored_messages"
     )]
     messages: Vec<Message>,
+    #[serde(default)]
+    task_state: crate::agent::todo::TaskState,
+}
+
+impl SessionFile {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.version <= 1, "unsupported hostbot session version");
+        anyhow::ensure!(
+            self.version == 0 || self.session_control.is_some(),
+            "missing hostbot session_control"
+        );
+        self.task_state.validate()?;
+        if let Some(control) = &self.session_control {
+            control.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Sanitize a component for use in a filename: keep `[a-z0-9_-]`, map everything else (incl. the `-`
@@ -265,12 +322,30 @@ fn session_path(platform: &str, route: &str, chat: &str) -> PathBuf {
     sessions_dir().join(name)
 }
 
-/// Load every persisted session for `platform` → `(route, chat, messages)` triples. The daemon keys
-/// its in-memory map by `(route, Chat)` after parsing `chat` via `Chat::from_str`. Corrupt / foreign
-/// files are skipped silently (a partial write or another platform's file must not crash startup).
+/// Legacy projection used by storage fixtures. Live lane startup must retain the owned task state.
+#[cfg(test)]
 pub fn load_sessions(platform: &str) -> Vec<(String, String, Vec<Message>)> {
+    load_sessions_with_state(platform)
+        .into_iter()
+        .map(|(route, chat, messages, _, _)| (route, chat, messages))
+        .collect()
+}
+
+/// Load validated lane envelopes; old files without a task start with an empty owned state.
+/// Corrupt / foreign files are skipped (a bad lane must not crash the daemon).
+#[cfg(test)]
+pub fn load_sessions_with_state(
+    platform: &str,
+) -> Vec<(
+    String,
+    String,
+    Vec<Message>,
+    crate::agent::todo::TaskState,
+    SessionControl,
+)> {
     let dir = sessions_dir();
     let mut out = Vec::new();
+    let mut rejected = 0usize;
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return out,
@@ -281,21 +356,143 @@ pub fn load_sessions(platform: &str) -> Vec<(String, String, Vec<Message>)> {
             continue;
         }
         let Ok(s) = std::fs::read_to_string(&path) else {
+            rejected = rejected.saturating_add(1);
             continue;
         };
         let Ok(sf) = serde_json::from_str::<SessionFile>(&s) else {
+            rejected = rejected.saturating_add(1);
             continue;
         };
         if sf.platform != platform {
-            continue; // another platform's session dir-mate
+            continue;
         }
-        out.push((sf.route, sf.chat, sf.messages));
+        if sf.validate().is_err() {
+            rejected = rejected.saturating_add(1);
+            continue;
+        }
+        out.push((
+            sf.route,
+            sf.chat,
+            sf.messages,
+            sf.task_state,
+            sf.session_control.unwrap_or_default(),
+        ));
+    }
+    if rejected > 0 {
+        // One bounded diagnostic per scan; never echo filenames, parser errors or stored content.
+        eprintln!("[hostbot] skipped {rejected} unreadable or unsupported session file(s); existing files remain protected from overwrite");
     }
     out
 }
 
+/// Authoritative lazy lane read. An absent scan seed is NOT permission to start normally: scan
+/// projections skip invalid files, whereas execution startup must call this and propagate errors.
+pub(crate) fn load_session_with_state(
+    platform: &str,
+    route: &str,
+    chat: &str,
+) -> Result<Option<(Vec<Message>, crate::agent::todo::TaskState, SessionControl)>> {
+    let path = session_path(platform, route, chat);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("hostbot session is unavailable"),
+        Ok(_) => {}
+    }
+    let bytes = crate::core::session_store::read_bounded(&path, 128 * 1024 * 1024)
+        .map_err(|_| anyhow::anyhow!("hostbot session is unavailable"))?;
+    let sf: SessionFile = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("hostbot session is unreadable or unsupported"))?;
+    sf.validate()?;
+    anyhow::ensure!(
+        sf.platform == platform && sf.route == route && sf.chat == chat,
+        "hostbot session identity mismatch"
+    );
+    Ok(Some((
+        sf.messages,
+        sf.task_state,
+        sf.session_control.unwrap_or_default(),
+    )))
+}
+
+/// An older host saved every topic under the numeric chat ID. Never copy its history into a
+/// new topic or silently widen an unreadable or restricted legacy session.
+pub(crate) fn load_lane_session(
+    platform: &str,
+    route: &str,
+    chat: &str,
+    legacy_parent: Option<&str>,
+) -> Result<Option<(Vec<Message>, crate::agent::todo::TaskState, SessionControl)>> {
+    if let Some(parent) = legacy_parent {
+        if let Some((_, _, policy)) = load_session_with_state(platform, route, parent)? {
+            anyhow::ensure!(
+                !policy.is_planning(),
+                "legacy chat has an active planning restriction"
+            );
+        }
+    }
+    load_session_with_state(platform, route, chat)
+}
+
 /// Persist one session after a turn. `chat` is the `Display` form of the platform's chat id.
 pub fn save_session(platform: &str, route: &str, chat: &str, messages: &[Message]) -> Result<()> {
+    let task_state = crate::agent::todo::durable_snapshot();
+    let snapshot = PersistenceSnapshot::capture(&task_state)?;
+    save_session_inner(
+        platform,
+        route,
+        chat,
+        messages,
+        &task_state,
+        SaveControl::Snapshot(&snapshot),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn save_session_with_control(
+    platform: &str,
+    route: &str,
+    chat: &str,
+    messages: &[Message],
+    task: &crate::agent::todo::TaskState,
+    control: &SessionControl,
+) -> Result<()> {
+    save_session_inner(
+        platform,
+        route,
+        chat,
+        messages,
+        task,
+        SaveControl::Explicit(control),
+    )
+}
+
+/// Resetting a transcript is not a trusted permission transition: preserve/conflict-check control
+/// under the session write lock, without reentering the caller's policy admission context.
+pub(crate) fn reset_session_with_control(
+    platform: &str,
+    route: &str,
+    chat: &str,
+    control: &SessionControl,
+) -> Result<()> {
+    save_session_inner(
+        platform,
+        route,
+        chat,
+        &[],
+        &crate::agent::todo::TaskState::default(),
+        SaveControl::Captured(Some(control)),
+    )
+}
+
+fn save_session_inner(
+    platform: &str,
+    route: &str,
+    chat: &str,
+    messages: &[Message],
+    task: &crate::agent::todo::TaskState,
+    policy: SaveControl<'_>,
+) -> Result<()> {
+    policy.check(task)?;
     let path = session_path(platform, route, chat);
     let lock_key = format!("{platform}:{route}:{chat}");
     let lock_path = crate::core::workspace_txn::store_lock("hostbot_session", &lock_key);
@@ -303,23 +500,89 @@ pub fn save_session(platform: &str, route: &str, chat: &str, messages: &[Message
         &lock_path,
         std::time::Duration::from_secs(5),
     )?;
+    // Startup may have refused this lane's saved state. Validate the existing target under the
+    // same write lock so a fresh in-memory lane cannot erase unreadable or future-format data.
+    const TARGET_ERROR: &str = "existing hostbot session cannot be safely overwritten";
+    let existing_control = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let existing: SessionFile =
+                serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!(TARGET_ERROR))?;
+            existing
+                .validate()
+                .map_err(|_| anyhow::anyhow!(TARGET_ERROR))?;
+            anyhow::ensure!(
+                existing.platform == platform && existing.route == route && existing.chat == chat,
+                TARGET_ERROR
+            );
+            existing.session_control
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => anyhow::bail!(TARGET_ERROR),
+    };
+    let control = policy.resolve(existing_control.as_ref())?;
     let sf = SessionFile {
+        version: 1,
+        session_control: Some(control),
         platform: platform.to_string(),
         route: route.to_string(),
         chat: chat.to_string(),
         messages: messages.to_vec(),
+        task_state: task.clone(),
     };
     let json = serde_json::to_string(&sf)?;
+    policy.check(task)?;
     crate::core::persist::atomic_write_owner_only(&path, json.as_bytes())?;
+    policy.check(task)?;
+    crate::agent::todo::mark_saved(&sf.task_state);
     Ok(())
 }
 
-/// Delete one session's file (used by `/new`, `/model`, and when a bot is removed). Best-effort.
-pub fn drop_session(platform: &str, route: &str, chat: &str) {
-    let _ = std::fs::remove_file(session_path(platform, route, chat));
+/// Delete a validated normal session. A reset is not permission to erase a saved restriction.
+/// The reset caller must propagate failure before clearing its in-memory conversation.
+pub fn drop_session(platform: &str, route: &str, chat: &str) -> Result<()> {
+    reset_saved_session(platform, route, chat, false)
 }
 
-/// Drop every session belonging to a given route (sub-bot) — used by `/rmbot`. Best-effort.
+fn reset_saved_session(
+    platform: &str,
+    route: &str,
+    chat: &str,
+    keep_restriction: bool,
+) -> Result<()> {
+    let lock_key = format!("{platform}:{route}:{chat}");
+    let lock_path = crate::core::workspace_txn::store_lock("hostbot_session", &lock_key);
+    let _lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
+        &lock_path,
+        std::time::Duration::from_secs(5),
+    )?;
+    let Some((_, _, control)) = load_session_with_state(platform, route, chat)? else {
+        return Ok(());
+    };
+    let path = session_path(platform, route, chat);
+    if control.is_planning() {
+        anyhow::ensure!(
+            keep_restriction,
+            "reset refused: saved planning policy cannot be deleted"
+        );
+        let empty = SessionFile {
+            version: 1,
+            session_control: Some(control),
+            platform: platform.to_owned(),
+            route: route.to_owned(),
+            chat: chat.to_owned(),
+            messages: Vec::new(),
+            task_state: crate::agent::todo::TaskState::default(),
+        };
+        crate::core::persist::atomic_write_owner_only(&path, &serde_json::to_vec(&empty)?)?;
+    } else {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// Reset saved route conversations after persona changes/removal. Restricted records retain an
+/// empty policy-bearing envelope; malformed records are left intact. Normal files are deleted.
+/// Best-effort for compatibility with route-management callers, never a permission transition.
 pub fn drop_route_sessions(platform: &str, route: &str) {
     let prefix = format!("{}.{}.", sanitize(platform), sanitize(route));
     let dir = sessions_dir();
@@ -327,10 +590,22 @@ pub fn drop_route_sessions(platform: &str, route: &str) {
         return;
     };
     for entry in entries.flatten() {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with(&prefix) {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let Ok(bytes) = crate::core::session_store::read_bounded(&path, 128 * 1024 * 1024) else {
+            continue;
+        };
+        let Ok(session) = serde_json::from_slice::<SessionFile>(&bytes) else {
+            continue;
+        };
+        if session.platform == platform
+            && session.route == route
+            && session_path(platform, route, &session.chat) == path
+        {
+            // Re-read and validate under the same lock used by saves before clearing anything.
+            let _ = reset_saved_session(platform, route, &session.chat, true);
         }
     }
 }
@@ -369,7 +644,26 @@ pub fn gc_sessions() -> usize {
         else {
             continue; // unknown mtime (or a clock skew making it "in the future") ⇒ keep it
         };
-        if age > max_age && std::fs::remove_file(&path).is_ok() {
+        if age <= max_age {
+            continue;
+        }
+        // A lane key is reused on its next message: expiring its restriction would silently grant
+        // normal execution. Unknown/corrupt records likewise need explicit repair, not deletion.
+        let Ok(bytes) = crate::core::session_store::read_bounded(&path, 128 * 1024 * 1024) else {
+            continue;
+        };
+        let Ok(session) = serde_json::from_slice::<SessionFile>(&bytes) else {
+            continue;
+        };
+        if session.validate().is_err()
+            || session
+                .session_control
+                .as_ref()
+                .is_some_and(SessionControl::is_planning)
+        {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
             dropped += 1;
         }
     }
@@ -379,6 +673,23 @@ pub fn gc_sessions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("store_control_tests.rs");
+
+    #[test]
+    fn legacy_desktop_bot_registry_round_trips_to_core_array() {
+        for raw in [
+            r#"{"bots":{"ops":{"token":"test","allowed_chat_ids":[-12]}}}"#,
+            r#"{"ops":{"token":"test","allowed_chat_ids":[-12]}}"#,
+        ] {
+            let bots = decode_bots(raw).unwrap();
+            assert_eq!(bots[0].name, "ops");
+            assert_eq!(bots[0].allowed_chat_ids, [-12]);
+            let array = serde_json::to_string(&bots).unwrap();
+            assert!(array.starts_with('['));
+            assert_eq!(decode_bots(&array).unwrap()[0].name, "ops");
+        }
+        assert!(decode_bots("{broken").is_err());
+    }
 
     #[test]
     fn session_storage_round_trip_preserves_turn_identity_and_projects_input_pixels() {
@@ -386,11 +697,22 @@ mod tests {
             Message::user_with_images("request", vec!["data:image/png;base64,AAAA".into()]);
         message.user_turn_id = Some(crate::core::types::UserTurnId::new().unwrap());
         let id = message.user_turn_id.clone();
+        let task = crate::agent::todo::TaskContext::private();
+        task.replace(vec![crate::agent::todo::Todo::new(
+            "resume this lane only",
+            crate::agent::todo::Status::InProgress,
+        )])
+        .unwrap();
+        task.end_turn(true);
+        let expected_task = task.snapshot();
         let session = SessionFile {
+            version: 1,
+            session_control: Some(SessionControl::default()),
             platform: "fixture".into(),
             route: "default".into(),
             chat: "1".into(),
             messages: vec![message],
+            task_state: expected_task.clone(),
         };
         let bytes = serde_json::to_vec(&session).unwrap();
         let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -402,10 +724,118 @@ mod tests {
         let loaded: SessionFile = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(loaded.messages[0].user_turn_id, id);
         assert!(loaded.messages[0].images.is_empty());
+        assert_eq!(loaded.task_state, expected_task);
+        loaded.task_state.validate().unwrap();
         let legacy: SessionFile = serde_json::from_str(
             r#"{"platform":"fixture","route":"default","chat":"1","messages":[{"role":"user","content":"legacy"}]}"#,
         ).unwrap();
         assert!(legacy.messages[0].user_turn_id.is_none());
+        assert_eq!(legacy.task_state, crate::agent::todo::TaskState::default());
+    }
+
+    #[test]
+    fn concurrent_lane_scopes_persist_only_their_own_task() {
+        use crate::agent::todo::{self, Status, TaskContext, Todo};
+        let (_home_lock, _home) = with_temp_home();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = TaskContext::private();
+        let second = TaskContext::private();
+        runtime.block_on(async {
+            let save_lane = |chat: &'static str| async move {
+                todo::set(vec![Todo::new(
+                    format!("work for {chat}"),
+                    Status::InProgress,
+                )]);
+                tokio::task::yield_now().await;
+                todo::end_turn(true);
+                save_session("fixture", "shared-route", chat, &[Message::user(chat)]).unwrap();
+            };
+            tokio::join!(
+                todo::with_context(first.clone(), save_lane("first")),
+                todo::with_context(second.clone(), save_lane("second")),
+            );
+        });
+        let saved = load_sessions_with_state("fixture");
+        assert_eq!(saved.len(), 2);
+        for (_, chat, _, state, _) in &saved {
+            let expected = if chat == "first" {
+                first.snapshot()
+            } else {
+                second.snapshot()
+            };
+            assert_eq!(*state, expected);
+            assert_eq!(state.items[0].content, format!("work for {chat}"));
+            assert!(state.active && state.carry_over);
+        }
+        first.clear();
+        assert!(
+            !second.snapshot().items.is_empty(),
+            "one lane's /new cannot clear a sibling"
+        );
+
+        let path = session_path("fixture", "shared-route", "first");
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["task_state"]["version"] = serde_json::json!(999);
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert_eq!(
+            load_sessions_with_state("fixture").len(),
+            1,
+            "invalid task is not silently dropped from an otherwise loaded lane"
+        );
+    }
+
+    #[test]
+    fn invalid_existing_session_is_not_overwritten_by_a_fresh_lane() {
+        use crate::agent::todo::{self, Status, TaskContext, TaskState, Todo};
+        let (_home_lock, _home) = with_temp_home();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let owner = TaskContext::private();
+        let path = session_path("fixture", "route", "1");
+        let valid = SessionFile {
+            version: 1,
+            session_control: Some(SessionControl::default()),
+            platform: "fixture".into(),
+            route: "route".into(),
+            chat: "1".into(),
+            messages: vec![Message::user("existing private conversation")],
+            task_state: TaskState::default(),
+        };
+        let mut future = serde_json::to_value(&valid).unwrap();
+        future["task_state"]["version"] = serde_json::json!(999);
+        let mut wrong_owner = serde_json::to_value(&valid).unwrap();
+        wrong_owner["chat"] = serde_json::json!("other-chat");
+        for bytes in [
+            b"{malformed private conversation".to_vec(),
+            serde_json::to_vec(&future).unwrap(),
+            serde_json::to_vec(&wrong_owner).unwrap(),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            runtime.block_on(todo::with_context(owner.clone(), async {
+                todo::set(vec![Todo::new("fresh lane task", Status::InProgress)]);
+                let error = save_session("fixture", "route", "1", &[Message::user("new turn")])
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "existing hostbot session cannot be safely overwritten"
+                );
+                assert!(
+                    owner.is_dirty(),
+                    "failed persistence must not acknowledge the new task"
+                );
+            }));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "rejected target must remain byte-identical"
+            );
+        }
     }
 
     /// Pin `AIZEN_HOME` to a fresh tempdir so the store reads/writes there, not the real `~/.aizen`.
@@ -623,7 +1053,7 @@ mod tests {
         assert!(tg.iter().any(|(r, c, _)| r == "default" && c == "42"));
         assert!(tg.iter().any(|(r, c, _)| r == "work" && c == "-100"));
 
-        drop_session("telegram", "default", "42");
+        drop_session("telegram", "default", "42").unwrap();
         let tg = load_sessions("telegram");
         assert_eq!(tg.len(), 1, "dropped one → one telegram session left");
         assert_eq!(tg[0].0, "work");
@@ -638,6 +1068,30 @@ mod tests {
             1,
             "discord session untouched"
         );
+    }
+
+    #[test]
+    fn restored_topics_keep_their_own_history_and_respect_legacy_policy() {
+        let (_lock, _home) = with_temp_home();
+        for key in ["-55", "-55_topic_1", "-55_topic_2"] {
+            save_session("telegram", "default", key, &[Message::user(key)]).unwrap();
+        }
+        for key in ["-55_topic_1", "-55_topic_2"] {
+            let (rows, _, _) = load_lane_session("telegram", "default", key, Some("-55"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].content.as_deref(), Some(key));
+        }
+        let old = session_path("telegram", "default", "-55");
+        let mut record: SessionFile =
+            serde_json::from_slice(&std::fs::read(&old).unwrap()).unwrap();
+        record.session_control.as_mut().unwrap().mode =
+            crate::core::session_control::ExecutionMode::Planning;
+        std::fs::write(&old, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(load_lane_session("telegram", "default", "-55_topic_1", Some("-55")).is_err());
+        std::fs::write(&old, b"invalid").unwrap();
+        assert!(load_lane_session("telegram", "default", "-55_topic_3", Some("-55")).is_err());
     }
 
     #[test]

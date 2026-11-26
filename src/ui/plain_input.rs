@@ -8,6 +8,12 @@ use crate::ui::{image_input, splash};
 use anyhow::Result;
 use console::style;
 
+pub(crate) struct SubmittedInput {
+    pub text: String,
+    pub images: Vec<String>,
+    pub raw_human: String,
+}
+
 /// A bordered single-line input box (the "chat box") read key-by-key via `console` (raw mode), so
 /// the box redraws as you type and the cursor sits inside it. A small line editor:
 /// - type / **Backspace** / **Del** insert+delete at the cursor; **←/→** move; **Home/End** jump;
@@ -20,10 +26,10 @@ use console::style;
 ///   files before consuming the draft). An `[N img]` tag shows in the top border; **Ctrl-X** removes the
 ///   most recent attachment (keeps your text).
 ///
-/// Returns `Some((line, images))` on Enter after validating clipboard and file-path attachments,
-/// or `None` to quit (Esc-empty / Ctrl-C/D / EOF / non-TTY). Refused intake stays editable.
+/// Returns the submitted text, images and original human text on Enter; refused intake stays editable.
+/// `None` means quit (Esc-empty / Ctrl-C/D / EOF / non-TTY).
 /// The visible window scrolls horizontally so the cursor stays in view on long lines.
-pub(crate) fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<String>)>> {
+pub(crate) fn read_input_box(history: &[String]) -> Result<Option<SubmittedInput>> {
     use console::{Key, Term};
     use std::io::Write;
     const W: usize = 66; // inner width between the │ borders
@@ -167,7 +173,11 @@ pub(crate) fn read_input_box(history: &[String]) -> Result<Option<(String, Vec<S
                     );
                 }
                 std::io::stdout().flush().ok();
-                return Ok(Some((submitted, images)));
+                return Ok(Some(SubmittedInput {
+                    text: submitted,
+                    images,
+                    raw_human: text,
+                }));
             }
             Key::Char('\u{f}') => {
                 // Ctrl-O: grab a copied screenshot from the clipboard (Win+Shift+S / "Copy image").

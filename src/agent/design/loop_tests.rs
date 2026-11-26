@@ -638,8 +638,6 @@ fn config(
         workspace_root: Some(home.root.clone()),
         quiet: true,
         enable_verify_gate: false,
-        auto_checkpoint: false,
-        checkpoint_each_edit: false,
         context_window: 0,
         collapse_after_observations: usize::MAX,
         spill_result_over_chars: 0,
@@ -681,6 +679,7 @@ fn tool_call(id: &str, name: &str, args: Value) -> ToolCall {
 }
 fn turn(calls: Vec<ToolCall>, text: Option<&str>) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: text.map(str::to_owned),
         tool_calls: calls,
         finish_reason: Some("stop".into()),

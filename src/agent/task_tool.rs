@@ -87,38 +87,122 @@ pub(crate) fn subagent_call_timeout() -> Duration {
         .unwrap_or(SUBAGENT_CALL_TIMEOUT)
 }
 
-/// WALL-CLOCK ceiling for a WHOLE dispatch. Override with
-/// `AIZEN_SUBAGENT_WALL_SECS` (`0` disables it entirely).
-///
-/// [`SUBAGENT_CALL_TIMEOUT`] bounds ONE call; this bounds the unattended run. `max_steps` is now a
-/// total iteration ceiling, but one step may still spend minutes in a model call or shell command, so
-/// time remains an independent bound. Twenty minutes is enough for a focused child while preventing
-/// one bad delegation from silently occupying a slot for an hour.
-///
-/// Delegated runs only — a top-level turn leaves `AgentConfig::deadline` at `None`. The user is
-/// watching there and owns Esc; a sub-agent runs `quiet` with nobody watching.
+/// Default initial soft window. Productive work can earn more time inside the dispatch ceiling.
 const SUBAGENT_WALL_TIMEOUT: Duration = Duration::from_secs(1200);
-
-/// Floor for the [`SUBAGENT_WALL_TIMEOUT`] env override. A misconfigured `AIZEN_SUBAGENT_WALL_SECS=5`
-/// would make every dispatch fail before its first model call could return, which reads as a broken
-/// build rather than a tight budget.
 const SUBAGENT_WALL_FLOOR: Duration = Duration::from_secs(60);
 
-/// The absolute instant a dispatch starting NOW must stop by, or `None` when no ceiling applies.
-///
-/// Called once per dispatch and threaded into the one agent loop, so the ceiling covers the whole
-/// run and can never be refreshed by a step extension.
-pub(crate) fn subagent_wall_deadline() -> Option<std::time::Instant> {
-    let budget = match std::env::var("AIZEN_SUBAGENT_WALL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        // Explicit opt-out: a user who wants the old unbounded-in-time behavior can have it.
-        Some(0) => return None,
-        Some(n) => Duration::from_secs(n).max(SUBAGENT_WALL_FLOOR),
-        None => SUBAGENT_WALL_TIMEOUT,
-    };
-    Some(std::time::Instant::now() + budget)
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubagentTimePolicy {
+    ceiling: Option<Duration>,
+    adaptive: bool,
+}
+
+impl SubagentTimePolicy {
+    pub(crate) fn from_env(max_steps: usize) -> Self {
+        Self::from_value(
+            std::env::var("AIZEN_SUBAGENT_WALL_SECS").ok().as_deref(),
+            max_steps,
+        )
+    }
+
+    fn from_value(value: Option<&str>, max_steps: usize) -> Self {
+        match value.and_then(|value| value.trim().parse::<u64>().ok()) {
+            Some(0) => Self {
+                ceiling: None,
+                adaptive: false,
+            },
+            Some(seconds) => Self {
+                ceiling: Some(Duration::from_secs(seconds).max(SUBAGENT_WALL_FLOOR)),
+                adaptive: false,
+            },
+            None => {
+                // The declared step contract already has a host cap. Larger contracts reserve
+                // more total time, but only fresh successful observations can unlock that reserve.
+                let steps = max_steps.clamp(1, MAX_STEP_BUDGET) as u64;
+                let seconds = (SUBAGENT_WALL_TIMEOUT.as_secs() + steps * 60).min(90 * 60);
+                Self {
+                    ceiling: Some(Duration::from_secs(seconds)),
+                    adaptive: true,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn deadline(self, start: std::time::Instant) -> Option<std::time::Instant> {
+        self.ceiling
+            .map(|budget| start.checked_add(budget).unwrap_or(start))
+    }
+
+    pub(crate) fn budget(
+        self,
+        start: std::time::Instant,
+        inherited_deadline: Option<std::time::Instant>,
+    ) -> Option<super::time_budget::AdaptiveTimeBudget> {
+        if !self.adaptive {
+            return None;
+        }
+        let local = self.deadline(start)?;
+        let hard = inherited_deadline.map_or(local, |parent| local.min(parent));
+        Some(super::time_budget::AdaptiveTimeBudget::new(
+            start,
+            SUBAGENT_WALL_TIMEOUT,
+            hard,
+        ))
+    }
+}
+
+/// Freeze one logical hard ceiling before dispatch. Journals retain it across retry/resume.
+/// A fixed environment override remains fixed; `0` remains an explicit opt-out.
+pub(crate) fn subagent_wall_deadline(max_steps: usize) -> Option<std::time::Instant> {
+    SubagentTimePolicy::from_env(max_steps).deadline(std::time::Instant::now())
+}
+
+#[cfg(test)]
+mod adaptive_policy_tests {
+    use super::*;
+
+    #[test]
+    fn larger_contract_reserves_time_without_starting_with_that_whole_window() {
+        let start = std::time::Instant::now();
+        let small = SubagentTimePolicy::from_value(None, 4);
+        let large = SubagentTimePolicy::from_value(None, usize::MAX);
+        assert!(large.deadline(start) > small.deadline(start));
+        assert_eq!(
+            large.deadline(start),
+            Some(start + Duration::from_secs(5400))
+        );
+        let budget = large.budget(start, large.deadline(start)).unwrap();
+        assert_eq!(
+            budget.deadline(start, true).0,
+            start + SUBAGENT_WALL_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn explicit_fixed_budget_and_opt_out_do_not_enable_auto_extension() {
+        let start = std::time::Instant::now();
+        for value in ["5", "600", "3600"] {
+            let policy = SubagentTimePolicy::from_value(Some(value), 80);
+            assert!(!policy.adaptive);
+            assert!(policy.budget(start, policy.deadline(start)).is_none());
+        }
+        let short = SubagentTimePolicy::from_value(Some("5"), 80);
+        assert_eq!(short.deadline(start), Some(start + SUBAGENT_WALL_FLOOR));
+        let unlimited = SubagentTimePolicy::from_value(Some("0"), 80);
+        assert!(unlimited.deadline(start).is_none());
+        assert!(unlimited.budget(start, None).is_none());
+    }
+
+    #[test]
+    fn invalid_override_is_bounded_and_parent_deadline_is_never_renewed() {
+        let start = std::time::Instant::now();
+        let policy = SubagentTimePolicy::from_value(Some("invalid"), 25);
+        let parent = start + Duration::from_secs(30);
+        let budget = policy.budget(start, Some(parent)).unwrap();
+        budget.note_progress(start, Duration::from_secs(1), "file_read", "fresh contents");
+        assert_eq!(budget.deadline(start, true).0, parent);
+        assert!(budget.deadline(parent, true).1.is_none());
+    }
 }
 
 /// Default total step budget for a dispatch when the parent doesn't set `max_steps`. Matches the
@@ -175,6 +259,7 @@ impl TaskContract {
     }
 }
 
+#[derive(Clone)]
 pub struct TaskTool {
     client: reqwest::Client,
     base_url: String,
@@ -488,153 +573,46 @@ fn seat_native_dispatch(
     Ok(())
 }
 
+#[path = "task_git_worktree.rs"]
+mod git_worktree;
+
+pub(crate) fn validate_owned_workflow(
+    args: &Value,
+    ctx: &crate::core::exec_ctx::ExecutionContext,
+) -> Result<()> {
+    git_worktree::validate(args, ctx)
+}
+
 #[derive(Clone)]
 struct PreparedTaskDispatch {
     dispatch: Dispatch,
     execution: super::speculation::ExecutionMode,
-    speculative: Option<std::sync::Arc<SpeculativeTask>>,
+    owned_task: Option<std::sync::Arc<crate::core::git_ops::OwnedTask>>,
+    owned_complete: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    owned_attempt: Option<crate::core::git_ops::GitNativeAttempt>,
+    owned_release: Option<
+        std::sync::Arc<
+            std::sync::Mutex<Option<crate::agent::git_native_attempt::ReleasedGitAttempt>>,
+        >,
+    >,
     image_config: crate::core::cli_config::CliConfig,
     image_policy: crate::llm::media::VisionPolicy,
     image_destination: String,
     relay_allowed: bool,
 }
 
-/// The controller seats this descriptor only after the entire cohort has passed approval.
-struct SpeculativeTask {
-    cohort: std::sync::Arc<super::speculation::Cohort>,
-    child_scope: String,
-    overlay: crate::core::speculation::store::OverlayHandle,
-    logical_complete: std::sync::atomic::AtomicBool,
-    track: std::sync::Mutex<Option<crate::agent::orchestration::Track>>,
-    report: std::sync::Mutex<Option<SpeculativeTaskReport>>,
-    released: std::sync::Mutex<Option<crate::agent::speculative_attempt::ReleasedAttempt>>,
-}
-
-struct SpeculativeTaskReport {
-    parent_scope: String,
-    label: String,
-    body: String,
-}
-
-pub(crate) fn speculative_scope(
-    call: &PreparedToolCall,
-) -> Option<crate::core::native_scope::NativeWriteScope> {
-    let prepared = call
+/// The outer observer must cover the actual host-frozen Task workload. Model JSON or another
+/// tool's untyped delegation marker cannot authorize a longer observer. The child still owns its
+/// adaptive soft window, and the executor clamps this ceiling to its parent's current deadline.
+pub(crate) fn prepared_wall_deadline(call: &PreparedToolCall) -> Option<std::time::Instant> {
+    let frozen = call
         .delegation
         .as_ref()?
         .downcast_ref::<PreparedTaskDispatch>()?;
-    (prepared.execution == super::speculation::ExecutionMode::Speculative)
-        .then(|| prepared.dispatch.native_scope.clone())
-        .flatten()
-}
-
-pub(crate) fn seat_speculative(
-    call: &PreparedToolCall,
-    cohort: std::sync::Arc<super::speculation::Cohort>,
-    parent: &crate::core::exec_ctx::ExecutionContext,
-) -> Result<PreparedToolCall> {
-    let mut prepared = call
-        .delegation
-        .as_ref()
-        .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
-        .context("speculation requires a frozen task dispatch")?
-        .clone();
-    anyhow::ensure!(
-        prepared.execution == super::speculation::ExecutionMode::Speculative
-            && prepared.speculative.is_none(),
-        "speculative task is already seated or requested direct execution"
-    );
-    let scope = prepared
-        .dispatch
-        .native_scope
-        .as_ref()
-        .context("speculative task lost its exact scope")?;
-    let child_scope = format!(
-        "{}/task/{}",
-        parent.resource_scope(),
-        NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let owner = format!("{child_scope}/attempt/1");
-    let overlay = cohort.overlay(&owner, scope)?;
-    prepared.speculative = Some(std::sync::Arc::new(SpeculativeTask {
-        cohort,
-        child_scope,
-        overlay,
-        logical_complete: std::sync::atomic::AtomicBool::new(false),
-        track: std::sync::Mutex::new(None),
-        report: std::sync::Mutex::new(None),
-        released: std::sync::Mutex::new(None),
-    }));
-    let mut call = call.clone();
-    call.delegation = Some(std::sync::Arc::new(prepared));
-    Ok(call)
-}
-
-/// Called only after the outer driver body was joined, including its reporting and TLS cleanup.
-/// Consumes volatile native-attempt resource release proof; durable lifecycle is separate.
-pub(crate) fn seal_speculative_after_driver(
-    call: &PreparedToolCall,
-    parent: &crate::core::exec_ctx::ExecutionContext,
-) -> Result<super::speculation::ReleasedOverlay> {
-    let task = call
-        .delegation
-        .as_ref()
-        .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
-        .and_then(|prepared| prepared.speculative.as_ref())
-        .context("task has no controller-seated speculative attempt")?;
-    anyhow::ensure!(
-        task.logical_complete
-            .load(std::sync::atomic::Ordering::Acquire),
-        "speculative child did not complete its logical contract"
-    );
-    let released = task
-        .released
-        .lock()
-        .map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?
-        .take()
-        .context("speculative task has no unused resource-release token")?;
-    task.cohort.seal_released(parent, &task.overlay, released)
-}
-
-pub(crate) fn finish_speculative_status(call: &PreparedToolCall, verified: bool, detail: &str) {
-    if let Some(task) = call
-        .delegation
-        .as_ref()
-        .and_then(|value| value.downcast_ref::<PreparedTaskDispatch>())
-        .and_then(|dispatch| dispatch.speculative.as_ref())
-    {
-        // Taking the deferred report makes accepted publication idempotent. Private findings
-        // remain tied to the captured base even after a command verifies the combined tree.
-        let report = task
-            .report
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if verified {
-            if let Some(report) = report {
-                crate::agent::blackboard::note(
-                    &report.parent_scope,
-                    &crate::agent::blackboard::task_note_id(&report.label, &task.child_scope),
-                    &format!("[Integrated and command-verified: {detail}]\n[Findings are base-scoped to {}; peer edits may require semantic review, not a fresh live-tree review.]\n{}",
-                        task.cohort.base().id(), report.body),
-                );
-            }
-        }
-        if let Some(track) = task
-            .track
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            if verified {
-                track.finish_ok(format!("integrated and verified · {detail}"));
-            } else {
-                track.finish_err(format!(
-                    "cohort not verified; inspect retained evidence · {detail}"
-                ));
-            }
-        }
+    if frozen.execution != super::speculation::ExecutionMode::Direct {
+        return None;
     }
+    subagent_wall_deadline(frozen.dispatch.max_steps)
 }
 
 /// Resolve a delegated child's wire effort independently of the parent's adaptive turn tier.
@@ -1174,7 +1152,10 @@ impl TaskTool {
         Ok(PreparedTaskDispatch {
             dispatch,
             execution: super::speculation::ExecutionMode::from_args(args)?,
-            speculative: None,
+            owned_task: None,
+            owned_complete: None,
+            owned_attempt: None,
+            owned_release: None,
             image_config,
             image_policy,
             image_destination,
@@ -1188,28 +1169,28 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "One bounded child; independent tasks → workflow. Exact-scoped native children overlap; \
-         unrestricted writers serialize. No nested delegation or restore/undo. Prefer agent over role."
+        "One bounded child. Independent exact read/write scopes can overlap; conflicting writers serialize. For parallel proposals on one file see workflow. No nested delegation or restore."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "self-contained task"},
-                "agent": {"type": "string", "description": "<agents> slug; overrides role/tools"},
-                "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "Without agent: argus=read (default), metis=plan, daedalus=edit, nemesis=review, themis=tests/no edit, clio=web, mnemosyne=history; legacy names valid."},
-                "model": {"type": "string", "description": "child model override"},
-                "label": {"type": "string", "description": "result-header tag"},
-                "boundaries": {"type": "string", "description": "forbidden actions/targets"},
-                "expected_output": {"type": "string", "description": "answer contract"},
-                "context": {"type": "array", "items": {"type": "string"}, "description": "known findings, <=10 lines; don't re-derive"},
+                "agent": {"type": "string", "description": "specialist slug; overrides role/tools"},
+                "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "default argus; legacy names accepted"},
+                "model": {"type": "string"},
+                "label": {"type": "string"},
+                "boundaries": {"type": "string"},
+                "expected_output": {"type": "string"},
+                "context": {"type": "array", "items": {"type": "string"}, "description": "known findings, <=10 lines"},
                 "max_steps": {"type": "integer", "description": "total model steps; role default 15-45, cap 80"},
-                "read_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"Exact native reads; read-only without write_paths. Union <=32; no dirs/globs."},
-                "write_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"Exact native read/write files; read_paths union; parent verifies. No dirs/globs."},
-                "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Native exact scopes: private same-base edits, parent merges/verifies; default direct."},
-                "reference_ids": {"type":"array", "maxItems":4, "uniqueItems":true, "items":{"type":"string","maxLength":128}, "description":"Current-chat refs; live purpose/destination/account grant. No parent history/sibling evidence."},
-                "return_evidence": {"type": "array", "items": {"type": "string", "maxLength": 128}, "maxItems": 4, "description": "child captures or @latest_capture (one latest successful screenshot); final completed attempt only, no refs/unapproved providers"},
-                "expects": {"type": "object", "description": "final-answer JSON Schema; JSON only, validated json:ok|invalid"}
+                "read_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"exact native reads; no dirs/globs"},
+                "write_paths": {"type":"array", "minItems":1, "maxItems":32, "uniqueItems":true, "items":{"type":"string","maxLength":4096}, "description":"exact native files; parent verifies"},
+                "isolation": {"type":"string", "enum":["worktree"], "description":"fresh Git worktree; daedalus native-only; explicit integration"},
+                "execution": {"type":"string", "enum":["direct"], "description":"Use explicit isolation=worktree for Git-owned native work"},
+                "reference_ids": {"type":"array", "maxItems":4, "uniqueItems":true, "items":{"type":"string","maxLength":128}},
+                "return_evidence": {"type":"array", "maxItems":4, "items":{"type":"string","maxLength":128}},
+                "expects": {"type":"object", "description":"final JSON Schema"}
             },
             "required": ["prompt"],
             "additionalProperties": false
@@ -1226,16 +1207,22 @@ impl Tool for TaskTool {
     /// are still destructive: only frozen disjoint resource keys unlock their separate write batch.
     /// Shell/build, images and unrestricted dispatches never gain that admission from a role name.
     fn is_concurrency_safe_for(&self, args: &Value) -> bool {
-        self.prepare_dispatch(args, false).is_ok_and(|d| {
-            d.execution == super::speculation::ExecutionMode::Direct
-                && dispatch_is_read_only(&d.dispatch.registry)
-        })
+        !git_worktree::requested(args)
+            && self.prepare_dispatch(args, false).is_ok_and(|d| {
+                d.execution == super::speculation::ExecutionMode::Direct
+                    && dispatch_is_read_only(&d.dispatch.registry)
+            })
     }
     fn plan_call(
         &self,
         args: &Value,
         ctx: &crate::core::exec_ctx::ExecutionContext,
     ) -> Result<PreparedToolCall> {
+        if git_worktree::requested(args) {
+            git_worktree::validate(args, ctx)?;
+            self.prepare_dispatch(args, true)?;
+            return Ok(PreparedToolCall::new(args.clone()));
+        }
         self.prepare_call(args, ctx)
     }
     fn prepare_call(
@@ -1243,38 +1230,16 @@ impl Tool for TaskTool {
         args: &Value,
         ctx: &crate::core::exec_ctx::ExecutionContext,
     ) -> Result<PreparedToolCall> {
+        if let Some(isolation) = args.get("isolation") {
+            anyhow::ensure!(isolation == "worktree", "unsupported task isolation");
+            return git_worktree::prepare(self, args, ctx);
+        }
         let mut call = PreparedToolCall::new(args.clone());
         let mut prepared = self.prepare_dispatch(args, true)?;
         seat_native_dispatch(&mut prepared.dispatch, args, &self.root, ctx)?;
-        if prepared.execution == super::speculation::ExecutionMode::Speculative {
-            crate::agent::hooks::check_speculative_policy()?;
-            anyhow::ensure!(
-                ctx.overlay().is_none()
-                    && ctx.native_scope().is_none()
-                    && ctx.can_restore_workspace(),
-                "only the unrestricted coordinating parent may request speculative children"
-            );
-            anyhow::ensure!(
-                prepared.dispatch.native_scope.is_some(),
-                "speculative execution requires exact read_paths/write_paths"
-            );
-            anyhow::ensure!(
-                reference_ids(args)?.is_empty() && evidence_ids(args).is_empty(),
-                "speculative native execution does not accept or return media"
-            );
-            prepared.image_config.response_visuals =
-                Some(crate::core::cli_config::ResponseVisuals::Off);
-            prepared.image_policy = crate::llm::media::VisionPolicy::Unsupported;
-            prepared.relay_allowed = false;
-            prepared.dispatch.system.push_str("\n<private_overlay>All file reads and edits use your private immutable-base overlay. No live project file changes until the parent integrates the complete cohort. Read your own writes; do not claim builds, live integration or verification. This native-only lane returns text, not media. A failure retains only private work for parent inspection.</private_overlay>\n");
-        }
         if let Some(scope) = &prepared.dispatch.native_scope {
             call.preview = Some(crate::agent::tools::ApprovalPreview {
-                title: if prepared.execution == super::speculation::ExecutionMode::Speculative {
-                    "Private native overlay; parent integrates and verifies".into()
-                } else {
-                    "Native-only child file scope".into()
-                },
+                title: "Native-only child file scope".into(),
                 diff: None,
                 lines: scope.prompt().lines().map(str::to_owned).collect(),
             });
@@ -1286,6 +1251,9 @@ impl Tool for TaskTool {
         Ok(call)
     }
     fn delegation_read_only_prepared(&self, call: &PreparedToolCall) -> Option<bool> {
+        if git_worktree::frozen(call) {
+            return Some(false);
+        }
         call.delegation
             .as_ref()?
             .downcast_ref::<PreparedTaskDispatch>()
@@ -1319,8 +1287,8 @@ impl Tool for TaskTool {
         frozen.dispatch.native_scope.clone()
     }
     fn workspace_effect_prepared(&self, call: &PreparedToolCall) -> super::tools::WorkspaceEffect {
-        if speculative_scope(call).is_some() {
-            return super::tools::WorkspaceEffect::PrivateOverlay;
+        if git_worktree::frozen(call) {
+            return super::tools::WorkspaceEffect::External;
         }
         match self.delegation_read_only_prepared(call) {
             Some(true) | None => super::tools::WorkspaceEffect::None,
@@ -1332,13 +1300,16 @@ impl Tool for TaskTool {
     }
     fn workspace_target_prepared(&self, call: &PreparedToolCall) -> Option<PathBuf> {
         self.workspace_effect_prepared(call)
-            .needs_checkpoint()
+            .mutates_workspace()
             .then(|| self.root.clone())
     }
     fn is_concurrency_safe_prepared(&self, call: &PreparedToolCall) -> bool {
         self.delegation_read_only_prepared(call) == Some(true)
     }
     fn execute_prepared(&self, call: &PreparedToolCall) -> Result<ToolObservation> {
+        if git_worktree::frozen(call) {
+            return git_worktree::execute(self, call);
+        }
         let dispatch = call
             .delegation
             .as_ref()
@@ -1439,13 +1410,16 @@ impl TaskTool {
         prepared: &PreparedTaskDispatch,
         scoped_native_parallel: bool,
     ) -> Result<ToolObservation> {
-        if prepared.execution == super::speculation::ExecutionMode::Speculative {
-            crate::agent::hooks::check_speculative_policy()?;
-            anyhow::ensure!(
-                prepared.speculative.is_some(),
-                "speculative task requires controller-seated cohort admission; no live fallback"
-            );
-        }
+        // Historical labels cannot bypass fresh dispatch admission, even on a frozen descriptor.
+        prepared.execution.require_supported()?;
+        let git_owned = prepared.owned_task.is_some();
+        anyhow::ensure!(
+            git_owned == prepared.owned_attempt.is_some()
+                && git_owned == prepared.owned_release.is_some()
+                && git_owned == prepared.owned_complete.is_some()
+                && (!git_owned || prepared.execution == super::speculation::ExecutionMode::Direct),
+            "Git-owned task requires one complete native lifecycle; mixed or partial admission has no fallback"
+        );
         let prompt = args
             .get("prompt")
             .and_then(Value::as_str)
@@ -1524,7 +1498,7 @@ impl TaskTool {
                     &base,
                     &key,
                     &model,
-                    crate::llm::client::stream_chat_with_tools_sink_frozen(
+                    Box::pin(crate::llm::client::stream_chat_with_tools_sink_frozen(
                         &client,
                         &base,
                         &key,
@@ -1537,7 +1511,7 @@ impl TaskTool {
                         },
                         effort,
                         &frozen_cfg,
-                    ),
+                    )),
                 )
                 .await
                 .map(|(turn, receipt)| {
@@ -1562,13 +1536,14 @@ impl TaskTool {
             &crate::agent::context_pack::findings_from_args(args),
             parent_ctx.design().as_ref(),
         );
-        let child_scope = match &prepared.speculative {
-            Some(task) => task.child_scope.clone(),
-            None => format!(
+        let child_scope = if let Some(task) = &prepared.owned_task {
+            task.scope().to_owned()
+        } else {
+            format!(
                 "{}/task/{}",
                 parent_ctx.resource_scope(),
                 NEXT_TASK_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ),
+            )
         };
         let selected_reference_ids = reference_ids(args)?;
         let child_ctx = seat_child_references(
@@ -1585,14 +1560,9 @@ impl TaskTool {
         } else {
             child_ctx
         };
-        let child_ctx = if prepared.speculative.is_some() {
-            child_ctx
-        } else {
-            child_ctx.with_workspace_activity(crate::core::workspace_txn::WorkspaceActivity::begin(
-                &self.root,
-                &child_scope,
-            )?)
-        };
+        let child_ctx = child_ctx.with_workspace_activity(
+            crate::core::workspace_txn::WorkspaceActivity::begin(&self.root, &child_scope)?,
+        );
         let native_scoped = child_ctx.native_scope().is_some();
         let context_window = if self.context_window == 0 {
             0 // explicit guard-off fixtures/controllers remain guard-off
@@ -1608,8 +1578,9 @@ impl TaskTool {
             })
             .tokens
         };
+        let time_policy = SubagentTimePolicy::from_env(max_steps);
+        let time_started = std::time::Instant::now();
         let mut cfg = AgentConfig {
-            auto_checkpoint: !native_scoped,
             approval_mode: self.approval_mode, // inherit parent approval tier transitively
             cancel: own_cancel.clone(),
             exec_ctx: child_ctx,
@@ -1658,12 +1629,13 @@ impl TaskTool {
             // consulting the parent's todo list.
             max_stall_recoveries: 1,
             // The deadline is absolute for this one run; it cannot be refreshed by a continuation.
-            deadline: subagent_wall_deadline(),
+            deadline: time_policy.deadline(time_started),
             ..AgentConfig::default()
         };
 
         cfg.exec_ctx = cfg.exec_ctx.with_deadline(cfg.deadline);
         cfg.deadline = cfg.exec_ctx.deadline();
+        cfg.adaptive_time = time_policy.budget(time_started, cfg.deadline);
 
         // Make a transitive yolo grant visible: an unattended destructive sub-agent is easy to miss.
         // Route through the TUI funnel when it owns the screen — a raw `eprintln!` mid-turn writes
@@ -1764,10 +1736,7 @@ impl TaskTool {
         // brief (its own partial report attached). Both attempts retain their actual edits;
         // only the coordinating parent may inspect and reconcile incomplete work.
         //
-        let dispatch_lease = if sub_verify_gate
-            && prepared.speculative.is_none()
-            && !(native_scoped && scoped_native_parallel)
-        {
+        let dispatch_lease = if sub_verify_gate && !(native_scoped && scoped_native_parallel) {
             Some(
                 crate::core::workspace_txn::WorkspaceWriterLease::acquire_scoped(
                     &self.root,
@@ -1786,22 +1755,28 @@ impl TaskTool {
         // Usage totals span both attempts; live publication has its own watermark.
         let attempt = std::sync::atomic::AtomicUsize::new(0);
         let final_slot = std::cell::RefCell::new(None);
+        let final_handoff =
+            std::cell::Cell::new(crate::agent::native_handoff::UnverifiedHandoff::default());
         let run_once =
             |user_text: String| -> Result<(crate::agent::AgentOutcome, Vec<Message>, String)> {
-                let attempt_scope = format!(
-                    "{child_scope}/attempt/{}",
-                    attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                );
+                let attempt_scope = if prepared.owned_task.is_some() {
+                    child_scope.clone()
+                } else {
+                    format!(
+                        "{child_scope}/attempt/{}",
+                        attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    )
+                };
                 drop(final_slot.borrow_mut().take());
                 let slot = match initial_slot.borrow_mut().take() {
                     Some(slot) => slot,
                     None => {
-                        anyhow::ensure!(prepared.speculative.is_none(),
-                            "speculative attempt cannot reacquire admission or reuse a private overlay");
-                        acquire_task_slot(model_for_budget, &cfg.cancel, cfg.deadline)?
+                        anyhow::ensure!(prepared.owned_attempt.is_none(),
+                            "Git-owned native attempt cannot reacquire admission or reuse its lifecycle");
+                        acquire_task_slot(model_for_budget, &cfg.cancel, cfg.run_deadline())?
                     }
                 };
-                let mut native_owner = None;
+                let mut git_native_owner = None;
                 let mut direct_slot = None;
                 let mut attempt_cfg = cfg.clone();
                 attempt_cfg.exec_ctx = seat_child_references(
@@ -1819,28 +1794,19 @@ impl TaskTool {
                     cfg.tool_image_policy,
                 )?
                 .with_recovery(cfg.exec_ctx.recovery().clone());
-                if let Some(task) = &prepared.speculative {
-                    crate::agent::hooks::check_speculative_policy()?;
-                    attempt_cfg.exec_ctx =
-                        attempt_cfg.exec_ctx.with_overlay(task.overlay.clone())?;
-                    let scope = attempt_cfg
-                        .exec_ctx
-                        .native_scope()
-                        .context("speculative task lost its complete exact scope")?;
-                    native_owner = Some(
-                        crate::agent::speculative_attempt::AttemptOwner::new_required(
-                            slot,
-                            &self.root,
-                            &attempt_scope,
-                            task.overlay.clone(),
-                            scope,
-                        )?,
-                    );
-                    attempt_cfg.exec_ctx = native_owner
-                        .as_ref()
-                        .context("speculative task owner unavailable")?
-                        .bind_context(&attempt_cfg.exec_ctx)?;
+                if let Some(attempt) = &prepared.owned_attempt {
+                    let owner = crate::agent::git_native_attempt::OwnedNativeAttemptOwner::admit(
+                        slot,
+                        attempt.clone(),
+                        &attempt_cfg.exec_ctx,
+                    )?;
+                    attempt_cfg.exec_ctx = owner.bind_context(&attempt_cfg.exec_ctx)?;
+                    git_native_owner = Some(owner);
                 } else {
+                    anyhow::ensure!(
+                        prepared.owned_task.is_none(),
+                        "Git-owned task lost its native lifecycle; direct fallback is forbidden"
+                    );
                     let slot = std::sync::Arc::new(slot);
                     attempt_cfg.exec_ctx = attempt_cfg.exec_ctx.with_attempt_slot(slot.clone());
                     direct_slot = Some(slot);
@@ -1855,47 +1821,36 @@ impl TaskTool {
                     .unwrap_or_default();
                 let attempt_system = child_design_system(&system, &attempt_cfg.exec_ctx);
                 let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        let mut msgs = vec![
-                            Message::system(attempt_system.as_str()),
-                            child_reference_message(&attempt_cfg.exec_ctx, user_text)?,
-                        ];
-                        let o = match crate::agent::run_agent_loop(
-                            &chat,
-                            &attempt_cfg,
-                            &registry,
-                            &mut msgs,
-                        )
-                        .await
-                        {
-                            Ok(o) => o,
-                            Err(e) => {
-                                let completed_tool_turns = msgs
-                                    .iter()
-                                    .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-                                    .count();
-                                // The transcript dies with this return — salvage the same partial report
-                                // the Ok path gets. Without it, a child that completed 20 tool turns and
-                                // then hit a terminal API error handed the parent one line and no list of
-                                // what it had already touched.
-                                let partial = partial_report_from_messages(&msgs);
-                                return Err(e.context(format!(
-                            "after {completed_tool_turns} completed tool turn(s) — the workspace \
-                             may already contain partial edits from this sub-agent; inspect before \
-                             retrying.\nPartial progress before the failure:\n{partial}"
-                        )));
-                            }
-                        };
-                        Ok::<_, anyhow::Error>((o, msgs, evidence_scope))
-                    })
+                    // The bridge and streaming loop are heap-pinned, not copied through the
+                    // already nested parent/tool/runtime stack. Ownership and awaits stay local.
+                    tokio::runtime::Handle::current().block_on(Box::pin(run_child_transcript(
+                        &chat,
+                        &attempt_cfg,
+                        &registry,
+                        attempt_system.as_str(),
+                        user_text,
+                        evidence_scope,
+                    )))
                 });
+                let handoff = result
+                    .as_ref()
+                    .map(|(outcome, _, _)| {
+                        crate::agent::native_handoff::unverified_handoff(
+                            outcome,
+                            &attempt_cfg.exec_ctx,
+                            &attempt_cfg.cancel,
+                        )
+                    })
+                    .unwrap_or_default();
+                final_handoff.set(handoff);
                 *attempt_chat_context
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = cfg.exec_ctx.clone();
                 drop(attempt_cfg);
-                if let Some(owner) = native_owner {
-                    let driver = crate::agent::speculative_attempt::driver_result(
+                if let Some(owner) = git_native_owner {
+                    let driver = crate::agent::native_handoff::driver_result(
                         result.as_ref().map(|(outcome, _, _)| outcome),
+                        handoff,
                     );
                     let released = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(owner.finish_with_driver(
@@ -1903,17 +1858,15 @@ impl TaskTool {
                             driver,
                         ))
                     })?;
-                    let task = prepared
-                        .speculative
+                    let mut destination = prepared
+                        .owned_release
                         .as_ref()
-                        .context("speculative task lost its controller")?;
-                    let mut destination = task
-                        .released
+                        .context("Git-owned task lost its private release destination")?
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("speculative release state poisoned"))?;
+                        .map_err(|_| anyhow::anyhow!("Git-owned release state poisoned"))?;
                     anyhow::ensure!(
                         destination.is_none(),
-                        "speculative task already released an attempt"
+                        "Git-owned task already released an attempt"
                     );
                     *destination = Some(released);
                 }
@@ -1931,26 +1884,10 @@ impl TaskTool {
                 }
                 result
             };
-        // Retain the audit baseline through settlement; it grants the child no undo authority.
-        let _pre_dispatch = if sub_verify_gate && !native_scoped {
-            crate::features::timemachine::save_for_in_context(
-                cfg.exec_ctx.recovery(),
-                &self.root,
-                &format!("before {label}"),
-                true,
-                true,
-                &cfg.exec_ctx,
-            )
-            .with_context(|| {
-                format!("sub-agent ({label}) pre-dispatch checkpoint failed; dispatch not run")
-            })?
-        } else {
-            None
-        };
         let first_text = crate::agent::context_pack::prepend(pack.as_deref(), prompt);
         let (outcome, retried) = run_task_attempts(
             first_text,
-            sub_verify_gate && prepared.speculative.is_none(),
+            sub_verify_gate && prepared.owned_task.is_none(),
             run_once,
             |stop| {
                 track.set_phase(
@@ -1962,11 +1899,7 @@ impl TaskTool {
         let (outcome, msgs, final_scope) = match outcome {
             Ok(o) => o,
             Err(e) => {
-                let retained = if prepared.speculative.is_some() {
-                    "private overlay work is retained; no live integration started and no automatic retry or restore ran"
-                } else {
-                    "no automatic restore or undo ran; actual or possibly-applied child edits remain for the coordinating parent to inspect"
-                };
+                let retained = "no automatic restore or undo ran; actual or possibly-applied child edits remain for the coordinating parent to inspect";
                 let (tokens_in, tokens_out) = usage_out.finish();
                 let detail = format!(
                     "error: {e:#}\n{retained}\nObserved spend: {tokens_in}→{tokens_out} tok"
@@ -1988,6 +1921,9 @@ impl TaskTool {
         let stop_kind = outcome.stop;
         let stop = match &stop_kind {
             crate::agent::StopReason::Done => "done",
+            crate::agent::StopReason::Incomplete => {
+                "incomplete: completion requirements are not satisfied"
+            }
             crate::agent::StopReason::Divergence => "stopped making progress",
             crate::agent::StopReason::MaxIters => "hit the step limit",
             crate::agent::StopReason::VerificationFailed => {
@@ -2030,7 +1966,7 @@ impl TaskTool {
                         &first_err,
                         &usage_out,
                         &cfg.cancel,
-                        cfg.deadline,
+                        cfg.run_deadline(),
                     );
                     match repaired.as_deref().map(|r| validate_contract(r, schema)) {
                         Some(Ok(v)) => (
@@ -2047,13 +1983,11 @@ impl TaskTool {
         };
         let body_warning = stop_body_warning(&stop_kind);
         let ok = matches!(stop_kind, crate::agent::StopReason::Done);
-        if let Some(task) = &prepared.speculative {
-            // Logical success never seals private bytes. The coordinator joins this entire
-            // driver (including TLS/cfg cleanup) before requesting a private-body-quiescent seal.
-            task.logical_complete.store(
-                ok && !json_tag.contains("json:invalid"),
-                std::sync::atomic::Ordering::Release,
-            );
+        let handoff = final_handoff.get().eligible()
+            && matches!(stop_kind, crate::agent::StopReason::Incomplete);
+        let integration_candidate = (ok || handoff) && !json_tag.contains("json:invalid");
+        if let Some(complete) = &prepared.owned_complete {
+            complete.store(integration_candidate, std::sync::atomic::Ordering::Release);
         }
         let (tokens_in, tokens_out) = usage_out.finish();
         let retry_tag = if retried { " · retried" } else { "" };
@@ -2070,57 +2004,24 @@ impl TaskTool {
             "{} step(s), {stop}{json_tag}{retry_tag}{tok_tag}",
             outcome.iters
         );
-        if let Some(task) = &prepared.speculative {
-            if ok && !json_tag.contains("json:invalid") {
-                track.set_phase(
-                    crate::agent::orchestration::Phase::Running,
-                    format!(
-                        "private attempt returned; awaiting parent sealing/integration · {detail}"
-                    ),
-                );
-                *task
-                    .track
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("speculative status poisoned"))? = Some(track);
-            } else {
-                track.finish_err(format!(
-                    "private attempt incomplete; no integration · {detail}"
-                ));
-            }
-        } else if ok {
+        if ok {
             track.finish_ok(detail);
         } else {
             track.finish_err(detail);
         }
         let mut warning = body_warning.map(|w| format!("{w}\n")).unwrap_or_default();
         if !ok {
-            warning.push_str(if prepared.speculative.is_some() {
-                "[Private overlay attempt incomplete; no live integration or automatic retry/restore ran. The coordinating parent must inspect retained private work.]\n"
-            } else {
-                "[No automatic restore or undo ran; actual or possibly-applied edits from this dispatch remain. The coordinating parent must inspect and consolidate partial work.]\n"
-            });
+            warning.push_str(
+                "[No automatic restore or undo ran; actual or possibly-applied edits from this dispatch remain. The coordinating parent must inspect and consolidate partial work.]\n",
+            );
         }
         // File the whole report on the sibling blackboard: the parent sees this result cut to
         // its budget, a later child can `file_read` all of it.
-        if let Some(task) = &prepared.speculative {
-            if ok && !json_tag.contains("json:invalid") {
-                *task
-                    .report
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("speculative report poisoned"))? =
-                    Some(SpeculativeTaskReport {
-                        parent_scope: parent_ctx.resource_scope(),
-                        label: label.clone(),
-                        body: format!("{warning}{body}"),
-                    });
-            }
-        } else {
-            crate::agent::blackboard::note(
-                &parent_ctx.resource_scope(),
-                &crate::agent::blackboard::task_note_id(&label, &child_scope),
-                &format!("{warning}{body}"),
-            );
-        }
+        crate::agent::blackboard::note(
+            &parent_ctx.resource_scope(),
+            &crate::agent::blackboard::task_note_id(&label, &child_scope),
+            &format!("{warning}{body}"),
+        );
         let images = if ok && !json_tag.contains("json:invalid") && relay_allowed {
             crate::agent::selected_evidence_images(&msgs, &requested_evidence, &final_scope)
         } else {
@@ -2133,18 +2034,9 @@ impl TaskTool {
         if !requested_evidence.is_empty() && !relay_allowed {
             warning.push_str("[Visual evidence not relayed: this child used a different provider destination; evidence IDs do not authorize disclosure across providers.]\n");
         }
-        let overlay_tag = if let Some(task) = &prepared.speculative {
-            format!(
-                ", private overlay; not yet integrated; base={} overlay={}",
-                task.cohort.base().id(),
-                task.overlay.id()
-            )
-        } else {
-            String::new()
-        };
         Ok(ToolObservation {
             text: format!(
-                "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}{overlay_tag}]\n{warning}{body}",
+                "[task: {header_label}, {} step(s), {stop}{json_tag}{retry_tag}{tok_tag}]\n{warning}{body}",
                 outcome.iters
             ),
             images,
@@ -2192,6 +2084,45 @@ pub(crate) fn thin_brief(brief: &str) -> Option<String> {
 }
 
 type TaskAttemptResult = Result<(crate::agent::AgentOutcome, Vec<Message>, String)>;
+
+/// Keep the child loop on the heap while preserving one borrowed config and one transcript.
+/// The synchronous Task bridge can already be nested inside the parent loop's poll stack.
+async fn run_child_transcript<F, Fut>(
+    chat: F,
+    cfg: &AgentConfig,
+    registry: &crate::agent::tools::ToolRegistry,
+    system: &str,
+    user_text: String,
+    evidence_scope: String,
+) -> TaskAttemptResult
+where
+    F: Fn(Vec<Message>, Vec<ToolDef>) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::llm::client::ChatTurn>>,
+{
+    let mut msgs = vec![
+        Message::system(system),
+        child_reference_message(&cfg.exec_ctx, user_text)?,
+    ];
+    let outcome = match Box::pin(crate::agent::run_agent_loop(chat, cfg, registry, &mut msgs)).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let completed_tool_turns = msgs
+                .iter()
+                .filter(|message| message.role == "assistant" && !message.tool_calls.is_empty())
+                .count();
+            // The transcript dies with this return. Preserve the same partial report, without
+            // adding a continuation, retry, cancellation boundary or another runtime.
+            let partial = partial_report_from_messages(&msgs);
+            return Err(error.context(format!(
+                "after {completed_tool_turns} completed tool turn(s) - the workspace \
+                 may already contain partial edits from this sub-agent; inspect before \
+                 retrying.\nPartial progress before the failure:\n{partial}"
+            )));
+        }
+    };
+    Ok((outcome, msgs, evidence_scope))
+}
 
 /// One bounded retry shares partial progress, never undo authority; a live worker forbids retry.
 fn run_task_attempts(
@@ -2346,6 +2277,9 @@ pub(crate) fn partial_report_from_messages(msgs: &[Message]) -> String {
 pub(crate) fn stop_body_warning(stop: &crate::agent::StopReason) -> Option<&'static str> {
     match stop {
         crate::agent::StopReason::Done => None,
+        crate::agent::StopReason::Incomplete => Some(
+            "[INCOMPLETE / UNVERIFIED — runtime completion requirements are not satisfied. Native-scoped work may still need parent integration and verification; do not treat this report as success or rerun the child merely to obtain a check.]",
+        ),
         crate::agent::StopReason::VerificationFailed => Some(
             "[UNVERIFIED — the sub-agent's own build/check never passed. The working tree may be broken; treat every claim below as unconfirmed and re-check before building on it.]",
         ),
@@ -2524,7 +2458,7 @@ pub(crate) fn unknown_role_error(role: &str) -> String {
 /// OUTWARD tools (e.g. skill_install) that may have approval-gated network side effects but do
 /// not mutate repository/workspace state. Their own calls can remain serial (image_read and
 /// reference_read do); this classification only allows independent child dispatches to fan out.
-/// Repository metadata writers such as `checkpoint` are excluded from the read-only base entirely.
+/// Workspace recovery tools are excluded from the read-only base entirely.
 pub(crate) fn dispatch_is_read_only(r: &crate::agent::tools::ToolRegistry) -> bool {
     WRITERS.iter().all(|w| r.get(w).is_none())
 }
@@ -2544,8 +2478,7 @@ pub(crate) const WRITERS: &[&str] = &[
     // capability even though today it only ever ships alongside `shell_run`.
     "process",
     "skill_save",
-    // One name now covers save/rewind/restore (the read-only `checkpoint_view` is not a writer).
-    "checkpoint",
+    "native_owner_undo",
     "symbol_replace",
     "symbol_insert",
     // Browser sessions are shared state: even reads can observe a sibling's navigation. Treat
@@ -2878,6 +2811,53 @@ fn validate_shallow(value: &Value, schema: &Value, path: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_transcript_future_keeps_nested_driver_stack_bounded() {
+        type ProbeFuture = std::future::Ready<Result<crate::llm::client::ChatTurn>>;
+        type ProbeChat = fn(Vec<Message>, Vec<ToolDef>) -> ProbeFuture;
+        type Registry = crate::agent::tools::ToolRegistry;
+        // Inspect monomorphized future TYPES, never construct or poll a large future on the
+        // test thread. The real driver helper is shared by direct and Git-owned Task dispatch.
+        fn driver_bytes<F: std::future::Future>(
+            _: fn(
+                ProbeChat,
+                &'static AgentConfig,
+                &'static Registry,
+                &'static str,
+                String,
+                String,
+            ) -> F,
+        ) -> (usize, usize) {
+            (
+                std::mem::size_of::<F>(),
+                std::mem::size_of::<std::pin::Pin<Box<F>>>(),
+            )
+        }
+        fn loop_bytes<F: std::future::Future>(
+            _: fn(
+                ProbeChat,
+                &'static AgentConfig,
+                &'static Registry,
+                &'static mut Vec<Message>,
+            ) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let (driver, boxed) = driver_bytes(run_child_transcript::<ProbeChat, ProbeFuture>);
+        let unboxed_loop = loop_bytes(crate::agent::run_agent_loop::<ProbeChat, ProbeFuture>);
+        eprintln!(
+            "Task future frames: bridge={driver} B; boxed={boxed} B; unboxed_loop={unboxed_loop} B"
+        );
+        assert!(
+            driver <= 64 * 1024,
+            "child transcript embeds a large agent future: {driver} B"
+        );
+        assert!(
+            boxed <= 2 * std::mem::size_of::<usize>(),
+            "heap-pinned bridge grew inline: {boxed} B"
+        );
+    }
 
     #[test]
     fn native_registry_rebuild_preserves_prose_and_following_sections() {
@@ -3329,6 +3309,98 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_observer_uses_the_actual_frozen_task_contract() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let _home = crate::core::config::EnvGuard::set([("AIZEN_HOME", dir.path())]);
+        let _wall = crate::core::config::EnvGuard::set([("AIZEN_SUBAGENT_WALL_SECS", "")]);
+        let tool = tool(0);
+        let args = serde_json::json!({"prompt":"read main.rs", "role":"argus", "max_steps":80});
+        let frozen = tool.prepare_dispatch(&args, true).unwrap();
+        assert_eq!(frozen.dispatch.max_steps, 80);
+        let mut prepared = PreparedToolCall::new(args);
+        prepared.delegation = Some(std::sync::Arc::new(frozen));
+        // Wire JSON cannot alter a host-frozen workload after preparation.
+        prepared.args["max_steps"] = serde_json::json!(1);
+        let cfg = AgentConfig::default();
+        let before = tokio::time::Instant::now();
+        let until = super::super::prepared_tool_deadline(&cfg, &prepared);
+        assert!(until.duration_since(before) >= Duration::from_secs(5399));
+        assert!(until.duration_since(before) <= Duration::from_secs(5401));
+        assert!(
+            cfg.deadline.is_none(),
+            "observer selection cannot mutate the parent's authority"
+        );
+    }
+
+    #[test]
+    fn adaptive_observer_keeps_the_parent_deadline_and_fixed_override() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let _home = crate::core::config::EnvGuard::set([("AIZEN_HOME", dir.path())]);
+        let _wall = crate::core::config::EnvGuard::set([("AIZEN_SUBAGENT_WALL_SECS", "3600")]);
+        let args = serde_json::json!({"prompt":"read main.rs", "role":"argus", "max_steps":80});
+        let frozen = tool(0).prepare_dispatch(&args, true).unwrap();
+        let mut prepared = PreparedToolCall::new(args);
+        prepared.delegation = Some(std::sync::Arc::new(frozen));
+        let before = tokio::time::Instant::now();
+        let fixed = super::super::prepared_tool_deadline(&AgentConfig::default(), &prepared);
+        assert!(fixed.duration_since(before) >= Duration::from_secs(3599));
+        assert!(fixed.duration_since(before) <= Duration::from_secs(3601));
+        let parent = std::time::Instant::now() + Duration::from_secs(15);
+        let cfg = AgentConfig {
+            deadline: Some(parent),
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            super::super::prepared_tool_deadline(&cfg, &prepared).into_std(),
+            parent
+        );
+    }
+
+    #[test]
+    fn adaptive_observer_rejects_json_only_or_untyped_delegation_budgets() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _wall = crate::core::config::EnvGuard::set([("AIZEN_SUBAGENT_WALL_SECS", "")]);
+        let _safe = crate::core::config::EnvGuard::set([("AIZEN_TOOL_CALL_SECS", "600")]);
+        let mut prepared =
+            PreparedToolCall::new(serde_json::json!({"max_steps":80, "timeout":5400}));
+        let cfg = AgentConfig::default();
+        for forged in [false, true] {
+            if forged {
+                prepared.delegation = Some(std::sync::Arc::new(prepared.args.clone()));
+            }
+            assert!(prepared_wall_deadline(&prepared).is_none());
+            let before = tokio::time::Instant::now();
+            let until = super::super::prepared_tool_deadline(&cfg, &prepared);
+            assert!(
+                until.duration_since(before)
+                    <= super::super::safe_tool_ceiling() + Duration::from_secs(1)
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_retired_execution_is_rejected_before_dispatch() {
+        let tool = tool(0);
+        let args = serde_json::json!({"prompt": "read tracked.txt", "role": "argus"});
+        let mut prepared = tool.prepare_dispatch(&args, true).unwrap();
+        prepared.execution = super::super::speculation::ExecutionMode::Speculative;
+        let error = tool
+            .execute_dispatch_with_policy(&args, &prepared, true)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("speculative execution is retired"));
+    }
+
+    #[test]
     fn thin_briefs_are_refused_unless_they_name_a_target() {
         assert!(thin_brief("fix it").is_some());
         assert!(thin_brief("review the change").is_some());
@@ -3404,31 +3476,9 @@ mod tests {
         let parent = ExecutionContext::default();
         let ctx = child_execution_context(&parent, "bound-task", &first, "bound-task");
         assert!(!ctx.can_restore_workspace());
-        let first_snapshot = crate::features::timemachine::save_for_in_context(
-            ctx.recovery(),
-            &first,
-            "before task",
-            true,
-            true,
-            &ctx,
-        )
-        .unwrap()
-        .unwrap();
-        let second_snapshot = crate::features::timemachine::save_for(
-            &crate::features::timemachine::RunRecovery::default(),
-            &second,
-            "before unrelated task",
-            true,
-            true,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            first_snapshot.id, second_snapshot.id,
-            "IDs alone do not identify the root"
-        );
-        // Baselines settle before the attempt-duration lease; the unrelated root must not try to
-        // reenter this child's physical authority under a default execution scope.
+        assert!(!ctx.recovery().can_restore_workspace());
+        assert_eq!(ctx.resource_scope(), "bound-task");
+        // An attempt-duration lease protects the bound root; retries retain partial work.
         let _lease = WorkspaceWriterLease::acquire_scoped(
             &first,
             Duration::from_secs(1),
@@ -3452,6 +3502,7 @@ mod tests {
                 std::fs::write(first.join("f.txt"), format!("partial attempt {n}")).unwrap();
                 Ok((
                     AgentOutcome {
+                        speech_final_verified: false,
                         final_text: Some("partial".into()),
                         iters: 1,
                         stop: if n == 1 {
@@ -3482,6 +3533,7 @@ mod tests {
             std::fs::read_to_string(second.join("f.txt")).unwrap(),
             "unrelated edit remains"
         );
+        assert!(!home.join("timemachine").exists());
     }
 
     #[test]
@@ -3500,6 +3552,7 @@ mod tests {
                     }
                     Ok((
                         AgentOutcome {
+                            speech_final_verified: false,
                             final_text: None,
                             iters: 1,
                             stop: StopReason::VerificationFailed,
@@ -3523,6 +3576,7 @@ mod tests {
         assert!(!needs_retry(&StopReason::Deadline));
         assert!(needs_retry(&StopReason::VerificationFailed));
         assert!(!needs_retry(&StopReason::Done));
+        assert!(!needs_retry(&StopReason::Incomplete));
         assert!(!needs_retry(&StopReason::MaxIters));
         assert!(!needs_retry(&StopReason::Divergence));
         assert!(!needs_retry(&StopReason::Cancelled));
@@ -4159,6 +4213,7 @@ mod tests {
         // Everything else at least marks the work as partial, so a parent never builds on a
         // half-finished dispatch believing it finished.
         for stop in [
+            Incomplete,
             Divergence,
             MaxIters,
             Cancelled,
@@ -4202,22 +4257,22 @@ mod tests {
 
         // Default wall clock: bounded and larger than one model-call ceiling, but no longer an hour.
         std::env::remove_var(K);
-        let d = subagent_wall_deadline().expect("a dispatch must be time-bounded by default");
+        let d = subagent_wall_deadline(25).expect("a dispatch must be time-bounded by default");
         let budget = d.saturating_duration_since(std::time::Instant::now());
         assert!(budget > subagent_call_timeout());
-        assert!(budget <= SUBAGENT_WALL_TIMEOUT);
+        assert!(budget <= SUBAGENT_WALL_TIMEOUT + Duration::from_secs(25 * 60));
 
         // Explicit opt-out for anyone who wants the old unbounded-in-time behavior.
         std::env::set_var(K, "0");
         assert!(
-            subagent_wall_deadline().is_none(),
+            subagent_wall_deadline(25).is_none(),
             "0 must disable the ceiling outright"
         );
 
         // A floor, because the failure mode of a too-tight value is silent and confusing: every
         // dispatch would die before its first model call returned, which reads as a broken build.
         std::env::set_var(K, "5");
-        let tight = subagent_wall_deadline()
+        let tight = subagent_wall_deadline(25)
             .expect("a tight value is still a ceiling")
             .saturating_duration_since(std::time::Instant::now());
         assert!(
@@ -4229,7 +4284,7 @@ mod tests {
         // silently remove the bound.
         std::env::set_var(K, "not-a-number");
         assert!(
-            subagent_wall_deadline().is_some(),
+            subagent_wall_deadline(25).is_some(),
             "an unparseable value must not disable the ceiling"
         );
 

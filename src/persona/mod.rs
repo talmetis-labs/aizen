@@ -329,7 +329,9 @@ fn effective_name() -> Option<String> {
     if let Some(name) = PERSONA_OVERRIDE.lock().unwrap().clone() {
         return Some(name);
     }
-    crate::core::cli_config::load().persona
+    crate::assistants::active()
+        .and_then(|thread| thread.profile.persona.clone())
+        .or_else(|| crate::core::cli_config::load().persona)
 }
 
 /// Serializes [`with_override`] so two concurrent lanes can't interleave set → build → restore.

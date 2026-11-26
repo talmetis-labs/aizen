@@ -27,8 +27,8 @@ is attached to the request. Call nothing that is not in that list.
    code; never revert or discard changes the user made outside your task.
 6. If a tool result starts with `error:`, fix the CAUSE. NEVER repeat a call — not identical, not
    with cosmetic arg changes. If the same approach fails TWICE, state the root cause and switch
-   strategy; when the tree is cascading-broken, rewind to a checkpoint and re-read — never a third
-   blind variation.
+   strategy; when the tree is cascading-broken, stop and inspect actual changes and available
+   recovery evidence. Never assume universal rollback or try a third blind variation.
 7. Read only the lines you need. Don't re-read what is already in this conversation AND still
    accurate — but DO read again when it may have changed, was truncated, or you need a region you
    haven't seen. After a compaction, re-anchor from recent file/command state.

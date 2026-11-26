@@ -640,6 +640,7 @@ async fn stream_turn_at_projected(
             }
             let eager = eager_by_position(&calls, eager);
             return Ok(ChatTurn {
+                speech_final_verified: false,
                 content: acc.content(),
                 tool_calls: calls,
                 finish_reason: Some("tool_calls".into()),
@@ -1232,6 +1233,7 @@ impl SseAccumulator {
             Some("tool_calls".into())
         };
         ChatTurn {
+            speech_final_verified: false,
             content,
             tool_calls,
             finish_reason,
@@ -1487,6 +1489,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn codex_image_budget_refusal_precedes_http_and_releases_for_retry() {
+        use crate::llm::{
+            client::tests::raw_sse_backend,
+            image_send::{
+                image_test_lock, isolated_image_budget_transport_test, try_image_memory_lease,
+                IMAGE_MEMORY_BUDGET,
+            },
+            media::with_image_delivery,
+        };
+        if isolated_image_budget_transport_test() {
+            return;
+        }
+        let _guard = image_test_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (base, hits, server) = raw_sse_backend(b"data: \xffinvalid\n\n".to_vec()).await;
+                let url = format!("{base}/codex/responses");
+                let http = reqwest::Client::builder().no_proxy().build().unwrap();
+                let auth = CountingAuth::default();
+                let ctx = crate::core::exec_ctx::ExecutionContext::default();
+                let messages = [Message::user_with_images(
+                    "inspect",
+                    vec!["data:legacy".into()],
+                )];
+                let attempt = || async {
+                    with_image_delivery(
+                        &ctx,
+                        &url,
+                        "fixture-key",
+                        "gpt-5.4-mini",
+                        stream_turn_at(
+                            &http,
+                            &url,
+                            &auth,
+                            "gpt-5.4-mini",
+                            &messages,
+                            &[],
+                            "sess",
+                            StreamSink::default(),
+                            StreamCaps {
+                                first_frame: Duration::from_secs(20),
+                                idle: Duration::from_secs(20),
+                            },
+                        ),
+                    )
+                    .await
+                };
+                let held = try_image_memory_lease(IMAGE_MEMORY_BUDGET).unwrap();
+                let refused = tokio::time::timeout(Duration::from_secs(30), attempt())
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                assert!(refused
+                    .to_string()
+                    .starts_with("image request memory budget busy or exceeded"));
+                assert!(refused.downcast_ref::<client::TransportFailure>().is_none());
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+                drop(held);
+                let retried = tokio::time::timeout(Duration::from_secs(30), attempt())
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                let failure = retried
+                    .downcast_ref::<client::TransportFailure>()
+                    .expect("retry must reach the malformed SSE fixture");
+                assert_eq!(failure.provider_code.as_deref(), Some("SSE_MALFORMED"));
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                server.abort();
+            });
+    }
+
     #[tokio::test]
     async fn codex_raw_limit_and_malformed_are_not_replayed_or_tool_salvaged() {
         use crate::llm::{
@@ -1544,7 +1623,14 @@ mod tests {
                     .unwrap()
                     .err()
                     .unwrap();
-                let failure = error.downcast_ref::<client::TransportFailure>().unwrap();
+                let failure = error.downcast_ref::<client::TransportFailure>().unwrap_or_else(|| {
+                    panic!(
+                        "expected raw SSE failure: limit={limit}, tool_prefix={}, hits={}, memory_admission={}",
+                        !prefix.is_empty(),
+                        hits.load(Ordering::SeqCst),
+                        error.to_string().starts_with("image request memory budget busy or exceeded"),
+                    )
+                });
                 assert_eq!(
                     failure.provider_code.as_deref(),
                     Some(if limit {

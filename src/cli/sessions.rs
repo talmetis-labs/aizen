@@ -94,8 +94,11 @@ async fn sessions_menu_scoped(
 
         if pick < n_sessions {
             let name = &names[pick];
-            match load_session_with_design(history, name, model_label) {
-                Ok((n, saved_design)) => {
+            match load_session_with_state(history, name, model_label) {
+                Ok((n, saved_design, saved_task, _saved_control)) => {
+                    // Reset the outgoing owner only after validation, then install the incoming task.
+                    reset_per_session_state();
+                    agent::todo::restore(saved_task)?;
                     if let Some(design) = design {
                         design.reset();
                         if let Some(saved) = saved_design {
@@ -103,9 +106,9 @@ async fn sessions_menu_scoped(
                                 tui::note_line(&format!("design state not restored: {error}"));
                             }
                         }
-                        update_live_history_with_design(history, Some(&design.snapshot()));
                     }
-                    reset_per_session_state(); // thread switch — same contract as /resume
+                    let design_snapshot = design.map(|design| design.snapshot());
+                    update_live_history_with_design(history, design_snapshot.as_ref());
 
                     // Route through emit_line, not println! — the retained render thread is already
                     // live again by the time we return, and a raw print behind its back corrupts the
@@ -282,6 +285,8 @@ async fn import_menu_scoped(
             // belong to it, not to whatever was live before the import.
             reset_per_session_state();
             set_session_slug(None); // the imported chat autosaves under a fresh aizen slug from here
+            let design_snapshot = design.map(|design| design.snapshot());
+            update_live_history_with_design(history, design_snapshot.as_ref());
             agent::replay_transcript(history);
             let tag = match session.cli {
                 features::foreign_session::Cli::Claude => "claude",

@@ -1,7 +1,9 @@
 //! Noninteractive `/compact` for saved conversations (including Desktop callers).
 
 use crate::core::endpoint::{http_client, resolve_endpoint_with_model_fallback};
-use crate::core::session_store::{read_session_for_edit, write_session_if_unchanged};
+use crate::core::session_store::{
+    read_session_for_edit, write_session_if_unchanged_with_receipt, SessionSaveReceipt,
+};
 use crate::core::types::Message;
 use anyhow::Result;
 use std::future::Future;
@@ -34,6 +36,7 @@ struct CompactResult {
     slug: String,
     before: usize,
     after: usize,
+    receipt: SessionSaveReceipt,
 }
 
 pub(crate) async fn run(args: CompactArgs) -> Result<()> {
@@ -105,11 +108,13 @@ where
     );
     let meta = meta.unwrap_or_default();
     let (history, (before, after)) = compact(history, meta.model.clone()).await?;
-    write_session_if_unchanged(&history, slug, meta, design.as_ref(), &revision)?;
+    let (_, receipt) =
+        write_session_if_unchanged_with_receipt(&history, slug, meta, design.as_ref(), &revision)?;
     Ok(CompactResult {
         slug: slug.to_string(),
         before,
         after,
+        receipt,
     })
 }
 
@@ -339,9 +344,27 @@ mod tests {
             let (loaded, _, _) =
                 read_session_path_with_design(&sessions_dir().join("saved.json")).unwrap();
             assert_eq!(loaded.len(), new["messages"].as_array().unwrap().len());
+            let published = bytes("saved", "json");
+            let expected_sha256: String = ring::digest::digest(&ring::digest::SHA256, &published)
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             let json = serde_json::to_value(result).unwrap();
-            assert_eq!(json.as_object().unwrap().len(), 3);
+            assert_eq!(json.as_object().unwrap().len(), 4);
             assert_eq!(json["slug"], "saved");
+            assert_eq!(json["receipt"]["version"], 1);
+            assert_eq!(json["receipt"]["envelope_sha256"], expected_sha256);
+            assert_eq!(
+                json["receipt"]["generation"],
+                new["generation"].as_u64().unwrap().to_string()
+            );
+            assert_eq!(json["receipt"].as_object().unwrap().len(), 3);
+            assert_eq!(published.last(), Some(&b'\n'));
+            // The receipt remains the operation's identity after another writer replaces it.
+            write_session(&history(), "saved", SessionMeta::default()).unwrap();
+            assert_ne!(bytes("saved", "json"), published);
+            assert_eq!(json["receipt"]["envelope_sha256"], expected_sha256);
         });
     }
 
@@ -400,14 +423,13 @@ mod tests {
     fn compact_rejects_envelope_and_delta_changes_during_summary() {
         with_pool(|| {
             for extension in ["json", "jsonl"] {
-                write_session(&history(), "saved", SessionMeta::default()).unwrap();
+                // Each case preserves deliberately corrupted bytes; never reuse that envelope.
+                let slug = format!("saved-{extension}");
+                write_session(&history(), &slug, SessionMeta::default()).unwrap();
                 let concurrent = b"concurrent edit";
-                let result = block_on(compact_saved_with("saved", |h, model| async move {
-                    std::fs::write(
-                        sessions_dir().join(format!("saved.{extension}")),
-                        concurrent,
-                    )
-                    .unwrap();
+                let target = sessions_dir().join(format!("{slug}.{extension}"));
+                let result = block_on(compact_saved_with(&slug, |h, model| async move {
+                    std::fs::write(target, concurrent).unwrap();
                     fake_compact(h, model).await
                 }));
                 assert!(result
@@ -415,7 +437,7 @@ mod tests {
                     .unwrap()
                     .to_string()
                     .contains("session changed"));
-                assert_eq!(bytes("saved", extension), concurrent);
+                assert_eq!(bytes(&slug, extension), concurrent);
             }
         });
     }

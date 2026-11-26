@@ -32,6 +32,7 @@ pub enum SlashId {
     Where,
     Files,
     Goal,
+    Plan,
     Model,
     Provider,
     Login,
@@ -47,6 +48,7 @@ pub enum SlashId {
     Telegram,
     Serve,
     Sessions,
+    Share,
     Import,
     Resume,
     Workflows,
@@ -54,9 +56,7 @@ pub enum SlashId {
     Work,
     Agents,
     Recover,
-    Timemachine,
-    Checkpoint,
-    Diff,
+    Time,
     Compact,
     Lsp,
     Reach,
@@ -71,8 +71,6 @@ pub enum SlashId {
     Cost,
     Tools,
     Update,
-    Undo,
-    Redo,
     Quit,
     Save,
     Smart,
@@ -151,6 +149,17 @@ pub const BUILTINS: &[Builtin] = &[
         description: "show commands and tips",
         argument_hint: "",
         help: "this list",
+        stdin: Stdin::Never,
+    },
+    Builtin {
+        id: SlashId::Plan,
+        name: "plan",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "control persistent planning-only execution",
+        argument_hint: "on [path] | status | off",
+        help: "persist planning-only mode; allow bounded native exploration and only the selected plan write. off explicitly restores normal tools without completing tasks or waiving checks",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -358,6 +367,17 @@ pub const BUILTINS: &[Builtin] = &[
         stdin: Stdin::Always,
     },
     Builtin {
+        id: SlashId::Share,
+        name: "share",
+        aliases: &[],
+        hidden_aliases: &[],
+        hidden: false,
+        description: "continue this saved session in Aizen Chat",
+        argument_hint: "",
+        help: "hand the saved session to the VPS connector and leave the terminal",
+        stdin: Stdin::Never,
+    },
+    Builtin {
         id: SlashId::Sessions,
         name: "sessions",
         aliases: &[],
@@ -450,42 +470,14 @@ pub const BUILTINS: &[Builtin] = &[
         stdin: Stdin::Never,
     },
     Builtin {
-        id: SlashId::Timemachine,
-        name: "timemachine",
-        aliases: &[
-            ("timeline", "alias for /timemachine"),
-            ("tm", "alias for /timemachine"),
-        ],
+        id: SlashId::Time,
+        name: "time",
+        aliases: &[("timemachine", "alias for /time"), ("tm", "alias for /time")],
         hidden_aliases: &[],
         hidden: false,
-        description: "browse checkpoints and jump back to that code + chat",
-        argument_hint: "",
-        help: "browse every checkpoint (▸ = current) and pick one to jump back to that code + chat; also /timeline · /tm · /undo · /redo",
-        stdin: Stdin::Always,
-    },
-    Builtin {
-        id: SlashId::Checkpoint,
-        name: "checkpoint",
-        aliases: &[
-            ("snapshot", "alias for /checkpoint"),
-            ("cp", "alias for /checkpoint"),
-        ],
-        hidden_aliases: &[],
-        hidden: false,
-        description: "save a code restore point",
-        argument_hint: "[note]",
-        help: "save a restore point of the working tree now",
-        stdin: Stdin::Never,
-    },
-    Builtin {
-        id: SlashId::Diff,
-        name: "diff",
-        aliases: &[],
-        hidden_aliases: &["changes"],
-        hidden: false,
-        description: "what changed between two points in time",
-        argument_hint: "[from] [to] [-p]",
-        help: "what changed in the working tree since a checkpoint (read before you /undo)",
+        description: "inspect Git history and manage isolated worktrees",
+        argument_hint: "[status|history|branches|worktrees|focus|reflog|create|remove|switch|undo|undo-paths|redo|integrate|integrate-task|verify-task|merge|cherry-pick|sequencer|delete-branch|reconcile|operations|verifications|recovery]",
+        help: "Git inspection (default: status); create/remove use /work. Switch, undo/redo, integration and branch deletion preview first; --yes executes. No checkpoint rewind",
         stdin: Stdin::Never,
     },
     Builtin {
@@ -643,28 +635,6 @@ pub const BUILTINS: &[Builtin] = &[
         argument_hint: "[mnemos]",
         help: "bare /update picks an Aizen version; /update mnemos reviews a strictly newer package, preserves data/settings and requires fresh activation consent",
         stdin: Stdin::Always,
-    },
-    Builtin {
-        id: SlashId::Undo,
-        name: "undo",
-        aliases: &[("rewind", "alias for /undo")],
-        hidden_aliases: &[],
-        hidden: false,
-        description: "rewind to the previous checkpoint",
-        argument_hint: "",
-        help: "",
-        stdin: Stdin::Never,
-    },
-    Builtin {
-        id: SlashId::Redo,
-        name: "redo",
-        aliases: &[],
-        hidden_aliases: &[],
-        hidden: false,
-        description: "re-apply the next checkpoint",
-        argument_hint: "",
-        help: "",
-        stdin: Stdin::Never,
     },
     Builtin {
         id: SlashId::Quit,
@@ -1067,8 +1037,7 @@ mod tests {
             "agents",
             "tools",
             "browser",
-            "undo",
-            "redo",
+            "time",
             "serve",
             "auto-copy",
             "autocopy",
@@ -1232,9 +1201,6 @@ mod tests {
             "provider",
             "provider add",
             "provider manage",
-            "timemachine",
-            "timeline",
-            "tm",
             "effort",
             "update",
             "tools menu",
@@ -1249,7 +1215,10 @@ mod tests {
             "cost",
             "mcp",
             "memory",
-            "diff",
+            "time",
+            "time history",
+            "timemachine",
+            "tm",
             "effort high",
             "provider openrouter",
             "tools",
@@ -1260,6 +1229,31 @@ mod tests {
         ] {
             assert!(!takes_stdin(line), "/{line} must run with the box still up");
         }
+    }
+
+    #[test]
+    fn git_time_surface_has_no_checkpoint_picker_routes() {
+        for spelling in ["time", "timemachine", "tm"] {
+            assert_eq!(resolve(spelling).unwrap().id, SlashId::Time);
+            assert!(!takes_stdin(spelling));
+        }
+        for removed in [
+            "checkpoint",
+            "snapshot",
+            "cp",
+            "timeline",
+            "diff",
+            "changes",
+            "undo",
+            "rewind",
+            "redo",
+        ] {
+            assert!(resolve(removed).is_none(), "retired route: {removed}");
+        }
+        assert_eq!(
+            cmd("/time history --limit 7"),
+            ("time".into(), "history --limit 7".into())
+        );
     }
 
     #[test]

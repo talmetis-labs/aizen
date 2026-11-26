@@ -11,6 +11,7 @@ use console::style;
 
 pub(crate) fn run_sandbox(cmd: SandboxCliCmd) -> Result<()> {
     match cmd {
+        SandboxCliCmd::Review { topic } => crate::sandbox::review::run(&topic),
         SandboxCliCmd::Status => status(),
         SandboxCliCmd::Doctor { json } => doctor(json),
         SandboxCliCmd::Explain => explain(),
@@ -274,7 +275,7 @@ fn explain() -> Result<()> {
 
 fn run_probe(command: &str, network: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let mut sbx = runner::prepare_std(
+    let sbx = runner::prepare_std(
         SandboxRequest::shell(CommandOrigin::UserEscape, command, cwd.clone(), cwd)
             .network(network),
     )?;
@@ -283,35 +284,77 @@ fn run_probe(command: &str, network: bool) -> Result<()> {
             println!("{} {d}", style("degraded:").yellow());
         }
     }
-    let bounded = crate::core::proctree::output_bounded(
-        &mut sbx.command,
+    // Move the guard into the physical body; returning from a timed-out observer must not drop
+    // sandbox temp or originating policy ownership while a child/pipe worker is still alive.
+    let output = sbx.output_bounded(
         std::time::Duration::from_secs(120),
         std::time::Duration::from_secs(2),
-    );
-    match bounded {
-        Ok(o) => {
-            sbx.finish(if o.timed_out {
-                runner::Outcome::Timeout
-            } else {
-                runner::Outcome::Exit(o.code)
-            });
-            if !o.stdout.trim().is_empty() {
-                println!("{}", o.stdout.trim_end());
-            }
-            if !o.stderr.trim().is_empty() {
-                eprintln!("{}", o.stderr.trim_end());
-            }
-            let label = match o.code {
-                _ if o.timed_out => "timed out (tree killed)".to_string(),
-                Some(c) => format!("exit {c}"),
-                None => "killed".to_string(),
-            };
-            println!("{} {label}", style("sandbox run:").dim());
-            Ok(())
+    )?;
+    if !output.stdout.trim().is_empty() {
+        println!("{}", output.stdout.trim_end());
+    }
+    if !output.stderr.trim().is_empty() {
+        eprintln!("{}", output.stderr.trim_end());
+    }
+    if output.output_truncated {
+        eprintln!("sandbox run: output capture truncated");
+    }
+    let label = probe_output_label(&output)?;
+    println!("{} {label}", style("sandbox run:").dim());
+    Ok(())
+}
+
+fn probe_output_label(output: &crate::core::proctree::BoundedOutput) -> Result<String> {
+    if output.settlement == crate::core::proctree::BoundedSettlement::Unknown {
+        return Err(crate::core::proctree::BoundedExecutionError {
+            cause: std::io::Error::other("sandbox probe physical effects remain unproven"),
+            settlement: output.settlement,
         }
-        Err(e) => {
-            sbx.finish(runner::Outcome::SpawnFailed);
-            Err(e.into())
+        .into());
+    }
+    Ok(match output.code {
+        _ if output.timed_out => "timed out (tree killed)".to_string(),
+        Some(code) => format!("exit {code}"),
+        None => "killed".to_string(),
+    })
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::core::proctree::{BoundedExecutionError, BoundedOutput, BoundedSettlement};
+
+    #[test]
+    fn probe_never_labels_unsettled_output_as_exit_or_tree_killed() {
+        let mut output = BoundedOutput {
+            stdout: "partial probe output".into(),
+            stderr: String::new(),
+            code: Some(0),
+            timed_out: false,
+            output_truncated: true,
+            settlement: BoundedSettlement::Unknown,
+        };
+        for timed_out in [false, true] {
+            output.timed_out = timed_out;
+            let error = probe_output_label(&output).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<BoundedExecutionError>()
+                    .unwrap()
+                    .settlement,
+                BoundedSettlement::Unknown
+            );
         }
+        output.settlement = BoundedSettlement::Proven;
+        assert_eq!(
+            probe_output_label(&output).unwrap(),
+            "timed out (tree killed)"
+        );
+        output.timed_out = false;
+        assert_eq!(probe_output_label(&output).unwrap(), "exit 0");
+        output.code = Some(7);
+        assert_eq!(probe_output_label(&output).unwrap(), "exit 7");
+        output.code = None;
+        assert_eq!(probe_output_label(&output).unwrap(), "killed");
     }
 }

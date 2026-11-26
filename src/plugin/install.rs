@@ -432,7 +432,7 @@ fn inventory(
     Ok(state.result)
 }
 
-fn owner_only(path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn owner_only(path: &Path, directory: bool) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -493,7 +493,7 @@ fn owner_only(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
-fn verify_private(path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn verify_private(path: &Path, directory: bool) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1052,7 +1052,8 @@ pub(crate) fn publish_no_replace(source: &Path, destination: &Path) -> Result<()
     let to = CString::new(destination.as_os_str().as_bytes())?;
     ensure!(
         unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 from.as_ptr(),
                 libc::AT_FDCWD,

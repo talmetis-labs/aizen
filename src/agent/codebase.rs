@@ -442,6 +442,12 @@ fn source_tree_drifted(idx: &CodebaseIndex) -> bool {
 /// The current turn still uses the (possibly stale) index — retrieval is best-effort context, and
 /// stalling every turn to re-read a large tree would cost far more than one turn of slight staleness.
 pub fn ensure_fresh() {
+    // This helper also has callers outside prompt folding. Freeze/admit before even locating the
+    // index or touching debounce/single-flight state, and retain ownership in the detached worker.
+    let execution = crate::agent::hooks::automation_context(None);
+    let Ok(admitted) = crate::agent::hooks::admit_automation(&execution) else {
+        return;
+    };
     // First build stays explicit — no on-disk index means /init has not run.
     if !index_path().exists() {
         return;
@@ -477,17 +483,19 @@ pub fn ensure_fresh() {
         return;
     }
     // Everything expensive (the gitignore walk + stat pass + rebuild) runs OFF the turn thread.
-    std::thread::spawn(|| {
-        let drifted = load_cached()
-            .map(|(idx, _)| source_tree_drifted(&idx))
-            .unwrap_or(false);
-        if drifted {
-            // Incremental: reuses unchanged files by (len,mtime)+SHA-256, so a drift rebuild only
-            // re-reads what actually changed, then calls invalidate_cache() so the next query
-            // reloads the fresh index. Errors (e.g. a concurrent /init holding the lock) are benign.
-            let _ = build_index(true, None, &|_| {});
-        }
-        REINDEX_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    std::thread::spawn(move || {
+        crate::core::exec_ctx::with_current(admitted, || {
+            let drifted = load_cached()
+                .map(|(idx, _)| source_tree_drifted(&idx))
+                .unwrap_or(false);
+            if drifted {
+                // Incremental: reuses unchanged files by (len,mtime)+SHA-256, so a drift rebuild only
+                // re-reads what actually changed, then calls invalidate_cache() so the next query
+                // reloads the fresh index. Errors (e.g. a concurrent /init holding the lock) are benign.
+                let _ = build_index(true, None, &|_| {});
+            }
+            REINDEX_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+        });
     });
 }
 
@@ -2511,6 +2519,85 @@ mod tests {
         std::fs::write(p, content).unwrap();
     }
 
+    #[test]
+    fn bound_workspaces_build_and_search_distinct_indexes_for_identical_paths() {
+        with_repo("bound-workspaces", |parent| {
+            use crate::core::{exec_ctx, file_placement::PlacementContext};
+            let sibling = parent.parent().unwrap().join("sibling");
+            std::fs::create_dir(&sibling).unwrap();
+            write(
+                parent,
+                "src/lib.rs",
+                "pub fn parent_quartz() -> usize { 11 }\n",
+            );
+            write(
+                &sibling,
+                "src/lib.rs",
+                "pub fn child_cobalt() -> usize { 29 }\n",
+            );
+            let context = |root: &Path| {
+                exec_ctx::ExecutionContext::default().with_placement(
+                    PlacementContext::with_paths(
+                        root.canonicalize().unwrap(),
+                        config::aizen_home(),
+                        parent.parent().unwrap().join("scratch"),
+                        "index-routing",
+                    )
+                    .unwrap(),
+                )
+            };
+            let contexts = [context(parent), context(&sibling)];
+            let paths: Vec<_> = contexts
+                .iter()
+                .map(|ctx| {
+                    exec_ctx::with_current(ctx.clone(), || {
+                        build(false);
+                        index_path()
+                    })
+                })
+                .collect();
+            assert_ne!(paths[0], paths[1]);
+            let before: Vec<_> = paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            let ready = std::sync::Barrier::new(2);
+            std::thread::scope(|threads| {
+                for (index, expected) in ["parent_quartz", "child_cobalt"].into_iter().enumerate() {
+                    let context = contexts[index].clone();
+                    let ready = &ready;
+                    threads.spawn(move || {
+                        exec_ctx::with_current(context, || {
+                            ready.wait();
+                            for _ in 0..12 {
+                                let (idx, _) = load_cached().unwrap();
+                                assert_eq!(Path::new(&idx.root), config::project_root());
+                                assert!(idx
+                                    .chunks
+                                    .iter()
+                                    .any(|chunk| chunk.content.contains(expected)));
+                                let output = search(expected, 5).unwrap();
+                                assert!(output.contains(expected), "{output}");
+                            }
+                        })
+                    });
+                }
+            });
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "queries must not rewrite either index"
+                );
+            }
+            assert_eq!(config::project_root(), parent);
+            assert!(
+                !sibling.join(".aizen").exists(),
+                "root routing must not copy parent configuration"
+            );
+        });
+    }
+
     fn build(incremental: bool) -> ScanStats {
         build_index(incremental, None, &|_| {}).expect("build_index")
     }
@@ -3042,6 +3129,40 @@ mod tests {
     }
 
     #[test]
+    fn restricted_refresh_never_touches_debounce_or_schedules_a_worker() {
+        use crate::core::exec_ctx::{with_current, ExecutionContext};
+        use crate::core::session_control::ExecutionMode;
+
+        with_repo("fresh-restricted", |proj| {
+            write(proj, "src/keep.rs", "pub fn keep_me() {}\n");
+            build(false);
+            let bytes = std::fs::read(index_path()).unwrap();
+            let task = crate::agent::todo::TaskContext::private();
+            let stale = ExecutionContext::default().with_task(task.clone());
+            task.control()
+                .transition(ExecutionMode::Planning, None, |_| Ok(()))
+                .unwrap();
+            let planning = ExecutionContext::default().with_task(task);
+            let blocked_task = crate::agent::todo::TaskContext::private();
+            let blocked = ExecutionContext::default().with_task(blocked_task.clone());
+            assert!(blocked_task
+                .control()
+                .transition(ExecutionMode::Planning, None, |_| {
+                    anyhow::bail!("fixture persistence failure")
+                })
+                .is_err());
+            for execution in [planning, stale, blocked] {
+                *LAST_FRESH_CHECK.lock().unwrap() = None;
+                assert!(!REINDEX_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire));
+                with_current(execution, ensure_fresh);
+                assert!(LAST_FRESH_CHECK.lock().unwrap().is_none());
+                assert!(!REINDEX_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(std::fs::read(index_path()).unwrap(), bytes);
+            }
+        });
+    }
+
+    #[test]
     fn ensure_fresh_rebuilds_in_background_after_delete() {
         with_repo("fresh", |proj| {
             write(proj, "src/keep.rs", "pub fn keep_me() { /* survives */ }\n");
@@ -3064,7 +3185,21 @@ mod tests {
             if let Ok(mut g) = LAST_FRESH_CHECK.lock() {
                 *g = None;
             }
-            ensure_fresh();
+            let task = crate::agent::todo::TaskContext::private();
+            let control = task.control();
+            let execution = crate::core::exec_ctx::ExecutionContext::default().with_task(task);
+            // Hold the worker at load_cached so the observer can return before it settles. The
+            // detached owner must still prevent a human transition after caller TLS is gone.
+            let cache_guard = INDEX_CACHE.lock().unwrap();
+            crate::core::exec_ctx::with_current(execution, ensure_fresh);
+            assert!(control
+                .transition(
+                    crate::core::session_control::ExecutionMode::Planning,
+                    None,
+                    |_| panic!("detached refresh must retain policy admission"),
+                )
+                .is_err());
+            drop(cache_guard);
 
             // ensure_fresh detaches its walk+rebuild; join it (bounded) so env teardown can't race
             // the background build_index. The delete is count-based drift → timing-independent.

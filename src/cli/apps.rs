@@ -4,6 +4,8 @@
 //! (`npx`/`uvx`/`docker`) is PATH-checked first so a missing runtime is reported here rather than as
 //! a mystery failure on the next launch. Secrets are masked on every display path.
 
+mod status;
+
 use crate::agent::app_catalog;
 use crate::cli_args::AppsCmd;
 
@@ -77,27 +79,15 @@ pub(crate) async fn run_apps(cmd: Option<AppsCmd>) -> Result<()> {
 
 /// HOME-only status: no project resolution, registry request, MCP probe or process launch.
 pub(crate) fn apps_status(key: Option<&str>, json: bool) -> Result<()> {
-    use crate::agent::apps::{jobs::Journal, status};
-
     let home = crate::core::config::aizen_home();
     let connectors = status::configured(&home.join("mcp.json"), key)?;
-    let jobs = Journal::new(home.join("app-jobs")).status().map_err(|_| {
-        anyhow!("cannot read app job journal: state is incomplete, invalid or inaccessible; no recovery was attempted")
-    })?;
     let report = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "configuration_scope": "home",
         "project_overrides_checked": false,
         "live_probe_performed": false,
-        "creative_dispatch_enabled": false,
-        "enrollment_state": "unavailable",
         "live_app_state": "unknown",
-        "reason": "Creative foundation only; no production adapter is enabled. MCP configuration does not establish app support.",
         "connectors": connectors,
-        "jobs": jobs,
-        "job_scope": "all_home_operations",
-        "job_state_observation": "last_recorded_not_live",
-        "job_control_authority": false,
     });
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -117,14 +107,6 @@ pub(crate) fn apps_status(key: Option<&str>, json: bool) -> Result<()> {
         }
         if connectors.is_empty() {
             println!("  no HOME connectors configured");
-        }
-        println!("Creative adapters: unavailable; live app state: unknown (not probed)");
-        println!(
-            "Durable jobs: {} (last recorded, not live; all HOME operations; IDs do not grant control)",
-            jobs.len()
-        );
-        for job in jobs {
-            println!("  {}", serde_json::to_string(&job)?);
         }
     }
     Ok(())

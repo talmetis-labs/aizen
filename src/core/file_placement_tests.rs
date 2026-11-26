@@ -1,6 +1,8 @@
 use super::*;
 use crate::core::exec_ctx::ExecutionContext;
 
+include!("file_placement_bound_tests.rs");
+
 /// A unique fixture-owned directory; no environment override, live home, or added test dependency.
 pub(crate) struct TestDir(PathBuf);
 

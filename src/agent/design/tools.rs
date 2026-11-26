@@ -408,6 +408,9 @@ mod tests {
 
     #[test]
     fn compare_and_trace_exhaustion_precedes_encoded_byte_readers() {
+        if crate::llm::image_send::isolated_image_budget_test() {
+            return;
+        }
         let _lock = crate::llm::image_send::image_test_lock();
         let image = crate::core::tool_media::ToolImage::from_bytes(
             b"GIF89a-fixture",
@@ -439,6 +442,9 @@ mod tests {
 
     #[test]
     fn admitted_encoded_reader_failure_releases_owner() {
+        if crate::llm::image_send::isolated_image_budget_test() {
+            return;
+        }
         let _lock = crate::llm::image_send::image_test_lock();
         let image = crate::core::tool_media::ToolImage::from_bytes(
             b"GIF89a-fixture",

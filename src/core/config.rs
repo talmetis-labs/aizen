@@ -128,11 +128,14 @@ pub(crate) fn resolve_default_home_for_test(base: &Path) -> PathBuf {
     resolve_default_home(base)
 }
 
-/// The project root for PROJECT-LOCAL customization (`./.aizen/`): the git repo top-level if we're
-/// in one, else the current dir. Repo-root-aware so launching `aizen` from a SUBDIR still finds the
-/// repo's `.aizen/` (R4 — fixes the cwd-relative footgun). `AIZEN_PROJECT_ROOT` overrides (tests + an
-/// escape hatch). Shell-out to git keeps the pure-static posture (no git2/gix).
+/// The project root for PROJECT-LOCAL customization (`./.aizen/`). An executing context's immutable
+/// placement wins over ambient configuration: a child must never load the parent's local config.
+/// Outside a bound context, use the repo top-level (or cwd); `AIZEN_PROJECT_ROOT` remains the startup
+/// override. This does not change cwd or process environment when a child selects another workspace.
 pub fn project_root() -> PathBuf {
+    if let Some(root) = bound_project_root() {
+        return root;
+    }
     if let Ok(v) = std::env::var("AIZEN_PROJECT_ROOT") {
         let v = v.trim();
         if !v.is_empty() {
@@ -188,6 +191,14 @@ pub fn project_root() -> PathBuf {
     outermost(&VCS)
         .or_else(|| outermost(&MANIFEST))
         .unwrap_or_else(|| cwd.clone())
+}
+
+/// Root captured by the host execution boundary, not a model-selected config override.
+fn bound_project_root() -> Option<PathBuf> {
+    crate::core::exec_ctx::current().and_then(|ctx| {
+        ctx.placement()
+            .map(|placement| placement.project_root().to_path_buf())
+    })
 }
 
 /// True when an env var is set to a truthy token (`1`/`true`/`yes`/`on`).
@@ -277,8 +288,7 @@ fn slug_fragment_prefold(name: &str) -> String {
 /// `canonicalize` fallback, which let *whether git happened to spawn* (PATH luck) pick the key:
 /// the same repo silently forked into twin memory/skills/index zones. A moved or re-cloned
 /// checkout is now an explicit `aizen zone migrate`, never an implicit re-key. Cached per
-/// (`AIZEN_PROJECT_ROOT` env, cwd) so tests that repoint `AIZEN_PROJECT_ROOT` are never served a
-/// stale slug.
+/// bound placement root (if any), `AIZEN_PROJECT_ROOT` and cwd, never across different worktrees.
 pub fn project_slug() -> String {
     identity().2
 }
@@ -290,22 +300,18 @@ pub fn project_key() -> String {
     identity().1
 }
 
-/// `(root, key, slug)` for the current workspace, computed ONCE per (`AIZEN_PROJECT_ROOT`, cwd).
+/// `(root, key, slug)` cached per bound placement, startup override and cwd.
 ///
-/// The three are derived from the same `project_root()` call by construction, so a caller can never
-/// see a key and a slug that disagree. Sharing the cache also matters for cost: `project_root()` may
-/// spawn `git rev-parse`, and stamping session provenance wants all three every autosave — three
-/// separate lookups would have meant three git spawns per turn.
+/// All three derive from one project root; no process-global root mutation is needed for children.
 fn identity() -> (PathBuf, String, String) {
     type WorkspaceIdentity = (PathBuf, String, String);
-    type CachedIdentity = Option<(String, WorkspaceIdentity)>;
+    type CacheKey = (Option<PathBuf>, Option<std::ffi::OsString>, Option<PathBuf>);
+    type CachedIdentity = Option<(CacheKey, WorkspaceIdentity)>;
     static CACHE: std::sync::Mutex<CachedIdentity> = std::sync::Mutex::new(None);
-    let cache_key = format!(
-        "{}|{}",
-        std::env::var("AIZEN_PROJECT_ROOT").unwrap_or_default(),
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
+    let cache_key = (
+        bound_project_root(),
+        std::env::var_os("AIZEN_PROJECT_ROOT"),
+        std::env::current_dir().ok(),
     );
     if let Ok(guard) = CACHE.lock() {
         if let Some((k, ident)) = guard.as_ref() {
@@ -546,6 +552,100 @@ pub fn embed_model_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rooted_context(root: &Path, home: &Path) -> crate::core::exec_ctx::ExecutionContext {
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            root.to_path_buf(),
+            home.to_path_buf(),
+            home.join("scratch"),
+            "config-routing",
+        )
+        .unwrap();
+        crate::core::exec_ctx::ExecutionContext::default().with_placement(placement)
+    }
+
+    #[test]
+    fn bound_project_identity_is_nested_thread_local_and_never_falls_back_to_parent() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let parent = dir.path().join("parent/work");
+        let child = dir.path().join("child/work");
+        let ambient = dir.path().join("ambient");
+        for root in [&parent, &child, &ambient] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let _env = EnvGuard::set([("AIZEN_PROJECT_ROOT", &ambient)]);
+        let home = dir.path().join("home");
+        let parent_ctx = rooted_context(&parent, &home);
+        let child_ctx = rooted_context(&child, &home);
+        let cwd = std::env::current_dir().unwrap();
+        let ambient_identity = identity();
+        let parent_identity = crate::core::exec_ctx::with_current(parent_ctx.clone(), || {
+            let before = identity();
+            assert_eq!(before.0, parent);
+            crate::core::exec_ctx::with_current(child_ctx.clone(), || {
+                assert_eq!(project_root(), child);
+                assert_eq!(project_aizen_dir(), child.join(".aizen"));
+                assert_ne!(project_key(), before.1);
+                assert_ne!(project_slug(), before.2);
+            });
+            assert_eq!(identity(), before);
+            before
+        });
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (ctx, root) in [(parent_ctx, &parent), (child_ctx.clone(), &child)] {
+                let ready = &ready;
+                threads.spawn(move || {
+                    crate::core::exec_ctx::with_current(ctx, || {
+                        ready.wait();
+                        for _ in 0..64 {
+                            assert_eq!(project_root(), *root);
+                            assert_eq!(identity().0, *root);
+                            assert_eq!(project_key(), workspace_key(root));
+                        }
+                    })
+                });
+            }
+        });
+        // A vanished pinned directory remains pinned. It must not redirect later code into cwd.
+        std::fs::remove_dir(&child).unwrap();
+        crate::core::exec_ctx::with_current(child_ctx, || assert_eq!(project_root(), child));
+        assert_eq!(identity(), ambient_identity);
+        assert_ne!(parent_identity.1, ambient_identity.1);
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
+        assert_eq!(
+            std::env::var_os("AIZEN_PROJECT_ROOT"),
+            Some(ambient.into_os_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_project_identity_follows_future_polls_without_leaking_between_children() {
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let home = dir.path().join("home");
+        let check = |root: PathBuf| {
+            let context = rooted_context(&root, &home);
+            crate::core::exec_ctx::with_current_future(context, async move {
+                let key = workspace_key(&root);
+                for _ in 0..32 {
+                    assert_eq!(project_root(), root);
+                    assert_eq!(project_key(), key);
+                    tokio::task::yield_now().await;
+                }
+                (project_root(), project_slug())
+            })
+        };
+        let (a, b) = tokio::join!(check(first.clone()), check(second.clone()));
+        assert_eq!(a.0, first);
+        assert_eq!(b.0, second);
+        assert_ne!(a.1, b.1);
+        assert!(crate::core::exec_ctx::current().is_none());
+    }
 
     #[test]
     fn slug_fragment_normalizes_and_bounds() {

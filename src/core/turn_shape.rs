@@ -133,6 +133,9 @@ const QUESTION_HEADS: &[&str] = &[
     "mô tả",
     "tóm tắt",
     "liệt kê",
+    "giai thich",
+    "tai sao",
+    "vi sao",
     "cho tôi biết",
     "nói",
     "kể",
@@ -153,6 +156,12 @@ const QUESTION_TAILS: &[&str] = &[
     "ở đâu",
     "khi nào",
     "bao nhiêu",
+    "la gi",
+    "the nao",
+    "nhu nao",
+    "o dau",
+    "khi nao",
+    "bao nhieu",
 ];
 
 /// Interrogative phrases that mark a question wherever they sit in the sentence.
@@ -328,13 +337,19 @@ static CONVERSATION: Mutex<Option<TurnShape>> = Mutex::new(None);
 /// The shape of the turn being seated right now, un-widened — what the persona gate reads.
 static THIS_TURN: Mutex<Option<TurnShape>> = Mutex::new(None);
 
+/// Pure widening rule for the deferred tool surface, not per-request routing.
+fn widened_shape(previous: Option<TurnShape>, request: TurnShape) -> TurnShape {
+    previous.map_or(request, |shape| shape.max(request))
+}
+
 /// Record this turn's shape and return the conversation's (widened) shape. Widening only, so
 /// the deferred tool set — and with it the advertised tool list — changes at most a few times
-/// per conversation and never flips back and forth.
+/// per conversation and never flips back and forth. Per-request routing must use the input
+/// shape, not this return value.
 pub fn note_turn(shape: TurnShape) -> TurnShape {
     *THIS_TURN.lock().unwrap_or_else(|e| e.into_inner()) = Some(shape);
     let mut g = CONVERSATION.lock().unwrap_or_else(|e| e.into_inner());
-    let next = g.map_or(shape, |cur| cur.max(shape));
+    let next = widened_shape(*g, shape);
     *g = Some(next);
     next
 }
@@ -422,17 +437,72 @@ mod tests {
 
     #[test]
     fn conversation_shape_only_widens_until_reset() {
-        reset_conversation();
-        assert_eq!(conversation_shape(), None);
-        assert_eq!(note_turn(TurnShape::Question), TurnShape::Question);
-        assert_eq!(note_turn(TurnShape::MultiFile), TurnShape::MultiFile);
+        // Exercise the same pure transition as note_turn without resetting other tests' state.
+        let question = widened_shape(None, TurnShape::Question);
+        assert_eq!(question, TurnShape::Question);
+        let multi_file = widened_shape(Some(question), TurnShape::MultiFile);
+        assert_eq!(multi_file, TurnShape::MultiFile);
         assert_eq!(
-            note_turn(TurnShape::Question),
+            widened_shape(Some(multi_file), TurnShape::Question),
             TurnShape::MultiFile,
             "a later question does not narrow the surface"
         );
-        reset_conversation();
-        assert_eq!(note_turn(TurnShape::SmallEdit), TurnShape::SmallEdit);
-        reset_conversation();
+        assert_eq!(
+            widened_shape(None, TurnShape::SmallEdit),
+            TurnShape::SmallEdit,
+            "a reset conversation starts from the new request"
+        );
+    }
+
+    fn assert_architect_sequence(turns: &[(&str, TurnShape, TurnShape, bool)]) {
+        let cfg = crate::core::cli_config::CliConfig::default();
+        let mut conversation = None;
+        for &(prompt, expected_request, expected_conversation, expected_route) in turns {
+            let request_shape = classify(prompt);
+            assert_eq!(request_shape, expected_request, "{prompt}");
+            conversation = Some(widened_shape(conversation, request_shape));
+            assert_eq!(conversation, Some(expected_conversation), "{prompt}");
+            assert_eq!(
+                crate::agent::architect::applies(Some("max"), request_shape, true, &cfg),
+                expected_route,
+                "architect must route the current request, not the deferred surface: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn architect_multifile_then_small_edit_keeps_deferred_surface_wide() {
+        assert_architect_sequence(&[
+            (
+                "rename estimate_tokens across the whole codebase",
+                TurnShape::MultiFile,
+                TurnShape::MultiFile,
+                true,
+            ),
+            (
+                "fix the typo in src/a.rs",
+                TurnShape::SmallEdit,
+                TurnShape::MultiFile,
+                false,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn architect_research_then_multifile_routes_current_request() {
+        assert_architect_sequence(&[
+            (
+                "research how other agents handle prompt caching",
+                TurnShape::Research,
+                TurnShape::Research,
+                false,
+            ),
+            (
+                "update src/a.rs, src/b.rs and src/c.rs to use the new estimator",
+                TurnShape::MultiFile,
+                TurnShape::Research,
+                true,
+            ),
+        ]);
     }
 }

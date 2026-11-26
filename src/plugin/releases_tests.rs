@@ -68,6 +68,8 @@ struct Fake {
     release: Release,
     sums: Vec<u8>,
     checksum_calls: Cell<usize>,
+    tag_requests: std::cell::RefCell<Vec<String>>,
+    missing_tag: bool,
 }
 impl Fake {
     fn new(value: &str) -> Self {
@@ -77,6 +79,8 @@ impl Fake {
             release,
             sums,
             checksum_calls: Cell::new(0),
+            tag_requests: std::cell::RefCell::new(Vec::new()),
+            missing_tag: false,
         }
     }
 }
@@ -84,8 +88,9 @@ impl Source for Fake {
     async fn list(&self, page: usize) -> Result<(Vec<Release>, bool)> {
         Ok(self.pages[page - 1].clone())
     }
-    async fn by_tag(&self, _: &str) -> Result<Option<Release>> {
-        Ok(Some(self.release.clone()))
+    async fn by_tag(&self, value: &str) -> Result<Option<Release>> {
+        self.tag_requests.borrow_mut().push(value.to_owned());
+        Ok((!self.missing_tag).then(|| self.release.clone()))
     }
     async fn by_id(&self, _: u64) -> Result<Release> {
         Ok(self.release.clone())
@@ -97,6 +102,86 @@ impl Source for Fake {
     async fn download(&self, _: &Asset, _: &str, _: &mut File) -> Result<()> {
         panic!("discovery and review never download or execute an archive")
     }
+}
+
+#[tokio::test]
+async fn catalog_lists_stable_versions_without_fetching_checksums() {
+    let mut source = Fake::new("0.10.0");
+    let (older, _) = fixture_release("0.9.0", 5);
+    let (mut metadata, _) = fixture_release("1.0.0", 6);
+    metadata.assets.clear();
+    let (mut invalid, _) = fixture_release("0.11.0", 7);
+    invalid.assets[0].browser_download_url = "https://example.com/untrusted.zip".into();
+    let (mut draft, _) = fixture_release("2.0.0", 8);
+    draft.draft = true;
+    let (mut prerelease, _) = fixture_release("3.0.0", 9);
+    prerelease.prerelease = true;
+    let (mut noncanonical, _) = fixture_release("4.0.0", 10);
+    noncanonical.tag_name = "v04.0.0".into();
+    source.pages[0].0 = vec![
+        older,
+        source.release.clone(),
+        metadata,
+        invalid,
+        draft,
+        prerelease,
+        noncanonical,
+    ];
+    let catalog = catalog_with(&source, TARGETS[1]).await.unwrap();
+    assert!(catalog.complete);
+    assert_eq!(catalog.target, TARGETS[1]);
+    assert_eq!(
+        catalog.entries,
+        vec![
+            CatalogEntry {
+                version: "1.0.0".into(),
+                availability: CatalogAvailability::MetadataOnly
+            },
+            CatalogEntry {
+                version: "0.11.0".into(),
+                availability: CatalogAvailability::InvalidPackageMetadata
+            },
+            CatalogEntry {
+                version: "0.10.0".into(),
+                availability: CatalogAvailability::PackageMetadata
+            },
+            CatalogEntry {
+                version: "0.9.0".into(),
+                availability: CatalogAvailability::PackageMetadata
+            },
+        ]
+    );
+    assert_eq!(source.checksum_calls.get(), 0);
+}
+
+#[tokio::test]
+async fn catalog_empty_and_partial_discovery_are_distinct() {
+    let mut source = Fake::new("0.1.0");
+    source.pages[0].0.clear();
+    let empty = catalog_with(&source, TARGETS[1]).await.unwrap();
+    assert!(empty.complete && empty.entries.is_empty());
+    source.pages = (1..=3)
+        .map(|id| (vec![fixture_release(&format!("0.{id}.0"), id).0], true))
+        .collect();
+    let partial = catalog_with(&source, TARGETS[1]).await.unwrap();
+    assert!(!partial.complete);
+    assert_eq!(partial.entries.len(), 3);
+    assert_eq!(partial.entries[0].version, "0.3.0");
+    assert_eq!(source.checksum_calls.get(), 0);
+}
+
+#[tokio::test]
+async fn catalog_rejects_duplicate_versions_across_pages() {
+    let mut source = Fake::new("0.1.0");
+    let (duplicate, _) = fixture_release("0.1.0", 5);
+    source.pages = vec![
+        (vec![source.release.clone()], true),
+        (vec![duplicate], false),
+    ];
+    let error = catalog_with(&source, TARGETS[1]).await.unwrap_err();
+    assert!(error.to_string().contains("Duplicate stable"));
+    assert_eq!(source.checksum_calls.get(), 0);
+    assert!(discover(&source, TARGETS[1], None).await.is_err());
 }
 
 #[test]
@@ -169,6 +254,25 @@ async fn exact_version_does_not_follow_a_different_tag() {
     assert!(discover(&source, TARGETS[1], Some("0.2.0")).await.is_err());
     assert_eq!(source.checksum_calls.get(), 0);
 }
+#[tokio::test]
+async fn exact_selection_is_nonlatest_and_never_falls_back_when_unavailable() {
+    let mut source = Fake::new("0.1.0");
+    source.pages[0].0.insert(0, fixture_release("0.2.0", 99).0);
+    let (highest, selected, complete) = discover(&source, TARGETS[1], Some("0.1.0")).await.unwrap();
+    assert_eq!(highest.as_deref(), Some("0.1.0"));
+    assert_eq!(selected.unwrap().version, "0.1.0");
+    assert!(complete);
+    assert_eq!(&*source.tag_requests.borrow(), &["0.1.0"]);
+    assert_eq!(source.checksum_calls.get(), 1);
+    source.release.assets.clear();
+    let (_, selected, complete) = discover(&source, TARGETS[1], Some("0.1.0")).await.unwrap();
+    assert!(selected.is_none() && complete);
+    source.missing_tag = true;
+    let (highest, selected, complete) = discover(&source, TARGETS[1], Some("0.1.0")).await.unwrap();
+    assert!(highest.is_none() && selected.is_none() && complete);
+    assert_eq!(source.checksum_calls.get(), 1);
+}
+
 #[test]
 fn release_inventory_refuses_duplicate_missing_extra_and_foreign_assets() {
     let (base, _) = fixture_release("0.1.0", 1);

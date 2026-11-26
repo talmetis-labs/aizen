@@ -92,29 +92,89 @@ pub struct Context {
     /// Suppress the human trace line (sub-agents run quiet; the report still reaches the JSON
     /// stream when it is on).
     pub quiet: bool,
+    /// Explicit driver ownership; hook execution may run without a worker thread-local context.
+    pub exec_ctx: Option<crate::core::exec_ctx::ExecutionContext>,
+}
+
+/// Capture automation ownership before crossing a worker/background boundary. Only an explicit
+/// task binding may supply a missing policy; never borrow the ambient checklist singleton.
+/// A present (possibly stale) policy is authoritative and is never replaced with a fresh one.
+pub(crate) fn automation_context(
+    explicit: Option<&crate::core::exec_ctx::ExecutionContext>,
+) -> crate::core::exec_ctx::ExecutionContext {
+    let current = crate::core::exec_ctx::current();
+    let ctx = explicit
+        .cloned()
+        .or_else(|| current.clone())
+        .unwrap_or_default();
+    if ctx.policy().is_none() {
+        // Do not refresh a frozen worker policy through its mutable task owner when a caller
+        // supplied an unbound/default context (including after a human transition).
+        if let Some(current) = current.filter(|current| current.policy().is_some()) {
+            return current;
+        }
+        if let Some(task) = super::todo::bound_context() {
+            return ctx.with_task(task);
+        }
+    }
+    ctx
+}
+
+/// Suppressed automation is discarded, not deferred. Admission also prevents a human transition
+/// while an already-started automatic effect is still settling.
+pub(crate) fn admit_automation(
+    ctx: &crate::core::exec_ctx::ExecutionContext,
+) -> anyhow::Result<crate::core::exec_ctx::ExecutionContext> {
+    anyhow::ensure!(
+        ctx.permits_automation(),
+        "automation suppressed by planning, stale, or blocked execution policy"
+    );
+    if ctx.policy().is_some() {
+        ctx.admit_policy()
+    } else {
+        // Trusted standalone callers without a conversation retain their existing behavior.
+        Ok(ctx.clone())
+    }
 }
 
 impl Context {
+    fn automation_context(&self) -> Self {
+        Self {
+            exec_ctx: Some(automation_context(self.exec_ctx.as_ref())),
+            ..self.clone()
+        }
+    }
+
+    fn admit_automation(&self) -> Option<Self> {
+        let ctx = self.automation_context();
+        let exec_ctx = admit_automation(ctx.exec_ctx.as_ref()?).ok()?;
+        Some(Self {
+            exec_ctx: Some(exec_ctx),
+            ..ctx
+        })
+    }
+
     /// The driver's view: the config's workspace root and its execution context.
     pub fn from_cfg(cfg: &super::AgentConfig) -> Self {
         Self {
             cwd: cfg.effective_root(),
             dispatch: cfg.exec_ctx.dispatch_label(),
             quiet: cfg.quiet,
+            exec_ctx: Some(automation_context(Some(&cfg.exec_ctx))),
         }
     }
 
     /// A tool body's view: the workspace pinned for this call, not the process-global cwd.
     pub fn here(quiet: bool) -> Self {
-        let ctx = crate::core::exec_ctx::current();
+        let ctx = automation_context(None);
         Self {
             cwd: ctx
-                .as_ref()
-                .and_then(|ctx| ctx.placement())
+                .placement()
                 .map(|placement| placement.workspace_root().to_path_buf())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            dispatch: ctx.and_then(|ctx| ctx.dispatch_label()),
+            dispatch: ctx.dispatch_label(),
             quiet,
+            exec_ctx: Some(ctx),
         }
     }
 }
@@ -150,28 +210,28 @@ pub fn configured() -> Option<HooksConfig> {
     cli_config::load().hooks.filter(|h| !h.is_empty())
 }
 
-/// Speculation cannot safely run workspace hooks. Inspect configuration without executing it;
-/// an environment toggle is not a durable isolation policy.
-pub(crate) fn check_speculative_policy() -> anyhow::Result<()> {
-    if cli_config::load()
-        .hooks
-        .is_some_and(|hooks| !hooks.is_empty())
-    {
-        anyhow::bail!("speculative native execution is unavailable while lifecycle hooks are configured; use direct execution so guards/formatters run normally (no hooks were skipped)");
-    }
-    Ok(())
-}
-
 /// Run the matching `pre_tool` hooks for `tool`.
 pub fn pre_tool(tool: &str, args: &Value, ctx: &Context) -> PreToolVerdict {
+    let ctx = ctx.automation_context();
+    if !ctx
+        .exec_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.permits_automation())
+    {
+        return PreToolVerdict::Pass;
+    }
     match configured() {
-        Some(cfg) => pre_tool_with(&cfg, tool, args, ctx),
+        Some(cfg) => pre_tool_with(&cfg, tool, args, &ctx),
         None => PreToolVerdict::Pass,
     }
 }
 
 /// [`pre_tool`] against an explicit config.
 pub fn pre_tool_with(cfg: &HooksConfig, tool: &str, args: &Value, ctx: &Context) -> PreToolVerdict {
+    let Some(ctx) = ctx.admit_automation() else {
+        return PreToolVerdict::Pass;
+    };
+    let ctx = &ctx;
     let mut verdict = PreToolVerdict::Pass;
     for h in cfg
         .pre_tool
@@ -208,7 +268,15 @@ pub fn post_tool(
     ok: bool,
     ctx: &Context,
 ) -> Option<String> {
-    configured().and_then(|cfg| post_tool_with(&cfg, tool, args, result, ok, ctx))
+    let ctx = ctx.automation_context();
+    if !ctx
+        .exec_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.permits_automation())
+    {
+        return None;
+    }
+    configured().and_then(|cfg| post_tool_with(&cfg, tool, args, result, ok, &ctx))
 }
 
 /// [`post_tool`] against an explicit config.
@@ -220,6 +288,8 @@ pub fn post_tool_with(
     ok: bool,
     ctx: &Context,
 ) -> Option<String> {
+    let ctx = ctx.admit_automation()?;
+    let ctx = &ctx;
     let mut notes: Vec<String> = Vec::new();
     for h in cfg
         .post_tool
@@ -258,10 +328,18 @@ pub fn post_tool_with(
 
 /// Run every `stop` hook for a finished top-level run. `stop` is the loop's stop reason word.
 pub fn stop(stop: &str, steps: usize, final_text: Option<&str>, ctx: &Context) {
+    let ctx = ctx.automation_context();
+    if !ctx
+        .exec_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.permits_automation())
+    {
+        return;
+    }
     let Some(cfg) = configured() else {
         return;
     };
-    stop_with(&cfg, stop, steps, final_text, ctx);
+    stop_with(&cfg, stop, steps, final_text, &ctx);
 }
 
 /// [`stop`] against an explicit config.
@@ -272,6 +350,10 @@ pub fn stop_with(
     final_text: Option<&str>,
     ctx: &Context,
 ) {
+    let Some(ctx) = ctx.admit_automation() else {
+        return;
+    };
+    let ctx = &ctx;
     for h in &cfg.stop {
         let input = input(
             HookEvent::Stop,
@@ -387,15 +469,11 @@ fn execute(
         error: None,
         elapsed_ms: 0,
     };
-    // Even a policy change after admission cannot smuggle a process through a native overlay.
-    if crate::core::exec_ctx::current().is_some_and(|ctx| ctx.overlay().is_some()) {
-        let reason =
-            "lifecycle hooks cannot execute inside a private native overlay; use direct execution";
-        out.decision = Some(Decision::Deny);
-        out.reason = Some(reason.to_string());
-        out.error = Some(reason.to_string());
+    let Some(ctx) = ctx.admit_automation() else {
+        out.error = Some("lifecycle hook suppressed by execution policy".to_string());
         return out;
-    }
+    };
+    let ctx = &ctx;
     if run.is_empty() {
         out.error = Some("empty `run`".to_string());
         return out;
@@ -418,7 +496,10 @@ fn execute(
     .private_tmp(false)
     .wall_timeout(timeout)
     .extra_env(env);
-    let sbx = match crate::sandbox::runner::prepare_std(req) {
+    let owner = ctx.exec_ctx.as_ref().expect("admitted hook context");
+    let sbx = match crate::core::exec_ctx::with_current(owner.clone(), || {
+        crate::sandbox::runner::prepare_std(req)
+    }) {
         Ok(s) => s,
         Err(e) => {
             out.error = Some(format!("refused by the sandbox policy: {e}"));
@@ -427,10 +508,25 @@ fn execute(
         }
     };
     let bytes = serde_json::to_vec(input).unwrap_or_default();
-    let bounded = sbx.output_bounded_with_input(&bytes, timeout, DRAIN_GRACE);
+    if let Some(owner) = ctx.exec_ctx.clone().or_else(crate::core::exec_ctx::current) {
+        // Hook output is never check evidence, including exit zero or an approval decision.
+        owner.note_task_effects();
+    }
+    let bounded = crate::core::exec_ctx::with_current(owner.clone(), || {
+        sbx.output_bounded_with_input(&bytes, timeout, DRAIN_GRACE)
+    });
     out.elapsed_ms = started.elapsed().as_millis() as u64;
     match bounded {
-        Err(e) => out.error = Some(format!("could not complete: {e}")),
+        Err(e) => {
+            // A hook may deny immediately without consuming a large event. Losing that decision
+            // to BrokenPipe must not turn the gate into Pass or retain an earlier hook's Allow.
+            // Only this typed incomplete-input case changes the ordinary nonblocking-error rule.
+            if event == HookEvent::PreTool && e.stdin_delivery_failed() {
+                out.decision = Some(Decision::Deny);
+                out.reason = Some("hook did not receive its complete input; call refused".into());
+            }
+            out.error = Some(format!("could not complete: {e}"));
+        }
         Ok(o)
             if crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED
                 && o.settlement == crate::core::proctree::BoundedSettlement::Unknown =>
@@ -594,6 +690,8 @@ fn report(r: &HookRun, ctx: &Context) {
 mod tests {
     use super::*;
 
+    include!("hooks_input_tests.rs");
+
     fn hook(run: &str, matches: Option<&str>) -> Hook {
         Hook {
             run: run.to_string(),
@@ -618,8 +716,102 @@ mod tests {
                 cwd: root,
                 dispatch: None,
                 quiet: true,
+                exec_ctx: crate::core::exec_ctx::current(),
             })
         })
+    }
+
+    #[test]
+    fn planning_stale_and_blocked_hooks_are_discarded_without_effects() {
+        use crate::core::exec_ctx::ExecutionContext;
+        use crate::core::session_control::ExecutionMode;
+
+        let task = crate::agent::todo::TaskContext::private();
+        let control = task.control();
+        let stale = ExecutionContext::default().with_task(task.clone());
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let planning = ExecutionContext::default().with_task(task.clone());
+        let blocked_task = crate::agent::todo::TaskContext::private();
+        let blocked = ExecutionContext::default().with_task(blocked_task.clone());
+        assert!(blocked_task
+            .control()
+            .transition(ExecutionMode::Planning, None, |_| {
+                anyhow::bail!("fixture persistence failure")
+            })
+            .is_err());
+        let config = HooksConfig {
+            pre_tool: vec![hook("exit 2", None)],
+            post_tool: vec![hook("exit 2", None)],
+            stop: vec![hook("exit 2", None)],
+        };
+        let before = task.snapshot();
+        for execution in [stale, planning, blocked] {
+            let ctx = Context {
+                cwd: std::env::temp_dir(),
+                dispatch: None,
+                quiet: true,
+                exec_ctx: Some(execution),
+            };
+            assert_eq!(
+                pre_tool_with(&config, "file_read", &json!({}), &ctx),
+                PreToolVerdict::Pass
+            );
+            assert!(post_tool_with(&config, "file_read", &json!({}), "ok", true, &ctx).is_none());
+            stop_with(&config, "done", 1, None, &ctx);
+            let receipt = execute(&config.stop[0], HookEvent::Stop, None, &json!({}), &ctx);
+            assert_eq!(
+                receipt.error.as_deref(),
+                Some("lifecycle hook suppressed by execution policy")
+            );
+            assert!(receipt.exit.is_none());
+            assert!(receipt.decision.is_none());
+        }
+        assert_eq!(
+            task.snapshot(),
+            before,
+            "suppression must not report a mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_hook_policy_uses_bound_task_and_never_widens_after_exit() {
+        use crate::core::session_control::ExecutionMode;
+        let task = crate::agent::todo::TaskContext::private();
+        let control = task.control();
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let captured = crate::agent::todo::with_context(task, async {
+            let context = Context::here(true);
+            assert!(context.exec_ctx.as_ref().unwrap().is_planning());
+            context
+        })
+        .await;
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        assert!(captured.admit_automation().is_none());
+    }
+
+    #[test]
+    fn default_context_cannot_refresh_a_frozen_worker_policy() {
+        use crate::core::{exec_ctx::ExecutionContext, session_control::ExecutionMode};
+        let task = crate::agent::todo::TaskContext::private();
+        let control = task.control();
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let restricted = ExecutionContext::default().with_task(task);
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        crate::core::exec_ctx::with_current(restricted, || {
+            let captured = automation_context(Some(&ExecutionContext::default()));
+            assert!(captured.is_planning());
+            assert!(admit_automation(&captured).is_err());
+        });
     }
 
     #[test]
@@ -716,6 +908,7 @@ mod tests {
             cwd: PathBuf::from("/work"),
             dispatch: Some("argus · t1".to_string()),
             quiet: true,
+            exec_ctx: None,
         };
         let v = input(
             HookEvent::PreTool,

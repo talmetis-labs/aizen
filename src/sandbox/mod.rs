@@ -36,6 +36,7 @@ pub mod backend;
 pub mod capabilities;
 pub mod policy;
 pub mod request;
+pub(crate) mod review;
 pub mod runner;
 
 use serde::{Deserialize, Serialize};
@@ -112,6 +113,8 @@ pub enum CommandOrigin {
     /// (closed action enum, exec form — no shell), with the model-supplied path/rev arguments
     /// validated by the tool before they reach argv.
     GitInspect,
+    /// An explicitly requested Git workspace mutation with fixed, validated argv.
+    GitMutation,
     /// A `` !`cmd` `` expansion inside a user-defined custom command (repository-influenced).
     CustomCommand,
     /// The user's own `!cmd` escape typed at the REPL prompt.
@@ -154,6 +157,7 @@ impl CommandOrigin {
             Self::VerifyGate => "verify_gate",
             Self::Lsp => "lsp",
             Self::GitInspect => "git_inspect",
+            Self::GitMutation => "git_mutation",
             Self::CustomCommand => "custom_command",
             Self::UserEscape => "user_escape",
             Self::TelegramShell => "telegram_shell",

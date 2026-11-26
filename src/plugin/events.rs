@@ -101,9 +101,10 @@ pub(crate) fn prepare(
         .as_ref()
         .expect("logical turn has an identity")
         .as_str();
-    let Some(context) = context::selected(root, &session, event, &session)? else {
+    let Some(mut context) = context::selected(root, &session, event, &session)? else {
         return Ok(None);
     };
+    retain_snapshot_boundary(&mut context, snapshot);
     anyhow::ensure!(
         context.generation == state.generation,
         "Memory selection changed while preparing learning event"
@@ -114,35 +115,14 @@ pub(crate) fn prepare(
     {
         return Ok(None);
     }
-    // The provider owns gates/prompts/decisions. Core only bounds what can leave its process.
-    let user = bounded_text(user);
-    let transcript = bounded_text(&crate::repl::postturn::render_transcript(turn));
-    let operation_id = format!(
-        "turn-{}",
-        manifest::sha256(
-            format!(
-                "{}:{}:{}:{}",
-                context.generation, context.workspace_id, session, event
-            )
-            .as_bytes()
-        )
-    );
-    let mut params = api::ProcessTurn {
-        operation_id,
-        user_text: user,
-        transcript,
-        dry_run: false,
-        confirmed: false,
-        payload_sha256: None,
-        rendered_evidence: None,
-    };
-    params.payload_sha256 = Some(manifest::sha256(&params.payload_bytes(&context)?));
-    params.validate()?;
+    let params = completed_turn_params(&context, turn, snapshot)?;
     learning_live(&execution, &cancel)?;
     if !super::outbox::prepare(&context, &params)? {
         return Ok(None);
     }
-    let notes_owner = snapshot.and_then(|snapshot| snapshot.learning_owner(&context));
+    let notes_owner = snapshot
+        .filter(|snapshot| super::snapshots::is_live_turn(snapshot))
+        .and_then(|snapshot| snapshot.learning_owner(&context));
     let model = model.filter(|_| {
         state
             .selected
@@ -168,6 +148,67 @@ pub(crate) fn prepare(
         tool_calls,
         recovered,
     }))
+}
+
+/// Snapshot boundaries are the first turn id, not the session id. Retain one only when the selected
+/// provider context still identifies that exact lane and turn; do not adopt a foreign workspace.
+fn retain_snapshot_boundary(
+    context: &mut api::ProviderContext,
+    snapshot: Option<&super::snapshots::Snapshot>,
+) {
+    let Some(adopted) = snapshot.and_then(|snapshot| snapshot.context.as_ref()) else {
+        return;
+    };
+    if adopted.generation == context.generation
+        && adopted.session_id == context.session_id
+        && adopted.turn_id == context.turn_id
+        && adopted.user_id == context.user_id
+        && adopted.workspace_id == context.workspace_id
+        && adopted.workspace_root == context.workspace_root
+        && adopted.cwd == context.cwd
+        && adopted.device_id == context.device_id
+        && adopted.data_root == context.data_root
+    {
+        context.boundary_id.clone_from(&adopted.boundary_id);
+    }
+}
+
+/// Build the exact journaled payload before reserving an operation. Only receipt-bound evidence
+/// from this turn may reach either provider learning path; merely fetching recall is insufficient.
+fn completed_turn_params(
+    context: &api::ProviderContext,
+    turn: &[crate::core::types::Message],
+    snapshot: Option<&super::snapshots::Snapshot>,
+) -> Result<api::ProcessTurn> {
+    // The provider owns gates/prompts/decisions. Core only bounds what can leave its process.
+    let user = turn
+        .first()
+        .and_then(crate::core::memory_context::clean_content)
+        .unwrap_or("")
+        .trim();
+    let operation_id = format!(
+        "turn-{}",
+        manifest::sha256(
+            format!(
+                "{}:{}:{}:{}",
+                context.generation, context.workspace_id, context.session_id, context.turn_id
+            )
+            .as_bytes()
+        )
+    );
+    let mut params = api::ProcessTurn {
+        operation_id,
+        user_text: bounded_text(user),
+        transcript: bounded_text(&crate::repl::postturn::render_transcript(turn)),
+        dry_run: false,
+        confirmed: false,
+        payload_sha256: None,
+        rendered_evidence: snapshot
+            .and_then(|snapshot| snapshot.rendered_evidence_for(context, turn)),
+    };
+    params.payload_sha256 = Some(manifest::sha256(&params.payload_bytes(context)?));
+    params.validate()?;
+    Ok(params)
 }
 
 fn bounded_text(text: &str) -> String {
@@ -403,6 +444,140 @@ mod tests {
             tool_calls: 0,
             recovered: false,
         }
+    }
+
+    #[test]
+    fn completed_turn_payload_journals_only_receipt_bound_rendered_evidence() {
+        use crate::core::types::{Message, UserTurnId};
+
+        if super::super::manager::host_target().is_err() {
+            return;
+        }
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", home.path().as_os_str())]);
+        let package = super::super::manager::tests::native_review_fixture(home.path());
+        super::super::manager::activate(
+            &super::super::manager::review("fixture").unwrap(),
+            super::super::settings::ExecutionGrant {
+                manifest_sha256: package.pins.manifest.sha256,
+                guarded_execution: true,
+                network: false,
+                learning: true,
+                turn_model_learning: false,
+            },
+        )
+        .unwrap();
+        let execution = crate::core::exec_ctx::ExecutionContext::new(
+            crate::core::convo::ConversationId::new("fixture-session"),
+        );
+        let mut event = queued_event(
+            home.path(),
+            execution.clone(),
+            crate::core::cancel::TurnCancel::new(),
+        );
+        let turn_id = UserTurnId::new().unwrap();
+        event.context = context::selected(
+            home.path(),
+            "fixture-session",
+            turn_id.as_str(),
+            "first-turn-boundary",
+        )
+        .unwrap()
+        .unwrap();
+        let body = "Use Cargo for this workspace.";
+        let evidence = api::RenderedEvidence {
+            provider_id: "fixture".into(),
+            generation: event.context.generation,
+            user_id: event.context.user_id.clone(),
+            workspace_id: event.context.workspace_id.clone(),
+            session_id: event.context.session_id.clone(),
+            turn_id: event.context.turn_id.clone(),
+            boundary_id: event.context.boundary_id.clone(),
+            facts: vec![api::RenderedFact {
+                handle: "m1".into(),
+                channel: api::EvidenceChannel::Recall,
+                source: api::EvidenceSource {
+                    id: "fixture-fact".into(),
+                    revision: 1,
+                    scope: api::Scope::Project,
+                    workspace_id: Some(event.context.workspace_id.clone()),
+                    content_sha256: manifest::sha256(body.as_bytes()),
+                },
+                text: body.into(),
+            }],
+        };
+        evidence.validate().unwrap();
+        let snapshot = super::super::snapshots::Snapshot {
+            provider_id: "fixture".into(),
+            context: Some(event.context.clone()),
+            recall: format!("Recalled Memory:\n[m1] {body}"),
+            ids: vec!["fixture-fact".into()],
+            rendered_evidence: Some(evidence),
+            ..Default::default()
+        };
+        let mut user = Message::user(format!("{}\n\nRemember Cargo.", snapshot.turn_prefix(true)));
+        user.user_turn_id = Some(turn_id);
+        snapshot.seal_message(&mut user);
+        let turn = [user, Message::assistant("Done.")];
+        let prepared = prepare(
+            &crate::agent::StopReason::Done,
+            &turn,
+            home.path(),
+            execution,
+            crate::core::cancel::TurnCancel::new(),
+            Some(&snapshot),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(prepared.context.boundary_id, "first-turn-boundary");
+        assert!(
+            prepared.params.rendered_evidence.is_some(),
+            "real prepare keeps the original conversation boundary"
+        );
+        assert!(
+            prepared.notes_owner.is_none(),
+            "retired one-shot evidence cannot revive session notes"
+        );
+        let params = completed_turn_params(&event.context, &turn, Some(&snapshot)).unwrap();
+        assert_eq!(params.payload_sha256, prepared.params.payload_sha256);
+        assert_eq!(params.user_text, "Remember Cargo.");
+        assert_eq!(
+            params.rendered_evidence.as_ref().unwrap().facts[0].handle,
+            "m1"
+        );
+        assert_eq!(
+            params.payload_sha256.as_deref(),
+            Some(manifest::sha256(&params.payload_bytes(&event.context).unwrap()).as_str())
+        );
+        // Both dispatch paths serialize this same payload; evidence must also be in the digest.
+        let serialized = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            serialized["rendered_evidence"]["facts"][0]["source"]["id"],
+            "fixture-fact"
+        );
+        let without = completed_turn_params(&event.context, &turn, None).unwrap();
+        assert!(without.rendered_evidence.is_none());
+        assert_ne!(params.payload_sha256, without.payload_sha256);
+        let mut unsealed = turn.clone();
+        unsealed[0].memory_scaffold = None;
+        assert!(
+            completed_turn_params(&event.context, &unsealed, Some(&snapshot))
+                .unwrap()
+                .rendered_evidence
+                .is_none()
+        );
+        let mut different_turn = event.context.clone();
+        different_turn.turn_id = "other-turn".into();
+        assert!(
+            completed_turn_params(&different_turn, &turn, Some(&snapshot))
+                .unwrap()
+                .rendered_evidence
+                .is_none()
+        );
     }
 
     #[test]
@@ -688,6 +863,7 @@ mod tests {
         let execution = crate::core::exec_ctx::ExecutionContext::default();
         let history = [user];
         let results: Vec<_> = [
+            crate::agent::StopReason::Incomplete,
             crate::agent::StopReason::Cancelled,
             crate::agent::StopReason::Deadline,
             crate::agent::StopReason::MaxIters,

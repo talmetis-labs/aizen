@@ -6,7 +6,11 @@
 //! in the input box for review.
 
 use crate::agent::design::TaskDesignState;
+use crate::agent::todo::TaskState;
 use crate::core::persist::{atomic_write_owner_only, remove_if_exists};
+use crate::core::session_control::SessionControl;
+use crate::core::session_store::{PersistenceSnapshot, SaveControl};
+use crate::core::snapshots::SnapshotRef;
 use crate::core::types::Message;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA: u32 = 2;
+const LEGACY_SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,11 +57,18 @@ pub struct RecoveryManifest {
     pub phase: RecoveryPhase,
     pub session_name: Option<String>,
     pub safe_history_len: usize,
+    /// Schema-2 lookup evidence only. Never reinterpret this as a Git task or OID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<u32>,
+    /// Schema-3 backend-qualified provenance, not a live pin or restore capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_ref: Option<SnapshotRef>,
     pub sidecar_generation: u64,
     /// State is in the same generation's history envelope, never an unrelated active singleton.
     #[serde(default)]
     pub has_design_state: bool,
+    #[serde(default)]
+    pub has_task_state: bool,
     pub turn_id: Option<u64>,
     /// Only a completed coordinating loop can clear this; autosave/Idle is not settlement proof.
     pub side_effects_possible: bool,
@@ -65,6 +77,36 @@ pub struct RecoveryManifest {
     #[serde(default)]
     pub effects_unsettled: bool,
     pub updated_unix: u64,
+}
+
+impl RecoveryManifest {
+    fn validate_checkpoint_schema(&self) -> Result<()> {
+        match self.schema {
+            LEGACY_SCHEMA => anyhow::ensure!(
+                self.checkpoint_ref.is_none(),
+                "schema-2 recovery cannot contain a typed snapshot reference"
+            ),
+            SCHEMA => anyhow::ensure!(
+                self.checkpoint_id.is_none(),
+                "schema-3 recovery cannot contain an unbound numeric checkpoint"
+            ),
+            _ => anyhow::bail!("unsupported recovery schema"),
+        }
+        if let Some(reference) = &self.checkpoint_ref {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint_label(&self) -> Option<String> {
+        self.checkpoint_ref
+            .as_ref()
+            .map(SnapshotRef::display_label)
+            .or_else(|| {
+                self.checkpoint_id
+                    .map(|id| format!("legacy checkpoint #{id}"))
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +123,189 @@ pub struct RecoveryOffer {
 }
 
 static ACTIVE: Mutex<Option<ActiveLease>> = Mutex::new(None);
+// Focus never destroys old conversation generations or releases uncertain recovery evidence.
+static FOCUSED_LEASES: Mutex<Vec<ActiveLease>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn clear_focus_test_state() {
+    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    FOCUSED_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+#[cfg(test)]
+pub(crate) fn focus_test_scope() -> Option<String> {
+    ACTIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|active| active.manifest.repo_scope.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn focus_test_history_len() -> usize {
+    ACTIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |active| active.manifest.safe_history_len)
+}
+
+pub(crate) struct PreparedRecoveryScope {
+    scope: String,
+    fresh: Option<ActiveLease>,
+}
+
+impl PreparedRecoveryScope {
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = active.as_ref() {
+            require_focus_settled(active)?;
+        }
+        let retained = FOCUSED_LEASES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = retained
+            .iter()
+            .find(|lease| lease.manifest.repo_scope == self.scope)
+        {
+            require_focus_settled(existing)?;
+        } else if let Some(fresh) = &self.fresh {
+            require_focus_settled(fresh)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn save_conversation(
+        &mut self,
+        history: &[Message],
+        design: Option<&TaskDesignState>,
+        task: &TaskState,
+        snapshot: &PersistenceSnapshot,
+    ) -> Result<()> {
+        if let Some(fresh) = self.fresh.as_mut() {
+            return checkpoint_active(
+                fresh,
+                history,
+                None,
+                RecoveryPhase::Idle,
+                design,
+                task,
+                SaveControl::Snapshot(snapshot),
+            );
+        }
+        let mut retained = FOCUSED_LEASES.lock().unwrap_or_else(|e| e.into_inner());
+        let target = retained
+            .iter_mut()
+            .find(|lease| lease.manifest.repo_scope == self.scope)
+            .context("prepared recovery target is missing")?;
+        checkpoint_active(
+            target,
+            history,
+            None,
+            RecoveryPhase::Idle,
+            design,
+            task,
+            SaveControl::Snapshot(snapshot),
+        )
+    }
+
+    pub(crate) fn activate(mut self) {
+        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retained = FOCUSED_LEASES.lock().unwrap_or_else(|e| e.into_inner());
+        let next = retained
+            .iter()
+            .position(|lease| lease.manifest.repo_scope == self.scope)
+            .map(|index| retained.swap_remove(index))
+            .or_else(|| self.fresh.take());
+        if let Some(next) = next {
+            if let Some(old) = active.replace(next) {
+                retained.push(old);
+            }
+        }
+    }
+}
+
+pub(crate) fn prepare_focus_scope(
+    scope: String,
+    session_name: Option<String>,
+) -> Result<PreparedRecoveryScope> {
+    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = active.as_ref() {
+        require_focus_settled(active)?;
+    }
+    let retained = FOCUSED_LEASES.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = retained
+        .iter()
+        .find(|lease| lease.manifest.repo_scope == scope);
+    anyhow::ensure!(
+        existing.is_some() || retained.len() < 64,
+        "too many retained recovery scopes; open a separate session"
+    );
+    if let Some(existing) = existing {
+        require_focus_settled(existing)?;
+    }
+    let fresh = if existing.is_none() {
+        Some(create_lease(scope.clone(), session_name)?)
+    } else {
+        None
+    };
+    Ok(PreparedRecoveryScope { scope, fresh })
+}
+
+fn require_focus_settled(active: &ActiveLease) -> Result<()> {
+    anyhow::ensure!(
+        !active.manifest.effects_unsettled && !active.manifest.side_effects_possible,
+        "workspace focus blocked by unresolved recovery effects"
+    );
+    active._lock.verify_existing_path(&lock_path(&active.dir))?;
+    let disk = crate::core::file_placement::read_existing_regular(
+        &manifest_path(&active.dir),
+        128 * 1024,
+    )?;
+    let stored: RecoveryManifest = serde_json::from_slice(&disk)?;
+    anyhow::ensure!(
+        serde_json::to_value(&stored)? == serde_json::to_value(&active.manifest)?,
+        "recovery scope changed outside its owner; focus refused"
+    );
+    Ok(())
+}
+
+struct ScopedLease {
+    active: std::sync::MutexGuard<'static, Option<ActiveLease>>,
+    retained: std::sync::MutexGuard<'static, Vec<ActiveLease>>,
+    root: Option<String>,
+}
+impl ScopedLease {
+    fn active_mut(&mut self) -> Option<&mut ActiveLease> {
+        let matches = self.active.as_ref().is_some_and(|lease| {
+            self.root.as_ref().is_none_or(|root| {
+                crate::core::config::normalize_path_key(Path::new(&lease.manifest.repo_scope))
+                    == *root
+            })
+        });
+        if matches || self.root.is_none() {
+            return self.active.as_mut();
+        }
+        self.retained.iter_mut().find(|lease| {
+            self.root.as_ref().is_some_and(|root| {
+                crate::core::config::normalize_path_key(Path::new(&lease.manifest.repo_scope))
+                    == *root
+            })
+        })
+    }
+}
+fn scoped_active() -> ScopedLease {
+    let root = crate::core::exec_ctx::current().and_then(|ctx| {
+        ctx.placement()
+            .map(|placement| crate::core::config::normalize_path_key(placement.project_root()))
+    });
+    ScopedLease {
+        active: ACTIVE.lock().unwrap_or_else(|e| e.into_inner()),
+        retained: FOCUSED_LEASES.lock().unwrap_or_else(|e| e.into_inner()),
+        root,
+    }
+}
 
 struct ActiveLease {
     dir: PathBuf,
@@ -133,55 +358,75 @@ fn new_run_id() -> String {
 
 /// Begin a recovery lease for the current process. Best-effort: failure never blocks the REPL.
 pub fn begin(repo_scope: impl Into<String>, session_name: Option<String>) {
-    let run_id = new_run_id();
+    if let Ok(lease) = create_lease(repo_scope.into(), session_name) {
+        *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
+    }
+}
+
+fn create_lease(repo_scope: String, session_name: Option<String>) -> Result<ActiveLease> {
+    let run_id = format!(
+        "{}-{}",
+        new_run_id(),
+        crate::core::persist::unique_sequence()
+    );
     let dir = lease_dir(&run_id);
-    let _ = fs::create_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
     crate::core::config::harden_dir(&dir);
-    let lock = match crate::core::repo_lock::RepoTxnLock::acquire(
-        &lock_path(&dir),
-        Duration::from_secs(1),
-    ) {
-        Ok(l) => l,
-        Err(_) => return,
-    };
+    let lock =
+        crate::core::repo_lock::RepoTxnLock::acquire(&lock_path(&dir), Duration::from_secs(1))?;
     let manifest = RecoveryManifest {
         schema: SCHEMA,
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         run_id,
         repo: crate::core::config::project_slug(),
-        repo_scope: repo_scope.into(),
+        repo_scope,
         phase: RecoveryPhase::Idle,
         session_name,
         safe_history_len: 0,
         checkpoint_id: None,
+        checkpoint_ref: None,
         sidecar_generation: 0,
         has_design_state: false,
+        has_task_state: false,
         turn_id: None,
         side_effects_possible: false,
         effects_unsettled: false,
         updated_unix: now_unix(),
     };
-    if write_manifest(&dir, &manifest).is_err() {
-        return;
-    }
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActiveLease {
+    write_manifest(&dir, &manifest)?;
+    Ok(ActiveLease {
         dir,
         manifest,
         _lock: lock,
-    });
+    })
 }
 
 fn write_manifest(dir: &Path, manifest: &RecoveryManifest) -> Result<()> {
+    manifest.validate_checkpoint_schema()?;
     let bytes = serde_json::to_vec_pretty(manifest)?;
     atomic_write_owner_only(&manifest_path(dir), &bytes)
 }
 
 #[derive(Serialize, Deserialize)]
 struct HistoryGeneration {
+    #[serde(default)]
+    version: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::core::session_store::deserialize_session_control"
+    )]
+    session_control: Option<SessionControl>,
     generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     design_state: Option<TaskDesignState>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::core::session_store::deserialize_task_state"
+    )]
+    task_state: Option<TaskState>,
     messages: Vec<serde_json::Value>,
 }
 
@@ -193,20 +438,98 @@ pub fn checkpoint_history_with_design(
     phase: RecoveryPhase,
     design: Option<&TaskDesignState>,
 ) -> Result<()> {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+    let task = crate::agent::todo::durable_snapshot();
+    checkpoint_history_with_state(history, pending_draft, phase, design, &task)
+}
+
+pub fn checkpoint_history_with_state(
+    history: &[Message],
+    pending_draft: Option<&str>,
+    phase: RecoveryPhase,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+) -> Result<()> {
+    let snapshot = PersistenceSnapshot::capture(task)?;
+    checkpoint_history_with_policy(
+        history,
+        pending_draft,
+        phase,
+        design,
+        task,
+        SaveControl::Snapshot(&snapshot),
+    )
+}
+
+/// Trusted ingress may persist while holding the control transition mutex; do not reenter it.
+#[cfg(test)]
+pub(crate) fn checkpoint_history_with_control(
+    history: &[Message],
+    pending_draft: Option<&str>,
+    phase: RecoveryPhase,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    control: &SessionControl,
+) -> Result<()> {
+    checkpoint_history_with_policy(
+        history,
+        pending_draft,
+        phase,
+        design,
+        task,
+        SaveControl::Explicit(control),
+    )
+}
+
+pub(crate) fn checkpoint_history_with_policy(
+    history: &[Message],
+    pending_draft: Option<&str>,
+    phase: RecoveryPhase,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    policy: SaveControl<'_>,
+) -> Result<()> {
+    policy.check(task)?;
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return Ok(());
     };
+    checkpoint_active(active, history, pending_draft, phase, design, task, policy)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_active(
+    active: &mut ActiveLease,
+    history: &[Message],
+    pending_draft: Option<&str>,
+    phase: RecoveryPhase,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    policy: SaveControl<'_>,
+) -> Result<()> {
     let old = active.manifest.clone();
-    let generation = old.sidecar_generation.saturating_add(1);
+    // Never turn an unreadable/future committed generation into an apparently normal checkpoint.
+    let existing_control = if old.sidecar_generation > 0 {
+        Some(read_authoritative_snapshot(&active.dir, &old)?.3)
+    } else {
+        None
+    };
+    let control = policy.resolve(existing_control.as_ref())?;
+    let generation = old
+        .sidecar_generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("recovery generation exhausted"))?;
     let hist_path = history_path(&active.dir, generation);
     let draft_path_new = draft_path(&active.dir, generation);
     let result = (|| -> Result<()> {
         let stored = HistoryGeneration {
+            version: 1,
+            session_control: Some(control.clone()),
             generation,
             design_state: design.cloned(),
+            task_state: Some(task.clone()),
             messages: crate::core::session_store::stored_history(history)?,
         };
+        policy.check(task)?;
         atomic_write_owner_only(&hist_path, &serde_json::to_vec(&stored)?)?;
         if let Some(draft) = pending_draft {
             atomic_write_owner_only(&draft_path_new, draft.as_bytes())?;
@@ -223,10 +546,12 @@ pub fn checkpoint_history_with_design(
         next.safe_history_len = history.len();
         next.sidecar_generation = generation;
         next.has_design_state = design.is_some();
+        next.has_task_state = true;
         if !old.effects_unsettled {
             next.turn_id = pending_draft.map(|_| generation).or(old.turn_id);
         }
         next.updated_unix = now_unix();
+        policy.check(task)?;
         write_manifest(&active.dir, &next)?;
         active.manifest = next;
         Ok(())
@@ -269,8 +594,8 @@ impl Drop for TurnBoundary {
 }
 
 fn record_turn_completion(settled: bool) {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return;
     };
     if !settled
@@ -283,6 +608,7 @@ fn record_turn_completion(settled: bool) {
     if settled && !active.manifest.effects_unsettled {
         active.manifest.side_effects_possible = false;
         active.manifest.checkpoint_id = None;
+        active.manifest.checkpoint_ref = None;
         active.manifest.turn_id = None;
     } else {
         active.manifest.effects_unsettled = true;
@@ -297,8 +623,8 @@ fn record_turn_completion(settled: bool) {
 }
 
 pub(crate) fn mark_effects_unsettled() {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return;
     };
     active.manifest.effects_unsettled = true;
@@ -308,8 +634,8 @@ pub(crate) fn mark_effects_unsettled() {
 }
 
 pub fn set_phase(phase: RecoveryPhase) {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return;
     };
     let old = active.manifest.clone();
@@ -327,8 +653,8 @@ pub fn set_phase(phase: RecoveryPhase) {
 }
 
 pub fn mark_side_effects_possible() {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return;
     };
     if active.manifest.side_effects_possible {
@@ -342,16 +668,25 @@ pub fn mark_side_effects_possible() {
     }
 }
 
-pub fn set_checkpoint(id: Option<u32>) {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+pub fn set_checkpoint(reference: Option<SnapshotRef>) {
+    // This API records evidence, never opens Git or upgrades persisted data into authority.
+    if reference
+        .as_ref()
+        .is_some_and(|value| value.validate().is_err())
+    {
+        return;
+    }
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return;
     };
     if active.manifest.effects_unsettled {
         return;
     }
     let old = active.manifest.clone();
-    active.manifest.checkpoint_id = id;
+    active.manifest.schema = SCHEMA;
+    active.manifest.checkpoint_id = None;
+    active.manifest.checkpoint_ref = reference;
     active.manifest.updated_unix = now_unix();
     if write_manifest(&active.dir, &active.manifest).is_err() {
         active.manifest = old;
@@ -359,8 +694,8 @@ pub fn set_checkpoint(id: Option<u32>) {
 }
 
 pub fn set_session_name(name: Option<String>) {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else {
+    let mut guard = scoped_active();
+    let Some(active) = guard.active_mut() else {
         return;
     };
     let old = active.manifest.clone();
@@ -374,6 +709,12 @@ pub fn set_session_name(name: Option<String>) {
 /// Clean exit retires only proven leases; uncertain effects remain available for inspection and keep
 /// their lease lock until this process actually exits.
 pub fn clear() {
+    // Navigation-retained generations are evidence, not cleanup candidates. Release only their
+    // proven-settled locks on clean exit; uncertain ones stay charged until process termination.
+    FOCUSED_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|lease| lease.manifest.effects_unsettled || lease.manifest.side_effects_possible);
     let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(active) = guard.as_mut() else {
         return;
@@ -406,8 +747,8 @@ const LEASE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Deliberately scope-BLIND, which is the whole point — the leak is precisely the leases this
 /// process would otherwise never look at. Safety comes from the lock plus the age check, not from
 /// scope: a directory is removed only if its lock can be taken exclusively (so no live process owns
-/// it) and it is older than [`LEASE_TTL_SECS`]. An unparseable manifest is dated by the directory's
-/// own mtime, so junk that can never become an offer still ages out instead of living forever.
+/// it) and it is older than [`LEASE_TTL_SECS`]. Unknown or unreadable manifests are retained;
+/// only directories without a manifest and already-consumed residue may age out by directory mtime.
 ///
 /// Best-effort throughout: sweeping is housekeeping and must never block or fail a REPL start.
 pub fn sweep_expired() {
@@ -433,17 +774,30 @@ pub fn sweep_expired() {
         let stamp = if residue {
             None
         } else {
-            fs::read_to_string(manifest_path(&path))
-                .ok()
-                .and_then(|raw| serde_json::from_str::<RecoveryManifest>(&raw).ok())
-                .map(|m| {
-                    if m.effects_unsettled || m.side_effects_possible {
-                        // Age is not reconciliation. Retain uncertain attribution/baseline pointers.
-                        now
-                    } else {
-                        m.updated_unix
+            match fs::read_to_string(manifest_path(&path)) {
+                Ok(raw) => {
+                    // A newer backend/schema or unreadable reference may still own recovery
+                    // evidence. Neither an old timestamp nor a parse failure authorizes deletion.
+                    let Ok(manifest) = serde_json::from_str::<RecoveryManifest>(&raw) else {
+                        continue;
+                    };
+                    if manifest.validate_checkpoint_schema().is_err()
+                        || (manifest.sidecar_generation > 0
+                            && read_authoritative_snapshot(&path, &manifest).is_err())
+                    {
+                        continue;
                     }
-                })
+                    Some(
+                        if manifest.effects_unsettled || manifest.side_effects_possible {
+                            now
+                        } else {
+                            manifest.updated_unix
+                        },
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            }
         };
         let age_ok = match stamp {
             Some(updated) => now.saturating_sub(updated) > LEASE_TTL_SECS,
@@ -507,15 +861,14 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
             continue;
         }
         let Ok(raw) = fs::read_to_string(manifest_path(&path)) else {
-            quarantine(&path);
+            // Preserve unreadable bytes for inspection rather than making them TTL residue.
             continue;
         };
         let Ok(manifest) = serde_json::from_str::<RecoveryManifest>(&raw) else {
-            quarantine(&path);
+            // A backend/schema this reader cannot understand is not disposable evidence.
             continue;
         };
-        if manifest.schema != SCHEMA {
-            quarantine(&path);
+        if manifest.validate_checkpoint_schema().is_err() {
             continue;
         }
         if manifest.repo_scope != repo_scope {
@@ -524,8 +877,9 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
         if manifest.sidecar_generation == 0 || manifest.safe_history_len == 0 {
             continue;
         }
-        let Ok((history, design_state)) = read_authoritative_snapshot(&path, &manifest) else {
-            quarantine(&path);
+        let Ok((history, design_state, _, _)) = read_authoritative_snapshot(&path, &manifest)
+        else {
+            // Unsupported policy/task generations are evidence, not quarantine/TTL residue.
             continue;
         };
         let pending_draft = fs::read_to_string(draft_path(&path, manifest.sidecar_generation))
@@ -543,19 +897,28 @@ pub fn scan_stale(repo_scope: &str) -> Vec<RecoveryOffer> {
     out
 }
 
-fn quarantine(path: &Path) {
-    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("bad");
-    let mut q = recovery_root().join(format!("quarantine-{stem}"));
-    if q.exists() {
-        q = recovery_root().join(format!("quarantine-{stem}-{}", now_unix()));
-    }
-    let _ = fs::rename(path, q);
-}
+pub type RecoveryState = (
+    Vec<Message>,
+    Option<String>,
+    Option<TaskDesignState>,
+    TaskState,
+    SessionControl,
+);
 
-/// Restore the authoritative conversation/design generation and consume the lease exactly once.
+/// Legacy acceptance may consume only a task-free conversation. Inspection can omit tasks; restore
+/// must never consume a lease and then silently throw away its execution state.
+#[cfg(test)]
 pub fn accept_with_design(
     offer: &RecoveryOffer,
 ) -> Result<(Vec<Message>, Option<String>, Option<TaskDesignState>)> {
+    accept_state_inner(offer, false).map(|(history, draft, design, _, _)| (history, draft, design))
+}
+
+pub fn accept_with_state(offer: &RecoveryOffer) -> Result<RecoveryState> {
+    accept_state_inner(offer, true)
+}
+
+fn accept_state_inner(offer: &RecoveryOffer, accepts_task: bool) -> Result<RecoveryState> {
     let lock = crate::core::repo_lock::RepoTxnLock::acquire_exclusive(
         &lock_path(&offer.path),
         Duration::from_secs(1),
@@ -569,12 +932,24 @@ pub fn accept_with_design(
     {
         anyhow::bail!("recovery offer changed before it could be consumed; rescan and retry");
     }
-    let (history, design) = read_authoritative_snapshot(&offer.path, &current)?;
+    let (history, design, task, control) = read_authoritative_snapshot(&offer.path, &current)?;
+    anyhow::ensure!(
+        accepts_task || (task == TaskState::default() && control == SessionControl::default()),
+        "recovery contains task/control state; restore with accept_with_state"
+    );
     let draft = fs::read_to_string(draft_path(&offer.path, current.sidecar_generation))
         .ok()
         .filter(|s| !s.trim().is_empty());
+    // Restoration refusal must leave the offer consumable and the transcript unchanged.
+    let control = if let Some(owner) = crate::agent::todo::bound_context() {
+        let context = owner.control();
+        context.restore(control)?;
+        context.snapshot()
+    } else {
+        control
+    };
     consume_dir(&offer.path, lock)?;
-    Ok((history, draft, design))
+    Ok((history, draft, design, task, control))
 }
 
 /// Discard one recovery offer exactly once.
@@ -597,7 +972,13 @@ pub fn discard(offer: &RecoveryOffer) -> Result<()> {
 fn read_authoritative_snapshot(
     path: &Path,
     manifest: &RecoveryManifest,
-) -> Result<(Vec<Message>, Option<TaskDesignState>)> {
+) -> Result<(
+    Vec<Message>,
+    Option<TaskDesignState>,
+    TaskState,
+    SessionControl,
+)> {
+    manifest.validate_checkpoint_schema()?;
     let bytes = crate::core::session_store::read_bounded(
         &history_path(path, manifest.sidecar_generation),
         128 * 1024 * 1024,
@@ -605,39 +986,56 @@ fn read_authoritative_snapshot(
     .map_err(|e| anyhow::anyhow!("recovery history unavailable: {e:?}"))?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).context("parsing recovery history")?;
-    let (mut history, design) = if value.is_array() {
+    let (mut history, design, task, control) = if value.is_array() {
         anyhow::ensure!(
-            !manifest.has_design_state,
-            "recovery generation lost its design state"
+            !manifest.has_design_state && !manifest.has_task_state,
+            "recovery generation lost its design/task state"
         );
         (
             crate::core::session_store::parse_stored_history(&bytes)?,
             None,
+            TaskState::default(),
+            SessionControl::default(),
         )
     } else {
-        let stored: HistoryGeneration = serde_json::from_value(value)?;
+        let stored: HistoryGeneration = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(stored.version <= 1, "unsupported recovery history version");
+        anyhow::ensure!(
+            stored.version == 0 || stored.session_control.is_some(),
+            "missing recovery session_control"
+        );
         anyhow::ensure!(
             stored.generation == manifest.sidecar_generation,
-            "recovery history/design generation mismatch"
+            "recovery history/design/task generation mismatch"
         );
         anyhow::ensure!(
             stored.design_state.is_some() == manifest.has_design_state,
             "recovery design state does not match commit record"
+        );
+        anyhow::ensure!(
+            stored.task_state.is_some() == manifest.has_task_state,
+            "recovery task state does not match commit record"
         );
         (
             crate::core::session_store::parse_stored_history(&serde_json::to_vec(
                 &stored.messages,
             )?)?,
             stored.design_state,
+            stored.task_state.unwrap_or_default(),
+            stored.session_control.unwrap_or_default(),
         )
     };
+    task.validate().context("invalid recovery task state")?;
+    control
+        .validate()
+        .context("invalid recovery session control")?;
     // Truncating a new envelope would pair history from one point with state from a later point.
     anyhow::ensure!(
         history.len() == manifest.safe_history_len,
         "recovery history is incomplete or mismatched"
     );
     history.truncate(manifest.safe_history_len);
-    Ok((history, design))
+    Ok((history, design, task, control))
 }
 
 fn consume_dir(path: &Path, lock: crate::core::repo_lock::RepoTxnLock) -> Result<()> {
@@ -664,8 +1062,8 @@ pub fn format_offer(offer: &RecoveryOffer) -> String {
         .unwrap_or_default();
     let ckpt = offer
         .manifest
-        .checkpoint_id
-        .map(|id| format!(" · checkpoint #{id}"))
+        .checkpoint_label()
+        .map(|label| format!(" · {label}"))
         .unwrap_or_default();
     let effects = if offer.manifest.effects_unsettled {
         " · effects unsettled; inspect before retry or recovery"
@@ -683,6 +1081,7 @@ pub fn format_offer(offer: &RecoveryOffer) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("recovery_control_tests.rs");
 
     fn manifest(scope: &str, generation: u64, len: usize) -> RecoveryManifest {
         RecoveryManifest {
@@ -696,12 +1095,37 @@ mod tests {
             session_name: None,
             safe_history_len: len,
             checkpoint_id: None,
+            checkpoint_ref: None,
             sidecar_generation: generation,
             has_design_state: false,
+            has_task_state: false,
             turn_id: Some(generation),
             side_effects_possible: false,
             effects_unsettled: false,
             updated_unix: 1,
+        }
+    }
+
+    fn reference(id: u32) -> SnapshotRef {
+        use crate::core::snapshots::SnapshotBinding;
+        let root = std::env::temp_dir().join("recovery-reference-fixture");
+        SnapshotRef::Legacy {
+            binding: SnapshotBinding {
+                repo_id: "repo-fixture".into(),
+                worktree_id: "worktree-fixture".into(),
+                canonical_git_dir: root.join(".git"),
+                canonical_common_git_dir: root.join(".git"),
+                canonical_root: root,
+            },
+            checkpoint_id: id,
+        }
+    }
+
+    fn git_reference(length: usize) -> SnapshotRef {
+        SnapshotRef::Git {
+            binding: reference(1).binding().clone(),
+            task_id: "task-fixture".into(),
+            commit: crate::core::snapshots::GitOid::parse(&"a".repeat(length)).unwrap(),
         }
     }
 
@@ -808,7 +1232,8 @@ mod tests {
         assert!(
             !raw.contains("base64") && !raw.contains("blob:") && !raw.contains("visual_assets")
         );
-        let (restored, _) = read_authoritative_snapshot(&fixture.dir, &manifest).unwrap();
+        let (restored, _, task, _) = read_authoritative_snapshot(&fixture.dir, &manifest).unwrap();
+        assert_eq!(task, TaskState::default());
         assert!(restored.iter().all(|m| m.images.is_empty()));
         assert!(restored
             .iter()
@@ -846,7 +1271,7 @@ mod tests {
             )
             .unwrap();
             let turn_id = fixture.stored().turn_id;
-            set_checkpoint(Some(12));
+            set_checkpoint(Some(reference(12)));
             mark_side_effects_possible();
             let mut boundary = TurnBoundary::new();
             let _outcome = crate::agent::tools::ToolOutcome::failed_with_effect_state(
@@ -858,7 +1283,7 @@ mod tests {
             let stored = fixture.stored();
             assert!(stored.effects_unsettled && stored.side_effects_possible);
             assert_eq!(stored.phase, RecoveryPhase::Finalizing);
-            assert_eq!(stored.checkpoint_id, Some(12));
+            assert_eq!(stored.checkpoint_ref, Some(reference(12)));
             assert_eq!(stored.turn_id, turn_id);
             assert_eq!(
                 read_authoritative_snapshot(&fixture.dir, &stored)
@@ -878,11 +1303,11 @@ mod tests {
             )
             .unwrap();
             TurnBoundary::new().complete(true);
-            set_checkpoint(Some(13));
+            set_checkpoint(Some(reference(13)));
             crate::core::session_store::autosave_last_with_design(&history, Some("fixture"), None);
             let mut stored = fixture.stored();
             assert!(stored.effects_unsettled && stored.side_effects_possible);
-            assert_eq!(stored.checkpoint_id, Some(12));
+            assert_eq!(stored.checkpoint_ref, Some(reference(12)));
             assert_eq!(stored.turn_id, turn_id);
             clear();
             assert!(
@@ -912,7 +1337,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         {
             let fixture = ActiveFixture::new();
-            set_checkpoint(Some(7));
+            set_checkpoint(Some(reference(7)));
             mark_side_effects_possible();
             drop(TurnBoundary::new());
             checkpoint_history_with_design(
@@ -923,11 +1348,11 @@ mod tests {
             )
             .unwrap();
             assert!(fixture.stored().effects_unsettled);
-            assert_eq!(fixture.stored().checkpoint_id, Some(7));
+            assert_eq!(fixture.stored().checkpoint_ref, Some(reference(7)));
         }
         {
             let fixture = ActiveFixture::new();
-            set_checkpoint(Some(8));
+            set_checkpoint(Some(reference(8)));
             mark_side_effects_possible();
             checkpoint_history_with_design(
                 &[Message::user("still running")],
@@ -952,8 +1377,154 @@ mod tests {
             assert_eq!(stored.phase, RecoveryPhase::Idle);
             assert!(!stored.effects_unsettled && !stored.side_effects_possible);
             assert!(stored.checkpoint_id.is_none());
+            assert!(stored.checkpoint_ref.is_none());
             clear();
             assert!(!manifest_path(&fixture.dir).exists());
+        }
+    }
+
+    #[test]
+    fn typed_checkpoint_write_preserves_full_provenance_and_has_no_numeric_alias() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = ActiveFixture::new();
+        for reference in [reference(12), git_reference(40), git_reference(64)] {
+            set_checkpoint(Some(reference.clone()));
+            let stored = fixture.stored();
+            assert_eq!(stored.schema, SCHEMA);
+            assert_eq!(stored.checkpoint_ref, Some(reference.clone()));
+            assert!(stored.checkpoint_id.is_none());
+            let raw: serde_json::Value =
+                serde_json::from_slice(&fs::read(manifest_path(&fixture.dir)).unwrap()).unwrap();
+            assert!(raw.get("checkpoint_id").is_none());
+            assert_eq!(stored.checkpoint_label(), Some(reference.display_label()));
+        }
+        set_checkpoint(None);
+        assert!(fixture.stored().checkpoint_ref.is_none());
+    }
+
+    #[test]
+    fn typed_git_checkpoint_survives_unsettled_turn_and_clear_attempts() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = ActiveFixture::new();
+        let reference = git_reference(64);
+        set_checkpoint(Some(reference.clone()));
+        mark_side_effects_possible();
+        TurnBoundary::new().complete(false);
+        set_checkpoint(None);
+        set_checkpoint(Some(git_reference(40)));
+        TurnBoundary::new().complete(true);
+        clear();
+        let stored = fixture.stored();
+        assert!(stored.effects_unsettled && stored.side_effects_possible);
+        assert_eq!(stored.checkpoint_ref, Some(reference));
+    }
+
+    #[test]
+    fn schema_two_numeric_checkpoint_is_read_without_fabricated_binding() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let mut legacy = manifest("legacy-scope", 1, 1);
+        legacy.schema = LEGACY_SCHEMA;
+        legacy.checkpoint_id = Some(42);
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        json.as_object_mut().unwrap().remove("checkpoint_ref");
+        let decoded: RecoveryManifest = serde_json::from_value(json).unwrap();
+        decoded.validate_checkpoint_schema().unwrap();
+        assert_eq!(decoded.checkpoint_id, Some(42));
+        assert!(decoded.checkpoint_ref.is_none());
+        assert_eq!(
+            decoded.checkpoint_label().as_deref(),
+            Some("legacy checkpoint #42")
+        );
+        atomic_write_owner_only(
+            &history_path(fixture.path(), 1),
+            &serde_json::to_vec(&vec![
+                serde_json::to_value(Message::user("old history")).unwrap()
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let (history, _, _, _) = read_authoritative_snapshot(fixture.path(), &decoded).unwrap();
+        assert_eq!(history[0].content.as_deref(), Some("old history"));
+    }
+
+    #[test]
+    fn mixed_future_and_unbound_recovery_checkpoint_schemas_are_rejected() {
+        let mut stored = manifest("scope", 1, 0);
+        stored.checkpoint_id = Some(1);
+        assert!(stored.validate_checkpoint_schema().is_err());
+        stored.checkpoint_ref = Some(reference(1));
+        assert!(stored.validate_checkpoint_schema().is_err());
+        stored.schema = LEGACY_SCHEMA;
+        assert!(stored.validate_checkpoint_schema().is_err());
+        stored.checkpoint_id = None;
+        stored.schema = SCHEMA + 1;
+        assert!(stored.validate_checkpoint_schema().is_err());
+        stored.schema = SCHEMA;
+        stored.checkpoint_ref = Some(reference(0));
+        assert!(stored.validate_checkpoint_schema().is_err());
+    }
+
+    #[test]
+    fn scan_and_accept_read_both_checkpoint_schemas_without_rewriting_identity() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for typed in [false, true] {
+            let fixture = ActiveFixture::new();
+            checkpoint_history_with_design(
+                &[Message::user("saved conversation")],
+                Some("draft"),
+                RecoveryPhase::WaitingModel,
+                None,
+            )
+            .unwrap();
+            let mut stored = fixture.stored();
+            if typed {
+                stored.checkpoint_ref = Some(git_reference(64));
+            } else {
+                stored.schema = LEGACY_SCHEMA;
+                stored.checkpoint_id = Some(21);
+            }
+            fixture.exit_process();
+            write_manifest(&fixture.dir, &stored).unwrap();
+            let bytes = fs::read(manifest_path(&fixture.dir)).unwrap();
+            let offers = scan_stale("owned-scope");
+            assert_eq!(offers.len(), 1);
+            assert_eq!(offers[0].manifest.checkpoint_ref, stored.checkpoint_ref);
+            assert_eq!(offers[0].manifest.checkpoint_id, stored.checkpoint_id);
+            assert_eq!(fs::read(manifest_path(&fixture.dir)).unwrap(), bytes);
+            let (history, draft, _, _, _) = accept_with_state(&offers[0]).unwrap();
+            assert_eq!(history[0].content.as_deref(), Some("saved conversation"));
+            assert_eq!(draft.as_deref(), Some("draft"));
+        }
+    }
+
+    #[test]
+    fn future_or_unreadable_checkpoint_evidence_is_not_swept_or_quarantined() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = ActiveFixture::new();
+        fixture.exit_process();
+        let mut future = manifest("owned-scope", 1, 1);
+        future.schema = SCHEMA + 1;
+        future.updated_unix = 1;
+        let mut unknown_backend = serde_json::to_value(&future).unwrap();
+        unknown_backend["schema"] = serde_json::json!(SCHEMA);
+        unknown_backend["checkpoint_ref"] = serde_json::json!({"backend":"future"});
+        for raw in [
+            serde_json::to_vec(&future).unwrap(),
+            serde_json::to_vec(&unknown_backend).unwrap(),
+            b"{truncated".to_vec(),
+        ] {
+            atomic_write_owner_only(&manifest_path(&fixture.dir), &raw).unwrap();
+            assert!(scan_stale("owned-scope").is_empty());
+            sweep_expired();
+            assert_eq!(fs::read(manifest_path(&fixture.dir)).unwrap(), raw);
         }
     }
 
@@ -978,8 +1549,11 @@ mod tests {
         )
         .snapshot();
         let stored = HistoryGeneration {
+            version: 0,
+            session_control: None,
             generation: 7,
             design_state: Some(state),
+            task_state: None,
             messages: vec![serde_json::to_value(Message::user("same-generation")).unwrap()],
         };
         atomic_write_owner_only(
@@ -989,7 +1563,8 @@ mod tests {
         .unwrap();
         let mut manifest = manifest("workspace", 7, 1);
         manifest.has_design_state = true;
-        let (history, design) = read_authoritative_snapshot(&dir, &manifest).unwrap();
+        let (history, design, task, _) = read_authoritative_snapshot(&dir, &manifest).unwrap();
+        assert_eq!(task, TaskState::default());
         assert_eq!(history[0].content.as_deref(), Some("same-generation"));
         assert_eq!(design.unwrap().owner_id, "owner");
         manifest.has_design_state = false;
@@ -1015,6 +1590,139 @@ mod tests {
             .1
             .is_none());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_task_checkpoint_is_coherent_and_legacy_accept_cannot_discard_it() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = ActiveFixture::new();
+        let context = crate::agent::todo::TaskContext::private();
+        context
+            .replace(vec![crate::agent::todo::Todo::new(
+                "resume owned checklist",
+                crate::agent::todo::Status::InProgress,
+            )])
+            .unwrap();
+        let history = vec![Message::user("owned request")];
+        checkpoint_history_with_state(
+            &history,
+            Some("continue"),
+            RecoveryPhase::WaitingModel,
+            None,
+            &context.snapshot(),
+        )
+        .unwrap();
+        let first_generation = fixture.stored().sidecar_generation;
+        context.end_turn(true);
+        let task = context.snapshot();
+        checkpoint_history_with_state(
+            &history,
+            Some("continue"),
+            RecoveryPhase::WaitingModel,
+            None,
+            &task,
+        )
+        .unwrap();
+        let manifest = fixture.stored();
+        assert!(manifest.has_task_state);
+        assert!(manifest.sidecar_generation > first_generation);
+        let snapshot = read_authoritative_snapshot(&fixture.dir, &manifest).unwrap();
+        assert_eq!(snapshot.0.len(), history.len());
+        assert_eq!(snapshot.2, task);
+        let before = fs::read(manifest_path(&fixture.dir)).unwrap();
+        let mut future = task.clone();
+        future.version = 999;
+        assert!(
+            checkpoint_history_with_state(&history, None, RecoveryPhase::Idle, None, &future)
+                .is_err()
+        );
+        assert_eq!(fs::read(manifest_path(&fixture.dir)).unwrap(), before);
+        assert_eq!(
+            read_authoritative_snapshot(&fixture.dir, &manifest)
+                .unwrap()
+                .2,
+            task
+        );
+        fixture.exit_process();
+        let offers = scan_stale("owned-scope");
+        assert_eq!(offers.len(), 1);
+        assert!(accept_with_design(&offers[0]).is_err());
+        assert!(
+            manifest_path(&fixture.dir).is_file(),
+            "legacy rejection must not consume the lease"
+        );
+        let (restored, draft, _, restored_task, _) = accept_with_state(&offers[0]).unwrap();
+        assert_eq!(restored[0].content.as_deref(), Some("owned request"));
+        assert_eq!(draft.as_deref(), Some("continue"));
+        assert_eq!(restored_task, task);
+        assert!(accept_with_state(&offers[0]).is_err());
+    }
+
+    #[test]
+    fn recovery_rejects_missing_invalid_and_mismatched_task_generation() {
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let mut manifest = manifest("tasks", 3, 1);
+        manifest.has_task_state = true;
+        let valid = serde_json::json!({
+            "generation": 3,
+            "task_state": TaskState::default(),
+            "messages": [Message::user("task generation")],
+        });
+        atomic_write_owner_only(
+            &history_path(dir.path(), 3),
+            &serde_json::to_vec(&valid).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_authoritative_snapshot(dir.path(), &manifest)
+                .unwrap()
+                .2,
+            TaskState::default()
+        );
+        for kind in ["missing", "null", "future", "generation"] {
+            let mut invalid = valid.clone();
+            match kind {
+                "missing" => {
+                    invalid.as_object_mut().unwrap().remove("task_state");
+                }
+                "null" => invalid["task_state"] = serde_json::Value::Null,
+                "future" => invalid["task_state"]["version"] = serde_json::json!(999),
+                "generation" => invalid["generation"] = serde_json::json!(2),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&invalid).unwrap();
+            atomic_write_owner_only(&history_path(dir.path(), 3), &bytes).unwrap();
+            assert!(
+                read_authoritative_snapshot(dir.path(), &manifest).is_err(),
+                "accepted {kind}"
+            );
+            assert_eq!(fs::read(history_path(dir.path(), 3)).unwrap(), bytes);
+        }
+        manifest.has_task_state = false;
+        atomic_write_owner_only(
+            &history_path(dir.path(), 3),
+            &serde_json::to_vec(&valid).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            read_authoritative_snapshot(dir.path(), &manifest).is_err(),
+            "state presence must match manifest"
+        );
+        let mut legacy = valid;
+        legacy.as_object_mut().unwrap().remove("task_state");
+        atomic_write_owner_only(
+            &history_path(dir.path(), 3),
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_authoritative_snapshot(dir.path(), &manifest)
+                .unwrap()
+                .2,
+            TaskState::default()
+        );
     }
 
     #[test]
@@ -1182,6 +1890,12 @@ mod tests {
         let mut m = manifest("some-other-repo", 3, 2);
         m.updated_unix = old_stamp;
         write_manifest(&foreign, &m).unwrap();
+        // Expired valid history is collectible; missing/corrupt policy sidecars are not.
+        atomic_write_owner_only(
+            &history_path(&foreign, 3),
+            &serde_json::to_vec(&vec![Message::user("old"), Message::assistant("done")]).unwrap(),
+        )
+        .unwrap();
 
         // A fresh lease in the same scope — must be left alone.
         let fresh = recovery_root().join("fresh-here");

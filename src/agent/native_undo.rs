@@ -217,6 +217,7 @@ impl Tool for NativeOwnerUndo {
         for resource in &frozen.resources {
             resource.verify()?;
         }
+        let _inverse = frozen.parent.recovery().begin_inverse()?;
         let mut rows = Vec::with_capacity(frozen.resources.len());
         let mut settled_total = 0usize;
         for (index, resource) in frozen.resources.iter().enumerate() {
@@ -513,7 +514,7 @@ mod tests {
             .unwrap();
         let requests = match prepared.footprint.as_ref().unwrap() {
             PreparedFootprint::Native(resources) => resources,
-            PreparedFootprint::Global | PreparedFootprint::Overlay { .. } => {
+            PreparedFootprint::Global => {
                 panic!("exact live resources required")
             }
         };

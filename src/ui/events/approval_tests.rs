@@ -65,6 +65,11 @@ fn approval_stdio_helper() -> anyhow::Result<()> {
     enable(true);
     note_stdin_piped(scenario != "console_cancel");
     start_stdin_reader();
+    if scenario.starts_with("migration_") {
+        migration_stdio_scenario(&root, &scenario)?;
+        write_line(&json!({"type":"fixture_done"}).to_string());
+        return Ok(());
+    }
     if matches!(scenario.as_str(), "identical_deny" | "identical_allow") {
         let worker = |label: &'static str, abandon| {
             let root = root.clone();
@@ -167,6 +172,165 @@ fn approval_stdio_helper() -> anyhow::Result<()> {
         );
     }
     write_line(&json!({"type":"fixture_done"}).to_string());
+    Ok(())
+}
+
+const MIGRATION_PROSE: &str =
+    "# Legacy notes\r\n\r\n- [x] prose is not a Check\r\nKeep trailing spaces  ";
+const MIGRATION_EDIT: &str = "# Editor changed this while approval was pending\n";
+
+// Called only by the owned helper process; never mutate approval globals in the test parent.
+fn migration_stdio_scenario(root: &Path, scenario: &str) -> anyhow::Result<()> {
+    let standing = matches!(scenario, "migration_grants" | "migration_yolo");
+    if standing {
+        ALLOW_ALL.store(true, Ordering::Relaxed);
+        crate::core::approval::grant_session("file_write", None);
+        assert!(crate::core::approval::granted("file_write", None).is_some());
+    }
+    let cases: &[(&str, bool)] = match scenario {
+        "migration_once" => &[("approved", true), ("later", false)],
+        "migration_grants" => &[("denied", false), ("approved", true)],
+        "migration_cas" => &[("changed", false)],
+        "migration_yolo" => &[("yolo", false)],
+        _ => anyhow::bail!("unknown migration fixture scenario"),
+    };
+    for &(label, expected) in cases {
+        migration_attempt(root, label, expected)?;
+        assert_eq!(
+            allow_all(),
+            standing,
+            "one-time reply must not widen or clear session authority"
+        );
+        assert_eq!(
+            crate::core::approval::session_grants().len(),
+            usize::from(standing)
+        );
+        assert!(lock().waiting().is_empty());
+    }
+    Ok(())
+}
+
+fn migration_attempt(root: &Path, label: &str, expected: bool) -> anyhow::Result<()> {
+    use crate::agent::{planning_write, todo};
+    use crate::core::exec_ctx::ExecutionContext;
+    use crate::core::native_journal::{inspect_existing_records, RecordClaim, RecordProofStatus};
+    use crate::core::persist::FileFingerprint;
+    use crate::core::session_control::ExecutionMode;
+    use crate::core::workspace_txn::NativeResource;
+
+    std::fs::create_dir_all(root.join("docs/plans"))?;
+    let relative = format!("docs/plans/{label}.md");
+    let path = root.join(&relative);
+    crate::core::persist::atomic_write(&path, MIGRATION_PROSE.as_bytes())?;
+    let migration = planning_write::LegacyMigration::read(root, Some(&relative), None)?;
+    let task = todo::TaskContext::private();
+    let control = task.control();
+    control.transition(
+        ExecutionMode::Planning,
+        Some(migration.target().clone()),
+        |_| Ok(()),
+    )?;
+    task.replace_with_requirements(
+        vec![todo::Todo::new(
+            "existing implementation",
+            todo::Status::Pending,
+        )],
+        vec![(
+            "@index:0".into(),
+            todo::Requirement::Check {
+                command: "cargo check".into(),
+                root: "workspace".into(),
+                source_identity: None,
+            },
+        )],
+    )?;
+    let ctx = ExecutionContext::default()
+        .with_task(task.clone())
+        .with_dispatch_label(Some(label.to_owned()))
+        .with_deadline(Some(Instant::now() + Duration::from_secs(15)))
+        .with_placement(crate::core::file_placement::PlacementContext::with_paths(
+            root.to_path_buf(),
+            root.join("home"),
+            root.join("process"),
+            "migration-fixture",
+        )?)
+        .with_native_scope(crate::core::native_scope::NativeWriteScope::resolve(
+            root,
+            std::slice::from_ref(&relative),
+        )?)?;
+    ctx.note_task_effects_at(Some(root));
+    let before = task.snapshot();
+    assert!(!before.obligations.is_empty());
+    let prepared = planning_write::prepare_migration(&migration, &ctx)?;
+    let approved_bytes = prepared.args["content"]
+        .as_str()
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let proof = planning_write::proof(&prepared).unwrap().clone();
+    let owner = ctx.resource_scope();
+    let result = if label == "yolo" {
+        // Production bridge pins Ask; separately exercise its real gate under a Yolo config.
+        let allowed = crate::agent::migration_yolo_approval_fixture(&prepared, ctx)?;
+        anyhow::ensure!(!allowed, "Yolo bypassed explicit migration denial");
+        Err(anyhow::anyhow!("fixture observed explicit denial"))
+    } else {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        runtime.block_on(crate::agent::execute_human_plan_migration(prepared, ctx))
+    };
+    assert_eq!(result.is_ok(), expected, "{label}: {result:?}");
+    let after = task.snapshot();
+    assert_eq!(after.items, before.items);
+    assert_eq!(after.requirements, before.requirements);
+    assert_eq!(after.obligations, before.obligations);
+    assert_eq!(after.checks, before.checks);
+    assert!(!task.is_complete());
+    assert!(control.snapshot().is_planning());
+    assert_eq!(
+        control.snapshot().plan_target.as_ref(),
+        Some(migration.target())
+    );
+    let resource = NativeResource::resolve(&path)?;
+    let journal = inspect_existing_records(&[RecordClaim {
+        // Each child owns a fresh HOME; only the one approved migration can create record 1.
+        id: 1,
+        expected_owner: &owner,
+        resource: &resource,
+        before: &FileFingerprint::for_bytes(MIGRATION_PROSE.as_bytes()),
+        after: &FileFingerprint::for_bytes(&approved_bytes),
+    }]);
+    if expected {
+        assert!(proof.successful_write());
+        assert_eq!(std::fs::read(&path)?, approved_bytes);
+        assert!(approved_bytes.ends_with(MIGRATION_PROSE.as_bytes()));
+        assert_eq!(after.effect_epoch, before.effect_epoch + 1);
+        let attachment = todo::PlanAttachment::load(root, &relative)?;
+        assert!(attachment.live);
+        assert_eq!(after.plan.as_ref(), Some(&attachment));
+        let records = journal?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, RecordProofStatus::SettledApplied);
+    } else {
+        assert!(!proof.successful_write());
+        assert_eq!(after.effect_epoch, before.effect_epoch);
+        assert!(after.plan.is_none());
+        assert!(
+            journal.is_err(),
+            "refusal/CAS failure cannot journal an applied write"
+        );
+        let expected_bytes = if label == "changed" {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("changed"), "{error:#}");
+            MIGRATION_EDIT.as_bytes()
+        } else {
+            MIGRATION_PROSE.as_bytes()
+        };
+        assert_eq!(std::fs::read(&path)?, expected_bytes);
+    }
+    report(label, expected);
     Ok(())
 }
 
@@ -328,6 +492,96 @@ pub(crate) fn verify_tui_grants() -> anyhow::Result<()> {
         );
         Ok(())
     })
+}
+
+fn drive_migration(scenario: &str, expected: &[(&str, bool)]) -> anyhow::Result<()> {
+    fixture(scenario, |driver, root| {
+        let root = root.canonicalize()?;
+        let mut requests = HashMap::new();
+        let mut outcomes = HashMap::new();
+        loop {
+            let record = driver.next()?;
+            match record["type"].as_str() {
+                Some("control_request") => {
+                    let request = &record["request"];
+                    assert_eq!(request["tool_name"], "file_write");
+                    let label = request["agent_id"].as_str().unwrap();
+                    assert!(expected.iter().any(|(name, _)| name == &label));
+                    let id = record["request_id"].as_str().unwrap();
+                    assert!(requests.insert(label.to_owned(), id.to_owned()).is_none());
+                    let path = root.join(format!("docs/plans/{label}.md"));
+                    assert_eq!(Path::new(request["input"]["path"].as_str().unwrap()), path);
+                    assert_eq!(std::fs::read(&path)?, MIGRATION_PROSE.as_bytes());
+                    let content = request["input"]["content"].as_str().unwrap();
+                    assert!(content.ends_with(MIGRATION_PROSE));
+                    assert!(content.starts_with("---\naizen_plan: 1\nid: p-"));
+                    assert!(request["preview"]["diff"]
+                        .as_str()
+                        .unwrap()
+                        .contains("aizen:phase legacy"));
+                    assert!(request["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Migrate this exact legacy document once"));
+                    if label == "changed" {
+                        crate::core::persist::atomic_write(&path, MIGRATION_EDIT.as_bytes())?;
+                    }
+                    // A requested permanent grant must remain invocation-only for migrations.
+                    let behavior = if matches!(label, "approved" | "changed") {
+                        "allow"
+                    } else {
+                        "deny"
+                    };
+                    driver.reply(id, behavior, true)?;
+                }
+                Some("fixture_approval_result") => {
+                    let label = record["name"].as_str().unwrap().to_owned();
+                    assert!(outcomes
+                        .insert(label, record["allowed"].as_bool().unwrap())
+                        .is_none());
+                }
+                Some("fixture_done") => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            requests.len(),
+            expected.len(),
+            "standing approval cannot suppress a migration prompt"
+        );
+        assert_eq!(outcomes.len(), expected.len());
+        assert_eq!(
+            requests
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            expected.len()
+        );
+        for &(label, success) in expected {
+            assert_eq!(outcomes[label], success);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn real_plan_migration_approval_is_one_time_despite_widening_reply() -> anyhow::Result<()> {
+    drive_migration("migration_once", &[("approved", true), ("later", false)])
+}
+
+#[test]
+fn real_plan_migration_requires_approval_despite_standing_grants() -> anyhow::Result<()> {
+    drive_migration("migration_grants", &[("denied", false), ("approved", true)])
+}
+
+#[test]
+fn real_plan_migration_approval_time_cas_preserves_editor_bytes() -> anyhow::Result<()> {
+    drive_migration("migration_cas", &[("changed", false)])
+}
+
+#[test]
+fn real_plan_migration_gate_cannot_inherit_yolo() -> anyhow::Result<()> {
+    drive_migration("migration_yolo", &[("yolo", false)])
 }
 
 #[test]

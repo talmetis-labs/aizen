@@ -113,6 +113,30 @@ pub(crate) fn clean_content(message: &Message) -> Option<&str> {
         .or(message.content.as_deref())
 }
 
+/// Only a verified host receipt for this exact turn can attest that recall reached the model.
+/// A matching phrase, a copied receipt, or a different turn's prefix is not rendered evidence.
+pub(crate) fn has_bound_prefix(
+    message: &Message,
+    prefix: &str,
+    provider: &str,
+    generation: u64,
+    session: &str,
+    turn: &str,
+) -> bool {
+    message.memory_scaffold.as_ref().is_some_and(|receipt| {
+        receipt.provider == provider
+            && receipt.generation == generation
+            && receipt.session == session
+            && receipt.turn == turn
+            && receipt.prefix_bytes == prefix.len()
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.starts_with(prefix))
+            && verified_content(message, receipt).is_some()
+    })
+}
+
 pub(crate) fn strip_message(message: &mut Message) {
     if let Some(clean) =
         clean_content(message).filter(|clean| Some(*clean) != message.content.as_deref())

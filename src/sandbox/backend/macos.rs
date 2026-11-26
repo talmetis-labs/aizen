@@ -112,6 +112,8 @@ mod tests {
         let fs = FsPolicy {
             read_write: vec!["/ws/proj".into(), "/tmp/aizen-sbx-1".into()],
             read_only: vec![],
+            #[cfg(target_os = "linux")]
+            remove_worktree_parent: None,
             exec_files: vec![],
             deny: vec!["/Users/u/.ssh".into(), "/Users/u/.aws".into()],
         };

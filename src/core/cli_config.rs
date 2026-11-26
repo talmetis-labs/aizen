@@ -117,12 +117,8 @@ pub struct CliConfig {
     /// turns it off without a config edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architect_mode: Option<bool>,
-    /// Keep the rarely-used built-in tools (workflow, checkpoint, the memory and skill write
-    /// surface, …) off the request and behind `tool_search`. `None` ⇒ on for first-party APIs
-    /// (api.anthropic.com, api.openai.com) and off elsewhere: some hosted gateways grammar-lock
-    /// tool-call names to the advertised set, and there a deferred tool can never be called (see
-    /// REFERENCE, "Tool Search"). `Some(true)` turns it on for a gateway you have checked;
-    /// `Some(false)` turns it off everywhere.
+    /// Defer rarely used built-ins until discovery advertises their schemas.
+    /// Enabled by default for agent endpoints. Explicit false keeps the full surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lean_tools: Option<bool>,
     /// Auto-detect reasoning effort per-turn (keyword + complexity — see `core::effort`). `None` ⇒
@@ -260,22 +256,6 @@ pub struct CliConfig {
     /// also disables it without editing this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
-    /// Max time-machine checkpoints retained (oldest auto-pruned past this on each save, never the
-    /// active one). `None` ⇒ default 50. `Some(0)` ⇒ unlimited (keep everything).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timemachine_keep: Option<usize>,
-    /// How many low-value SAFETY-NET checkpoints (`before agent edits`, one per agent run) to retain,
-    /// independent of `timemachine_keep`. Retention drops the oldest safety-nets past this floor before
-    /// it ever touches a descriptive `phase: …` milestone, so `aizen time list` stays readable.
-    /// `None` ⇒ default 5.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timemachine_keep_safety: Option<usize>,
-    /// Maximum files in one Time Machine snapshot. `None` ⇒ 100,000.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timemachine_max_files: Option<u64>,
-    /// Maximum aggregate Git blob bytes in one snapshot. `None` ⇒ 2 GiB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timemachine_max_bytes: Option<u64>,
     /// Saved conversations kept in the pool, newest first; the oldest beyond this are removed at
     /// autosave — never the one being written. `None` ⇒ 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,9 +264,6 @@ pub struct CliConfig {
     /// the oldest conversations go first when it is over. `None` ⇒ 256 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions_max_bytes: Option<u64>,
-    /// Maximum size of one file/blob in a snapshot. `None` ⇒ 512 MiB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timemachine_max_file_bytes: Option<u64>,
     /// Discord two-way bot (the `aizen discord serve` gateway daemon). Distinct from the one-way Discord
     /// webhook under [`NotifyConfig`] — this is a full bot that receives messages and replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1398,38 +1375,9 @@ pub fn effort_override() -> Option<Option<String>> {
         .clone()
 }
 
-/// The host of an endpoint URL (scheme, userinfo, port and path stripped), lowercase.
-fn endpoint_host(base_url: &str) -> String {
-    let after_scheme = base_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
-    after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit('@')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-/// A first-party model API, where a tool whose name is not in the request's `tools` array can
-/// still be called — the property built-in tool deferral needs.
-pub fn is_first_party_api(base_url: &str) -> bool {
-    matches!(
-        endpoint_host(base_url).as_str(),
-        "api.anthropic.com" | "api.openai.com"
-    )
-}
-
-/// Whether built-in tool deferral applies for `base_url` under `cfg` (see `CliConfig::lean_tools`).
+/// An empty endpoint is used by prompt-size and catalog inspection to request the full inventory.
 pub fn lean_tools_enabled_in(cfg: &CliConfig, base_url: &str) -> bool {
-    cfg.lean_tools
-        .unwrap_or_else(|| is_first_party_api(base_url))
+    cfg.lean_tools.unwrap_or(!base_url.is_empty())
 }
 
 pub fn lean_tools_enabled(base_url: &str) -> bool {
@@ -1820,6 +1768,28 @@ pub fn mask(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obsolete_checkpoint_settings_do_not_change_session_retention() {
+        let cfg: CliConfig = serde_json::from_value(serde_json::json!({
+            "timemachine_keep": 0,
+            "timemachine_keep_safety": 5,
+            "timemachine_max_files": 100,
+            "timemachine_max_bytes": 4096,
+            "timemachine_max_file_bytes": 512,
+            "sessions_keep": 75,
+            "sessions_max_bytes": 8192
+        }))
+        .unwrap();
+        assert_eq!(cfg.sessions_keep, Some(75));
+        assert_eq!(cfg.sessions_max_bytes, Some(8192));
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert!(!serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|key| key.starts_with("timemachine_")));
+    }
 
     #[test]
     fn memory_plugin_config_status_is_read_only_and_rejects_duplicate_or_corrupt_json() {
@@ -3122,15 +3092,15 @@ mod effort_routing_tests {
     }
 
     #[test]
-    fn lean_tools_is_on_for_first_party_apis_and_configurable_elsewhere() {
+    fn lean_tools_defaults_on_for_agent_endpoints_and_honors_overrides() {
         let cfg = CliConfig::default();
         assert!(lean_tools_enabled_in(&cfg, "https://api.anthropic.com/v1"));
         assert!(lean_tools_enabled_in(
             &cfg,
             "https://user@API.OpenAI.com:443/v1/"
         ));
-        assert!(!lean_tools_enabled_in(&cfg, "https://openrouter.ai/api/v1"));
-        assert!(!lean_tools_enabled_in(&cfg, "http://localhost:8080/v1"));
+        assert!(lean_tools_enabled_in(&cfg, "https://openrouter.ai/api/v1"));
+        assert!(lean_tools_enabled_in(&cfg, "http://localhost:8080/v1"));
         assert!(!lean_tools_enabled_in(&cfg, ""));
         let on = CliConfig {
             lean_tools: Some(true),
