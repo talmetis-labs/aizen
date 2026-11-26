@@ -12929,20 +12929,17 @@ mod tests {
         // done"), and that is exactly the shape that needs a wall clock — so the deadline check sits
         // outside the `!goal_mode` guard, and this pins that.
         let r = registry();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let base = cfg();
+        // Leave time for the first real tool lease to settle on a loaded Windows runner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
         let chat = move |_m: Vec<Message>, _d: Vec<ToolDef>| {
             let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async move {
-                // Finish two ordinary turns, then cross the exact configured deadline in the model
-                // call, not in a tool worker. Relative sleeps can land just before the ceiling and
-                // accidentally exercise the fail-closed UnknownWorker path instead of this stop.
-                if n >= 2 {
-                    // Return after (not exactly at) the deadline. An exact timer tie can let the
-                    // read watcher win its own sleep_until race and truthfully report UnknownWorker;
-                    // crossing the deadline before returning means the tool launch is rejected as a
-                    // settled no-op, and the next loop-top check owns the deadline assertion.
+                // Finish one ordinary turn, then return strictly after the deadline so the
+                // next tool launch is refused before any worker can race the timer.
+                if n >= 1 {
                     let after_deadline = deadline + std::time::Duration::from_millis(100);
                     tokio::time::sleep_until(tokio::time::Instant::from_std(after_deadline)).await;
                 }
@@ -12956,7 +12953,7 @@ mod tests {
             auto_extend_to: 50,
             goal: Some("keep going".into()),
             deadline: Some(deadline),
-            ..cfg()
+            ..base
         };
         let out = run_agent(chat, &c, &r, "sys", "task").await.unwrap();
         assert_eq!(

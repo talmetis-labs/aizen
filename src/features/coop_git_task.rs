@@ -554,6 +554,18 @@ impl GitTaskRegistration {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_task_description_for_test(&self, description: String) -> Result<()> {
+        let mut state = self
+            .manifest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task registration poisoned"))?;
+        self.verify_locked(&state)?;
+        let mut manifest = state.0.clone();
+        manifest.task = description;
+        self.save_locked(&mut state, manifest)
+    }
+
+    #[cfg(test)]
     pub(crate) fn check_reserved_native_paths_for_test(&self, paths: &[String]) -> Result<()> {
         self.manifest
             .lock()

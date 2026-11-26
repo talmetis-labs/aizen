@@ -26,8 +26,9 @@ jobs:
         # macOS is here for the sandbox backend (Seatbelt) as much as for the build: the sandbox
         # test suite exercises Landlock/seccomp on Linux and sandbox-exec on macOS — platforms the
         # maintainer's Windows machine cannot runtime-verify.
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
+        os: [ubuntu-latest, macos-latest]
+        suite: [all]
+    steps: &build_and_test
       - uses: actions/checkout@v4
 
       - name: Show toolchain
@@ -40,7 +41,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ matrix.suite }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build
@@ -48,12 +49,48 @@ jobs:
 
       - name: Test
         timeout-minutes: 40
+        if: matrix.suite == 'all'
         run: cargo test --bin aizen
+
+      - name: Test Git operations
+        timeout-minutes: 40
+        if: matrix.suite == 'git'
+        run: |
+          cargo test --bin aizen -- core::git_ops::
+
+      - name: Test other modules
+        timeout-minutes: 40
+        if: matrix.suite == 'other'
+        run: |
+          cargo test --bin aizen -- --skip core::git_ops::
 
       # What the sandbox can actually enforce on THIS runner, in the job log — the per-platform
       # capability matrix in docs/SANDBOX.md is checked against these outputs at release time.
       - name: Sandbox capability probe
+        if: matrix.suite != 'git'
         run: cargo run --bin aizen -- sandbox doctor --json
+
+  windows_tests:
+    # Run the process-heavy Git suite on its own runner and keep the existing required check.
+    name: Windows tests (${{ matrix.suite }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+        suite: [git, other]
+    steps: *build_and_test
+
+  windows_test_result:
+    name: build + test (windows-latest)
+    needs: windows_tests
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both Windows test jobs to pass
+        env:
+          WINDOWS_TEST_RESULT: ${{ needs.windows_tests.result }}
+        run: test "$WINDOWS_TEST_RESULT" = success
 
   bench:
     name: loop + task suite (${{ matrix.os }})

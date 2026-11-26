@@ -453,17 +453,14 @@ fn registry_rejects_v2_missing_or_inconsistent_terminal_evidence_even_after_owne
 #[test]
 fn terminal_capacity_is_checked_before_admission_and_before_any_worker_intent() -> Result<()> {
     registry_fixture(|f, registration| {
-        let prefix = format!("{}/", "segment".repeat(10)).repeat(30);
-        // NativeResource intentionally requires an existing, witnessed parent directory.
-        // Only this disposable fixture owns the deep tree; no production path is created.
-        std::fs::create_dir_all(f.identity.canonical_root.join(&prefix))?;
-        let writes = (0..32)
-            .map(|index| format!("{prefix}file-{index}.txt"))
-            .collect::<Vec<_>>();
-        let scope = NativeWriteScope::resolve(&f.identity.canonical_root, &writes)?;
+        // Leave room for the running registration, but not for its full worker envelope.
+        // Long filesystem paths would hit the host's path limit before the manifest limit.
+        registration.set_task_description_for_test("x".repeat(MAX_MANIFEST_BYTES - 8 * 1024))?;
         let path = f.manifest_path()?;
         let before = std::fs::read(&path)?;
-        let error = registration.begin_native(&f.identity, &scope).unwrap_err();
+        let error = registration
+            .begin_native(&f.identity, &f.scope)
+            .unwrap_err();
         assert!(error.to_string().contains("128 KiB"), "{error:#}");
         assert_eq!(std::fs::read(path)?, before);
         assert_eq!(

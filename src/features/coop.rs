@@ -1558,7 +1558,7 @@ fn work_target_with_query(
     )?
     .is_empty();
     let range = format!("{}..{}", base.as_str(), tip.as_str());
-    let ahead = String::from_utf8(query(&path, &["rev-list", "--count", &range])?)
+    let ahead = String::from_utf8(query(&path, &["rev-list", "--count", &range, "--"])?)
         .context("Git ahead query returned non-UTF-8 data")?
         .trim()
         .parse::<u64>()
@@ -1828,38 +1828,36 @@ impl crate::agent::tools::Tool for TeamStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{config::EnvGuard, file_placement::tests::TestDir};
 
-    /// Point `aizen_home()` at a private temp tree. Holds `TEST_HOME_LOCK` because `AIZEN_HOME` is
-    /// process-global, and creates the dir up front so nothing that canonicalizes it can flake.
+    /// Hold the process-global home lock until the environment and fixture have been restored.
     struct Home {
-        _guard: std::sync::MutexGuard<'static, ()>,
+        _env: EnvGuard,
         root: PathBuf,
+        _directory: TestDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Home {
-        fn new(tag: &str) -> Self {
+        fn new() -> Self {
             let guard = crate::core::config::TEST_HOME_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let root = std::env::temp_dir().join(format!(
-                "aizen-coop-{tag}-{}-{}",
-                std::process::id(),
-                crate::core::persist::unique_sequence()
-            ));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).unwrap();
-            std::env::set_var("AIZEN_HOME", &root);
+            let directory = TestDir::new();
+            let root = directory.path().to_path_buf();
+            #[cfg(windows)]
+            let root = {
+                // Git for Windows expects a normal drive path for worktree arguments.
+                let path = root.to_str().expect("fixture path is Unicode");
+                PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(path))
+            };
+            let env = EnvGuard::set([("AIZEN_HOME", &root)]);
             Self {
-                _guard: guard,
+                _env: env,
                 root,
+                _directory: directory,
+                _guard: guard,
             }
-        }
-    }
-
-    impl Drop for Home {
-        fn drop(&mut self) {
-            std::env::remove_var("AIZEN_HOME");
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1894,7 +1892,7 @@ mod tests {
 
     #[test]
     fn a_session_whose_process_is_gone_reads_as_abandoned() {
-        let _home = Home::new("liveness");
+        let _home = Home::new();
         let repo = "repo-a";
         fs::create_dir_all(sessions_dir(repo)).unwrap();
 
@@ -1935,7 +1933,7 @@ mod tests {
 
     #[test]
     fn registry_is_repo_scoped_and_preserves_unreadable_manifests() {
-        let _home = Home::new("scope");
+        let _home = Home::new();
         fs::create_dir_all(sessions_dir("repo-a")).unwrap();
         fs::create_dir_all(sessions_dir("repo-b")).unwrap();
         write_manifest(&manifest("repo-a", "s-a", SessionState::Idle)).unwrap();
@@ -1960,7 +1958,7 @@ mod tests {
 
     #[test]
     fn finished_sessions_are_kept_until_retention_then_swept() {
-        let _home = Home::new("retention");
+        let _home = Home::new();
         let repo = "repo-r";
         fs::create_dir_all(sessions_dir(repo)).unwrap();
         let mut recent = manifest(repo, "s-recent", SessionState::Finished);
@@ -1985,7 +1983,7 @@ mod tests {
 
     #[test]
     fn second_session_on_one_file_is_warned_once_and_recorded_for_both() {
-        let _home = Home::new("overlap");
+        let _home = Home::new();
         let repo = "repo-o";
         let paths = vec!["src/login.ts".to_string(), "src/token.ts".to_string()];
         let first = claim_paths(repo, "s-a", &paths).unwrap();
@@ -2023,7 +2021,7 @@ mod tests {
 
     #[test]
     fn overlaps_surface_on_both_sessions_views() {
-        let _home = Home::new("overlap-view");
+        let _home = Home::new();
         let repo = "repo-ov";
         fs::create_dir_all(sessions_dir(repo)).unwrap();
         let mut a = manifest(repo, "s-a", SessionState::Finished);
@@ -2071,7 +2069,7 @@ mod tests {
     #[test]
     fn managed_worktree_removal_preserves_ignored_files_and_checks_git_state() -> Result<()> {
         let _mode = crate::sandbox::runner::tests::lock();
-        let home = Home::new("work-remove");
+        let home = Home::new();
         let root = home.root.join("repo");
         fs::create_dir(&root)?;
         let Some(git) = crate::core::gitx::git_exe() else {
@@ -2330,7 +2328,7 @@ mod tests {
 
     #[test]
     fn branch_refresh_preserves_evidence_and_only_updates_matching_active_owner() -> Result<()> {
-        let home = Home::new("branch-refresh");
+        let home = Home::new();
         let identity = owner_identity(&home);
         let barrier = acquire_registration_barrier(&identity, Duration::ZERO)?;
         refresh_active_branch(None, &identity, Some("refs/heads/topic"), &barrier)?;
@@ -2399,7 +2397,7 @@ mod tests {
 
     #[test]
     fn removal_inspection_queries_fail_closed_and_never_read_legacy_registry() -> Result<()> {
-        let home = Home::new("removal-query-admission");
+        let home = Home::new();
         let id = owner_identity(&home);
         let path = worktrees_root(&id.repo_id).join("fixture");
         fs::create_dir_all(&path)?;
@@ -2458,7 +2456,7 @@ mod tests {
 
     #[test]
     fn mutation_owner_admission_is_read_only_and_does_not_sweep() -> Result<()> {
-        let home = Home::new("owner-read-only");
+        let home = Home::new();
         let identity = owner_identity(&home);
         require_no_other_workspace_owner(&identity)?;
         assert!(
@@ -2491,7 +2489,7 @@ mod tests {
 
     #[test]
     fn mutation_owner_admission_excludes_only_exact_self_in_same_worktree() -> Result<()> {
-        let home = Home::new("owner-live");
+        let home = Home::new();
         let identity = owner_identity(&home);
         fs::create_dir_all(sessions_dir(&identity.repo_id))?;
         let mut m = manifest(&identity.repo_id, "owner-live", SessionState::Working);
@@ -2534,7 +2532,7 @@ mod tests {
 
     #[test]
     fn registration_barrier_excludes_publication_until_mutation_releases_it() -> Result<()> {
-        let home = Home::new("registration-barrier");
+        let home = Home::new();
         let identity = owner_identity(&home);
         let held = acquire_registration_barrier(&identity, Duration::ZERO)?;
         held.verify()?;
@@ -2568,7 +2566,7 @@ mod tests {
 
     #[test]
     fn registration_barrier_rejects_unsafe_namespace_and_lock_replacement() -> Result<()> {
-        let home = Home::new("registration-path");
+        let home = Home::new();
         let identity = owner_identity(&home);
         let directory = home.root.join("coop-registration");
         fs::write(&directory, b"must not replace this file")?;
@@ -2599,7 +2597,7 @@ mod tests {
 
     #[test]
     fn mutation_owner_admission_refuses_unknown_registry_evidence() -> Result<()> {
-        let home = Home::new("owner-unknown");
+        let home = Home::new();
         let identity = owner_identity(&home);
         let dir = sessions_dir(&identity.repo_id);
         fs::create_dir_all(dir.parent().unwrap())?;
@@ -2684,7 +2682,7 @@ mod tests {
 
     #[test]
     fn historical_refusals_preserve_index_working_files_and_manifest() -> Result<()> {
-        let home = Home::new("historical-refusal");
+        let home = Home::new();
         let root = home.root.join("worktree");
         fs::create_dir_all(root.join(".git"))?;
         // Intentionally not a valid repository/index. Refusal must precede even Git discovery,
@@ -2779,7 +2777,7 @@ mod tests {
 
     #[test]
     fn historical_attribution_evidence_survives_retention() {
-        let _home = Home::new("historical-retention");
+        let _home = Home::new();
         let repo = "repo-history";
         fs::create_dir_all(sessions_dir(repo)).unwrap();
         for variant in 0..5 {
@@ -2807,7 +2805,7 @@ mod tests {
 
     #[test]
     fn future_manifests_and_unknown_states_are_preserved_with_their_locks() {
-        let _home = Home::new("future-schema");
+        let _home = Home::new();
         let repo = "repo-future";
         fs::create_dir_all(sessions_dir(repo)).unwrap();
         for (id, state) in [("readable", "finished"), ("unknown-state", "future-state")] {
