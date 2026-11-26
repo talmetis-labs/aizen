@@ -70,6 +70,56 @@ fn context_override_is_retained_only_on_the_same_main_route() {
 }
 
 #[test]
+fn context_override_accepts_user_token_formats_and_rejects_invalid_values() {
+    for (input, tokens) in [
+        ("128k", 128_000),
+        (" 1M ", 1_000_000),
+        ("200,000", 200_000),
+        ("32_000", 32_000),
+    ] {
+        assert_eq!(parse_context_window(input), Ok(Some(tokens)));
+    }
+    for input in ["", "Auto", "0"] {
+        assert_eq!(parse_context_window(input), Ok(None));
+    }
+    for input in ["1.5m", "-1k", "999", "k128", "18446744073709551615m"] {
+        assert!(parse_context_window(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn context_override_stays_in_sync_with_the_active_provider() -> Result<()> {
+    use crate::core::model_context::{resolve_in, Source};
+
+    let base_url = "https://context-fixture.invalid/v1";
+    let api_key = "fixture-key";
+    let model = "fixture-model";
+    let mut cfg = cli_config::CliConfig::default();
+    cfg.upsert_provider(cli_config::ProviderProfile::normalized(
+        "primary", base_url, api_key, model,
+    )?)?;
+    cfg.activate_provider("primary")?;
+    let endpoint = cli_config::ResolvedEndpoint {
+        base_url: base_url.into(),
+        api_key: api_key.into(),
+        model: model.into(),
+    };
+
+    apply_context_window_override(&mut cfg, "200,000")?;
+    assert!(apply_context_window_override(&mut cfg, "wrong").is_err());
+    cfg.activate_provider("primary")?;
+    let window = resolve_in(&cfg, &endpoint);
+    assert_eq!(window.tokens, 200_000);
+    assert_eq!(window.source, Source::Configured);
+
+    apply_context_window_override(&mut cfg, "auto")?;
+    assert_ne!(resolve_in(&cfg, &endpoint).source, Source::Configured);
+    cfg.activate_provider("primary")?;
+    assert_eq!(cfg.model_context_window, None);
+    Ok(())
+}
+
+#[test]
 fn sandbox_network_control_preserves_other_settings_and_rejects_invalid_values() {
     let mut cfg = cli_config::CliConfig {
         sandbox: Some(crate::sandbox::policy::SandboxSettings {
