@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import stat
@@ -63,6 +64,14 @@ def require(condition: bool, message: str) -> None:
     # Remain effective even if someone accidentally invokes Python with -O.
     if not condition:
         raise AssertionError(message)
+
+
+def mnemos_version(stdout: str) -> str:
+    component = r"(?:0|[1-9][0-9]*)"
+    match = re.fullmatch(rf"aizen-mnemos ({component}\.{component}\.{component})", stdout.strip())
+    if match is None:
+        raise AssertionError("Expected an aizen-mnemos executable with a stable X.Y.Z version")
+    return match[1]
 
 
 def sha256(path: Path) -> str:

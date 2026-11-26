@@ -1,286 +1,287 @@
-//! `aizen time …` and `/timemachine` — the git-backed checkpoint timeline.
-//!
-//! Checkpoints are commits in a store that borrows objects from the working repo, so saving is cheap
-//! and restoring is reversible (the pre-restore tree is itself checkpointed first). `diff_lines` and
-//! `build_time_diff` are shared with the slash surface so the CLI and the REPL cannot drift.
+//! `aizen time …` and `/time` inspect real Git history and share the existing worktree adapters.
+//! There is no checkpoint store, numeric revision translation, or conversation rewind here.
 
-use crate::agent::prompt_lanes::*;
-use crate::core::cli_config;
-use crate::core::session_store::*;
-use crate::core::types::Message;
-use crate::features::timemachine;
-use crate::ui::{splash, tui};
-use crate::{cli_args::TimeCmd, ui_theme};
-use anyhow::{bail, Context, Result};
-use console::style;
-use dialoguer::{Input, Select};
+use crate::cli_args::TimeCmd;
+use crate::core::{exec_ctx, git_ops};
+use crate::features::coop;
+use anyhow::{Context, Result};
+use clap::Parser;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn run_time(cmd: TimeCmd) -> Result<()> {
+    for line in time_lines(cmd)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The REPL uses the same closed argument schema as the CLI, never an arbitrary Git command.
+/// Whitespace separates arguments here; use the CLI for resource paths containing spaces.
+pub(crate) fn parse_time_args(arg: &str) -> Result<TimeCmd> {
+    #[derive(Parser)]
+    #[command(name = "/time", disable_version_flag = true)]
+    struct TimeArguments {
+        #[command(subcommand)]
+        command: TimeCmd,
+    }
+    let arg = if arg.trim().is_empty() {
+        "status"
+    } else {
+        arg.trim()
+    };
+    // Focus consumes one literal path, including spaces. This is not a shell parser: no expansion,
+    // escaping or additional options. Other commands retain their existing closed argument grammar.
+    if let Some(path) = arg
+        .strip_prefix("focus")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+    {
+        let path = path.trim();
+        let path = path
+            .strip_prefix('"')
+            .and_then(|p| p.strip_suffix('"'))
+            .unwrap_or(path);
+        return Ok(TimeArguments::try_parse_from(["/time", "focus", path])?.command);
+    }
+    Ok(
+        TimeArguments::try_parse_from(std::iter::once("/time").chain(arg.split_whitespace()))?
+            .command,
+    )
+}
+
+fn inspection_root() -> Result<PathBuf> {
+    if let Some(root) = exec_ctx::current().and_then(|ctx| {
+        ctx.placement()
+            .map(|placement| placement.workspace_root().to_path_buf())
+    }) {
+        return Ok(root);
+    }
+    std::env::current_dir().context("locating the current Git worktree")
+}
+
+/// Text is returned to the caller so REPL output always goes through the retained renderer.
+/// Failed Git queries, unsupported operations and unknown settlement are errors, not empty success.
+pub(crate) fn time_lines(cmd: TimeCmd) -> Result<Vec<String>> {
     match cmd {
-        TimeCmd::Save { label } => {
-            let snap = timemachine::save(&label.join(" "), false)?;
-            println!(
-                "{} #{}  {}",
-                style("✓ checkpoint").color256(splash::ACCENT),
-                snap.id,
-                style(&snap.created).dim()
-            );
-            Ok(())
+        TimeCmd::Focus { .. } => anyhow::bail!("focus requires /time focus in the owning interactive session; no workspace was changed"),
+        TimeCmd::Create { name, base, yes } => {
+            let prepared = coop::prepare_work_new(&inspection_root()?, &name, base.as_deref())?;
+            let mut lines = vec![prepared.preview()?];
+            if !yes {
+                lines.push("Preview only — no worktree or branch was created. Re-run with --yes to approve creation; the base and source state will be prepared again.".into());
+                return Ok(lines);
+            }
+            let wt = prepared.execute()?;
+            lines.extend([
+                format!("created worktree {} on {}", wt.path.display(), wt.branch),
+                format!(
+                    "committed base {}; pending parent edits are not copied",
+                    wt.base.as_str()
+                ),
+                format!("open a separate session there: cd {}", wt.path.display()),
+            ]);
+            if wt.dirty {
+                lines.push("checkout left uncommitted/untracked/ignored files; inspect before using this worktree".into());
+            }
+            Ok(lines)
         }
-        TimeCmd::List => {
-            print_timeline()?;
-            Ok(())
+        TimeCmd::Remove { name } => Ok(vec![coop::work_remove(&name, false)?]),
+        TimeCmd::Worktrees => coop::work_inventory_lines(),
+        TimeCmd::Switch { branch, yes } => change_lines(git_ops::Change::Switch { branch }, yes),
+        TimeCmd::Undo {
+            commits,
+            mainline,
+            yes,
+        } => change_lines(git_ops::Change::Revert { commits, mainline }, yes),
+        TimeCmd::UndoPaths { commit, paths, mainline, yes } => {
+            change_lines(git_ops::Change::RevertPaths { commit, paths, mainline }, yes)
         }
-        TimeCmd::Restore { id } => {
-            let (snap, removed) = timemachine::restore_with_report(id)?;
-            let label = if snap.label.is_empty() {
-                "(no label)".to_string()
-            } else {
-                snap.label.clone()
+        TimeCmd::Redo { receipt, yes } => change_lines(git_ops::Change::Redo { receipt }, yes),
+        TimeCmd::Reconcile { receipt, yes } => {
+            change_lines(git_ops::Change::Reconcile { receipt }, yes)
+        }
+        TimeCmd::Operations { receipt } => {
+            let root = inspection_root()?;
+            let report = match receipt {
+                Some(id) => serde_json::to_string_pretty(&git_ops::inspect_operation(&root, &id)?)?,
+                None => serde_json::to_string_pretty(&git_ops::operation_receipts(&root)?)?,
             };
-            println!(
-                "{} #{} — {label}",
-                style("⏪ restored to").color256(splash::ACCENT),
-                snap.id
-            );
-            // Say WHAT changed and that it's undoable: aizen only rewinds the working tree (files),
-            // never your chat/history — and because the pre-restore state was auto-snapshotted, you
-            // can always go forward again (`aizen time redo`, or restore the newest checkpoint).
-            println!("{}", style("  files only — your conversation is untouched · reversible with `aizen time redo`").dim());
-            print_removed(&removed);
-            Ok(())
+            Ok(vec![report])
         }
-        TimeCmd::Diff {
-            from,
-            to,
-            patch,
-            paths,
-            json,
-        } => run_time_diff(from, to, paths, patch, json),
-        TimeCmd::Undo => {
-            let (snap, removed) = timemachine::undo_with_report()?;
-            println!(
-                "{} #{}",
-                style("⏪ undo →").color256(splash::ACCENT),
-                snap.id
-            );
-            print_removed(&removed);
-            Ok(())
+        TimeCmd::Verifications => Ok(vec![serde_json::to_string_pretty(
+            &git_ops::verification_records(&inspection_root()?)?,
+        )?]),
+        TimeCmd::DeleteBranch {
+            branch,
+            retained_ref,
+            yes,
+        } => change_lines(
+            git_ops::Change::DeleteBranch {
+                branch,
+                retained_ref,
+            },
+            yes,
+        ),
+        TimeCmd::Integrate { commit, yes } => {
+            change_lines(git_ops::Change::Integrate { commit }, yes)
         }
-        TimeCmd::Redo => {
-            let (snap, removed) = timemachine::redo_with_report()?;
-            println!(
-                "{} #{}",
-                style("⏩ redo →").color256(splash::ACCENT),
-                snap.id
-            );
-            print_removed(&removed);
-            Ok(())
+        TimeCmd::IntegrateTask { receipt, yes } => {
+            change_lines(git_ops::Change::IntegrateTask { receipt }, yes)
         }
-        TimeCmd::Prune { keep } => {
-            let k = keep.or(cli_config::load().timemachine_keep).unwrap_or(50);
-            let dropped = timemachine::prune(k)?;
-            println!(
-                "{} {dropped} old checkpoint(s); kept ≤{k}.",
-                style("🧹 pruned").color256(splash::ACCENT)
-            );
-            Ok(())
+        TimeCmd::VerifyTask { receipt, yes } => {
+            change_lines(git_ops::Change::VerifyTask { receipt }, yes)
         }
-        TimeCmd::Rm { ids } => {
-            let removed = timemachine::remove(&ids)?;
-            println!(
-                "{} {removed} checkpoint(s); disk is reclaimed by the next `aizen time gc`.",
-                style("🧹 removed").color256(splash::ACCENT)
-            );
-            Ok(())
-        }
-        TimeCmd::Doctor {
-            json,
-            repair,
-            cohort,
+        TimeCmd::Sequencer {
+            receipt,
+            step,
+            yes,
+        } => change_lines(git_ops::Change::Sequencer { receipt, step }, yes),
+        TimeCmd::Merge { commit, yes } => change_lines(git_ops::Change::Merge { commit }, yes),
+        TimeCmd::CherryPick {
+            commits,
+            mainline,
+            yes,
+        } => change_lines(git_ops::Change::CherryPick { commits, mainline }, yes),
+        TimeCmd::Recovery {            cohort,
             prepared,
             resources,
+            json,
             record_observation,
-        } => {
-            match (cohort, prepared) {
-                (Some(cohort), Some(prepared)) if !repair => {
-                    return run_recovery_report(&cohort, &prepared, &resources, json, record_observation);
-                }
-                (None, None) if resources.is_empty() && !record_observation => {}
-                _ => bail!("restart report requires cohort and prepared together and cannot be combined with repair"),
-            }
-            let report = if repair {
-                timemachine::doctor_repair()?
-            } else {
-                timemachine::doctor()?
-            };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "{}  repo {} · worktree {} · {} checkpoint(s)",
-                    if report.ok {
-                        "✓ time machine healthy"
-                    } else {
-                        "⚠ time machine needs attention"
-                    },
-                    report.repo_id,
-                    report.worktree_id,
-                    report.checkpoints
-                );
-                println!("  store {}", report.store);
-                // Loose objects are not an "issue" — a store with 15k of them still restores fine.
-                // They are a disk-growth signal, so surface them only once there are enough to matter
-                // and say what fixes it, rather than printing a zero on every healthy run.
-                if report.loose_objects >= 1024 {
-                    println!(
-                        "  {} loose object(s) not packed — run `aizen time gc` to compact",
-                        report.loose_objects
-                    );
-                }
-                for issue in &report.issues {
-                    println!("  - {issue}");
-                }
-            }
-            if !report.ok {
-                bail!("time-machine doctor found {} issue(s)", report.issues.len());
-            }
-            Ok(())
-        }
-        TimeCmd::Gc { all, apply } => {
-            if all {
-                let report = timemachine::gc_all(apply)?;
-                let fmt_mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
-                if report.orphans.is_empty() {
-                    println!(
-                        "{} {} store(s) scanned · no orphans (every store is still reachable from its repo)",
-                        style("🧹 time gc --all:").color256(splash::ACCENT),
-                        report.stores.len()
-                    );
-                } else {
-                    let total: u64 = report.orphans.iter().map(|o| o.bytes).sum();
-                    println!(
-                        "{} {} orphan store(s), {} reclaimable:",
-                        style("🧹 time gc --all:").color256(splash::ACCENT),
-                        report.orphans.len(),
-                        fmt_mb(total)
-                    );
-                    for o in &report.orphans {
-                        // Two distinct fates, named apart: a repo that vanished, and a repo that is
-                        // alive but re-keyed under a different store id after an identity change.
-                        let why = if !o.source_exists {
-                            format!(
-                                "source gone: {}",
-                                o.source.as_deref().unwrap_or("(unknown)")
-                            )
-                        } else {
-                            format!(
-                                "superseded by {} — its repo now keys there",
-                                o.superseded_by.as_deref().unwrap_or("(unknown)")
-                            )
-                        };
-                        println!(
-                            "  {} · {} · {} checkpoint(s) · {}",
-                            o.repo_id,
-                            fmt_mb(o.bytes),
-                            o.checkpoints,
-                            why
-                        );
-                    }
-                    if report.applied {
-                        // `--apply` RENAMES; nothing here or anywhere else ever empties the trash.
-                        // Saying only "moved" alongside a "reclaimable" figure reads as though the
-                        // disk came back, and it has not — so name the step that actually frees it.
-                        let trash = report.trash_dir.as_deref().unwrap_or("(trash)");
-                        println!("  → moved to {trash}");
-                        println!(
-                            "  {} still on disk until you delete that directory — nothing reaps it for you",
-                            style("note:").bold()
-                        );
-                    } else {
-                        println!(
-                            "  (dry-run — re-run with {} to move these to .trash/)",
-                            style("--apply").bold()
-                        );
-                    }
-                }
-                Ok(())
-            } else {
-                let (report, compacted, pruned) = timemachine::doctor_gc()?;
-                println!(
-                    "{} repo {} · worktree {} · {} checkpoint(s)",
-                    style("🧹 time metadata cleaned:").color256(splash::ACCENT),
-                    report.repo_id,
-                    report.worktree_id,
-                    report.checkpoints
-                );
-                // Report bytes actually returned, not objects touched: packing 14k objects sounds
-                // like work, but the number the user came for is how much smaller the store got.
-                if let Some(c) = compacted.filter(|c| c.packed > 0) {
-                    // Scale the unit: a small store printed as "0.0 MB → 0.0 MB" reads as a no-op
-                    // when 36 objects were in fact packed.
-                    let size = |b: u64| {
-                        if b >= 1_048_576 {
-                            format!("{:.1} MB", b as f64 / 1_048_576.0)
-                        } else {
-                            format!("{:.0} KB", b as f64 / 1024.0)
-                        }
-                    };
-                    println!(
-                        "  packed {} loose object(s) · {} → {}",
-                        c.packed,
-                        size(c.before_bytes),
-                        size(c.after_bytes)
-                    );
-                }
-                if let Some(p) = pruned.filter(|p| p.pruned > 0) {
-                    let size = |b: u64| {
-                        if b >= 1_048_576 {
-                            format!("{:.1} MB", b as f64 / 1_048_576.0)
-                        } else {
-                            format!("{:.0} KB", b as f64 / 1024.0)
-                        }
-                    };
-                    println!(
-                        "  pruned {} unreachable object(s) of {} · {} → {}",
-                        p.pruned,
-                        p.owned,
-                        size(p.before_bytes),
-                        size(p.after_bytes)
-                    );
-                }
-                Ok(())
-            }
-        }
-        TimeCmd::Clear => {
-            let n = timemachine::clear()?;
-            println!(
-                "{} {n} checkpoint(s) deleted.",
-                style("🧹 cleared").color256(splash::ACCENT)
+        } => recovery_lines(&cohort, &prepared, &resources, json, record_observation),
+        TimeCmd::Status => inspect_lines(
+            &inspection_root()?,
+            "Git worktree status",
+            vec![
+                "status".into(),
+                "--short".into(),
+                "--branch".into(),
+                "--untracked-files=all".into(),
+            ],
+        ),
+        TimeCmd::History { limit } => {
+            let mut lines = inspect_lines(
+                &inspection_root()?,
+                "Git commit history (HEAD)",
+                vec![
+                    "log".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
+                    "--format=%h %s".into(),
+                    format!("--max-count={limit}"),
+                    "--".into(),
+                ],
+            )?;
+            lines.push(
+                "Git commits do not include pending worktree/index edits or untracked files."
+                    .into(),
             );
-            Ok(())
+            Ok(lines)
+        }
+        TimeCmd::Branches => inspect_lines(
+            &inspection_root()?,
+            "Local Git branches",
+            vec![
+                "branch".into(),
+                "--list".into(),
+                "--no-color".into(),
+                "--no-abbrev".into(),
+                "--format=%(HEAD) %(refname:short) %(objectname)".into(),
+            ],
+        ),
+        TimeCmd::Reflog { limit } => {
+            let mut lines = inspect_lines(
+                &inspection_root()?,
+                "Local Git reflog (HEAD)",
+                vec![
+                    "reflog".into(),
+                    "show".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
+                    "--format=%h %gd %gs".into(),
+                    format!("--max-count={limit}"),
+                    "HEAD".into(),
+                    "--".into(),
+                ],
+            )?;
+            lines.push("Reflog retention is controlled by Git; it does not save uncommitted or untracked files.".into());
+            Ok(lines)
         }
     }
 }
 
-/// Explicit inspection CLI boundary; metadata append requires its separate flag. No ordinary repair.
-fn run_recovery_report(
+fn change_lines(change: git_ops::Change, yes: bool) -> Result<Vec<String>> {
+    let inverse = matches!(change, git_ops::Change::RevertPaths { .. });
+    let reconcile = matches!(change, git_ops::Change::Reconcile { .. });
+    let verification = matches!(change, git_ops::Change::VerifyTask { .. });
+    let sequencer = matches!(change, git_ops::Change::Sequencer { .. });
+    let prepared = git_ops::Prepared::prepare(&inspection_root()?, change)?;
+    let mut lines = vec![prepared.preview()?];
+    if !yes {
+        lines.push("Preview only — nothing was executed. Re-run with --yes for explicit approval; state, targets and the approved command list are prepared again and revalidated.".into());
+        return Ok(lines);
+    }
+    // Execute this prepared object, never resolve a fresh moving target after preparation.
+    let outcome = prepared.execute()?;
+    lines.push(match &outcome {
+        git_ops::PreparedOutcome::Change(receipt) => serde_json::to_string_pretty(receipt)?,
+        git_ops::PreparedOutcome::Verify(record) => serde_json::to_string_pretty(record)?,
+        git_ops::PreparedOutcome::Handoff(handoff) => serde_json::to_string_pretty(handoff)?,
+    });
+    lines.push(if inverse {
+        "Selected inverse committed only in its owned worktree, UNVERIFIED and NOT INTEGRATED. Approve integrate-task <registration-id> separately, then verify-task <integration-id> at the destination. No destination edits or cleanup were performed.".into()
+    } else if reconcile {
+        "Manual resolution acknowledged in metadata only; original failure and partial commit mappings are retained. No Git action was replayed and project verification has NOT run.".into()
+    } else if verification {
+        "Verification evidence recorded or relinked for this exact destination. Only a settled pass marks the integration verified; relinking runs no command, and a failure or unknown effect is never inferred as success.".into()
+    } else if sequencer {
+        "Sequencer step settled; project verification has NOT run. A remaining conflict is reported, not cleaned up; inspect Git state before continuing.".into()
+    } else {
+        "Git operation settled; project verification has NOT run. Inspect the resulting destination and run its required tests before treating the work as complete.".into()
+    });
+    Ok(lines)
+}
+
+fn inspect_lines(root: &Path, title: &str, args: Vec<String>) -> Result<Vec<String>> {
+    let bytes = git_ops::inspection_bytes(root, args)?;
+    let text = std::str::from_utf8(&bytes).context("Git inspection output is not UTF-8")?;
+    // Git metadata is untrusted terminal text. Preserve printable text, not terminal control codes.
+    let mut lines = vec![title.to_string()];
+    lines.extend(text.lines().map(|line| {
+        line.chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect::<Vec<_>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect()
+    }));
+    if text.trim().is_empty() {
+        lines.push("(no entries returned by Git)".into());
+    }
+    Ok(lines)
+}
+
+/// Historical speculation evidence remains readable without granting restore or replay authority.
+/// A metadata append requires its own explicit flag; there is no backend repair/GC route.
+fn recovery_lines(
     cohort: &str,
     prepared: &str,
     resources: &[String],
     json: bool,
     record_observation: bool,
-) -> Result<()> {
-    use crate::core::exec_ctx::{self, ExecutionContext};
-    let root = std::env::current_dir()?;
+) -> Result<Vec<String>> {
+    use crate::core::exec_ctx::ExecutionContext;
+    use crate::core::speculation::restart;
+    let root = inspection_root()?;
     let inspect = || {
         if record_observation {
-            timemachine::record_speculation_recovery_observation(&root, cohort, prepared, resources)
+            restart::record_speculation_recovery_observation(&root, cohort, prepared, resources)
         } else {
-            timemachine::inspect_speculation_recovery(&root, cohort, prepared, resources)
+            restart::inspect_speculation_recovery(&root, cohort, prepared, resources)
         }
     };
-    // Only this top-level CLI boundary may seat a parent; never replace an existing restriction.
+    // Only this user-command boundary may seat a parent; never replace an existing restriction.
     let report = if exec_ctx::current().is_some() {
         inspect()?
     } else {
@@ -288,410 +289,264 @@ fn run_recovery_report(
             .with_resource_scope(format!("cli/recovery-report/{}", std::process::id()));
         exec_ctx::with_current(parent, inspect)?
     };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+    Ok(if json {
+        vec![serde_json::to_string_pretty(&report.to_json())?]
     } else {
-        println!("{}", report.to_text());
-    }
-    Ok(())
+        vec![report.to_text()]
+    })
 }
 
-/// Resolve the `[FROM] [TO]` positional pair into two timeline sides.
-/// Defaults: cursor -> working; with one argument, that checkpoint -> working.
-fn resolve_diff_sides(
-    from: Option<&str>,
-    to: Option<&str>,
-) -> Result<(timemachine::DiffSide, timemachine::DiffSide)> {
-    use timemachine::DiffSide;
-    let parse = |s: &str| {
-        DiffSide::parse(s).with_context(|| {
-            format!("`{s}` is not a checkpoint id or `working` (try `aizen time list`)")
-        })
-    };
-    match (from, to) {
-        (None, _) => {
-            let (snaps, cursor) = timemachine::timeline()?;
-            let cur = cursor.and_then(|i| snaps.get(i)).map(|s| s.id).context(
-                "no checkpoints yet — nothing to diff against (`aizen time save` first)",
-            )?;
-            Ok((DiffSide::Checkpoint(cur), DiffSide::Working))
-        }
-        (Some(f), None) => Ok((parse(f)?, DiffSide::Working)),
-        (Some(f), Some(t)) => Ok((parse(f)?, parse(t)?)),
-    }
-}
-
-/// Render a diff report as display lines. Shared so `aizen time diff` (stdout) and `/diff` (the TUI,
-/// which MUST go through `tui::emit_line` or the render thread wipes the output) format identically.
-/// `narrow_hint` differs between the two because the flag spelling does: `--path p` vs `-- p`.
-pub(crate) fn diff_lines(report: &timemachine::DiffReport, narrow_hint: &str) -> Vec<String> {
-    if report.is_empty() {
-        return vec![style(format!(
-            "⎇ no changes between {} and {}",
-            report.from, report.to
-        ))
-        .dim()
-        .to_string()];
-    }
-    let mut out = vec![format!(
-        "{}  {} → {}  ·  {} file(s), {}",
-        style("⎇ diff").color256(splash::ACCENT).bold(),
-        report.from,
-        report.to,
-        report.files.len(),
-        style(format!(
-            "+{} -{}",
-            report.total_added(),
-            report.total_deleted()
-        ))
-        .dim(),
-    )];
-    for f in &report.files {
-        // `None` counts mean git reported `-`: a binary file, not a zero-line change.
-        let churn = match (f.added, f.deleted) {
-            (Some(a), Some(d)) => format!("+{a} -{d}"),
-            _ => "binary".to_string(),
-        };
-        let path = match &f.old_path {
-            Some(old) => format!("{old} → {}", f.path),
-            None => f.path.clone(),
-        };
-        out.push(format!("  {} {path}  {}", f.status, style(churn).dim()));
-    }
-    match &report.patch {
-        Some(text) => {
-            out.push(String::new());
-            out.extend(text.lines().map(|l| l.to_string()));
-            if report.patch_truncated {
-                out.push(
-                    style(format!("… patch truncated — narrow it with {narrow_hint}"))
-                        .dim()
-                        .to_string(),
-                );
-            }
-        }
-        None => out.push(
-            style(format!(
-                "  --patch for the full text · {narrow_hint} to narrow it"
-            ))
-            .dim()
-            .to_string(),
-        ),
-    }
-    out
-}
-
-/// `aizen time diff` — print the changes between two points in the timeline.
-fn run_time_diff(
-    from: Option<String>,
-    to: Option<String>,
-    paths: Vec<String>,
-    patch: bool,
-    json: bool,
-) -> Result<()> {
-    let report = build_time_diff(from, to, paths, patch)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    for line in diff_lines(&report, "--path <p>") {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-/// Cap on emitted patch bytes. Generous enough for a real review, bounded so a huge rewrite cannot
-/// flood the terminal (or, for the agent tool, the tool-result budget).
-const DIFF_PATCH_LIMIT: usize = 400 * 1024;
-
-pub(crate) fn build_time_diff(
-    from: Option<String>,
-    to: Option<String>,
-    paths: Vec<String>,
-    patch: bool,
-) -> Result<timemachine::DiffReport> {
-    let (a, b) = resolve_diff_sides(from.as_deref(), to.as_deref())?;
-    timemachine::diff(&a, &b, &paths, patch.then_some(DIFF_PATCH_LIMIT))
-}
-
-/// Human "2m ago" from a snapshot's stored LOCAL timestamp. Pure core (`rel_time_from`) takes `now`
-/// so the bucketing is unit-testable; a malformed timestamp degrades to the raw string.
-fn rel_time(created: &str) -> String {
-    rel_time_from(created, chrono::Local::now().naive_local())
-}
-fn rel_time_from(created: &str, now: chrono::NaiveDateTime) -> String {
-    match chrono::NaiveDateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S") {
-        Ok(t) => {
-            let secs = (now - t).num_seconds();
-            if secs < 0 {
-                "just now".to_string()
-            } else if secs < 60 {
-                format!("{secs}s ago")
-            } else if secs < 3600 {
-                format!("{}m ago", secs / 60)
-            } else if secs < 86_400 {
-                format!("{}h ago", secs / 3600)
-            } else {
-                format!("{}d ago", secs / 86_400)
-            }
-        }
-        Err(_) => created.to_string(),
+/// Retired checkpoint commands are never interpreted as Git revisions or successful no-ops.
+pub(crate) fn unsupported_time_hint(arg: &str) -> Option<&'static str> {
+    match arg.split_whitespace().next()? {
+        "save" | "list" | "restore" | "diff" | "prune" | "rm" | "gc" | "clear" | "doctor" =>
+            Some("Checkpoint storage and restore commands were removed. Use /time status, history, branches, worktrees or reflog. Historical numeric IDs are not Git revisions; saved evidence has not been deleted."),
+        "continue" | "abort" | "quit" =>
+            Some("Use `/time sequencer <failed-operation-id> continue|abort|quit` for a recognized merge/cherry-pick/revert conflict. Root-level continue/abort are not standalone commands; unresolved receipts must not be deleted to bypass a refusal."),
+        _ => None,
     }
 }
 
 #[cfg(test)]
-#[path = "../tests/rel_time.rs"]
-mod rel_time_tests;
+mod tests {
+    use super::*;
 
-/// `aizen time list` — a static, glanceable print of the checkpoint timeline (newest first), with the
-/// active point marked `▸`, relative times, labels, and `auto`/`+chat` tags. Read-only, and CLI-only:
-/// in the REPL `/timemachine` shows the same history as a picker, so there is nothing to print.
-fn print_timeline() -> Result<()> {
-    let (snaps, cursor) = timemachine::timeline()?;
-    if snaps.is_empty() {
-        tui::emit_line(
-            &style("⎇ timeline — no checkpoints yet · /checkpoint to save one")
-                .dim()
-                .to_string(),
+    #[test]
+    fn default_time_is_read_only_status() {
+        assert!(matches!(parse_time_args("").unwrap(), TimeCmd::Status));
+        assert!(matches!(
+            parse_time_args("history --limit 7").unwrap(),
+            TimeCmd::History { limit: 7 }
+        ));
+        assert!(
+            matches!(parse_time_args("create topic").unwrap(), TimeCmd::Create { name, base: None, yes: false } if name == "topic")
         );
-        return Ok(());
-    }
-    let n = snaps.len();
-    tui::emit_line(&format!(
-        "{}  {n} checkpoint(s)",
-        style("⎇ timeline").color256(splash::ACCENT).bold(),
-    ));
-    // Align the `#id` column to the widest id present (+1 for the leading `#`).
-    let id_w = snaps
-        .iter()
-        .map(|s| s.id.to_string().len())
-        .max()
-        .unwrap_or(1)
-        + 1;
-    // Newest first (the ledger stores oldest → newest).
-    for (i, s) in snaps.iter().enumerate().rev() {
-        let is_cur = Some(i) == cursor;
-        let id = format!("#{}", s.id);
-        let rel = rel_time(&s.created);
-        let label = if s.label.is_empty() {
-            "(no label)".to_string()
-        } else {
-            s.label.clone()
-        };
-        let mut tags = String::new();
-        if s.auto {
-            tags.push_str(" · auto");
-        }
-        if s.has_chat {
-            tags.push_str(" · +chat");
-        }
-        let head = format!("{id:<id_w$}  {rel:<9}  {label}");
-        let mark = if is_cur { "▸" } else { " " };
-        // Current point accented; tags always dim. Style the marker+head as one segment, then append
-        // the dim tags separately so no ANSI code nests inside another.
-        let body = if is_cur {
-            format!(
-                "{} {}",
-                style(mark).color256(splash::ACCENT).bold(),
-                style(head).color256(splash::ACCENT)
-            )
-        } else {
-            format!("{mark} {head}")
-        };
-        let tag_str = if tags.is_empty() {
-            String::new()
-        } else {
-            style(tags).dim().to_string()
-        };
-        tui::emit_line(&format!("{body}{tag_str}"));
-    }
-    tui::emit_line(
-        &style("▸ = current · restore: aizen time restore <id>   (or /timemachine in the REPL)")
-            .dim()
-            .to_string(),
-    );
-    Ok(())
-}
-
-/// `/timemachine` — the whole time machine in one list: every checkpoint, and picking one rewinds to
-/// that state.
-///
-/// A row carries the id, how long ago it was taken, its label, and the `+chat` tag when the
-/// conversation was captured alongside the tree. Picking a row restores everything that checkpoint
-/// holds — the working tree always, and the conversation too whenever a chat sidecar exists — so one
-/// pick returns you to that code AND that chat. There is deliberately no Files/Task/Both sub-menu and
-/// no `pick`/`restore` argument: this list IS the surface.
-///
-/// Every restore is reversible: the pre-restore tree is auto-snapshotted, and the live conversation is
-/// saved to its own session file before being replaced.
-pub(crate) async fn timemachine_menu(
-    history: &mut Vec<Message>,
-    model_label: &mut str,
-) -> Result<()> {
-    let theme = ui_theme();
-    loop {
-        let (snaps, cursor) = match timemachine::timeline() {
-            Ok(t) => t,
-            Err(e) => {
-                println!("{e}");
-                return Ok(());
-            }
-        };
-        let n = snaps.len();
-        let mut items: Vec<String> = snaps
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let here = if Some(i) == cursor { "▸ " } else { "  " };
-                let label = if s.label.is_empty() {
-                    "(no label)".to_string()
-                } else {
-                    s.label.clone()
-                };
-                // Spell out what a pick will rewind, since the pick itself is now the whole gesture.
-                let scope = if s.has_chat {
-                    "code + chat"
-                } else {
-                    "code only"
-                };
-                let tags = if s.auto {
-                    format!(" · auto · {scope}")
-                } else {
-                    format!(" · {scope}")
-                };
-                format!(
-                    "{here}#{} {}  {label}{}",
-                    s.id,
-                    style(rel_time(&s.created)).dim(),
-                    style(tags).dim(),
-                )
-            })
-            .collect();
-        items.push("✚ Save a checkpoint now (code + chat)".to_string());
-        items.push("Back".to_string());
-        let prompt = format!(
-            "Time machine — {n} checkpoint(s); pick one to rewind to it (reversible). Esc to go back"
+        assert!(
+            matches!(parse_time_args("create topic --base HEAD~2 --yes").unwrap(), TimeCmd::Create { name, base: Some(base), yes: true } if name == "topic" && base == "HEAD~2")
         );
-        let pick = match Select::with_theme(&theme)
-            .with_prompt(prompt)
-            .report(false)
-            .items(&items)
-            .default(cursor.unwrap_or(0))
-            .interact_opt()?
-        {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        if pick < n {
-            restore_checkpoint(&snaps[pick], history, model_label)?;
-        } else if pick == n {
-            let label: String = Input::with_theme(&theme)
-                .with_prompt("Label (optional)")
-                .allow_empty(true)
-                .interact_text()?;
-            // Capture the conversation alongside the tree so this checkpoint supports task restore.
-            match timemachine::save_with_chat(label.trim(), false, history) {
-                Ok(s) => println!(
-                    "{} #{} ({})",
-                    style("✓ checkpoint").color256(splash::ACCENT),
-                    s.id,
-                    if s.has_chat {
-                        "code + chat"
-                    } else {
-                        "files only"
-                    }
-                ),
-                Err(e) => println!("{}", style(format!("save failed: {e}")).red()),
+    }
+
+    #[test]
+    fn checkpoint_ids_and_unsupported_mutations_are_never_git_arguments() {
+        for input in [
+            "42",
+            "restore 42",
+            "diff 42",
+            "undo",
+            "redo",
+            "undo 42 --yes",
+            "redo #42 --yes",
+            "redo ../escape --yes",
+            "redo HEAD~1 --yes",
+            "redo one two --yes",
+            "integrate 42 --yes",
+            "create topic --base 42 --yes",
+            "create topic --base --force",
+            "create topic --force",
+            "save label",
+            "clear",
+            "gc --all --apply",
+            "doctor --repair",
+            "focus",
+            "delete-branch topic",
+            "delete-branch topic --retained-ref refs/heads/main --force",
+        ] {
+            assert!(parse_time_args(input).is_err(), "accepted {input}");
+        }
+        assert!(unsupported_time_hint("restore 42")
+            .unwrap()
+            .contains("not Git revisions"));
+        assert!(
+            matches!(parse_time_args("focus main").unwrap(), TimeCmd::Focus { path } if path == "main")
+        );
+        assert!(unsupported_time_hint("focus main").is_none());
+        assert!(time_lines(TimeCmd::Focus {
+            path: "main".into()
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("owning interactive"));
+        // Root-level continue/abort are redirected to the owned sequencer subcommand.
+        assert!(unsupported_time_hint("continue")
+            .unwrap()
+            .contains("/time sequencer"));
+    }
+
+    #[test]
+    fn mutations_require_explicit_targets_and_default_to_preview() {
+        assert!(
+            matches!(parse_time_args("undo-paths HEAD --path selected.txt --path renamed.txt").unwrap(),
+            TimeCmd::UndoPaths { paths, yes: false, mainline: None, .. } if paths == ["selected.txt", "renamed.txt"])
+        );
+        for bad in [
+            "undo-paths HEAD",
+            "undo-paths 42 --path file.txt",
+            "undo-paths HEAD --path file.txt --force",
+        ] {
+            assert!(parse_time_args(bad).is_err(), "accepted {bad}");
+        }
+        assert!(matches!(
+            parse_time_args("switch topic").unwrap(),
+            TimeCmd::Switch { yes: false, .. }
+        ));
+        assert!(
+            matches!(parse_time_args("undo HEAD~1 HEAD --yes").unwrap(), TimeCmd::Undo { commits, mainline: None, yes: true } if commits == ["HEAD~1", "HEAD"])
+        );
+        assert!(matches!(
+            parse_time_args("undo HEAD --mainline 2").unwrap(),
+            TimeCmd::Undo {
+                mainline: Some(2),
+                yes: false,
+                ..
             }
-        } else {
-            return Ok(());
+        ));
+        assert!(matches!(
+            parse_time_args("delete-branch topic --retained-ref refs/heads/main").unwrap(),
+            TimeCmd::DeleteBranch { branch, retained_ref, yes: false }
+                if branch == "topic" && retained_ref == "refs/heads/main"
+        ));
+        assert!(matches!(
+            parse_time_args("delete-branch topic --retained-ref refs/heads/main --yes").unwrap(),
+            TimeCmd::DeleteBranch { yes: true, .. }
+        ));
+        assert!(matches!(
+            parse_time_args("operations").unwrap(),
+            TimeCmd::Operations { receipt: None }
+        ));
+        assert!(matches!(
+            parse_time_args("verifications").unwrap(),
+            TimeCmd::Verifications
+        ));
+        assert!(matches!(
+            parse_time_args("redo undo-operation-1").unwrap(),
+            TimeCmd::Redo { receipt, yes: false } if receipt == "undo-operation-1"
+        ));
+        assert!(matches!(
+            parse_time_args("integrate refs/heads/topic").unwrap(),
+            TimeCmd::Integrate { yes: false, .. }
+        ));
+        assert!(matches!(
+            parse_time_args("integrate-task git-task-1-2-3").unwrap(),
+            TimeCmd::IntegrateTask { receipt, yes: false } if receipt == "git-task-1-2-3"
+        ));
+        assert!(matches!(
+            parse_time_args("integrate-task git-task-1-2-3 --yes").unwrap(),
+            TimeCmd::IntegrateTask { yes: true, .. }
+        ));
+        assert!(matches!(
+            parse_time_args("verify-task 123-456-7").unwrap(),
+            TimeCmd::VerifyTask { receipt, yes: false } if receipt == "123-456-7"
+        ));
+        assert!(matches!(
+            parse_time_args("verify-task 123-456-7 --yes").unwrap(),
+            TimeCmd::VerifyTask { yes: true, .. }
+        ));
+        assert!(matches!(
+            parse_time_args("sequencer failed-operation-1 abort").unwrap(),
+            TimeCmd::Sequencer { receipt, step, yes: false }
+                if receipt == "failed-operation-1" && step == "abort"
+        ));
+        assert!(matches!(
+            parse_time_args("sequencer failed-operation-1 continue --yes").unwrap(),
+            TimeCmd::Sequencer { step, yes: true, .. } if step == "continue"
+        ));
+        for bad in [
+            "sequencer",
+            "sequencer failed-operation-1",
+            "sequencer ../escape abort",
+            "sequencer failed-operation-1 reset",
+        ] {
+            assert!(parse_time_args(bad).is_err(), "accepted {bad}");
+        }
+        for bad in [
+            "integrate-task",
+            "integrate-task 42",
+            "integrate-task ../escape",
+            "integrate-task git-task-1 --force",
+            "verify-task",
+            "verify-task ../escape",
+            "verify-task 123-456-7 --force",
+        ] {
+            assert!(parse_time_args(bad).is_err(), "accepted {bad}");
+        }
+        assert!(matches!(
+            parse_time_args("merge refs/heads/topic").unwrap(),
+            TimeCmd::Merge { yes: false, .. }
+        ));
+        assert!(matches!(
+            parse_time_args("cherry-pick HEAD~1 HEAD --yes").unwrap(),
+            TimeCmd::CherryPick { commits, mainline: None, yes: true }
+                if commits == ["HEAD~1", "HEAD"]
+        ));
+        assert!(matches!(
+            parse_time_args("cherry-pick HEAD --mainline 2").unwrap(),
+            TimeCmd::CherryPick {
+                mainline: Some(2),
+                yes: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_time_args("reconcile failed-operation-1").unwrap(),
+            TimeCmd::Reconcile { yes: false, .. }
+        ));
+        assert!(parse_time_args("reconcile ../escape --yes").is_err());
+        assert!(parse_time_args("reconcile 42 --yes").is_err());
+        assert!(parse_time_args("reconcile failed-operation-1 --force").is_err());
+        assert!(unsupported_time_hint("merge topic").is_none());
+        assert!(unsupported_time_hint("cherry-pick HEAD").is_none());
+        for bad in [
+            "merge 42",
+            "merge HEAD --force",
+            "cherry-pick",
+            "cherry-pick 42",
+            "cherry-pick HEAD --mainline 0",
+            "cherry-pick HEAD --skip",
+        ] {
+            assert!(parse_time_args(bad).is_err(), "accepted {bad}");
+        }
+        assert!(parse_time_args("undo HEAD --mainline 0").is_err());
+        assert!(parse_time_args("redo --yes").is_err());
+    }
+
+    #[test]
+    fn inspection_limits_and_extra_arguments_are_rejected() {
+        for input in [
+            "history --limit 0",
+            "history --limit 1001",
+            "status --force",
+            "reflog 42",
+            "branches main",
+            "remove topic --force",
+        ] {
+            assert!(parse_time_args(input).is_err(), "accepted {input}");
         }
     }
 }
 
-/// Rewind to everything a checkpoint holds: the working tree, plus the conversation when that
-/// checkpoint captured one.
-///
-/// There is no Files / Task / Both question any more — picking a row in the time machine means "put me
-/// back there", and what that restores is a property of the checkpoint, not a choice to re-litigate.
-/// A `/checkpoint` (or one saved from the picker) carries a chat sidecar and rewinds code + chat; an
-/// auto/agent checkpoint has no sidecar and rewinds code only, which the row already says.
-fn restore_checkpoint(
-    snap: &timemachine::Snapshot,
-    history: &mut Vec<Message>,
-    model_label: &mut str,
-) -> Result<()> {
-    // Files-only checkpoints (auto/agent) have no chat to restore.
-    if !snap.has_chat {
-        return files_restore(snap.id);
-    }
-    // Preflight and durably back up chat BEFORE files move. The live `history` is only assigned
-    // after file restore succeeds, so a failed files phase cannot leave files/chat divergent.
-    let chat = timemachine::load_chat_checked(snap.id)?;
-    if chat.is_empty() {
-        bail!("checkpoint #{} has an empty saved conversation", snap.id);
-    }
-    let backup = current_session_slug().unwrap_or_else(|| allocate_session_slug(history));
-    save_session(history, &backup, Some(model_label))
-        .context("backing up the current conversation before restore")?;
-    files_restore(snap.id)?;
-    *history = chat;
-    migrate_legacy_prompt_lanes(history, model_label);
-    refresh_prompt_lanes_for_thread_switch(history, model_label);
-    // The rewound thread continues under a NEW file — keeping the old slug would make the
-    // next autosave overwrite the backup that was just written.
-    set_session_slug(None);
-    update_live_history(history);
-    println!(
-        "{} #{} — files and conversation rewound",
-        style("⏪ restored").color256(splash::ACCENT),
-        snap.id
-    );
-    println!(
-        "{}",
-        style(format!(
-            "  (your previous chat was saved as “{backup}” — /sessions to get it back)"
-        ))
-        .dim()
-    );
-    Ok(())
-}
+#[cfg(test)]
+mod operation_inspection_args_tests {
+    use super::*;
 
-/// Rewind only the working tree to checkpoint `id` (reversible — pre-restore tree auto-saved).
-fn files_restore(id: u32) -> Result<()> {
-    let s = timemachine::restore(id).with_context(|| format!("restoring checkpoint #{id}"))?;
-    println!(
-        "{} #{} — files rewound; your chat is untouched",
-        style("⏪ restored").color256(splash::ACCENT),
-        s.id
-    );
-    println!(
-        "{}",
-        style("  (reversible — the pre-restore tree was auto-saved; pick it to go back)").dim()
-    );
-    Ok(())
-}
-
-/// Name the files a restore removed because the target checkpoint never had them (E5.1). They are
-/// all in the checkpoint the restore saved first, so `aizen time redo` brings them back.
-fn print_removed(removed: &[String]) {
-    if removed.is_empty() {
-        return;
+    #[test]
+    fn exact_operation_inspection_preserves_list_grammar_and_refuses_other_actions() {
+        assert!(matches!(
+            parse_time_args("operations").unwrap(),
+            TimeCmd::Operations { receipt: None }
+        ));
+        assert!(
+            matches!(parse_time_args("operations --receipt failed-operation-1").unwrap(),
+            TimeCmd::Operations { receipt: Some(id) } if id == "failed-operation-1")
+        );
+        for input in [
+            "operations --receipt",
+            "operations --receipt ../escape",
+            "operations --receipt 42",
+            "operations --receipt valid-id --yes",
+            "operations --receipt valid-id --force",
+            "operations --receipt one-id --receipt two-id",
+        ] {
+            assert!(parse_time_args(input).is_err(), "accepted {input}");
+        }
     }
-    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
-    let more = removed.len().saturating_sub(shown.len());
-    println!(
-        "{}",
-        style(format!(
-            "  removed {} file(s) that checkpoint never had: {}{}",
-            removed.len(),
-            shown.join(", "),
-            if more > 0 {
-                format!(" (+{more} more)")
-            } else {
-                String::new()
-            }
-        ))
-        .dim()
-    );
 }

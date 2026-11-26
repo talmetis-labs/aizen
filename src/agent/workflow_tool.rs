@@ -1,7 +1,7 @@
 //! `workflow` — the model-callable fan-out primitive (deterministic orchestration IN conversation).
 //!
 //! `aizen workflow` (workflow.rs) is CLI-only: the model can't invoke it, so multi-agent patterns had
-//! to be narrated serially through `task`. This tool exposes the same bounded fan-out with three
+//! to be narrated serially through `task`. This tool exposes the same bounded fan-out with four
 //! modes, keeping control flow in CODE and content in the model (the workflows-over-agents rule):
 //!
 //! - `fanout`: run tasks concurrently (you decide how many), then one synthesis pass
@@ -15,6 +15,7 @@
 //! - `verify`: the adversarial-refuter preset — each finding gets a read-only reviewer explicitly
 //!   prompted to REFUTE it (industrially measured at ~0.93 accuracy filtering false positives).
 //!   No synthesis: the per-finding verdicts return raw.
+//! - `propose_edits`: independent readers of one file return exact replacements to the parent.
 //!
 //! Registered by default at depth 0 so a fresh install always has a real fan-out primitive. Users
 //! who prefer the smaller top-level schema can opt out with `workflow_tool: false`. Depth 0 only,
@@ -48,6 +49,102 @@ struct PreparedWorkflowDispatch {
     synthesize: bool,
     read_only: bool,
     parent_ctx: crate::core::exec_ctx::ExecutionContext,
+}
+
+/// A proposal is read-only. Only a refused attempt to apply the batch creates
+/// outstanding work, and writing a different file cannot clear it.
+#[derive(Default)]
+pub(super) struct ProposalApplications(std::collections::HashMap<String, bool>);
+
+impl ProposalApplications {
+    pub(super) fn observe(
+        &mut self,
+        cfg: &super::AgentConfig,
+        registry: &super::tools::ToolRegistry,
+        call: &crate::core::types::ToolCall,
+        execution: &super::tools::ToolExecution,
+    ) {
+        let name = call.function.name.as_str();
+        if name == "workflow" && execution.failure.is_none() {
+            if let Some(dispatch) = execution
+                .prepared
+                .as_ref()
+                .and_then(|p| p.delegation.as_ref())
+                .and_then(|d| d.downcast_ref::<PreparedWorkflowDispatch>())
+                .filter(|d| d.spec.name == "propose_edits")
+            {
+                if let Some(super::workflow::WorkflowDispatchMode::ScopedNative(scope)) = dispatch
+                    .spec
+                    .tasks
+                    .first()
+                    .map(super::workflow::workflow_dispatch_mode)
+                {
+                    for resource in scope.resources() {
+                        self.0.entry(resource.key().to_owned()).or_insert(false);
+                    }
+                }
+            }
+        }
+        if self.0.is_empty() {
+            return;
+        }
+        if name == "file_edit" && execution.failure.is_some() {
+            // A match failure often happens before a PreparedToolCall exists.
+            if let Ok(args) = super::parse_call_args(&call.function.arguments) {
+                if args.get("edits").is_some_and(Value::is_array)
+                    && args.get("dry_run").and_then(Value::as_bool) != Some(true)
+                {
+                    if let Some(path) = super::edit_target_file(&cfg.effective_root(), &args) {
+                        self.mark(&path, true);
+                    }
+                }
+            }
+            return;
+        }
+        if self.rejected()
+            && registry
+                .get(name)
+                .is_some_and(|tool| execution.changed_workspace(tool))
+        {
+            if let Some(prepared) = execution.prepared.as_ref() {
+                for path in super::prepared_edit_paths(&cfg.effective_root(), name, prepared) {
+                    self.mark(&path, false);
+                }
+            }
+        }
+    }
+
+    fn mark(&mut self, path: &std::path::Path, value: bool) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        if let Ok(target) = crate::core::workspace_txn::NativeResource::resolve(&path) {
+            if let Some(rejected) = self.0.get_mut(target.key()) {
+                *rejected = value;
+            }
+        }
+    }
+
+    pub(super) fn rejected(&self) -> bool {
+        self.0.values().any(|rejected| *rejected)
+    }
+}
+
+/// Only a host-prepared effect-free reader can replace the generic tool observer window.
+pub(crate) fn prepared_wall_deadline(call: &PreparedToolCall) -> Option<std::time::Instant> {
+    let frozen = call
+        .delegation
+        .as_ref()?
+        .downcast_ref::<PreparedWorkflowDispatch>()?;
+    if !frozen.read_only || !workflow_has_no_outward_effects(&frozen.spec) {
+        return None;
+    }
+    let deadline =
+        super::workflow::prepared_workflow_wall_deadline(&frozen.spec, frozen.synthesize)?;
+    Some(
+        frozen
+            .parent_ctx
+            .deadline()
+            .map_or(deadline, |parent| deadline.min(parent)),
+    )
 }
 
 impl WorkflowTool {
@@ -85,6 +182,53 @@ fn refuter_prompt(finding: &str) -> String {
          take the claim at face value. Reply with exactly one line `verdict: confirmed` or \
          `verdict: refuted` or `verdict: uncertain`, then your evidence with file:line.\n\nFINDING:\n{finding}"
     )
+}
+
+fn propose_edits_spec(args: &Value) -> Result<WorkflowSpec> {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| {
+            !path.is_empty()
+                && path.len() <= 4096
+                && path.trim() == *path
+                && !path.chars().any(char::is_control)
+        })
+        .ok_or_else(|| anyhow::anyhow!("propose_edits requires one exact file path"))?;
+    let parts = args
+        .get("parts")
+        .and_then(Value::as_array)
+        .filter(|parts| (2..=32).contains(&parts.len()))
+        .ok_or_else(|| anyhow::anyhow!("propose_edits requires 2..=32 independent changes"))?;
+    let contract = serde_json::json!({
+        "type":"object", "required":["edits"], "properties":{"edits":{
+            "type":"array", "items":{"type":"object", "required":["old_string","new_string"],
+            "properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}}}
+        }}
+    });
+    let mut tasks = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let brief = part
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("part {} needs a change description", index + 1))?;
+        tasks.push(WorkflowTask {
+            id: format!("proposal-{}", index + 1),
+            role: "metis".into(),
+            prompt: format!("Read {path} with file_read and propose only this change: {brief}"),
+            read_paths: Some(vec![path.to_owned()]),
+            expected_output: Some("Copy each nonempty old_string exactly with enough unique context. Supply the replacement in new_string. Return an empty edits array if the change is already satisfied or cannot be grounded in this file.".into()),
+            expects: Some(contract.clone()),
+            ..Default::default()
+        });
+    }
+    Ok(WorkflowSpec {
+        name: "propose_edits".into(),
+        tasks,
+        synthesis: None,
+        prepared_synthesis: None,
+    })
 }
 
 /// The `implement` preset: daedalus makes the change, themis verifies it (report opening with
@@ -153,6 +297,7 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
         .and_then(|v| v.as_str())
         .unwrap_or("fanout");
     match mode {
+        "propose_edits" => Ok((propose_edits_spec(args)?, false)),
         "fanout" => {
             let tasks_in = args
                 .get("tasks")
@@ -188,7 +333,14 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                     prepared: None,
                     prepared_metis: None,
                     attempt: None,
-                    overlay: None,
+                    owned: None,
+                    git_base: None,
+                    git_prerequisites: Vec::new(),
+                    isolation: match t.get("isolation") {
+                        None => crate::agent::workflow::WorkflowIsolation::Shared,
+                        Some(Value::String(mode)) if mode == "worktree" => crate::agent::workflow::WorkflowIsolation::Worktree,
+                        _ => bail!("workflow isolation must be worktree or omitted"),
+                    },
                     execution: crate::agent::speculation::ExecutionMode::from_args(t)?,
                     id: t
                         .get("id")
@@ -347,7 +499,9 @@ pub(crate) fn build_spec(args: &Value) -> Result<(WorkflowSpec, bool)> {
                 false,
             ))
         }
-        other => bail!("unknown workflow mode '{other}' (use fanout, implement or verify)"),
+        other => bail!(
+            "unknown workflow mode '{other}' (use fanout, implement, verify or propose_edits)"
+        ),
     }
 }
 
@@ -366,36 +520,37 @@ impl Tool for WorkflowTool {
         "workflow"
     }
     fn description(&self) -> &str {
-        "Fanout after reports; implement edit→test→review + one FAIL retry; verify refuters. \
-         Parent verifies edits; opaque work serializes. No restore/undo."
+        "Run dependent tasks, implement changes, or verify findings. propose_edits gathers one file's edit proposals for the parent to apply and verify."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["fanout", "implement", "verify"], "description": "fanout=tasks; implement=prompt; verify=findings"},
+                "mode": {"type": "string", "enum": ["fanout", "implement", "verify", "propose_edits"], "description": "fanout=tasks, implement=prompt, verify=findings, propose_edits=path+parts"},
+                "path": {"type":"string","maxLength":4096,"description":"existing file"},
+                "parts": {"type":"array","minItems":2,"maxItems":32,"items":{"type":"string","minLength":1},"description":"independent edits"},
                 "prompt": {"type": "string"},
                 "tasks": {"type": "array", "maxItems": 32, "items": {"type": "object", "properties": {
                     "id": {"type": "string"},
                     "prompt": {"type": "string"},
-                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "nemesis=read(default); daedalus=edit; themis=test"},
-                    "agent": {"type": "string", "description": "<agents> slug"},
+                    "role": {"type": "string", "enum": ["argus", "metis", "daedalus", "nemesis", "themis", "clio", "mnemosyne"], "description": "nemesis=default, daedalus=edit, themis=test"},
+                    "agent": {"type": "string", "description": "agent slug"},
                     "model": {"type": "string"},
-                    "execution": {"type":"string", "enum":["direct", "speculative"], "description":"Private native edits; parent integrates/verifies. No hooks/shell/media."},
-                    "reference_ids": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","maxLength":128},"description":"Conversation refs; live grant."},
-                    "return_evidence": {"type":"array","maxItems":4,"items":{"type":"string","maxLength":128},"description":"Final child captures or @latest_capture (one screenshot); no inherited refs"},
+                    "execution": {"type":"string", "enum":["direct"]},
+                    "reference_ids": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","maxLength":128},"description":"granted refs"},
+                    "return_evidence": {"type":"array","maxItems":4,"items":{"type":"string","maxLength":128},"description":"child captures or @latest_capture"},
                     "boundaries": {"type": "string"},
-                    "read_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"Exact native reads; read-only without write_paths; union <=32 files"},
-                    "write_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"read/write union; parent integrates"},
+                    "read_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"exact files"},
+                    "write_paths": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description":"exact edits"},
                     "expected_output": {"type": "string"},
-                    "context": {"type": "array", "items": {"type": "string"}, "description":"known findings, <=10 lines"},
-                    "max_steps": {"type": "integer", "description": "steps; cap 80"},
-                    "expects": {"type": "object", "description": "JSON-only answer schema"},
-                    "after": {"type": "array", "items": {"type": "string"}, "description":"prerequisite task IDs"},
-                    "retry_on_fail": {"type": "string", "description":"after ID: retry+rereview on VERDICT: FAIL"}
+                    "context": {"type": "array", "items": {"type": "string"}},
+                    "max_steps": {"type": "integer"},
+                    "expects": {"type": "object", "description": "JSON answer schema"},
+                    "after": {"type": "array", "items": {"type": "string"}, "description":"dependency IDs"},
+                    "retry_on_fail": {"type": "string", "description":"retry ID on VERDICT: FAIL"}
                 }, "required": ["prompt"], "additionalProperties": false}},
                 "synthesis": {"type": "string"},
-                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description":"verify claims: file:line"}
+                "findings": {"type": "array", "maxItems": 32, "items": {"type": "string"}, "description":"claims with file:line"}
             },
             "required": ["mode"],
             "additionalProperties": false
@@ -477,7 +632,7 @@ impl Tool for WorkflowTool {
     }
     fn workspace_target_prepared(&self, call: &PreparedToolCall) -> Option<PathBuf> {
         self.workspace_effect_prepared(call)
-            .needs_checkpoint()
+            .mutates_workspace()
             .then(|| self.root.clone())
     }
     fn execute_prepared(&self, call: &PreparedToolCall) -> Result<ToolObservation> {
@@ -528,25 +683,31 @@ impl WorkflowTool {
         // Keep the actual preparation carrier through the async driver; driver TLS cannot narrow or
         // silently add authority to this already-approved workflow.
         let exec_ctx = dispatch.parent_ctx.clone();
-        finish_workflow_dispatch(tokio::task::block_in_place(|| {
+        let mut observation = finish_workflow_dispatch(tokio::task::block_in_place(|| {
             crate::core::cancel::with_current(cancel, || {
                 crate::core::exec_ctx::with_current(exec_ctx, || {
                     // Every child and synthesis captures its own wire effort without touching a
                     // process-global override shared with concurrent runs.
-                    tokio::runtime::Handle::current().block_on(run_workflow_collect_observation(
-                        &client,
-                        &base,
-                        &key,
-                        &model,
-                        approval,
-                        spec,
-                        synthesize,
-                        &self.root,
-                        self.context_window,
+                    tokio::runtime::Handle::current().block_on(Box::pin(
+                        run_workflow_collect_observation(
+                            &client,
+                            &base,
+                            &key,
+                            &model,
+                            approval,
+                            spec,
+                            synthesize,
+                            &self.root,
+                            self.context_window,
+                        ),
                     ))
                 })
             })
-        }))
+        }))?;
+        if spec.name == "propose_edits" {
+            observation.text.insert_str(0, "Read-only edit proposals. Check each report against the current file and requested behavior. Resolve overlaps or missing changes before submitting one reviewed file_edit with edits[], then verify.\n\n");
+        }
+        Ok(observation)
     }
 }
 
@@ -642,6 +803,38 @@ mod tests {
             tool.result_is_error("VERDICT: PASS\nscoped findings"),
             Some(false)
         );
+    }
+
+    #[test]
+    fn proposals_use_one_read_scope_and_return_raw_contracts() {
+        let mut args = serde_json::json!({"mode":"propose_edits","path":"calc.rs","parts":["simplify addition","simplify subtraction"]});
+        let (spec, synthesize) = build_spec(&args).unwrap();
+        assert!(!synthesize);
+        assert_eq!(spec.tasks.len(), 2);
+        for task in &spec.tasks {
+            assert_eq!(task.read_paths.as_ref().unwrap(), &["calc.rs"]);
+            assert!(task.write_paths.is_none() && task.agent.is_none());
+            assert!(!task_is_writer(&task.role, None));
+            let schema = task.expects.as_ref().unwrap();
+            assert!(crate::agent::task_tool::validate_contract(
+                r#"{"edits":[{"old_string":"x","new_string":"y"}]}"#,
+                schema
+            )
+            .is_ok());
+            assert!(crate::agent::task_tool::validate_contract(
+                r#"{"edits":[{"new_string":"y"}]}"#,
+                schema
+            )
+            .is_err());
+        }
+        for parts in [
+            serde_json::json!(["x"]),
+            serde_json::json!(["first", "  "]),
+            serde_json::json!(["first", 3]),
+        ] {
+            args["parts"] = parts;
+            assert!(build_spec(&args).is_err());
+        }
     }
 
     #[test]
@@ -948,3 +1141,7 @@ mod tests {
         assert!(err.to_string().contains("depth-capped"), "{err}");
     }
 }
+
+#[cfg(test)]
+#[path = "workflow_time_budget_tests.rs"]
+mod time_budget_tests;

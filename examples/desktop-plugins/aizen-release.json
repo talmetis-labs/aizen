@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "slug": "bang-cong-viec-mau",
+  "version": "1.0.0",
+  "desktop": {
+    "uiApiVersion": 1,
+    "views": [
+      {
+        "type": "board",
+        "id": "board",
+        "title": "Bảng công việc",
+        "columns": [
+          { "id": "todo", "title": "Cần làm" },
+          { "id": "doing", "title": "Đang làm" },
+          { "id": "done", "title": "Hoàn tất" }
+        ]
+      },
+      { "type": "calculator", "id": "calculator", "title": "Máy tính" }
+    ]
+  }
+}

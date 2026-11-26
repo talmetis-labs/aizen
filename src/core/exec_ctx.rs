@@ -37,7 +37,7 @@
 
 use crate::core::convo::ConversationId;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Volatile ownership accounting for one speculative attempt.
@@ -149,6 +149,63 @@ impl WorkspaceChanges {
 pub struct ApprovalRoute {
     pub route: String,
     pub chat: String,
+    pub sender_id: Option<String>,
+}
+
+/// Host-only provenance for prepared calls. It identifies one immutable placement, not live Git
+/// ancestry or a mutable session focus. Moving to another placement mints a new token; existing
+/// children retain their original one. Full focus must additionally settle/rebind all host scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceBinding {
+    generation: u64,
+    workspace_root: std::path::PathBuf,
+    project_root: std::path::PathBuf,
+    home_root: std::path::PathBuf,
+}
+
+impl WorkspaceBinding {
+    fn new(placement: &crate::core::file_placement::PlacementContext) -> Self {
+        Self {
+            generation: next_workspace_generation(),
+            workspace_root: placement.workspace_root().to_path_buf(),
+            project_root: placement.project_root().to_path_buf(),
+            home_root: placement.home_root().to_path_buf(),
+        }
+    }
+
+    fn matches_placement(&self, placement: &crate::core::file_placement::PlacementContext) -> bool {
+        self.workspace_root == placement.workspace_root()
+            && self.project_root == placement.project_root()
+            && self.home_root == placement.home_root()
+    }
+}
+
+/// A host-only placement snapshot that retains prepared-call provenance when a fresh turn is built.
+/// It carries no task, policy, admission, resource scope, or authority from the originating turn.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspacePlacement {
+    placement: crate::core::file_placement::PlacementContext,
+    binding: WorkspaceBinding,
+}
+
+static NEXT_WORKSPACE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_workspace_generation() -> u64 {
+    let mut current = NEXT_WORKSPACE_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("workspace binding generation exhausted");
+        match NEXT_WORKSPACE_GENERATION.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Immutable per-turn identity. Cheap to clone (one `Arc` bump); shared by a top-level turn and every
@@ -174,22 +231,35 @@ struct Inner {
     dispatch_label: Option<String>,
     /// Conversation-owned design state; cloned handles share a task, delegated children fork it.
     design: Option<crate::agent::design::DesignContext>,
+    /// Owned checklist authority; never resolved through a process-global task list.
+    task: Option<crate::agent::todo::TaskContext>,
+    /// Frozen conversation permission, independent of private/reset task state.
+    policy: Option<crate::core::session_control::ExecutionPolicy>,
+    /// Kept by every executable fork until the last physical worker settles.
+    policy_lease: Option<Arc<crate::core::session_control::PolicyLease>>,
+    /// Single native document operation, armed only inside its guarded write closure.
+    plan_write_proof: Option<Arc<crate::agent::planning_write::PlanWriteProof>>,
+    /// Live-tree ancestors receive effect invalidation, never observation/check authority.
+    task_effect_sinks: Vec<crate::agent::todo::TaskContext>,
     /// Immutable destination roots/run scope pinned from AgentConfig::effective_root by executor.
     placement: Option<crate::core::file_placement::PlacementContext>,
+    /// Immutable workspace placement and controller generation. A child inherits this binding unless
+    /// an explicit owned-worktree fork supplies a new placement/generation.
+    binding: Option<WorkspaceBinding>,
     /// Clone within one logical run; explicitly fork for a delegated child or fresh user work.
-    recovery: crate::features::timemachine::RunRecovery,
+    recovery: crate::core::run_recovery::RunRecovery,
     /// Only the coordinating parent may restore workspace state; delegation revokes this permanently.
     restore_authorized: bool,
     /// Exact file authority, inherited monotonically across retries and nested contexts.
     native_scope: Option<crate::core::native_scope::NativeWriteScope>,
-    /// Controller-owned immutable lane binding; changing other context fields cannot remove it.
-    overlay: Option<crate::core::speculation::store::OverlayHandle>,
     workspace_activities: Vec<Arc<crate::core::workspace_txn::WorkspaceActivity>>,
     workspace_changes: Vec<Arc<WorkspaceChanges>>,
+    /// Retain the separately registered Git task owner through every physical child worker.
+    owned_git_task: Option<Arc<crate::core::git_ops::OwnedTask>>,
+    /// Lifetime-only controller retention for Git preparation/inspection workers, not native authority.
+    owned_task_allocation_owner: Option<Arc<crate::core::git_ops::OwnedTaskAllocationOwner>>,
     #[cfg(test)]
     native_body_probe: Option<crate::agent::builtin::NativeBodyTestProbe>,
-    #[cfg(test)]
-    speculative_driver_join_probe: Option<crate::agent::tools::workers::WorkerJoinTestProbe>,
     /// Physical execution keeps admission charged while any blocking tool worker still owns it.
     attempt_slot: Option<Arc<crate::agent::task_tool::SubagentSlot>>,
     /// Weak launch admission only; the controller owns physical body joins separately.
@@ -223,17 +293,22 @@ impl Default for Inner {
             approval_route: None,
             dispatch_label: None,
             design: None,
+            task: None,
+            policy: None,
+            policy_lease: None,
+            plan_write_proof: None,
+            task_effect_sinks: Vec::new(),
             placement: None,
-            recovery: crate::features::timemachine::RunRecovery::default(),
+            binding: None,
+            recovery: crate::core::run_recovery::RunRecovery::default(),
             restore_authorized: true,
             native_scope: None,
-            overlay: None,
             workspace_activities: Vec::new(),
             workspace_changes: Vec::new(),
+            owned_git_task: None,
+            owned_task_allocation_owner: None,
             #[cfg(test)]
             native_body_probe: None,
-            #[cfg(test)]
-            speculative_driver_join_probe: None,
             attempt_carrier: None,
             attempt_slot: None,
             tool_workers: None,
@@ -247,6 +322,24 @@ impl Default for Inner {
             #[cfg(test)]
             test_lock_namespace: crate::core::workspace_txn::explicit_test_lock_namespace(),
         }
+    }
+}
+
+/// A native read's pre-operation owner/requirement/epoch, never constructible from tool output.
+pub(crate) struct TaskObservation {
+    task: crate::agent::todo::TaskContext,
+    token: crate::agent::todo::EvidenceToken,
+    target: String,
+    path: std::path::PathBuf,
+}
+
+impl TaskObservation {
+    pub(crate) fn record(self, fingerprint: &crate::core::persist::FileFingerprint) {
+        // Evidence admission is best-effort: a stale token/capacity refusal must not turn a
+        // successful file read into a misleading tool failure, nor fabricate completion.
+        let _ = self
+            .task
+            .record_file_observation(self.token, self.target, &self.path, fingerprint);
     }
 }
 
@@ -290,17 +383,22 @@ impl ExecutionContext {
             approval_route: self.0.approval_route.clone(),
             dispatch_label: self.0.dispatch_label.clone(),
             design: self.0.design.clone(),
+            task: self.0.task.clone(),
+            policy: self.0.policy.clone(),
+            policy_lease: self.0.policy_lease.clone(),
+            plan_write_proof: self.0.plan_write_proof.clone(),
+            task_effect_sinks: self.0.task_effect_sinks.clone(),
             placement: self.0.placement.clone(),
+            binding: self.0.binding.clone(),
             recovery: self.0.recovery.clone(),
             restore_authorized: self.0.restore_authorized,
             native_scope: self.0.native_scope.clone(),
-            overlay: self.0.overlay.clone(),
             workspace_activities: self.0.workspace_activities.clone(),
             workspace_changes: self.0.workspace_changes.clone(),
+            owned_git_task: self.0.owned_git_task.clone(),
+            owned_task_allocation_owner: self.0.owned_task_allocation_owner.clone(),
             #[cfg(test)]
             native_body_probe: self.0.native_body_probe.clone(),
-            #[cfg(test)]
-            speculative_driver_join_probe: self.0.speculative_driver_join_probe.clone(),
             attempt_carrier: self.0.attempt_carrier.clone(),
             attempt_slot: self.0.attempt_slot.clone(),
             tool_workers: self.0.tool_workers.clone(),
@@ -386,6 +484,25 @@ impl ExecutionContext {
             if i.resource_scope.as_deref() != Some(scope.as_str()) {
                 i.tool_images = Arc::new(std::sync::Mutex::new(Vec::new()));
                 i.visual = Arc::new(std::sync::Mutex::new(Default::default()));
+                // Child scratch work must never acquire the parent's checklist authority.
+                // Keep only an invalidation sink: a failed child can still have changed live files.
+                if let Some(parent) = i.task.take() {
+                    if i.policy.is_none() {
+                        i.policy = Some(parent.control().policy());
+                    }
+                    if !i
+                        .task_effect_sinks
+                        .iter()
+                        .any(|sink| sink.same_owner(&parent))
+                    {
+                        i.task_effect_sinks.push(parent);
+                    }
+                }
+                let task = crate::agent::todo::TaskContext::private();
+                i.task = Some(match &i.policy {
+                    Some(policy) => task.with_control(policy.context()),
+                    None => task,
+                });
             }
             i.resource_scope = Some(scope);
         })
@@ -430,6 +547,97 @@ impl ExecutionContext {
     pub fn dispatch_label(&self) -> Option<String> {
         self.0.dispatch_label.clone()
     }
+    pub fn with_task(&self, task: crate::agent::todo::TaskContext) -> Self {
+        self.with(|i| {
+            let task = if let Some(policy) = &i.policy {
+                task.with_control(policy.context())
+            } else {
+                i.policy = Some(task.control().policy());
+                task
+            };
+            i.task = Some(task);
+        })
+    }
+
+    pub(crate) fn policy(&self) -> Option<&crate::core::session_control::ExecutionPolicy> {
+        self.0.policy.as_ref()
+    }
+
+    pub(crate) fn is_planning(&self) -> bool {
+        self.policy().is_some_and(|policy| policy.is_planning())
+    }
+
+    /// Freeze admission into the context so detached worker clones retain it after observer exit.
+    pub(crate) fn admit_policy(&self) -> anyhow::Result<Self> {
+        let policy = self
+            .policy()
+            .ok_or_else(|| anyhow::anyhow!("execution policy is missing"))?;
+        policy.validate_current()?;
+        if let Some(parent) = crate::agent::planning::current_policy() {
+            parent.check_inheritance(policy)?;
+        }
+        if self.0.policy_lease.is_some() {
+            return Ok(self.clone());
+        }
+        let lease = Arc::new(policy.admit()?);
+        Ok(self.with(|i| i.policy_lease = Some(lease)))
+    }
+
+    /// Host automation is not a model tool; it must consult the same immutable restriction.
+    pub(crate) fn permits_automation(&self) -> bool {
+        let owned = self
+            .policy()
+            .cloned()
+            .or_else(|| self.task().map(|task| task.control().policy()));
+        let inherited = crate::agent::planning::current_policy();
+        if let (Some(parent), Some(owned)) = (&inherited, &owned) {
+            if parent.check_inheritance(owned).is_err() {
+                return false;
+            }
+        }
+        owned
+            .or(inherited)
+            .is_none_or(|policy| policy.validate_current().is_ok() && !policy.is_planning())
+    }
+
+    pub fn task(&self) -> Option<&crate::agent::todo::TaskContext> {
+        self.0.task.as_ref()
+    }
+
+    /// Capture only an explicitly requested exact native file, before reading its bytes.
+    /// Relative requirements are resolved against the tool's pinned root, never process cwd.
+    pub(crate) fn capture_task_observation(
+        &self,
+        path: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Option<TaskObservation> {
+        let task = self.task()?;
+        let absolute = path.to_str()?;
+        let relative = path.strip_prefix(root).ok().and_then(|path| path.to_str());
+        for target in std::iter::once(absolute).chain(relative) {
+            if let Some(token) = task.observation_capture(target) {
+                return Some(TaskObservation {
+                    task: task.clone(),
+                    token,
+                    target: target.to_owned(),
+                    path: path.to_path_buf(),
+                });
+            }
+            let portable = target.replace('\\', "/");
+            if portable != target {
+                if let Some(token) = task.observation_capture(&portable) {
+                    return Some(TaskObservation {
+                        task: task.clone(),
+                        token,
+                        target: portable,
+                        path: path.to_path_buf(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
     pub fn with_design(&self, design: crate::agent::design::DesignContext) -> Self {
         self.with(|i| i.design = Some(design))
     }
@@ -641,11 +849,129 @@ impl ExecutionContext {
     /// Pin native file destination roots at the execution boundary. Children explicitly fork this
     /// snapshot with their actual workspace and resource scope; no workspace global is introduced.
     pub fn with_placement(&self, placement: crate::core::file_placement::PlacementContext) -> Self {
-        self.with(|i| i.placement = Some(placement))
+        self.with(|i| {
+            if !i
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.matches_placement(&placement))
+            {
+                i.binding = Some(WorkspaceBinding::new(&placement));
+            }
+            i.placement = Some(placement);
+        })
+    }
+
+    /// Capture workspace identity without retaining a previous turn's authority or admission.
+    pub(crate) fn workspace_snapshot(&self) -> Option<WorkspacePlacement> {
+        Some(WorkspacePlacement {
+            placement: self.placement()?.clone(),
+            binding: self.workspace_binding()?.clone(),
+        })
+    }
+
+    /// A new turn in the same host session inherits the exact token, not a new same-path identity.
+    pub(crate) fn with_workspace(&self, workspace: &WorkspacePlacement) -> Self {
+        self.with(|i| {
+            i.placement = Some(workspace.placement.clone());
+            i.binding = Some(workspace.binding.clone());
+        })
+    }
+
+    pub(crate) fn workspace_binding(&self) -> Option<&WorkspaceBinding> {
+        self.0.binding.as_ref()
+    }
+
+    pub(crate) fn require_current_binding(
+        &self,
+        prepared: Option<&WorkspaceBinding>,
+    ) -> anyhow::Result<()> {
+        // Legacy unbound standalone calls remain supported. Losing an existing bound provenance
+        // or moving an unbound prepared call into a bound execution context is not compatible.
+        anyhow::ensure!(
+            self.workspace_binding() == prepared,
+            "prepared workspace binding is stale or missing; prepare again in this context"
+        );
+        Ok(())
     }
 
     pub fn placement(&self) -> Option<&crate::core::file_placement::PlacementContext> {
         self.0.placement.as_ref()
+    }
+
+    /// Retain an already-admitted controller owner with inspection/preparation workers. This changes
+    /// no placement, binding, policy, native scope, writer admission, or restore authority.
+    pub(crate) fn with_owned_task_allocation_owner(
+        &self,
+        owner: Arc<crate::core::git_ops::OwnedTaskAllocationOwner>,
+    ) -> Self {
+        self.with(|i| i.owned_task_allocation_owner = Some(owner))
+    }
+
+    /// A fresh Git checkout does not mutate the parent's tree. Only the controller's native-only
+    /// lane may detach these effect collectors; inherited physical/policy guards remain retained.
+    pub(crate) fn for_owned_git_task(
+        &self,
+        task: Arc<crate::core::git_ops::OwnedTask>,
+        scope: crate::core::native_scope::NativeWriteScope,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.native_scope().is_none(),
+            "owned task cannot widen an existing lane"
+        );
+        for resource in scope.resources() {
+            anyhow::ensure!(
+                resource.path().starts_with(task.root()),
+                "owned native authority escapes worktree"
+            );
+        }
+        let placement = match self.placement() {
+            Some(p) => p.fork_for(task.root().to_path_buf(), task.scope())?,
+            None => crate::core::file_placement::PlacementContext::new(
+                task.root().to_path_buf(),
+                crate::core::config::aizen_home(),
+            )?
+            .fork_for(task.root().to_path_buf(), task.scope())?,
+        };
+        Ok(self
+            .with_resource_scope(task.scope())
+            .without_workspace_restore()
+            .with(|i| {
+                i.task_effect_sinks.clear();
+                i.workspace_activities.clear();
+                i.workspace_changes.clear();
+                i.plan_write_proof = None;
+                i.binding = Some(WorkspaceBinding::new(&placement));
+                i.placement = Some(placement);
+                i.native_scope = Some(scope);
+                i.owned_git_task = Some(task);
+            }))
+    }
+
+    /// Check the actual live allocation, never a reconstructed path, branch, or owner string.
+    pub(crate) fn require_owned_git_task(
+        &self,
+        task: &Arc<crate::core::git_ops::OwnedTask>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.0
+                .owned_git_task
+                .as_ref()
+                .is_some_and(|bound| Arc::ptr_eq(bound, task)),
+            "execution context belongs to another live Git task"
+        );
+        anyhow::ensure!(
+            !self.can_restore_workspace()
+                && self.resource_scope() == task.scope()
+                && self
+                    .placement()
+                    .is_some_and(|p| p.workspace_root() == task.root()),
+            "Git task context lost its exact native ownership binding"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn has_owned_git_task(&self) -> bool {
+        self.0.owned_git_task.is_some()
     }
 
     pub(crate) fn with_workspace_changes(&self, changes: Arc<WorkspaceChanges>) -> Self {
@@ -673,19 +999,72 @@ impl ExecutionContext {
         self.0.native_body_probe.as_ref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_speculative_driver_join_probe(
-        &self,
-        probe: crate::agent::tools::workers::WorkerJoinTestProbe,
-    ) -> Self {
-        self.with(|i| i.speculative_driver_join_probe = Some(probe))
+    /// Invalidate completion proof for each admitted opaque effect or actual native mutation.
+    /// This is ordered (every call advances the epoch), unlike the sticky path collector below.
+    pub(crate) fn note_task_effects(&self) {
+        let root = self
+            .placement()
+            .map(|placement| placement.workspace_root().to_path_buf())
+            .or_else(|| std::env::current_dir().ok());
+        self.note_task_effects_at(root.as_deref());
     }
 
-    #[cfg(test)]
-    pub(crate) fn speculative_driver_join_probe(
+    pub(crate) fn note_task_effects_at(&self, root: Option<&std::path::Path>) {
+        if let Some(task) = self.task() {
+            task.invalidate_effects_at(root);
+        }
+        for sink in &self.0.task_effect_sinks {
+            if self.task().is_none_or(|task| !task.same_owner(sink)) {
+                sink.invalidate_effects_at(root);
+            }
+        }
+    }
+
+    pub(crate) fn with_plan_write_proof(
         &self,
-    ) -> Option<&crate::agent::tools::workers::WorkerJoinTestProbe> {
-        self.0.speculative_driver_join_probe.as_ref()
+        proof: Arc<crate::agent::planning_write::PlanWriteProof>,
+    ) -> Self {
+        self.with(|i| i.plan_write_proof = Some(proof))
+    }
+
+    pub(crate) fn note_native_mutation(&self, paths: &[std::path::PathBuf]) {
+        if self
+            .0
+            .plan_write_proof
+            .as_ref()
+            .is_some_and(|proof| proof.record_mutation(self, paths))
+        {
+            if let Some(task) = self.task() {
+                task.invalidate_plan_write_effects();
+            }
+            for sink in &self.0.task_effect_sinks {
+                if self.task().is_none_or(|task| !task.same_owner(sink)) {
+                    sink.invalidate_plan_write_effects();
+                }
+            }
+            self.note_workspace_changes(paths);
+            return;
+        }
+        // Writes can land outside placement, or in several projects at once (for example a move).
+        // Preserve every actual verification root instead of recording an unresolvable unknown or
+        // letting the last root stand in for all earlier effects. Deleted targets still have a parent.
+        let mut roots = std::collections::BTreeSet::new();
+        for path in paths {
+            let root = std::path::absolute(path).ok().and_then(|path| {
+                let parent = path.parent()?;
+                let root = crate::agent::verify_gate::verify_root(parent)
+                    .unwrap_or_else(|| parent.to_path_buf());
+                Some(root.canonicalize().unwrap_or(root))
+            });
+            roots.insert(root);
+        }
+        if roots.is_empty() {
+            roots.insert(None);
+        }
+        for root in roots {
+            self.note_task_effects_at(root.as_deref());
+        }
+        self.note_workspace_changes(paths);
     }
 
     pub(crate) fn note_workspace_changes(&self, paths: &[std::path::PathBuf]) {
@@ -723,43 +1102,13 @@ impl ExecutionContext {
         scope: crate::core::native_scope::NativeWriteScope,
     ) -> anyhow::Result<Self> {
         if let Some(parent) = &self.0.native_scope {
-            if self.0.overlay.is_some() {
-                parent.check_narrowing_frozen(&scope)?;
-            } else {
-                parent.check_narrowing(&scope)?;
-            }
+            parent.check_narrowing(&scope)?;
         }
         Ok(self.with(|i| i.native_scope = Some(scope)))
     }
 
     pub(crate) fn native_scope(&self) -> Option<&crate::core::native_scope::NativeWriteScope> {
         self.0.native_scope.as_ref()
-    }
-
-    /// Only a controller-held handle can enter a private lane. Existing lanes cannot be replaced.
-    pub(crate) fn with_overlay(
-        &self,
-        overlay: crate::core::speculation::store::OverlayHandle,
-    ) -> anyhow::Result<Self> {
-        let scope = self.native_scope().ok_or_else(|| {
-            anyhow::anyhow!("a speculative overlay requires an exact native scope")
-        })?;
-        overlay.check_owner_scope(&self.resource_scope(), scope)?;
-        if let Some(current) = &self.0.overlay {
-            anyhow::ensure!(
-                current.same_handle(&overlay),
-                "cannot replace an active overlay"
-            );
-        }
-        Ok(self.with(|i| {
-            i.overlay = Some(overlay);
-            i.restore_authorized = false;
-            i.recovery = i.recovery.without_workspace_restore();
-        }))
-    }
-
-    pub(crate) fn overlay(&self) -> Option<&crate::core::speculation::store::OverlayHandle> {
-        self.0.overlay.as_ref()
     }
 
     /// Delegation revokes workspace restore authority; builders and retries cannot regrant it.
@@ -774,11 +1123,11 @@ impl ExecutionContext {
         self.0.restore_authorized
     }
 
-    pub fn recovery(&self) -> &crate::features::timemachine::RunRecovery {
+    pub fn recovery(&self) -> &crate::core::run_recovery::RunRecovery {
         &self.0.recovery
     }
 
-    pub fn with_recovery(&self, recovery: crate::features::timemachine::RunRecovery) -> Self {
+    pub fn with_recovery(&self, recovery: crate::core::run_recovery::RunRecovery) -> Self {
         self.with(|i| {
             i.restore_authorized &= recovery.can_restore_workspace();
             i.recovery = if i.restore_authorized {
@@ -790,7 +1139,7 @@ impl ExecutionContext {
     }
 
     pub fn fork_recovery(&self) -> Self {
-        self.with_recovery(crate::features::timemachine::RunRecovery::default())
+        self.with_recovery(crate::core::run_recovery::RunRecovery::default())
     }
 
     /// The turn's approval route, if any.
@@ -808,6 +1157,10 @@ impl Default for ExecutionContext {
 }
 
 thread_local! {
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "initializer is already const; Clippy 1.99 reports this macro invocation"
+    )]
     /// Stack of contexts active on THIS thread. A stack (not a single slot) so a nested
     /// `with_current` — e.g. a tool that re-enters the agent loop — restores the outer context on
     /// exit, exactly like [`crate::core::cancel`]'s token stack.
@@ -818,6 +1171,31 @@ thread_local! {
 /// panic, via the `Drop` guard). Must wrap the tool body INSIDE the `spawn_blocking` closure — a
 /// context pushed on the driver thread is invisible on the worker thread the body actually runs on.
 pub fn with_current<T>(ctx: ExecutionContext, f: impl FnOnce() -> T) -> T {
+    // A nested shared-body caller cannot erase the originating restriction by constructing a
+    // default/private context. Preserve its frozen view (including staleness), never reread a
+    // newer owner state that could widen permission.
+    let parent = current();
+    let inherited = crate::agent::planning::current_policy()
+        .filter(|policy| policy.is_planning() || policy.validate_current().is_err());
+    let ctx = if let Some(policy) = inherited {
+        ctx.with(|inner| {
+            let own_admission = inner
+                .policy
+                .as_ref()
+                .filter(|own| policy.check_inheritance(own).is_ok())
+                .and_then(|_| inner.policy_lease.clone());
+            inner.policy = Some(policy.clone());
+            inner.policy_lease = parent
+                .as_ref()
+                .and_then(|parent| parent.0.policy_lease.clone())
+                .or(own_admission);
+            if let Some(task) = inner.task.take() {
+                inner.task = Some(task.with_control(policy.context()));
+            }
+        })
+    } else {
+        ctx
+    };
     struct Pop;
     impl Drop for Pop {
         fn drop(&mut self) {
@@ -832,6 +1210,33 @@ pub fn with_current<T>(ctx: ExecutionContext, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Bind a captured context on each poll, never across an await on a shared runtime thread.
+/// The future owns the context (and any admission) even if its original observer returns early.
+pub(crate) fn with_current_future<F: std::future::Future>(
+    ctx: ExecutionContext,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    // Box before returning the wrapper, not on its first poll: an async fn would retain the
+    // entire unpolled child inline through nested agent/tool/runtime frames. Construction still
+    // neither polls the child nor binds CURRENT. The small async shell keeps the original
+    // completion behavior: Ready drops the inner future and context even if the shell is retained.
+    let mut future = Box::pin(future);
+    async move {
+        std::future::poll_fn(move |cx| with_current(ctx.clone(), || future.as_mut().poll(cx))).await
+    }
+}
+
+/// Controller-only synchronous completion of focus inside the currently executing REPL poll.
+/// The enclosing `with_current` still restores its caller on return. A queued ready submission may
+/// run before the next poll, so updating only the session handle would otherwise leave it on A.
+pub(crate) fn rebind_current_workspace(workspace: &WorkspacePlacement) {
+    CURRENT.with(|slot| {
+        if let Some(context) = slot.borrow_mut().last_mut() {
+            *context = context.with_workspace(workspace);
+        }
+    });
+}
+
 /// The context of the currently executing synchronous tool body, if any. `None` on a thread with no
 /// pinned turn (e.g. a caller reading before any `with_current` wrap) — callers fall back to their
 /// process-global slot.
@@ -839,9 +1244,313 @@ pub fn current() -> Option<ExecutionContext> {
     CURRENT.with(|slot| slot.borrow().last().cloned())
 }
 
+/// Actual synchronous native mutation, called before fallible post-write bookkeeping.
+pub(crate) fn note_native_mutation(path: &std::path::Path) {
+    if let Some(ctx) = current() {
+        ctx.note_native_mutation(&[path.to_path_buf()]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_future_large_unpolled_body_stays_out_of_wrapper_state() {
+        struct LargeFuture {
+            _padding: [u8; 256 * 1024],
+        }
+        impl std::future::Future for LargeFuture {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                std::task::Poll::Ready(())
+            }
+        }
+        fn future_type_bytes<F: std::future::Future>(
+            _factory: fn(ExecutionContext, LargeFuture) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Measure the type only. Constructing the deliberately large input on the test stack
+        // would conflate the regression with the stack space needed by the fixture itself.
+        let bytes = future_type_bytes(with_current_future::<LargeFuture>);
+        assert!(bytes <= 1024, "unpolled context wrapper is {bytes} bytes");
+    }
+
+    struct ContextFutureProbe {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        dropped_under: Arc<std::sync::Mutex<Option<String>>>,
+        ready: bool,
+    }
+
+    impl std::future::Future for ContextFutureProbe {
+        type Output = ();
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            assert_eq!(current().unwrap().resource_scope(), "eager-child");
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.ready {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for ContextFutureProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.dropped_under.lock().unwrap() = current().map(|ctx| ctx.resource_scope());
+        }
+    }
+
+    #[test]
+    fn current_future_unpolled_drop_keeps_carrier_without_binding_or_polling() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = AttemptCarrierRegistry::new();
+        let child = ExecutionContext::default()
+            .with_resource_scope("eager-child")
+            .with_attempt_carrier_registry(&registry);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped_under = Arc::new(std::sync::Mutex::new(None));
+        with_current(
+            ExecutionContext::default().with_resource_scope("outer"),
+            || {
+                let run = with_current_future(
+                    child,
+                    ContextFutureProbe {
+                        polls: polls.clone(),
+                        drops: drops.clone(),
+                        dropped_under: dropped_under.clone(),
+                        ready: false,
+                    },
+                );
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    registry.live(),
+                    1,
+                    "unpolled wrapper retains executable authority"
+                );
+                assert_eq!(current().unwrap().resource_scope(), "outer");
+                drop(run);
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    registry.live(),
+                    0,
+                    "dropping the unpolled wrapper retires its carrier"
+                );
+                assert_eq!(current().unwrap().resource_scope(), "outer");
+            },
+        );
+        assert_eq!(dropped_under.lock().unwrap().as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn current_future_pending_polls_rebind_and_restore_without_releasing_carrier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = AttemptCarrierRegistry::new();
+        let child = ExecutionContext::default()
+            .with_resource_scope("eager-child")
+            .with_attempt_carrier_registry(&registry);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped_under = Arc::new(std::sync::Mutex::new(None));
+        let mut run = Box::pin(with_current_future(
+            child,
+            ContextFutureProbe {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                dropped_under: dropped_under.clone(),
+                ready: false,
+            },
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        for scope in ["first-observer", "second-observer"] {
+            with_current(
+                ExecutionContext::default().with_resource_scope(scope),
+                || {
+                    assert!(std::future::Future::poll(run.as_mut(), &mut cx).is_pending());
+                    assert_eq!(current().unwrap().resource_scope(), scope);
+                    assert_eq!(registry.live(), 1);
+                    assert_eq!(drops.load(Ordering::SeqCst), 0);
+                },
+            );
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        with_current(
+            ExecutionContext::default().with_resource_scope("drop-observer"),
+            || {
+                drop(run);
+                assert_eq!(current().unwrap().resource_scope(), "drop-observer");
+            },
+        );
+        assert_eq!(registry.live(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dropped_under.lock().unwrap().as_deref(),
+            Some("drop-observer")
+        );
+    }
+
+    #[test]
+    fn current_future_ready_releases_inner_capture_even_if_completed_shell_is_retained() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = AttemptCarrierRegistry::new();
+        let child = ExecutionContext::default()
+            .with_resource_scope("eager-child")
+            .with_attempt_carrier_registry(&registry);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped_under = Arc::new(std::sync::Mutex::new(None));
+        let mut run = Box::pin(with_current_future(
+            child,
+            ContextFutureProbe {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                dropped_under: dropped_under.clone(),
+                ready: true,
+            },
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        with_current(
+            ExecutionContext::default().with_resource_scope("outer"),
+            || {
+                assert!(std::future::Future::poll(run.as_mut(), &mut cx).is_ready());
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    drops.load(Ordering::SeqCst),
+                    1,
+                    "Ready retires the inner future before shell drop"
+                );
+                assert_eq!(
+                    registry.live(),
+                    0,
+                    "Ready retires the owned context before shell drop"
+                );
+                assert_eq!(current().unwrap().resource_scope(), "outer");
+                assert_eq!(dropped_under.lock().unwrap().as_deref(), Some("outer"));
+                drop(run);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn current_future_panicking_poll_matches_original_capture_retirement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Exact pre-eager async wrapper body. A caught poll panic unwinds its inner poll_fn,
+        // even while the caller retains the outer future. Compare that contract, not the
+        // different lifetime of a bare PollFn. This grants no worker join or release proof.
+        async fn reference_pre_eager_current_future<F: std::future::Future>(
+            ctx: ExecutionContext,
+            future: F,
+        ) -> F::Output {
+            let mut future = Box::pin(future);
+            std::future::poll_fn(move |cx| with_current(ctx.clone(), || future.as_mut().poll(cx)))
+                .await
+        }
+
+        struct PanicProbe {
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+            dropped_under: Arc<std::sync::Mutex<Option<String>>>,
+        }
+        impl std::future::Future for PanicProbe {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                assert_eq!(current().unwrap().resource_scope(), "eager-child");
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                panic!("fixture poll panic");
+            }
+        }
+        impl Drop for PanicProbe {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                *self.dropped_under.lock().unwrap() = current().map(|ctx| ctx.resource_scope());
+            }
+        }
+        fn observe<F: std::future::Future<Output = ()>>(
+            factory: impl FnOnce(ExecutionContext, PanicProbe) -> F,
+        ) -> (usize, usize, usize, Option<String>, usize) {
+            let registry = AttemptCarrierRegistry::new();
+            let child = ExecutionContext::default()
+                .with_resource_scope("eager-child")
+                .with_attempt_carrier_registry(&registry);
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let dropped_under = Arc::new(std::sync::Mutex::new(None));
+            let mut run = Box::pin(factory(
+                child,
+                PanicProbe {
+                    polls: polls.clone(),
+                    drops: drops.clone(),
+                    dropped_under: dropped_under.clone(),
+                },
+            ));
+            assert_eq!(
+                registry.live(),
+                1,
+                "the unpolled wrapper owns its executable capture"
+            );
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            let previous = current().map(|ctx| ctx.resource_scope());
+            let observed = with_current(
+                ExecutionContext::default().with_resource_scope("outer"),
+                || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        std::future::Future::poll(run.as_mut(), &mut cx)
+                    }));
+                    assert!(result.is_err());
+                    assert_eq!(current().unwrap().resource_scope(), "outer");
+                    let before_shell_drop = (
+                        registry.live(),
+                        polls.load(Ordering::SeqCst),
+                        drops.load(Ordering::SeqCst),
+                        dropped_under.lock().unwrap().clone(),
+                    );
+                    drop(run);
+                    assert_eq!(registry.live(), 0);
+                    assert_eq!(current().unwrap().resource_scope(), "outer");
+                    (
+                        before_shell_drop.0,
+                        before_shell_drop.1,
+                        before_shell_drop.2,
+                        before_shell_drop.3,
+                        drops.load(Ordering::SeqCst),
+                    )
+                },
+            );
+            assert_eq!(current().map(|ctx| ctx.resource_scope()), previous);
+            observed
+        }
+        let original = observe(reference_pre_eager_current_future::<PanicProbe>);
+        let eager = observe(with_current_future::<PanicProbe>);
+        assert_eq!(
+            eager, original,
+            "eager allocation must preserve async unwind ownership"
+        );
+        assert_eq!(
+            original,
+            (0, 1, 1, Some("outer".into()), 1),
+            "the inner body and executable capture retire exactly once under the restored observer"
+        );
+    }
 
     #[test]
     fn test_lock_namespace_survives_child_worker_until_physical_completion() {
@@ -1012,6 +1721,164 @@ mod tests {
     }
 
     #[test]
+    fn task_effect_epochs_reach_ancestors_without_sharing_checklist_owners() {
+        let task = crate::agent::todo::TaskContext::private();
+        let parent = ExecutionContext::default().with_task(task.clone());
+        let child = parent.with_resource_scope("child");
+        let sibling = parent.with_resource_scope("sibling");
+        let grandchild = child.with_resource_scope("grandchild");
+        assert!(!task.same_owner(child.task().unwrap()));
+        assert!(!child.task().unwrap().same_owner(sibling.task().unwrap()));
+        let base = task.effect_epoch();
+        let child_base = child.task().unwrap().effect_epoch();
+        let sibling_base = sibling.task().unwrap().effect_epoch();
+        let path = std::path::PathBuf::from("same.txt");
+        grandchild.note_native_mutation(std::slice::from_ref(&path));
+        grandchild.note_native_mutation(std::slice::from_ref(&path));
+        assert_eq!(task.effect_epoch(), base + 2);
+        assert_eq!(child.task().unwrap().effect_epoch(), child_base + 2);
+        assert_eq!(sibling.task().unwrap().effect_epoch(), sibling_base);
+        // Attribution-only calls do not invent another mutation or turn a no-op into a write.
+        child.note_workspace_changes(&[path]);
+        assert_eq!(task.effect_epoch(), base + 2);
+        // An explicitly reattached same owner is deduplicated from the inherited sink list.
+        child.with_task(task.clone()).note_task_effects();
+        assert_eq!(task.effect_epoch(), base + 3);
+    }
+
+    #[test]
+    fn native_mutation_preserves_actual_roots_with_or_without_placement() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let base = fixture.path().canonicalize().unwrap();
+        let a = base.join("project-a");
+        let b = base.join("project-b");
+        let plain = base.join("plain");
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        }
+        std::fs::create_dir_all(plain.join(".aizen")).unwrap();
+        // Bound discovery to this unsupported fixture rather than any manifest in the tester's
+        // home directory above the system temporary directory. No runnable command is provided.
+        std::fs::write(plain.join(".aizen/verify.json"), "{}").unwrap();
+        let expected: std::collections::BTreeSet<_> = [&a, &b, &plain]
+            .into_iter()
+            .map(|root| root.canonicalize().unwrap())
+            .collect();
+        for placement in [false, true] {
+            let task = crate::agent::todo::TaskContext::private();
+            let mut ctx = ExecutionContext::default().with_task(task.clone());
+            if placement {
+                ctx = ctx.with_placement(
+                    crate::core::file_placement::PlacementContext::with_paths(
+                        a.clone(),
+                        base.join("home"),
+                        base.join("scratch"),
+                        "mutation-roots",
+                    )
+                    .unwrap(),
+                );
+            }
+            let epoch = task.effect_epoch();
+            // Targets may already have been deleted; parent roots must remain verifiable. Two paths
+            // in one project share a root, but an outside-project effect cannot collapse into it.
+            ctx.note_native_mutation(&[
+                a.join("src/a.rs"),
+                a.join("src/deleted.rs"),
+                b.join("src/b.rs"),
+                plain.join("deleted.txt"),
+            ]);
+            assert_eq!(task.effect_epoch(), epoch + 3);
+            let roots: std::collections::BTreeSet<_> = task
+                .snapshot()
+                .obligations
+                .iter()
+                .filter(|obligation| obligation.item_id.is_empty())
+                .map(|obligation| {
+                    std::path::PathBuf::from(obligation.root.as_ref().expect("known native root"))
+                        .canonicalize()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(roots, expected);
+        }
+    }
+
+    #[test]
+    fn opaque_effect_has_runtime_root_but_explicit_unknown_stays_unknown() {
+        let task = crate::agent::todo::TaskContext::private();
+        ExecutionContext::default()
+            .with_task(task.clone())
+            .note_task_effects();
+        let state = task.snapshot();
+        assert_eq!(state.obligations.len(), 1);
+        let root = state.obligations[0].root.as_ref().unwrap();
+        assert_eq!(
+            std::path::Path::new(root).canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        let unknown = crate::agent::todo::TaskContext::private();
+        ExecutionContext::default()
+            .with_task(unknown.clone())
+            .note_task_effects_at(None);
+        let state = unknown.snapshot();
+        assert_eq!(state.obligations.len(), 1);
+        assert!(state.obligations[0].root.is_none());
+    }
+
+    #[test]
+    fn native_observation_capture_is_owner_and_epoch_scoped() {
+        use crate::agent::todo::{Requirement, Status, TaskContext, Todo};
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().canonicalize().unwrap();
+        let path = root.join("read.txt");
+        std::fs::write(&path, b"native bytes").unwrap();
+        let task = TaskContext::private();
+        let rows = task
+            .replace(vec![Todo::new("observe file", Status::Done)])
+            .unwrap();
+        let id = rows[0].id.clone();
+        task.replace_with_requirements(
+            rows,
+            vec![(
+                id,
+                Requirement::Observe {
+                    target: "read.txt".into(),
+                },
+            )],
+        )
+        .unwrap();
+        let parent = ExecutionContext::default().with_task(task.clone());
+        assert!(parent
+            .with_resource_scope("child")
+            .capture_task_observation(&path, &root)
+            .is_none());
+        assert!(parent
+            .capture_task_observation(&root.join("other.txt"), &root)
+            .is_none());
+        let old = parent.capture_task_observation(&path, &root).unwrap();
+        parent.note_task_effects();
+        old.record(&crate::core::persist::FileFingerprint::for_bytes(
+            b"native bytes",
+        ));
+        assert!(
+            task.snapshot().observations.is_empty(),
+            "old epoch cannot mint a receipt"
+        );
+        parent
+            .capture_task_observation(&path, &root)
+            .unwrap()
+            .record(&crate::core::persist::FileFingerprint::for_bytes(
+                b"native bytes",
+            ));
+        assert_eq!(task.snapshot().observations.len(), 1);
+        assert!(
+            task.snapshot().checks.is_empty(),
+            "observations never become checks"
+        );
+    }
+
+    #[test]
     fn delegated_restore_authority_cannot_be_regranted_by_context_builders() {
         let parent = ExecutionContext::new(ConversationId::new("restore-authority"));
         assert!(parent.can_restore_workspace());
@@ -1021,7 +1888,7 @@ mod tests {
             .fork_recovery();
         assert!(!child.can_restore_workspace());
         assert!(!child.recovery().can_restore_workspace());
-        let reset = child.with_recovery(crate::features::timemachine::RunRecovery::default());
+        let reset = child.with_recovery(crate::core::run_recovery::RunRecovery::default());
         assert!(!reset.can_restore_workspace());
         assert!(!reset.recovery().can_restore_workspace());
         assert!(!reset.fork_recovery().recovery().can_restore_workspace());
@@ -1424,6 +2291,7 @@ mod tests {
             .with_approval_route(Some(ApprovalRoute {
                 route: "work".into(),
                 chat: "7".into(),
+                sender_id: None,
             }));
 
         assert_eq!(ctx.persona().as_deref(), Some("Aria"));
@@ -1451,11 +2319,13 @@ mod tests {
             .with_approval_route(Some(ApprovalRoute {
                 route: "default".into(),
                 chat: "1".into(),
+                sender_id: None,
             }));
         let b = ExecutionContext::new(ConversationId::new("telegram:work:2")).with_approval_route(
             Some(ApprovalRoute {
                 route: "work".into(),
                 chat: "2".into(),
+                sender_id: None,
             }),
         );
         with_current(a.clone(), || {

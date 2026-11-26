@@ -9,6 +9,21 @@ use anyhow::anyhow; // `main.rs` no longer needs it now that `apps` moved out; t
 mod memory_boundary;
 
 #[test]
+fn interactive_entry_future_size_stays_bounded() {
+    // Measure the type without constructing a large future on the test thread's stack.
+    fn bytes<F: std::future::Future>(_: fn() -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    let outer = bytes(run_menu);
+    let inner = bytes(run_menu_inner);
+    eprintln!("interactive future frames: outer={outer} B; inner={inner} B");
+    assert!(
+        outer <= 64 * 1024 && inner <= 64 * 1024,
+        "interactive entry embeds large REPL futures: outer={outer} B; inner={inner} B"
+    );
+}
+
+#[test]
 fn config_provider_subcommands_parse() {
     for argv in [
         vec![
@@ -96,7 +111,7 @@ fn agent_save_session_is_a_switch_and_never_eats_the_task() {
         panic!("expected the agent subcommand");
     };
     assert!(args.save_session);
-    assert_eq!(args.task, "sửa cái nút xoá");
+    assert_eq!(args.task.as_deref(), Some("sửa cái nút xoá"));
 
     // Off unless asked: the scripting path must not start writing files because it was upgraded.
     let plain = Cli::try_parse_from(["aizen", "agent", "chạy test"]).expect("parse");
@@ -155,7 +170,7 @@ fn agent_image_is_repeatable_and_never_eats_the_task() {
         panic!("expected the agent subcommand");
     };
     assert_eq!(args.image, vec!["a.png".to_string(), "b.jpg".to_string()]);
-    assert_eq!(args.task, "cái nút này sai chỗ nào");
+    assert_eq!(args.task.as_deref(), Some("cái nút này sai chỗ nào"));
 
     // Omitted is the old shape exactly: no parts array, no image field, a request byte-identical
     // to one from a core that never had this flag.

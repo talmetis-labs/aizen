@@ -109,6 +109,8 @@ fn scratch_run_component(run_id: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct PlacementContext {
     workspace: PathBuf,
+    /// Project-local configuration/index identity can differ from the tool cwd at startup.
+    project: PathBuf,
     home: PathBuf,
     scratch_process: PathBuf,
     run_id: String,
@@ -165,6 +167,7 @@ impl PlacementContext {
         let mut ownership = Ownership::default();
         ownership.namespaces.insert(identity, "root".into());
         Ok(Self {
+            project: workspace.clone(),
             workspace,
             home,
             scratch_process,
@@ -207,8 +210,16 @@ impl PlacementContext {
         let scratch = self.scratch_run.join(&handle);
         let scratch_namespace =
             ScratchNamespace::new(&self.scratch_run, &self.run_id, &handle, &identity)?;
+        let project = if ScratchIdentity::new(&root, "root")
+            == ScratchIdentity::new(&self.workspace, "root")
+        {
+            self.project.clone()
+        } else {
+            root.clone()
+        };
         Ok(Self {
             workspace: root,
+            project,
             home: self.home.clone(),
             scratch_process: self.scratch_process.clone(),
             run_id: self.run_id.clone(),
@@ -220,8 +231,21 @@ impl PlacementContext {
         })
     }
 
+    /// Capture startup configuration identity without changing relative tool paths. A later fork
+    /// into another workspace resets this to that workspace; a same-workspace child keeps it.
+    pub(crate) fn with_project_root(mut self, project: PathBuf) -> Result<Self> {
+        if !project.is_absolute() {
+            bail!("placement project root must be an explicit absolute path");
+        }
+        self.project = project;
+        Ok(self)
+    }
+
     pub fn workspace_root(&self) -> &Path {
         &self.workspace
+    }
+    pub(crate) fn project_root(&self) -> &Path {
+        &self.project
     }
     pub fn home_root(&self) -> &Path {
         &self.home
@@ -355,6 +379,30 @@ fn validate_component(component: &str) -> Result<()> {
     Ok(())
 }
 
+// Attribution wraps actual standard-library primitives, not higher-level validation helpers.
+// Production builds compile out the spans; results and error behavior are unchanged.
+pub(crate) fn path_metadata(path: &Path) -> std::io::Result<Metadata> {
+    #[cfg(test)]
+    let _cost = super::io_attribution::Span::begin(super::io_attribution::Event::PathMetadata);
+    fs::symlink_metadata(path)
+}
+
+pub(crate) fn path_canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    let _cost = super::io_attribution::Span::begin(super::io_attribution::Event::PathCanonicalize);
+    #[cfg(test)]
+    let _lookup =
+        super::io_attribution::Span::begin(super::io_attribution::Event::CanonicalPathLookup);
+    fs::canonicalize(path)
+}
+
+pub(crate) fn descriptor_metadata(file: &fs::File) -> std::io::Result<Metadata> {
+    #[cfg(test)]
+    let _cost =
+        super::io_attribution::Span::begin(super::io_attribution::Event::DescriptorMetadata);
+    file.metadata()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeStamp {
     identity: (u64, u64),
@@ -454,6 +502,8 @@ fn file_identity(path: &Path, _md: &Metadata, follow: bool) -> Result<(u64, u64)
         } else {
             FILE_FLAG_OPEN_REPARSE_POINT
         };
+    #[cfg(test)]
+    let _cost = super::io_attribution::Span::begin(super::io_attribution::Event::PathIdentityOpen);
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -469,6 +519,9 @@ fn file_identity(path: &Path, _md: &Metadata, follow: bool) -> Result<(u64, u64)
         return Err(std::io::Error::last_os_error()).context("opening placement identity handle");
     }
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(test)]
+    let _identity_cost =
+        super::io_attribution::Span::begin(super::io_attribution::Event::DescriptorIdentity);
     let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
     let error = if ok == 0 {
         Some(std::io::Error::last_os_error())
@@ -495,11 +548,22 @@ fn file_identity(_path: &Path, _md: &Metadata, _follow: bool) -> Result<(u64, u6
 /// Read existing evidence through a bounded, checked descriptor. No creation, hardening or writes.
 /// Path/descriptor rechecks detect ordinary drift, not hostile kernel-atomic path substitution.
 pub(crate) fn read_existing_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_existing_regular_with_metadata(path, limit).map(|(bytes, _)| bytes)
+}
+
+/// The metadata comes from the same checked descriptor as the bytes, never a separate path reopen.
+pub(crate) fn read_existing_regular_with_metadata(
+    path: &Path,
+    limit: u64,
+) -> Result<(Vec<u8>, Metadata)> {
     limit
         .checked_add(1)
         .context("existing file byte bound overflow")?;
     let resource = crate::core::workspace_txn::NativeResource::resolve(path)?;
-    let md = fs::symlink_metadata(path)?;
+    // Resolve has validated the supplied ancestry. Keep its canonical spelling for descriptor and
+    // identity opens too: direct Win32 calls do not add the long-path prefix as std::fs does.
+    let path = resource.path();
+    let md = path_metadata(path)?;
     anyhow::ensure!(
         md.is_file() && !is_link_or_reparse(&md) && md.len() <= limit,
         "existing evidence must be a bounded regular non-link file"
@@ -510,12 +574,47 @@ pub(crate) fn read_existing_regular(path: &Path, limit: u64) -> Result<Vec<u8>> 
     read_existing_regular_descriptor(&resource, &stamp, file, limit)
 }
 
+/// Read against an already retained parent identity, without resolving/rebinding its path.
+/// Fresh ancestor/leaf, descriptor, bounds and pathname checks still bracket the actual read.
+#[cfg(test)] // Source-Git callers remain fixture-gated until complete backend cutover.
+pub(crate) fn read_bound_regular(
+    resource: &crate::core::workspace_txn::NativeResource,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    read_bound_regular_with_metadata(resource, limit).map(|(bytes, _)| bytes)
+}
+
+/// Same standalone retained-resource checks, including descriptor-derived source modes.
+#[cfg(test)]
+pub(crate) fn read_bound_regular_with_metadata(
+    resource: &crate::core::workspace_txn::NativeResource,
+    limit: u64,
+) -> Result<(Vec<u8>, Metadata)> {
+    limit
+        .checked_add(1)
+        .context("existing file byte bound overflow")?;
+    resource.verify()?;
+    let path = resource.path();
+    let md = path_metadata(path)?;
+    anyhow::ensure!(
+        md.is_file() && !is_link_or_reparse(&md) && md.len() <= limit,
+        "existing evidence must be a bounded regular non-link file"
+    );
+    let stamp = NodeStamp::capture(path, &md, false)?;
+    resource.verify()?;
+    let file = open_existing_read_only(path)?;
+    read_existing_regular_descriptor(resource, &stamp, file, limit)
+}
+
 fn read_existing_regular_descriptor(
     resource: &crate::core::workspace_txn::NativeResource,
     stamp: &NodeStamp,
     mut file: fs::File,
     limit: u64,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Metadata)> {
+    #[cfg(test)]
+    let mut cost = super::io_attribution::Span::begin(super::io_attribution::Event::CheckedRead);
+    let metadata = descriptor_metadata(&file)?;
     let read_limit = limit
         .checked_add(1)
         .context("existing file byte bound overflow")?;
@@ -527,24 +626,30 @@ fn read_existing_regular_descriptor(
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(usize::try_from(stamp.len).context("existing file length overflow")?)?;
-    (&mut file).take(read_limit).read_to_end(&mut bytes)?;
+    let read_result = (&mut file).take(read_limit).read_to_end(&mut bytes);
+    #[cfg(test)]
+    cost.returned_bytes(bytes.len());
+    read_result?;
     anyhow::ensure!(
         bytes.len() as u64 == stamp.len && existing_regular_stamp(&file)? == *stamp,
         "existing evidence descriptor changed during inspection"
     );
     resource.verify()?;
     anyhow::ensure!(
-        NodeStamp::capture(
-            resource.path(),
-            &fs::symlink_metadata(resource.path())?,
-            false
-        )? == *stamp,
+        NodeStamp::capture(resource.path(), &path_metadata(resource.path())?, false)? == *stamp,
         "existing evidence pathname changed during inspection"
     );
-    Ok(bytes)
+    anyhow::ensure!(
+        metadata.permissions() == descriptor_metadata(&file)?.permissions(),
+        "existing evidence descriptor permissions changed during inspection"
+    );
+    Ok((bytes, metadata))
 }
 
-fn open_existing_read_only(path: &Path) -> Result<fs::File> {
+pub(crate) fn open_existing_read_only(path: &Path) -> Result<fs::File> {
+    #[cfg(test)]
+    let _cost =
+        super::io_attribution::Span::begin(super::io_attribution::Event::ReadDescriptorOpen);
     #[cfg(any(
         windows,
         target_os = "linux",
@@ -588,8 +693,14 @@ fn open_existing_read_only(path: &Path) -> Result<fs::File> {
     }
 }
 
-fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
-    let md = file.metadata()?;
+pub(crate) fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
+    existing_regular_observation(file).map(|(stamp, _)| stamp)
+}
+
+/// One descriptor observation supplies both stamp and full permissions. Link count is freshly
+/// checked on every call; stamp equality alone does not prove a single-link descriptor.
+pub(crate) fn existing_regular_observation(file: &fs::File) -> Result<(NodeStamp, Metadata)> {
+    let md = descriptor_metadata(file)?;
     anyhow::ensure!(
         md.is_file() && !is_link_or_reparse(&md),
         "existing evidence descriptor must be a regular non-link file"
@@ -609,6 +720,9 @@ fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
         use windows_sys::Win32::Storage::FileSystem::{
             GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
         };
+        #[cfg(test)]
+        let _cost =
+            super::io_attribution::Span::begin(super::io_attribution::Event::DescriptorIdentity);
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
             return Err(std::io::Error::last_os_error())
@@ -627,7 +741,7 @@ fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
     let identity = {
         bail!("existing evidence descriptor identity unavailable on this platform");
     };
-    Ok(NodeStamp {
+    let stamp = NodeStamp {
         identity,
         followed_identity: None,
         kind: 1,
@@ -635,7 +749,8 @@ fn existing_regular_stamp(file: &fs::File) -> Result<NodeStamp> {
         modified: md.modified().ok(),
         created: md.created().ok(),
         readonly: md.permissions().readonly(),
-    })
+    };
+    Ok((stamp, md))
 }
 
 #[derive(Debug, Clone)]
@@ -757,7 +872,7 @@ pub fn prepare_destination(
 }
 
 fn optional_stamp(path: &Path, allow_links: bool) -> Result<Option<NodeStamp>> {
-    match fs::symlink_metadata(path) {
+    match path_metadata(path) {
         Ok(md) => NodeStamp::capture(path, &md, allow_links).map(Some),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => {
@@ -814,7 +929,6 @@ impl ResolvedDestination {
     }
     /// Exact preview baseline for regular files up to 4 MiB. Large files/directories return None;
     /// tools reading a full preview must bind that read's own persistence/CAS fingerprint as well.
-    #[cfg(test)]
     pub fn fingerprint(&self) -> Option<&FileFingerprint> {
         self.fingerprint.as_ref()
     }
@@ -919,6 +1033,7 @@ impl ResolvedDestination {
                 fs::create_dir(&ancestor.path).with_context(|| {
                     format!("creating managed directory {}", ancestor.path.display())
                 })?;
+                crate::core::exec_ctx::note_native_mutation(&ancestor.path);
                 let stamp = optional_stamp(&ancestor.path, false)?
                     .context("managed directory disappeared after creation")?;
                 if stamp.kind != 2 {
@@ -933,7 +1048,7 @@ impl ResolvedDestination {
                 && owner.scratch_lock.is_none()
             {
                 let path = ancestor.path.join(".ownership.lock");
-                if let Ok(md) = fs::symlink_metadata(&path) {
+                if let Ok(md) = path_metadata(&path) {
                     if is_link_or_reparse(&md) || !md.is_file() {
                         bail!("invalid managed scratch ownership lock: {}", path.display());
                     }

@@ -26,10 +26,6 @@ use std::path::{Path, PathBuf};
 /// won't know it happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Durable event schema keeps dispatch intents inline; warning cleanup must not restructure journal records"
-)]
 pub enum Event {
     /// An LLM call. `request_hash` is a stable hash of the messages+tools sent, so `resume` can
     /// detect "the inputs changed since the crash" (the caller mutated state) and refuse to replay
@@ -103,6 +99,14 @@ pub enum Event {
         iters: usize,
         tokens_in: u64,
         tokens_out: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_handoff: Option<crate::core::git_ops::TaskHandoff>,
+    },
+    /// Explicit parent integration and destination verification, durably linked before settlement.
+    GitTaskAccepted {
+        seq: u64,
+        key: crate::agent::workflow::AttemptKey,
+        evidence: crate::core::git_ops::VerifiedTaskIntegration,
     },
     SpeculativeCohortCaptured {
         seq: u64,
@@ -144,6 +148,7 @@ impl Event {
             | Event::WorkflowStarted { seq, .. }
             | Event::DispatchIntent { seq, .. }
             | Event::AttemptCompleted { seq, .. }
+            | Event::GitTaskAccepted { seq, .. }
             | Event::SpeculativeCohortCaptured { seq, .. }
             | Event::SpeculativeCohortIntegrated { seq, .. }
             | Event::TaskSettled { seq, .. } => *seq,
@@ -240,6 +245,7 @@ impl RunLogWriter {
             | Event::WorkflowStarted { seq: s, .. }
             | Event::DispatchIntent { seq: s, .. }
             | Event::AttemptCompleted { seq: s, .. }
+            | Event::GitTaskAccepted { seq: s, .. }
             | Event::SpeculativeCohortCaptured { seq: s, .. }
             | Event::SpeculativeCohortIntegrated { seq: s, .. }
             | Event::TaskSettled { seq: s, .. } => *s = seq,
@@ -362,7 +368,7 @@ fn plan_base_id(id: &str) -> &str {
     }
 }
 
-pub(crate) const WORKFLOW_VERSION: u32 = 2;
+pub(crate) const WORKFLOW_VERSION: u32 = 3;
 
 /// Validate the journal envelope before deriving routing or deciding that a run is already done.
 pub(crate) fn workflow_header<'a>(
@@ -380,6 +386,7 @@ pub(crate) fn workflow_header<'a>(
                 e,
                 Event::DispatchIntent { .. }
                     | Event::AttemptCompleted { .. }
+                    | Event::GitTaskAccepted { .. }
                     | Event::SpeculativeCohortCaptured { .. }
                     | Event::SpeculativeCohortIntegrated { .. }
                     | Event::TaskSettled { .. }
@@ -489,7 +496,7 @@ pub(crate) fn validate_speculative_cohorts(
                 ..
             } if membership.contains_key(key) => {
                 anyhow::ensure!(dispatched.contains(key) && !integrated.contains(key)
-                    && completed.insert(key.clone()) && crate::agent::workflow::completed_status(status),
+                    && completed.insert(key.clone()) && crate::agent::workflow::integration_candidate_status(status),
                     "speculative attempt failed, incomplete or not uniquely dispatched; reconciliation required");
                 let report = crate::agent::workflow::TaskOutcome {
                     id: key.display(),
@@ -503,6 +510,7 @@ pub(crate) fn validate_speculative_cohorts(
                     tokens_in: 0,
                     tokens_out: 0,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 };
                 anyhow::ensure!(
                     !crate::agent::workflow::verdict_failed(&report),
@@ -522,7 +530,7 @@ pub(crate) fn validate_speculative_cohorts(
                     cohort_id == expected_id
                         && members == expected_members
                         && members.iter().all(|key| completed.contains(key)),
-                    "integration receipt does not cover the complete successful frozen cohort"
+                    "integration receipt does not cover the complete admissible frozen cohort"
                 );
                 // This proves a supported lifecycle summary, not current source truth or renewed
                 // execution authority. Legacy/arbitrary strings cannot release dependencies.
@@ -544,11 +552,84 @@ pub(crate) fn validate_speculative_cohorts(
     Ok(integrated)
 }
 
+/// Git acceptance is structural journal evidence only; the scheduler separately reopens the
+/// exact destination records on resume. A pending handoff is resumable, not redispatchable.
+pub(crate) fn validate_git_workflow(events: &[Event]) -> Result<()> {
+    use crate::agent::workflow::{AttemptKind, WorkflowIsolation};
+    use std::collections::{HashMap, HashSet};
+    let mut dispatched = HashMap::new();
+    let mut completed = HashMap::new();
+    let mut accepted = HashSet::new();
+    for event in events {
+        match event {
+            Event::DispatchIntent { intent, .. }
+                if intent.task.isolation == WorkflowIsolation::Worktree =>
+            {
+                anyhow::ensure!(
+                    intent.key.kind == AttemptKind::Initial
+                        && intent.key.ordinal == 1
+                        && intent.task.git_base.is_some()
+                        && dispatched.insert(intent.key.clone(), intent).is_none(),
+                    "owned workflow cannot retry or lose its dispatch base"
+                );
+                for prerequisite in &intent.inputs {
+                    anyhow::ensure!(
+                        accepted.contains(prerequisite),
+                        "dependent Git dispatch precedes verified prerequisites"
+                    );
+                }
+            }
+            Event::AttemptCompleted {
+                key,
+                status,
+                git_handoff,
+                ..
+            } => {
+                if let Some(intent) = dispatched.get(key) {
+                    let handoff = git_handoff.as_ref().context(
+                        "owned completion has no typed handoff; inspect retained effects",
+                    )?;
+                    crate::core::git_ops::validate_task_handoff(handoff)?;
+                    anyhow::ensure!(
+                        status == "git-handoff-pending"
+                            && intent.task.git_base.as_ref() == Some(&handoff.base)
+                            && completed.insert(key.clone(), handoff).is_none(),
+                        "invalid owned workflow completion"
+                    );
+                } else {
+                    anyhow::ensure!(git_handoff.is_none(), "Git handoff has no owned dispatch");
+                }
+            }
+            Event::GitTaskAccepted { key, evidence, .. } => {
+                let handoff = completed
+                    .get(key)
+                    .context("Git acceptance precedes its completed handoff")?;
+                anyhow::ensure!(
+                    accepted.insert(key.clone())
+                        && evidence.destination == handoff.tip
+                        && crate::core::git_ops::valid_operation_id(&evidence.integration)
+                        && crate::core::git_ops::valid_operation_id(&evidence.verification),
+                    "invalid Git acceptance link"
+                );
+            }
+            Event::TaskSettled { selected, .. } if dispatched.contains_key(selected) => {
+                anyhow::ensure!(
+                    accepted.contains(selected),
+                    "Git task settled without destination verification"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Plan a resume using literal IDs and selected logical outcomes. Legacy display aliases are
 /// interpreted only where ownership is unambiguous; failures never authorize repeating a write.
 pub fn plan(events: &[Event], task_ids: &[&str]) -> Vec<Action> {
     if let Err(error) = workflow_header(events, task_ids)
         .and_then(|_| validate_speculative_cohorts(events).map(|_| ()))
+        .and_then(|_| validate_git_workflow(events))
     {
         return task_ids
             .iter()
@@ -610,7 +691,7 @@ pub fn plan(events: &[Event], task_ids: &[&str]) -> Vec<Action> {
     }
     task_ids.iter().map(|id| {
         if let Some(key) = intents.iter().find(|key| key.task_id.0 == *id && !completed.contains_key(*key)) {
-            return Action::Reconcile { reason: format!("unknown outcome: {} was admitted without a completion; inspect crash recovery/checkpoints before repeating", key.display()) };
+            return Action::Reconcile { reason: format!("unknown outcome: {} was admitted without a completion; inspect actual workspace effects and crash-recovery evidence before repeating", key.display()) };
         }
         if completed.iter().any(|(key, event)| key.task_id.0 == *id
             && matches!(event, Event::AttemptCompleted { status, .. } if status == "unknown-worker")) {
@@ -633,6 +714,10 @@ pub fn plan(events: &[Event], task_ids: &[&str]) -> Vec<Action> {
                 | Event::AttemptCompleted { status, summary, iters, tokens_in, tokens_out, .. })
                 if task_outcome_skippable(status) => Action::Skip { status: status.clone(),
                     summary: summary.clone(), iters: *iters, tokens_in: *tokens_in, tokens_out: *tokens_out },
+            Some(_) if versioned && events.iter().any(|e| matches!(e,
+                Event::GitTaskAccepted { key, .. }
+                    if settled.get(&TaskId((*id).to_string())) == Some(key)
+            )) => Action::Continue,
             Some(_) if versioned => Action::Reconcile { reason: "logical task settled incomplete/failed; resume cannot label it done or repeat its side effects".into() },
             _ => Action::Run,
         }
@@ -665,6 +750,11 @@ pub fn describe(e: &Event) -> String {
         } => format!(
             "#{seq:>4} completed {} → {status} [{tokens_in}+{tokens_out} tok]",
             key.display()
+        ),
+        Event::GitTaskAccepted { seq, key, evidence } => format!(
+            "#{seq:>4} Git {} accepted at {}",
+            key.display(),
+            evidence.destination.as_str()
         ),
         Event::SpeculativeCohortCaptured {
             seq,
@@ -801,6 +891,7 @@ mod tests {
             model: "m".into(),
             status: "unknown-worker".into(),
             summary: "observer returned while physical worker still owns attempt".into(),
+            git_handoff: None,
             iters: 1,
             tokens_in: 11,
             tokens_out: 3,

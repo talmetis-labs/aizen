@@ -12,23 +12,19 @@ use serde_json::Value;
 #[path = "tool_workers.rs"]
 pub(crate) mod workers;
 
-/// What a tool call may mutate in the local workspace. This is deliberately separate from
-/// `is_destructive`: an outbound notification needs approval but no code checkpoint, while a file
-/// edit needs both. Args-aware classification keeps read-only process actions from creating Git
-/// snapshots merely because their tool shares one broad capability.
+/// What a tool call may mutate in the local workspace, separate from approval requirements.
+/// An outbound notification has external effects; a file edit needs workspace attribution and
+/// verification. Read-only process actions must not be classified as workspace writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEffect {
     None,
     Paths,
     OpaqueWorkspace,
-    /// Private speculative bytes, not a materialized workspace edit or checkpoint.
-    PrivateOverlay,
-    RepoMetadata,
     External,
 }
 
 impl WorkspaceEffect {
-    pub fn needs_checkpoint(self) -> bool {
+    pub fn mutates_workspace(self) -> bool {
         matches!(self, Self::Paths | Self::OpaqueWorkspace)
     }
 }
@@ -353,6 +349,18 @@ impl std::future::Future for StartedSafeCall {
 }
 
 impl ToolExecution {
+    /// A settled exact-plan receipt exempts only this mutation from arming implementation checks.
+    /// Keep changed_workspace physical accounting intact; no path or result prose grants a waiver.
+    pub(crate) fn delivered_plan(&self) -> bool {
+        self.outcome.failure.is_none()
+            && self.outcome.effect_state == ToolEffectState::Settled
+            && self
+                .prepared
+                .as_ref()
+                .and_then(crate::agent::builtin::plan_write_proof)
+                .is_some_and(|proof| proof.successful_write())
+    }
+
     pub fn changed_workspace(&self, tool: &dyn Tool) -> bool {
         if let Some(changes) = self
             .prepared
@@ -365,7 +373,7 @@ impl ToolExecution {
             && self
                 .prepared
                 .as_ref()
-                .is_some_and(|p| tool.workspace_effect_prepared(p).needs_checkpoint())
+                .is_some_and(|p| tool.workspace_effect_prepared(p).mutates_workspace())
             && !self
                 .outcome
                 .text
@@ -393,14 +401,6 @@ pub(crate) enum PreparedFootprint {
             crate::core::repo_lock::LockMode,
         )>,
     ),
-    /// Controller-seated private resources; never acquire live path locks for these bodies.
-    Overlay {
-        handle: crate::core::speculation::store::OverlayHandle,
-        files: Vec<(
-            crate::core::speculation::store::OverlayFile,
-            crate::core::repo_lock::LockMode,
-        )>,
-    },
     Global,
 }
 
@@ -413,6 +413,8 @@ pub struct PreparedToolCall {
     pub preview: Option<ApprovalPreview>,
     pub file: Option<FilePreparation>,
     pub(crate) footprint: Option<PreparedFootprint>,
+    /// Host-only permission snapshot at preparation; never accepted from model JSON.
+    pub(crate) planning_policy: Option<crate::core::session_control::ExecutionPolicy>,
     /// Host-frozen external Memory dispatch; never reconstructed from model JSON.
     pub(crate) memory_provider: Option<crate::plugin::tool_support::FrozenCall>,
     /// Placement-bound UI aliases; execution, approval and wire results retain absolute paths.
@@ -421,6 +423,8 @@ pub struct PreparedToolCall {
     pub delegation: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Shared with the actual delegated workers, never inferred from their textual reports.
     pub(crate) workspace_changes: Option<std::sync::Arc<crate::core::exec_ctx::WorkspaceChanges>>,
+    /// Exact host placement at preparation, including its generation. No model JSON can mint this.
+    pub(crate) workspace_binding: Option<crate::core::exec_ctx::WorkspaceBinding>,
     /// Single-use stream correlation, shared only by clones of this prepared invocation.
     pub(crate) approval_identity: crate::ui::events::ApprovalIdentity,
 }
@@ -443,10 +447,13 @@ impl PreparedToolCall {
             preview: None,
             file: None,
             footprint: None,
+            planning_policy: None,
             memory_provider: None,
             display_paths: Vec::new(),
             delegation: None,
             workspace_changes: None,
+            workspace_binding: crate::core::exec_ctx::current()
+                .and_then(|context| context.workspace_binding().cloned()),
             approval_identity: crate::ui::events::ApprovalIdentity::default(),
         }
     }
@@ -482,12 +489,21 @@ pub struct FilePreparation {
 /// compile here — which is the correct guardrail, not a false alarm: such a tool could not be run
 /// concurrently anyway.
 pub trait Tool: Send + Sync {
+    /// Local discovery terms only. They never change approval, dispatch, or the wire schema.
+    fn search_aliases(&self) -> &[String] {
+        &[]
+    }
+
     /// `category_action`, unique in the registry (e.g. `memory_search`, `file_read`).
     fn name(&self) -> &str;
     /// What it does · when to use · "Not for X → use Y" · caveat (see system-prompt.md).
     fn description(&self) -> &str;
     /// JSON-Schema for the arguments object (use `additionalProperties:false` for strict gateways).
     fn parameters(&self) -> Value;
+    /// Audited native planning capability; unknown tools default deny even if named like a reader.
+    fn planning_capability(&self) -> Option<crate::agent::planning::Capability> {
+        None
+    }
     /// Destructive / outward-facing → the loop gates it behind approval before executing.
     fn is_destructive(&self) -> bool {
         false
@@ -528,19 +544,16 @@ pub trait Tool: Send + Sync {
     fn is_concurrency_safe_prepared(&self, call: &PreparedToolCall) -> bool {
         self.is_concurrency_safe_for(&call.args)
     }
-    /// Workspace mutation classification used by automatic checkpoints and verification. Override
+    /// Workspace mutation classification used by effect tracking and verification. Override
     /// this for local writers; approval-only/network/process-control tools keep the default `None`.
     fn workspace_effect(&self, _args: &Value) -> WorkspaceEffect {
         WorkspaceEffect::None
     }
-    /// WHERE this call will write — an absolute directory to look for a repository in. The
-    /// checkpoint gate uses it to discover the work tree that actually owns the change, instead of
-    /// assuming the process's cwd does. Those differ constantly in practice: a session launched from
-    /// the home directory editing `Desktop/proj/src/x.js` found no repo at cwd and reported "not a
-    /// git repository (run `git init`)" — advice that, followed literally, would have turned the
-    /// user's ENTIRE HOME DIRECTORY into a repository, while the real project sat one level down
-    /// with a perfectly good `.git`. Override in every tool that names a path; the default `None`
-    /// means "no particular path" and leaves the gate on cwd.
+    /// WHERE this call will write — an absolute directory identifying the edited location.
+    /// Verification can follow the actual target instead of assuming the process's cwd owns it.
+    /// A session launched from home may edit a nested project; absence of Git at cwd is not a
+    /// reason to initialize a repository there. Override in every tool that names a path;
+    /// the default `None` means "no particular path" and supplies no target-directory override.
     fn workspace_target(&self, _args: &Value) -> Option<std::path::PathBuf> {
         None
     }
@@ -588,6 +601,14 @@ pub trait Tool: Send + Sync {
         _ctx: &crate::core::exec_ctx::ExecutionContext,
     ) -> Result<PreparedToolCall> {
         Ok(PreparedToolCall::new(args.clone()))
+    }
+    /// Shared host admission before any preparation, including eager dispatch.
+    fn prepare_checked(
+        &self,
+        args: &Value,
+        ctx: &crate::core::exec_ctx::ExecutionContext,
+    ) -> Result<PreparedToolCall> {
+        crate::agent::planning::prepare(self, args, ctx)
     }
     /// Run the tool. `args` is the parsed (object) arguments. Return the result text; return
     /// an `Err` for a real failure — the loop feeds the error back to the model to recover.
@@ -674,14 +695,14 @@ pub type DeferredSurface = (Vec<String>, Vec<(String, usize)>);
 ///
 /// `deferred` tools are REGISTERED but not ADVERTISED: they execute normally when called by name,
 /// yet their schema never rides on the request. The model reaches them through `tool_search`,
-/// whose results carry the full schema in-band — so a large MCP surface costs tokens only when it
+/// whose matches attach the full schema to the next request — so a large MCP surface costs tokens only when it
 /// is actually used, and the request's `tools` array stays byte-stable for the prefix cache.
 #[derive(Clone)]
 struct Entry {
     tool: std::sync::Arc<dyn Tool>,
     deferred: bool,
     /// Where a deferred tool came from (the MCP server key) — feeds the per-server counts in the
-    /// prompt's deferred-surface note. `None` for every advertised tool.
+    /// prompt's deferred-surface note. Keep it for eager MCP tools in case a request defers them.
     origin: Option<String>,
 }
 
@@ -700,10 +721,14 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.register_from(tool, None);
+    }
+
+    pub(super) fn register_from(&mut self, tool: Box<dyn Tool>, origin: Option<String>) {
         self.tools.push(Entry {
             tool: std::sync::Arc::from(tool),
             deferred: false,
-            origin: None,
+            origin,
         });
     }
 
@@ -718,6 +743,12 @@ impl ToolRegistry {
             deferred: true,
             origin: Some(origin),
         });
+    }
+
+    pub(crate) fn is_deferred(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|e| e.deferred && e.tool.name() == name)
     }
 
     /// Look up a tool by exact name.
@@ -738,7 +769,7 @@ impl ToolRegistry {
     }
 
     /// The `tools` array for the chat request — the ADVERTISED surface only. Deferred tools are
-    /// deliberately absent: their schemas travel in `tool_search` results instead, which keeps this
+    /// deliberately absent until the loop promotes a match into the next request, which keeps this
     /// array (and the prefix cache built over it) byte-stable however many integrations connect.
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools
@@ -808,8 +839,16 @@ impl ToolRegistry {
     pub fn defer(&mut self, name: &str, origin: &str) -> Option<std::sync::Arc<dyn Tool>> {
         let e = self.tools.iter_mut().find(|e| e.tool.name() == name)?;
         e.deferred = true;
-        e.origin = Some(origin.to_string());
+        e.origin.get_or_insert_with(|| origin.to_owned());
         Some(e.tool.clone())
+    }
+
+    pub(crate) fn advertise(&mut self, names: &[&str]) {
+        for entry in &mut self.tools {
+            if names.contains(&entry.tool.name()) {
+                entry.deferred = false;
+            }
+        }
     }
 
     /// Every deferred tool with its origin label, in registration order.

@@ -22,13 +22,17 @@
 use std::process::{Child, Command};
 use std::time::Duration;
 
+#[path = "proctree_timing.rs"]
+mod timing;
+pub(crate) use timing::{BoundedDeadlines, BoundedTiming};
+
 /// `CREATE_NO_WINDOW` (winbase.h): a spawned console child (git.exe, cmd.exe, a build tool) gets no
 /// console window of its own. Applied to every child Aizen spawns through [`prepare`] /
 /// [`prepare_tokio`]. Two reasons, both load-bearing:
 ///
 ///  * No console flash when Aizen runs under a TUI/alt-screen or fully headless (`aizen serve`).
 ///  * Every console child consumes the window station's shared **desktop heap**. A fan-out of git
-///    checkpoints + subagents can exhaust it, and `CreateProcess` then fails during loader init with
+///    operations + subagents can exhaust it, and `CreateProcess` then fails during loader init with
 ///    `STATUS_DLL_INIT_FAILED` (0xc0000142) — the modal "unable to start correctly" dialog. A
 ///    windowless child sidesteps that allocation entirely.
 ///
@@ -118,7 +122,8 @@ pub fn prepare(cmd: &mut Command) {
     }
 }
 
-/// Contain a just-spawned child. Pair with [`prepare`] on the same `Command`.
+/// Legacy non-Windows containment and Windows test fixtures. Pair with [`prepare`].
+#[cfg(any(test, not(windows)))]
 pub fn contain(child: &Child) -> Containment {
     #[cfg(windows)]
     {
@@ -192,8 +197,25 @@ impl<C: std::fmt::Debug> std::error::Error for ContainedSpawnError<C> {
 /// the existing process-group spawn and returns UNKNOWN tree proof.
 pub(crate) fn spawn_contained_std(
     command: &mut Command,
+    flags: u32,
+    #[cfg(windows)] limits: Option<&windows_job::JobLimits>,
+) -> Result<(Child, Containment), ContainedSpawnError<Child>> {
+    spawn_contained_std_until(
+        command,
+        flags,
+        #[cfg(windows)]
+        limits,
+        None,
+    )
+}
+
+/// OS spawn itself is synchronous and cannot be interrupted. Once it returns, never resume an
+/// overdue Windows child or allocate fresh cleanup time beyond the originating operation deadline.
+pub(crate) fn spawn_contained_std_until(
+    command: &mut Command,
     #[cfg_attr(not(windows), allow(unused_variables))] flags: u32,
     #[cfg(windows)] limits: Option<&windows_job::JobLimits>,
+    #[cfg_attr(not(windows), allow(unused_variables))] deadlines: Option<BoundedDeadlines>,
 ) -> Result<(Child, Containment), ContainedSpawnError<Child>> {
     #[cfg(windows)]
     {
@@ -204,7 +226,12 @@ pub(crate) fn spawn_contained_std(
         let spawned = command.spawn();
         command.creation_flags(flags | CREATE_NO_WINDOW);
         let child = spawned.map_err(ContainedSpawnError::before_spawn)?;
-        match windows_job::protect_suspended(child.as_raw_handle().cast(), child.id(), limits) {
+        match windows_job::protect_suspended(
+            child.as_raw_handle().cast(),
+            child.id(),
+            limits,
+            deadlines,
+        ) {
             Ok(containment) => Ok((child, containment)),
             Err(failure) => Err(ContainedSpawnError {
                 cause: failure.cause,
@@ -216,8 +243,14 @@ pub(crate) fn spawn_contained_std(
     }
     #[cfg(not(windows))]
     {
-        let child = command.spawn().map_err(ContainedSpawnError::before_spawn)?;
+        let mut child = command.spawn().map_err(ContainedSpawnError::before_spawn)?;
         let containment = contain(&child);
+        if deadlines.is_some_and(|limits| std::time::Instant::now() >= limits.run_until) {
+            // Unix spawn cannot hold the child suspended; terminate as soon as the OS returns.
+            // The caller still owns reap/drain settlement under the same absolute deadline.
+            terminate_tree(&containment);
+            let _ = child.kill();
+        }
         Ok((child, containment))
     }
 }
@@ -247,7 +280,7 @@ pub(crate) fn spawn_contained_tokio(
                 containment: Some(Containment::None),
             });
         };
-        match windows_job::protect_suspended(handle.cast(), pid, limits) {
+        match windows_job::protect_suspended(handle.cast(), pid, limits, None) {
             Ok(containment) => Ok((child, containment)),
             Err(failure) => Err(ContainedSpawnError {
                 cause: failure.cause,
@@ -338,6 +371,29 @@ impl std::fmt::Display for BoundedExecutionError {
 impl std::error::Error for BoundedExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.cause)
+    }
+}
+
+/// Typed transport failure, so permission hooks cannot mistake lost input for an ordinary
+/// nonblocking hook error. Partial output must never grant approval or additional context.
+#[derive(Debug)]
+struct StdinDeliveryFailure(std::io::Error);
+impl std::fmt::Display for StdinDeliveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bounded stdin delivery failed: {}", self.0)
+    }
+}
+impl std::error::Error for StdinDeliveryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl BoundedExecutionError {
+    pub(crate) fn stdin_delivery_failed(&self) -> bool {
+        self.cause
+            .get_ref()
+            .is_some_and(|error| error.is::<StdinDeliveryFailure>())
     }
 }
 
@@ -439,10 +495,8 @@ pub struct BoundedOutput {
 
 /// What [`output_bounded_bytes`] came back with — identical to [`BoundedOutput`] but BYTE-EXACT.
 ///
-/// Required by callers whose stdout is binary and must survive verbatim: `git cat-file blob` hands
-/// back file contents, and decoding those through `String::from_utf8_lossy` would replace every
-/// invalid byte with U+FFFD — silently corrupting any non-UTF-8 file a checkpoint restores or diffs.
-/// `-z`-separated git output has the same requirement (NUL-delimited, byte-exact paths).
+/// Required by binary and delimiter-exact callers: a lossy UTF-8 decode would replace every invalid
+/// byte with U+FFFD. Git `-z` output must preserve exact path bytes and record boundaries.
 pub struct BoundedBytes {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -458,8 +512,8 @@ impl BoundedBytes {
     /// Did the command exit successfully? (`false` for a timeout kill, which has no code — the
     /// distinction matters: a killed child must never read as success.)
     ///
-    /// Currently exercised only by this module's tests; production callers rebuild a real
-    /// `ExitStatus` from `code` instead (see `timemachine::run_git_bounded`).
+    /// Convenience predicate exercised by this module's tests. Execution callers must inspect
+    /// the exit code together with timeout, truncation and physical-settlement evidence.
     #[allow(dead_code)]
     pub fn success(&self) -> bool {
         self.code == Some(0)
@@ -493,8 +547,8 @@ pub fn output_bounded(
 
 /// [`output_bounded`] without the lossy decode: stdout/stderr come back as raw bytes.
 ///
-/// Use this whenever the child's stdout is binary or delimiter-exact (`git cat-file blob`, any `-z`
-/// output). [`output_bounded`] is a thin lossy wrapper over this function, so both share one
+/// Use this whenever the child's stdout is binary or delimiter-exact (such as Git `-z` output).
+/// [`output_bounded`] is a thin lossy wrapper over this function, so both share one
 /// containment/deadline implementation — a fix here reaches every bounded caller.
 pub fn output_bounded_bytes(
     cmd: &mut Command,
@@ -513,7 +567,7 @@ fn output_bounded_bytes_fed(
     check_bounded_effects().map_err(std::io::Error::other)?;
     configure_bounded_stdio(cmd, input.is_some());
     prepare(cmd);
-    // Never acquire another physical gate under native/TM admission. Strict core callers retain
+    // Never acquire another physical gate under native/workspace admission. Strict core callers retain
     // their current context (activity/inherited writer ancestry) with the actual worker instead.
     let strict = crate::agent::workflow::SCOPED_NATIVE_PARALLEL_ENABLED;
     let owner = if strict {
@@ -585,7 +639,11 @@ impl BoundedBody {
             settlement: BoundedSettlement::Unknown,
         }
     }
-    fn startup_error(&mut self, cause: std::io::Error, grace: Duration) -> BoundedExecutionError {
+    fn startup_error(
+        &mut self,
+        cause: std::io::Error,
+        deadline: std::time::Instant,
+    ) -> BoundedExecutionError {
         #[cfg(test)]
         BOUNDED_STARTUP_FAILURE_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -596,9 +654,6 @@ impl BoundedBody {
         // owner here until a bounded reap; kill alone would leave a Unix zombie and let a legacy
         // lifetime's last token release its guard/context before the child has actually settled.
         self.terminate();
-        let deadline = std::time::Instant::now()
-            .checked_add(grace)
-            .unwrap_or_else(std::time::Instant::now);
         let reaped = loop {
             let status = self
                 .child
@@ -738,10 +793,33 @@ fn spawn_bounded_drain<R: std::io::Read + Send + 'static>(
 /// deadline never releases owners held by active drains; strict UNKNOWN quarantines the whole body.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output_bounded_spawned(
-    mut child: Child,
+    child: Child,
     containment: Containment,
     input: Option<Vec<u8>>,
     timeout: Duration,
+    drain_grace: Duration,
+    owner: Option<BoundedOwner>,
+    strict_unknown: bool,
+    cap: Option<usize>,
+) -> Result<BoundedBytes, BoundedExecutionError> {
+    output_bounded_spawned_timed(
+        child,
+        containment,
+        input,
+        BoundedTiming::Relative(timeout),
+        drain_grace,
+        owner,
+        strict_unknown,
+        cap,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn output_bounded_spawned_timed(
+    mut child: Child,
+    containment: Containment,
+    input: Option<Vec<u8>>,
+    timing: BoundedTiming,
     drain_grace: Duration,
     owner: Option<BoundedOwner>,
     strict_unknown: bool,
@@ -772,28 +850,58 @@ pub(crate) fn output_bounded_spawned(
     let out_token = body.lifetime.drain();
     let err_token = body.lifetime.drain();
     let input_token = body.lifetime.drain();
-    let out = spawn_bounded_drain(out_pipe, out_token, cap)
-        .map_err(|e| body.startup_error(e, drain_grace))?;
-    let err = spawn_bounded_drain(err_pipe, err_token, cap)
-        .map_err(|e| body.startup_error(e, drain_grace))?;
+    let out = spawn_bounded_drain(out_pipe, out_token, cap).map_err(|e| {
+        body.startup_error(
+            e,
+            timing.cleanup_deadline(std::time::Instant::now(), drain_grace),
+        )
+    })?;
+    let err = spawn_bounded_drain(err_pipe, err_token, cap).map_err(|e| {
+        body.startup_error(
+            e,
+            timing.cleanup_deadline(std::time::Instant::now(), drain_grace),
+        )
+    })?;
     let (input_tx, input_rx) = std::sync::mpsc::channel();
-    if let (Some(bytes), Some(mut stdin)) = (input, stdin) {
-        spawn_bounded_worker("bounded-stdin", move || {
-            use std::io::Write;
-            let _ = stdin.write_all(&bytes);
+    match (input, stdin) {
+        (Some(bytes), Some(mut stdin)) => {
+            spawn_bounded_worker("bounded-stdin", move || {
+                use std::io::Write;
+                let result = stdin.write_all(&bytes);
+                drop(stdin);
+                drop(input_token);
+                let _ = input_tx.send(result);
+            })
+            .map_err(|e| {
+                body.startup_error(
+                    e,
+                    timing.cleanup_deadline(std::time::Instant::now(), drain_grace),
+                )
+            })?;
+        }
+        (Some(_), None) => {
+            drop(input_token);
+            let _ = input_tx.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "required stdin pipe is missing",
+            )));
+        }
+        (None, stdin) => {
             drop(stdin);
             drop(input_token);
-            let _ = input_tx.send(());
-        })
-        .map_err(|e| body.startup_error(e, drain_grace))?;
-    } else {
-        drop(input_token);
-        let _ = input_tx.send(());
+            let _ = input_tx.send(Ok(()));
+        }
     }
-    let started = std::time::Instant::now();
+    let run_deadline = timing.run_deadline(std::time::Instant::now());
     let mut timed_out = false;
-    let mut cleanup_started = None;
+    let mut cleanup_deadline = None;
     let code = loop {
+        let now = std::time::Instant::now();
+        if !timed_out && now >= run_deadline {
+            timed_out = true;
+            body.terminate();
+            cleanup_deadline = Some(timing.cleanup_deadline(now, drain_grace));
+        }
         let status = body
             .child
             .lock()
@@ -802,30 +910,25 @@ pub(crate) fn output_bounded_spawned(
         match status {
             Ok(Some(status)) => break if timed_out { None } else { status.code() },
             Ok(None) => {
-                if !timed_out && started.elapsed() >= timeout {
-                    timed_out = true;
-                    body.terminate();
-                    cleanup_started = Some(std::time::Instant::now());
-                }
-                if cleanup_started.is_some_and(|start| start.elapsed() >= drain_grace) {
+                let wake = cleanup_deadline.unwrap_or(run_deadline);
+                let remaining = wake.saturating_duration_since(std::time::Instant::now());
+                if timed_out && remaining.is_zero() {
                     return Err(body.error(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "owned child did not exit during bounded cleanup",
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(10).min(remaining));
             }
             Err(error) => return Err(body.error(error)),
         }
     };
-    let deadline = std::time::Instant::now()
-        .checked_add(drain_grace)
-        .unwrap_or_else(std::time::Instant::now);
+    let deadline = timing.cleanup_deadline(std::time::Instant::now(), drain_grace);
     let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
     let stdout = out.recv_timeout(remaining()).ok();
     let stderr = err.recv_timeout(remaining()).ok();
-    let input_done = input_rx.recv_timeout(remaining()).is_ok();
-    let all_workers_done = stdout.is_some() && stderr.is_some() && input_done;
+    let input_result = input_rx.recv_timeout(remaining()).ok();
+    let all_workers_done = stdout.is_some() && stderr.is_some() && input_result.is_some();
     let tree_settled = loop {
         match body.containment.known_quiescent() {
             Ok(Some(true)) => break true,
@@ -849,6 +952,14 @@ pub(crate) fn output_bounded_spawned(
     let stdout = stdout.map(|v| v.bytes).unwrap_or_default();
     let stderr = stderr.map(|v| v.bytes).unwrap_or_default();
     body.completed = true;
+    // Completion of the writer is physical evidence, not proof that its bytes were delivered.
+    // Settle every worker/tree first so a broken pipe never releases still-running owners early.
+    if let Some(Err(error)) = input_result {
+        return Err(BoundedExecutionError {
+            cause: std::io::Error::new(error.kind(), StdinDeliveryFailure(error)),
+            settlement,
+        });
+    }
     Ok(BoundedBytes {
         stdout,
         stderr,
@@ -950,6 +1061,7 @@ pub mod windows_job {
     //! Unifying them would mean a generic over raw-handle extraction for a 30-line binding.
 
     use super::Containment;
+    #[cfg(test)]
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -973,6 +1085,7 @@ pub mod windows_job {
     }
 
     impl JobLimits {
+        #[cfg(test)]
         fn is_default(&self) -> bool {
             self.active_process_limit.is_none()
                 && self.job_memory_bytes.is_none()
@@ -993,6 +1106,7 @@ pub mod windows_job {
     unsafe impl Sync for Job {}
 
     impl Job {
+        #[cfg(test)]
         fn kill_on_close() -> Option<Self> {
             Self::kill_on_close_with(&JobLimits::default())
         }
@@ -1079,11 +1193,13 @@ pub mod windows_job {
     }
 
     /// Assign a freshly-spawned child (and thus its descendants) to a new kill-on-close job.
+    #[cfg(test)]
     pub fn contain(child: &std::process::Child) -> Containment {
         assign(child.as_raw_handle() as HANDLE)
     }
 
     /// [`contain`], with resource ceilings from the sandbox policy on the same job.
+    #[cfg(test)]
     pub fn contain_with_limits(child: &std::process::Child, limits: &JobLimits) -> Containment {
         assign_with(child.as_raw_handle() as HANDLE, limits)
     }
@@ -1127,6 +1243,7 @@ pub mod windows_job {
         process: HANDLE,
         pid: u32,
         limits: Option<&JobLimits>,
+        deadlines: Option<super::BoundedDeadlines>,
     ) -> Result<Containment, ProtectionFailure> {
         use windows_sys::Win32::System::Threading::{
             ResumeThread, TerminateProcess, WaitForSingleObject,
@@ -1144,6 +1261,12 @@ pub mod windows_job {
             #[cfg(test)]
             if FAIL_PROTECTED_RESUME.with(std::cell::Cell::get) {
                 return Err(std::io::Error::other("injected protected resume refusal"));
+            }
+            if deadlines.is_some_and(|limits| std::time::Instant::now() >= limits.run_until) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "operation deadline exhausted before protected child resume",
+                ));
             }
             // CREATE_SUSPENDED contributes exactly one suspension. A zero count means the child
             // already executed; >1 means it remains suspended. Neither may certify protected spawn.
@@ -1171,7 +1294,14 @@ pub mod windows_job {
                     _ => true,
                 };
                 let process_termination = unsafe { TerminateProcess(process, 1) != 0 };
-                let wait = unsafe { WaitForSingleObject(process, 2_000) };
+                let cleanup_ms = deadlines.map_or(2_000, |limits| {
+                    limits
+                        .settle_until
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(2_000) as u32
+                });
+                let wait = unsafe { WaitForSingleObject(process, cleanup_ms) };
                 let job_empty = match &containment {
                     Containment::Job(job) => job.active_processes().is_ok_and(|count| count == 0),
                     _ => true,
@@ -1254,10 +1384,12 @@ pub mod windows_job {
         Ok(thread)
     }
 
+    #[cfg(test)]
     fn assign(process: HANDLE) -> Containment {
         assign_with(process, &JobLimits::default())
     }
 
+    #[cfg(test)]
     fn assign_with(process: HANDLE, limits: &JobLimits) -> Containment {
         let job = if limits.is_default() {
             Job::kill_on_close()
@@ -1296,6 +1428,9 @@ pub mod windows_job {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    include!("proctree_input_tests.rs");
+    include!("proctree_deadline_tests.rs");
 
     struct StartupFailureInjection {
         previous_failure: Option<usize>,
@@ -1761,10 +1896,8 @@ mod tests {
 
     /// `output_bounded_bytes` must hand back stdout VERBATIM.
     ///
-    /// The Time Machine reads file contents through `git cat-file blob`, so a lossy UTF-8 decode
-    /// anywhere on that path silently rewrites every invalid byte to U+FFFD — corrupting any
-    /// non-UTF-8 file a checkpoint captures, diffs, or restores. This pins the guarantee that made
-    /// it safe to route the Time Machine's git calls through the bounded runner at all.
+    /// Git inspection and other binary-output consumers must not replace invalid bytes with
+    /// U+FFFD. Pin the bounded runner's byte-preservation contract independently of text decoding.
     #[test]
     fn bounded_bytes_preserves_invalid_utf8() {
         // 0xFF is never valid UTF-8. Getting a child to emit one, portably, is fiddlier than it

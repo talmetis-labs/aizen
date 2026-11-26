@@ -23,6 +23,21 @@ const SHELL_ESCAPE_CAP: usize = 6000;
 /// `` !`cmd` `` refs expanded. Output routes through `tui::emit_line` (works under the sticky TUI and
 /// the plain REPL alike). Sync — every step (remember / classify / expand / run) is synchronous.
 pub(crate) async fn preprocess_input(line: &str) -> InputPre {
+    let ctx = crate::agent::hooks::automation_context(None);
+    if !ctx.permits_automation() {
+        let t = line.trim_start();
+        if t.starts_with('#') || t.starts_with('!') || line.contains("!`") {
+            tui::emit_line("Planning mode: memory writes and shell expansion are disabled; use /plan off explicitly before implementation.");
+            return InputPre::Handled;
+        }
+        // Let the audited bounded native reader handle paths; do not expand arbitrary auxiliary
+        // input effects while restricted. Quoted/repository text never changes the policy.
+        return InputPre::Send(line.to_owned());
+    }
+    let Ok(_admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+        tui::emit_line("Input preparation refused: execution policy changed.");
+        return InputPre::Handled;
+    };
     let t = line.trim_start();
     // `#text` → remember a fact directly (the highest-confidence capture → straight into the store).
     if let Some(rest) = t.strip_prefix('#') {
@@ -113,6 +128,12 @@ pub(crate) fn run_shell_escape_in(command: &str, dir: Option<&std::path::Path>) 
     };
     let cwd = dir
         .map(std::path::Path::to_path_buf)
+        .or_else(|| {
+            crate::core::exec_ctx::current().and_then(|ctx| {
+                ctx.placement()
+                    .map(|placement| placement.workspace_root().to_path_buf())
+            })
+        })
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let sbx = match crate::sandbox::runner::prepare_std(

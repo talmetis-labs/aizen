@@ -58,8 +58,8 @@ pub(crate) fn run_prompt_size(
     let total = prompt + tools_bytes;
     // Rough: 4 bytes/token. The real count is tokenizer-specific — this is a budget, not a bill.
     let tok = |b: usize| b / 4;
-    // The LEAN surface: what a coding turn advertises when built-in deferral is on (first-party
-    // APIs by default, `lean_tools: true` elsewhere) — the rare tools move behind `tool_search`.
+    // The LEAN surface: what a coding turn advertises when built-in deferral is on (the default for agent
+    // endpoints) — the rare tools move behind `tool_search`.
     let deferred = agent::builtin::deferred_builtins(None);
     let lean_tools_bytes: usize = defs
         .iter()
@@ -169,7 +169,7 @@ pub(crate) fn run_prompt_size(
         tok(total) / 1000
     );
     println!(
-        "  Lean (coding turn)   : {lean_total:>8} B  ({}, ~{}k tokens; {lean_deferred} tools deferred behind tool_search — on for first-party APIs, `lean_tools` elsewhere)",
+        "  Lean (coding turn)   : {lean_total:>8} B  ({}, ~{}k tokens; {lean_deferred} tools deferred behind tool_search — on by default, `lean_tools: false` to opt out)",
         kb(lean_total),
         tok(lean_total) / 1000
     );
@@ -309,6 +309,23 @@ pub(crate) async fn run_agent_capture(
     task: &str,
     approval_mode: ApprovalMode,
 ) -> Result<String> {
+    agent::todo::with_context(
+        agent::todo::TaskContext::default(),
+        run_agent_capture_scoped(http, base_url, api_key, model, task, approval_mode),
+    )
+    .await
+}
+
+async fn run_agent_capture_scoped(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    task: &str,
+    approval_mode: ApprovalMode,
+) -> Result<String> {
+    agent::todo::begin_user_turn();
+    agent::todo::current_context().finish_turn(agent::todo::TurnEnd::Interrupted);
     let context_window = crate::core::model_context::discover(&cli_config::ResolvedEndpoint {
         base_url: base_url.to_string(),
         api_key: api_key.to_string(),
@@ -323,7 +340,8 @@ pub(crate) async fn run_agent_capture(
             std::process::id(),
             crate::core::persist::unique_sequence()
         )),
-    );
+    )
+    .with_task(agent::todo::current_context());
     let snapshot_key = execution.conversation().to_string();
     let user_turn_id = crate::core::types::UserTurnId::new()?;
     let turn_cancel = crate::core::cancel::TurnCancel::new();
@@ -408,27 +426,58 @@ pub(crate) async fn run_agent_capture(
     let mut history = vec![Message::system(&system), Message::user(sent)];
     history[1].user_turn_id = Some(user_turn_id);
     snapshot.seal_message(&mut history[1]);
-    let result = crate::plugin::associations::scoped(
+    let local_learning = crate::repl::postturn::LocalLearningContext::capture_in_context(
+        &cfg.effective_root(),
+        crate::persona::active(),
+        &cfg.exec_ctx,
+    );
+    let mut result = crate::plugin::associations::scoped(
         snapshot.clone(),
         cfg.exec_ctx.clone(),
         agent::run_agent_loop(chat, &cfg, &registry, &mut history),
     )
     .await;
-    let association_result = finish_associations(&snapshot, &result).await;
+    if let Ok(outcome) = &mut result {
+        outcome.reconcile_task_completion(&cfg.exec_ctx, &cfg.cancel);
+    }
+    agent::todo::current_context().finish_turn(
+        result
+            .as_ref()
+            .map(|outcome| outcome.stop.task_turn_end())
+            .unwrap_or(agent::todo::TurnEnd::Failed),
+    );
+    let association_result = finish_associations(&snapshot, &result, &cfg.exec_ctx).await;
     crate::plugin::snapshots::reset(&snapshot_key);
     let outcome = result?;
     association_result?;
-    learn_completed_turn(&outcome.stop, &history, &cfg, Some(learning_model)).await?;
+    let learning_endpoint = cli_config::ResolvedEndpoint {
+        base_url: base.into(),
+        api_key: key.into(),
+        model: model_ref.into(),
+    };
+    let (provider_result, ()) = tokio::join!(
+        learn_completed_turn(
+            &outcome.stop,
+            &history,
+            &cfg,
+            Some(learning_model),
+            Some(&snapshot)
+        ),
+        local_learning.run_completed(&outcome.stop, &history, http, &learning_endpoint),
+    );
+    provider_result?;
     // A `clarify` yield in a captured (non-REPL) run — e.g. `aizen serve` — has no input box to loop
     // back to, so surface the question as the reply itself. Over Telegram the owner just answers
     // with their next message; for a plain capture caller it reads as the agent's question.
     if let StopReason::AwaitingInput(ask) = &outcome.stop {
         return Ok(format!("❓ {}", ask.display()));
     }
-    Ok(outcome
+    let answer = outcome
         .final_text
+        .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
+        .unwrap_or("(the agent produced no answer)");
+    Ok(crate::ui::events::completion_result_text(outcome.stop.label(), answer).into_owned())
 }
 
 pub(crate) async fn run_models(args: ModelsArgs) -> Result<()> {
@@ -509,10 +558,254 @@ pub(crate) async fn run_chat(args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
+const MAX_TASK_FILE_BYTES: usize = 512 * 1024;
+
+/// Resolve once, before startup migrations/configuration or any stdin reader. The main dispatch
+/// calls this early; the command runner also checks it for direct callers. Never echoes task data.
+pub(crate) fn prepare_agent_task(args: &mut AgentArgs) -> Result<()> {
+    anyhow::ensure!(
+        args.task.is_some() != args.task_file.is_some(),
+        "provide exactly one task: positional text or --task-file PATH"
+    );
+    if let Some(path) = args.task_file.as_deref() {
+        let task = read_agent_task_file(path)?;
+        args.task = Some(task);
+        args.task_file = None;
+    }
+    anyhow::ensure!(
+        args.task.as_deref().is_some_and(|s| !s.trim().is_empty()),
+        "empty task (pass positional text or --task-file PATH)"
+    );
+    Ok(())
+}
+
+fn read_agent_task_file(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    // Check before open (directories/devices/FIFOs) and on the opened handle (replacement race).
+    // O_NONBLOCK prevents a regular-file-to-FIFO swap from hanging the Unix open.
+    let metadata = std::fs::symlink_metadata(path).context("cannot inspect --task-file")?;
+    anyhow::ensure!(metadata.is_file(), "--task-file must be a regular file");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).context("cannot open --task-file")?;
+    let metadata = file
+        .metadata()
+        .context("cannot inspect opened --task-file")?;
+    anyhow::ensure!(metadata.is_file(), "--task-file must be a regular file");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "--task-file must not be a reparse point"
+        );
+    }
+    anyhow::ensure!(
+        metadata.len() <= MAX_TASK_FILE_BYTES as u64,
+        "--task-file exceeds 512 KiB"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_TASK_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("cannot read --task-file")?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_TASK_FILE_BYTES,
+        "--task-file exceeds 512 KiB"
+    );
+    let text = String::from_utf8(bytes).context("--task-file must be valid UTF-8")?;
+    anyhow::ensure!(!text.contains('\0'), "--task-file must not contain NUL");
+    anyhow::ensure!(!text.trim().is_empty(), "--task-file must not be empty");
+    Ok(text)
+}
+
+fn read_agent_resume_state(
+    slug: &str,
+) -> Result<(
+    session_store::SessionStateSnapshot,
+    session_store::SessionRevision,
+)> {
+    session_store::read_session_for_edit_with_state(slug)
+}
+
+/// Trusted CLI ingress only. No prompt rebuilding, provider access or auxiliary setup may precede
+/// this read/transition. The normal loader later restores the transcript under the committed policy.
+fn prepare_agent_control(
+    args: &mut AgentArgs,
+) -> Result<Option<crate::core::session_control::PlanTarget>> {
+    use crate::core::session_control::ExecutionMode;
+    anyhow::ensure!(
+        args.plan.is_none() || !args.exit_plan,
+        "--plan and --exit-plan are mutually exclusive"
+    );
+    let owner = agent::todo::bound_context()
+        .context("agent control ingress requires an active conversation owner")?;
+    let control = owner.control();
+    let saved = args
+        .resume
+        .as_deref()
+        .map(read_agent_resume_state)
+        .transpose()?;
+    if let Some(((_, _, _, _, saved_control), _)) = &saved {
+        control.restore(saved_control.clone())?;
+    }
+    if args.plan.is_none() && !args.exit_plan {
+        control.policy().validate_current()?;
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        args.resume.as_deref().is_none_or(|slug| session_store::sanitize_name(slug) != "last"),
+        "planning transitions cannot target the retired 'last' pointer; resume its saved slug explicitly"
+    );
+    let current = control.snapshot();
+    let mut selected_existing = None;
+    let (mode, target) = if let Some(path) = &args.plan {
+        // cwd is the CLI registry's root. Do not spawn Git merely to select a plan destination.
+        let root = std::env::current_dir().context("reading plan workspace")?;
+        let selected = crate::agent::plan_control::select_target(
+            &root,
+            path.as_deref(),
+            current.plan_target.as_ref(),
+        )?;
+        if selected.observation.is_some() {
+            selected_existing = Some(selected.target.clone());
+        }
+        (ExecutionMode::Planning, Some(selected.target))
+    } else {
+        anyhow::ensure!(
+            saved
+                .as_ref()
+                .is_some_and(|(state, _)| state.4.is_planning())
+                && current.is_planning(),
+            "--exit-plan requires --resume <SLUG> naming an existing restricted session"
+        );
+        (ExecutionMode::Normal, current.plan_target.clone())
+    };
+    let slug = args
+        .resume
+        .as_deref()
+        .map(session_store::sanitize_name)
+        .unwrap_or_else(|| session_store::allocate_session_slug(&[]));
+    let (messages, meta, design, task) = match &saved {
+        Some(((messages, meta, design, task, _), _)) => (
+            messages.clone(),
+            meta.clone().unwrap_or_default(),
+            design.clone(),
+            task.clone(),
+        ),
+        None => (
+            Vec::new(),
+            session_store::SessionMeta {
+                project_root: target.as_ref().map(|target| target.root.clone()),
+                model: args.model.clone(),
+                ..Default::default()
+            },
+            None,
+            owner.snapshot(),
+        ),
+    };
+    let prepared = session_store::prepare_control_transition(
+        &messages,
+        &slug,
+        meta,
+        design.as_ref(),
+        &task,
+        &current,
+        saved.as_ref().map(|(_, revision)| revision),
+    )?;
+    let prepared = if saved.is_none() {
+        prepared.require_absent()?
+    } else {
+        prepared
+    };
+    let mut published = None;
+    control.transition(mode, target.clone(), |next| {
+        published = Some(prepared.save(next)?);
+        Ok(())
+    })?;
+    // No new turn has been recorded yet. Pin its eventual transcript to the very envelope that
+    // carries the transition, not a second session or an ambient legacy pointer.
+    args.resume = Some(slug.clone());
+    args.save_session = true;
+    let path = published.context("planning transition did not publish a session")?;
+    crate::ui::events::session_saved(&slug, &path);
+    let mode = if mode == ExecutionMode::Planning {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    status(&format!(
+        "plan-only mode {mode}; session '{slug}' saved at {path}"
+    ));
+    Ok(selected_existing)
+}
+
+fn attach_agent_selected_plan(target: &crate::core::session_control::PlanTarget) -> Result<()> {
+    let owner =
+        agent::todo::bound_context().context("selected plan requires a conversation owner")?;
+    let policy = owner.control().policy();
+    let _lease = policy.admit()?;
+    anyhow::ensure!(
+        policy.is_planning() && policy.state().plan_target.as_ref() == Some(target),
+        "selected plan does not match the committed execution policy"
+    );
+    let attachment =
+        agent::todo::PlanAttachment::load(std::path::Path::new(&target.root), &target.path)?;
+    anyhow::ensure!(
+        attachment.id == target.id,
+        "selected plan identity changed before attachment"
+    );
+    owner.attach_plan(attachment)
+}
+
 pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
+    agent::todo::with_context(
+        agent::todo::TaskContext::default(),
+        run_agent_cmd_scoped(args),
+    )
+    .await
+}
+
+async fn run_agent_cmd_scoped(mut args: AgentArgs) -> Result<()> {
+    prepare_agent_task(&mut args)?;
+    if let Some(surface) = args.desktop_computer.as_deref() {
+        anyhow::ensure!(
+            args.output_format == "stream-json",
+            "--desktop-computer requires stream-json"
+        );
+        crate::agent::computer::bind(
+            surface,
+            args.desktop_computer_read_only,
+            args.desktop_computer_v2,
+        )?;
+    }
+    // Validate before loading configuration, arming stdin, or making any provider request.
+    if args.host_preview_diagnostics && args.output_format != "stream-json" {
+        anyhow::bail!("--host-preview-diagnostics requires --output-format stream-json");
+    }
+    if args.host_browser_preview && args.output_format != "stream-json" {
+        anyhow::bail!("--host-browser-preview requires --output-format stream-json");
+    }
     match args.output_format.as_str() {
         "stream-json" => {
             crate::ui::events::enable(true);
+            if args.host_browser_preview {
+                crate::ui::events::enable_browser_frames();
+            }
+            if args.host_preview_diagnostics {
+                crate::ui::events::enable_host_preview_diagnostics();
+            }
             // Pipes present independent requests concurrently; consoles queue presentation.
             // Stream-json has one stdin owner in either case; the human REPL stays separate.
             crate::ui::events::note_stdin_piped(!std::io::IsTerminal::is_terminal(
@@ -532,11 +825,34 @@ pub(crate) async fn run_agent_cmd(args: AgentArgs) -> Result<()> {
         }
     }
     if let Err(e) = &result {
-        // The stream's last word: a caller reading stdout must not have to parse stderr to learn
-        // that the run died. `main` still prints the error and exits non-zero. No-op in text mode.
-        crate::ui::events::error(&format!("{e:#}"));
+        // Incomplete already emitted its authoritative result record. Returning an error gives the
+        // process a nonzero exit without replacing it with a second, generic error result.
+        if !e.is::<IncompleteRun>() {
+            crate::ui::events::preview_owner_exiting();
+            crate::ui::events::error(&format!("{e:#}"));
+        }
     }
     result
+}
+
+#[derive(Debug)]
+struct IncompleteRun;
+
+impl std::fmt::Display for IncompleteRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incomplete: runtime completion requirements are not satisfied")
+    }
+}
+
+impl std::error::Error for IncompleteRun {}
+
+/// Preserve legacy exit-code behavior for all existing stops; only new Incomplete is nonzero.
+fn completion_exit(stop: &StopReason) -> Result<()> {
+    if matches!(stop, StopReason::Incomplete) {
+        Err(IncompleteRun.into())
+    } else {
+        Ok(())
+    }
 }
 
 /// A status line of the one-shot's trace: stderr in text mode (stdout is the answer), a `trace`
@@ -562,9 +878,13 @@ fn usage_since(cursor: (u64, u64)) -> serde_json::Value {
     })
 }
 
-async fn run_agent_inner(args: AgentArgs) -> Result<()> {
-    if args.task.trim().is_empty() {
-        anyhow::bail!("empty task (pass the task as the first argument)");
+async fn run_agent_inner(mut args: AgentArgs) -> Result<()> {
+    let _thread_lock = crate::assistants::bind_run(&mut args)?;
+    let selected_plan = prepare_agent_control(&mut args)?;
+    let task = args.task.take().context("task was not prepared")?;
+    if args.goal {
+        agent::goal::clear();
+        agent::goal::arm(true);
     }
     // Read before the endpoint is resolved, so a mistyped path costs a failed open rather than a
     // billed request. Loud rather than skipped: this is the scripting and CI entry point, and an
@@ -600,7 +920,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // Resolve effort once; headless uses the same routed-turn contract as both REPLs.
     // An omitted flag inherits the configured wire tier, without arming a process-global override.
     let harness_effort = match args.effort.as_deref() {
-        Some("auto") => crate::ui::effort_ui::resolve_turn_effort(args.task.trim()),
+        Some("auto") => crate::ui::effort_ui::resolve_turn_effort(task.trim()),
         Some(other) => Some(other.to_string()),
         None => cli_config::load().reasoning_effort,
     };
@@ -609,19 +929,39 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         api_key,
         model,
     };
-    let design = crate::repl::turn::new_session_design(format!("agent:{}", std::process::id()));
+    let owner = crate::assistants::active().map_or_else(
+        || format!("agent:{}", std::process::id()),
+        |thread| thread.owner(),
+    );
+    let design = crate::repl::turn::new_session_design(owner);
     design.set_mode(args.design);
     // Load the session before planning so the same scoped design state is used throughout this turn.
     let mut history = Vec::new();
+    let room_turn = if let Some(binding) = crate::assistants::active() {
+        binding.start_room_turn(task.trim(), &mut history)?
+    } else {
+        None
+    };
     if let Some(slug) = args.resume.as_deref() {
-        let (n, saved_design) =
-            session_store::load_session_with_design(&mut history, slug, &endpoint.model)?;
+        let (n, saved_design, saved_task, _saved_control) =
+            session_store::load_session_with_state(&mut history, slug, &endpoint.model)?;
+        crate::agent::prompt_lanes::reset_per_session_state();
+        agent::todo::restore(saved_task)?;
         if let Some(state) = saved_design {
-            design.restore_session(state)?;
+            // A bound topic supplies the durable Memory identity. Old/copied design metadata
+            // may still be used for ordinary session switching, but cannot redirect a bot turn.
+            if crate::assistants::active().is_none_or(|binding| binding.owner() == state.owner_id) {
+                design.restore_session(state)?;
+            }
         }
         if !crate::ui::events::on() {
             status(&format!("resumed '{slug}' ({n} messages)"));
         }
+    }
+    agent::todo::begin_user_turn();
+    agent::todo::current_context().finish_turn(agent::todo::TurnEnd::Interrupted);
+    if let Some(target) = &selected_plan {
+        attach_agent_selected_plan(target)?;
     }
     design.set_mode(args.design);
     design.begin_turn(
@@ -633,6 +973,17 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         harness_effort.clone(),
         harness_effort.clone(),
         design.clone(),
+    );
+    // Freeze a NEW context only after restore/transition. Keep its lease through settlement so
+    // startup and the registry cannot race another ingress transition or widen an older context.
+    let startup = resolved.execution_context().admit_policy()?;
+    let automation = startup.permits_automation();
+    if automation {
+        crate::run_id_migration_once();
+    }
+    anyhow::ensure!(
+        automation || !args.reference_images,
+        "--reference-images preprocessing is unavailable in plan-only mode; use ordinary --image inspection"
     );
     let image_preferences = if args.image_modes.is_empty() {
         vec![
@@ -650,11 +1001,12 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             &images,
             &image_preferences,
         )?;
-    } else if crate::llm::media::vision_policy_in(
-        &resolved.vision_config,
-        &resolved.endpoint.base_url,
-        &resolved.endpoint.model,
-    ) == crate::llm::media::VisionPolicy::Supported
+    } else if automation
+        && crate::llm::media::vision_policy_in(
+            &resolved.vision_config,
+            &resolved.endpoint.base_url,
+            &resolved.endpoint.model,
+        ) == crate::llm::media::VisionPolicy::Supported
     {
         // Ordinary image inspection needs a reread handle, not a mandatory exact comparison.
         // Vision defaults on; the resolved snapshot still honors an explicit disable.
@@ -666,8 +1018,32 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     }
     resolved.freeze_vision_config();
     crate::repl::turn::validate_current_reference_route(&resolved)?;
-    let shape =
-        crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(args.task.trim()));
+    let routing_task = agent::chat_input::routing_text(&task);
+    let request_shape = crate::core::turn_shape::classify(&routing_task);
+    crate::core::turn_shape::note_turn(request_shape);
+    let light_turn = automation
+        && !args.goal
+        && args.desktop_computer.is_none()
+        && images.is_empty()
+        && crate::assistants::active().is_none()
+        && agent::chat_input::settled_history(&history)
+        && !agent::todo::has_incomplete()
+        && !resolved
+            .execution_context()
+            .task()
+            .is_some_and(|task| task.needs_check());
+    let settings = cli_config::load();
+    let direct_reply = light_turn
+        && settings.prompt_tier.is_none()
+        && agent::chat_input::requests_text_only(agent::chat_input::without_desktop_notes(&task));
+    let focused_tools = if light_turn
+        && cli_config::lean_tools_enabled_in(&settings, &resolved.endpoint.base_url)
+    {
+        agent::chat_input::focused_tools(&routing_task)
+    } else {
+        None
+    };
+    let skip_context_lookup = direct_reply || (focused_tools.is_some() && history.len() < 8);
     let cli_approval = if args.yes {
         ApprovalMode::Yolo
     } else {
@@ -679,21 +1055,27 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         crate::core::steer::arm();
         crate::ui::events::start_stdin_reader();
     }
-    crate::repl::turn::architect_phase(
-        &http,
-        &mut resolved,
-        shape,
-        args.task.trim(),
-        args.task.trim(),
-        cancel.clone(),
-        cli_approval,
-    )
-    .await;
+    if automation && !direct_reply {
+        crate::repl::turn::architect_phase(
+            &http,
+            &mut resolved,
+            request_shape,
+            &routing_task,
+            task.trim(),
+            cancel.clone(),
+            cli_approval,
+        )
+        .await;
+    }
     resolved.freeze_vision_config();
     crate::repl::turn::validate_current_reference_route(&resolved)?;
-    let context_window = crate::core::model_context::discover(&resolved.endpoint)
-        .await
-        .tokens;
+    let context_window = if automation && !skip_context_lookup {
+        crate::core::model_context::discover(&resolved.endpoint)
+            .await
+            .tokens
+    } else {
+        crate::core::model_context::resolve_in(&resolved.vision_config, &resolved.endpoint).tokens
+    };
     let ep = &resolved.endpoint;
     let model = ep.model.clone();
     let base_url = ep.base_url.clone();
@@ -706,11 +1088,13 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     // The cursor was captured before architect planning so its paid calls belong to this run.
 
-    // Registry includes the `task` sub-agent tool (depth 0); a spawned sub-agent uses a
-    // role-scoped registry WITHOUT `task` (no recursion).
-    arm_lsp_session();
+    // Registry includes the `task` sub-agent tool in normal mode only. Planning construction
+    // consults the restored owner before any MCP discovery or delegated integration startup.
+    if automation && !direct_reply {
+        arm_lsp_session();
+    }
     // Built BEFORE the prompt: it publishes the live tool surface the routing map is generated from.
-    let registry = agent::builtin::default_registry_with_task(
+    let mut registry = agent::builtin::registry_with_task(
         http.clone(),
         base_url.clone(),
         api_key.clone(),
@@ -718,27 +1102,45 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         cli_approval,
         context_window,
         None, // cwd IS the project on the CLI path
+        !direct_reply,
     )?;
-    // The first record of a machine-readable run — `system` / `init`: what is about to happen and
-    // with what, before any request goes out. The tool list is the one the first request carries.
+    if let Some(keep) = focused_tools.filter(|_| !args.goal) {
+        agent::builtin::focus_turn(&mut registry, keep);
+    } else if args.desktop_computer.is_some()
+        && agent::chat_input::edits_selected_surface_task(&routing_task)
+    {
+        agent::builtin::advertise_workspace_tools_for_surface(&mut registry);
+    } else if !args.goal
+        && light_turn
+        && cli_config::lean_tools_enabled_in(&settings, &base_url)
+        && !direct_reply
+    {
+        agent::builtin::focus_remote_lookup(&mut registry, &routing_task);
+    }
+    let visible_tools = if direct_reply {
+        Vec::new()
+    } else {
+        registry.advertised_names()
+    };
     crate::ui::events::start(
         &model,
         &cwd,
         resolved.wire_effort.as_deref(),
         images.len(),
-        &registry.advertised_names(),
+        &visible_tools,
         cli_approval.as_str(),
     );
     let max = args.max_iters.unwrap_or(25).max(1);
     let mut cfg = AgentConfig {
         cancel,
+        goal: args.goal.then(|| task.clone()),
         max_iters: max,
         auto_extend_to: max.saturating_mul(2),
         enable_self_review: cli_config::self_review_enabled(&cli_config::load()),
         approval_mode: cli_approval,
         context_window,
         compact_at_pct: crate::compact_threshold_pct(),
-        enable_lsp: crate::agent::lsp::LSP.is_enabled(),
+        enable_lsp: automation && crate::agent::lsp::LSP.is_enabled(),
         nudge_role: agent::NudgeRole::for_base_url(&base_url),
         // A machine-driven run (the desktop plugin, a script) can only correct course via a
         // `steer` line on stdin, so under stream-json this loop drains the same mailbox the TUI
@@ -749,6 +1151,20 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // The stream-json control reader was armed before architect planning so child approvals work.
     resolved.configure(&mut cfg, args.max_iters.is_none());
     let architect_plan = resolved.architect_plan.as_ref();
+    crate::core::memory_context::strip_history(&mut history);
+    let sum_ep = crate::summarizer_endpoint(&base_url, &api_key, &model);
+    if let Some(thread) =
+        crate::assistants::active().filter(|_| automation && cfg.compact_at_pct > 0)
+    {
+        let prepare =
+            crate::assistants::context::prepare(&thread.directory, &history, |messages| {
+                crate::llm::compact_summary::summarize(&http, &sum_ep, messages)
+            });
+        cfg.assistant_context = crate::core::cancel::race(&cfg.cancel, prepare)
+            .await
+            .flatten()
+            .map(std::sync::Arc::new);
+    }
 
     // The model call, injected into the loop. http_ref/base/key/model are all Copy
     // (&Client / &str), so the closure stays `Fn` across the loop's repeated calls.
@@ -768,6 +1184,9 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     let streamed_text = std::sync::Mutex::new(None::<String>);
     let streamed_text_ref = &streamed_text;
     let chat = move |mut msgs: Vec<Message>, defs: Vec<ToolDef>| {
+        if let Some(view) = &cfg_ref.assistant_context {
+            view.apply(&mut msgs);
+        }
         if let Some(design) = cfg_ref.exec_ctx.design() {
             crate::agent::design::prompt::seat_prompt(&mut msgs, &design);
         }
@@ -816,25 +1235,30 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // handed, and `run_agent` is exactly these two opening messages plus that call.
     // One user turn either way. With attachments it serializes as a parts array (text first, then
     // one image_url part each) instead of a plain string, which is the only difference on the wire.
-    crate::core::memory_context::strip_history(&mut history);
     let snapshot_key = cfg.exec_ctx.conversation().to_string();
     let user_turn_id = crate::core::types::UserTurnId::new()?;
-    let snapshot = match crate::plugin::snapshots::prepare(
-        &snapshot_key,
-        &cfg.effective_root(),
-        cfg.exec_ctx.clone(),
-        &user_turn_id,
-        args.task.trim(),
-        args.resume.is_none(),
-        cfg.cancel.clone(),
-    )
-    .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            crate::plugin::runtime::optional_failure(error)?;
-            Default::default()
+    let snapshot = if automation {
+        match crate::plugin::snapshots::prepare(
+            &snapshot_key,
+            &cfg.effective_root(),
+            cfg.exec_ctx.clone(),
+            &user_turn_id,
+            &routing_task,
+            args.resume.is_none()
+                || (crate::assistants::active().is_some()
+                    && !history.iter().any(|m| m.role == "user")),
+            cfg.cancel.clone(),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                crate::plugin::runtime::optional_failure(error)?;
+                Default::default()
+            }
         }
+    } else {
+        Default::default()
     };
     let bundle = crate::plugin::associations::with_affinity(&snapshot, || {
         agent::build_top_level_system_prompt_bundle(
@@ -845,11 +1269,22 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             Some(&snapshot.standing),
         )
     });
+    let mut bundle = bundle;
+    if let Some(thread) = crate::assistants::active() {
+        thread.add_preferences(&mut bundle.dynamic);
+    }
     crate::agent::prompt_lanes::splice_prompt_lanes(&mut history, bundle);
-    let sent = if snapshot.recall.is_empty() {
-        args.task.trim().to_owned()
+    let message_task = if direct_reply {
+        std::borrow::Cow::Borrowed(agent::chat_input::without_desktop_notes(&task))
+    } else if focused_tools.is_some() {
+        agent::chat_input::without_preview_guidance(task.trim())
     } else {
-        format!("{}\n\n{}", snapshot.recall, args.task.trim())
+        std::borrow::Cow::Borrowed(task.trim())
+    };
+    let sent = if snapshot.recall.is_empty() {
+        message_task.into_owned()
+    } else {
+        format!("{}\n\n{}", snapshot.recall, message_task)
     };
     let mut asked = if images.is_empty() {
         Message::user(&sent)
@@ -879,18 +1314,43 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     // A one-shot run is the canonical single-turn shape (one prompt, many tool steps): give it the
     // same mid-loop compaction the REPL has, so a 60-step task summarizes its older steps instead
     // of relying on tool-result clearing alone.
-    let sum_ep = crate::summarizer_endpoint(base, key, model_ref);
     let summarize = move |msgs: Vec<Message>| {
         let ep = sum_ep.clone();
         async move { crate::llm::compact_summary::summarize(http_ref, &ep, msgs).await }
     };
-    let result = crate::plugin::associations::scoped(
+    let local_learning = crate::repl::postturn::LocalLearningContext::capture_in_context(
+        &cfg.effective_root(),
+        crate::persona::active(),
+        &cfg.exec_ctx,
+    );
+    let mut result = crate::plugin::associations::scoped(
         snapshot.clone(),
         cfg.exec_ctx.clone(),
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, &mut history),
     )
     .await;
-    let association_result = finish_associations(&snapshot, &result).await;
+    if let Ok(outcome) = &mut result {
+        // Hooks may mutate the tree; their output cannot certify completion.
+        if cfg.exec_ctx.permits_automation() {
+            let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
+            crate::agent::hooks::run_blocking(|| {
+                crate::agent::hooks::stop(
+                    outcome.stop.label(),
+                    outcome.iters,
+                    outcome.final_text.as_deref(),
+                    &hook_ctx,
+                )
+            });
+        }
+        outcome.reconcile_task_completion(&cfg.exec_ctx, &cfg.cancel);
+    }
+    agent::todo::current_context().finish_turn(
+        result
+            .as_ref()
+            .map(|outcome| outcome.stop.task_turn_end())
+            .unwrap_or(agent::todo::TurnEnd::Failed),
+    );
+    let association_result = finish_associations(&snapshot, &result, &cfg.exec_ctx).await;
     crate::plugin::snapshots::reset(&snapshot_key);
     // Saved before the error is propagated. A run that ended badly still happened, and the REPL
     // treats persistence as not optional — that promise should not be weaker off a terminal.
@@ -905,21 +1365,25 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
     } else {
         None
     };
-    let outcome = result?;
-    association_result?;
-    learn_completed_turn(&outcome.stop, &history, &cfg, Some(learning_model)).await?;
-    // The user's `stop` hooks see every finished run, however it ended (see `agent::hooks`).
-    {
-        let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
-        crate::agent::hooks::run_blocking(|| {
-            crate::agent::hooks::stop(
-                outcome.stop.label(),
-                outcome.iters,
-                outcome.final_text.as_deref(),
-                &hook_ctx,
-            )
-        });
+    if let Some(publication) = room_turn {
+        publication.finish(result.as_ref().ok().and_then(|o| o.final_text.as_deref()))?;
     }
+    let outcome = result?;
+    if crate::assistants::active().is_some_and(|b| !b.in_room()) && saved.is_none() {
+        anyhow::bail!("this assistant turn could not be saved");
+    }
+    association_result?;
+    let (provider_result, ()) = tokio::join!(
+        learn_completed_turn(
+            &outcome.stop,
+            &history,
+            &cfg,
+            Some(learning_model),
+            Some(&snapshot)
+        ),
+        local_learning.run_completed(&outcome.stop, &history, &http, ep),
+    );
+    provider_result?;
     if crate::ui::events::on() {
         // One closing line carries what the text mode spreads over stdout and stderr: the stop
         // reason, the answer, the question when the model asked one, and this run's tokens.
@@ -934,6 +1398,7 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         let media = cfg.exec_ctx.media().snapshot();
         usage["media"] = serde_json::json!({"attempts":media.attempts,"json_bytes":media.json_bytes,
             "image_uri_bytes":media.image_uri_bytes,"images":media.images,"peak_reserved_bytes":media.peak});
+        crate::ui::events::preview_owner_exiting();
         crate::ui::events::done_with_verification(
             outcome.stop.label(),
             outcome.iters,
@@ -944,8 +1409,9 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             usage,
             outcome.verification.clone(),
             streamed.as_deref(),
+            outcome.speech_final_verified,
         );
-        return Ok(());
+        return completion_exit(&outcome.stop);
     }
     {
         let streamed = streamed_text.lock().unwrap_or_else(|e| e.into_inner());
@@ -954,9 +1420,13 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
             streamed.as_deref(),
         );
     }
-    match outcome.stop {
+    match &outcome.stop {
         // The final answer was already streamed to stdout during the call.
         StopReason::Done => {}
+        StopReason::Incomplete => eprintln!(
+            "\n[incomplete: runtime completion requirements are not satisfied after {} steps; the work above is not confirmed complete]",
+            outcome.iters
+        ),
         StopReason::Divergence => eprintln!(
             "\n[stopped after {} steps: recent attempts added no new evidence; the answer above is the best result from established facts]",
             outcome.iters
@@ -990,16 +1460,18 @@ async fn run_agent_inner(args: AgentArgs) -> Result<()> {
         // A one-shot run has no thread to refresh into; the model's note is its final answer.
         StopReason::Refresh => {}
     }
-    Ok(())
+    completion_exit(&outcome.stop)
 }
 
 async fn finish_associations(
     snapshot: &crate::plugin::snapshots::Snapshot,
     result: &Result<agent::AgentOutcome>,
+    execution: &crate::core::exec_ctx::ExecutionContext,
 ) -> Result<()> {
-    if result
-        .as_ref()
-        .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
+    if execution.permits_automation()
+        && result
+            .as_ref()
+            .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
     {
         crate::plugin::associations::flush(snapshot).await
     } else {
@@ -1015,8 +1487,9 @@ async fn learn_completed_turn(
     history: &[Message],
     cfg: &AgentConfig,
     model: Option<crate::plugin::events::TurnModel>,
+    snapshot: Option<&crate::plugin::snapshots::Snapshot>,
 ) -> Result<()> {
-    if !matches!(stop, StopReason::Done) {
+    if !matches!(stop, StopReason::Done) || !cfg.exec_ctx.permits_automation() {
         return Ok(());
     }
     let result = match crate::plugin::events::prepare(
@@ -1025,7 +1498,7 @@ async fn learn_completed_turn(
         &cfg.effective_root(),
         cfg.exec_ctx.clone(),
         cfg.cancel.clone(),
-        None, // One-shot snapshots are retired; never recreate ephemeral notes after exit.
+        snapshot, // Retired one-shots carry evidence, but cannot recreate ephemeral session notes.
         model,
     ) {
         Ok(Some(event)) => crate::plugin::events::dispatch(event).await,
@@ -1303,7 +1776,7 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
         .iter()
         .any(|action| matches!(action, crate::agent::runlog::Action::Reconcile { .. }))
     {
-        anyhow::bail!("resume refused: unresolved or incomplete outcomes require workspace/checkpoint reconciliation; no dispatch started");
+        anyhow::bail!("resume refused: unresolved or incomplete outcomes require inspection of actual workspace effects and recovery evidence; no dispatch started");
     }
 
     let text = std::fs::read_to_string(spec_path)
@@ -1342,9 +1815,88 @@ pub(crate) async fn run_run_resume(run_id: &str, spec_path: Option<&str>, yes: b
 }
 
 #[cfg(test)]
+#[path = "agent_control_tests.rs"]
+mod agent_control_tests;
+
+#[cfg(test)]
+mod task_file_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn task_file_rejects_nonregular_empty_nul_invalid_utf8_and_oversize() {
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let path = dir.path().join("task.txt");
+        assert!(read_agent_task_file(dir.path()).is_err());
+        assert!(read_agent_task_file(&path).is_err());
+        for bytes in [
+            vec![],
+            b" \r\n\t".to_vec(),
+            vec![0xff],
+            b"hello\0world".to_vec(),
+            vec![b'x'; MAX_TASK_FILE_BYTES + 1],
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_agent_task_file(&path).is_err());
+        }
+        let exact = "é".repeat(MAX_TASK_FILE_BYTES / 2);
+        std::fs::write(&path, &exact).unwrap();
+        assert_eq!(read_agent_task_file(&path).unwrap(), exact);
+    }
+
+    #[test]
+    fn task_file_prepares_once_without_reopening_or_touching_stdin() {
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let path = dir.path().join("task.txt");
+        std::fs::write(&path, "  synthetic task\n").unwrap();
+        let mut args =
+            AgentArgs::try_parse_from(["agent", "--task-file", path.to_str().unwrap()]).unwrap();
+        prepare_agent_task(&mut args).unwrap();
+        assert_eq!(args.task.as_deref(), Some("  synthetic task\n"));
+        assert!(args.task_file.is_none());
+        std::fs::remove_file(path).unwrap();
+        prepare_agent_task(&mut args).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_file_rejects_symlink_and_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let file = dir.path().join("task");
+        std::fs::write(&file, "synthetic").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(read_agent_task_file(&link).is_err());
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_agent_task_file(&fifo).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::session_store::{parse_session_bytes, sessions_dir, set_session_slug};
+
+    #[test]
+    fn only_new_incomplete_changes_one_shot_exit_status() {
+        let error = completion_exit(&StopReason::Incomplete).unwrap_err();
+        assert!(error.is::<IncompleteRun>());
+        for stop in [
+            StopReason::Done,
+            StopReason::Cancelled,
+            StopReason::Deadline,
+            StopReason::MaxIters,
+            StopReason::Divergence,
+            StopReason::VerificationFailed,
+            StopReason::Refresh,
+            StopReason::AwaitingInput(crate::agent::clarify::Ask { questions: vec![] }),
+        ] {
+            assert!(completion_exit(&stop).is_ok(), "{stop:?}");
+        }
+    }
 
     #[test]
     fn incomplete_one_shots_never_prepare_memory_learning() {
@@ -1363,6 +1915,7 @@ mod tests {
             .build()
             .unwrap();
         for stop in [
+            StopReason::Incomplete,
             StopReason::Cancelled,
             StopReason::Deadline,
             StopReason::MaxIters,
@@ -1371,12 +1924,24 @@ mod tests {
             StopReason::Refresh,
         ] {
             runtime
-                .block_on(learn_completed_turn(&stop, &[user.clone()], &cfg, None))
+                .block_on(learn_completed_turn(
+                    &stop,
+                    &[user.clone()],
+                    &cfg,
+                    None,
+                    None,
+                ))
                 .unwrap();
         }
         // Even a successful turn with no selected provider creates no optional-memory roots.
         runtime
-            .block_on(learn_completed_turn(&StopReason::Done, &[user], &cfg, None))
+            .block_on(learn_completed_turn(
+                &StopReason::Done,
+                &[user],
+                &cfg,
+                None,
+                None,
+            ))
             .unwrap();
         assert!(!missing.exists());
         if let Some(old) = old_home {

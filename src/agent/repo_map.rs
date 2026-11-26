@@ -196,8 +196,8 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Per-file change counts over the last [`CHURN_COMMITS`] commits (`git log --name-only`) — the
-/// same shell-out pattern as timemachine. `None` when not a repo / git missing.
+/// Per-file change counts over the last [`CHURN_COMMITS`] commits (`git log --name-only`).
+/// `None` when not a repo / Git is missing.
 ///
 /// `-c core.quotePath=false` (P2.4): by default git OCTAL-ESCAPES non-ASCII bytes in path output
 /// (e.g. a Vietnamese filename `hồ_sơ.rs` prints as `"h\341\273\223_s\306\241.rs"`), which would

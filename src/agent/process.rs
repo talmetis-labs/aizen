@@ -698,6 +698,9 @@ fn start(
     // guards: `process start` is what runs dev servers and watchers, i.e. exactly the processes that
     // spawn real children behind the `cmd.exe`/`sh` wrapper and keep holding a port after a kill.
     let started = Instant::now();
+    if let Some(ctx) = crate::core::exec_ctx::current() {
+        ctx.note_task_effects_at(Some(&dir));
+    }
     let (mut child, containment) = match sbx.spawn_contained() {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -1301,6 +1304,11 @@ impl Tool for Process {
                 let e = lookup(&reg, id, &scope)?;
                 let mut guard = e.stdin.lock().unwrap_or_else(|e| e.into_inner());
                 let stdin = guard.as_mut().context("process stdin is closed")?;
+                if !input.is_empty() {
+                    if let Some(ctx) = crate::core::exec_ctx::current() {
+                        ctx.note_task_effects();
+                    }
+                }
                 stdin
                     .write_all(input.as_bytes())
                     .context("writing to process stdin")?;

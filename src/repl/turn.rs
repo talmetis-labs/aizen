@@ -14,13 +14,14 @@ use crate::core::session_store::publish_live_history;
 use crate::core::types::ToolDef;
 use crate::core::{cli_config, types};
 use crate::llm::client;
-use crate::repl::postturn::{last_turn_slice, maybe_evolve_persona, maybe_run_secretary};
+use crate::repl::postturn::{last_turn_slice, LocalLearningContext};
 use crate::ui::context_report::{
     ctx_permille, resolve_ctx_window, usage_ctx_tokens, usage_input_tokens,
 };
 use crate::ui::image_input;
 use crate::ui::{splash, theme, tui};
 use crate::{approval_mode, cancellable_slash, eager_enabled, summarizer_endpoint};
+use anyhow::Context;
 use anyhow::Result;
 use console::style;
 use types::Message;
@@ -38,6 +39,8 @@ pub(crate) struct ResolvedTurn {
     reference_markers: Vec<crate::core::tool_media::ToolImage>,
     /// Frozen saved config with explicit session overrides; never persist this snapshot.
     pub(crate) vision_config: cli_config::CliConfig,
+    /// Freeze placement only; a prior turn's policy/admission must never become session state.
+    workspace: Option<crate::core::exec_ctx::WorkspacePlacement>,
 }
 
 impl ResolvedTurn {
@@ -82,6 +85,7 @@ impl ResolvedTurn {
             references: None,
             reference_markers: Vec::new(),
             vision_config,
+            workspace: crate::core::exec_ctx::current().and_then(|ctx| ctx.workspace_snapshot()),
         }
     }
 
@@ -96,12 +100,18 @@ impl ResolvedTurn {
             crate::core::convo::ConversationId::new(state.owner_id),
         )
         .with_design(self.design.clone());
-        match &self.references {
+        let context = match &self.workspace {
+            Some(workspace) => context.with_workspace(workspace),
+            None => context,
+        };
+        let context = match &self.references {
             Some(access) => context
                 .with_resource_scope(access.scope().task_scope.clone())
                 .with_references(access.clone()),
             None => context,
-        }
+        };
+        // Reference authorization may change resource scope, but this remains the owning turn.
+        context.with_task(crate::agent::todo::current_context())
     }
 
     /// Add identity sidecars to the newly seated canonical user occurrence, not another history
@@ -158,6 +168,11 @@ impl ResolvedTurn {
             .collect();
         cfg.tool_image_destination_label = Some(format!("{label_url} · {label_model}"));
         cfg.exec_ctx = self.execution_context();
+        cfg.architect_document = self.architect_plan.as_ref().and_then(|plan| {
+            let path = plan.path.as_ref()?.to_str()?.replace('\\', "/");
+            let document = crate::agent::plan_document::parse(plan.text.as_bytes()).ok()?;
+            Some((path, document.id))
+        });
         if apply_budgets {
             if let Some(tier) = self.harness_effort.as_deref() {
                 cfg.apply_effort(tier);
@@ -253,6 +268,8 @@ fn register_current_reference_images(
     Vec<crate::core::reference_media::ReferenceDescriptor>,
 )> {
     let context = turn.execution_context();
+    let _admitted = crate::agent::hooks::admit_automation(&context)
+        .context("image reference preparation is unavailable while execution is restricted")?;
     let registry =
         crate::core::reference_media::ReferenceRegistry::new(context.conversation().to_string());
     anyhow::ensure!(
@@ -368,10 +385,13 @@ pub(crate) fn new_session_design(owner: impl Into<String>) -> DesignContext {
 }
 
 pub(crate) fn design_workspace() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .map(|p| p.display().to_string())
+    crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        })
+        .or_else(|| std::env::current_dir().ok())
+        .map(|root| root.canonicalize().unwrap_or(root).display().to_string())
         .unwrap_or_else(|| ".".to_string())
 }
 
@@ -406,7 +426,10 @@ pub(crate) fn build_turn_registry(
         ep.model.clone(),
         approval_mode(),
         crate::core::model_context::resolve(ep).tokens,
-        None, // cwd IS the project in the REPL
+        crate::core::exec_ctx::current().and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        }), // None is reserved for an unbound standalone caller, never a focused REPL.
     )
 }
 
@@ -466,6 +489,10 @@ pub(crate) async fn architect_phase(
     approval: crate::core::approval::ApprovalMode,
 ) {
     use crate::agent::architect;
+    let planner_context = turn.execution_context();
+    let Ok(_admitted) = crate::agent::hooks::admit_automation(&planner_context) else {
+        return;
+    };
     let cfg = cli_config::load();
     if !architect::applies(
         turn.harness_effort.as_deref(),
@@ -478,7 +505,6 @@ pub(crate) async fn architect_phase(
     let root = std::path::PathBuf::from(design_workspace());
     let planner = architect::planner_model(&cfg, &turn.endpoint.model);
     tui::emit_line(&theme::faint(&format!("architect: metis planning on {planner}…")).to_string());
-    let planner_context = turn.execution_context();
     let Some(plan) = architect::plan(
         http,
         &turn.endpoint,
@@ -496,12 +522,17 @@ pub(crate) async fn architect_phase(
     };
     // Prepare only: the editor saves through ordinary file tools, never a privileged write here.
     let mut plan = plan;
-    architect::prepare_document(
+    if let Err(error) = architect::prepare_document(
         original_brief,
         &mut plan,
         &planner,
         turn.harness_effort.as_deref(),
-    );
+    ) {
+        tui::emit_line(&format!(
+            "architect: discarded invalid unsaved plan draft: {error}"
+        ));
+        return;
+    }
     if turn.references.is_none() {
         turn.design.set_intent(plan.design_intent);
     }
@@ -568,9 +599,9 @@ pub(crate) async fn seat_user_message(
     client::cost_meter().begin_turn();
     // The todo list is scoped to the turn: cleared here unless the previous turn ended abnormally
     // (its open items are then the continuation plan). Assume THIS turn ends abnormally until
-    // `finish_turn` says otherwise, so a turn that errors out keeps its plan for the retry.
+    // run_agent_turn seals its result, so prep failures and dropped futures keep their plan.
     crate::agent::todo::begin_user_turn();
-    crate::agent::todo::end_turn(true);
+    crate::agent::todo::current_context().finish_turn(crate::agent::todo::TurnEnd::Interrupted);
     // Retire only content-bound host scaffolds at a valid user boundary. Saved source files and
     // unmarked text remain unchanged. The actual turn carrier/cancel token survives provider IO.
     crate::core::memory_context::strip_history(history);
@@ -581,11 +612,7 @@ pub(crate) async fn seat_user_message(
         &root,
         cfg.exec_ctx.clone(),
         &user_turn_id,
-        if crate::core::turn_shape::classify(line) == crate::core::turn_shape::TurnShape::Question {
-            "" // Question turns do not render recall; do not attribute unseen hits to this turn.
-        } else {
-            line
-        },
+        line,
         false,
         cfg.cancel.clone(),
     )
@@ -682,7 +709,8 @@ pub(crate) async fn run_agent_turn(
             let (turn, receipt) =
                 crate::llm::media::with_image_delivery(&cfg.exec_ctx, base, key, model, async {
                     let starter = eager_on.then(|| agent::eager_starter(registry, cfg));
-                    client::stream_chat_with_tools_sink_frozen(
+                    // Keep the streaming future out of the enclosing REPL and loop futures.
+                    Box::pin(client::stream_chat_with_tools_sink_frozen(
                         http,
                         base,
                         key,
@@ -698,7 +726,7 @@ pub(crate) async fn run_agent_turn(
                         },
                         wire_effort,
                         &image_config,
-                    )
+                    ))
                     .await
                 })
                 .await?;
@@ -757,13 +785,41 @@ pub(crate) async fn run_agent_turn(
             }
         });
     let association_snapshot = crate::plugin::snapshots::current("repl");
-    let result = crate::plugin::associations::scoped(
+    let mut result = crate::plugin::associations::scoped(
         association_snapshot.clone(),
         cfg.exec_ctx.clone(),
         agent::run_agent_loop_full(chat, summarize, oracle, cfg, registry, history),
     )
     .await;
-    if result.is_err() {
+    if let Ok(outcome) = &mut result {
+        // Stop hooks may change the tree: reconcile before recovery, learning or persistence.
+        // Clarification remains a yield rather than a finished-answer hook boundary.
+        if cfg.exec_ctx.permits_automation()
+            && !matches!(outcome.stop, StopReason::AwaitingInput(_))
+        {
+            crate::agent::hooks::run_blocking(|| {
+                crate::agent::hooks::stop(
+                    outcome.stop.label(),
+                    outcome.iters,
+                    outcome.final_text.as_deref(),
+                    &crate::agent::hooks::Context::from_cfg(cfg),
+                )
+            });
+        }
+        outcome.reconcile_task_completion(&cfg.exec_ctx, &cfg.cancel);
+    }
+    // Seal the owner state before any recovery checkpoint or caller autosave, including errors
+    // and clarify yields (which deliberately skip finish_turn).
+    crate::agent::todo::current_context().finish_turn(
+        result
+            .as_ref()
+            .map(|outcome| outcome.stop.task_turn_end())
+            .unwrap_or(crate::agent::todo::TurnEnd::Failed),
+    );
+    if !result
+        .as_ref()
+        .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
+    {
         crate::plugin::associations::discard(&association_snapshot);
     }
     if result.as_ref().err().is_some_and(|error| {
@@ -803,10 +859,13 @@ pub(crate) fn surface_appended_final_text(final_text: Option<&str>, streamed_tex
 /// Ordering is load-bearing and was the thing that drifted: the learning passes read the FULL detail
 /// of the turn, so they must run before auto-compaction summarizes it away, and persistence must
 /// happen last and unconditionally — a cancelled learning pass is not a reason to lose the
-/// transcript.
+/// transcript. `local_learning` is captured before the agent starts, never after a tool or stop hook
+/// has switched the active persona; a changed card makes the original owner's learning skip.
+#[allow(clippy::too_many_arguments)] // Keep pre-turn ownership separate from mutable turn state.
 pub(crate) async fn finish_turn(
     outcome: &AgentOutcome,
     persona_before: Option<String>,
+    local_learning: LocalLearningContext,
     history: &mut Vec<Message>,
     http: &reqwest::Client,
     ep: &cli_config::ResolvedEndpoint,
@@ -821,25 +880,16 @@ pub(crate) async fn finish_turn(
     // paragraph. Silence here makes those read exactly like `Done`, and the passes below would then
     // file a red tree as a finished task.
     surface_abnormal_stop(outcome);
-    // The user's `stop` hooks see every finished top-level turn (see `agent::hooks`).
-    crate::agent::hooks::run_blocking(|| {
-        crate::agent::hooks::stop(
-            outcome.stop.label(),
-            outcome.iters,
-            outcome.final_text.as_deref(),
-            &crate::agent::hooks::Context::here(false),
-        )
-    });
-    // A turn that did not reach `Done` leaves its plan for the next user turn (see `todo`).
-    crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
-    // Goal mode finishes only on a verify-passing `Done`. Clear it here so the next turn is an
-    // ordinary capped turn again; Esc leaves the goal armed on purpose, so the user can retry.
+    // run_agent_turn ran stop hooks and sealed the owned task state before recovery/persistence,
+    // including outcomes that never reach this post-turn path (errors and clarification).
+    // Goal mode finishes only on the authoritative `Done`. Do not promote that decision into an
+    // invented verification status; a read-only/report task need not have run a checker.
     if crate::agent::goal::current_goal().is_some() && matches!(outcome.stop, StopReason::Done) {
         crate::agent::goal::set_goal(None);
         crate::agent::goal::arm(false);
         crate::agent::goal::clear();
         tui::emit_line(
-            &style("🎯 goal complete — verified. goal mode off.")
+            &style("goal complete. goal mode off.")
                 .color256(splash::ACCENT)
                 .to_string(),
         );
@@ -883,7 +933,8 @@ pub(crate) async fn finish_turn(
     // drain gives `DRAIN_JOIN` to satisfy. So they run in the background on a copy of the turn.
     // Auto-compaction is not a post-turn pass any more: the loop compacts between its own steps
     // (`compact_at_pct`), so a long turn shrinks mid-flight instead of after it ends.
-    {
+    // Only authoritative completion can record successful-turn learning or associations.
+    if matches!(outcome.stop, StopReason::Done) && cfg.exec_ctx.permits_automation() {
         let turn = last_turn_slice(history).to_vec();
         let root = cfg.effective_root();
         let execution = cfg.exec_ctx.clone();
@@ -910,29 +961,52 @@ pub(crate) async fn finish_turn(
         };
         let http = http.clone();
         let ep = ep.clone();
-        crate::repl::learning_queue::LEARNING.spawn(async move {
-            crate::plugin::associations::scoped(association_snapshot.clone(), execution, async {
-                maybe_run_secretary(&turn, &http, &ep.base_url, &ep.api_key, &ep.model).await;
-                maybe_evolve_persona(&http, &ep.base_url, &ep.api_key, &ep.model).await;
-            })
-            .await;
-            if crate::plugin::associations::flush(&association_snapshot)
-                .await
-                .is_err()
-            {
-                tui::note_line(
-                    "Memory associations did not settle; further optional learning skipped.",
-                );
-                return;
-            }
-            if let Some(event) = memory_event {
-                if crate::plugin::events::dispatch(event).await.is_err() {
+        let provider_snapshot = association_snapshot.clone();
+        crate::repl::learning_queue::LEARNING.spawn_independent_in_context(
+            &cfg.exec_ctx,
+            async move {
+                crate::plugin::associations::scoped(
+                    association_snapshot.clone(),
+                    execution,
+                    async {
+                        local_learning
+                            .run(&turn, &http, &ep.base_url, &ep.api_key, &ep.model)
+                            .await;
+                    },
+                )
+                .await;
+                if crate::plugin::associations::flush(&association_snapshot)
+                    .await
+                    .is_err()
+                {
                     tui::note_line(
-                        "Memory provider learning failed; no automatic retry was attempted.",
+                        "Memory associations did not settle; optional feedback stopped.",
                     );
                 }
-            }
-        });
+            },
+            async move {
+                // Flush this turn's already-recorded associations before dispatch, but do not make
+                // provider learning wait behind two independent identity model calls (up to 120s).
+                if crate::plugin::associations::flush(&provider_snapshot)
+                    .await
+                    .is_err()
+                {
+                    tui::note_line(
+                        "Memory associations did not settle; further optional learning skipped.",
+                    );
+                    return;
+                }
+                if let Some(event) = memory_event {
+                    if crate::plugin::events::dispatch(event).await.is_err() {
+                        tui::note_line(
+                            "Memory provider learning failed; no automatic retry was attempted.",
+                        );
+                    }
+                }
+            },
+        );
+    } else {
+        crate::plugin::associations::discard(&crate::plugin::snapshots::current("repl"));
     }
     // Persistence is NOT optional: a cancelled learning pass must still leave the conversation on
     // disk. `autosave_session` names the session with a model call,
@@ -972,6 +1046,12 @@ pub(crate) async fn finish_turn(
 fn surface_abnormal_stop(outcome: &AgentOutcome) {
     let line = match &outcome.stop {
         StopReason::Done => return,
+        StopReason::Incomplete => format!(
+            "incomplete after {} steps: runtime completion requirements are not satisfied. \
+             The work above is not confirmed complete; continue to resolve the outstanding work \
+             or missing evidence.",
+            outcome.iters
+        ),
         StopReason::VerificationFailed => format!(
             "⚠ edits were made but verification never passed ({} steps). The tree is likely broken \
              — `/diff` to see what changed, `/rewind` to undo, or tell me to keep fixing.",
@@ -1073,6 +1153,37 @@ pub(crate) fn show_clarify(ask: &crate::agent::clarify::Ask) {
 mod smoke_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn resolved_execution_context_keeps_task_owner_across_blocking_tools() {
+        use crate::agent::todo::{self, Status, TaskContext, Todo};
+        let owner = TaskContext::private();
+        todo::with_context(owner.clone(), async {
+            let resolved = ResolvedTurn::from_frozen(
+                cli_config::ResolvedEndpoint {
+                    base_url: "http://127.0.0.1:9/v1".into(),
+                    api_key: "unused".into(),
+                    model: "fixture-model".into(),
+                },
+                None,
+                None,
+                DesignContext::new("task-owner", ".", DesignMode::Off),
+                cli_config::CliConfig::default(),
+            );
+            let execution = resolved.execution_context();
+            assert!(execution.task().is_some());
+            tokio::task::spawn_blocking(move || {
+                crate::core::exec_ctx::with_current(execution, || {
+                    todo::set(vec![Todo::new("owned tool update", Status::InProgress)]);
+                });
+            })
+            .await
+            .unwrap();
+            assert_eq!(todo::snapshot()[0].content, "owned tool update");
+            assert_eq!(owner.snapshot(), todo::durable_snapshot());
+        })
+        .await;
+    }
+
     #[test]
     fn lifting_images_validates_combined_selection_before_mutating_the_draft() {
         let image = crate::llm::media::tests::image(93);
@@ -1135,6 +1246,60 @@ mod smoke_tests {
     }
 
     #[test]
+    fn resolved_turn_captures_session_placement_without_freezing_previous_permission() {
+        use crate::core::{
+            exec_ctx, file_placement::PlacementContext, session_control::ExecutionMode,
+        };
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let project = fixture.path().join("project-config");
+        std::fs::create_dir(&project).unwrap();
+        let placement = PlacementContext::new(root.clone(), fixture.path().join("home"))
+            .unwrap()
+            .with_project_root(project.clone())
+            .unwrap();
+        let session = exec_ctx::ExecutionContext::default().with_placement(placement);
+        let task = crate::agent::todo::TaskContext::private();
+        let control = task.control();
+        let prior_permission = exec_ctx::ExecutionContext::default().with_task(task.clone());
+        let turn = exec_ctx::with_current(session.clone(), || {
+            ResolvedTurn::from_frozen(
+                cli_config::ResolvedEndpoint {
+                    base_url: "http://127.0.0.1:9/v1".into(),
+                    api_key: "unused".into(),
+                    model: "fixture".into(),
+                },
+                None,
+                None,
+                DesignContext::new("fixture", root.display().to_string(), DesignMode::Off),
+                cli_config::CliConfig::default(),
+            )
+        });
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        assert!(prior_permission
+            .policy()
+            .unwrap()
+            .validate_current()
+            .is_err());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(crate::agent::todo::with_context(task, async {
+            let context = turn.execution_context();
+            assert_eq!(context.workspace_binding(), session.workspace_binding());
+            assert_eq!(context.placement().unwrap().workspace_root(), root);
+            assert_eq!(context.placement().unwrap().project_root(), project);
+            assert!(context.policy().unwrap().validate_current().is_ok());
+            assert!(context.can_restore_workspace());
+        }));
+        assert!(exec_ctx::current().is_none());
+    }
+
+    #[test]
     fn resolved_model_drives_prompt_context_and_harness_without_erasing_history() {
         let _home = crate::core::config::TEST_HOME_LOCK
             .lock()
@@ -1157,6 +1322,7 @@ mod smoke_tests {
             references: None,
             reference_markers: Vec::new(),
             vision_config: cli_config::CliConfig::default(),
+            workspace: None,
         };
         let mut cfg = AgentConfig::default();
         resolved.configure(&mut cfg, true);

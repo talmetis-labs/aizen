@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
-#[path = "speculative_native_tools.rs"]
-mod speculative_native_tools;
-pub(crate) use speculative_native_tools::prepared_native_worker;
+#[path = "git_native_tools.rs"]
+mod git_native_tools;
+pub(crate) use git_native_tools::prepared_git_native_worker;
 
 /// Default wall-clock cap for `shell_run` (a hung command must never freeze the agent loop).
 const SHELL_TIMEOUT_SECS: u64 = 120;
@@ -206,7 +206,7 @@ pub fn deferred_tools_note() -> Option<String> {
 }
 
 /// The note text for one deferred surface. Built-in deferred tools are NAMED (there are a dozen
-/// and the model must know `checkpoint` exists to ask for it); MCP tools are counted per server
+/// and the model must know `skill_save` exists to ask for it); MCP tools are counted per server
 /// (there can be hundreds). Byte-stable for a stable surface.
 pub(crate) fn deferred_tools_note_for(surface: &crate::agent::tools::DeferredSurface) -> String {
     let (names, by_origin) = surface;
@@ -235,14 +235,17 @@ pub(crate) fn deferred_tools_note_for(surface: &crate::agent::tools::DeferredSur
         }
         s.push_str(&format!(
             "{} MCP tool(s) are connected but not pre-loaded: {}",
-            names.len() - builtin.len(),
+            by_origin
+                .iter()
+                .filter(|(origin, _)| origin != "builtin")
+                .map(|(_, count)| count)
+                .sum::<usize>(),
             mcp.join(", ")
         ));
     }
     s.push_str(
-        ". When the task needs one, find it with `tool_search` (by name or capability) — a match \
-         returns the full argument schema, and that tool is then callable directly by its exact \
-         name.\n",
+        ". Call tools already attached directly. Use `tool_search` for other capabilities. \
+         Matching schemas are attached to the next request.\n",
     );
     s
 }
@@ -274,24 +277,72 @@ pub(crate) fn swap_deferred_tools_for_test(
 /// resolve against (NOT a hard boundary: `confine` no longer rejects paths that escape it, so an
 /// absolute or `../` path may reach elsewhere on disk — see [`confine`]).
 fn resolve_root() -> Result<PathBuf> {
-    std::env::current_dir()
-        .context("resolving cwd")?
+    let root = crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        })
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().context("resolving cwd"))?;
+    let root = root
         .canonicalize()
-        .context("canonicalizing cwd")
+        .context("bound tool workspace is unavailable")?;
+    anyhow::ensure!(root.is_dir(), "bound tool workspace is not a directory");
+    Ok(root)
 }
 
 /// The built-in tools rooted at `root`. Shared by the top-level registry and the `coder`
 /// sub-agent role, and by the task suite (`bench tasks`), which wants the real surface minus the
 /// `task`/`workflow` dispatchers.
 pub(crate) fn default_registry_in(root: &Path) -> ToolRegistry {
+    local_registry(root, true)
+}
+
+fn local_registry(root: &Path, connect_mcp: bool) -> ToolRegistry {
+    if let Some(registry) = restricted_registry(root) {
+        return registry;
+    }
     #[cfg(feature = "browser")]
     let browser_configured = crate::agent::browser::is_configured();
     #[cfg(not(feature = "browser"))]
     let browser_configured = false;
-    default_registry_for_browser(root, browser_configured)
+    registry_for_browser(root, browser_configured, connect_mcp)
 }
 
+/// No integration discovery or delegation is constructed on this path.
+pub(super) fn planning_registry(
+    root: &Path,
+    policy: &crate::core::session_control::ExecutionPolicy,
+) -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    if policy.validate_current().is_err() {
+        return r;
+    }
+    r.register(Box::new(FileRead::new(root.to_path_buf())));
+    r.register(Box::new(FileGlob::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::search::SearchFiles::new(
+        root.to_path_buf(),
+    )));
+    r.register(Box::new(FileWrite::new(root.to_path_buf())));
+    r.register(Box::new(crate::agent::todo::TodoWrite));
+    r
+}
+
+fn restricted_registry(root: &Path) -> Option<ToolRegistry> {
+    crate::agent::planning::current_policy()
+        .filter(|policy| policy.is_planning() || policy.validate_current().is_err())
+        .map(|policy| planning_registry(root, &policy))
+}
+
+#[cfg(test)]
 fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRegistry {
+    registry_for_browser(root, browser_configured, true)
+}
+
+fn registry_for_browser(root: &Path, browser_configured: bool, connect_mcp: bool) -> ToolRegistry {
+    if let Some(registry) = restricted_registry(root) {
+        return registry;
+    }
     #[cfg(not(feature = "browser"))]
     let _ = browser_configured;
     use crate::agent::web_tools::{WebCrawl, WebFetch, WebSearch};
@@ -313,6 +364,7 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     // Top-level only, like the `<sessions>` block that advertises it: a sub-agent serves one
     // stated task and has no business rummaging through the user's other conversations.
     r.register(Box::new(SessionRecall));
+    r.register(Box::new(GitInspect::new(root.to_path_buf())));
     r.register(Box::new(FileRead::new(root.to_path_buf())));
     r.register(Box::new(FileGlob::new(root.to_path_buf())));
     r.register(Box::new(crate::agent::search::SearchFiles::new(
@@ -331,18 +383,12 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     // `subagent_read_only_base`, so a specialist sub-agent can't touch bot config.
     register_bot_admin(&mut r);
     register_notify(&mut r);
-    // Two tools, not five: `checkpoint` carries the mutating actions (save/rewind/restore) and
-    // `checkpoint_view` the read-only ones (diff/list). The split is on `is_destructive`, which the
-    // trait defines per TYPE rather than per args — folding the reads in would make listing a
-    // timeline ask the user for approval.
-    r.register(Box::new(crate::features::timemachine::Checkpoint::new(
-        root.to_path_buf(),
-    )));
-    r.register(Box::new(crate::features::timemachine::CheckpointView::new(
-        root.to_path_buf(),
-    )));
     // Explicit per-owner undo belongs only to the coordinating parent's full registry.
     r.register(Box::new(crate::agent::native_undo::NativeOwnerUndo::new(
+        root.to_path_buf(),
+    )));
+    // Git history changes are a coordinating-parent capability, never a specialist grant.
+    r.register(Box::new(crate::agent::git_change::GitChange::new(
         root.to_path_buf(),
     )));
     // Who else is editing this repository right now. Top-level only, and not because it is unsafe
@@ -422,11 +468,13 @@ fn default_registry_for_browser(root: &Path, browser_configured: bool) -> ToolRe
     // estimate over `deferAutoTokens`) registers its tools DEFERRED: dispatchable by name, absent
     // from `defs()`. `tool_search` is their discovery door and registers only when at least one
     // tool is deferred — a session with a small surface pays neither the tool nor its schema.
-    for d in crate::agent::mcp::discovered_tools() {
-        if d.deferred {
-            r.register_deferred(std::sync::Arc::from(d.tool), d.server);
-        } else {
-            r.register(d.tool);
+    if connect_mcp {
+        for d in crate::agent::mcp::discovered_tools() {
+            if d.deferred {
+                r.register_deferred(std::sync::Arc::from(d.tool), d.server);
+            } else {
+                r.register_from(d.tool, Some(d.server));
+            }
         }
     }
     r.register(Box::new(crate::agent::image_read::ImageRead::new(
@@ -520,15 +568,46 @@ pub fn default_registry_with_task(
     context_window: usize,
     root: Option<PathBuf>,
 ) -> Result<ToolRegistry> {
+    registry_with_task(
+        client,
+        base_url,
+        api_key,
+        model,
+        approval_mode,
+        context_window,
+        root,
+        true,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The caller selects the model endpoint, workspace, approval policy and MCP access"
+)]
+pub(crate) fn registry_with_task(
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    approval_mode: crate::core::approval::ApprovalMode,
+    context_window: usize,
+    root: Option<PathBuf>,
+    connect_mcp: bool,
+) -> Result<ToolRegistry> {
     let root = match root {
-        // A lane-supplied root is canonicalized so the tools, the writer lease, and the checkpoint
-        // path all key off ONE spelling of the directory.
+        // A lane-supplied root is canonicalized so tools and writer leases
+        // all key off ONE spelling of the directory.
         Some(r) => r.canonicalize().unwrap_or(r),
         None => resolve_root()?,
     };
+    if let Some(registry) = restricted_registry(&root) {
+        publish_active_tools(&registry);
+        return Ok(registry);
+    }
     // Decided before `base_url` moves into the delegation tools below.
     let lean = crate::core::cli_config::lean_tools_enabled(&base_url);
-    let mut r = default_registry_in(&root);
+    let mut r = local_registry(&root, connect_mcp);
+    crate::agent::computer::register(&mut r);
     r.register(Box::new(PersonaCreate));
     r.register(Box::new(crate::agent::task_tool::TaskTool::new(
         client.clone(),
@@ -559,9 +638,15 @@ pub fn default_registry_with_task(
     crate::agent::toolsets::apply_toolset_filter(&mut r);
     // The rarely-used built-ins ride behind `tool_search` instead of on every request; which ones
     // depends on the conversation's shape (widest turn so far), so the list stays byte-stable.
-    // Only where a non-advertised tool can still be called (`lean_tools`): a grammar-locking
-    // gateway would leave a deferred tool uncallable, silently.
-    if lean {
+    // Discovery advertises matched schemas before dispatch on strict gateways too.
+    if crate::agent::computer::bound() && r.get("computer_observe").is_some() {
+        for name in r.advertised_names() {
+            if !crate::agent::computer::surface_tool(&name) {
+                r.defer(&name, "builtin");
+            }
+        }
+        install_tool_search(&mut r);
+    } else if lean {
         defer_builtins_for_shape(&mut r, crate::core::turn_shape::conversation_shape());
     }
     // Publish the live surface so the `<skills>` index can hide skills that `require:` an absent tool.
@@ -569,16 +654,59 @@ pub fn default_registry_with_task(
     Ok(r)
 }
 
+fn defer_unrelated(r: &mut ToolRegistry, keep: &[&str]) {
+    for name in r.advertised_names() {
+        if name != "tool_search" && !keep.contains(&name.as_str()) {
+            r.defer(&name, "builtin");
+        }
+    }
+    install_tool_search(r);
+}
+
+pub(crate) fn focus_turn(r: &mut ToolRegistry, keep: &[&str]) {
+    defer_unrelated(r, keep);
+    publish_active_tools(r);
+}
+
+pub(crate) fn advertise_workspace_tools_for_surface(r: &mut ToolRegistry) {
+    if r.get("computer_observe").is_none() {
+        return;
+    }
+    r.advertise(&["file_read", "file_glob", "search_files"]);
+    if !crate::agent::computer::read_only() {
+        r.advertise(&["file_edit", "file_write", "shell_run", "process"]);
+    }
+    publish_active_tools(r);
+}
+
+/// Reuse normal discovery ranking for a short integration lookup, including normally eager MCP
+/// tools. Only a single, non-mutating match warrants sending a focused initial tool list.
+pub(crate) fn focus_remote_lookup(r: &mut ToolRegistry, request: &str) {
+    if request.len() > 640
+        || !super::request_language::is_single_clause(&super::request_language::normalize(request))
+        || !r.names().iter().any(|name| name.starts_with("mcp_"))
+    {
+        return;
+    }
+    let mut candidate = r.clone();
+    defer_unrelated(&mut candidate, &[]);
+    let matches = super::tool_search::requested_tools(&candidate, request);
+    if let [name] = matches.as_slice() {
+        if name.starts_with("mcp_") && r.get(name).is_some_and(|tool| !tool.is_destructive()) {
+            *r = candidate;
+            publish_active_tools(r);
+        }
+    }
+}
+
 /// Built-in tools a coding turn rarely calls, kept OFF the request and reachable through
 /// `tool_search`: the orchestration and character surfaces, the memory and skill WRITE surfaces,
-/// the time machine, the crawler. Measured at ~14.5 KB of the 42 KB schema block (2026-09-15).
-/// Every one of them stays dispatchable — a model that needs `checkpoint` asks `tool_search` for
+/// and the crawler.
+/// Every one of them stays dispatchable — a model that needs `skill_save` asks `tool_search` for
 /// it, gets the schema back, and calls it by name.
 const DEFERRED_ALWAYS: &[&str] = &[
     "workflow",
     "persona_create",
-    "checkpoint",
-    "checkpoint_view",
     "memory_save",
     "memory_update",
     "memory_forget",
@@ -619,7 +747,18 @@ const DEFERRED_ALWAYS: &[&str] = &[
 
 /// Deferred on top of [`DEFERRED_ALWAYS`] when the conversation is a pure question: nothing is
 /// going to be moved, run in the background, or delegated.
-const DEFERRED_FOR_QUESTIONS: &[&str] = &["file_move", "process", "task"];
+const DEFERRED_FOR_QUESTIONS: &[&str] = &[
+    "file_move",
+    "process",
+    "task",
+    "file_write",
+    "file_edit",
+    "git_change",
+    "design_brief",
+    "design_review",
+    "todo_write",
+    "native_owner_undo",
+];
 
 /// The built-in names to defer for a conversation shape. `None` (no turn classified yet —
 /// `serve` lanes, `prompt-size`) takes the coding set. Research keeps the crawler; everything
@@ -691,7 +830,7 @@ fn should_register_workflow() -> bool {
 
 /// The read-only tool base shared by EVERY sub-agent registry (role- or specialist-scoped): memory +
 /// read/glob/search + `git_inspect` + skill_load/registry + LSP navigation (when enabled). NEVER
-/// includes `task`, checkpoint, edit/shell, or top-level-only stateful tools. Factored out so
+/// includes `task`, native owner undo, edit/shell, or top-level-only stateful tools. Factored out so
 /// `role_registry` and `agent_registry` cannot drift.
 ///
 /// Two deliberate ABSENCES relative to the old base:
@@ -987,8 +1126,8 @@ fn write_effect(root: &Path, raw: Option<&str>) -> WorkspaceEffect {
     WorkspaceEffect::OpaqueWorkspace
 }
 
-/// The DIRECTORY a write will land in — what [`Tool::workspace_target`] hands the checkpoint gate so
-/// it looks for a repository where the change actually happens. Mirrors `confine`'s resolution
+/// The DIRECTORY a write will land in — what [`Tool::workspace_target`] hands admission so
+/// it resolves identity where the change actually happens. Mirrors `confine`'s resolution
 /// (relative → `root`, absolute as-is) but stops at the parent: a not-yet-created file has no
 /// directory of its own, and the parent is what a repo lookup needs anyway. Uncanonicalized —
 /// `RepoContext::discover` runs git in it, which resolves the rest.
@@ -1825,15 +1964,52 @@ fn check_native_path(
 /// Frozen execution state cannot be transplanted into a narrower or differently owned lane.
 /// Ordinary direct calls keep their legacy compatibility; any ambient native scope fails closed.
 fn verify_frozen_native_context(frozen: Option<&ExecutionContext>) -> Result<()> {
+    let inherited = crate::agent::planning::current_policy();
+    if let Some(policy) = frozen.and_then(ExecutionContext::policy) {
+        policy.validate_current()?;
+        if let Some(active) = &inherited {
+            policy.check_inheritance(active)?;
+        } else {
+            anyhow::ensure!(
+                !policy.is_planning(),
+                "prepared planning call lost its policy owner"
+            );
+        }
+    } else if let Some(active) = &inherited {
+        active.validate_current()?;
+        anyhow::ensure!(
+            !active.is_planning(),
+            "unbound file call cannot enter a planning context"
+        );
+    }
     let ambient = crate::core::exec_ctx::current();
-    match (
-        frozen.and_then(ExecutionContext::overlay),
-        ambient.as_ref().and_then(ExecutionContext::overlay),
-    ) {
-        (Some(frozen_overlay), Some(ambient_overlay))
-            if frozen_overlay.same_handle(ambient_overlay) => {}
-        (None, None) => {}
-        _ => bail!("prepared file call cannot cross live/private overlay or owner/base boundaries; prepare again"),
+    anyhow::ensure!(
+        frozen.and_then(ExecutionContext::workspace_binding)
+            == ambient
+                .as_ref()
+                .and_then(ExecutionContext::workspace_binding),
+        "prepared workspace binding is stale or missing; prepare again in this context"
+    );
+    if frozen.is_some_and(ExecutionContext::has_owned_git_task)
+        || ambient
+            .as_ref()
+            .is_some_and(ExecutionContext::has_owned_git_task)
+    {
+        let (frozen_attempt, frozen_binding) = frozen
+            .and_then(ExecutionContext::tool_workers)
+            .and_then(|producer| producer.git_binding())
+            .context("prepared Git-native call lost its lifecycle; no direct fallback")?;
+        let (active_attempt, active_binding) = ambient
+            .as_ref()
+            .and_then(ExecutionContext::tool_workers)
+            .and_then(|producer| producer.git_binding())
+            .context("ambient Git-native call lost its lifecycle; no direct fallback")?;
+        anyhow::ensure!(
+            frozen_attempt.same_attempt(active_attempt) && frozen_binding == active_binding,
+            "prepared Git-native call belongs to another live attempt"
+        );
+        frozen_attempt.check_owned_context(frozen.unwrap())?;
+        active_attempt.check_owned_context(ambient.as_ref().unwrap())?;
     }
     let frozen_scope = frozen.and_then(ExecutionContext::native_scope);
     let ambient_scope = ambient.as_ref().and_then(ExecutionContext::native_scope);
@@ -1971,11 +2147,7 @@ impl FileRead {
         args: &Value,
         ctx: Option<&ExecutionContext>,
     ) -> Result<PreparedToolCall> {
-        if let Some(ctx) = ctx {
-            if ctx.overlay().is_some() {
-                return speculative_native_tools::prepare_read_overlay(self, args, ctx);
-            }
-        }
+        crate::agent::planning::check_direct(self, ctx)?;
         bounded_native_arguments(args, "file_read")?;
         let list = args.get("files").and_then(Value::as_array);
         if list.is_some_and(Vec::is_empty) {
@@ -2112,6 +2284,11 @@ impl FileRead {
         if FrozenReadIdentity::capture(resolved)? != entry.identity {
             bail!("file_read target identity changed after preparation; prepare again");
         }
+        // Capture authority before I/O; completion below cannot mint evidence for a newer epoch.
+        let observation = frozen
+            .ctx
+            .as_ref()
+            .and_then(|ctx| ctx.capture_task_observation(resolved, &self.root));
         // Metadata and opened-handle length are checked before allocating or reading disk bytes.
         #[cfg(test)]
         tests::native_body_rendezvous("file_read", resolved);
@@ -2132,6 +2309,9 @@ impl FileRead {
         }
         crate::core::read_ledger::note(resolved, &observed);
         if entry.start.is_none() && entry.end.is_none() && !frozen.number {
+            if let Some(observation) = observation {
+                observation.record(&observed);
+            }
             let view = budget_view(&content, &entry.label, max_lines, max_bytes);
             // No advisory discovery/RPC inside any exact native resource-locked body.
             if !frozen.batch
@@ -2139,7 +2319,7 @@ impl FileRead {
                 && frozen
                     .ctx
                     .as_ref()
-                    .is_none_or(|ctx| ctx.native_scope().is_none())
+                    .is_none_or(|ctx| ctx.native_scope().is_none() && ctx.permits_automation())
             {
                 let is_code = crate::agent::lsp::discovery::server_for_path(resolved).is_some();
                 let lsp_on = crate::agent::lsp::LSP.is_enabled();
@@ -2156,6 +2336,9 @@ impl FileRead {
         if s > e {
             return Ok(String::new());
         }
+        if let Some(observation) = observation {
+            observation.record(&observed);
+        }
         Ok(range_view(
             &lines,
             s,
@@ -2168,10 +2351,7 @@ impl FileRead {
     }
 
     fn read_prepared(&self, prepared: &PreparedToolCall) -> Result<String> {
-        if speculative_native_tools::is_overlay_read(prepared) {
-            return speculative_native_tools::execute_read_overlay(prepared)
-                .expect("overlay read delegation");
-        }
+        let _policy_admission = crate::agent::planning::admit_direct(self, None)?;
         let frozen = prepared
             .delegation
             .as_ref()
@@ -2249,6 +2429,9 @@ impl FileRead {
 }
 
 impl Tool for FileRead {
+    fn planning_capability(&self) -> Option<crate::agent::planning::Capability> {
+        Some(crate::agent::planning::Capability::NativeRead)
+    }
     fn name(&self) -> &str {
         "file_read"
     }
@@ -2452,6 +2635,9 @@ impl FileGlob {
     }
 }
 impl Tool for FileGlob {
+    fn planning_capability(&self) -> Option<crate::agent::planning::Capability> {
+        Some(crate::agent::planning::Capability::NativeRead)
+    }
     fn name(&self) -> &str {
         "file_glob"
     }
@@ -2475,7 +2661,14 @@ impl Tool for FileGlob {
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
+        let _policy_admission = crate::agent::planning::admit_direct(self, None)?;
         let pattern = str_arg(args, "pattern")?;
+        if crate::agent::planning::current_policy().is_some_and(|policy| policy.is_planning()) {
+            anyhow::ensure!(
+                pattern.len() <= 4096,
+                "planning glob pattern exceeds 4096 bytes"
+            );
+        }
         let git_aware = args
             .get("ignore")
             .and_then(|v| v.as_bool())
@@ -2760,11 +2953,7 @@ impl FileEdit {
         args: &Value,
         ctx: Option<&ExecutionContext>,
     ) -> Result<PreparedToolCall> {
-        if let Some(ctx) = ctx {
-            if ctx.overlay().is_some() {
-                return speculative_native_tools::prepare_edit_overlay(self, args, ctx);
-            }
-        }
+        crate::agent::planning::check_direct(self, ctx)?;
         struct InputLimit(usize);
         impl std::io::Write for InputLimit {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -3010,9 +3199,7 @@ impl FileEdit {
         prepared: &PreparedToolCall,
         check_read_ledger: bool,
     ) -> Result<String> {
-        if let Some(result) = speculative_native_tools::execute_edit_overlay(prepared) {
-            return result;
-        }
+        let _policy_admission = crate::agent::planning::admit_direct(self, None)?;
         let frozen = prepared
             .delegation
             .as_ref()
@@ -3071,10 +3258,15 @@ impl FileEdit {
                 &ctx.resource_scope(),
             )?
         } else {
-            crate::core::persist::compare_and_atomic_write(
+            crate::core::persist::compare_and_atomic_write_observed(
                 &frozen.target,
                 &frozen.expected,
                 frozen.content.as_bytes(),
+                || {
+                    if let Some(ctx) = &frozen.ctx {
+                        ctx.note_native_mutation(std::slice::from_ref(&frozen.target));
+                    }
+                },
             )
             .with_context(|| format!("writing {}", frozen.target.display()))?
         };
@@ -3159,9 +3351,6 @@ impl Tool for FileEdit {
         write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
     fn workspace_effect_prepared(&self, prepared: &PreparedToolCall) -> WorkspaceEffect {
-        if let Some(effect) = speculative_native_tools::workspace_effect_prepared(prepared) {
-            return effect;
-        }
         let frozen = prepared
             .delegation
             .as_ref()
@@ -3177,9 +3366,6 @@ impl Tool for FileEdit {
         }
     }
     fn workspace_target_prepared(&self, prepared: &PreparedToolCall) -> Option<PathBuf> {
-        if speculative_native_tools::is_overlay_edit(prepared) {
-            return None;
-        }
         prepared
             .delegation
             .as_ref()
@@ -3209,6 +3395,26 @@ impl Tool for FileEdit {
 /// shelling out (`type NUL > f` to blank the file, then a heredoc to refill it) — which destroys the
 /// file and then fails, the exact thrash this tool removes. `file_edit` stays the right tool for a
 /// localized change; `file_write` is for whole-file create/replace.
+/// Host-only provenance consumed by both native effect accounting and loop verification.
+pub(crate) fn plan_write_proof(
+    call: &PreparedToolCall,
+) -> Option<&std::sync::Arc<crate::agent::planning_write::PlanWriteProof>> {
+    crate::agent::planning_write::proof(call)
+}
+
+pub(crate) fn check_plan_write_prepared(
+    ctx: &ExecutionContext,
+    call: &PreparedToolCall,
+) -> Result<()> {
+    plan_write_proof(call)
+        .context("planning file_write requires exact host-prepared provenance")?
+        .check_prepared(ctx, call)
+}
+
+pub(crate) fn plan_write_diff(before: &str, after: &str) -> Result<String> {
+    bounded_write_diff(before, after)
+}
+
 struct FrozenFileWrite {
     destination: ResolvedDestination,
     expected: crate::core::persist::FileFingerprint,
@@ -3280,10 +3486,12 @@ impl FileWrite {
         args: &Value,
         ctx: Option<&ExecutionContext>,
     ) -> Result<PreparedToolCall> {
-        if let Some(ctx) = ctx {
-            if ctx.overlay().is_some() {
-                return speculative_native_tools::prepare_write_overlay(self, args, ctx);
-            }
+        crate::agent::planning::check_direct(self, ctx)?;
+        if let Some(ctx) = ctx.filter(|ctx| ctx.is_planning()) {
+            return crate::agent::planning_write::prepare(&self.root, args, ctx);
+        }
+        if crate::core::exec_ctx::current().is_some_and(|ctx| ctx.is_planning()) {
+            bail!("planning file_write requires its restricted execution context");
         }
         bounded_native_arguments(args, "file_write")?;
         let path = str_arg(args, "path")?;
@@ -3420,8 +3628,12 @@ impl FileWrite {
     }
 
     fn write_prepared(&self, prepared: &PreparedToolCall) -> Result<String> {
-        if let Some(result) = speculative_native_tools::execute_write_overlay(prepared) {
+        let _policy_admission = crate::agent::planning::admit_direct(self, None)?;
+        if let Some(result) = crate::agent::planning_write::execute(prepared) {
             return result;
+        }
+        if crate::core::exec_ctx::current().is_some_and(|ctx| ctx.is_planning()) {
+            bail!("planning file_write requires exact host-prepared provenance");
         }
         let frozen = prepared
             .delegation
@@ -3473,10 +3685,15 @@ impl FileWrite {
             frozen.destination.ensure()?;
             frozen.destination.verify()?;
             crate::core::native_journal::validate_mutation_target(&frozen.target)?;
-            crate::core::persist::compare_and_atomic_write(
+            crate::core::persist::compare_and_atomic_write_observed(
                 &frozen.target,
                 &frozen.expected,
                 frozen.content.as_bytes(),
+                || {
+                    if let Some(ctx) = &frozen.ctx {
+                        ctx.note_native_mutation(std::slice::from_ref(&frozen.target));
+                    }
+                },
             )
             .with_context(|| format!("writing {}", frozen.target.display()))?
         };
@@ -3488,6 +3705,9 @@ impl FileWrite {
 impl Tool for FileWrite {
     fn name(&self) -> &str {
         "file_write"
+    }
+    fn planning_capability(&self) -> Option<crate::agent::planning::Capability> {
+        Some(crate::agent::planning::Capability::PlanWrite)
     }
     /// Create vs overwrite, with the patch against the current content when overwriting.
     fn preview(&self, args: &Value) -> Option<crate::agent::tools::ApprovalPreview> {
@@ -3574,7 +3794,7 @@ impl Tool for FileWrite {
         write_target_dir(&self.root, args.get("path").and_then(|v| v.as_str()))
     }
     fn workspace_effect_prepared(&self, prepared: &PreparedToolCall) -> WorkspaceEffect {
-        if let Some(effect) = speculative_native_tools::workspace_effect_prepared(prepared) {
+        if let Some(effect) = crate::agent::planning_write::effect(prepared) {
             return effect;
         }
         let frozen = prepared
@@ -3592,8 +3812,8 @@ impl Tool for FileWrite {
         }
     }
     fn workspace_target_prepared(&self, prepared: &PreparedToolCall) -> Option<PathBuf> {
-        if speculative_native_tools::is_overlay_write(prepared) {
-            return None;
+        if let Some(proof) = plan_write_proof(prepared) {
+            return proof.target().parent().map(Path::to_path_buf);
         }
         prepared
             .delegation
@@ -3625,6 +3845,11 @@ impl Tool for FileWrite {
 struct FileMove {
     root: PathBuf,
 }
+
+struct FrozenFileMove {
+    ctx: Option<ExecutionContext>,
+}
+
 impl FileMove {
     fn new(root: PathBuf) -> Self {
         Self { root }
@@ -3635,6 +3860,7 @@ impl FileMove {
         args: &Value,
         ctx: Option<&ExecutionContext>,
     ) -> Result<PreparedToolCall> {
+        crate::agent::planning::check_direct(self, ctx)?;
         let from = str_arg(args, "from")?;
         let to = str_arg(args, "to")?;
         let purpose = FilePurpose::parse_optional(args.get("purpose"))?;
@@ -3789,6 +4015,8 @@ impl FileMove {
         source.verify()?;
         destination.verify()?;
         let mut prepared = PreparedToolCall::new(args.clone());
+        prepared.workspace_binding = ctx.and_then(ExecutionContext::workspace_binding).cloned();
+        prepared.delegation = Some(std::sync::Arc::new(FrozenFileMove { ctx: ctx.cloned() }));
         if let Some(placement) = ctx.and_then(ExecutionContext::placement) {
             prepared.display_paths = [source.actual_path(), destination.actual_path()]
                 .into_iter()
@@ -3936,6 +4164,13 @@ impl Tool for FileMove {
 }
 impl FileMove {
     fn move_prepared(&self, prepared: &PreparedToolCall) -> Result<String> {
+        let frozen = prepared
+            .delegation
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<FrozenFileMove>())
+            .context("file_move requires its frozen execution context")?;
+        verify_frozen_native_context(frozen.ctx.as_ref())?;
+        let _policy_admission = crate::agent::planning::admit_direct(self, frozen.ctx.as_ref())?;
         let args = &prepared.args;
         let guard = prepared
             .file
@@ -4040,6 +4275,7 @@ impl FileMove {
             let stash = stash_path(&dst);
             std::fs::rename(&dst, &stash)
                 .with_context(|| format!("staging existing {to} aside before overwrite"))?;
+            crate::core::exec_ctx::note_native_mutation(&dst);
             match move_path(&src, &dst) {
                 Ok(()) => {
                     // Move landed — the stashed old destination is now safe to drop.
@@ -4052,7 +4288,9 @@ impl FileMove {
                 Err(move_err) => {
                     // Roll back: put the original destination back exactly where it was, then report
                     // the move failure (not the rollback) as the actionable error.
-                    let _ = std::fs::rename(&stash, &dst);
+                    if std::fs::rename(&stash, &dst).is_ok() {
+                        crate::core::exec_ctx::note_native_mutation(&dst);
+                    }
                     return Err(anyhow::Error::new(move_err)).with_context(|| {
                         format!("moving {from} → {to} (destination left unchanged)")
                     });
@@ -4098,16 +4336,24 @@ fn stash_path(p: &Path) -> PathBuf {
 /// happy path is a single atomic `rename` that preserves the inode + metadata.
 fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     match std::fs::rename(src, dst) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(ctx) = crate::core::exec_ctx::current() {
+                ctx.note_native_mutation(&[src.to_path_buf(), dst.to_path_buf()]);
+            }
+            Ok(())
+        }
         Err(e) if is_cross_device(&e) => {
             // Cross-device: recursively copy then remove the source. Directories are walked; files
             // are a straight copy (which carries permissions via std on both Windows and Unix).
             copy_recursive(src, dst)?;
-            if src.is_dir() {
+            let removed = if src.is_dir() {
                 std::fs::remove_dir_all(src)
             } else {
                 std::fs::remove_file(src)
-            }
+            };
+            // Recursive deletion can fail after removing a prefix; never keep old proof on error.
+            crate::core::exec_ctx::note_native_mutation(src);
+            removed
         }
         Err(e) => Err(e),
     }
@@ -4123,7 +4369,13 @@ fn is_cross_device(e: &std::io::Error) -> bool {
 /// Recursively copy `src` → `dst` (file or directory). Used only on the cross-filesystem move path.
 fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
-        std::fs::create_dir_all(dst)?;
+        let existed = dst.exists();
+        let created = std::fs::create_dir_all(dst);
+        if !existed {
+            // Recursive creation may leave a prefix even when the final mkdir fails.
+            crate::core::exec_ctx::note_native_mutation(dst);
+        }
+        created?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
@@ -4133,7 +4385,12 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(src, dst).map(|_| ())
+        let copied = std::fs::copy(src, dst);
+        if copied.is_ok() || dst.exists() {
+            // A failed copy can leave a truncated destination; output success is not required.
+            crate::core::exec_ctx::note_native_mutation(dst);
+        }
+        copied.map(|_| ())
     }
 }
 
@@ -4763,7 +5020,7 @@ fn shell_restore_preflight(command: &str, ctx: Option<&ExecutionContext>) -> Res
         .first()
         .is_some_and(|word| matches!(*word, "git" | "git.exe"));
     if !direct_git {
-        bail!("shell restore target cannot be frozen safely; nested aizen time restore/undo can self-lock; use the parent checkpoint/native owner undo tool");
+        bail!("shell restore target cannot be frozen safely; nested aizen time restore/undo can self-lock; use explicit parent Git operations or native_owner_undo for exact owned edits");
     }
     if command.len() > 64 * 1024
         || command.chars().any(|ch| {
@@ -4791,7 +5048,7 @@ fn shell_restore_preflight(command: &str, ctx: Option<&ExecutionContext>) -> Res
                 || word.starts_with("-C")
         })
     {
-        bail!("shell restore target is ambiguous (routing options, quoting or command chain); use the parent checkpoint/native owner undo tool");
+        bail!("shell restore target is ambiguous (routing options, quoting or command chain); use explicit parent Git operations or native_owner_undo for exact owned edits");
     }
     Ok(true)
 }
@@ -5022,6 +5279,11 @@ impl Tool for ShellRun {
         // Contain the tree BEFORE anything can go wrong with it: on Windows we spawn a `cmd.exe`
         // wrapper, so killing our direct child leaves the real work (cargo, node, a dev server)
         // orphaned — still running, and still holding the write end of the pipes below.
+        // Opaque command admission invalidates proof even if it later fails or detaches.
+        // This is after all typed refusal/cancellation paths, never derived from exit text.
+        if let Some(ctx) = &ctx {
+            ctx.note_task_effects_at(Some(&dir));
+        }
         let (mut child, containment) = match sbx.spawn_contained() {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -5267,7 +5529,7 @@ pub(crate) fn drain<R: std::io::Read>(pipe: Option<R>) -> String {
 
 /// Wall-clock cap for one `git_inspect` query. Generous for `blame` on a large file; a read-only
 /// query that needs longer is a query to narrow, not to wait on.
-const GIT_INSPECT_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_INSPECT_TIMEOUT: Duration = crate::core::git_ops::INSPECT_TIMEOUT;
 
 /// Transcript cap for one `git_inspect` result (chars). A whole-tree `git diff` can be megabytes;
 /// the drain threads already bound RAM, this bounds what rides the conversation.
@@ -5312,17 +5574,17 @@ impl Tool for GitInspect {
         "git_inspect"
     }
     fn description(&self) -> &str {
-        "Read-only git status/log/diff/commit/blame to see what changed and when. No \
-         add/commit/push/checkout. diff without rev shows uncommitted changes; blame needs path."
+        "Read-only git status/log/diff/show/blame, branches, worktrees, and reflog. Paths are \
+         literal. No add/commit/push/checkout. Reflog records ref moves, not uncommitted files."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["status", "log", "diff", "show", "blame"]},
-                "path": {"type": "string", "description": "optional file/dir filter; required for blame"},
-                "rev": {"type": "string", "description": "revision/range (HEAD~3, main..HEAD, a1b2c3); status ignores; show defaults HEAD"},
-                "limit": {"type": "integer", "description": "log max commits (default 20, cap 100)"}
+                "action": {"type": "string", "enum": ["status", "log", "diff", "show", "blame", "branches", "worktrees", "reflog"]},
+                "path": {"type": "string", "description": "optional literal file/dir filter; required for blame; unavailable for branches/worktrees/reflog"},
+                "rev": {"type": "string", "description": "revision/range (HEAD~3, main..HEAD, a1b2c3); show/reflog default HEAD; unavailable for branches/worktrees"},
+                "limit": {"type": "integer", "description": "log/reflog/branches row limit (default 20, cap 100); worktrees returns a complete bounded inventory"}
             },
             "required": ["action"],
             "additionalProperties": false
@@ -5340,10 +5602,8 @@ impl Tool for GitInspect {
                 ));
             }
         };
-        // The path rides to git AS WRITTEN (a pathspec, resolved by git against the workspace
-        // cwd) rather than through `confine`: canonicalizing on Windows yields a `\\?\` verbatim
-        // path git does not accept, and the `--` separator below already guarantees a hostile
-        // name cannot become an option. Only argv-boundary hygiene is enforced here.
+        // Git resolves literal paths against the explicitly bound workspace. Avoid canonicalizing
+        // file arguments into Windows verbatim paths, which Git may not accept.
         let path = match args.get("path").and_then(|v| v.as_str()).map(str::trim) {
             None | Some("") => None,
             Some(p)
@@ -5364,13 +5624,21 @@ impl Tool for GitInspect {
             .map(|n| (n as usize).clamp(1, GIT_LOG_CAP))
             .unwrap_or(GIT_LOG_DEFAULT);
 
-        // Fixed argv per action — the only model-shaped bytes are the validated rev + confined path.
-        let mut argv: Vec<String> = vec!["-c".into(), "color.ui=false".into()];
+        if matches!(action, "branches" | "worktrees") && (rev.is_some() || path.is_some()) {
+            return Ok("error: branches/worktrees do not accept rev or path filters".into());
+        }
+        if action == "reflog" && path.is_some() {
+            return Ok("error: reflog records ref movement, not file history; omit path".into());
+        }
+        // Fixed argv per action; literal pathspecs are enforced by the shared inspection profile.
+        let mut argv: Vec<String> = Vec::new();
         match action {
             "status" => argv.extend(["status".into(), "--short".into(), "--branch".into()]),
             "log" => {
                 argv.extend([
                     "log".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
                     "--date=short".into(),
                     "--format=%h %ad %an — %s".into(),
                     format!("-n{limit}"),
@@ -5380,27 +5648,70 @@ impl Tool for GitInspect {
                 }
             }
             "diff" => {
-                argv.extend(["diff".into(), "--stat".into(), "--patch".into()]);
+                argv.extend(
+                    [
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--stat",
+                        "--patch",
+                    ]
+                    .map(String::from),
+                );
                 if let Some(r) = &rev {
                     argv.push(r.clone());
                 }
             }
             "show" => {
-                argv.extend(["show".into(), "--stat".into(), "--patch".into()]);
+                argv.extend(
+                    [
+                        "show",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--stat",
+                        "--patch",
+                    ]
+                    .map(String::from),
+                );
                 argv.push(rev.clone().unwrap_or_else(|| "HEAD".into()));
             }
             "blame" => {
                 let Some(_) = &path else {
                     return Ok("error: blame requires a path".to_string());
                 };
-                argv.extend(["blame".into(), "--date=short".into()]);
+                argv.extend(["blame", "--no-textconv", "--date=short"].map(String::from));
                 if let Some(r) = &rev {
                     argv.push(r.clone());
                 }
             }
+            "branches" => argv.extend([
+                "for-each-ref".into(),
+                "--sort=refname".into(),
+                format!("--count={limit}"),
+                "--format=%(refname) %(objectname) %(upstream)".into(),
+                "refs/heads/".into(),
+            ]),
+            "worktrees" => {
+                let inventory = crate::core::git_ops::worktree_inventory(&self.root)?;
+                let text = serde_json::to_string_pretty(&inventory)?;
+                anyhow::ensure!(
+                    text.len() <= 64 * 1024,
+                    "worktree inventory exceeds tool output limit"
+                );
+                return Ok(text);
+            }
+            "reflog" => argv.extend([
+                "reflog".into(),
+                "show".into(),
+                "--no-ext-diff".into(),
+                "--no-textconv".into(),
+                "--format=%H %gD %gs".into(),
+                format!("-n{limit}"),
+                rev.clone().unwrap_or_else(|| "HEAD".into()),
+            ]),
             other => {
                 return Ok(format!(
-                    "error: unknown action {other:?} — use status | log | diff | show | blame"
+                    "error: unknown action {other:?} — use status | log | diff | show | blame | branches | worktrees | reflog"
                 ));
             }
         }
@@ -5409,90 +5720,82 @@ impl Tool for GitInspect {
             argv.push(p.clone());
         }
 
-        // Same containment discipline as every model-influenced spawn (CLAUDE.md: through
-        // `runner::prepare_*`, never a bare `Command::new`). Exec form: no shell in the path at all.
-        let mut sbx = crate::sandbox::runner::prepare_std(
-            crate::sandbox::request::SandboxRequest::exec(
-                crate::sandbox::CommandOrigin::GitInspect,
-                PathBuf::from("git"),
-                argv,
-                self.root.clone(),
-                self.root.clone(),
-            )
-            .wall_timeout(GIT_INSPECT_TIMEOUT),
-        )?;
-        sbx.command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match sbx.command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                sbx.finish(crate::sandbox::runner::Outcome::SpawnFailed);
-                return Ok(format!(
-                    "error: could not run git ({e}) — is git installed and on PATH?"
-                ));
-            }
-        };
-        let containment = sbx.contain(&child);
-        let oh = {
-            let pipe = child.stdout.take();
-            std::thread::spawn(move || drain(pipe))
-        };
-        let eh = {
-            let pipe = child.stderr.take();
-            std::thread::spawn(move || drain(pipe))
-        };
-        let start = Instant::now();
-        let status = loop {
-            match child.try_wait()? {
-                Some(st) => break Some(st),
-                None if start.elapsed() >= GIT_INSPECT_TIMEOUT => {
-                    crate::core::proctree::kill_tree(&mut child, &containment);
-                    break None;
-                }
-                None => std::thread::sleep(Duration::from_millis(20)),
-            }
-        };
-        let (stdout, _) = crate::core::proctree::join_drain(oh, DRAIN_GRACE);
-        let (stderr, _) = crate::core::proctree::join_drain(eh, DRAIN_GRACE);
-        sbx.finish(match status {
-            None => crate::sandbox::runner::Outcome::Timeout,
-            Some(st) => crate::sandbox::runner::Outcome::Exit(st.code()),
-        });
-        let Some(st) = status else {
-            return Ok(format!(
-                "error: git {action} exceeded {}s — narrow it with path/rev/limit",
-                GIT_INSPECT_TIMEOUT.as_secs()
-            ));
-        };
-        if !st.success() {
-            let msg = if stderr.trim().is_empty() {
-                stdout
-            } else {
-                stderr
-            };
-            return Ok(format!("error: git {action} failed: {}", msg.trim()));
-        }
-        let mut out = stdout;
-        if out.trim().is_empty() {
-            out = match action {
-                "status" => "clean — no uncommitted changes (branch line above absent means \
-                             detached or unborn HEAD)"
-                    .into(),
-                "diff" => "no differences".into(),
-                _ => "(no output)".into(),
-            };
-        }
-        if out.chars().count() > GIT_INSPECT_MAX_CHARS {
-            let clipped: String = out.chars().take(GIT_INSPECT_MAX_CHARS).collect();
-            out = format!(
-                "{clipped}\n… [truncated at {GIT_INSPECT_MAX_CHARS} chars — narrow with \
-                 path/rev/limit]"
+        // The shared profile uses the resolved Git executable and the consuming sandbox runner.
+        let sbx = crate::core::git_ops::prepare_inspection(&self.root, argv)?;
+        git_inspect_result(action, sbx.output_bounded(GIT_INSPECT_TIMEOUT, DRAIN_GRACE))
+    }
+}
+
+fn git_inspect_result(
+    action: &str,
+    result: std::result::Result<
+        crate::core::proctree::BoundedOutput,
+        crate::core::proctree::BoundedExecutionError,
+    >,
+) -> Result<String> {
+    use crate::core::proctree::BoundedSettlement;
+    let output = match result {
+        Ok(output) if output.settlement == BoundedSettlement::Unknown => {
+            return Err(
+                anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                    crate::agent::tools::ToolEffectState::UnknownWorker,
+                ))
+                .context(format!("git {action} physical effects remain unproven")),
             );
         }
-        Ok(out.trim_end().to_string())
+        Ok(output) => output,
+        Err(error) if error.settlement == BoundedSettlement::Unknown => {
+            return Err(
+                anyhow::Error::new(crate::agent::tools::ToolEffectsUnsettled(
+                    crate::agent::tools::ToolEffectState::UnknownWorker,
+                ))
+                .context(format!("git {action} did not settle: {error}")),
+            );
+        }
+        Err(error) if error.cause.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(error).context("git inspection was refused before spawn");
+        }
+        Err(error) => {
+            return Ok(format!(
+                "error: could not run git ({error}) — is git installed and on PATH?"
+            ));
+        }
+    };
+    if output.timed_out {
+        return Ok(format!(
+            "error: git {action} exceeded {}s — narrow it with path/rev/limit",
+            GIT_INSPECT_TIMEOUT.as_secs()
+        ));
     }
+    if output.code != Some(0) {
+        let msg = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(format!("error: git {action} failed: {}", msg.trim()));
+    }
+    let mut out = output.stdout;
+    if out.trim().is_empty() {
+        out = match action {
+            "status" => "clean — no uncommitted changes (branch line above absent means \
+                         detached or unborn HEAD)"
+                .into(),
+            "diff" => "no differences".into(),
+            _ => "(no output)".into(),
+        };
+    }
+    if out.chars().count() > GIT_INSPECT_MAX_CHARS {
+        let clipped: String = out.chars().take(GIT_INSPECT_MAX_CHARS).collect();
+        out = format!(
+            "{clipped}\n… [truncated at {GIT_INSPECT_MAX_CHARS} chars — narrow with \
+             path/rev/limit]"
+        );
+    }
+    if output.output_truncated {
+        out.push_str("\n… [git output capture truncated — narrow with path/rev/limit]");
+    }
+    Ok(out.trim_end().to_string())
 }
 
 // ── skill_load ───────────────────────────────────────────────────────────────
@@ -5928,6 +6231,52 @@ mod tests {
     }
 
     #[test]
+    fn git_changes_are_parent_only_even_when_a_specialist_requests_them() {
+        let root = temp_root("git-change-surface");
+        assert!(default_registry_for_browser(&root, false)
+            .get("git_change")
+            .is_some());
+        assert!(subagent_read_only_base(&root).get("git_change").is_none());
+        for role in [
+            "coder",
+            "tester",
+            "planner",
+            "reviewer",
+            "argus",
+            "daedalus",
+            "themis",
+            "unknown-role",
+        ] {
+            assert!(
+                role_registry(role, &root).get("git_change").is_none(),
+                "{role}"
+            );
+        }
+        let specialist = crate::agents::AgentDef {
+            name: "Git capability probe".into(),
+            description: String::new(),
+            color: String::new(),
+            emoji: String::new(),
+            vibe: String::new(),
+            tools: vec!["git_change".into(), "Edit".into(), "Bash".into()],
+            model: None,
+            base_url: None,
+            api_key_ref: None,
+            body: String::new(),
+            division: None,
+            source: crate::agents::AgentSource::AizenHome,
+            source_path: PathBuf::new(),
+        };
+        assert!(agent_registry(&specialist, &root)
+            .get("git_change")
+            .is_none());
+        assert_eq!(
+            crate::agent::toolsets::classify_tool("git_change"),
+            Some("recovery")
+        );
+    }
+
+    #[test]
     fn tool_schema_stays_within_budget() {
         // The default registry is the CORE top-level surface. Delegation and persona tools are
         // appended by `default_registry_with_task`; keeping this test explicit prevents a new core
@@ -6189,6 +6538,48 @@ mod tests {
             .execute(&serde_json::json!({"path":"f.txt","start":2,"end":3}))
             .unwrap();
         assert_eq!(mid, "l2\nl3");
+    }
+
+    #[test]
+    fn file_read_empty_range_cannot_complete_observe_requirement() {
+        use crate::agent::todo::{Requirement, Status, TaskContext, Todo};
+
+        let (_fixture, ctx) = native_preparation_fixture();
+        let root = ctx.placement().unwrap().workspace_root().to_path_buf();
+        std::fs::write(root.join("observed.txt"), "first\nsecond\n").unwrap();
+        let task = TaskContext::private();
+        task.replace_with_requirements(
+            vec![Todo::new("read source", Status::Done)],
+            vec![(
+                "@index:0".into(),
+                Requirement::Observe {
+                    target: "observed.txt".into(),
+                },
+            )],
+        )
+        .unwrap();
+        let ctx = ctx.with_task(task.clone());
+        let read = FileRead::new(root);
+        crate::core::exec_ctx::with_current(ctx.clone(), || {
+            for args in [
+                serde_json::json!({"path":"observed.txt", "start":100}),
+                serde_json::json!({"path":"observed.txt", "start":2,"end":1}),
+                serde_json::json!({"path":"observed.txt", "end":0}),
+            ] {
+                let prepared = read.prepare_call(&args, &ctx).unwrap();
+                assert!(read.execute_prepared(&prepared).unwrap().text.is_empty());
+                assert!(task.snapshot().observations.is_empty());
+                assert!(!task.is_complete());
+            }
+            let prepared = read
+                .prepare_call(
+                    &serde_json::json!({"path":"observed.txt", "start":2,"end":2}),
+                    &ctx,
+                )
+                .unwrap();
+            assert_eq!(read.execute_prepared(&prepared).unwrap().text, "second");
+            assert!(task.is_complete());
+        });
     }
 
     #[test]
@@ -7048,7 +7439,7 @@ mod tests {
     }
 
     #[test]
-    fn write_tools_point_the_checkpoint_gate_at_the_target_not_the_cwd() {
+    fn write_tools_point_admission_at_the_target_not_the_cwd() {
         // THE invariant behind the "run `git init`" misfire: the gate must look for a work tree
         // where the write LANDS. A session rooted in a home directory editing a project two levels
         // down asked about the wrong directory, found no repo, and told the user to `git init` —
@@ -7179,7 +7570,10 @@ mod tests {
             );
             let cached = prepared.preview.as_ref().unwrap();
             assert!(cached.lines[0].contains("create"));
-            let out = write.execute_prepared(&prepared).unwrap();
+            let out = crate::core::exec_ctx::with_current(ctx.clone(), || {
+                write.execute_prepared(&prepared)
+            })
+            .unwrap();
             assert!(out.text.contains(&actual.to_string_lossy().to_string()));
             assert_eq!(std::fs::read_to_string(&actual).unwrap(), purpose);
             let second =
@@ -7216,7 +7610,10 @@ mod tests {
         let args = serde_json::json!({"path":"new.txt","content":"approved","purpose":"project"});
         let prepared = write.prepare_call(&args, &ctx).unwrap();
         std::fs::write(root.join("new.txt"), "created elsewhere").unwrap();
-        assert!(write.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert_eq!(
             std::fs::read_to_string(root.join("new.txt")).unwrap(),
             "created elsewhere"
@@ -7230,14 +7627,20 @@ mod tests {
             cached_preview.lines
         );
         assert_eq!(prepared.preview.as_ref().unwrap().diff, cached_preview.diff);
-        assert!(write.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert_eq!(
             std::fs::read_to_string(root.join("new.txt")).unwrap(),
             "changed after approval"
         );
         let prepared = write.prepare_call(&args, &ctx).unwrap();
         std::fs::remove_file(root.join("new.txt")).unwrap();
-        assert!(write.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert!(!root.join("new.txt").exists());
     }
 
@@ -7259,7 +7662,9 @@ mod tests {
             Some(root.canonicalize().unwrap())
         );
         let artifact = PathBuf::from(prepared.args["to"].as_str().unwrap());
-        let out = mv.execute_prepared(&prepared).unwrap();
+        let out =
+            crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&prepared))
+                .unwrap();
         assert!(out.text.contains(&artifact.to_string_lossy().to_string()));
         assert!(!root.join("source.txt").exists());
         let publish = mv
@@ -7273,7 +7678,7 @@ mod tests {
             mv.workspace_target(&publish.args),
             Some(root.canonicalize().unwrap())
         );
-        mv.execute_prepared(&publish).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&publish)).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("published.txt")).unwrap(),
             "source"
@@ -7306,7 +7711,8 @@ mod tests {
             write.workspace_effect(&prepared.args),
             WorkspaceEffect::External
         );
-        write.execute_prepared(&prepared).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&prepared))
+            .unwrap();
         let artifact = PathBuf::from(prepared.args["path"].as_str().unwrap());
         let followup = write
             .prepare_call(&serde_json::json!({"path":artifact,"content":"B"}), &ctx)
@@ -7315,7 +7721,8 @@ mod tests {
             write.workspace_effect_prepared(&followup),
             WorkspaceEffect::External
         );
-        write.execute_prepared(&followup).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&followup))
+            .unwrap();
         let mv = FileMove::new(root.clone());
         let managed = mv
             .prepare_call(
@@ -7327,7 +7734,7 @@ mod tests {
             mv.workspace_effect_prepared(&managed),
             WorkspaceEffect::External
         );
-        mv.execute_prepared(&managed).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&managed)).unwrap();
         let scratch = PathBuf::from(managed.args["to"].as_str().unwrap());
         let publish = mv
             .prepare_call(
@@ -7343,7 +7750,7 @@ mod tests {
             mv.workspace_target_prepared(&publish),
             Some(workspace.clone())
         );
-        mv.execute_prepared(&publish).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&publish)).unwrap();
         let external = temp_root("purpose-source-outside");
         std::fs::write(external.join("outside.txt"), "outside").unwrap();
         let out_to_managed = mv.prepare_call(&serde_json::json!({"from":external.join("outside.txt"),"to":"outside.txt","purpose":"artifact"}), &ctx).unwrap();
@@ -7367,15 +7774,36 @@ mod tests {
         let args = serde_json::json!({"from":"a.txt","to":"b.txt","overwrite":true});
         let prepared = mv.prepare_call(&args, &ctx).unwrap();
         std::fs::remove_file(root.join("b.txt")).unwrap();
-        assert!(mv.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("destination existence or identity changed since preparation"),
+            "{error:#}"
+        );
         assert!(root.join("a.txt").exists());
         std::fs::write(root.join("b.txt"), "B").unwrap();
         let prepared = mv.prepare_call(&args, &ctx).unwrap();
         std::fs::write(root.join("a.txt"), "changed source").unwrap();
-        assert!(mv.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&prepared))
+                .unwrap_err();
+        let reason = error.to_string();
+        assert!(
+            reason.contains("changed after preparation")
+                || reason.contains("destination existence or identity changed since preparation"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "changed source"
+        );
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "B");
         let prepared = mv.prepare_call(&args, &ctx).unwrap();
-        mv.execute_prepared(&prepared).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&prepared))
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("b.txt")).unwrap(),
             "changed source"
@@ -7392,11 +7820,18 @@ mod tests {
         let args = serde_json::json!({"from":"tree","to":"tree","purpose":"artifact"});
         let prepared = mv.prepare_call(&args, &ctx).unwrap();
         std::fs::write(root.join("tree/deep/a.txt"), "B").unwrap();
-        assert!(mv.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("changed after preparation"),
+            "{error:#}"
+        );
         assert!(root.join("tree").is_dir());
         let prepared = mv.prepare_call(&args, &ctx).unwrap();
         let dst = PathBuf::from(prepared.args["to"].as_str().unwrap());
-        mv.execute_prepared(&prepared).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || mv.execute_prepared(&prepared))
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dst.join("deep/a.txt")).unwrap(),
             "B"
@@ -7441,7 +7876,8 @@ mod tests {
                 &ctx,
             )
             .unwrap();
-        write.execute_prepared(&prepared).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&prepared))
+            .unwrap();
         let managed_tree = ctx.placement().unwrap().artifact_root().join("tree");
         std::os::unix::fs::symlink(root.parent().unwrap(), managed_tree.join("escape")).unwrap();
         assert!(mv
@@ -8211,14 +8647,14 @@ mod tests {
                 PreparedFootprint::Global => {
                     panic!("ordinary regular target should resolve exactly")
                 }
-                PreparedFootprint::Overlay { .. } => {
-                    panic!("overlay footprint is not valid in live fixture")
-                }
             }
             prepared.args["path"] = serde_json::json!(root.join("unapproved.txt"));
             prepared.args["content"] = serde_json::json!("UNAPPROVED".repeat(1024));
             prepared.args["purpose"] = serde_json::json!("scratch");
-            let output = write.execute_prepared(&prepared).unwrap();
+            let output = crate::core::exec_ctx::with_current(ctx.clone(), || {
+                write.execute_prepared(&prepared)
+            })
+            .unwrap();
             assert!(output.text.starts_with(&expected_output));
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "approved\n");
             assert!(!root.join("unapproved.txt").exists());
@@ -8243,7 +8679,10 @@ mod tests {
         FileRead::new(root.clone())
             .execute(&serde_json::json!({"path":"f.txt"}))
             .unwrap();
-        assert!(write.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "peer\n");
         let prepared = write
             .prepare_call(
@@ -8260,11 +8699,11 @@ mod tests {
             crate::core::read_ledger::observed(&target),
             Some(stale.clone())
         );
-        assert!(write
-            .execute_prepared(&prepared)
-            .unwrap_err()
-            .to_string()
-            .contains("overwrite conflict"));
+        assert!(crate::core::exec_ctx::with_current(ctx.clone(), || write
+            .execute_prepared(&prepared))
+        .unwrap_err()
+        .to_string()
+        .contains("overwrite conflict"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "peer\n");
         assert_eq!(crate::core::read_ledger::observed(&target), Some(stale));
         crate::core::read_ledger::forget(&target);
@@ -8372,13 +8811,15 @@ mod tests {
                 assert_eq!(resources[0].1, LockMode::Shared);
             }
             PreparedFootprint::Global => panic!("regular read target should resolve exactly"),
-            PreparedFootprint::Overlay { .. } => {
-                panic!("overlay footprint is not valid in live fixture")
-            }
         }
         std::fs::write(&target, "new one\nnew two\n").unwrap();
         prepared.args = serde_json::json!({"path":"other.txt","files":[{"path":"other.txt"}],"start":1,"number":false});
-        assert_eq!(read.execute_prepared(&prepared).unwrap().text, "2|new two");
+        assert_eq!(
+            crate::core::exec_ctx::with_current(ctx.clone(), || read.execute_prepared(&prepared))
+                .unwrap()
+                .text,
+            "2|new two"
+        );
         assert_eq!(
             crate::core::read_ledger::observed(&target),
             Some(crate::core::persist::FileFingerprint::for_bytes(
@@ -8414,12 +8855,12 @@ mod tests {
                 }
             }
             PreparedFootprint::Global => panic!("valid batch should resolve exact read footprint"),
-            PreparedFootprint::Overlay { .. } => {
-                panic!("overlay footprint is not valid in live fixture")
-            }
         }
         prepared.args["files"] = serde_json::json!([{"path":"8.txt"}]);
-        let output = read.execute_prepared(&prepared).unwrap().text;
+        let output =
+            crate::core::exec_ctx::with_current(ctx.clone(), || read.execute_prepared(&prepared))
+                .unwrap()
+                .text;
         assert!(output.contains("body-0") && output.contains("body-7"));
         assert!(!output.contains("body-8"));
         assert!(output.contains("1 more file(s) not read"));
@@ -8441,13 +8882,21 @@ mod tests {
             .unwrap();
         std::fs::rename(&target, root.join("old.txt")).unwrap();
         std::fs::write(&target, "different identity").unwrap();
-        assert!(read.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || read.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert!(crate::core::read_ledger::observed(&target).is_none());
         let prepared = read
             .prepare_call(&serde_json::json!({"path":"f.txt","start":1,"end":1}), &ctx)
             .unwrap();
         std::fs::write(&target, vec![b'x'; PREPARED_EDIT_MAX_BYTES + 1]).unwrap();
-        assert!(format!("{:#}", read.execute_prepared(&prepared).unwrap_err()).contains("4 MiB"));
+        assert!(format!(
+            "{:#}",
+            crate::core::exec_ctx::with_current(ctx.clone(), || read.execute_prepared(&prepared))
+                .unwrap_err()
+        )
+        .contains("4 MiB"));
         assert!(crate::core::read_ledger::observed(&target).is_none());
     }
 
@@ -8480,6 +8929,121 @@ mod tests {
                 &scoped
             )
             .is_err());
+    }
+
+    #[test]
+    fn prepared_native_calls_refuse_another_placement_before_body() {
+        let (temp, original) = native_preparation_fixture();
+        let root = original.placement().unwrap().workspace_root().to_path_buf();
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(root.join("same.txt"), "original\n").unwrap();
+        std::fs::write(other.join("same.txt"), "other\n").unwrap();
+        let moved = original.with_placement(
+            original
+                .placement()
+                .unwrap()
+                .fork_for(other.clone(), "move")
+                .unwrap(),
+        );
+        let read = FileRead::new(root.clone());
+        let write = FileWrite::new(root.clone());
+        let (read_call, write_call) = crate::core::exec_ctx::with_current(original.clone(), || {
+            (
+            read.prepare_call(&serde_json::json!({"path":"same.txt"}), &original).unwrap(),
+            write.prepare_call(&serde_json::json!({"path":"new.txt","content":"forbidden\n","purpose":"project"}), &original).unwrap(),
+        )
+        });
+        crate::core::exec_ctx::with_current(moved, || {
+            assert!(read
+                .execute_prepared(&read_call)
+                .unwrap_err()
+                .to_string()
+                .contains("binding is stale"));
+            assert!(write
+                .execute_prepared(&write_call)
+                .unwrap_err()
+                .to_string()
+                .contains("binding is stale"));
+        });
+        assert!(!root.join("new.txt").exists());
+        assert!(!other.join("new.txt").exists());
+        assert_eq!(std::fs::read(root.join("same.txt")).unwrap(), b"original\n");
+        assert_eq!(std::fs::read(other.join("same.txt")).unwrap(), b"other\n");
+    }
+
+    #[test]
+    fn prepared_move_refuses_stale_workspace_before_creating_parents() {
+        let (temp, original) = native_preparation_fixture();
+        let root = original.placement().unwrap().workspace_root().to_path_buf();
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(root.join("source.txt"), "original\n").unwrap();
+        std::fs::write(other.join("source.txt"), "other\n").unwrap();
+        let moved = original.with_placement(
+            original
+                .placement()
+                .unwrap()
+                .fork_for(other.clone(), "focus")
+                .unwrap(),
+        );
+        let returned = moved.with_placement(
+            moved
+                .placement()
+                .unwrap()
+                .fork_for(root.clone(), "return")
+                .unwrap(),
+        );
+        let tool = FileMove::new(root.clone());
+        let args = serde_json::json!({
+            "from":"source.txt", "to":"new/target.txt", "purpose":"project", "create_dirs":true
+        });
+        // Explicit preparation must capture its caller, even with a different ambient placement.
+        let prepared = crate::core::exec_ctx::with_current(moved.clone(), || {
+            tool.prepare_call(&args, &original).unwrap()
+        });
+        assert_eq!(
+            prepared.workspace_binding.as_ref(),
+            original.workspace_binding()
+        );
+        for context in [ExecutionContext::default(), moved.clone(), returned.clone()] {
+            let mut altered = prepared.clone();
+            // Public dispatch fields cannot replace the context retained by the native body.
+            altered.workspace_binding = context.workspace_binding().cloned();
+            let error =
+                crate::core::exec_ctx::with_current(context, || tool.execute_prepared(&altered))
+                    .unwrap_err();
+            assert!(error.to_string().contains("binding is stale"), "{error:#}");
+            assert_eq!(
+                std::fs::read(root.join("source.txt")).unwrap(),
+                b"original\n"
+            );
+            assert_eq!(std::fs::read(other.join("source.txt")).unwrap(), b"other\n");
+            assert!(!root.join("new").exists());
+            assert!(!other.join("new").exists());
+        }
+        let unbound = tool
+            .prepare_call(&args, &ExecutionContext::default())
+            .unwrap();
+        assert!(crate::core::exec_ctx::with_current(returned.clone(), || {
+            tool.execute_prepared(&unbound)
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("binding is stale"));
+        let fresh = tool.prepare_call(&args, &returned).unwrap();
+        crate::core::exec_ctx::with_current(returned, || tool.execute_prepared(&fresh)).unwrap();
+        assert!(!root.join("source.txt").exists());
+        assert_eq!(
+            std::fs::read(root.join("new/target.txt")).unwrap(),
+            b"original\n"
+        );
+        crate::core::exec_ctx::with_current(moved, || FileMove::new(other.clone()).execute(&args))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(other.join("new/target.txt")).unwrap(),
+            b"other\n"
+        );
     }
 
     #[test]
@@ -8571,16 +9135,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("journal storage"));
-            assert!(write
-                .execute_prepared(&write_call)
-                .unwrap_err()
-                .to_string()
-                .contains("journal storage"));
-            assert!(edit
-                .execute_prepared(&edit_call)
-                .unwrap_err()
-                .to_string()
-                .contains("journal storage"));
+            for error in [
+                crate::core::exec_ctx::with_current(ctx.clone(), || {
+                    write.execute_prepared(&write_call)
+                })
+                .unwrap_err(),
+                crate::core::exec_ctx::with_current(ctx.clone(), || {
+                    edit.execute_prepared(&edit_call)
+                })
+                .unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("journal storage"), "{error:#}");
+            }
             assert!(write.prepare_call(&serde_json::json!({
                 "path":storage.join("storage.lock"),"content":"forbidden","purpose":"project"
             }), &ctx).is_err());
@@ -8877,7 +9443,11 @@ mod tests {
                         edit.execute_prepared(&edit_call)
                     }),
                 ] {
-                    assert!(result.unwrap_err().to_string().contains("scope"));
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains("scope") || error.contains("binding is stale"),
+                        "{error}"
+                    );
                 }
                 assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
             }
@@ -9056,6 +9626,9 @@ mod tests {
     #[test]
     fn prepared_scoped_write_after_apply_failure_retains_journal_and_prior_ledger() {
         let (temp, ctx) = native_preparation_fixture();
+        let parent = ctx.with_task(crate::agent::todo::TaskContext::private());
+        let ctx = parent.with_resource_scope("partial-write-child");
+        let epoch = parent.task().unwrap().effect_epoch();
         let root = ctx.placement().unwrap().workspace_root().to_path_buf();
         let target = root.join("f.txt");
         std::fs::write(&target, "before\n").unwrap();
@@ -9094,6 +9667,10 @@ mod tests {
                         .downcast_ref::<crate::core::native_journal::PossiblyApplied>()
                         .is_some());
                     assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+                    assert!(
+                        parent.task().unwrap().effect_epoch() > epoch,
+                        "failed child live mutation must stale parent proof before returning"
+                    );
                     // A possibly-applied tool does not report successful fresh observation.
                     assert_eq!(
                         crate::core::read_ledger::observed(&target),
@@ -9106,7 +9683,11 @@ mod tests {
                         crate::core::native_journal::Reconciliation::After { .. }
                     )));
                     assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
-                    assert!(write.execute_prepared(&prepared).is_err());
+                    let error = crate::core::exec_ctx::with_current(ctx.clone(), || {
+                        write.execute_prepared(&prepared)
+                    })
+                    .unwrap_err();
+                    assert!(!error.to_string().contains("binding is stale"), "{error:#}");
                 })
             })
         });
@@ -9128,7 +9709,10 @@ mod tests {
             .unwrap();
         std::fs::remove_file(root.join("alias.txt")).unwrap();
         symlink(root.join("b.txt"), root.join("alias.txt")).unwrap();
-        assert!(read.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || read.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert!(crate::core::read_ledger::observed(&root.join("a.txt")).is_none());
         assert!(crate::core::read_ledger::observed(&root.join("b.txt")).is_none());
     }
@@ -9165,7 +9749,10 @@ mod tests {
             prepared.args["edits"] =
                 serde_json::json!([{"old_string":"beta","new_string":"UNAPPROVED"}]);
             prepared.args["dry_run"] = serde_json::json!(true);
-            let output = edit.execute_prepared(&prepared).unwrap();
+            let output = crate::core::exec_ctx::with_current(ctx.clone(), || {
+                edit.execute_prepared(&prepared)
+            })
+            .unwrap();
             assert!(output.text.starts_with(&expected_output));
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "ALPHA beta\n");
             assert!(!root.join("unapproved.txt").exists());
@@ -9193,7 +9780,11 @@ mod tests {
             FileRead::new(root.clone())
                 .execute(&serde_json::json!({"path":"f.txt"}))
                 .unwrap();
-            assert!(edit.execute_prepared(&prepared).is_err());
+            let error = crate::core::exec_ctx::with_current(ctx.clone(), || {
+                edit.execute_prepared(&prepared)
+            })
+            .unwrap_err();
+            assert!(!error.to_string().contains("binding is stale"), "{error:#}");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha peer\n");
             assert_eq!(prepared.preview.as_ref().unwrap().diff, preview.diff);
             assert_eq!(prepared.file.as_ref().unwrap().expected, expected);
@@ -9223,13 +9814,16 @@ mod tests {
         let args = serde_json::json!({"path":"f.txt","old_string":"alpha","new_string":"ALPHA"});
         let prepared = edit.prepare_call(&args, &ctx).unwrap();
         assert_eq!(crate::core::read_ledger::observed(&target), Some(seen));
-        let error = edit.execute_prepared(&prepared).unwrap_err();
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || edit.execute_prepared(&prepared))
+                .unwrap_err();
         assert!(format!("{error:#}").contains("overwrite conflict"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha peer\n");
         FileRead::new(root.clone())
             .execute(&serde_json::json!({"path":"f.txt"}))
             .unwrap();
-        edit.execute_prepared(&prepared).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || edit.execute_prepared(&prepared))
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "ALPHA peer\n");
         assert_eq!(
             crate::core::read_ledger::observed(&target),
@@ -9260,11 +9854,11 @@ mod tests {
             &target,
             &crate::core::persist::FileFingerprint::for_bytes(b"different observation"),
         );
-        assert!(edit
-            .execute_prepared(&prepared)
-            .unwrap_err()
-            .to_string()
-            .contains("overwrite conflict"));
+        assert!(crate::core::exec_ctx::with_current(ctx.clone(), || edit
+            .execute_prepared(&prepared))
+        .unwrap_err()
+        .to_string()
+        .contains("overwrite conflict"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha\n");
         crate::core::read_ledger::forget(&target);
     }
@@ -9302,7 +9896,10 @@ mod tests {
                 edit.workspace_effect_prepared(&prepared),
                 WorkspaceEffect::None
             );
-            let output = edit.execute_prepared(&prepared).unwrap();
+            let output = crate::core::exec_ctx::with_current(ctx.clone(), || {
+                edit.execute_prepared(&prepared)
+            })
+            .unwrap();
             assert!(output.text.starts_with(prefix));
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha beta\n");
             assert_eq!(
@@ -9361,7 +9958,8 @@ mod tests {
                 .with_placement(placement);
         let write = FileWrite::new(root.clone());
         let created = write.prepare_call(&serde_json::json!({"path":"existing.txt","content":"alpha\n","purpose":"artifact"}), &ctx).unwrap();
-        write.execute_prepared(&created).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || write.execute_prepared(&created))
+            .unwrap();
         let actual = created
             .file
             .as_ref()
@@ -9385,7 +9983,8 @@ mod tests {
             edit.workspace_target_prepared(&prepared),
             actual.parent().map(Path::to_path_buf)
         );
-        edit.execute_prepared(&prepared).unwrap();
+        crate::core::exec_ctx::with_current(ctx.clone(), || edit.execute_prepared(&prepared))
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&actual).unwrap(), "ALPHA\n");
         assert!(!root.join("existing.txt").exists());
         crate::core::read_ledger::forget(&actual);
@@ -9408,7 +10007,10 @@ mod tests {
         std::fs::rename(&parent, root.join("original-parent")).unwrap();
         std::fs::create_dir(&parent).unwrap();
         std::fs::write(parent.join("f.txt"), "alpha\n").unwrap();
-        assert!(edit.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || edit.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert_eq!(
             std::fs::read_to_string(parent.join("f.txt")).unwrap(),
             "alpha\n"
@@ -9439,7 +10041,10 @@ mod tests {
             .unwrap();
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&b, &alias).unwrap();
-        assert!(edit.execute_prepared(&prepared).is_err());
+        let error =
+            crate::core::exec_ctx::with_current(ctx.clone(), || edit.execute_prepared(&prepared))
+                .unwrap_err();
+        assert!(!error.to_string().contains("binding is stale"), "{error:#}");
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "alpha\n");
     }
@@ -10171,6 +10776,89 @@ mod tests {
     }
 
     #[test]
+    fn git_inspect_unsettled_output_never_becomes_success_or_a_soft_error() {
+        use crate::core::proctree::{BoundedExecutionError, BoundedOutput, BoundedSettlement};
+
+        for timed_out in [false, true] {
+            let error = git_inspect_result(
+                "status",
+                Ok(BoundedOutput {
+                    stdout: "apparently clean".into(),
+                    stderr: String::new(),
+                    code: Some(0),
+                    timed_out,
+                    output_truncated: false,
+                    settlement: BoundedSettlement::Unknown,
+                }),
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::agent::tool_error_effect_state(&error),
+                crate::agent::tools::ToolEffectState::UnknownWorker
+            );
+        }
+        let error = git_inspect_result(
+            "diff",
+            Err(BoundedExecutionError {
+                cause: std::io::Error::other("fixture incomplete cleanup"),
+                settlement: BoundedSettlement::Unknown,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::agent::tool_error_effect_state(&error),
+            crate::agent::tools::ToolEffectState::UnknownWorker
+        );
+        assert!(git_inspect_result(
+            "status",
+            Err(BoundedExecutionError {
+                cause: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "planning"),
+                settlement: BoundedSettlement::Proven,
+            }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn git_inspect_settled_output_preserves_rendering_and_reports_capture_truncation() {
+        use crate::core::proctree::{BoundedOutput, BoundedSettlement};
+        let output = || BoundedOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: Some(0),
+            timed_out: false,
+            output_truncated: false,
+            settlement: BoundedSettlement::Proven,
+        };
+        assert!(git_inspect_result("status", Ok(output()))
+            .unwrap()
+            .starts_with("clean —"));
+        assert_eq!(
+            git_inspect_result("diff", Ok(output())).unwrap(),
+            "no differences"
+        );
+        let mut failed = output();
+        failed.code = Some(128);
+        failed.stderr = "fatal: not a git repository\n".into();
+        assert_eq!(
+            git_inspect_result("status", Ok(failed)).unwrap(),
+            "error: git status failed: fatal: not a git repository"
+        );
+        let mut timed_out = output();
+        timed_out.timed_out = true;
+        assert!(git_inspect_result("blame", Ok(timed_out))
+            .unwrap()
+            .starts_with("error: git blame exceeded 30s"));
+        let mut clipped = output();
+        clipped.stdout = "x".repeat(GIT_INSPECT_MAX_CHARS + 1);
+        clipped.output_truncated = true;
+        let rendered = git_inspect_result("diff", Ok(clipped)).unwrap();
+        assert!(rendered.starts_with(&"x".repeat(GIT_INSPECT_MAX_CHARS)));
+        assert!(rendered.contains("truncated at 20000 chars"));
+        assert!(rendered.contains("git output capture truncated"));
+    }
+
+    #[test]
     fn git_inspect_runs_real_queries_through_the_sandbox_runner() {
         // End-to-end proof of the exec path (SandboxRequest::exec → spawn → drain): a real repo,
         // real commits, and the closed argv actually reaching git. Skipped where git is absent.
@@ -10231,6 +10919,53 @@ mod tests {
             .execute(&serde_json::json!({"action": "blame", "path": "a.txt", "rev": "HEAD"}))
             .unwrap();
         assert!(blame.contains("one"), "blame shows the line: {blame}");
+        let branches = t
+            .execute(&serde_json::json!({"action": "branches"}))
+            .unwrap();
+        assert!(branches.contains("refs/heads/"), "branches: {branches}");
+        let worktrees = t
+            .execute(&serde_json::json!({"action": "worktrees"}))
+            .unwrap();
+        let inventory: serde_json::Value = serde_json::from_str(&worktrees).unwrap();
+        assert_eq!(inventory.as_array().unwrap().len(), 1);
+        let reflog = t.execute(&serde_json::json!({"action": "reflog"})).unwrap();
+        assert!(reflog.contains("first"), "reflog: {reflog}");
+        // The path is literal, not a wildcard selecting unrelated files.
+        let literal = t
+            .execute(&serde_json::json!({"action": "diff", "path": "*.txt"}))
+            .unwrap();
+        assert_eq!(literal, "no differences");
+        // A configured external diff actually runs without the inspection profile. The tool must
+        // still return Git's patch, not repository-configured executable output.
+        git(&["config", "diff.external", "echo git-external-sentinel"]);
+        let control = std::process::Command::new("git")
+            .args(["diff", "--ext-diff"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(control.status.success());
+        assert!(String::from_utf8_lossy(&control.stdout).contains("git-external-sentinel"));
+        let safe_diff = t.execute(&serde_json::json!({"action": "diff"})).unwrap();
+        assert!(safe_diff.contains("+two"), "safe diff: {safe_diff}");
+        assert!(!safe_diff.contains("git-external-sentinel"));
+        git(&["config", "--unset", "diff.external"]);
+        std::fs::write(dir.join(".gitattributes"), "a.txt diff=fixture\n").unwrap();
+        git(&[
+            "config",
+            "diff.fixture.textconv",
+            "echo git-textconv-sentinel",
+        ]);
+        let control = std::process::Command::new("git")
+            .args(["show", "--textconv", "HEAD:a.txt"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(control.status.success(), "textconv control: {control:?}");
+        assert!(String::from_utf8_lossy(&control.stdout).contains("git-textconv-sentinel"));
+        let safe_show = t
+            .execute(&serde_json::json!({"action": "show", "rev": "HEAD:a.txt"}))
+            .unwrap();
+        assert_eq!(safe_show, "one");
         // A non-repo directory surfaces git's own error as a soft error, not a panic.
         let outside = std::env::temp_dir().join(format!("aizen-nongit-{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();
@@ -10258,6 +10993,9 @@ mod tests {
         rej(serde_json::json!({"action": "diff", "path": "--work-tree=/etc"}));
         // blame without a path is refused up front.
         rej(serde_json::json!({"action": "blame"}));
+        rej(serde_json::json!({"action": "worktrees", "rev": "HEAD"}));
+        rej(serde_json::json!({"action": "branches", "path": "a.txt"}));
+        rej(serde_json::json!({"action": "reflog", "path": "a.txt"}));
         // Read-only classification: never destructive, parallel-safe, no workspace effect.
         assert!(!t.is_destructive());
         assert!(t.is_concurrency_safe());
@@ -10309,7 +11047,7 @@ mod deferral_tests {
         r.register(Box::new(PersonaCreate));
         let before = r.advertised_names().len();
         defer_builtins_for_shape(&mut r, Some(TurnShape::SmallEdit));
-        for n in ["checkpoint", "skill_save", "persona_create", "web_crawl"] {
+        for n in ["skill_save", "persona_create", "web_crawl"] {
             assert!(!adv(&r, n), "{n} must not ride the request");
             assert!(r.get(n).is_some(), "{n} stays dispatchable");
         }
@@ -10355,21 +11093,25 @@ mod deferral_tests {
         let mut rs = default_registry_in(&root("research"));
         defer_builtins_for_shape(&mut rs, Some(TurnShape::Research));
         assert!(adv(&rs, "web_crawl"));
-        assert!(!adv(&rs, "checkpoint"));
+        for retired in ["checkpoint", "checkpoint_view"] {
+            assert!(rs.get(retired).is_none());
+        }
+        assert!(adv(&rs, "native_owner_undo"));
+        assert!(adv(&rs, "git_inspect"));
     }
 
     #[test]
     fn deferred_note_names_builtins_and_counts_mcp_servers() {
         let surface: crate::agent::tools::DeferredSurface = (
             vec![
-                "checkpoint".into(),
+                "skill_save".into(),
                 "memory_save".into(),
                 "mcp_github_issue".into(),
             ],
             vec![("builtin".into(), 2), ("github".into(), 1)],
         );
         let note = deferred_tools_note_for(&surface);
-        assert!(note.contains("checkpoint, memory_save"), "{note}");
+        assert!(note.contains("skill_save, memory_save"), "{note}");
         assert!(
             note.contains("1 MCP tool(s)") && note.contains("github (1)"),
             "{note}"

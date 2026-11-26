@@ -67,18 +67,33 @@ pub struct SymbolEditPlan {
 /// The process-global LSP manager. One per CLI process; servers are spawned lazily and reused.
 pub static LSP: Lazy<LspManager> = Lazy::new(LspManager::new);
 
-/// The language [`discovery::detect`] would serve for the process cwd — i.e. what the lazy server
-/// WILL be once the first symbol query lands. Cached for the process lifetime: the sidebar asks on
-/// every status refresh, and the cwd does not move under a running session (the same assumption the
-/// renderer's `sidebar_cwd` makes).
+/// Detect from the captured project identity. An unavailable bound root must not fall back to cwd,
+/// and a process-lifetime cached language cannot describe navigation between worktrees.
 fn detected_workspace_lang() -> Option<&'static str> {
-    static DETECTED: Lazy<Option<&'static str>> = Lazy::new(|| {
-        std::env::current_dir()
-            .ok()
-            .and_then(|d| discovery::detect(&d))
-            .map(|(spec, _)| spec.lang)
-    });
-    *DETECTED
+    // The renderer has no execution context; its input-root projection is display-only, never
+    // consulted by query/spawn admission. Cache per root so status painting does not walk at 9fps.
+    let root = crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.project_root().to_path_buf())
+        })
+        .or_else(crate::ui::tui::input_workspace)
+        .unwrap_or_else(crate::core::config::project_root);
+    type Detection = Option<(PathBuf, Option<&'static str>)>;
+    static DETECTED: Mutex<Detection> = Mutex::new(None);
+    let mut cache = DETECTED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((previous, language)) = &*cache {
+        if *previous == root {
+            return *language;
+        }
+    }
+    let language = root
+        .is_dir()
+        .then(|| discovery::detect(&root))
+        .flatten()
+        .map(|(spec, _)| spec.lang);
+    *cache = Some((root, language));
+    language
 }
 
 /// A crashed server is respawned at most this many times per session before being marked disabled
@@ -195,6 +210,8 @@ pub struct LspManager {
 /// One post-edit diagnostics job that outran the inline wait.
 struct PendingFold {
     file: PathBuf,
+    /// Frozen identity without an admission lease: old feedback is discarded after a transition.
+    policy: Option<crate::core::session_control::ExecutionPolicy>,
     /// The server whose workspace snapshot the caller scan reads; `None` in tests.
     server: Option<Arc<LspServer>>,
     rx: std::sync::mpsc::Receiver<Option<Vec<DiagItem>>>,
@@ -274,6 +291,8 @@ impl LspManager {
     /// Turn LSP on for this session: build the dedicated runtime if needed. Idempotent. Does NOT
     /// spawn any server yet — servers start lazily on first use.
     pub fn enable(&self) -> Result<()> {
+        let ctx = crate::agent::hooks::automation_context(None);
+        let _admitted = crate::agent::hooks::admit_automation(&ctx)?;
         self.check_startup_effects()?;
         let mut guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
@@ -294,21 +313,48 @@ impl LspManager {
         Ok(())
     }
 
-    /// Turn LSP off: drop all servers (each `Drop` aborts its mainloop → `kill_on_drop` + the
-    /// Windows Job Object reap the child tree) and shut the runtime down. Reclaims the servers' RAM.
-    pub fn disable(&self) {
-        self.enabled.store(false, Ordering::Relaxed);
-        let servers: Vec<Arc<LspServer>> = self
+    /// Stop policy-bound servers before entering planning without changing the user's LSP switch.
+    /// The idle runtime has no repository process; frozen policy still gates every future query.
+    pub(crate) fn suspend(&self) {
+        let servers = self.drain_servers();
+        let runtime = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(runtime) = runtime.as_ref() {
+            for server in servers {
+                runtime.spawn(async move { server.shutdown().await });
+            }
+        }
+        // If a concurrent explicit disable took the runtime, dropping the servers requests cleanup;
+        // their monitors still retain physical/policy ownership until settlement is proven.
+    }
+
+    fn drain_servers(&self) -> Vec<Arc<LspServer>> {
+        let servers = self
             .servers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain()
-            .map(|(_, v)| v)
+            .map(|(_, server)| server)
             .collect();
         self.restarts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.diag_baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_folds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        servers
+    }
+
+    /// Turn LSP off: drop all servers (each `Drop` aborts its mainloop → `kill_on_drop` + the
+    /// Windows Job Object reap the child tree) and shut the runtime down. Reclaims the servers' RAM.
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        let servers = self.drain_servers();
         let rt = self
             .runtime
             .lock()
@@ -320,15 +366,17 @@ impl LspManager {
             if let Some(rt) = rt {
                 rt.block_on(async {
                     for s in &servers {
-                        // best-effort graceful shutdown→exit; `Drop` is the hard backstop.
-                        let _ = tokio::time::timeout(Duration::from_secs(5), s.shutdown()).await;
+                        // shutdown bounds both handshake and settlement. An outer handshake-only
+                        // timeout would abort before Stop/drain and strand its policy lease.
+                        s.shutdown().await;
                     }
                 });
-                drop(rt); // drop the runtime explicitly (joins its workers)
+                // Drop requests IO teardown while the monitor runtime can still observe it.
+                drop(servers);
+                drop(rt);
+            } else {
+                drop(servers);
             }
-            // Drop the server Arcs → `LspServer::drop` aborts each mainloop task → `kill_on_drop`
-            // (+ Job Object on Windows) reaps the child tree.
-            drop(servers);
         });
     }
 
@@ -507,6 +555,8 @@ impl LspManager {
     /// background for next time — or the 3s hard cap elapsing). An edit's success is never held
     /// hostage by a slow analysis.
     pub fn edit_feedback(&self, file: &Path) -> Option<String> {
+        let ctx = crate::agent::hooks::automation_context(None);
+        let admitted = crate::agent::hooks::admit_automation(&ctx).ok()?;
         if !self.is_enabled() || !self.edit_feedback_enabled() {
             return None;
         }
@@ -530,20 +580,23 @@ impl LspManager {
         let f = file.clone();
         let srv = Arc::clone(&server);
         let (tx, rx) = std::sync::mpsc::channel();
-        handle.spawn(async move {
-            // The job runs on regardless of whether the edit waits for it: a generous wall-clock
-            // cap around re-open + re-analysis + (bounded) settle, since only the inline wait below
-            // is on the edit's critical path.
-            let out = tokio::time::timeout(
-                Duration::from_secs(20),
-                srv.diagnostics_bounded(&f, Duration::from_millis(4_000)),
-            )
-            .await;
-            let _ = tx.send(match out {
-                Ok(Ok(items)) => Some(items),
-                _ => None,
-            });
-        });
+        handle.spawn(crate::core::exec_ctx::with_current_future(
+            admitted,
+            async move {
+                // The job runs on regardless of whether the edit waits for it: a generous wall-clock
+                // cap around re-open + re-analysis + (bounded) settle, since only the inline wait below
+                // is on the edit's critical path.
+                let out = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    srv.diagnostics_bounded(&f, Duration::from_millis(4_000)),
+                )
+                .await;
+                let _ = tx.send(match out {
+                    Ok(Ok(items)) => Some(items),
+                    _ => None,
+                });
+            },
+        ));
         match rx.recv_timeout(Duration::from_millis(EDIT_FEEDBACK_INLINE_MS)) {
             Ok(Some(items)) => Some(self.fold_items(&file, &items).0),
             Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
@@ -555,6 +608,7 @@ impl LspManager {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(PendingFold {
                         file,
+                        policy: ctx.policy().cloned(),
                         server: Some(server),
                         rx,
                         started: std::time::Instant::now(),
@@ -593,9 +647,23 @@ impl LspManager {
     pub fn take_ready_feedback(&self) -> Vec<ReadyFold> {
         let pending: Vec<PendingFold> =
             std::mem::take(&mut *self.pending_folds.lock().unwrap_or_else(|e| e.into_inner()));
+        let ctx = crate::agent::hooks::automation_context(None);
+        let Ok(_admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+            // Never replay feedback suppressed by a human restriction after a later exit.
+            return Vec::new();
+        };
         let mut ready = Vec::new();
         let mut keep = Vec::new();
         for p in pending {
+            if let Some(policy) = &p.policy {
+                if policy.validate_current().is_err()
+                    || ctx
+                        .policy()
+                        .is_none_or(|active| policy.check_inheritance(active).is_err())
+                {
+                    continue;
+                }
+            }
             match p.rx.try_recv() {
                 Ok(Some(items)) => {
                     let (text, mut has_error) = self.fold_items(&p.file, &items);
@@ -691,6 +759,7 @@ impl LspManager {
             .unwrap_or_else(|e| e.into_inner())
             .push(PendingFold {
                 file,
+                policy: crate::agent::planning::current_policy(),
                 server: None,
                 rx,
                 started: std::time::Instant::now(),
@@ -710,15 +779,21 @@ impl LspManager {
     /// Fire-and-forget server spawn (a throwaway OS thread carries the blocking handshake) so the
     /// NEXT edit's fold finds a live server. Never blocks the caller.
     fn warm_spawn(&self, spec: &'static discovery::ServerSpec, root: PathBuf) {
+        let ctx = crate::agent::hooks::automation_context(None);
+        let Ok(admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+            return;
+        };
         if self.check_startup_effects().is_err() {
             return;
         }
         let Ok(handle) = self.handle() else { return };
         let timeout = self.request_timeout();
         std::thread::spawn(move || {
-            // A failed warm start needs no bookkeeping here: the child it admitted carries its own
-            // settlement charge and clears it by itself once the monitor proves the tree exited.
-            let _ = LSP.get_or_spawn(spec, &root, &handle, timeout);
+            crate::core::exec_ctx::with_current(admitted, || {
+                // A failed warm start needs no bookkeeping here: the child it admitted carries its own
+                // settlement charge and clears it by itself once the monitor proves the tree exited.
+                let _ = LSP.get_or_spawn(spec, &root, &handle, timeout);
+            })
         });
     }
 
@@ -731,6 +806,8 @@ impl LspManager {
         F: FnOnce(Arc<LspServer>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
+        let ctx = crate::agent::hooks::automation_context(None);
+        let admitted = crate::agent::hooks::admit_automation(&ctx)?;
         self.check_startup_effects()?;
         if !self.is_enabled() {
             bail!("LSP is off — enable it with `/lsp on`");
@@ -746,7 +823,7 @@ impl LspManager {
         let server = self.get_or_spawn(spec, &root, &handle, timeout)?;
 
         let (tx, rx) = std::sync::mpsc::channel();
-        handle.spawn(async move {
+        handle.spawn(crate::core::exec_ctx::with_current_future(admitted, async move {
             let r = tokio::time::timeout(timeout, f(server)).await;
             let _ = tx.send(match r {
                 Ok(inner) => inner,
@@ -754,7 +831,7 @@ impl LspManager {
                     "LSP {op} timed out after {timeout:?} (the server may still be indexing — try again)"
                 )),
             });
-        });
+        }));
         rx.recv_timeout(timeout + Duration::from_secs(3))
             .map_err(|_| anyhow!("LSP request did not return"))?
     }
@@ -779,6 +856,8 @@ impl LspManager {
         handle: &Handle,
         timeout: Duration,
     ) -> Result<Arc<LspServer>> {
+        let ctx = crate::agent::hooks::automation_context(None);
+        let admitted = crate::agent::hooks::admit_automation(&ctx)?;
         self.check_startup_effects()?;
         let key = format!("{}\0{}", spec.lang, root.display());
         {
@@ -817,12 +896,15 @@ impl LspManager {
         let (tx, rx) = std::sync::mpsc::channel();
         let root_owned = root.to_path_buf();
         let unsettled = Arc::clone(&self.startup_unsettled);
-        handle.spawn(async move {
-            // `spawn` owns the charge: it releases it on a live handshake and marks it failed on any
-            // startup failure. An abandoned observer therefore cannot bless an unowned child.
-            let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout, &unsettled).await;
-            let _ = tx.send(r);
-        });
+        handle.spawn(crate::core::exec_ctx::with_current_future(
+            admitted,
+            async move {
+                // `spawn` owns the charge: it releases it on a live handshake and marks it failed on any
+                // startup failure. An abandoned observer therefore cannot bless an unowned child.
+                let r = LspServer::spawn(spec, &bin, &root_owned, init_timeout, &unsettled).await;
+                let _ = tx.send(r);
+            },
+        ));
         let result = match rx.recv_timeout(init_timeout + Duration::from_secs(5)) {
             Ok(result) => result,
             Err(_) => {
@@ -1109,6 +1191,173 @@ fn format_diagnostics(root: &Path, file: &Path, items: &[DiagItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_detection_tracks_bound_root_without_cwd_or_process_lifetime_cache() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let rust = fixture.path().join("rust");
+        let python = fixture.path().join("python");
+        std::fs::create_dir(&rust).unwrap();
+        std::fs::create_dir(&python).unwrap();
+        std::fs::write(rust.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(python.join("pyproject.toml"), "[project]\n").unwrap();
+        let placement =
+            crate::core::file_placement::PlacementContext::new(rust, fixture.path().join("home"))
+                .unwrap();
+        let first =
+            crate::core::exec_ctx::ExecutionContext::default().with_placement(placement.clone());
+        let second = first.with_placement(placement.fork_for(python, "python").unwrap());
+        crate::core::exec_ctx::with_current(first, || {
+            assert_eq!(detected_workspace_lang(), Some("rust"))
+        });
+        crate::core::exec_ctx::with_current(second, || {
+            assert_eq!(detected_workspace_lang(), Some("python"))
+        });
+    }
+
+    #[test]
+    fn planning_lsp_leaf_calls_refuse_before_runtime_or_discovery() {
+        use crate::core::exec_ctx::{with_current, ExecutionContext};
+        use crate::core::session_control::ExecutionMode;
+        let manager = LspManager::new_isolated();
+        let task = crate::agent::todo::TaskContext::private();
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let ctx = ExecutionContext::default().with_task(task.clone());
+        let assert_refused = || {
+            assert!(manager
+                .enable()
+                .unwrap_err()
+                .to_string()
+                .contains("automation suppressed"));
+            assert!(manager.runtime.lock().unwrap().is_none());
+            assert!(!manager.is_enabled());
+            // Even a manager previously armed in normal mode must refuse before discovery.
+            manager.enabled.store(true, Ordering::Relaxed);
+            assert!(manager
+                .references(Path::new("missing-project"), "symbol", false)
+                .unwrap_err()
+                .to_string()
+                .contains("automation suppressed"));
+            assert!(manager
+                .edit_feedback(Path::new("missing-project.rs"))
+                .is_none());
+            manager.warm_spawn(&discovery::SERVERS[0], PathBuf::from("missing-project"));
+            assert!(manager.servers.lock().unwrap().is_empty());
+            assert!(manager.pending_folds.lock().unwrap().is_empty());
+            manager.enabled.store(false, Ordering::Relaxed);
+        };
+        with_current(ctx.clone(), assert_refused);
+        task.control()
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        with_current(ctx, assert_refused); // A frozen planning caller never replays after exit.
+        assert!(manager.enable().is_ok()); // Unbound normal callers remain compatible.
+        manager.disable();
+    }
+
+    #[test]
+    fn planning_suspension_preserves_enabled_choice_and_policy_admission() {
+        use crate::core::exec_ctx::{with_current, ExecutionContext};
+        use crate::core::session_control::ExecutionMode;
+
+        let manager = LspManager::new_isolated();
+        manager.suspend();
+        assert!(!manager.is_enabled());
+        assert!(
+            manager.handle().is_err(),
+            "disabled manager must not be armed"
+        );
+        manager.enable().unwrap();
+        let task = crate::agent::todo::TaskContext::private();
+        let control = task.control();
+        let old_normal = ExecutionContext::default().with_task(task.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_current(old_normal.clone(), || {
+            manager.park_fold_for_test(PathBuf::from("old.rs"), rx);
+        });
+        manager.restarts.lock().unwrap().insert("old".into(), 2);
+        manager.suspend();
+        tx.send(None).unwrap_err();
+        assert!(manager.is_enabled());
+        assert!(manager.handle().is_ok());
+        assert!(manager.pending_folds.lock().unwrap().is_empty());
+        assert!(manager.restarts.lock().unwrap().is_empty());
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let planning = ExecutionContext::default().with_task(task.clone());
+        for ctx in [old_normal, planning.clone()] {
+            with_current(ctx, || {
+                assert!(manager
+                    .references(Path::new("missing"), "symbol", false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("automation suppressed"));
+            });
+        }
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        with_current(planning, || assert!(manager.enable().is_err()));
+        with_current(ExecutionContext::default().with_task(task), || {
+            assert!(manager.is_enabled());
+            assert!(manager.handle().is_ok());
+            assert!(crate::agent::hooks::admit_automation(
+                &crate::agent::hooks::automation_context(None)
+            )
+            .is_ok());
+        });
+        manager.disable();
+        manager.suspend();
+        assert!(
+            !manager.is_enabled(),
+            "explicit off must survive suspension"
+        );
+    }
+
+    #[test]
+    fn planning_lsp_discards_old_feedback_without_replay() {
+        use crate::core::exec_ctx::{with_current, ExecutionContext};
+        use crate::core::session_control::ExecutionMode;
+        let manager = LspManager::new_isolated();
+        let task = crate::agent::todo::TaskContext::private();
+        let normal = ExecutionContext::default().with_task(task.clone());
+        let park = || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            manager.park_fold_for_test(PathBuf::from("owned.rs"), rx);
+            tx.send(Some(vec![diag("error", 1, "old diagnostics", None)]))
+                .unwrap();
+        };
+        with_current(normal, park);
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        with_current(ExecutionContext::default().with_task(task.clone()), || {
+            assert!(manager.take_ready_feedback().is_empty());
+            assert!(manager.pending_folds.lock().unwrap().is_empty());
+        });
+        task.control()
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        with_current(ExecutionContext::default().with_task(task.clone()), || {
+            assert!(manager.take_ready_feedback().is_empty());
+            park();
+        });
+        // No drain occurred between these transitions; frozen feedback is still stale.
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        task.control()
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        with_current(ExecutionContext::default().with_task(task), || {
+            assert!(manager.take_ready_feedback().is_empty());
+            park();
+            assert_eq!(manager.take_ready_feedback().len(), 1);
+        });
+    }
 
     #[test]
     fn startup_uncertainty_blocks_queries_and_clears_once_settlement_is_proven() {

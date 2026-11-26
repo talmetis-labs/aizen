@@ -488,13 +488,13 @@ fn deferred_tools_leave_the_request_but_stay_dispatchable_through_tool_search() 
         "rows"
     );
 
-    // Discovery: the search result carries the exact name + the full schema in-band.
+    // Discovery returns the exact name. The loop promotes the matching schema.
     let search = registry.get("tool_search").unwrap();
     let out = search
         .execute(&serde_json::json!({"query": "query database"}))
         .unwrap();
-    assert!(out.contains("## mcp_fake_query"), "{out}");
-    assert!(out.contains("\"required\":[\"sql\"]"), "{out}");
+    assert!(out.contains("- mcp_fake_query"), "{out}");
+    assert!(!out.contains("\"required\""), "{out}");
 
     // The skills gate sees the WHOLE dispatchable surface (advertised ∪ deferred)…
     let (names, by_server) = registry.deferred_summary().expect("deferred present");
@@ -547,6 +547,7 @@ async fn run_scripted(registry: &ToolRegistry, turns: Vec<ChatTurn>) -> Vec<Mess
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| ChatTurn {
+                speech_final_verified: false,
                 content: Some("done".into()),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
@@ -562,8 +563,6 @@ async fn run_scripted(registry: &ToolRegistry, turns: Vec<ChatTurn>) -> Vec<Mess
         auto_extend_to: 4,
         quiet: true,
         enable_verify_gate: false,
-        auto_checkpoint: false,
-        checkpoint_each_edit: false,
         enable_self_review: false,
         ..crate::agent::AgentConfig::default()
     };
@@ -576,6 +575,7 @@ async fn run_scripted(registry: &ToolRegistry, turns: Vec<ChatTurn>) -> Vec<Mess
 
 fn tool_call(name: &str, args: &str) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: None,
         tool_calls: vec![ToolCall {
             id: "c1".into(),
@@ -664,6 +664,7 @@ async fn a_call_written_as_text_is_recovered_when_tool_calls_is_empty() {
         "arguments": {"path": path.to_string_lossy()}
     });
     let text_turn = ChatTurn {
+        speech_final_verified: false,
         content: Some(format!(
             "Let me read it.
 <tool_call>

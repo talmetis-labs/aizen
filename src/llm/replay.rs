@@ -132,6 +132,7 @@ impl TapedTurn {
             ..Default::default()
         });
         ChatTurn {
+            speech_final_verified: false,
             content: self.content,
             tool_calls: self.tool_calls,
             finish_reason: self.finish_reason,
@@ -489,6 +490,7 @@ pub fn replay_text(model: &str, messages: &[Message]) -> Result<Option<String>> 
 
 pub fn record_text(model: &str, messages: &[Message], text: &str) -> Result<()> {
     let turn = ChatTurn {
+        speech_final_verified: false,
         content: Some(text.to_string()),
         tool_calls: Vec::new(),
         finish_reason: Some("stop".into()),
@@ -653,6 +655,7 @@ mod tests {
 
     fn call_turn(name: &str, args: &str) -> ChatTurn {
         ChatTurn {
+            speech_final_verified: false,
             content: None,
             tool_calls: vec![ToolCall {
                 id: "call_abc123".into(),
@@ -730,6 +733,7 @@ mod tests {
         let path = temp_tape("per-call-quiet-drift");
         let messages = vec![Message::system("prompt v1"), Message::user("go")];
         let turn = ChatTurn {
+            speech_final_verified: false,
             content: Some("recorded reply".into()),
             tool_calls: Vec::new(),
             finish_reason: Some("stop".into()),
@@ -914,6 +918,7 @@ mod tests {
         let mut msgs2 = msgs.clone();
         msgs2.push(Message::tool_result("call_abc123", "fn main(){}"));
         let fin = ChatTurn {
+            speech_final_verified: false,
             content: Some("done".into()),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),

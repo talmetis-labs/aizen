@@ -98,7 +98,6 @@ async fn executor_hooks_run_once_for_mixed_native_and_eager_calls_in_pinned_work
         eager_call.id.clone(),
         INTERRUPTED_TOOL_PLACEHOLDER,
     )];
-    let mut checkpointed = false;
     let mut writer_lease = None;
     let results = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -108,7 +107,6 @@ async fn executor_hooks_run_once_for_mixed_native_and_eager_calls_in_pinned_work
             &config,
             &mut sink,
             vec![(0, started)],
-            &mut checkpointed,
             &mut writer_lease,
         ),
     )

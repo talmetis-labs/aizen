@@ -125,7 +125,7 @@ pub(crate) fn where_report() -> String {
         None => {
             let _ = writeln!(
                 s,
-                "git          : NOT FOUND — identity uses the nearest .git marker (or this folder); time-machine checkpoints are off"
+                "git          : NOT FOUND — identity uses filesystem project markers (or this folder); Git navigation is unavailable"
             );
         }
     }

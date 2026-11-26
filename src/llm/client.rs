@@ -1690,6 +1690,8 @@ async fn send_prepared_chat(
 
 /// The outcome of one non-streaming tool-calling turn.
 pub struct ChatTurn {
+    /// Positive provenance for real provider answer content; never inferred from display text.
+    pub(crate) speech_final_verified: bool,
     /// Natural-language content (the final answer when `tool_calls` is empty).
     pub content: Option<String>,
     /// Tool calls the model wants executed. NON-EMPTY ⇒ tools path (the source of truth —
@@ -2220,6 +2222,12 @@ async fn chat_with_tools_effort_live(
     // used to fail the whole message parse here — `content` was `Option<String>`, and a sequence
     // did not fit it. `RespMessage`'s hand-rolled `Deserialize` now joins text parts at the
     // boundary, so by this point `content` already carries the text regardless of spelling.
+    let speech_final_verified = verified_speech_answer(
+        choice.message.content.as_deref(),
+        !choice.message.tool_calls.is_empty(),
+        choice.finish_reason.as_deref(),
+        true,
+    );
     let content = resolve_content(&choice.message);
     let empty_wire_note = if choice.message.tool_calls.is_empty()
         && content.as_deref().is_none_or(|s| s.trim().is_empty())
@@ -2239,6 +2247,7 @@ async fn chat_with_tools_effort_live(
     // it exactly once — attached to the error when the budget dies.
     let empty_wire_raw = empty_wire_note.as_ref().map(|_| summarize_bytes(&raw, 400));
     Ok(ChatTurn {
+        speech_final_verified,
         content,
         tool_calls: std::mem::take(&mut choice.message.tool_calls),
         finish_reason: choice.finish_reason.clone(),
@@ -2787,6 +2796,25 @@ fn emit_completed_assistant_text(text: Option<&str>) {
     });
 }
 
+fn verified_speech_answer(
+    direct_content: Option<&str>,
+    has_tools: bool,
+    finish_reason: Option<&str>,
+    completed_transport: bool,
+) -> bool {
+    completed_transport
+        && !has_tools
+        && matches!(finish_reason, Some("stop" | "end_turn"))
+        && direct_content.is_some_and(|text| {
+            let lower = text.to_ascii_lowercase();
+            !text.trim().is_empty()
+                && text.len() <= 24 * 1024
+                && !["<think", "<analysis", "<reasoning", "<trace", "<system"]
+                    .iter()
+                    .any(|tag| lower.contains(tag))
+        })
+}
+
 fn reasoning_only_answer<'a>(full: &str, has_tools: bool, reasoning: &'a str) -> Option<&'a str> {
     let text = reasoning.trim();
     (full.is_empty() && !has_tools && !text.is_empty()).then_some(text)
@@ -3202,6 +3230,8 @@ async fn stream_chat_with_tools_eager_live(
         // so everything here is executable regardless of how the stream ended.
         let has_incomplete = acc.has_incomplete();
         let indexed = acc.finish_indexed();
+        let verified_transport =
+            done && stream_err.is_none() && !provider_failed && !has_incomplete;
 
         // The display is now clean (fence closed, partial line flushed) — deal with a transport error
         // that interrupted the stream. Two cases:
@@ -3263,6 +3293,12 @@ async fn stream_chat_with_tools_eager_live(
         // Streaming twin of `resolve_content` (non-streaming): a model that answered ONLY in the
         // reasoning channel produced an answer, not an empty turn. Same narrow gate — no real
         // content, no tool calls — so chain-of-thought is never APPENDED to a real answer.
+        let speech_final_verified = verified_speech_answer(
+            Some(&full),
+            !indexed.is_empty(),
+            finish_reason.as_deref(),
+            verified_transport,
+        );
         let fallback = reasoning_only_answer(&full, !indexed.is_empty(), &reasoning);
         let content = if !full.is_empty() {
             Some(full)
@@ -3277,6 +3313,7 @@ async fn stream_chat_with_tools_eager_live(
             None
         };
         return Ok(ChatTurn {
+            speech_final_verified,
             content,
             tool_calls: indexed.into_iter().map(|(_, tc)| tc).collect(),
             finish_reason,
@@ -3788,6 +3825,7 @@ pub(crate) mod tests {
                 meter.record(usage);
             }
             let turn = ChatTurn {
+                speech_final_verified: false,
                 content: Some("private tape answer".into()),
                 tool_calls: Vec::new(),
                 finish_reason: Some("stop".into()),
@@ -4911,6 +4949,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn speech_final_nonstream_requires_direct_clean_text_without_tools() {
+        let reasoning = resp_msg(r#"{"content":null,"reasoning_content":"private text"}"#);
+        assert_eq!(resolve_content(&reasoning).as_deref(), Some("private text"));
+        assert!(!verified_speech_answer(
+            reasoning.content.as_deref(),
+            false,
+            Some("stop"),
+            true,
+        ));
+        let real =
+            resp_msg(r#"{"content":"Actual response.","reasoning_content":"separate reasoning"}"#);
+        assert!(verified_speech_answer(
+            real.content.as_deref(),
+            false,
+            Some("stop"),
+            true
+        ));
+        assert!(!verified_speech_answer(
+            real.content.as_deref(),
+            true,
+            Some("stop"),
+            true
+        ));
+        assert!(!verified_speech_answer(
+            real.content.as_deref(),
+            false,
+            Some("length"),
+            true
+        ));
+        assert!(!verified_speech_answer(
+            real.content.as_deref(),
+            false,
+            Some("stop"),
+            false
+        ));
+        assert!(!verified_speech_answer(
+            Some("<think>private</think>"),
+            false,
+            Some("stop"),
+            true
+        ));
+    }
+
+    #[test]
     fn reasoning_only_reply_is_not_mistaken_for_provider_silence() {
         // THE BUG: the streaming `Delta` has always read `reasoning_content`/`reasoning`, but the
         // non-streaming `RespMessage` did not — and SUB-AGENTS are the one caller that runs
@@ -5095,6 +5177,28 @@ pub(crate) mod tests {
         );
         assert!(error.message.contains("max_completion_tokens"));
         assert!(!error.message.contains("sk-hidden"));
+    }
+
+    #[tokio::test]
+    async fn speech_final_stream_provenance_does_not_promote_reasoning_only() {
+        use crate::llm::media::tests as media_tests;
+        for (reply, text, proof) in [
+            ("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private reasoning\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", "private reasoning", false),
+            ("data: {\"choices\":[{\"delta\":{\"content\":\"Actual response.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", "Actual response.", true),
+        ] {
+            let (base, receiver, server) =
+                media_tests::request_receiver(reply, "text/event-stream").await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cfg = crate::core::cli_config::CliConfig::default();
+            let turn = stream_chat_with_tools_eager_live(
+                &client, &base, "fixture-key", "test-model", &[Message::user("hi")],
+                &[], StreamSink::default(), None, &cfg,
+            ).await.unwrap();
+            assert_eq!(turn.content.as_deref(), Some(text));
+            assert_eq!(turn.speech_final_verified, proof);
+            receiver.await.unwrap();
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

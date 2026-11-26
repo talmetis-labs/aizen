@@ -34,6 +34,10 @@ struct Binding {
 }
 tokio::task_local! { static BINDING: Binding; }
 thread_local! {
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "initializer is already const; Clippy 1.99 reports this macro invocation"
+    )]
     static AFFINITY: RefCell<Vec<snapshots::Snapshot>> = const { RefCell::new(Vec::new()) };
 }
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());

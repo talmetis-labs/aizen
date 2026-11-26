@@ -31,7 +31,7 @@ fn scoped_native_reads_ignore_cache_candidates_and_reject_outside_entries() {
         )
         .unwrap();
     let args = serde_json::json!({"path": "allowed.txt"});
-    let prepared = tool.prepare_call(&args, &config.exec_ctx).unwrap();
+    let prepared = planning::prepare(tool.as_ref(), &args, &config.exec_ctx).unwrap();
     let candidate = ReadCacheEntry {
         files: vec![(
             root.join("allowed.txt"),
@@ -66,7 +66,8 @@ fn scoped_native_reads_ignore_cache_candidates_and_reject_outside_entries() {
 
     // A cached/prepared call from broader authority cannot carry private bytes into this scope.
     let outside_args = serde_json::json!({"path": "outside.txt"});
-    let outside = tool.prepare_call(&outside_args, &broad).unwrap();
+    let outside = planning::prepare(tool.as_ref(), &outside_args, &broad).unwrap();
+    assert_eq!(outside.workspace_binding, prepared.workspace_binding);
     let outside_candidate = ReadCacheEntry {
         files: vec![(
             root.join("outside.txt"),

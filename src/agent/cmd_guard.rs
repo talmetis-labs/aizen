@@ -458,7 +458,11 @@ fn restore_segment(words: &[String]) -> bool {
         "git" => git_restore_request(args),
         "aizen" if args.first().is_some_and(|arg| arg == "time") => {
             match args.get(1).map(String::as_str) {
-                Some("restore" | "undo" | "redo") => true,
+                Some(
+                    "restore" | "undo" | "undo-paths" | "redo" | "switch" | "integrate"
+                    | "integrate-task" | "verify-task" | "merge" | "cherry-pick" | "sequencer"
+                    | "reconcile" | "remove" | "create" | "delete-branch",
+                ) => true,
                 Some("doctor") => args[2..]
                     .iter()
                     .take_while(|arg| arg.as_str() != "--")
@@ -762,7 +766,19 @@ mod tests {
             "git read-tree --reset HEAD",
             "aizen time restore checkpoint",
             "aizen time undo",
+            "aizen time undo-paths HEAD --path src/main.rs --yes",
             "aizen time redo",
+            "aizen time switch topic --yes",
+            "aizen time integrate HEAD~1 --yes",
+            "aizen time integrate-task git-task-1-2-3 --yes",
+            "aizen time verify-task 123-456-7 --yes",
+            "aizen time sequencer failed-operation-1 abort --yes",
+            "aizen time merge refs/heads/topic --yes",
+            "aizen time cherry-pick HEAD~1 HEAD --yes",
+            "aizen time reconcile failed-operation-1 --yes",
+            "aizen time delete-branch topic --retained-ref refs/heads/main --yes",
+            "aizen time remove topic",
+            "aizen time create topic",
             "aizen time doctor --repair",
         ] {
             assert!(delegated_restore_command(command), "{command}");

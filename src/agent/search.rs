@@ -446,6 +446,9 @@ impl SearchFiles {
 }
 
 impl Tool for SearchFiles {
+    fn planning_capability(&self) -> Option<crate::agent::planning::Capability> {
+        Some(crate::agent::planning::Capability::NativeRead)
+    }
     fn name(&self) -> &str {
         "search_files"
     }
@@ -475,10 +478,23 @@ impl Tool for SearchFiles {
         })
     }
     fn execute(&self, args: &Value) -> Result<String> {
+        let _policy_admission = crate::agent::planning::admit_direct(self, None)?;
+        let planning =
+            crate::agent::planning::current_policy().is_some_and(|policy| policy.is_planning());
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
             .context("missing `pattern`")?;
+        if planning {
+            for key in ["pattern", "path", "glob"] {
+                anyhow::ensure!(
+                    args.get(key)
+                        .and_then(Value::as_str)
+                        .is_none_or(|s| s.len() <= 4096),
+                    "planning search {key} exceeds 4096 bytes"
+                );
+            }
+        }
         let ignore_case = args
             .get("ignore_case")
             .and_then(|v| v.as_bool())
@@ -491,7 +507,12 @@ impl Tool for SearchFiles {
         let max_results = args
             .get("max_results")
             .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_MAX_RESULTS as u64) as usize;
+            .unwrap_or(DEFAULT_MAX_RESULTS as u64);
+        let max_results = if planning {
+            max_results.min(DEFAULT_MAX_RESULTS as u64)
+        } else {
+            max_results
+        } as usize;
         let ctx = args
             .get("context")
             .and_then(|v| v.as_u64())
@@ -554,6 +575,8 @@ impl Tool for SearchFiles {
         let deadline = Instant::now() + SEARCH_TIMEOUT;
         let budget_hit = AtomicBool::new(false);
         let re = &re;
+        // Walker threads have no execution TLS. Carry only the explicit owner's read authority.
+        let execution = crate::core::exec_ctx::current();
         wb.build_parallel().run(|| {
             Box::new(|dent| {
                 // Stop the whole walk once the match cap or the wall-clock budget is reached.
@@ -576,7 +599,14 @@ impl Tool for SearchFiles {
                     skipped_large.fetch_add(1, Ordering::Relaxed); // P2.3: count, then report
                     return WalkState::Continue;
                 }
-                let bytes = match std::fs::read(dent.path()) {
+                let observation = execution
+                    .as_ref()
+                    .and_then(|owner| owner.capture_task_observation(dent.path(), &self.root));
+                let bytes = match if planning {
+                    crate::core::file_placement::read_existing_regular(dent.path(), MAX_FILE_BYTES)
+                } else {
+                    std::fs::read(dent.path()).map_err(anyhow::Error::from)
+                } {
                     Ok(b) => b,
                     Err(_) => return WalkState::Continue,
                 };
@@ -611,6 +641,10 @@ impl Tool for SearchFiles {
                             return WalkState::Quit;
                         }
                         files_hit.fetch_add(1, Ordering::Relaxed);
+                        if let Some(observation) = observation {
+                            observation
+                                .record(&crate::core::persist::FileFingerprint::for_bytes(&bytes));
+                        }
                         results.lock().unwrap().push((rel, Vec::new()));
                     }
                     return WalkState::Continue;
@@ -668,6 +702,9 @@ impl Tool for SearchFiles {
                         })
                         .collect()
                 };
+                if let Some(observation) = observation {
+                    observation.record(&crate::core::persist::FileFingerprint::for_bytes(&bytes));
+                }
                 results.lock().unwrap().push((rel, rows));
                 WalkState::Continue
             })
@@ -859,6 +896,59 @@ mod tests {
         let t = SearchFiles::new(root());
         assert!(t.execute(&serde_json::json!({"pattern": "("})).is_err());
         assert!(t.execute(&serde_json::json!({})).is_err()); // missing pattern
+    }
+
+    #[test]
+    fn parallel_search_records_only_matching_native_observations_in_both_modes() {
+        use crate::agent::todo::{Requirement, Status, TaskContext, Todo};
+        use crate::core::exec_ctx::{with_current, ExecutionContext};
+
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("target.txt");
+        std::fs::write(root.join("other.txt"), b"unrelated content").unwrap();
+        for mode in ["content", "files_with_matches"] {
+            std::fs::write(&target, b"matching needle\n").unwrap();
+            let task = TaskContext::private();
+            task.replace_with_requirements(
+                vec![
+                    Todo::new("inspect matching file", Status::Done),
+                    Todo::new("inspect unrelated file", Status::Done),
+                ],
+                vec![
+                    (
+                        "@index:0".into(),
+                        Requirement::Observe {
+                            target: "target.txt".into(),
+                        },
+                    ),
+                    (
+                        "@index:1".into(),
+                        Requirement::Observe {
+                            target: "other.txt".into(),
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+            let ctx = ExecutionContext::default().with_task(task.clone());
+            let output = with_current(ctx, || {
+                SearchFiles::new(root.clone()).execute(&serde_json::json!({
+                    "pattern": "needle", "output_mode": mode,
+                }))
+            })
+            .unwrap();
+            assert!(output.contains("target.txt"), "{mode}: {output}");
+            let state = task.snapshot();
+            assert_eq!(state.items[0].status, Status::Done, "{mode}");
+            assert_eq!(state.items[1].status, Status::Pending, "{mode}");
+            assert_eq!(state.observations.len(), 1, "{mode}");
+            assert!(state.checks.is_empty(), "search must never certify a check");
+
+            std::fs::write(&target, b"changed after search\n").unwrap();
+            let _ = task.revalidate_sources();
+            assert_eq!(task.snapshot().items[0].status, Status::Pending, "{mode}");
+        }
     }
 
     fn tmp(tag: &str) -> PathBuf {

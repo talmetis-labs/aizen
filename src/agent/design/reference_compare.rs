@@ -796,6 +796,9 @@ mod tests {
     }
     #[test]
     fn owned_encoded_inputs_transfer_diagnostic_leases_through_last_clone() {
+        if crate::llm::image_send::isolated_image_budget_test() {
+            return;
+        }
         use crate::llm::image_send::{try_image_memory_lease, IMAGE_MEMORY_BUDGET};
         let _lock = crate::llm::image_send::image_test_lock();
         let png = tool_media::encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap();
@@ -863,6 +866,9 @@ mod tests {
 
     #[test]
     fn owned_encoded_inputs_keep_admission_until_failed_input_storage_drops() {
+        if crate::llm::image_send::isolated_image_budget_test() {
+            return;
+        }
         use crate::llm::image_send::{try_image_memory_lease, IMAGE_MEMORY_BUDGET};
         let _lock = crate::llm::image_send::image_test_lock();
         let budget = WorkBudget::acquire(6).unwrap();

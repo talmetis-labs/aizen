@@ -105,7 +105,7 @@ impl From<crate::core::native_journal::RecordProofStatus> for ObservedNativeStat
 
 impl InspectionObservation {
     pub(crate) fn validate(&self) -> Result<()> {
-        use super::store::{MAX_COHORT_FILES, MAX_FILE_BYTES};
+        use super::evidence::{MAX_COHORT_FILES, MAX_FILE_BYTES};
         ensure!(
             self.schema == 1
                 && self.base.len() == 32
@@ -281,7 +281,7 @@ mod tests {
             for owner in [
                 String::new(),
                 "x".repeat(1025),
-                "é".repeat(513),
+                "Ã©".repeat(513),
                 "parent\0child".into(),
                 "parent\nchild".into(),
                 "parent\u{7f}child".into(),
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn observation_file_count_accepts_boundary_and_rejects_overflow() {
-        use super::super::store::MAX_COHORT_FILES;
+        use super::super::evidence::MAX_COHORT_FILES;
         for count in [0, MAX_COHORT_FILES, MAX_COHORT_FILES + 1] {
             let mut value = fixture();
             let template = value["files"][0].clone();
@@ -333,7 +333,7 @@ mod tests {
         for key in [
             String::new(),
             "k".repeat(129),
-            "é".repeat(65),
+            "Ã©".repeat(65),
             "key\nother".into(),
             "key\0other".into(),
         ] {
@@ -385,10 +385,10 @@ mod tests {
         }
         let mut boundary = fixture();
         boundary["files"][0]["fingerprint"]["byte_len"] =
-            json!(super::super::store::MAX_FILE_BYTES);
+            json!(super::super::evidence::MAX_FILE_BYTES);
         assert!(parse_validated(boundary.clone()).is_ok());
         boundary["files"][0]["fingerprint"]["byte_len"] =
-            json!(super::super::store::MAX_FILE_BYTES + 1);
+            json!(super::super::evidence::MAX_FILE_BYTES + 1);
         assert!(parse_validated(boundary).is_err());
     }
 

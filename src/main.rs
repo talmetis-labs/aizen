@@ -8,13 +8,16 @@
 // Domains that own a folder: the agent loop, personas, optional Memory providers, benches.
 mod agent;
 mod agents; // delegatable specialist sub-agent library (agency-agents format)
+mod assistants;
 mod bench;
 mod persona;
 mod plugin;
+mod remote;
+mod remote_slash;
 // Grouped by role (the src/ reorg — see each folder's mod.rs for what it holds):
 mod channels; // notify + shared channel glue
 mod core; // types · config · cli_config · approval · net_guard
-mod features; // crawl · timemachine · cron · commands
+mod features; // crawl · coop · cron · commands
 mod hostbot; // generic Telegram/Discord daemon
 mod llm; // the OpenAI-compatible chat client
 mod sandbox; // OS-level sandbox under approval/cmd_guard: policy · runner · per-platform backends
@@ -153,7 +156,27 @@ async fn main() -> Result<()> {
     // Without it, a git.exe that fails loader-init (0xc0000142) blocks behind a dialog the agent
     // can neither see nor dismiss; with it the child just returns a status we handle. Idempotent.
     suppress_hard_error_dialogs();
-    let cli = Cli::parse();
+    let mut cli = Cli::try_parse().unwrap_or_else(|error| {
+        crate::core::provider_key::handle_parse_error(error, std::env::args_os().skip(1))
+    });
+    // Reject task-file input before migrations/configuration; keep stdin for approvals/steering.
+    if let Some(Commands::Agent(args)) = &mut cli.command {
+        crate::cli::run_cmds::prepare_agent_task(args)?;
+    }
+    // Secret-bearing machine writes must bypass migrations, generic config reads and UI output.
+    if let Some(Commands::Config {
+        cmd:
+            Some(ConfigCmd::Provider {
+                cmd:
+                    ProviderConfigCmd::Key {
+                        stdin,
+                        output_format,
+                    },
+            }),
+    }) = &cli.command
+    {
+        crate::core::provider_key::run(*stdin, output_format.as_deref());
+    }
     // Offline Apps status must not run store migrations or resolve project configuration.
     if let Some(Commands::Apps {
         cmd: Some(AppsCmd::Status { name, json }),
@@ -190,6 +213,20 @@ async fn main() -> Result<()> {
         };
         return run_memory(cmd).await;
     }
+    // Agent ingress restores durable execution control before any effectful migration or setup.
+    // Its own scoped startup decides which automation is permitted.
+    if matches!(cli.command.as_ref(), Some(Commands::Agent(_))) {
+        let Some(Commands::Agent(args)) = cli.command else {
+            unreachable!()
+        };
+        return run_agent_cmd(args).await;
+    }
+    if let Some(Commands::Assistant { cmd }) = cli.command {
+        return assistants::manage(cmd);
+    }
+    if let Some(Commands::Remote { cmd }) = cli.command {
+        return remote::run(cmd).await;
+    }
     // Persona-owned migration remains separate; persistent Memory is never migrated at startup.
     run_id_migration_once();
     let command = match cli.command {
@@ -198,6 +235,9 @@ async fn main() -> Result<()> {
         None => return run_menu().await,
     };
     match command {
+        Commands::Assistant { .. } | Commands::Remote { .. } => {
+            unreachable!("handled before startup")
+        }
         Commands::Chat(args) => run_chat(args).await,
         Commands::Compact(args) => crate::cli::compact::run(args).await,
         Commands::Agent(args) => run_agent_cmd(args).await,
@@ -392,6 +432,16 @@ pub(crate) fn ui_theme() -> ColorfulTheme {
 /// continuous chat queue + Esc-to-cancel) on a real terminal, or the plain line-REPL fallback
 /// (non-TTY-forced, or `AIZEN_NO_STICKY=1`). Needs a TTY; piped/CI prints a hint.
 async fn run_menu() -> Result<()> {
+    // Keep large interactive loops out of every surrounding context/main future frame.
+    crate::agent::todo::with_context(
+        crate::agent::todo::TaskContext::default(),
+        Box::pin(run_menu_inner()),
+    )
+    .await
+}
+
+// The owner scope includes slash commands and exit flushing, not just model execution.
+async fn run_menu_inner() -> Result<()> {
     use std::io::IsTerminal;
     let forced = cli_config::branded_flag("MENU");
     if !forced && !std::io::stdin().is_terminal() {
@@ -412,11 +462,20 @@ async fn run_menu() -> Result<()> {
         prompt_mcp_trust(n);
     }
     let sticky = std::io::stdout().is_terminal() && !cli_config::branded_flag("NO_STICKY");
-    if sticky {
-        run_menu_sticky().await
-    } else {
-        run_menu_plain().await
-    }
+    // The owning REPL future pins placement before prompt, registry, retrieval, slash commands and
+    // post-turn work. This is session-owned, never a process root or a cwd change. Keep policy out
+    // of this lifetime snapshot: every turn freezes the conversation's then-current permission.
+    let session = agent::pin_placement_context(&agent::AgentConfig::default())?;
+    let workspace = crate::repl::workspace::SessionWorkspace::new(&session.exec_ctx)?;
+    tui::set_input_workspace(session.effective_root());
+    crate::repl::workspace::in_session(workspace, session.exec_ctx, async {
+        if sticky {
+            Box::pin(run_menu_sticky()).await
+        } else {
+            Box::pin(run_menu_plain()).await
+        }
+    })
+    .await
 }
 
 /// The HUD line, per the mockup: `model  ·  ~<used>/<max> tok  ·  <n> turns  ·  <mode>` with an
@@ -721,7 +780,7 @@ async fn run_menu_sticky() -> Result<()> {
     // pinned effort) next to the model name.
     refresh_effort_hud();
     if !tui::activate(&intro, &status_text(&history, &model_label)) {
-        return run_menu_plain().await;
+        return Box::pin(run_menu_plain()).await;
     }
     tui::set_ultimate(cli_config::ultimate_enabled()); // open the input box in the right colour (gold if ultimate)
     install_exit_flush_handler(); // flush the live chat if the terminal window is closed (Windows ✕)
@@ -795,6 +854,10 @@ async fn run_menu_sticky() -> Result<()> {
         // Only injected/clarify text needs path lifting here. Keyboard submissions already
         // validated before clearing the draft; parsing cleaned prose twice can select new paths.
         let prepared_images = matches!(&sub, tui::Submission::PreparedChat(..));
+        let raw_human = match &sub {
+            tui::Submission::PreparedChat(_, _, raw) => Some(raw.clone()),
+            _ => None,
+        };
         match sub {
             tui::Submission::Quit => {
                 drain_learning_before_exit().await;
@@ -845,8 +908,22 @@ async fn run_menu_sticky() -> Result<()> {
                     }
                 }
             }
-            tui::Submission::Chat(line, images) | tui::Submission::PreparedChat(line, images) => {
+            tui::Submission::Chat(line, images)
+            | tui::Submission::PreparedChat(line, images, _) => {
                 let mut line = line.trim().to_string();
+                // Only the original keyboard text may narrow permission, never cleaned attachment
+                // prose, custom-command expansions, clarify responses or steering leftovers.
+                if let Some(raw) = raw_human.as_deref() {
+                    if let Err(error) = crate::repl::planning::narrow_from_human(
+                        raw,
+                        &mut history,
+                        &model_label,
+                        &design,
+                    ) {
+                        tui::emit_line(&format!("planning entry refused: {error:#}"));
+                        continue;
+                    }
+                }
                 let mut images = images;
                 if !prepared_images {
                     if let Err(error) = lift_image_attachments(&mut line, &mut images) {
@@ -960,11 +1037,10 @@ async fn run_menu_sticky() -> Result<()> {
                 };
                 let eff = resolve_turn_effort(effort_src);
                 cli_config::set_effort_override(eff.clone());
-                // The turn's shape widens the conversation's, which picks the deferred tool set
-                // the registry below is built with (see `core::turn_shape`).
-                let shape = crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(
-                    effort_src,
-                ));
+                // Keep architect routing per request; only the deferred tool surface widens
+                // across the conversation (see `core::turn_shape`).
+                let request_shape = crate::core::turn_shape::classify(effort_src);
+                crate::core::turn_shape::note_turn(request_shape);
                 design.begin_turn(format!("turn:{}", history.len()), design_workspace());
                 let mut resolved = ResolvedTurn::new(&ep, eff.clone(), eff.clone(), design.clone());
                 let routed =
@@ -1000,7 +1076,7 @@ async fn run_menu_sticky() -> Result<()> {
                 crate::repl::turn::architect_phase(
                     &http,
                     &mut resolved,
-                    shape,
+                    request_shape,
                     &line,
                     effort_src,
                     turn_cancel.clone(),
@@ -1064,6 +1140,12 @@ async fn run_menu_sticky() -> Result<()> {
                 // clean user text.
                 let mut cfg = turn_agent_config(turn_cancel.clone(), &ep.model, true);
                 resolved.configure(&mut cfg, true);
+                let local_learning =
+                    crate::repl::postturn::LocalLearningContext::capture_in_context(
+                        &cfg.effective_root(),
+                        persona::active(),
+                        &cfg.exec_ctx,
+                    );
                 resolved.refresh_prompt(&mut history, &mut effective_model);
                 seat_user_message(&line, images, &mut history, &ep.model, &design, &cfg).await?;
                 resolved.seat_reference_markers(&mut history);
@@ -1094,8 +1176,12 @@ async fn run_menu_sticky() -> Result<()> {
                 );
                 // Tell the other windows this one is busy, and — unless the user pinned a task with
                 // `/team task` — describe what with the prompt that started the turn.
-                coop::suggest_task(&line);
-                coop::set_state(coop::SessionState::Working);
+                if let Ok(admitted) = crate::agent::hooks::admit_automation(&cfg.exec_ctx) {
+                    crate::core::exec_ctx::with_current(admitted, || {
+                        coop::suggest_task(&line);
+                        coop::set_state(coop::SessionState::Working);
+                    });
+                }
 
                 // Run the turn racing a cancel signal; on cancel the future is DROPPED at its current
                 // await (model stream / tool batch / verify gate), which aborts the in-flight request.
@@ -1141,15 +1227,23 @@ async fn run_menu_sticky() -> Result<()> {
                 // can start writing. Every branch below (ok / clarify / interrupt / error) flows
                 // through here, which is exactly the coverage the ledger needs: a cancelled turn that
                 // already wrote three files must still be reviewable by the coordinator.
-                for warning in coop::seal_turn() {
-                    tui::emit_line(&style(warning).color256(theme::WARN).to_string());
+                if let Ok(admitted) = crate::agent::hooks::admit_automation(&cfg.exec_ctx) {
+                    crate::core::exec_ctx::with_current(admitted, || {
+                        for warning in coop::seal_turn() {
+                            tui::emit_line(&style(warning).color256(theme::WARN).to_string());
+                        }
+                    });
                 }
                 // `_` bindings only, so this reads the result without moving it out of the match below.
-                coop::set_state(if matches!(result, Some(Err(_))) {
-                    coop::SessionState::Failed
-                } else {
-                    coop::SessionState::Idle
-                });
+                if let Ok(admitted) = crate::agent::hooks::admit_automation(&cfg.exec_ctx) {
+                    crate::core::exec_ctx::with_current(admitted, || {
+                        coop::set_state(if matches!(result, Some(Err(_))) {
+                            coop::SessionState::Failed
+                        } else {
+                            coop::SessionState::Idle
+                        });
+                    });
+                }
                 // Disarm the per-turn effort override the moment the turn ends — every branch below
                 // (ok / clarify / interrupt / error) flows through here, so effort never leaks into
                 // the next turn regardless of how this one finished.
@@ -1157,6 +1251,7 @@ async fn run_menu_sticky() -> Result<()> {
 
                 match result {
                     None => {
+                        crate::agent::todo::end_turn(true);
                         tui::emit_line(&theme::muted("⏹ stopped.").to_string());
                         history.push(Message::assistant("(interrupted by user)".to_string()));
                         // Esc means "stop" — also clear any queued submissions (type-ahead backlog or
@@ -1220,7 +1315,11 @@ async fn run_menu_sticky() -> Result<()> {
                                         "{}{seed}",
                                         crate::agent::compact::HANDOFF_MARKER_PREFIX
                                     )));
+                                    // Refresh re-seats the same work; unlike /clear it must not
+                                    // discard the interrupted plan while resetting other runtime state.
+                                    let task_state = crate::agent::todo::durable_snapshot();
                                     reset_per_session_state();
+                                    crate::agent::todo::restore_in_memory(task_state)?;
                                     set_session_slug(None);
                                     update_live_history_with_design(
                                         &history,
@@ -1231,6 +1330,8 @@ async fn run_menu_sticky() -> Result<()> {
                                     let mut cfg2 =
                                         turn_agent_config(turn_cancel.clone(), &ep.model, true);
                                     resolved.configure(&mut cfg2, true);
+                                    // Same live request: compaction/refresh cannot reset advice limits.
+                                    cfg2.workflow_advice = cfg.workflow_advice.clone();
                                     cfg2.exec_ctx = cfg2
                                         .exec_ctx
                                         .with_recovery(cfg.exec_ctx.recovery().clone());
@@ -1258,6 +1359,7 @@ async fn run_menu_sticky() -> Result<()> {
                                             finish_turn(
                                                 &outcome2,
                                                 persona_before,
+                                                local_learning,
                                                 &mut history,
                                                 &http,
                                                 ep,
@@ -1314,6 +1416,7 @@ async fn run_menu_sticky() -> Result<()> {
                             finish_turn(
                                 &outcome,
                                 persona_before,
+                                local_learning,
                                 &mut history,
                                 &http,
                                 ep,
@@ -1361,7 +1464,10 @@ async fn run_menu_sticky() -> Result<()> {
     crate::core::recovery::clear();
     // Unlike recovery, the coop manifest SURVIVES a clean exit: it is marked `finished` and kept so
     // the coordinator window can still review and commit this session's work after it is closed.
-    coop::clear();
+    let exit_context = crate::agent::hooks::automation_context(None);
+    if let Ok(admitted) = crate::agent::hooks::admit_automation(&exit_context) {
+        crate::core::exec_ctx::with_current(admitted, coop::clear);
+    }
     crate::agent::process::kill_all(); // reap any background dev servers/watchers we started
     println!("{}", style("bye.").dim());
     Ok(())
@@ -1400,7 +1506,11 @@ async fn run_menu_plain() -> Result<()> {
     loop {
         icons::set_tier(cli_config::load().icons.as_deref()); // refresh after a possible /config change
         print_status_line(&history, &model_label);
-        let (line, images) = match read_input_box(&input_history)? {
+        let crate::ui::plain_input::SubmittedInput {
+            text: line,
+            images,
+            raw_human,
+        } = match read_input_box(&input_history)? {
             Some(l) => l,
             None => {
                 drain_learning_before_exit().await;
@@ -1410,6 +1520,15 @@ async fn run_menu_plain() -> Result<()> {
         // The input box validates clipboard/path attachments before consuming the draft.
         let mut line = line.trim().to_string();
         if line.is_empty() && images.is_empty() {
+            continue;
+        }
+        if let Err(error) = crate::repl::planning::narrow_from_human(
+            &raw_human,
+            &mut history,
+            &model_label,
+            &design,
+        ) {
+            tui::emit_line(&format!("planning entry refused: {error:#}"));
             continue;
         }
         // Record for ↑/↓ recall (skip consecutive duplicates; text only — images aren't recallable).
@@ -1513,8 +1632,8 @@ async fn run_menu_plain() -> Result<()> {
         };
         let eff = resolve_turn_effort(effort_src);
         cli_config::set_effort_override(eff.clone());
-        let shape =
-            crate::core::turn_shape::note_turn(crate::core::turn_shape::classify(effort_src));
+        let request_shape = crate::core::turn_shape::classify(effort_src);
+        crate::core::turn_shape::note_turn(request_shape);
         design.begin_turn(format!("turn:{}", history.len()), design_workspace());
         let mut resolved = ResolvedTurn::new(&ep, eff.clone(), eff.clone(), design.clone());
         let routed = (resolved.endpoint.model != model).then_some(resolved.endpoint.model.as_str());
@@ -1546,7 +1665,7 @@ async fn run_menu_plain() -> Result<()> {
         crate::repl::turn::architect_phase(
             &http,
             &mut resolved,
-            shape,
+            request_shape,
             &line,
             effort_src,
             turn_cancel.clone(),
@@ -1593,6 +1712,11 @@ async fn run_menu_plain() -> Result<()> {
         // history / display.
         let mut cfg = turn_agent_config(turn_cancel, &ep.model, false);
         resolved.configure(&mut cfg, true);
+        let local_learning = crate::repl::postturn::LocalLearningContext::capture_in_context(
+            &cfg.effective_root(),
+            persona::active(),
+            &cfg.exec_ctx,
+        );
         resolved.refresh_prompt(&mut history, &mut effective_model);
         seat_user_message(&line, images, &mut history, &ep.model, &design, &cfg).await?;
         resolved.seat_reference_markers(&mut history);
@@ -1615,6 +1739,7 @@ async fn run_menu_plain() -> Result<()> {
                 finish_turn(
                     &outcome,
                     persona_before,
+                    local_learning,
                     &mut history,
                     &http,
                     ep,
@@ -1665,6 +1790,9 @@ pub(crate) fn approval_mode() -> ApprovalMode {
 ///
 /// Always refreshes request timeout + edit-feedback from config.
 fn arm_lsp_session() {
+    if crate::agent::planning::check_automation_boundary().is_err() {
+        return;
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     static ARMED: AtomicBool = AtomicBool::new(false);
     crate::agent::lsp::LSP.set_request_timeout(AgentConfig::default().lsp_request_timeout_secs);
@@ -1686,17 +1814,23 @@ fn warm_up_after_first_frame() {
     if std::env::var_os("AIZEN_NO_WARMUP").is_some() {
         return;
     }
+    let ctx = crate::agent::hooks::automation_context(None);
+    let Ok(admitted) = crate::agent::hooks::admit_automation(&ctx) else {
+        return;
+    };
     let _ = std::thread::Builder::new()
         .name("aizen-warmup".into())
-        .spawn(|| {
-            arm_lsp_session();
-            let root = crate::core::config::project_root();
-            for file in crate::agent::lsp::discovery::probe_files(&root) {
-                let _ = crate::agent::lsp::LSP.document_symbols(&file);
-            }
-            if crate::agent::codebase::load().is_some() {
-                let _ = crate::agent::codebase::build_index(true, None, &|_| {});
-            }
+        .spawn(move || {
+            crate::core::exec_ctx::with_current(admitted, || {
+                arm_lsp_session();
+                let root = crate::core::config::project_root();
+                for file in crate::agent::lsp::discovery::probe_files(&root) {
+                    let _ = crate::agent::lsp::LSP.document_symbols(&file);
+                }
+                if crate::agent::codebase::load().is_some() {
+                    let _ = crate::agent::codebase::build_index(true, None, &|_| {});
+                }
+            })
         });
 }
 

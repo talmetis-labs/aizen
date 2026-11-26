@@ -40,8 +40,9 @@ fn sniff_mime(b: &[u8]) -> Option<&'static str> {
 /// Read an image FILE → a data URL (cross-platform). Mime sniffed from magic bytes; non-image or
 /// oversize files are rejected.
 pub fn image_file_to_data_url(path: &str) -> Result<String> {
+    let source = selected_image_path(path);
     crate::core::tool_media::ToolImage::from_file(
-        std::path::Path::new(path),
+        &source,
         crate::core::tool_media::ImageProvenance::new("user_file", Some(path.to_owned())),
     )
     .map(|image| image.data_url())
@@ -73,7 +74,7 @@ fn extract_with_existing_sizes(
     let mut source_sizes = existing_sizes.clone();
     for (token, selected) in &tokens {
         if *selected {
-            let size = std::fs::metadata(token)
+            let size = std::fs::metadata(selected_image_path(token))
                 .context("cannot inspect selected image; no message was sent")?
                 .len();
             source_sizes.push(usize::try_from(size).context("selected image size overflow")?);
@@ -142,6 +143,20 @@ pub(crate) fn contains_image_path(line: &str) -> bool {
         .any(|token| has_image_ext(token))
 }
 
+fn selected_image_path(path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        return path;
+    }
+    let root = crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        })
+        .or_else(crate::ui::tui::input_workspace);
+    root.map(|root| root.join(&path)).unwrap_or(path)
+}
+
 /// True when `path` ends in an image extension AND is an existing file.
 fn has_image_ext(path: &str) -> bool {
     let ext_ok = std::path::Path::new(path)
@@ -149,7 +164,7 @@ fn has_image_ext(path: &str) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false);
-    ext_ok && std::path::Path::new(path).is_file()
+    ext_ok && selected_image_path(path).is_file()
 }
 
 /// Whitespace-split, keeping double-quoted spans together and stripping the quotes (drag-drop
@@ -268,6 +283,33 @@ mod tests {
         let bytes = crate::core::tool_media::encode_rgba_png(&[255, 0, 0, 255], 1, 1).unwrap();
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    #[test]
+    fn relative_image_selection_uses_immutable_bound_workspace() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("selected");
+        std::fs::create_dir(&root).unwrap();
+        let pixels = crate::core::tool_media::encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap();
+        std::fs::write(root.join("bound-image.png"), pixels).unwrap();
+        let placement = crate::core::file_placement::PlacementContext::new(
+            root.clone(),
+            fixture.path().join("home"),
+        )
+        .unwrap();
+        crate::core::exec_ctx::with_current(
+            crate::core::exec_ctx::ExecutionContext::default().with_placement(placement),
+            || {
+                assert!(contains_image_path("inspect bound-image.png"));
+                let (text, selected) =
+                    extract_image_attachments("inspect bound-image.png").unwrap();
+                assert_eq!(text, "inspect");
+                assert_eq!(selected.len(), 1);
+                std::fs::remove_file(root.join("bound-image.png")).unwrap();
+                std::fs::remove_dir(&root).unwrap();
+                assert!(image_file_to_data_url("bound-image.png").is_err());
+            },
+        );
     }
 
     #[test]

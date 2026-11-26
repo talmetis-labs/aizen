@@ -60,9 +60,9 @@ pub const CATALOG: &[ToolsetInfo] = &[
         blurb: "ask one question and yield the turn",
     },
     ToolsetInfo {
-        id: "checkpoint",
-        label: "checkpoint",
-        blurb: "git time-machine restore points",
+        id: "recovery",
+        label: "recovery",
+        blurb: "exact native edit undo and approved Git history changes",
     },
     ToolsetInfo {
         id: "messaging",
@@ -102,7 +102,11 @@ pub fn classify_tool(name: &str) -> Option<&'static str> {
 }
 
 fn list_match(hay: &str, list: &[String]) -> bool {
-    list.iter().any(|t| t.eq_ignore_ascii_case(hay))
+    list.iter().any(|t| {
+        t.eq_ignore_ascii_case(hay)
+            // Preserve an existing user's recovery restriction after the bundle rename.
+            || (hay == "recovery" && t.eq_ignore_ascii_case("checkpoint"))
+    })
 }
 
 /// Is bundle `id` allowed under `cfg`? Empty `enabled_toolsets` ⇒ no whitelist; empty
@@ -236,6 +240,30 @@ pub fn format_config_status() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_bundle_preserves_legacy_restrictions_without_registering_old_tools() {
+        assert_eq!(classify_tool("native_owner_undo"), Some("recovery"));
+        assert_eq!(classify_tool("git_inspect"), Some("lsp"));
+        assert_eq!(classify_tool("checkpoint"), None);
+        assert_eq!(classify_tool("checkpoint_view"), None);
+        for id in ["recovery", "checkpoint"] {
+            assert!(!toolset_allowed(
+                "recovery",
+                &CliConfig {
+                    disabled_toolsets: Some(vec![id.into()]),
+                    ..Default::default()
+                }
+            ));
+            assert!(toolset_allowed(
+                "recovery",
+                &CliConfig {
+                    enabled_toolsets: Some(vec![id.into()]),
+                    ..Default::default()
+                }
+            ));
+        }
+    }
 
     struct DeferredStub(&'static str);
 

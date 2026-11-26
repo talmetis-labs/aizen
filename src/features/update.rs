@@ -478,24 +478,23 @@ pub fn cached_notice() -> Option<String> {
         .then(|| format!("⬆ aizen {} is available — run /update", cache.latest_tag))
 }
 
-pub fn spawn_background_check() {
+/// Awaited by the startup owner so admission outlives transport and cache writes.
+pub(crate) async fn background_check() {
     if !crate::core::cli_config::update_check_enabled(&crate::core::cli_config::load()) {
         return;
     }
     if !should_check(read_cache().map(|c| c.checked_unix), now_unix()) {
         return;
     }
-    tokio::spawn(async {
-        if let Ok(releases) = list_releases(10).await {
-            if let Some(latest) = releases
-                .iter()
-                .filter(|r| !r.prerelease)
-                .max_by(|a, b| parse_version(&a.tag).cmp(&parse_version(&b.tag)))
-            {
-                let _ = write_cache(&latest.tag);
-            }
+    if let Ok(releases) = list_releases(10).await {
+        if let Some(latest) = releases
+            .iter()
+            .filter(|r| !r.prerelease)
+            .max_by(|a, b| parse_version(&a.tag).cmp(&parse_version(&b.tag)))
+        {
+            let _ = write_cache(&latest.tag);
         }
-    });
+    }
 }
 
 /// Human-readable asset size. `0` means GitHub did not report one.

@@ -103,19 +103,6 @@ impl NativeWriteScope {
         Ok(())
     }
 
-    /// Compare sealed authority only. Overlay IO must not inspect the mutable live tree.
-    pub(crate) fn check_narrowing_frozen(&self, child: &Self) -> Result<()> {
-        for resource in &child.resources {
-            if !self.resources.iter().any(|r| r.key() == resource.key()) {
-                bail!("native child read widens its sealed authority");
-            }
-        }
-        if child.writes.iter().any(|key| !self.writes.contains(key)) {
-            bail!("native child write widens its sealed authority");
-        }
-        Ok(())
-    }
-
     pub(crate) fn resources(&self) -> &[NativeResource] {
         &self.resources
     }

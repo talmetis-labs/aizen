@@ -38,12 +38,10 @@ def main():
             return result
 
         empty = json.loads(run("--json").stdout)
-        assert empty["schema_version"] == 1
-        assert empty["configuration_scope"] == "home"
-        assert empty["connectors"] == [] and empty["jobs"] == []
-        assert empty["creative_dispatch_enabled"] is False
-        assert empty["live_probe_performed"] is False
-        assert empty["live_app_state"] == "unknown"
+        assert empty == {
+            "schema_version": 2, "configuration_scope": "home", "project_overrides_checked": False,
+            "live_probe_performed": False, "live_app_state": "unknown", "connectors": [],
+        }
         assert not home.exists(), "status initialized absent HOME"
 
         home.mkdir()
@@ -59,8 +57,6 @@ def main():
         rows = json.loads(run("--json").stdout)
         assert len(rows["connectors"]) == 2
         assert rows["project_overrides_checked"] is False
-        assert rows["job_control_authority"] is False
-        assert rows["job_state_observation"] == "last_recorded_not_live"
         assert json.loads(run("fixture", "--json").stdout)["connectors"][0]["key"] == "fixture"
         assert "offline" in run().stdout
         run("missing", "--json", ok=False)
@@ -69,43 +65,22 @@ def main():
         run("--json", ok=False)
         config.write_bytes(b" " * (1024 * 1024 + 1))
         run("--json", ok=False)
-        config.write_text("{}", encoding="utf-8")
-
-        config.write_text(json.dumps({"mcpServers":{"fixture":{"command":"never-execute"}}}), encoding="utf-8")
+        config.write_text(json.dumps({"mcpServers": {"fixture": {"command": "never-execute"}}}), encoding="utf-8")
         journal = home / "app-jobs"
         journal.mkdir()
-        (journal / "operations.lock").write_bytes(b"")
-        run("--json", ok=False)  # initialization marker without journal is not an empty history
-        (journal / "operations.json").write_text(json.dumps({"version": 1, "records": [{
-            "version": 1, "operation_id": "a" * 64, "request_digest": "b" * 64,
-            "target": {"adapter_id": "fixture", "adapter_version": "1.0", "app": "blender",
-                       "app_version": "4.2", "instance_epoch": "fixture-epoch",
-                       "project_root": str(project.resolve()), "document_id": "Private scene",
-                       "revision": "fixture-revision", "schema_digest": "c" * 64},
-            "canonical_project_root": str(project.resolve()), "owner_scope": "fixture_scope",
-            "execution": "unknown", "effects": "unknown", "sequence": 2,
-        }]}), encoding="utf-8")
-        recorded = json.loads(run("fixture", "--json").stdout)
-        assert recorded["jobs"] == [{"operation_id": "a" * 64, "execution": "unknown",
-                                      "effects": "unknown", "sequence": 2}]
-        assert recorded["job_scope"] == "all_home_operations"
-        assert "Private scene" not in json.dumps(recorded)
-        assert "fixture_scope" not in json.dumps(recorded)
-        (journal / "operations.json").write_text("{broken", encoding="utf-8")
-        run("--json", ok=False)
-        (journal / "operations.json").write_text('{"version":"fixture-secret","records":[]}', encoding="utf-8")
-        run("--json", ok=False)
-        (journal / "operations.json").write_bytes(b" " * (1024 * 1024 + 1))
-        run("--json", ok=False)
+        (journal / "operations.json").write_text("{broken-fixture-secret", encoding="utf-8")
+        assert json.loads(run("--json").stdout) == {
+            **empty,
+            "connectors": [{"key": "fixture", "enabled": True, "transport": "stdio"}],
+        }
 
     print(json.dumps({
         "ok": True,
-        "scope": "actual CLI; isolated synthetic configuration/journal only, no live adapters",
+        "scope": "actual CLI with isolated MCP configuration",
         "checked": ["absent_home_no_writes", "redacted_json", "unknown_live_state",
                     "home_only", "key_filter", "text_output", "missing_key_failure",
                     "malformed_config_no_secret_echo", "bounded_config_read",
-                    "root_free_recorded_job_projection", "journal_error_no_secret_echo",
-                    "missing_corrupt_oversize_journal_fail_closed"],
+                    "legacy_journal_ignored"],
     }, indent=2))
 
 

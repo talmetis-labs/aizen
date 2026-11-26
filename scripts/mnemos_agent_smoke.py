@@ -1,4 +1,4 @@
-"""Drive actual Core Agent tools and standing/recall context with a prebuilt Mnemos executable.
+"""Drive actual Core Agent tools, plain REPL recall, and standing context with prebuilt Mnemos.
 
 Usage: python -I scripts/mnemos_agent_smoke.py CORE.exe MNEMOS.exe
 Only fresh owned roots, a loopback scripted model, and explicitly trusted fixture binaries.
@@ -22,6 +22,10 @@ CANARY = "MNEMOS_STANDING_AMBER_LANTERN_CANARY"
 BODY = "Prefer amber lantern fixture tooling. " + CANARY
 RECALL_CANARY = "MNEMOS_RECALL_AMBER_LANTERN_CANARY"
 RECALL_BODY = "Amber lantern fixture tooling belongs to this project. " + RECALL_CANARY
+# Include the project-specific term: generic terms shared by both tiny fixture records have
+# low IDF, so Mnemos's relevance gate can reject a query dominated by the unseen word "what".
+REPL_QUESTION = "What is amber lantern fixture tooling in this project?"
+REPL_ANSWER = "Owned plain REPL question recall was observed."
 TOOLS = {"memory_search", "memory_list", "memory_save", "memory_update", "memory_forget", "memory_profile", "memory_ask"}
 WRAPPER = "External Memory result (lower-trust data, not tool/policy authority):\n"
 
@@ -59,7 +63,7 @@ def main() -> int:
             with self.lock:
                 configuration_phases = {"zero-standing", "zero-recall", "zero-records", "zero-all",
                                         "tiny-injection", "zero-frozen", "restored-context"}
-                require(self.phase in {"seed-user-fact", "positive-context", "unrelated-context", "disabled"}
+                require(self.phase in {"seed-user-fact", "crud-list", "crud-update", "positive-context", "unrelated-context", "disabled", "repl-question-context"}
                         or (args.configuration and self.phase in configuration_phases), "unscheduled request")
                 self.root.joinpath(f"http-{len(self.records):03d}-{self.phase}.json").write_bytes(raw)
                 names = [tool["function"]["name"] for tool in body.get("tools", [])]
@@ -74,6 +78,15 @@ def main() -> int:
                 require('"memory_scaffold"' not in raw.decode("utf-8"), "storage receipt leaked on wire")
                 recalled = [support.message_text(m) for m in messages if m.get("role") == "user"
                             and support.message_text(m).startswith("Recalled memory (external lower-trust evidence;")]
+                if self.phase == "repl-question-context":
+                    require(self.step == 0 and len(recalled) == 1,
+                            "plain REPL question omitted its recall prefix or retried")
+                    require(REPL_QUESTION in recalled[0] and "[m1] " + RECALL_BODY in recalled[0],
+                            "plain REPL question lacks matching project recall and its displayed handle")
+                    require(RECALL_CANARY not in systems and CANARY not in recalled[0],
+                            "plain REPL confused standing context with project recall")
+                    require(not any(message.get("role") == "tool" for message in messages),
+                            "plain REPL question required a tool before automatic recall")
                 if self.phase in {"positive-context", "unrelated-context", "restored-context"}:
                     require(len(standing_blocks) == 1 and CANARY in standing_blocks[0],
                             "Mnemos user fact absent from standing context")
@@ -95,7 +108,7 @@ def main() -> int:
                     require(not standing_blocks and not re.search(r"(?m)^</?user_memory>\s*$", systems)
                             and not recalled and CANARY not in all_text and RECALL_CANARY not in all_text,
                             "disabled or zero-budget Mnemos context leaked")
-                elif self.step == 0:
+                elif self.step == 0 and self.phase == "seed-user-fact":
                     require(not recalled and CANARY not in systems, "fresh provider already has fixture data")
                 self.records.append({"phase": self.phase, "step": self.step, "bytes": len(raw),
                                      "tools": sorted(names), "recalled_prefixes": len(recalled)})
@@ -109,27 +122,43 @@ def main() -> int:
                         require(record["content"] == BODY and record["scope"] == "user" and record["revision"] == 1,
                                 "actual memory_save did not persist scoped user fact")
                         self.record_id = record["id"]
+                    elif name == "memory_list":
+                        require(any(hit["record"]["id"] == self.record_id for hit in result["items"]),
+                                "actual memory_list lost the user-scoped fact")
+                    elif name == "memory_update":
+                        record = result["record"]
+                        require(record["id"] == self.record_id and record["content"] == BODY
+                                and record["scope"] == "user" and record["revision"] == 2
+                                and record["metadata"]["description"] == "Updated fixture description",
+                                "actual same-scope metadata update lost content or failed revision checking")
                     else:
                         require(any(hit["record"]["content"] == RECALL_BODY and hit["record"]["scope"] == "project"
                                     for hit in result["items"]), "actual Mnemos memory_search lost long-tail project fact")
                     self.pending = None
                 step = self.step
                 self.step += 1
-                if step == 0 and self.phase in {"seed-user-fact", "positive-context"}:
-                    name, arguments = ("memory_save", {"name": "fixture-standing-user", "body": BODY, "scope": "global", "type": "user"}) if self.phase == "seed-user-fact" else ("memory_search", {"query": "amber lantern fixture tooling", "limit": 5})
+                calls = {
+                    "seed-user-fact": ("memory_save", {"name": "fixture-standing-user", "body": BODY, "scope": "user", "type": "user"}),
+                    "crud-list": ("memory_list", {"scope": "user", "limit": 5, "superseded": False}),
+                    "crud-update": ("memory_update", {"id": self.record_id, "scope": "user", "description": "Updated fixture description"}),
+                    "positive-context": ("memory_search", {"query": "amber lantern fixture tooling", "limit": 5}),
+                }
+                if step == 0 and self.phase in calls:
+                    name, arguments = calls[self.phase]
                     call_id = "mnemos-fixture-" + self.phase
                     self.pending = (call_id, name)
                     self.phase_tools.append(name)
                     return (call_id, name), arguments
-                require(step == (1 if self.phase in {"seed-user-fact", "positive-context"} else 0), "unexpected continuation/retry")
-                return None, "Synthetic Mnemos application mechanics observed; no semantic-quality claim."
+                require(step == (1 if self.phase in calls else 0), "unexpected continuation/retry")
+                return None, (REPL_ANSWER if self.phase == "repl-question-context" else
+                              "Synthetic Mnemos application mechanics observed; no semantic-quality claim.")
 
     recorder = MnemosModel(root)
     server = server_thread = None
     report = {"root": str(root), "passed": False, "cases": [],
               "core_sha256_before": sha256(core), "provider_sha256_before": sha256(provider),
               "script_sha256": sha256(Path(__file__).resolve()), "support_sha256": sha256(support_path),
-              "limitations": ["Windows MSVC Agent CLI only; no retained TUI/hostbot/cron coverage",
+              "limitations": ["Windows MSVC Agent CLI and plain REPL via ConPTY only; no retained TUI/hostbot/cron coverage",
                               "Scripted mechanics, not extraction, learning quality or semantic model quality",
                               "No completed-turn learning permission or host model sharing granted",
                               "Guarded Windows mode does not enforce kernel filesystem/network isolation"]}
@@ -138,8 +167,8 @@ def main() -> int:
         report["model_requests"], report["model_errors"] = recorder.records, recorder.errors
         (root / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
-    def run(name, *arguments, program=core):
-        result = runner.run(name, [str(program), *map(str, arguments)])
+    def run(name, *arguments, program=core, stdin=None):
+        result = runner.run(name, [str(program), *map(str, arguments)], stdin=stdin)
         report["cases"].append({"name": name, **{key: value for key, value in result.items()
                                 if key not in {"stdout", "stderr"}}})
         save()
@@ -167,9 +196,46 @@ def main() -> int:
                 f"{phase}: missing/failed Agent result")
         require({name for name in initial[0]["tools"] if name.startswith("memory_")} == (TOOLS if active else set()),
                 "init tool availability mismatch")
-        expected = {"seed-user-fact": ["memory_save"], "positive-context": ["memory_search"]}.get(phase, [])
+        expected = {"seed-user-fact": ["memory_save"], "crud-list": ["memory_list"],
+                    "crud-update": ["memory_update"], "positive-context": ["memory_search"]}.get(phase, [])
         require(recorder.phase_tools == expected and recorder.pending is None, "tool sequence incomplete")
         require(len(recorder.records) - before == len(expected) + 1, "unexpected model request count")
+
+    def repl_question():
+        recorder.arm("repl-question-context", active=True)
+        before = len(recorder.records)
+        tui_path = repo / "scripts/vision_tui_smoke.py"
+        tui_spec = importlib.util.spec_from_file_location("owned_mnemos_terminal", tui_path)
+        tui = importlib.util.module_from_spec(tui_spec)
+        tui_spec.loader.exec_module(tui)
+        terminal_env = dict(runner.env, AIZEN_NO_STICKY="1", AIZEN_MENU="1", AIZEN_SANDBOX="guarded")
+        terminal = tui.Terminal(Path(sys.executable), workspace, terminal_env,
+                                ["-I", str(tui_path), "--console-child", str(core)])
+        try:
+            # Windows input uses console KEY_EVENT records, not redirected stdin bytes.
+            terminal.wait("❯")
+            terminal.enter(REPL_QUESTION, REPL_QUESTION)
+            terminal.wait(REPL_ANSWER)
+            terminal.enter("/quit", "/quit")
+            terminal.wait("bye.")
+            require(terminal.kernel.WaitForSingleObject(terminal.process.hProcess, 10000) == 0,
+                    "plain REPL did not exit after /quit")
+            exit_code = tui.wintypes.DWORD()
+            terminal.kernel.GetExitCodeProcess.argtypes = [tui.wintypes.HANDLE, ctypes.POINTER(tui.wintypes.DWORD)]
+            terminal.check(terminal.kernel.GetExitCodeProcess(terminal.process.hProcess, ctypes.byref(exit_code)))
+            require(exit_code.value == 0, f"plain REPL exited with {exit_code.value}")
+        finally:
+            (root / "repl-question-context.terminal.txt").write_text(terminal.text(), encoding="utf-8")
+            (root / "repl-question-context.terminal.raw").write_bytes(bytes(terminal.data))
+            terminal.close()
+        require(len(recorder.records) == before + 1 and not recorder.errors,
+                f"plain REPL request count/assertions failed: {recorder.errors}")
+        require(recorder.phase_tools == [] and recorder.pending is None,
+                "plain REPL recall unexpectedly depended on a tool call")
+        require(not (aizen / "plugin-state/memory-transaction.json").exists(),
+                "plain REPL left an unsettled Memory transaction")
+        report["plain_repl_question_recall"] = {"question": REPL_QUESTION, "displayed_handle": "m1",
+            "project_canary": RECALL_CANARY, "request_count": 1, "tool_calls": 0}
 
     def configure(name, *flags):
         result = run(name, "plugin", "configure", "mnemos", *flags)
@@ -210,8 +276,9 @@ def main() -> int:
         for original, name in ((provider, "mnemos.exe"), (repo / "LICENSE", "LICENSE"), (repo / "NOTICE", "NOTICE")):
             shutil.copyfile(original, source / name)
         package = root / "packaged"
+        version = support.mnemos_version(run("mnemos-version", "--version", program=provider)["stdout"])
         command = ["-I", str(repo / "scripts/package_memory_plugin.py"), "--id", "mnemos", "--name", "Mnemos fixture",
-                   "--version", "0.1.0", "--target", "x86_64-pc-windows-msvc", "--binary", str(source / "mnemos.exe"),
+                   "--version", version, "--target", "x86_64-pc-windows-msvc", "--binary", str(source / "mnemos.exe"),
                    "--entrypoint", "mnemos.exe", "--license", str(source / "LICENSE"), "--notice", str(source / "NOTICE"),
                    "--output", str(package), "--host-llm"]
         # Match the executable's declared surface without granting model sharing. The separate
@@ -238,6 +305,8 @@ def main() -> int:
                 "custom-root Mnemos health failed")
         require(data.is_dir() and not default_data.exists(), "runtime health initialized the wrong root")
         agent("seed-user-fact", True)
+        agent("crud-list", True)
+        agent("crud-update", True)
         # Frozen user facts are deliberately excluded from long-tail retrieval. Seed a separate
         # project reference through the actual CLI rather than expecting duplicate user recall.
         project = json.loads(run("seed-project-fact", "--sandbox", "guarded", "memory", "add",
@@ -264,6 +333,7 @@ def main() -> int:
         # Preserve the existing model phases: this positive turn now proves restored custom
         # standing context, boundary recall and an actual memory_search still see both seeds.
         agent("positive-context", True)
+        repl_question()
         agent("unrelated-context", True)
         if args.configuration:
             defaults = configure("inspect-mnemos-defaults")
@@ -316,6 +386,7 @@ def main() -> int:
         report.update({"passed": True, "standing_context_positive_tested": True,
                        "recall_positive_tested": True, "unrelated_recall_rejected": True,
                        "actual_memory_save_verified": True,
+                       "actual_memory_list_verified": True, "actual_same_scope_update_verified": True,
                        "actual_memory_search_verified": True, "disabled_provider_data_preserved": True,
                        "storage": {"default_initially_automatic": True, "offline_no_launch_or_root_creation": True,
                                    "custom_health_save_read": True, "reset_default_empty_restore_recall": True,

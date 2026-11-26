@@ -9,7 +9,7 @@
 //! another. A recovery planner does not authorize expanded scope or a different worker contract.
 
 use crate::agent::builtin::{agent_registry, role_registry};
-use crate::agent::speculation::{Cohort, ExecutionMode};
+use crate::agent::speculation::ExecutionMode;
 use crate::agent::task_tool::{build_agent_subagent_prompt, build_subagent_prompt};
 use crate::agent::{run_agent_loop, AgentConfig, StopReason};
 use crate::core::types::{Message, ToolDef};
@@ -17,6 +17,8 @@ use crate::llm::client::stream_chat_with_visual_contract_frozen;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+#[path = "workflow_git.rs"]
+mod git;
 #[path = "workflow_scheduler.rs"]
 mod scheduler;
 pub(crate) use scheduler::{AttemptKey, AttemptKind, DispatchIntent, TaskId};
@@ -32,6 +34,7 @@ pub(crate) struct ResolvedWorkflowDispatch {
     declared_write_paths: Option<Vec<String>>,
     declared_read_paths: Option<Vec<String>>,
     execution: ExecutionMode,
+    isolation: WorkflowIsolation,
     system: String,
     contract: crate::agent::task_tool::TaskContract,
     expects: Option<serde_json::Value>,
@@ -62,6 +65,8 @@ pub(crate) const SCOPED_NATIVE_PARALLEL_ENABLED: bool = true;
 pub(crate) enum WorkflowDispatchMode {
     ReadOnly,
     ScopedNative(crate::core::native_scope::NativeWriteScope),
+    /// Fresh exact-native Git children under one scheduler's retained allocation owner.
+    OwnedNative,
     Opaque,
 }
 
@@ -69,6 +74,7 @@ impl WorkflowDispatchMode {
     pub(crate) fn compatible(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::ReadOnly, Self::ReadOnly) => true,
+            (Self::OwnedNative, Self::OwnedNative) => true,
             (Self::ScopedNative(a), Self::ScopedNative(b)) => !a.conflicts(b),
             // Unknown readers cannot prove independence from a writer. Exact scopes above
             // compare all read/write intersections; final native bodies still acquire their locks.
@@ -78,16 +84,18 @@ impl WorkflowDispatchMode {
 }
 
 pub(crate) fn workflow_dispatch_mode(task: &WorkflowTask) -> WorkflowDispatchMode {
+    if task.isolation == WorkflowIsolation::Worktree {
+        return if task.prepared.is_some() {
+            WorkflowDispatchMode::OwnedNative
+        } else {
+            WorkflowDispatchMode::Opaque
+        };
+    }
     let Some(dispatch) = task.prepared.as_ref() else {
         return WorkflowDispatchMode::Opaque;
     };
     if let Some(scope) = &dispatch.native_scope {
-        if (if task.overlay.is_some() {
-            scope.check_narrowing_frozen(scope)
-        } else {
-            scope.check_narrowing(scope)
-        })
-        .is_ok()
+        if scope.check_narrowing(scope).is_ok()
             && dispatch
                 .registry
                 .names()
@@ -147,6 +155,7 @@ fn workflow_task_is_writer(task: &WorkflowTask) -> bool {
 }
 
 /// A CLI spec has no ambient delegation authority; tool callers must pass their actual context.
+#[cfg(test)]
 fn prepare_workflow_spec_at_date(
     spec: &mut WorkflowSpec,
     root: &Path,
@@ -223,6 +232,18 @@ fn prepare_workflow_spec_at_date_in_context(
             relay_allowed,
         }));
     }
+    if spec
+        .tasks
+        .iter()
+        .any(|task| task.isolation == WorkflowIsolation::Worktree)
+    {
+        anyhow::ensure!(spec.tasks.iter().all(|task| task.isolation == WorkflowIsolation::Worktree),
+            "owned Git workflow currently requires every task to use worktree isolation; no shared/speculative mixing");
+        anyhow::ensure!(
+            spec.tasks.iter().all(|task| task.retry_on_fail.is_none()),
+            "owned Git workflows cannot use automatic fix loops"
+        );
+    }
     enforce_singular_writer(spec)
 }
 
@@ -263,19 +284,18 @@ fn validate_resolved_workflow_scope(
     dispatch: &ResolvedWorkflowDispatch,
     parent_ctx: &crate::core::exec_ctx::ExecutionContext,
 ) -> Result<()> {
+    task.execution.require_supported()?;
     if task.write_paths != dispatch.declared_write_paths
         || task.read_paths != dispatch.declared_read_paths
         || task.execution != dispatch.execution
+        || task.isolation != dispatch.isolation
+        || (task.git_base.is_some() && task.isolation != WorkflowIsolation::Worktree)
     {
         bail!("workflow read_paths/write_paths changed after preparation; fresh authorization required");
     }
     match (&dispatch.native_scope, parent_ctx.native_scope()) {
         (Some(scope), parent) => {
-            if task.overlay.is_some() {
-                scope.check_narrowing_frozen(scope)?;
-            } else {
-                scope.check_narrowing(scope)?;
-            }
+            scope.check_narrowing(scope)?;
             if let Some(parent) = parent {
                 parent.check_narrowing(scope)?;
             }
@@ -283,46 +303,9 @@ fn validate_resolved_workflow_scope(
         (None, Some(_)) => bail!("prepared workflow cannot acquire an ambient scope on retry"),
         (None, None) => {}
     }
-    if task.execution == ExecutionMode::Speculative {
-        anyhow::ensure!(
-            parent_ctx.overlay().is_none()
-                && parent_ctx.native_scope().is_none()
-                && parent_ctx.can_restore_workspace(),
-            "only the unrestricted coordinating parent may dispatch speculative workflow tasks"
-        );
+    if task.owned.is_none() {
+        git::validate(task, parent_ctx)?;
     }
-    validate_speculative_workflow_task(task, dispatch)?;
-    Ok(())
-}
-
-fn validate_speculative_workflow_task(
-    task: &WorkflowTask,
-    dispatch: &ResolvedWorkflowDispatch,
-) -> Result<()> {
-    if task.execution != ExecutionMode::Speculative {
-        anyhow::ensure!(
-            task.overlay.is_none(),
-            "direct workflow cannot carry a speculative overlay"
-        );
-        return Ok(());
-    }
-    crate::agent::hooks::check_speculative_policy()?;
-    anyhow::ensure!(
-        dispatch.native_scope.is_some(),
-        "speculative workflow tasks require exact read_paths/write_paths"
-    );
-    anyhow::ensure!(
-        task.reference_ids.is_empty() && task.return_evidence.is_empty(),
-        "speculative workflow tasks cannot accept or return media"
-    );
-    anyhow::ensure!(
-        dispatch
-            .registry
-            .names()
-            .iter()
-            .all(|name| matches!(name.as_str(), "file_read" | "file_edit" | "file_write")),
-        "speculative workflow tasks require the native-only tool set"
-    );
     Ok(())
 }
 
@@ -381,6 +364,7 @@ fn resolve_workflow_dispatch(
     model: &str,
     parent_ctx: &crate::core::exec_ctx::ExecutionContext,
 ) -> Result<ResolvedWorkflowDispatch> {
+    task.execution.require_supported()?;
     let spec = match task
         .agent
         .as_deref()
@@ -453,18 +437,11 @@ fn resolve_workflow_dispatch(
     let reasoning_effort = crate::agent::task_tool::child_reasoning_effort(
         spec.is_none().then_some(task.role.as_str()),
     );
-    let mut image_config =
+    let image_config =
         crate::core::cli_config::config_with_session_vision(crate::core::cli_config::load());
-    let mut image_policy =
-        crate::llm::media::vision_policy_in(&image_config, &ep.base_url, &ep.model);
+    let image_policy = crate::llm::media::vision_policy_in(&image_config, &ep.base_url, &ep.model);
     let image_destination = crate::llm::media::effective_destination_key(&ep.base_url, &ep.model);
-    let mut relay_allowed = crate::agent::task_tool::evidence_destination_matches(&caller, &ep);
-    if task.execution == ExecutionMode::Speculative {
-        image_config.response_visuals = Some(crate::core::cli_config::ResponseVisuals::Off);
-        image_policy = crate::llm::media::VisionPolicy::Unsupported;
-        relay_allowed = false;
-        system.push_str("\n<private_overlay>All file reads and edits use your private immutable-base overlay. No live project file changes until the parent integrates the complete cohort. Read your own writes; do not claim builds, live integration or verification. This native-only lane returns text, not media. A failure retains only private work for parent inspection.</private_overlay>\n");
-    }
+    let relay_allowed = crate::agent::task_tool::evidence_destination_matches(&caller, &ep);
     Ok(ResolvedWorkflowDispatch {
         label,
         ep,
@@ -473,6 +450,7 @@ fn resolve_workflow_dispatch(
         declared_write_paths: task.write_paths.clone(),
         declared_read_paths: task.read_paths.clone(),
         execution: task.execution,
+        isolation: task.isolation,
         system,
         contract,
         expects,
@@ -562,15 +540,68 @@ impl std::fmt::Debug for ResolvedSynthesis {
     }
 }
 
+/// Reserve a bounded outer window for the actual prepared workload. Summing logical task
+/// ceilings covers dependency waves and admission serialization without guessing parallel width.
+/// Retries share each logical task's existing frozen scheduler deadline; they add no new window.
+/// Only private resolved contracts count, never raw workflow JSON or later wire edits.
+pub(crate) fn prepared_workflow_wall_deadline(
+    spec: &WorkflowSpec,
+    synthesize: bool,
+) -> Option<std::time::Instant> {
+    if spec.tasks.is_empty() || spec.tasks.len() > 32 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let mut total = std::time::Duration::ZERO;
+    for task in &spec.tasks {
+        let frozen = task.prepared.as_ref()?;
+        let until =
+            crate::agent::task_tool::SubagentTimePolicy::from_env(frozen.contract.max_steps)
+                .deadline(now)?;
+        // Overflow in an explicit override closes the observer instead of disabling its bound.
+        if until <= now {
+            return Some(now);
+        }
+        total = match total.checked_add(until.duration_since(now)) {
+            Some(value) => value,
+            None => return Some(now),
+        };
+    }
+    if synthesize {
+        spec.prepared_synthesis.as_ref()?;
+        total = match total.checked_add(crate::agent::task_tool::subagent_call_timeout()) {
+            Some(value) => value,
+            None => return Some(now),
+        };
+    }
+    Some(now.checked_add(total).unwrap_or(now))
+}
+
+/// Explicit opt-in; ordinary workflows retain their existing shared/scoped behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkflowIsolation {
+    #[default]
+    Shared,
+    Worktree,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WorkflowTask {
     pub id: String,
-    /// Explicit private native-file execution; omission preserves the direct lane.
+    #[serde(default, skip_serializing_if = "isolation_is_shared")]
+    pub(crate) isolation: WorkflowIsolation,
+    /// Historical explicit base. Not a capability; revalidated before owned creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) git_base: Option<crate::core::snapshots::GitOid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) git_prerequisites: Vec<crate::core::snapshots::GitOid>,
+    /// Runtime-only ownership; never reconstructed from a journal field or branch name.
+    #[serde(skip)]
+    pub(crate) owned: Option<std::sync::Arc<crate::core::git_ops::OwnedTask>>,
+    /// Historical execution label; fresh dispatch accepts only the direct lane.
     #[serde(default, skip_serializing_if = "execution_is_direct")]
     pub(crate) execution: ExecutionMode,
-    /// Controller-minted lane capability, never accepted from the workflow JSON or log.
-    #[serde(skip)]
-    pub(crate) overlay: Option<crate::core::speculation::store::OverlayHandle>,
     /// Internal frozen capabilities; never accepted from the workflow JSON.
     #[serde(skip)]
     pub(crate) prepared: Option<std::sync::Arc<ResolvedWorkflowDispatch>>,
@@ -679,6 +710,10 @@ where
         return Ok(None);
     }
     parse_workflow_paths(Some(&value), "read_paths/write_paths").map_err(serde::de::Error::custom)
+}
+
+fn isolation_is_shared(isolation: &WorkflowIsolation) -> bool {
+    *isolation == WorkflowIsolation::Shared
 }
 
 fn execution_is_direct(mode: &ExecutionMode) -> bool {
@@ -945,10 +980,25 @@ pub struct TaskOutcome {
     pub tokens_out: u64,
     /// Only explicitly selected captures from this child's completed final attempt.
     pub evidence_images: Vec<crate::core::tool_media::ToolImage>,
+    /// Runtime/checked journal evidence; prose is never parsed into integration authority.
+    pub(crate) git_handoff: Option<crate::core::git_ops::TaskHandoff>,
 }
 
 pub(crate) fn completed_status(status: &str) -> bool {
     status.split('·').next().is_some_and(|s| s.trim() == "done") && !status.contains("json:invalid")
+}
+
+/// This status can only be emitted after the runtime's typed handoff admission. It remains a
+/// non-success result; the existing parent integration/check barrier is still mandatory.
+const UNVERIFIED_HANDOFF_STATUS: &str = "incomplete-unverified-handoff";
+
+pub(crate) fn integration_candidate_status(status: &str) -> bool {
+    completed_status(status)
+        || (status
+            .split('·')
+            .next()
+            .is_some_and(|s| s.trim() == UNVERIFIED_HANDOFF_STATUS)
+            && !status.contains("json:invalid"))
 }
 
 /// Latest accepted attempt only: old retry captures stay in the audit outcomes, never in synthesis.
@@ -1169,7 +1219,7 @@ async fn run_workflow_with_cancel(
     cancel: crate::core::cancel::TurnCancel,
     resume_id: Option<&str>,
 ) -> Result<()> {
-    let parent_ctx = crate::core::exec_ctx::ExecutionContext::default();
+    let parent_ctx = crate::core::exec_ctx::current().unwrap_or_default();
     validate_spec_ids(spec)?;
     // Omitted roles are read-only reviewers. Frozen disjoint exact-scoped editors may overlap;
     // unknown, opaque and same-file writers remain exclusive in the production scheduler.
@@ -1177,22 +1227,14 @@ async fn run_workflow_with_cancel(
         enforce_singular_writer(spec)?;
     }
 
-    let root = std::env::current_dir()
-        .context("resolving cwd")?
+    let root = parent_ctx
+        .placement()
+        .map(|p| p.project_root().to_path_buf())
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+        .context("resolving workflow root")?
         .canonicalize()
-        .context("canonicalizing cwd")?;
-    let parent_ctx = if spec
-        .tasks
-        .iter()
-        .any(|task| task.execution == ExecutionMode::Speculative)
-    {
-        parent_ctx.with_placement(crate::core::file_placement::PlacementContext::new(
-            root.clone(),
-            crate::core::config::aizen_home(),
-        )?)
-    } else {
-        parent_ctx
-    };
+        .context("canonicalizing workflow root")?;
     let mut prepared_spec = spec.clone();
     let width = crate::agent::task_tool::max_parallel_subagents_pub().min(spec.tasks.len());
 
@@ -1219,8 +1261,19 @@ async fn run_workflow_with_cancel(
     let date = crate::agent::runlog::workflow_header(&resume_events, &task_ids)?
         .map(str::to_string)
         .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
-    prepare_workflow_spec_at_date(&mut prepared_spec, &root, base_url, api_key, model, &date)?;
+    prepare_workflow_spec_at_date_in_context(
+        &mut prepared_spec,
+        &root,
+        base_url,
+        api_key,
+        model,
+        &date,
+        &parent_ctx,
+    )?;
     for task in &mut prepared_spec.tasks {
+        if task.isolation == WorkflowIsolation::Worktree {
+            continue;
+        }
         task.prepared_metis = Some(std::sync::Arc::new(resolve_workflow_planner(
             &root, &date, task, base_url, api_key, model,
         )?));
@@ -1255,6 +1308,7 @@ async fn run_workflow_with_cancel(
                     selected_for: None,
                     attempt: None,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 },
             );
         }
@@ -1541,16 +1595,11 @@ async fn run_workflow_with_cancel(
 /// checks roles at `build_spec` so the model gets the error before any slot is reserved; this is
 /// the belt for hand-written CLI spec files.)
 fn validate_spec_ids(spec: &WorkflowSpec) -> Result<()> {
+    for task in &spec.tasks {
+        task.execution.require_supported()?;
+    }
     if spec.tasks.is_empty() {
         bail!("workflow '{}' has no tasks", spec.name);
-    }
-    if spec.tasks.len() > 32
-        && spec
-            .tasks
-            .iter()
-            .any(|task| task.execution == ExecutionMode::Speculative)
-    {
-        bail!("speculative workflow caps at 32 tasks per explicit call");
     }
     let mut seen = std::collections::HashSet::new();
     for t in &spec.tasks {
@@ -1595,6 +1644,12 @@ fn enforce_workflow_writer_policy(spec: &WorkflowSpec, scoped_admission: bool) -
             .filter(|task| workflow_task_is_writer(task))
             .collect();
         if writers.len() > 1 {
+            if writers
+                .iter()
+                .all(|task| task.isolation == WorkflowIsolation::Worktree)
+            {
+                continue;
+            }
             if scoped_admission
                 && writers.iter().all(|task| {
                     matches!(
@@ -1684,149 +1739,20 @@ pub(crate) async fn fan_out(
     .await
 }
 
-type DeferredWorkflowReport = (
-    Option<crate::agent::orchestration::Track>,
-    TaskOutcome,
-    Option<crate::agent::speculative_attempt::ReleasedAttempt>,
-);
-
-struct DeferredWorkflowReports {
-    parent_scope: String,
-    pending: std::cell::RefCell<std::collections::HashMap<AttemptKey, DeferredWorkflowReport>>,
-}
-
-impl DeferredWorkflowReports {
-    fn defer(
-        &self,
-        key: AttemptKey,
-        track: Option<crate::agent::orchestration::Track>,
-        outcome: &TaskOutcome,
-        released: crate::agent::speculative_attempt::ReleasedAttempt,
-    ) {
-        if let Some(track) = &track {
-            track.set_phase(
-                crate::agent::orchestration::Phase::Running,
-                "private; awaiting integration + verification",
-            );
-        }
-        self.pending
-            .borrow_mut()
-            .insert(key, (track, outcome.clone(), Some(released)));
-    }
-
-    fn take_release(
-        &self,
-        key: &AttemptKey,
-    ) -> Result<crate::agent::speculative_attempt::ReleasedAttempt> {
-        self.pending
-            .borrow_mut()
-            .get_mut(key)
-            .and_then(|(_, _, released)| released.take())
-            .context("speculative workflow attempt has no unused resource-release token")
-    }
-
-    fn accept(&self, intents: &[DispatchIntent]) {
-        for intent in intents {
-            if let Some((track, outcome, _)) = self.pending.borrow_mut().remove(&intent.key) {
-                finish_workflow_attempt(outcome, true, track, |result| {
-                    crate::agent::blackboard::note(&self.parent_scope, &result.id, &result.summary);
-                });
-            }
-        }
-    }
-
-    fn refuse_pending(&self) {
-        for (_, (track, mut outcome, _)) in self.pending.borrow_mut().drain() {
-            outcome.status = "verification-failed".into();
-            outcome.summary.push_str("\n[Workflow incomplete: private candidate did not reach accepted parent integration and verification.]");
-            finish_workflow_attempt(outcome, true, track, |_| {});
-        }
-    }
-}
-
-struct WorkflowCohorts<'a> {
+/// Validates durable destination evidence; it cannot manufacture child release proof.
+struct WorkflowGitAcceptance<'a> {
+    root: &'a Path,
     parent_ctx: &'a crate::core::exec_ctx::ExecutionContext,
-    parent_track: Option<u64>,
-    cancel: &'a crate::core::cancel::TurnCancel,
-    active: std::cell::RefCell<Option<std::sync::Arc<Cohort>>>,
-    reports: &'a DeferredWorkflowReports,
+    owned_tasks: &'a crate::core::git_ops::OwnedTaskAllocator,
 }
 
-impl scheduler::CohortLifecycle for WorkflowCohorts<'_> {
-    fn capture(&self, intents: &mut [DispatchIntent]) -> Result<String> {
-        anyhow::ensure!(
-            self.active.borrow().is_none(),
-            "workflow already has an active speculative cohort"
-        );
-        let scopes = intents
-            .iter()
-            .map(|intent| {
-                let dispatch = intent
-                    .task
-                    .prepared
-                    .as_ref()
-                    .context("speculative dispatch not prepared")?;
-                validate_speculative_workflow_task(&intent.task, dispatch)?;
-                dispatch
-                    .native_scope
-                    .clone()
-                    .context("speculative dispatch lost exact native scope")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let cohort = Cohort::capture(self.parent_ctx, &scopes, Some(self.cancel))?;
-        for (intent, scope) in intents.iter_mut().zip(&scopes) {
-            let owner = workflow_child_scope(
-                self.parent_ctx,
-                self.parent_track,
-                &intent.task,
-                intent.key.ordinal,
-            );
-            intent.task.overlay = Some(cohort.overlay(&owner, scope)?);
-        }
-        cohort.freeze_lifecycle()?;
-        let id = cohort.base().id().to_string();
-        *self.active.borrow_mut() = Some(cohort);
-        Ok(id)
-    }
-
-    fn finish<'a>(
-        &'a self,
-        id: &'a str,
-        intents: &'a [DispatchIntent],
-    ) -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
-        Box::pin(async move {
-            let cohort = self
-                .active
-                .borrow_mut()
-                .take()
-                .context("workflow cohort capability is unavailable")?;
-            anyhow::ensure!(cohort.base().id() == id, "workflow cohort identity changed");
-            let sealed = intents
-                .iter()
-                .map(|intent| {
-                    let overlay = intent
-                        .task
-                        .overlay
-                        .as_ref()
-                        .context("workflow attempt lost private overlay")?;
-                    let released = self.reports.take_release(&intent.key)?;
-                    cohort.seal_released(self.parent_ctx, overlay, released)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let receipt = cohort.integrate(self.parent_ctx, &sealed, Some(self.cancel))?;
-            cohort
-                .verify_applied(self.parent_ctx, &receipt, Some(self.cancel), 120)
-                .await
-        })
-    }
-
-    fn accepted(&self, intents: &[DispatchIntent]) {
-        self.reports.accept(intents);
-    }
-
-    fn release(&self) {
-        drop(self.active.borrow_mut().take());
-        self.reports.refuse_pending();
+impl scheduler::GitAcceptance for WorkflowGitAcceptance<'_> {
+    fn accept_git(
+        &self,
+        handoff: &crate::core::git_ops::TaskHandoff,
+    ) -> Result<crate::core::git_ops::VerifiedTaskIntegration> {
+        let context = self.owned_tasks.context(self.parent_ctx)?;
+        crate::core::exec_ctx::with_current(context, || git::accept(self.root, handoff))
     }
 }
 
@@ -1877,7 +1803,10 @@ async fn fan_out_tracked(
         parent_ctx,
     )?;
     let tasks = prepared_tasks.as_slice();
+    anyhow::ensure!(!tasks.iter().any(|task| task.isolation == WorkflowIsolation::Worktree) || runlog.is_some(),
+        "owned Git workflow requires a durable CLI run log; run `aizen workflow <spec>` and resume that run after explicit integration/verification");
     let width = max_parallel.clamp(1, crate::agent::task_tool::max_parallel_subagents_pub());
+    let owned_tasks = crate::core::git_ops::OwnedTaskAllocator::new(&cancel);
     let gate = crate::agent::task_tool::SubagentGate::global();
     let policy = scheduler::Policy {
         metis,
@@ -1886,20 +1815,14 @@ async fn fan_out_tracked(
     };
     let recoveries = std::sync::Mutex::new(std::collections::HashMap::<
         TaskId,
-        crate::features::timemachine::RunRecovery,
+        crate::core::run_recovery::RunRecovery,
     >::new());
-    let reports = DeferredWorkflowReports {
-        parent_scope: parent_ctx.resource_scope(),
-        pending: std::cell::RefCell::new(std::collections::HashMap::new()),
-    };
-    let cohorts = WorkflowCohorts {
+    let acceptance = WorkflowGitAcceptance {
+        root,
         parent_ctx,
-        parent_track: parent,
-        cancel: &cancel,
-        active: std::cell::RefCell::new(None),
-        reports: &reports,
+        owned_tasks: &owned_tasks,
     };
-    scheduler::schedule_cohorts(
+    scheduler::schedule_with_git_acceptance(
         tasks,
         width,
         model,
@@ -1932,7 +1855,11 @@ async fn fan_out_tracked(
                         .context("workflow attempt has no frozen dispatch")?
                 });
             }
-            validate_frozen_workflow_scope(&intent.task, parent_ctx)
+            validate_frozen_workflow_scope(&intent.task, parent_ctx)?;
+            let context = owned_tasks.context(parent_ctx)?;
+            crate::core::exec_ctx::with_current(context, || {
+                git::freeze_base(root, &mut intent.task)
+            })
         },
         |intent| {
             gate.try_acquire_for(Some(
@@ -1967,12 +1894,32 @@ async fn fan_out_tracked(
                 .filter(|_| intent.key.kind == AttemptKind::Initial);
             let mut task = intent.task;
             task.attempt = Some(intent.key);
-            let reports = &reports;
+            let owned_tasks = &owned_tasks;
             async move {
                 if let Some(outcome) = prior {
                     return outcome;
                 }
-                run_one_task_admitted_with_reports(
+                if task.isolation == WorkflowIsolation::Worktree {
+                    // Bound the enum-sized attempt frame before the scheduler constructs/moves it.
+                    // Boxing only the outer driver still stacks the owned and direct child states.
+                    return Box::pin(git::run(
+                        http,
+                        base_url,
+                        api_key,
+                        model,
+                        approval_mode,
+                        root,
+                        date,
+                        &task,
+                        parent,
+                        owned_tasks,
+                        context_window,
+                        &parent_ctx,
+                        slot,
+                    ))
+                    .await;
+                }
+                Box::pin(run_one_task_admitted_owned(
                     http,
                     base_url,
                     api_key,
@@ -1986,12 +1933,12 @@ async fn fan_out_tracked(
                     context_window,
                     &parent_ctx,
                     slot,
-                    Some(reports),
-                )
+                    None,
+                ))
                 .await
             }
         },
-        &cohorts,
+        &acceptance,
     )
     .await
 }
@@ -2345,6 +2292,7 @@ fn workflow_fingerprint(spec: &WorkflowSpec) -> Result<u64> {
             "tools": d.registry.defs(), "system": d.system, "effort": d.reasoning_effort,
             "write_paths": d.declared_write_paths,
             "read_paths": d.declared_read_paths,
+            "isolation": d.isolation,
             "native_write_keys": d.native_scope.as_ref().map(|scope| scope.write_keys()),
             "native_resources": d.native_scope.as_ref().map(|scope| scope.resources().iter()
                 .map(|resource| serde_json::json!({"path": resource.path(), "key": resource.key()}))
@@ -2414,6 +2362,7 @@ pub(crate) async fn run_one_task_with_context(
         tokens_in: 0,
         tokens_out: 0,
         evidence_images: Vec::new(),
+        git_handoff: None,
     };
     let resolved = match task.prepared.clone().map(Ok).unwrap_or_else(|| {
         resolve_workflow_dispatch(root, date, &task, base_url, api_key, model, parent_ctx)
@@ -2498,7 +2447,7 @@ pub(crate) async fn run_one_task_admitted(
     parent_ctx: &crate::core::exec_ctx::ExecutionContext,
     slot: crate::agent::task_tool::SubagentSlot,
 ) -> TaskOutcome {
-    run_one_task_admitted_with_reports(
+    run_one_task_admitted_owned(
         http,
         base_url,
         api_key,
@@ -2519,49 +2468,56 @@ pub(crate) async fn run_one_task_admitted(
 
 /// Keep known no-start separate from admitted execution without a release proof.
 /// A moved release token does not undo physical closure; only the native owner can certify it.
+struct OwnedWorkflowAttempt {
+    attempt: crate::core::git_ops::GitNativeAttempt,
+    // Runtime-only handoff between the native driver and its coordinating Git controller.
+    // This proof is never serialized into TaskOutcome or recovered from a run log.
+    released: std::sync::Mutex<Option<crate::agent::git_native_attempt::ReleasedGitAttempt>>,
+}
+
 enum WorkflowAttemptAdmission {
     Direct(std::sync::Arc<crate::agent::task_tool::SubagentSlot>),
-    NativeReady(Option<crate::agent::task_tool::SubagentSlot>),
-    NativeRunning(Box<crate::agent::speculative_attempt::AttemptOwner>),
-    NativeReleased(Option<crate::agent::speculative_attempt::ReleasedAttempt>),
-    NativeUnknown,
+    GitReady {
+        slot: Option<crate::agent::task_tool::SubagentSlot>,
+        attempt: crate::core::git_ops::GitNativeAttempt,
+    },
+    GitRunning(Box<crate::agent::git_native_attempt::OwnedNativeAttemptOwner>),
+    GitReleased(Option<crate::agent::git_native_attempt::ReleasedGitAttempt>),
+    GitUnknown,
 }
 
 impl WorkflowAttemptAdmission {
-    fn new(mode: ExecutionMode, slot: crate::agent::task_tool::SubagentSlot) -> Self {
-        match mode {
-            ExecutionMode::Direct => Self::Direct(std::sync::Arc::new(slot)),
-            ExecutionMode::Speculative => Self::NativeReady(Some(slot)),
+    fn new_direct(slot: crate::agent::task_tool::SubagentSlot) -> Self {
+        Self::Direct(std::sync::Arc::new(slot))
+    }
+
+    fn new_git(
+        slot: crate::agent::task_tool::SubagentSlot,
+        attempt: crate::core::git_ops::GitNativeAttempt,
+    ) -> Self {
+        Self::GitReady {
+            slot: Some(slot),
+            attempt,
         }
     }
 
     fn bind_context(
         &mut self,
-        root: &Path,
         ctx: &crate::core::exec_ctx::ExecutionContext,
     ) -> Result<crate::core::exec_ctx::ExecutionContext> {
         match self {
             Self::Direct(slot) => Ok(ctx.with_attempt_slot(slot.clone())),
-            Self::NativeReady(slot) => {
-                let overlay = ctx
-                    .overlay()
-                    .context("speculative workflow lost its overlay")?;
-                let scope = ctx
-                    .native_scope()
-                    .context("speculative workflow lost its exact scope")?;
-                let owner = crate::agent::speculative_attempt::AttemptOwner::new_required(
+            Self::GitReady { slot, attempt } => {
+                let owner = crate::agent::git_native_attempt::OwnedNativeAttemptOwner::admit(
                     slot.take()
-                        .context("speculative workflow admission was already consumed")?,
-                    root,
-                    &ctx.resource_scope(),
-                    overlay.clone(),
-                    scope,
+                        .context("Git-native workflow admission was already consumed")?,
+                    attempt.clone(),
+                    ctx,
                 )?;
-                // If binding fails after admission, retain the owner for quarantine, not no-start.
-                *self = Self::NativeRunning(Box::new(owner));
+                *self = Self::GitRunning(Box::new(owner));
                 match self {
-                    Self::NativeRunning(owner) => owner.bind_context(ctx),
-                    _ => unreachable!("native owner was just seated"),
+                    Self::GitRunning(owner) => owner.bind_context(ctx),
+                    _ => unreachable!("Git-native owner was just seated"),
                 }
             }
             _ => bail!("workflow attempt cannot bind another executable context"),
@@ -2571,17 +2527,16 @@ impl WorkflowAttemptAdmission {
     async fn finish_native(
         &mut self,
         deadline: tokio::time::Instant,
-        driver: crate::core::speculation::workers::DriverResult,
+        driver: crate::core::worker_evidence::DriverResult,
     ) -> Result<()> {
         if matches!(self, Self::Direct(_)) {
             return Ok(());
         }
-        let previous = std::mem::replace(self, Self::NativeUnknown);
+        let previous = std::mem::replace(self, Self::GitUnknown);
         match previous {
-            Self::NativeRunning(owner) => {
-                // Cancellation/error leaves Unknown while the consuming owner quarantines itself.
+            Self::GitRunning(owner) => {
                 let token = owner.finish_with_driver(deadline, driver).await?;
-                *self = Self::NativeReleased(Some(token));
+                *self = Self::GitReleased(Some(token));
                 Ok(())
             }
             other => {
@@ -2594,21 +2549,21 @@ impl WorkflowAttemptAdmission {
     fn physically_finished(&self) -> bool {
         match self {
             Self::Direct(slot) => crate::agent::task_tool::ensure_attempt_finished(slot).is_ok(),
-            Self::NativeReady(_) | Self::NativeReleased(_) => true,
-            Self::NativeRunning(_) | Self::NativeUnknown => false,
+            Self::GitReady { .. } | Self::GitReleased(_) => true,
+            Self::GitRunning(_) | Self::GitUnknown => false,
         }
     }
 
-    fn take_release(&mut self) -> Option<crate::agent::speculative_attempt::ReleasedAttempt> {
+    fn take_git_release(&mut self) -> Option<crate::agent::git_native_attempt::ReleasedGitAttempt> {
         match self {
-            Self::NativeReleased(token) => token.take(),
+            Self::GitReleased(token) => token.take(),
             _ => None,
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_one_task_admitted_with_reports(
+async fn run_one_task_admitted_owned(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
@@ -2622,9 +2577,30 @@ async fn run_one_task_admitted_with_reports(
     context_window: usize,
     parent_ctx: &crate::core::exec_ctx::ExecutionContext,
     slot: crate::agent::task_tool::SubagentSlot,
-    reports: Option<&DeferredWorkflowReports>,
+    owned: Option<&OwnedWorkflowAttempt>,
 ) -> TaskOutcome {
-    let mut admission = WorkflowAttemptAdmission::new(task.execution, slot);
+    if task.execution.require_supported().is_err() || task.owned.is_some() != owned.is_some() {
+        return TaskOutcome {
+            id: task.id.clone(),
+            attempt: task.attempt.clone(),
+            selected_for: None,
+            role: task.role.clone(),
+            model: model.into(),
+            status: "admission-error".into(),
+            summary:
+                "Unsupported execution or missing Git-native lifecycle; no direct fallback or dispatch"
+                    .into(),
+            iters: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            evidence_images: Vec::new(),
+            git_handoff: None,
+        };
+    }
+    let mut admission = match owned {
+        Some(owned) => WorkflowAttemptAdmission::new_git(slot, owned.attempt.clone()),
+        None => WorkflowAttemptAdmission::new_direct(slot),
+    };
     let mut track = None;
     let mut outcome = run_one_task_owned(
         http,
@@ -2644,22 +2620,22 @@ async fn run_one_task_admitted_with_reports(
     )
     .await;
     let worker_finished = admission.physically_finished();
-    if task.execution == ExecutionMode::Speculative
-        && worker_finished
-        && completed_status(&outcome.status)
-    {
-        outcome.summary.push_str("\n[Speculative report: findings remain base-scoped to the captured tree. Accepted integration and a passing parent verification command do not recertify this report as a fresh review of the merged live tree; peer read/write dependencies still require semantic review.]");
-        if let (Some(reports), Some(key), Some(released)) =
-            (reports, task.attempt.as_ref(), admission.take_release())
-        {
-            reports.defer(key.clone(), track, &outcome, released);
-            return outcome;
+    if let Some(owned) = owned {
+        if let Some(released) = admission.take_git_release() {
+            match owned.released.lock() {
+                Ok(mut destination) if destination.is_none() => *destination = Some(released),
+                _ => {
+                    outcome.status = "git-task-incomplete".into();
+                    outcome.summary.push_str("\n[Private Git-native release destination unavailable; retain without commit or retry.]");
+                }
+            }
         }
-        outcome.status = "verification-failed".into();
-        outcome.summary.push_str("\n[Workflow incomplete: no coordinating integration barrier accepted this private candidate.]");
+    }
+    if task.owned.is_some() && integration_candidate_status(&outcome.status) {
+        outcome.status = UNVERIFIED_HANDOFF_STATUS.into();
     }
     finish_workflow_attempt(outcome, worker_finished, track, |result| {
-        if task.execution == ExecutionMode::Direct {
+        if task.execution == ExecutionMode::Direct && task.isolation == WorkflowIsolation::Shared {
             crate::agent::blackboard::note(
                 &parent_ctx.resource_scope(),
                 &result.id,
@@ -2764,6 +2740,7 @@ async fn run_one_task_owned(
             selected_for: None,
             attempt: None,
             evidence_images: Vec::new(),
+            git_handoff: None,
         };
     }
     let resolved = match task.prepared.as_ref() {
@@ -2786,6 +2763,7 @@ async fn run_one_task_owned(
                 selected_for: None,
                 attempt: None,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             }
         }
     };
@@ -2797,6 +2775,7 @@ async fn run_one_task_owned(
         declared_write_paths: _,
         declared_read_paths: _,
         execution: _,
+        isolation: _,
         system,
         contract,
         expects,
@@ -2852,7 +2831,7 @@ async fn run_one_task_owned(
                 &base,
                 &key,
                 &model,
-                crate::llm::client::stream_chat_with_tools_sink_frozen(
+                Box::pin(crate::llm::client::stream_chat_with_tools_sink_frozen(
                     &client,
                     &base,
                     &key,
@@ -2865,7 +2844,7 @@ async fn run_one_task_owned(
                     },
                     effort,
                     &frozen_cfg,
-                ),
+                )),
             )
             .await
             .map(|(turn, receipt)| {
@@ -2927,35 +2906,23 @@ async fn run_one_task_owned(
                 selected_for: None,
                 attempt: None,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             }
         }
     };
     let child_ctx = match native_scope {
+        Some(scope) if task.owned.is_some() => child_ctx.for_owned_git_task(
+            task.owned.as_ref().expect("checked owned task").clone(),
+            scope,
+        ),
         Some(scope) => child_ctx.with_native_scope(scope),
         None => Ok(child_ctx),
     };
-    let child_ctx = match child_ctx
-        .and_then(|ctx| match (task.execution, task.overlay.as_ref()) {
-            (ExecutionMode::Speculative, Some(overlay)) => {
-                crate::agent::hooks::check_speculative_policy()?;
-                ctx.with_overlay(overlay.clone())
-            }
-            (ExecutionMode::Speculative, None) => {
-                bail!("speculative workflow requires a controller-seated overlay; no live fallback")
-            }
-            (ExecutionMode::Direct, None) => Ok(ctx),
-            (ExecutionMode::Direct, Some(_)) => {
-                bail!("direct workflow cannot carry private overlay authority")
-            }
-        })
-        .and_then(|ctx| {
-            if task.execution == ExecutionMode::Speculative {
-                Ok(ctx)
-            } else {
-                crate::core::workspace_txn::WorkspaceActivity::begin(root, &child_scope)
-                    .map(|activity| ctx.with_workspace_activity(activity))
-            }
-        }) {
+    let child_ctx = match child_ctx.and_then(|ctx| {
+        task.execution.require_supported()?;
+        crate::core::workspace_txn::WorkspaceActivity::begin(root, &child_scope)
+            .map(|activity| ctx.with_workspace_activity(activity))
+    }) {
         Ok(ctx) => ctx,
         Err(error) => {
             return TaskOutcome {
@@ -2972,6 +2939,7 @@ async fn run_one_task_owned(
                 tokens_in: 0,
                 tokens_out: 0,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             }
         }
     };
@@ -2980,7 +2948,7 @@ async fn run_one_task_owned(
     if task.attempt.is_some() {
         child_ctx = child_ctx.with_recovery(parent_ctx.recovery().clone());
     }
-    child_ctx = match admission.bind_context(root, &child_ctx) {
+    child_ctx = match admission.bind_context(&child_ctx) {
         Ok(ctx) => ctx,
         Err(error) => {
             return TaskOutcome {
@@ -2995,6 +2963,7 @@ async fn run_one_task_owned(
                 tokens_in: 0,
                 tokens_out: 0,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             };
         }
     };
@@ -3009,6 +2978,8 @@ async fn run_one_task_owned(
     } else {
         crate::core::model_context::discover(&ep).await.tokens
     };
+    let time_policy = crate::agent::task_tool::SubagentTimePolicy::from_env(contract.max_steps);
+    let time_started = std::time::Instant::now();
     let mut cfg = AgentConfig {
         approval_mode,
         cancel: own_cancel.clone(),
@@ -3034,8 +3005,6 @@ async fn run_one_task_owned(
         // start-narrow-then-extend split the `task` tool uses.
         max_iters: contract.max_steps.div_ceil(2).max(1),
         auto_extend_to: contract.max_steps,
-        auto_checkpoint: is_writer && !native_scoped,
-        checkpoint_each_edit: false,
         todo_reminder_every: 0,
         // P0: workflow children use ScopedTodo; keep process-global poke/gates off.
         enable_todo_poke: false,
@@ -3057,7 +3026,7 @@ async fn run_one_task_owned(
         // Absolute attempt ceiling, tightened by the inherited parent deadline below. Expiry
         // remains an incomplete outcome; it neither refreshes the parent budget nor proves that
         // a blocking tool worker stopped or released its permit/lease.
-        deadline: crate::agent::task_tool::subagent_wall_deadline(),
+        deadline: time_policy.deadline(time_started),
         // enable_lsp default true is fine; tools only appear if registered in the sub-agent registry.
         // The clearing knobs themselves come from the defaults below — they are inert while
         // `context_window` is 0 and become live the moment a real window is threaded in.
@@ -3066,6 +3035,7 @@ async fn run_one_task_owned(
 
     cfg.exec_ctx = cfg.exec_ctx.with_deadline(cfg.deadline);
     cfg.deadline = cfg.exec_ctx.deadline();
+    cfg.adaptive_time = time_policy.budget(time_started, cfg.deadline);
     *child_chat_context.lock().unwrap_or_else(|e| e.into_inner()) = cfg.exec_ctx.clone();
     drop(child_ctx);
 
@@ -3112,6 +3082,7 @@ async fn run_one_task_owned(
                     tokens_in: 0,
                     tokens_out: 0,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 }
             }
         }
@@ -3183,8 +3154,14 @@ async fn run_one_task_owned(
         }
         Err(error) => Err(error),
     };
+    let handoff = result
+        .as_ref()
+        .map(|outcome| {
+            crate::agent::native_handoff::unverified_handoff(outcome, &cfg.exec_ctx, &cfg.cancel)
+        })
+        .unwrap_or_default();
     let repair_cancel = cfg.cancel.clone();
-    let repair_deadline = cfg.deadline;
+    let repair_deadline = cfg.run_deadline();
     drop(cfg);
     *child_chat_context.lock().unwrap_or_else(|e| e.into_inner()) =
         crate::core::exec_ctx::ExecutionContext::default();
@@ -3193,7 +3170,7 @@ async fn run_one_task_owned(
     // attempt carrier past the physical body join and block deferred publication.
     drop(chat);
     drop(child_chat_context);
-    let driver = crate::agent::speculative_attempt::driver_result(result.as_ref());
+    let driver = crate::agent::native_handoff::driver_result(result.as_ref(), handoff);
     let release_result = admission
         .finish_native(
             tokio::time::Instant::now() + std::time::Duration::from_secs(15),
@@ -3206,6 +3183,8 @@ async fn run_one_task_owned(
         Ok(o) => {
             let status = match o.stop {
                 StopReason::Done => "done",
+                StopReason::Incomplete if handoff.eligible() => UNVERIFIED_HANDOFF_STATUS,
+                StopReason::Incomplete => "incomplete",
                 StopReason::Divergence => "diverged",
                 StopReason::MaxIters => "max-iters",
                 StopReason::VerificationFailed => "verification-failed",
@@ -3278,6 +3257,7 @@ async fn run_one_task_owned(
                 selected_for: None,
                 attempt: None,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             }
         }
         Err(e) => TaskOutcome {
@@ -3295,6 +3275,7 @@ async fn run_one_task_owned(
             selected_for: None,
             attempt: None,
             evidence_images: Vec::new(),
+            git_handoff: None,
         },
     };
     if completed_status(&outcome.status) && relay_allowed {
@@ -3469,391 +3450,66 @@ fn truncate_summary(text: &str) -> String {
 mod native_speculation_acceptance {
     use super::*;
     use crate::agent::tools::Tool;
-    use serde_json::{json, Value};
+    use crate::core::persist::FileFingerprint;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const MODEL: &str = "owned-workflow-speculation-fixture";
     const KEY: &str = "owned-loopback-workflow-account";
     const FILE: &str = "owned.rs";
     const SOURCE: &str =
         "pub fn alpha() -> i32 {\n    10\n}\n\npub fn beta() -> i32 {\n    20\n}\n";
-    const WAIT: Duration = Duration::from_secs(10);
 
-    #[derive(Clone)]
-    struct ReleaseBodies(Arc<(Mutex<bool>, Condvar)>);
-
-    impl ReleaseBodies {
-        fn release(&self) {
-            let (lock, changed) = &*self.0;
-            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
-            changed.notify_all();
-        }
-
-        fn wait(&self) {
-            let (lock, changed) = &*self.0;
-            let ready = lock.lock().unwrap();
-            let (ready, _) = changed
-                .wait_timeout_while(ready, WAIT, |ready| !*ready)
-                .unwrap();
-            assert!(
-                *ready,
-                "both real Workflow native bodies must overlap before release"
-            );
-        }
-    }
-
-    struct ReleaseOnDrop(ReleaseBodies);
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-
-    struct ReleaseVerifyOnDrop(PathBuf);
-    impl Drop for ReleaseVerifyOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::write(&self.0, b"release");
-        }
-    }
-
-    struct BodyArrival {
-        label: String,
-        path: PathBuf,
-        overlay: String,
-        base: String,
-        owner: String,
-    }
-
-    struct ProviderState {
-        root: PathBuf,
-        scope: String,
-        first: String,
-        second: String,
-        merged: String,
-        own_reads: AtomicUsize,
-        second_finished_first: AtomicBool,
-        verify_barrier_observed: AtomicBool,
-        dependent_started: AtomicBool,
-    }
-
-    impl ProviderState {
-        fn assert_live_base(&self) {
-            assert_eq!(
-                std::fs::read(self.root.join(FILE)).unwrap(),
-                SOURCE.as_bytes(),
-                "no live edits while a private Workflow child is still unsettled"
-            );
-        }
-
-        fn private_image(first: bool) -> String {
-            if first {
-                SOURCE.replacen("    10\n", "    11\n", 1)
-            } else {
-                SOURCE.replacen("    20\n", "    21\n", 1)
-            }
-        }
-
-        fn note(&self, id: &str) -> PathBuf {
-            crate::agent::blackboard::dir_for(&self.scope)
-                .join(format!("{}.md", crate::agent::blackboard::safe_segment(id)))
-        }
-
-        fn assert_private_reports(&self) {
-            assert!(!self.note(&self.first).exists());
-            assert!(!self.note(&self.second).exists());
-            let board = crate::agent::orchestration::format_status();
-            for id in [&self.first, &self.second] {
+    // Byte inventory is restricted to this test's disposable directory, including its own HOME.
+    fn fixture_image(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, image: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
                 assert!(
-                    board
-                        .lines()
-                        .any(|line| line.contains(id.as_str())
-                            && line.contains("awaiting integration")),
-                    "{board}"
+                    !metadata.file_type().is_symlink(),
+                    "fixture must contain no links"
                 );
-            }
-        }
-    }
-
-    async fn bounded_until(mut predicate: impl FnMut() -> bool, why: &str) {
-        bounded_until_for(WAIT, &mut predicate, why).await;
-    }
-
-    async fn bounded_until_for(timeout: Duration, mut predicate: impl FnMut() -> bool, why: &str) {
-        tokio::time::timeout(timeout, async {
-            while !predicate() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "bounded Workflow fixture wait failed: {why}\n{}",
-                crate::agent::orchestration::format_status()
-            )
-        });
-    }
-
-    async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
-        let mut bytes = Vec::new();
-        let mut chunk = [0; 4096];
-        loop {
-            let n = socket.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "owned Workflow request ended before its body");
-            bytes.extend_from_slice(&chunk[..n]);
-            assert!(
-                bytes.len() <= 512 * 1024,
-                "bounded Workflow fixture request"
-            );
-            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                let headers = String::from_utf8(bytes[..end].to_vec())
-                    .unwrap()
-                    .to_ascii_lowercase();
-                let length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .unwrap();
-                assert!(length <= 512 * 1024);
-                if bytes.len() >= end + 4 + length {
-                    return (
-                        headers,
-                        serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
-                    );
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if metadata.is_dir() {
+                    image.insert(relative, None);
+                    visit(root, &path, image);
+                } else {
+                    assert!(metadata.is_file());
+                    image.insert(relative, Some(std::fs::read(path).unwrap()));
                 }
             }
         }
+        let mut image = BTreeMap::new();
+        visit(root, root, &mut image);
+        image
     }
 
-    fn sse(delta: Value, finish: &str) -> String {
-        format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
-        )
-    }
-
-    fn native_call(id: &str, name: &str, args: Value) -> String {
-        sse(
-            json!({"tool_calls":[{"index":0,"id":id,"type":"function",
-            "function":{"name":name,"arguments":args.to_string()}}]}),
-            "tool_calls",
-        )
-    }
-
-    async fn provider_request(
-        mut socket: tokio::net::TcpStream,
-        state: Arc<ProviderState>,
-    ) -> String {
-        let (headers, request) = read_request(&mut socket).await;
-        assert!(headers.starts_with("post /chat/completions "));
-        assert!(headers.contains(&format!("authorization: bearer {KEY}")));
-        assert_eq!(request["model"], MODEL);
-        if request["stream"] == false {
-            assert!(state.dependent_started.load(Ordering::SeqCst));
-            assert!(state.verify_barrier_observed.load(Ordering::SeqCst));
-            assert_eq!(
-                std::fs::read(state.root.join("target/verify-passed.txt")).unwrap(),
-                state.merged.as_bytes()
-            );
-            let body = json!({"choices":[{"index":0,"message":{"role":"assistant",
-                "content":"WF_SPEC_FIRST_COMPLETE; WF_SPEC_SECOND_COMPLETE; WF_SPEC_AFTER_COMPLETE. Parent verification accepted before dependent execution."},"finish_reason":"stop"}]}).to_string();
-            let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            socket.write_all(wire.as_bytes()).await.unwrap();
-            return "synthesis".into();
+    struct LedgerEntry(PathBuf);
+    impl Drop for LedgerEntry {
+        fn drop(&mut self) {
+            crate::core::read_ledger::forget(&self.0);
         }
-        assert_eq!(request["stream"], true);
-        let messages = request["messages"].as_array().unwrap();
-        let user = messages
-            .iter()
-            .find(|message| message["role"] == "user")
-            .unwrap()
-            .to_string();
-        // Upstream/context packs may contain an earlier sibling's marker; use the final brief.
-        let label = [
-            ("WF_SPEC_FIRST", "first"),
-            ("WF_SPEC_SECOND", "second"),
-            ("WF_SPEC_AFTER", "after"),
-        ]
-        .iter()
-        .filter_map(|(marker, label)| user.rfind(marker).map(|index| (index, *label)))
-        .max_by_key(|(index, _)| *index)
-        .expect("owned Workflow child brief")
-        .1;
-        let last = messages
-            .iter()
-            .rev()
-            .find(|message| message["role"] == "tool");
-        let response = if label == "after" {
-            state.dependent_started.store(true, Ordering::SeqCst);
-            assert!(state.verify_barrier_observed.load(Ordering::SeqCst));
-            assert_eq!(
-                std::fs::read(state.root.join(FILE)).unwrap(),
-                state.merged.as_bytes()
-            );
-            assert_eq!(std::fs::read(state.root.join("target/verify-passed.txt")).unwrap(), state.merged.as_bytes(),
-                "dependent dispatch must follow the real parent verifier, not physical child completion");
-            for (id, marker) in [
-                (&state.first, "WF_SPEC_FIRST_COMPLETE"),
-                (&state.second, "WF_SPEC_SECOND_COMPLETE"),
-            ] {
-                let report = std::fs::read_to_string(state.note(id)).unwrap();
-                assert!(
-                    report.contains(marker),
-                    "accepted reports must exist before dependencies are released"
-                );
-                assert!(report.contains("findings remain base-scoped"),
-                    "acceptance cannot silently relabel captured-base findings as a fresh live-tree review");
-            }
-            match last {
-                None => native_call(
-                    "read-live-after",
-                    "file_read",
-                    json!({"path":state.root.join(FILE)}),
-                ),
-                Some(result) => {
-                    assert_eq!(result["tool_call_id"], "read-live-after");
-                    let text = result["content"].as_str().unwrap();
-                    assert!(
-                        text.contains(&state.merged),
-                        "direct dependent reads the integrated live tree: {text}"
-                    );
-                    assert!(!text.contains("private overlay; not yet integrated"));
-                    sse(
-                        json!({"content":"WF_SPEC_AFTER_COMPLETE: read the verified merged live file."}),
-                        "stop",
-                    )
-                }
-            }
-        } else {
-            let system = messages
-                .iter()
-                .find(|message| message["role"] == "system")
-                .unwrap()
-                .to_string();
-            assert!(system.contains("<private_overlay>"));
-            let mut names: Vec<_> = request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["function"]["name"].as_str().unwrap())
-                .collect();
-            names.sort_unstable();
-            assert_eq!(
-                names,
-                vec!["file_edit", "file_read", "file_write"],
-                "real private Workflow children have exact native-only capabilities"
-            );
-            state.assert_live_base();
-            let first = label == "first";
-            match last {
-                None => native_call(
-                    &format!("read-base-{label}"),
-                    "file_read",
-                    json!({"path":state.root.join(FILE)}),
-                ),
-                Some(result) => {
-                    let text = result["content"].as_str().unwrap();
-                    assert!(!text.contains("error:"), "real native body failed: {text}");
-                    assert!(text.contains("private overlay; not yet integrated"));
-                    match result["tool_call_id"].as_str().unwrap() {
-                        id if id == format!("read-base-{label}") => {
-                            assert!(text.contains(SOURCE), "immutable base read: {text}");
-                            let (old, new) = if first {
-                                ("    10\n", "    11\n")
-                            } else {
-                                ("    20\n", "    21\n")
-                            };
-                            native_call(
-                                &format!("edit-{label}"),
-                                "file_edit",
-                                json!({"path":state.root.join(FILE),"old_string":old,"new_string":new}),
-                            )
-                        }
-                        id if id == format!("edit-{label}") => native_call(
-                            &format!("read-own-{label}"),
-                            "file_read",
-                            json!({"path":state.root.join(FILE)}),
-                        ),
-                        id if id == format!("read-own-{label}") => {
-                            assert!(
-                                text.contains(&ProviderState::private_image(first)),
-                                "own private readback: {text}"
-                            );
-                            assert!(
-                                !text.contains(&ProviderState::private_image(!first)),
-                                "sibling overlay leaked: {text}"
-                            );
-                            state
-                                .own_reads
-                                .fetch_or(if first { 1 } else { 2 }, Ordering::SeqCst);
-                            bounded_until(
-                                || state.own_reads.load(Ordering::SeqCst) == 3,
-                                "both real private readbacks",
-                            )
-                            .await;
-                            if first {
-                                // Workflow seals the whole cohort later. Its pending board transition,
-                                // unlike wire-response ordering, is after ensure_attempt_finished.
-                                bounded_until(|| crate::agent::orchestration::format_status().lines().any(|line|
-                                    line.contains(&state.second) && line.contains("awaiting integration")),
-                                    "second Workflow child physically finishes before first receives final response").await;
-                                state.assert_live_base();
-                                assert!(!state.note(&state.second).exists());
-                                assert!(!state.dependent_started.load(Ordering::SeqCst));
-                                assert!(!state.root.join("target/verify-started.txt").exists());
-                                state.second_finished_first.store(true, Ordering::SeqCst);
-                            }
-                            sse(
-                                json!({"content":format!("WF_SPEC_{}_COMPLETE: private edit and own readback; parent integrates and verifies.", label.to_ascii_uppercase())}),
-                                "stop",
-                            )
-                        }
-                        unexpected => {
-                            panic!("unexpected owned Workflow native result: {unexpected}")
-                        }
-                    }
-                }
-            }
-        };
-        let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
-        socket.write_all(wire.as_bytes()).await.unwrap();
-        label.to_owned()
     }
 
-    fn configure_verification(root: &Path, merged: &str) {
-        std::fs::create_dir(root.join(".aizen")).unwrap();
-        std::fs::create_dir(root.join("target")).unwrap();
-        std::fs::write(root.join("expected-merged.txt"), merged).unwrap();
-        // A real, bounded verification subprocess, not recursive Cargo under its build lock.
-        // Byte comparison proves this fixture only, not a typecheck or semantic serializability.
-        #[cfg(windows)]
-        let command = {
-            std::fs::write(root.join("target/verify-fixture.cmd"),
-                "@echo off\r\nfc /b owned.rs expected-merged.txt >nul 2>&1\r\nif errorlevel 1 exit /b 1\r\ntype owned.rs > target\\verify-started.txt\r\n:waiting\r\nif not exist target\\verify-release.txt goto waiting\r\ntype owned.rs > target\\verify-passed.txt\r\nexit /b 0\r\n").unwrap();
-            "call target\\verify-fixture.cmd"
-        };
-        #[cfg(not(windows))]
-        let command = "cmp -s owned.rs expected-merged.txt && cat owned.rs > target/verify-started.txt && while [ ! -f target/verify-release.txt ]; do sleep 0.01; done && cat owned.rs > target/verify-passed.txt";
-        std::fs::write(
-            root.join(".aizen/verify.json"),
-            json!({"commands":[command],"timeout_secs":5}).to_string(),
-        )
-        .unwrap();
-        crate::agent::mcp::trust_project().unwrap();
+    fn assert_retired(error: anyhow::Error) {
+        assert!(
+            format!("{error:#}").contains("speculative execution is retired"),
+            "{error:#}"
+        );
         assert_eq!(
-            crate::agent::verify_gate::detect_verify_commands(root),
-            vec![crate::agent::verify_gate::VerifyCommand::Custom(
-                command.into()
-            )]
+            crate::agent::tool_error_effect_state(&error),
+            crate::agent::tools::ToolEffectState::Settled
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[allow(clippy::await_holding_lock)] // HOME, then tape; retain until actual workers settle.
-    async fn speculative_real_workflow_same_file_bodies_overlap_and_dependencies_wait_for_verify() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // Pin the disposable HOME across awaited listener checks.
+    async fn retired_speculative_workflow_refuses_without_dispatch_or_implicit_migration() {
         let _home_lock = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -3866,80 +3522,54 @@ mod native_speculation_acceptance {
         let _env = crate::core::config::EnvGuard::set([
             ("AIZEN_HOME", home.as_os_str()),
             ("AIZEN_PROJECT_ROOT", root.as_os_str()),
-            ("AIZEN_MAX_SUBAGENTS", std::ffi::OsStr::new("4")),
-            ("AIZEN_SUBAGENT_CALL_SECS", std::ffi::OsStr::new("15")),
         ]);
         let _route = crate::core::config::EnvGuard::unset([
             "AIZEN_MODEL_OWNED_WORKFLOW_SPECULATION_FIXTURE_BASE_URL",
             "AIZEN_MODEL_OWNED_WORKFLOW_SPECULATION_FIXTURE_API_KEY",
             "AIZEN_NO_HOOKS",
         ]);
-        let _tape = crate::llm::replay::TAPE_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        crate::llm::replay::disable();
-        assert!(crate::agent::hooks::configured().is_none());
         std::fs::write(root.join(FILE), SOURCE).unwrap();
-        let merged = SOURCE
-            .replacen("    10\n", "    11\n", 1)
-            .replacen("    20\n", "    21\n", 1);
-        configure_verification(&root, &merged);
-        let suffix = crate::core::workspace_txn::stable_key(&fixture.path().display().to_string());
-        let suffix = &suffix[..16];
-        let state = Arc::new(ProviderState {
-            root: root.clone(),
-            scope: format!("owned-workflow-{suffix}"),
-            first: format!("wf-first-{suffix}"),
-            second: format!("wf-second-{suffix}"),
-            merged,
-            own_reads: AtomicUsize::new(0),
-            second_finished_first: AtomicBool::new(false),
-            verify_barrier_observed: AtomicBool::new(false),
-            dependent_started: AtomicBool::new(false),
-        });
-        let placement = crate::core::file_placement::PlacementContext::with_paths(
-            root.clone(),
-            home,
-            fixture.path().join("process"),
-            "workflow-acceptance",
+        std::fs::create_dir(root.join("target")).unwrap();
+        #[cfg(windows)]
+        let hook = "echo forbidden> target/hook-ran.txt";
+        #[cfg(not(windows))]
+        let hook = "printf forbidden > target/hook-ran.txt";
+        std::fs::write(
+            home.join("cli-config.json"),
+            json!({"hooks":{"pre_tool":[{"match":"*","run":hook,"timeout_secs":1}]}}).to_string(),
         )
         .unwrap();
-        let release = ReleaseBodies(Arc::new((Mutex::new(false), Condvar::new())));
-        let _release_on_failure = ReleaseOnDrop(release.clone());
-        let _verify_release_on_failure =
-            ReleaseVerifyOnDrop(root.join("target/verify-release.txt"));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let probe_release = release.clone();
+        assert!(crate::agent::hooks::configured().is_some());
+        let placement = crate::core::file_placement::PlacementContext::with_paths(
+            root.clone(),
+            home.clone(),
+            fixture.path().join("process"),
+            "workflow-retirement",
+        )
+        .unwrap();
+        let body_count = Arc::new(AtomicUsize::new(0));
+        let observed_bodies = body_count.clone();
+        let changes = Arc::new(crate::core::exec_ctx::WorkspaceChanges::default());
         let ctx = crate::core::exec_ctx::ExecutionContext::default()
             .with_placement(placement)
-            .with_resource_scope(state.scope.clone())
-            .with_deadline(Some(std::time::Instant::now() + Duration::from_secs(45)))
+            .with_resource_scope("workflow-retirement")
+            .with_deadline(Some(std::time::Instant::now() + Duration::from_secs(2)))
+            .with_workspace_changes(changes.clone())
             .with_native_body_probe(crate::agent::builtin::NativeBodyTestProbe::new(
-                move |tool, path| {
-                    if tool != "file_edit" {
-                        return;
-                    }
-                    let context = crate::core::exec_ctx::current()
-                        .expect("real Workflow native body context");
-                    assert!(!context.can_restore_workspace());
-                    let overlay = context.overlay().expect("real Workflow child overlay");
-                    tx.send(BodyArrival {
-                        label: context.dispatch_label().unwrap(),
-                        path: path.to_path_buf(),
-                        overlay: overlay.id().to_string(),
-                        base: overlay.base_id().to_string(),
-                        owner: overlay.owner().to_string(),
-                    })
-                    .unwrap();
-                    probe_release.wait();
+                move |_, _| {
+                    observed_bodies.fetch_add(1, Ordering::SeqCst);
                 },
             ));
+        let ledger = LedgerEntry(root.join(FILE));
+        let prior_read =
+            FileFingerprint::for_bytes(b"prior observation, not the current source bytes");
+        crate::core::read_ledger::note(&ledger.0, &prior_read);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_millis(250))
             .build()
             .unwrap();
         let tool = crate::agent::workflow_tool::WorkflowTool::new(
@@ -3952,224 +3582,105 @@ mod native_speculation_acceptance {
             root.clone(),
             0,
         );
-        let brief = "Use only native file tools on owned.rs. Read captured base, make one local file_edit, then read your private result. No shell, delegation, other files or claimed verification; the parent integrates and verifies.";
-        let args = json!({"mode":"fanout","tasks":[
-            {"id":state.first,"role":"daedalus","model":MODEL,"execution":"speculative","write_paths":[FILE],"max_steps":8,"prompt":format!("WF_SPEC_FIRST: {brief}")},
-            {"id":state.second,"role":"daedalus","model":MODEL,"execution":"speculative","write_paths":[FILE],"max_steps":8,"prompt":format!("WF_SPEC_SECOND: {brief}")},
-            {"id":"wf-after","role":"argus","model":MODEL,"read_paths":[FILE],"after":[state.first,state.second],"max_steps":4,
-                "prompt":"WF_SPEC_AFTER: After both edits have been integrated and parent verification accepted, use file_read to inspect the merged live owned.rs. Report that file only; no writes, shell, discovery or delegation."}
-        ]});
-        // Freeze/check real production endpoints before any provider work can run externally.
-        let (mut spec, _) = crate::agent::workflow_tool::build_spec(&args).unwrap();
-        prepare_workflow_spec_in_context(&mut spec, &root, &base, KEY, MODEL, &ctx).unwrap();
-        for task in &spec.tasks {
-            let endpoint = &task.prepared.as_ref().unwrap().ep;
-            assert_eq!(endpoint.base_url, base);
-            assert_eq!(endpoint.api_key, KEY);
-            assert_eq!(endpoint.model, MODEL);
-        }
-        let synthesis = &spec.prepared_synthesis.as_ref().unwrap().ep;
-        assert_eq!(synthesis.base_url, base);
-        assert_eq!(synthesis.api_key, KEY);
-        assert_eq!(synthesis.model, MODEL);
-        let prepared = tool.prepare_call(&args, &ctx).unwrap();
-        let body_state = state.clone();
-        let deadline = tokio::time::Instant::from_std(ctx.deadline().unwrap());
-        let controller = tokio::spawn(async move {
-            let _release_on_return = ReleaseOnDrop(release);
-            let mut entered = Vec::new();
-            for index in 0..2 {
-                // First arrival includes capture/admission; only the inter-body gap proves overlap.
-                let next = if index == 0 {
-                    deadline
-                } else {
-                    deadline.min(tokio::time::Instant::now() + WAIT)
-                };
-                entered.push(
-                    tokio::time::timeout_at(next, rx.recv())
-                        .await
-                        .expect("both actual Workflow bodies must enter")
-                        .unwrap(),
-                );
+        let brief = "Inspect only owned.rs through native file tools and report the requested result. Do not run commands, delegate, or claim verification.";
+        let retired = json!({"id":"retired","role":"daedalus","model":MODEL,"execution":"speculative","write_paths":[FILE],"max_steps":1,"prompt":brief});
+        let peer = json!({"id":"peer","role":"daedalus","model":MODEL,"execution":"speculative","write_paths":[FILE],"max_steps":1,"prompt":brief});
+        let direct = json!({"id":"direct","role":"argus","model":MODEL,"read_paths":[FILE],"max_steps":1,"prompt":brief});
+        let dependent = json!({"id":"dependent","role":"argus","model":MODEL,"read_paths":[FILE],"after":["retired","peer"],"max_steps":1,"prompt":brief});
+        let mut worktree = retired.clone();
+        worktree["isolation"] = json!("worktree");
+        let cases = [
+            vec![retired.clone(), peer, dependent],
+            vec![direct.clone(), retired.clone()],
+            vec![retired, direct],
+            vec![worktree],
+        ];
+        let before = fixture_image(fixture.path());
+        for tasks in cases {
+            let args = json!({"mode":"fanout","tasks":tasks});
+            assert_retired(
+                crate::agent::workflow_tool::build_spec(&args)
+                    .expect_err("retired request cannot build a workflow"),
+            );
+            let Err(error) = tool.plan_call(&args, &ctx) else {
+                panic!("retired request cannot produce a planned capability");
+            };
+            assert_retired(error);
+            let Err(error) = tool.prepare_call(&args, &ctx) else {
+                panic!("retired request cannot produce a prepared capability");
+            };
+            assert_retired(error);
+            assert_retired(
+                crate::core::exec_ctx::with_current(ctx.clone(), || {
+                    tool.execute_observation(&args)
+                })
+                .expect_err("retired request cannot execute"),
+            );
+
+            // Old serialized requests remain readable but cannot mint a fresh runtime scope,
+            // overlay, owned Git worktree, synthesis context, or dispatch through the CLI path.
+            let json_spec = json!({"name":"historical-retirement-fixture","tasks":args["tasks"]});
+            let mut spec: WorkflowSpec = serde_json::from_value(json_spec.clone()).unwrap();
+            assert!(spec
+                .tasks
+                .iter()
+                .any(|task| task.execution == ExecutionMode::Speculative));
+            assert_retired(
+                prepare_workflow_spec_in_context(&mut spec, &root, &base, KEY, MODEL, &ctx)
+                    .expect_err("historical execution label cannot authorize fresh preparation"),
+            );
+            assert!(spec.prepared_synthesis.is_none());
+            for task in &spec.tasks {
+                assert!(task.prepared.is_none());
+                assert!(task.prepared_metis.is_none());
+                assert!(task.owned.is_none());
+                assert!(task.attempt.is_none());
             }
-            assert_eq!(entered[0].path, entered[1].path);
-            assert_eq!(entered[0].path, body_state.root.join(FILE));
-            assert_ne!(entered[0].overlay, entered[1].overlay);
-            assert_ne!(entered[0].owner, entered[1].owner);
-            assert_eq!(entered[0].base, entered[1].base);
-            for id in [&body_state.first, &body_state.second] {
-                assert!(entered.iter().any(|body| body.label.contains(id.as_str())));
-            }
-            body_state.assert_live_base();
-            assert!(!body_state.dependent_started.load(Ordering::SeqCst));
-        });
-        let verify_state = state.clone();
-        let verifier = tokio::spawn(async move {
-            let _release_on_return =
-                ReleaseVerifyOnDrop(verify_state.root.join("target/verify-release.txt"));
-            // This includes both children, sealing, integration and durable verifier admission;
-            // the short native-body rendezvous budget starts too early to bound this whole path.
-            bounded_until_for(
-                Duration::from_secs(40),
-                || verify_state.root.join("target/verify-started.txt").exists(),
-                "real parent verifier entered",
-            )
-            .await;
+            let round_trip: WorkflowSpec =
+                serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
             assert_eq!(
-                std::fs::read(verify_state.root.join(FILE)).unwrap(),
-                verify_state.merged.as_bytes()
+                round_trip
+                    .tasks
+                    .iter()
+                    .map(|task| task.execution)
+                    .collect::<Vec<_>>(),
+                spec.tasks
+                    .iter()
+                    .map(|task| task.execution)
+                    .collect::<Vec<_>>()
             );
-            assert_eq!(verify_state.own_reads.load(Ordering::SeqCst), 3);
-            assert!(verify_state.second_finished_first.load(Ordering::SeqCst));
-            verify_state.assert_private_reports();
-            assert!(!verify_state.root.join("target/verify-passed.txt").exists());
-            assert!(!verify_state.dependent_started.load(Ordering::SeqCst));
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            verify_state.assert_private_reports();
-            assert!(!verify_state.dependent_started.load(Ordering::SeqCst));
-            verify_state
-                .verify_barrier_observed
-                .store(true, Ordering::SeqCst);
-        });
-        struct WorkflowCompleteOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for WorkflowCompleteOnDrop {
-            fn drop(&mut self) {
-                if let Some(send) = self.0.take() {
-                    let _ = send.send(());
-                }
-            }
-        }
-        let (complete, mut completed) = tokio::sync::oneshot::channel();
-        let completion = WorkflowCompleteOnDrop(Some(complete));
-        let server_state = state.clone();
-        let server = tokio::spawn(async move {
-            let mut handlers = Vec::new();
-            let mut accept_error = None;
-            loop {
-                // Sealing/integration/verification intentionally produce no provider traffic.
-                // Only completion of the real Workflow observer retires this listener.
-                let accepted = tokio::select! {
-                    biased;
-                    _ = &mut completed => break,
-                    accepted = listener.accept() => accepted,
-                };
-                match accepted {
-                    Ok((socket, peer)) => {
-                        assert!(peer.ip().is_loopback());
-                        let state = server_state.clone();
-                        handlers.push(tokio::spawn(async move {
-                            tokio::time::timeout(
-                                Duration::from_secs(25),
-                                provider_request(socket, state),
-                            )
-                            .await
-                            .expect("bounded Workflow fixture provider")
-                        }));
-                    }
-                    Err(error) => {
-                        accept_error = Some(format!("owned Workflow listener: {error}"));
-                        break;
-                    }
-                }
-            }
-            drop(listener);
-            // All handlers run concurrently with their existing 25-second bounds. Drain them
-            // before fixture cleanup; do not detach them or abort any real Workflow body.
-            let accepted = handlers.len();
-            let mut results = Vec::new();
-            for handler in handlers {
-                results.push(handler.await);
-            }
-            (accept_error, accepted, results)
-        });
-        // Never timeout/drop the Workflow observer: real bodies/HTTP/verify have bounded lifetimes,
-        // and production retains containment until physical settlement has been established.
-        // Catch only to signal/drain fixture helpers on unwind, then resume the original panic.
-        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _completion = completion;
-            tool.execute_prepared(&prepared)
-        }));
-        let controller_result = controller.await;
-        let verifier_result = verifier.await;
-        let server_result = server.await;
-        let result = match execution {
-            Ok(result) => result,
-            Err(panic) => {
-                // A panic is not proof that production's physical workers have settled.
-                std::mem::forget(fixture);
-                std::panic::resume_unwind(panic);
-            }
-        };
-        if result.as_ref().err().is_some_and(|error| {
-            crate::agent::tool_error_effect_state(error)
-                != crate::agent::tools::ToolEffectState::Settled
-        }) {
-            std::mem::forget(fixture);
-            panic!(
-                "Workflow workers unsettled; owned fixture retained at {}: {result:?}",
-                root.display()
-            );
-        }
-        let (accept_error, accepted, handlers) = server_result.unwrap();
-        let mut labels = Vec::new();
-        let mut handler_failures = Vec::new();
-        for (index, handler) in handlers.into_iter().enumerate() {
-            match handler {
-                Ok(label) => labels.push(label),
-                Err(error) => handler_failures.push(format!("request {}: {error}", index + 1)),
-            }
-        }
-        let diagnostics = format!(
-            "accepted={accepted}; labels={labels:?}; handler failures={handler_failures:?}; listener error={accept_error:?}; Workflow result: {result:?}"
-        );
-        controller_result.unwrap_or_else(|error| {
-            panic!("real Workflow native-body overlap assertions: {error}; {diagnostics}")
-        });
-        verifier_result.unwrap_or_else(|error| {
-            panic!("real Workflow verification barrier assertions: {error}; {diagnostics}")
-        });
-        assert!(
-            handler_failures.is_empty(),
-            "owned Workflow provider assertions: {diagnostics}"
-        );
-        assert!(accept_error.is_none(), "{diagnostics}");
-        assert_eq!(
-            accepted, 11,
-            "expected 11 owned Workflow requests: {diagnostics}"
-        );
-        for (label, count) in [("first", 4), ("second", 4), ("after", 2), ("synthesis", 1)] {
+            assert_eq!(body_count.load(Ordering::SeqCst), 0);
+            assert!(!changes.changed());
+            assert!(changes.paths().is_empty());
             assert_eq!(
-                labels.iter().filter(|seen| seen.as_str() == label).count(),
-                count,
-                "{diagnostics}"
+                crate::core::read_ledger::observed(&ledger.0),
+                Some(prior_read.clone())
+            );
+            assert_eq!(
+                fixture_image(fixture.path()),
+                before,
+                "refusal altered source, hooks, journals, ownership, admission or child reports"
             );
         }
-        let observation = result.unwrap();
-        assert!(
-            !observation.text.contains("Workflow incomplete"),
-            "{}",
-            observation.text
-        );
-        for marker in [
-            "WF_SPEC_FIRST_COMPLETE",
-            "WF_SPEC_SECOND_COMPLETE",
-            "WF_SPEC_AFTER_COMPLETE",
+        assert!(ctx.native_scope().is_none());
+        assert!(!ctx.has_owned_git_task());
+        assert!(ctx.tool_workers().is_none());
+        assert!(ctx.can_restore_workspace());
+        for path in [
+            "native-journal-v1",
+            "native-workspaces",
+            "timemachine",
+            "coop",
+            "locks/v1/slots/subagents",
         ] {
-            assert!(observation.text.contains(marker), "{}", observation.text);
+            assert!(!home.join(path).exists(), "retirement created {path}");
         }
-        assert!(state.dependent_started.load(Ordering::SeqCst));
-        assert_eq!(
-            std::fs::read(root.join(FILE)).unwrap(),
-            state.merged.as_bytes()
-        );
-        assert_eq!(
-            std::fs::read(root.join("target/verify-passed.txt")).unwrap(),
-            state.merged.as_bytes()
-        );
-        assert_eq!(
-            prepared.workspace_changes.as_ref().unwrap().paths(),
-            vec![root.join(FILE)],
-            "only real parent integration, not private authorship, records a live workspace change"
+        // No provider server is spawned. Any queued child/synthesis connection remains visible.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "retired Workflow contacted the owned loopback provider"
         );
     }
 }
@@ -4220,6 +3731,10 @@ mod tests {
         );
         assert!(std::mem::size_of_val(&collect) <= 16 * 1024);
         let child_bytes = std::mem::size_of_val(&child);
+        eprintln!(
+            "workflow future frames: collect={} B; child={child_bytes} B",
+            std::mem::size_of_val(&collect)
+        );
         assert!(
             child_bytes <= 64 * 1024,
             "workflow child future is {child_bytes} B; keep the streaming loop boxed"
@@ -4304,6 +3819,7 @@ mod tests {
                     attempt: None,
                     selected_for: None,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 },
                 finished,
                 Some(track),
@@ -4330,104 +3846,7 @@ mod tests {
     }
 
     #[test]
-    fn private_workflow_reports_publish_only_after_acceptance_and_refusal_stays_private() {
-        let _home = crate::core::config::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let fixture = crate::core::file_placement::tests::TestDir::new();
-        let _env =
-            crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path().join("home"))]);
-        let scope = format!("workflow-private-report-{}", fixture.path().display());
-        let reports = DeferredWorkflowReports {
-            parent_scope: scope.clone(),
-            pending: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-        // This test isolates report publication; seed only the pending report map, not release
-        // proof. Production `defer` requires a real token before this state can be reached.
-        for accepted in [true, false] {
-            let id = if accepted {
-                "accepted-private"
-            } else {
-                "rejected-private"
-            };
-            let key = AttemptKey {
-                task_id: TaskId(id.into()),
-                ordinal: 1,
-                kind: AttemptKind::Initial,
-            };
-            let report = TaskOutcome {
-                id: id.into(),
-                attempt: Some(key.clone()),
-                selected_for: None,
-                role: "daedalus".into(),
-                model: "m".into(),
-                status: "done".into(),
-                summary: "private work is not yet live".into(),
-                iters: 1,
-                tokens_in: 11,
-                tokens_out: 3,
-                evidence_images: Vec::new(),
-            };
-            let track = crate::agent::orchestration::start_workflow_child(None, id, "daedalus");
-            track.set_phase(
-                crate::agent::orchestration::Phase::Running,
-                "private; awaiting integration + verification",
-            );
-            reports
-                .pending
-                .borrow_mut()
-                .insert(key.clone(), (Some(track), report.clone(), None));
-            let note = crate::agent::blackboard::dir_for(&scope).join(format!("{id}.md"));
-            assert!(
-                !note.exists(),
-                "physical completion cannot publish a private report"
-            );
-            assert!(crate::agent::orchestration::format_status()
-                .lines()
-                .any(|line| line.contains(id) && line.contains("awaiting integration")));
-            if accepted {
-                let intent = DispatchIntent {
-                    key,
-                    goal: TaskId(id.into()),
-                    task: WorkflowTask::default(),
-                    inputs: Vec::new(),
-                    stage: AttemptKind::Initial,
-                    trigger: None,
-                    deadline_unix_ms: None,
-                    live_deadline: None,
-                };
-                reports.accept(std::slice::from_ref(&intent));
-                assert!(std::fs::read_to_string(&note)
-                    .unwrap()
-                    .contains(&report.summary));
-                let first = std::fs::read_to_string(&note).unwrap();
-                reports.accept(std::slice::from_ref(&intent));
-                assert_eq!(
-                    std::fs::read_to_string(&note).unwrap(),
-                    first,
-                    "publish at most once"
-                );
-            } else {
-                reports.refuse_pending();
-                assert!(
-                    !note.exists(),
-                    "failed integration cannot leak as settled work"
-                );
-            }
-            assert!(reports.pending.borrow().is_empty());
-            let expected = if accepted {
-                "done"
-            } else {
-                "verification-failed"
-            };
-            assert!(crate::agent::orchestration::format_status()
-                .lines()
-                .any(|line| line.contains(id) && line.contains(expected)));
-        }
-    }
-
-    #[test]
-    fn speculative_workflow_locally_disables_media_without_changing_session_config() {
+    fn retired_workflow_refuses_before_media_policy_or_session_changes() {
         let _home = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4437,39 +3856,34 @@ mod tests {
         let mut task = chained("private", "daedalus", &[], None);
         task.execution = ExecutionMode::Speculative;
         task.write_paths = Some(vec!["native.txt".into()]);
-        let config_before = serde_json::to_value(crate::core::cli_config::load()).unwrap();
-        let dispatch = resolve_workflow_dispatch(
-            fixture.path(),
-            "2026-10-15",
-            &task,
-            "https://unused.example/v1",
-            "unused",
-            "m",
-            &crate::core::exec_ctx::ExecutionContext::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            dispatch.image_config.response_visuals,
-            Some(crate::core::cli_config::ResponseVisuals::Off)
-        );
-        assert!(matches!(
-            dispatch.image_policy,
-            crate::llm::media::VisionPolicy::Unsupported
-        ));
-        assert!(!dispatch.relay_allowed);
-        assert!(dispatch
-            .system
-            .contains("native-only lane returns text, not media"));
-        assert_eq!(
-            serde_json::to_value(crate::core::cli_config::load()).unwrap(),
-            config_before
-        );
-        validate_speculative_workflow_task(&task, &dispatch).unwrap();
-        task.reference_ids = vec!["original".into()];
-        assert!(validate_speculative_workflow_task(&task, &dispatch).is_err());
-        task.reference_ids.clear();
-        task.return_evidence = vec!["capture".into()];
-        assert!(validate_speculative_workflow_task(&task, &dispatch).is_err());
+        let before = serde_json::to_value(crate::core::cli_config::load()).unwrap();
+        for (references, evidence) in [
+            (vec![], vec![]),
+            (vec!["original".into()], vec![]),
+            (vec![], vec!["capture".into()]),
+        ] {
+            task.reference_ids = references;
+            task.return_evidence = evidence;
+            let result = resolve_workflow_dispatch(
+                fixture.path(),
+                "2026-10-15",
+                &task,
+                "https://unused.example/v1",
+                "unused",
+                "m",
+                &crate::core::exec_ctx::ExecutionContext::default(),
+            );
+            let Err(error) = result else {
+                panic!("retired lane must never prepare a dispatch");
+            };
+            assert!(error
+                .to_string()
+                .contains("speculative execution is retired"));
+            assert_eq!(
+                serde_json::to_value(crate::core::cli_config::load()).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]
@@ -4553,6 +3967,7 @@ mod tests {
             declared_write_paths: task.write_paths.clone(),
             declared_read_paths: task.read_paths.clone(),
             execution: task.execution,
+            isolation: task.isolation,
             system,
             contract: crate::agent::task_tool::TaskContract {
                 boundaries: None,
@@ -4852,6 +4267,7 @@ mod tests {
             declared_write_paths: None,
             declared_read_paths: None,
             execution: ExecutionMode::Direct,
+            isolation: WorkflowIsolation::Shared,
             system: "Original 2026-10-11 system".into(),
             contract: crate::agent::task_tool::TaskContract {
                 boundaries: None,
@@ -5071,6 +4487,7 @@ mod tests {
             selected_for: None,
             attempt: None,
             evidence_images: Vec::new(),
+            git_handoff: None,
         };
         assert!(verdict_failed(&o("done", "VERDICT: FAIL\n2 tests failed")));
         assert!(verdict_failed(&o(
@@ -5148,6 +4565,7 @@ mod tests {
                     selected_for: None,
                     attempt: None,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 }
             }
         };
@@ -5237,6 +4655,7 @@ mod tests {
                     selected_for: None,
                     attempt: None,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 }
             }
         };
@@ -5307,6 +4726,7 @@ mod tests {
                     selected_for: None,
                     attempt: None,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 }
             }
         };
@@ -5366,6 +4786,7 @@ mod tests {
                     selected_for: None,
                     attempt: None,
                     evidence_images: Vec::new(),
+                    git_handoff: None,
                 }
             }
         };
@@ -5411,6 +4832,7 @@ mod tests {
                         selected_for: None,
                         attempt: None,
                         evidence_images: Vec::new(),
+                        git_handoff: None,
                     }
                 }
             }
@@ -5458,6 +4880,7 @@ mod tests {
                         selected_for: None,
                         attempt: None,
                         evidence_images: Vec::new(),
+                        git_handoff: None,
                     }
                 }
             }
@@ -5661,6 +5084,7 @@ mod tests {
                 selected_for: None,
                 attempt: None,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             },
             TaskOutcome {
                 id: "perf".into(),
@@ -5674,6 +5098,7 @@ mod tests {
                 selected_for: None,
                 attempt: None,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             },
         ];
         let p = build_synthesis_prompt("review", "merge", &results);
@@ -5699,6 +5124,7 @@ mod tests {
             selected_for: None,
             attempt: None,
             evidence_images: Vec::new(),
+            git_handoff: None,
         }];
         let p = build_synthesis_prompt("w", "merge", &results);
         assert!(p.contains("[truncated:"), "must mark truncation: {p}");
@@ -6096,6 +5522,8 @@ mod tests {
         assert!(selected_workflow_images(&[first, final_attempt]).is_empty());
         for status in [
             "error",
+            "incomplete",
+            "incomplete · json:ok",
             "cancelled",
             "deadline",
             "max-iters",
@@ -6105,6 +5533,30 @@ mod tests {
             assert!(!completed_status(status));
         }
         assert!(completed_status("done · json:ok"));
+    }
+
+    #[test]
+    fn unverified_handoff_is_an_integration_candidate_not_completed_work() {
+        assert!(integration_candidate_status(UNVERIFIED_HANDOFF_STATUS));
+        assert!(integration_candidate_status(&format!(
+            "{UNVERIFIED_HANDOFF_STATUS} · json:ok"
+        )));
+        assert!(!completed_status(UNVERIFIED_HANDOFF_STATUS));
+        for status in [
+            "incomplete",
+            "incomplete · json:ok",
+            "verification-failed",
+            "model says incomplete-unverified-handoff",
+            "incomplete-unverified-handoff · json:invalid",
+        ] {
+            assert!(!integration_candidate_status(status), "{status}");
+        }
+        let mut partial = outcome("child", "All checks passed; incomplete-unverified-handoff");
+        partial.status = "incomplete".into();
+        assert!(!integration_candidate_status(&partial.status));
+        assert_eq!(logical_failures(&[partial.clone()]), 1);
+        partial.status = UNVERIFIED_HANDOFF_STATUS.into();
+        assert_eq!(logical_failures(&[partial]), 1);
     }
 
     fn outcome(id: &str, summary: &str) -> TaskOutcome {
@@ -6120,6 +5572,7 @@ mod tests {
             selected_for: None,
             attempt: None,
             evidence_images: Vec::new(),
+            git_handoff: None,
         }
     }
 

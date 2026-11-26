@@ -48,6 +48,14 @@ pub struct StatusHandle(pub i64);
 pub struct Inbound<C> {
     pub route: String,
     pub chat: C,
+    pub message: IncomingMessage,
+}
+
+/// Transport identity belongs to each delivery, even while several senders share one lane.
+pub struct IncomingMessage {
+    pub event_id: String,
+    pub message_id: String,
+    pub sender_id: Option<String>,
     pub text: String,
 }
 
@@ -133,10 +141,10 @@ pub trait Platform: Send + Sync + 'static {
     fn supports_approval(&self) -> bool {
         false
     }
-    /// Pin the approval route to `(route, chat)` before a turn so a prompt returns to the SAME bot.
-    fn set_approval_route(&self, _route: &str, _chat: Self::Chat) {}
-    /// Clear it after the turn so it never leaks to the next one.
-    fn clear_approval_route(&self) {}
+    /// A pre-topic transcript can carry a still-active execution restriction.
+    fn legacy_parent_chat(_chat: Self::Chat) -> Option<String> {
+        None
+    }
 
     /// True if this platform can host extra bots live (`/addbot` / `/rmbot`).
     fn supports_multibot(&self) -> bool {
@@ -167,8 +175,7 @@ pub trait Platform: Send + Sync + 'static {
 
     /// The persona a given sub-bot `route` should speak as, layered over the global `config.persona`
     /// for one turn. `None` ⇒ use the global persona (the primary "default" bot = the user's own agent
-    /// identity). Only affects the `<persona>`/`<self>` blocks; `<user_memory>` stays global, so a
-    /// hosted bot has its own character but shares the primary agent's memory. Default: no override.
+    /// identity). This sets the voice. The selected Memory provider handles conversation scope.
     fn persona_for(&self, _route: &str) -> Option<String> {
         None
     }

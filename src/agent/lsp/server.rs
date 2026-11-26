@@ -240,6 +240,38 @@ struct SymHit {
     range: Range,
 }
 
+/// Keep the IO future ahead of its drain token in drop order, including an abort before the first
+/// poll. Separate captures in an async block do not provide that ordering for unpolled tasks.
+struct LspMainloop<F, T> {
+    io: std::pin::Pin<Box<F>>,
+    _stop: tokio::sync::oneshot::Sender<()>,
+    _lifetime: crate::agent::process::DrainLifetime<T>,
+}
+
+// The IO future stays pinned in its Box when this outer owner moves.
+impl<F, T> Unpin for LspMainloop<F, T> {}
+
+impl<F: std::future::Future, T> std::future::Future for LspMainloop<F, T> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().io.as_mut().poll(cx).map(|_| ())
+    }
+}
+
+fn sidecar_settlement_signal<T>(
+    lifetime: &Arc<crate::agent::process::SettlementLifetime<T>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (released, settled) = tokio::sync::watch::channel(false);
+    lifetime.on_release(move || {
+        released.send_replace(true);
+    });
+    settled
+}
+
 pub struct LspServer {
     pub spec: &'static ServerSpec,
     pub root: PathBuf,
@@ -253,6 +285,8 @@ pub struct LspServer {
     /// Observer task; its drain token and captured stop sender keep admission until actual IO stops
     /// and request verified teardown from a separate monitor that owns the child.
     mainloop_handle: tokio::task::JoinHandle<()>,
+    /// Observation only: a closed channel without `true` means quarantined, not settled.
+    settled: tokio::sync::watch::Receiver<bool>,
 }
 
 impl LspServer {
@@ -328,6 +362,7 @@ impl LspServer {
         // the charge failed — from then on only this monitor's proven tree exit retires it, and it
         // clears by itself. A successful start releases the charge as a live owner takes over.
         let charge = unsettled.track(&lifetime);
+        let settled = sidecar_settlement_signal(&lifetime);
         let io_lifetime = lifetime.drain();
         let stdout = child.stdout.take();
         let stdin = child.stdin.take();
@@ -349,11 +384,10 @@ impl LspServer {
             })?
             .compat_write();
 
-        let mainloop_handle = tokio::spawn(async move {
-            let _io_lifetime = io_lifetime;
-            let _ = mainloop.run_buffered(stdout, stdin).await;
-            // Transport completion requests teardown, but never itself proves the tree settled.
-            drop(stop);
+        let mainloop_handle = tokio::spawn(LspMainloop {
+            io: Box::pin(mainloop.run_buffered(stdout, stdin)),
+            _stop: stop,
+            _lifetime: io_lifetime,
         });
         // Dropping the observer also needs to stop a mainloop that is still waiting on IO. A second
         // sender is unnecessary: aborting that task drops its captured `stop` and wakes the monitor.
@@ -367,10 +401,10 @@ impl LspServer {
             diags,
             opened: AsyncMutex::new(HashMap::new()),
             mainloop_handle,
+            settled,
         };
-        // The handshake is the last fallible startup step: past it a live owner holds the child, so the
-        // charge retires. Before it, a failure marks the child unowned and it stays charged until the
-        // monitor proves the tree exited.
+        // Startup retains its charge through every await, including seed_open below. Cancellation
+        // drops an unresolved charge into failed state until the monitor proves physical settlement.
         server.caps = match server.initialize(root, init_timeout).await {
             Ok(caps) => caps,
             Err(error) => {
@@ -380,12 +414,12 @@ impl LspServer {
                 ));
             }
         };
-        charge.release();
         // tsserver-style servers only build a project once a file is open; seed one so project-wide
         // queries (workspace/symbol) work even before any file-anchored query happens.
         if !server.has_indexing_signal() {
             server.seed_open().await;
         }
+        charge.release();
         Ok(server)
     }
 
@@ -1011,12 +1045,22 @@ impl LspServer {
         })
     }
 
-    /// Graceful shutdown handshake (best-effort; `Drop` is the hard backstop).
+    /// Graceful handshake, then a bounded wait for physical settlement (never a kill acknowledgement).
+    /// Cancellation or timeout only stops observing; the monitor keeps the guard or quarantines it.
     pub async fn shutdown(&self) {
         let mut sock = self.socket.clone();
         let _ = tokio::time::timeout(Duration::from_secs(5), sock.shutdown(())).await;
         let _ = sock.exit(());
         let _ = sock.emit(Stop);
+        let mut settled = self.settled.clone();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while !*settled.borrow_and_update() {
+                if settled.changed().await.is_err() {
+                    break; // Unproven/quarantined: channel closure is not settlement proof.
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -1480,6 +1524,109 @@ async fn read_line_snippet(path: &Path, line0: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PendingIo {
+        closed: Arc<AtomicBool>,
+        polled: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl std::future::Future for PendingIo {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if let Some(polled) = self.polled.take() {
+                let _ = polled.send(());
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingIo {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+
+    struct IoCheckedOwner {
+        io_closed: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Drop for IoCheckedOwner {
+        fn drop(&mut self) {
+            assert!(self.io_closed.load(Ordering::Acquire));
+            self.released.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mainloop_abort_closes_io_before_releasing_proven_ownership() {
+        // Cover both a task aborted before its first poll and one suspended inside the IO future.
+        for started in [false, true] {
+            let io_closed = Arc::new(AtomicBool::new(false));
+            let released = Arc::new(AtomicBool::new(false));
+            let lifetime = Arc::new(crate::agent::process::SettlementLifetime::new(
+                IoCheckedOwner {
+                    io_closed: Arc::clone(&io_closed),
+                    released: Arc::clone(&released),
+                },
+                |_| panic!("proven fixture must not quarantine"),
+            ));
+            let settled = sidecar_settlement_signal(&lifetime);
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let (polled, polling) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(LspMainloop {
+                io: Box::pin(PendingIo {
+                    closed: io_closed,
+                    polled: Some(polled),
+                }),
+                _stop: stop,
+                _lifetime: lifetime.drain(),
+            });
+            if started {
+                polling.await.unwrap();
+            }
+            lifetime.prove_tree_settled();
+            assert!(!released.load(Ordering::Acquire));
+            assert!(!*settled.borrow());
+            task.abort();
+            // Merely requesting abort does not drop the future, even with tree proof already set.
+            assert!(!released.load(Ordering::Acquire));
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(stopped.await.is_err());
+            assert!(released.load(Ordering::Acquire));
+            assert!(*settled.borrow());
+        }
+    }
+
+    #[test]
+    fn missing_tree_proof_closes_signal_without_reporting_settlement() {
+        let quarantined = Arc::new(AtomicBool::new(false));
+        let lifetime = Arc::new(crate::agent::process::SettlementLifetime::new(
+            Arc::clone(&quarantined),
+            |quarantined| quarantined.store(true, Ordering::Release),
+        ));
+        let settled = sidecar_settlement_signal(&lifetime);
+        let io_closed = Arc::new(AtomicBool::new(false));
+        let (stop, _stopped) = tokio::sync::oneshot::channel();
+        let task = LspMainloop {
+            io: Box::pin(PendingIo {
+                closed: Arc::clone(&io_closed),
+                polled: None,
+            }),
+            _stop: stop,
+            _lifetime: lifetime.drain(),
+        };
+        drop(lifetime);
+        drop(task);
+        assert!(io_closed.load(Ordering::Acquire));
+        assert!(quarantined.load(Ordering::Acquire));
+        assert!(!*settled.borrow());
+        assert!(settled.has_changed().is_err());
+    }
 
     fn pos(line: u32, ch: u32) -> Position {
         Position {

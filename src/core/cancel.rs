@@ -114,6 +114,10 @@ impl TurnCancel {
 }
 
 thread_local! {
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "initializer is already const; Clippy 1.99 reports this macro invocation"
+    )]
     static CURRENT: RefCell<Vec<TurnCancel>> = const { RefCell::new(Vec::new()) };
 }
 

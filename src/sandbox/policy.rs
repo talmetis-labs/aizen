@@ -254,6 +254,8 @@ pub(super) fn native_plugin_fs(policy: &super::request::NativePluginPolicy) -> F
         read_write,
         read_only,
         exec_files: Vec::new(),
+        #[cfg(target_os = "linux")]
+        remove_worktree_parent: None,
         deny: Vec::new(),
     }
 }
@@ -274,6 +276,9 @@ pub struct FsPolicy {
     /// Unix kernel backends read it; Windows has no filesystem backend to feed.
     #[cfg_attr(windows, allow(dead_code))]
     pub exec_files: Vec<PathBuf>,
+    /// Landlock checks directory removal against its parent. This grants only that right.
+    #[cfg(target_os = "linux")]
+    pub remove_worktree_parent: Option<PathBuf>,
     /// Directories that must stay UNREADABLE even where broad reads are otherwise allowed
     /// (macOS deny rules; doctor's adversarial checks everywhere). On Linux the allow-list
     /// already excludes them.
@@ -350,6 +355,8 @@ pub fn fs_policy(workspace: &Path, tmp: Option<&Path>, s: &SandboxSettings) -> F
         read_write: rw,
         read_only: ro,
         exec_files: Vec::new(),
+        #[cfg(target_os = "linux")]
+        remove_worktree_parent: None,
         deny: credential_dirs(&home),
     }
 }
@@ -553,6 +560,11 @@ mod tests {
 
     #[test]
     fn broad_workspaces_are_flagged() {
+        // home_dir() is read both here and inside workspace_too_broad. Other fixtures replace
+        // HOME/USERPROFILE, so the comparison needs the same lock as those writers.
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         #[cfg(windows)]
         {
             assert!(workspace_too_broad(Path::new("C:\\")));

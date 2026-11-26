@@ -309,6 +309,10 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Write `body` under this run's scratch dir; `None` when the disk says no (the caller then keeps
 /// whatever it was going to keep and says the text was dropped).
 pub fn spill_to_scratch(tool: &str, body: &str) -> Option<PathBuf> {
+    // Spill files are auxiliary output, not session persistence or exact-plan bookkeeping.
+    // Keep the originating policy admitted across the physical write; suppressed output is cut.
+    let ctx = super::hooks::automation_context(None);
+    let _admitted = super::hooks::admit_automation(&ctx).ok()?;
     let dir = crate::core::scratch::dir().join("tool-output");
     std::fs::create_dir_all(&dir).ok()?;
     let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);

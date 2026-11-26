@@ -221,11 +221,6 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
             image_mode,
             update_check,
             skill_registry,
-            timemachine_keep,
-            timemachine_keep_safety,
-            timemachine_max_files,
-            timemachine_max_bytes,
-            timemachine_max_file_bytes,
             auto_effort,
             reasoning_effort,
             approval,
@@ -315,11 +310,6 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                 image_mode.is_some(),
                 update_check.is_some(),
                 skill_registry.is_some(),
-                timemachine_keep.is_some(),
-                timemachine_keep_safety.is_some(),
-                timemachine_max_files.is_some(),
-                timemachine_max_bytes.is_some(),
-                timemachine_max_file_bytes.is_some(),
                 auto_effort.is_some(),
                 reasoning_effort.is_some(),
                 approval.is_some(),
@@ -430,21 +420,6 @@ pub(crate) async fn run_config(cmd: Option<ConfigCmd>) -> Result<()> {
                     }
                     cfg.skill_registry = Some(v.to_string());
                 }
-            }
-            if let Some(k) = timemachine_keep {
-                cfg.timemachine_keep = Some(k); // 0 = unlimited
-            }
-            if let Some(k) = timemachine_keep_safety {
-                cfg.timemachine_keep_safety = Some(k);
-            }
-            if let Some(k) = timemachine_max_files {
-                cfg.timemachine_max_files = Some(k.max(1));
-            }
-            if let Some(k) = timemachine_max_bytes {
-                cfg.timemachine_max_bytes = Some(k.max(1));
-            }
-            if let Some(k) = timemachine_max_file_bytes {
-                cfg.timemachine_max_file_bytes = Some(k.max(1));
             }
             if let Some(b) = auto_effort {
                 cfg.auto_effort = Some(b);
@@ -586,8 +561,18 @@ pub(crate) fn provider_row(cfg: &cli_config::CliConfig, p: &cli_config::Provider
 
 /// Manage named main endpoint profiles from the CLI.
 async fn run_provider_config(cmd: ProviderConfigCmd) -> Result<()> {
+    if let ProviderConfigCmd::Key {
+        stdin,
+        output_format,
+    } = &cmd
+    {
+        crate::core::provider_key::run(*stdin, output_format.as_deref());
+    }
     let mut cfg = cli_config::load();
     match cmd {
+        ProviderConfigCmd::Key { .. } => {
+            unreachable!("machine key writes dispatch before config load")
+        }
         ProviderConfigCmd::Add {
             name,
             base_url,
@@ -954,31 +939,6 @@ fn print_config(cfg: &cli_config::CliConfig) {
             on(cfg.persona_evolve.unwrap_or(true))
         ),
     );
-    row(
-        "timeline",
-        match cfg.timemachine_keep.unwrap_or(50) {
-            0 => format!(
-                "{}  {}",
-                theme::accent("unlimited"),
-                theme::faint("· keep every checkpoint")
-            ),
-            k => format!(
-                "keep {}  {}",
-                theme::accent(k.to_string()),
-                theme::faint("· auto-prune oldest")
-            ),
-        },
-    );
-    row(
-        "snapshot budget",
-        format!(
-            "{} files · {} total · {} each",
-            cfg.timemachine_max_files.unwrap_or(100_000),
-            fmt_bytes(cfg.timemachine_max_bytes.unwrap_or(2 * 1024 * 1024 * 1024)),
-            fmt_bytes(cfg.timemachine_max_file_bytes.unwrap_or(512 * 1024 * 1024))
-        ),
-    );
-
     section("Sandbox");
     row(
         "saved mode",
@@ -1244,21 +1204,6 @@ fn print_roles_section(cfg: &cli_config::CliConfig) {
                 theme::faint("· provider routing is unmasked")
             ),
         ),
-    }
-}
-
-fn fmt_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if bytes >= GIB {
-        format!("{:.1}GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1}MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1}KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes}B")
     }
 }
 
@@ -3977,30 +3922,7 @@ fn prompt_compact_threshold(theme: &ColorfulTheme, cfg: &mut cli_config::CliConf
     Ok(())
 }
 
-/// Ask how many code checkpoints the time machine keeps before pruning the oldest. `unlimited`/`all`
-/// store 0, which the pruner reads as "never".
-fn prompt_timemachine_keep(theme: &ColorfulTheme, cfg: &mut cli_config::CliConfig) -> Result<()> {
-    let cur = cfg.timemachine_keep.unwrap_or(50);
-    let entered = Input::<String>::with_theme(theme)
-        .with_prompt("Time-machine checkpoints to keep? (a number, or `unlimited`)")
-        .default(if cur == 0 {
-            "unlimited".to_string()
-        } else {
-            cur.to_string()
-        })
-        .allow_empty(true)
-        .interact_text()?;
-    cfg.timemachine_keep = match entered.trim().to_ascii_lowercase().as_str() {
-        "unlimited" | "all" | "0" => Some(0),
-        s => match s.parse::<usize>() {
-            Ok(n) => Some(n),
-            _ => Some(cur), // blank/garbage → keep current
-        },
-    };
-    Ok(())
-}
-
-/// Section editor: session behavior — auto-compact %, skill/memory/persona learning, checkpoints.
+/// Section editor: session behavior — auto-compact %, skill/memory/persona learning.
 fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
     let theme = ui_theme();
     prompt_compact_threshold(&theme, cfg)?;
@@ -4016,7 +3938,6 @@ fn config_edit_session(cfg: &mut cli_config::CliConfig) -> Result<()> {
         "Persona evolution (learn a voice over time)?",
         cfg.persona_evolve.unwrap_or(true),
     )?);
-    prompt_timemachine_keep(&theme, cfg)?;
     Ok(())
 }
 
@@ -4453,9 +4374,6 @@ async fn config_setup_full(cfg: &mut cli_config::CliConfig) -> Result<()> {
         "Auto-learn durable facts from each turn?",
         cfg.memory_auto_learn.unwrap_or(true),
     )?);
-
-    // 8) time machine — how many code checkpoints to keep before auto-pruning the oldest.
-    prompt_timemachine_keep(&theme, cfg)?;
 
     step("Display");
     // 8) icon style — nerd (default; crisp monochrome glyphs, needs a Nerd Font) / emoji (colour,

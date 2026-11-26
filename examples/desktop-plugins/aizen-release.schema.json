@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Aizen Desktop plugin release v1",
+  "type": "object",
+  "required": ["schemaVersion", "slug", "version", "desktop"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "slug": { "$ref": "#/$defs/identifier" },
+    "version": {
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "desktop": {
+      "type": "object",
+      "required": ["uiApiVersion", "views"],
+      "additionalProperties": false,
+      "properties": {
+        "uiApiVersion": { "const": 1 },
+        "views": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": { "oneOf": [{ "$ref": "#/$defs/board" }, { "$ref": "#/$defs/calculator" }] }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,63}$" },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "Service and Core also validate the 160-byte UTF-8 limit and reject control characters and blank titles."
+    },
+    "column": {
+      "type": "object",
+      "required": ["id", "title"],
+      "additionalProperties": false,
+      "properties": { "id": { "$ref": "#/$defs/identifier" }, "title": { "$ref": "#/$defs/title" } }
+    },
+    "board": {
+      "type": "object",
+      "required": ["type", "id", "title", "columns"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "board" },
+        "id": { "$ref": "#/$defs/identifier" },
+        "title": { "$ref": "#/$defs/title" },
+        "columns": { "type": "array", "minItems": 2, "maxItems": 8, "items": { "$ref": "#/$defs/column" } }
+      }
+    },
+    "calculator": {
+      "type": "object",
+      "required": ["type", "id", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "calculator" },
+        "id": { "$ref": "#/$defs/identifier" },
+        "title": { "$ref": "#/$defs/title" }
+      }
+    }
+  }
+}

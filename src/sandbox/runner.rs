@@ -46,6 +46,11 @@ struct AuditState {
     rec: Option<Box<AuditRecord>>,
     started: Instant,
     tmp: Option<PrivateTmp>,
+    // Drop after private-temp cleanup, and transfer with all bookkeeping to long-lived owners.
+    execution: crate::core::exec_ctx::ExecutionContext,
+    // A standalone preparation may first acquire a policy at spawn; never replace its frozen
+    // native/resource provenance when retaining that later caller's admission.
+    spawn_execution: Option<crate::core::exec_ctx::ExecutionContext>,
 }
 
 impl AuditState {
@@ -61,8 +66,9 @@ impl AuditState {
 }
 
 /// A ready-to-spawn sandboxed command. Use the protected spawn methods when complete-tree proof is
-/// required; legacy `command.spawn()` + containment remains best-effort. Report the outcome with
-/// [`Sandboxed::finish`] or move bookkeeping via [`Sandboxed::into_guard`] for background processes
+/// required; legacy `command.spawn()` + containment remains best-effort and bypasses spawn-time
+/// policy revalidation. Report the outcome with [`Sandboxed::finish`] or move bookkeeping via
+/// [`Sandboxed::into_guard`] for background processes
 /// and servers. Unverified protected-spawn errors must retain their owned child/containment AND this
 /// bookkeeping guard alongside physical/workspace admission, not ordinary-drop them as settled.
 pub struct Sandboxed<C> {
@@ -82,16 +88,50 @@ impl<C> Sandboxed<C> {
         self.state.finish(outcome);
     }
 
-    /// Keep only the bookkeeping (audit + private temp) — for spawns that outlive the call site's
-    /// stack frame (background processes, language/MCP servers).
+    /// Keep policy ownership as well as audit/temp state through physical settlement. Reporting an
+    /// outcome does not release admission; callers must retain the guard while the child is alive.
     pub fn into_guard(mut self) -> SpawnGuard {
         SpawnGuard {
             state: AuditState {
                 rec: self.state.rec.take(),
                 started: self.state.started,
                 tmp: self.state.tmp.take(),
+                execution: self.state.execution,
+                spawn_execution: self.state.spawn_execution,
             },
         }
+    }
+
+    fn check_spawn_policy(&mut self) -> Result<()> {
+        // A prepared command is not a reusable grant. Check the caller before installing any
+        // originating TLS so a default/normal preparation cannot mask ambient planning/staleness.
+        crate::agent::planning::check_automation_boundary()?;
+        anyhow::ensure!(
+            self.state.execution.permits_automation(),
+            "sandbox spawn suppressed by originating execution policy"
+        );
+        let frozen = self
+            .state
+            .spawn_execution
+            .as_ref()
+            .unwrap_or(&self.state.execution);
+        let execution = crate::agent::hooks::automation_context(Some(frozen));
+        // A policy-less standalone preparation may first enter an owned turn at spawn. Admit that
+        // owner now; a previously frozen policy can never be replaced or refreshed this way.
+        self.state.spawn_execution = Some(crate::agent::hooks::admit_automation(&execution)?);
+        Ok(())
+    }
+
+    fn check_protected_spawn<C2>(
+        &mut self,
+    ) -> Result<(), crate::core::proctree::ContainedSpawnError<C2>> {
+        self.check_spawn_policy()
+            .map_err(|error| crate::core::proctree::ContainedSpawnError {
+                cause: std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string()),
+                cleanup_verified: true,
+                child: None,
+                containment: None,
+            })
     }
 }
 
@@ -164,6 +204,18 @@ impl Sandboxed<std::process::Command> {
     ) -> Result<crate::core::proctree::BoundedBytes, crate::core::proctree::BoundedExecutionError>
     {
         use crate::core::proctree::{self, BoundedExecutionError, BoundedSettlement};
+        // Refuse before audit writes, workspace/physical admission or stdio preparation. Existing
+        // unresolved physical effects remain unresolved even though this command never spawned.
+        if let Err(error) = self.check_spawn_policy() {
+            return Err(BoundedExecutionError {
+                cause: std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string()),
+                settlement: if proctree::check_bounded_effects().is_err() {
+                    BoundedSettlement::Unknown
+                } else {
+                    BoundedSettlement::Proven
+                },
+            });
+        }
         if let Err(error) = proctree::check_bounded_effects() {
             self.finish(Outcome::SpawnFailed);
             return Err(error);
@@ -173,9 +225,15 @@ impl Sandboxed<std::process::Command> {
                 proctree::check_bounded_effects()?;
                 let context = crate::core::exec_ctx::current();
                 anyhow::ensure!(
-                    context
-                        .as_ref()
-                        .is_none_or(|ctx| ctx.native_scope().is_none()),
+                    self.state.execution.native_scope().is_none()
+                        && self
+                            .state
+                            .spawn_execution
+                            .as_ref()
+                            .is_none_or(|ctx| ctx.native_scope().is_none())
+                        && context
+                            .as_ref()
+                            .is_none_or(|ctx| ctx.native_scope().is_none()),
                     "opaque bounded execution is unavailable inside native scope"
                 );
                 let cancel = crate::core::cancel::current();
@@ -221,8 +279,31 @@ impl Sandboxed<std::process::Command> {
         } else {
             None
         };
+        self.run_bounded_body(
+            input,
+            crate::core::proctree::BoundedTiming::Relative(timeout),
+            grace,
+            Some(Box::new((admission, owner))),
+            strict,
+            flags,
+        )
+    }
+
+    /// Spawn/drain mechanics shared by fresh admission and the single serial driver of an already
+    /// admitted body. Owners are lifetime-only here; callers must validate admission before entry.
+    fn run_bounded_body(
+        mut self,
+        input: Option<Vec<u8>>,
+        timing: crate::core::proctree::BoundedTiming,
+        grace: std::time::Duration,
+        owner: Option<crate::core::proctree::BoundedOwner>,
+        strict: bool,
+        flags: u32,
+    ) -> Result<crate::core::proctree::BoundedBytes, crate::core::proctree::BoundedExecutionError>
+    {
+        use crate::core::proctree::{self, BoundedExecutionError, BoundedSettlement};
         proctree::configure_bounded_stdio(&mut self.command, input.is_some());
-        let spawned = self.spawn_contained_with_flags(flags);
+        let spawned = self.spawn_contained_until(flags, timing.spawn_deadlines());
         let (child, containment) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -231,12 +312,7 @@ impl Sandboxed<std::process::Command> {
                 if !settled {
                     proctree::latch_bounded_unknown(true);
                     // Keep the entire typed error, including just-created child/job, and temp guard.
-                    proctree::quarantine_bounded_owner(Box::new((
-                        error,
-                        self.into_guard(),
-                        admission,
-                        owner,
-                    )));
+                    proctree::quarantine_bounded_owner(Box::new((error, self.into_guard(), owner)));
                 }
                 return Err(BoundedExecutionError {
                     cause,
@@ -249,13 +325,13 @@ impl Sandboxed<std::process::Command> {
             }
         };
         let guard = std::sync::Arc::new(std::sync::Mutex::new(self.into_guard()));
-        let caller: proctree::BoundedOwner = Box::new((guard.clone(), admission, owner));
+        let caller: proctree::BoundedOwner = Box::new((guard.clone(), owner));
         // Runner output is bounded; generic git/native byte helpers keep their legacy full capture.
-        let result = proctree::output_bounded_spawned(
+        let result = proctree::output_bounded_spawned_timed(
             child,
             containment,
             input,
-            timeout,
+            timing,
             grace,
             Some(caller),
             strict,
@@ -294,11 +370,24 @@ impl Sandboxed<std::process::Command> {
         (std::process::Child, crate::core::proctree::Containment),
         crate::core::proctree::ContainedSpawnError<std::process::Child>,
     > {
-        let result = crate::core::proctree::spawn_contained_std(
+        self.spawn_contained_until(flags, None)
+    }
+
+    fn spawn_contained_until(
+        &mut self,
+        flags: u32,
+        deadlines: Option<crate::core::proctree::BoundedDeadlines>,
+    ) -> Result<
+        (std::process::Child, crate::core::proctree::Containment),
+        crate::core::proctree::ContainedSpawnError<std::process::Child>,
+    > {
+        self.check_protected_spawn::<std::process::Child>()?;
+        let result = crate::core::proctree::spawn_contained_std_until(
             &mut self.command,
             flags,
             #[cfg(windows)]
             self.job_limits.as_ref(),
+            deadlines,
         );
         if result.is_err() {
             self.finish(Outcome::SpawnFailed);
@@ -308,6 +397,7 @@ impl Sandboxed<std::process::Command> {
 
     /// Contain a just-spawned child with the policy's resource ceilings. Late attachment cannot
     /// prove all descendants were assigned before execution; use `spawn_contained` for that proof.
+    #[cfg(test)]
     pub fn contain(&self, child: &std::process::Child) -> crate::core::proctree::Containment {
         #[cfg(windows)]
         {
@@ -348,6 +438,7 @@ impl Sandboxed<tokio::process::Command> {
         (tokio::process::Child, crate::core::proctree::Containment),
         crate::core::proctree::ContainedSpawnError<tokio::process::Child>,
     > {
+        self.check_protected_spawn::<tokio::process::Child>()?;
         let result = crate::core::proctree::spawn_contained_tokio(
             &mut self.command,
             flags,
@@ -679,6 +770,18 @@ fn request_fs(
     } else {
         let mut fs = policy::fs_policy(&req.workspace_root, tmp, settings);
         fs.read_write.push(req.cwd.clone());
+        #[cfg(target_os = "linux")]
+        {
+            fs.remove_worktree_parent = req.git_worktree_removal_parent();
+        }
+        #[cfg(unix)]
+        match req.origin {
+            super::CommandOrigin::GitInspect => fs.read_only.extend_from_slice(req.git_metadata()),
+            super::CommandOrigin::GitMutation => {
+                fs.read_write.extend_from_slice(req.git_metadata())
+            }
+            _ => {}
+        }
         fs
     }
 }
@@ -729,9 +832,16 @@ macro_rules! build_prepared {
         /// Build a sandboxed command of this flavor. Returns `Err` when policy refuses the spawn
         /// (strict without kernel backing, unattended without fallback, broad workspace).
         pub fn $fn_name(req: SandboxRequest) -> Result<Sandboxed<$cmd_ty>> {
-            let settings = policy::settings();
-            let res = resolve(&req, &settings)?;
-            $with_policy(req, settings, res)
+            crate::agent::planning::check_automation_boundary()?;
+            let execution = crate::agent::hooks::automation_context(None);
+            let admitted = crate::agent::hooks::admit_automation(&execution)?;
+            // Resolve settings/policy only after admission: refusals may append audit records, and
+            // preparation may allocate private temp state before a child is ever started.
+            crate::core::exec_ctx::with_current(admitted, || {
+                let settings = policy::settings();
+                let res = resolve(&req, &settings)?;
+                $with_policy(req, settings, res)
+            })
         }
 
         // Kept private: tests exercise command construction without reading real HOME/config or
@@ -741,6 +851,8 @@ macro_rules! build_prepared {
             settings: SandboxSettings,
             res: Resolution,
         ) -> Result<Sandboxed<$cmd_ty>> {
+            let execution = crate::agent::hooks::automation_context(None);
+            let execution = crate::agent::hooks::admit_automation(&execution)?;
             req.validate_restricted()?;
 
             #[allow(unused_mut)]
@@ -864,6 +976,8 @@ macro_rules! build_prepared {
                     rec: Some(Box::new(rec)),
                     started: Instant::now(),
                     tmp,
+                    execution,
+                    spawn_execution: None,
                 },
                 bounded_root: req.workspace_root.clone(),
                 bounded_scope: req.scope.clone(),
@@ -900,7 +1014,7 @@ build_prepared!(
 );
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sandbox::CommandOrigin;
     use std::sync::Mutex;
@@ -909,13 +1023,271 @@ mod tests {
     /// serialize on this lock (the suite runs tests in parallel threads).
     static MODE_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
         MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn req(origin: CommandOrigin) -> SandboxRequest {
         let cwd = std::env::current_dir().unwrap();
         SandboxRequest::shell(origin, "echo sandboxed", cwd.clone(), cwd)
+    }
+
+    fn owned_policy_fixture() -> (
+        crate::agent::todo::TaskContext,
+        crate::core::exec_ctx::ExecutionContext,
+    ) {
+        let task = crate::agent::todo::TaskContext::private();
+        let execution = crate::core::exec_ctx::ExecutionContext::default().with_task(task.clone());
+        (task, execution)
+    }
+
+    fn restricted_policy_fixtures() -> Vec<crate::core::exec_ctx::ExecutionContext> {
+        use crate::core::session_control::ExecutionMode;
+        let (task, stale) = owned_policy_fixture();
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let planning = crate::core::exec_ctx::ExecutionContext::default().with_task(task);
+        let (blocked_task, blocked) = owned_policy_fixture();
+        assert!(blocked_task
+            .control()
+            .transition(ExecutionMode::Planning, None, |_| {
+                anyhow::bail!("fixture persistence failure")
+            })
+            .is_err());
+        vec![planning, stale, blocked]
+    }
+
+    fn policy_test_request(root: &Path) -> SandboxRequest {
+        SandboxRequest::exec(
+            CommandOrigin::ShellRun,
+            root.join("no-such-policy-test-program"),
+            Vec::new(),
+            root.into(),
+            root.into(),
+        )
+        .private_tmp(false)
+    }
+
+    fn policy_test_resolution() -> Resolution {
+        Resolution {
+            effective: "off",
+            backend: "disabled",
+            guard: false,
+            kernel: false,
+            degraded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restricted_preparation_stops_before_settings_or_private_temp_effects() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("absent-home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        for execution in restricted_policy_fixtures() {
+            crate::core::exec_ctx::with_current(execution, || {
+                let std_result = prepare_std(policy_test_request(fixture.path()).private_tmp(true));
+                assert!(std_result.is_err());
+                let tokio_result =
+                    prepare_tokio(policy_test_request(fixture.path()).private_tmp(true));
+                assert!(tokio_result.is_err());
+            });
+            assert!(
+                !home.exists(),
+                "refusal must not initialize config/audit/temp roots"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_and_detached_guards_hold_policy_until_drop_not_finish() {
+        use crate::core::session_control::ExecutionMode;
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        for tokio in [false, true] {
+            let (task, execution) = owned_policy_fixture();
+            let control = task.control();
+            let mut guard = crate::core::exec_ctx::with_current(execution, || {
+                let request = policy_test_request(fixture.path());
+                if tokio {
+                    let mut prepared = prepare_tokio_with_policy(
+                        request,
+                        SandboxSettings::default(),
+                        policy_test_resolution(),
+                    )
+                    .unwrap();
+                    assert!(control
+                        .transition(ExecutionMode::Planning, None, |_| {
+                            panic!("prepared command must retain admission")
+                        })
+                        .is_err());
+                    prepared.state.rec = None;
+                    prepared.into_guard()
+                } else {
+                    let mut prepared = prepare_std_with_policy(
+                        request,
+                        SandboxSettings::default(),
+                        policy_test_resolution(),
+                    )
+                    .unwrap();
+                    assert!(control
+                        .transition(ExecutionMode::Planning, None, |_| {
+                            panic!("prepared command must retain admission")
+                        })
+                        .is_err());
+                    prepared.state.rec = None;
+                    prepared.into_guard()
+                }
+            });
+            guard.finish(Outcome::Spawned);
+            assert!(control
+                .transition(ExecutionMode::Planning, None, |_| {
+                    panic!("audit finish is not physical settlement")
+                })
+                .is_err());
+            drop(guard);
+            control
+                .transition(ExecutionMode::Planning, None, |_| Ok(()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn protected_and_bounded_spawns_recheck_restricted_ambient_context() {
+        let _home_lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let home = fixture.path().join("absent-home");
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        for owned_preparation in [false, true] {
+            let (_task, normal) = owned_policy_fixture();
+            let normal = if owned_preparation {
+                normal
+            } else {
+                crate::core::exec_ctx::ExecutionContext::default()
+            };
+            for restricted in restricted_policy_fixtures() {
+                let mut std = crate::core::exec_ctx::with_current(normal.clone(), || {
+                    prepare_std_with_policy(
+                        policy_test_request(fixture.path()),
+                        SandboxSettings::default(),
+                        policy_test_resolution(),
+                    )
+                    .unwrap()
+                });
+                let mut tokio = crate::core::exec_ctx::with_current(normal.clone(), || {
+                    prepare_tokio_with_policy(
+                        policy_test_request(fixture.path()),
+                        SandboxSettings::default(),
+                        policy_test_resolution(),
+                    )
+                    .unwrap()
+                });
+                crate::core::exec_ctx::with_current(restricted.clone(), || {
+                    let error = std
+                        .spawn_contained()
+                        .expect_err("planning must refuse before spawning");
+                    assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert!(error.cleanup_verified() && error.child.is_none());
+                    let error = tokio
+                        .spawn_contained_tokio()
+                        .expect_err("planning must refuse before spawning");
+                    assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert!(error.cleanup_verified() && error.child.is_none());
+                });
+                for strict in [false, true] {
+                    let prepared = crate::core::exec_ctx::with_current(normal.clone(), || {
+                        prepare_std_with_policy(
+                            policy_test_request(fixture.path()),
+                            SandboxSettings::default(),
+                            policy_test_resolution(),
+                        )
+                        .unwrap()
+                    });
+                    let error = crate::core::exec_ctx::with_current(restricted.clone(), || {
+                        prepared.output_bounded_policy(
+                            None,
+                            std::time::Duration::from_millis(10),
+                            std::time::Duration::from_millis(10),
+                            None,
+                            strict,
+                            0,
+                        )
+                    })
+                    .err()
+                    .expect("planning must refuse before bounded preparation");
+                    assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+                }
+            }
+        }
+        assert!(
+            !home.exists(),
+            "pre-spawn refusal must not write an audit record"
+        );
+    }
+
+    #[test]
+    fn frozen_restricted_preparation_cannot_spawn_without_ambient_context() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        for execution in restricted_policy_fixtures() {
+            let mut prepared = prepare_std_with_policy(
+                policy_test_request(fixture.path()),
+                SandboxSettings::default(),
+                policy_test_resolution(),
+            )
+            .unwrap();
+            // Production cannot reach this state: the preparation lease prevents transitions.
+            // Simulate a legacy/stale carrier to exercise the independent pre-spawn validation.
+            prepared.state.execution = execution;
+            let error = prepared
+                .spawn_contained()
+                .expect_err("frozen restriction must survive absent caller TLS");
+            assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(error.cleanup_verified() && error.child.is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_preparation_stays_compatible_and_can_admit_an_owned_spawn() {
+        use crate::core::session_control::ExecutionMode;
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let mut prepared = prepare_std_with_policy(
+            policy_test_request(fixture.path()),
+            SandboxSettings::default(),
+            policy_test_resolution(),
+        )
+        .unwrap();
+        assert!(prepared.state.execution.policy().is_none());
+        prepared.check_spawn_policy().unwrap();
+        assert!(prepared
+            .state
+            .spawn_execution
+            .as_ref()
+            .unwrap()
+            .policy()
+            .is_none());
+        prepared.state.rec = None;
+        let error = prepared
+            .spawn_contained()
+            .expect_err("fixture executable is deliberately absent");
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.cleanup_verified() && error.child.is_none());
+        let (task, execution) = owned_policy_fixture();
+        crate::core::exec_ctx::with_current(execution, || prepared.check_spawn_policy()).unwrap();
+        assert!(task
+            .control()
+            .transition(ExecutionMode::Planning, None, |_| {
+                panic!("spawn admission must survive caller TLS")
+            })
+            .is_err());
+        let guard = prepared.into_guard();
+        drop(guard);
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
     }
 
     #[test]
@@ -1429,6 +1801,29 @@ mod tests {
             "no escaping may leak into the shell: {:?}",
             out.stdout
         );
+    }
+
+    #[test]
+    fn planning_refuses_both_runner_flavors_before_environment_or_policy_setup() {
+        let task = crate::agent::todo::TaskContext::private();
+        task.control()
+            .transition(
+                crate::core::session_control::ExecutionMode::Planning,
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default().with_task(task);
+        crate::core::exec_ctx::with_current(ctx, || {
+            let std_error = prepare_std(req(CommandOrigin::ShellRun)).err().unwrap();
+            let tokio_error = prepare_tokio(req(CommandOrigin::ShellRun)).err().unwrap();
+            for error in [std_error, tokio_error] {
+                assert!(
+                    error.to_string().contains("unavailable in planning mode"),
+                    "{error:#}"
+                );
+            }
+        });
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! success/added, salmon = error/removed, gold = warning/yolo, blue = links/inline-code). The
 //! WORK-LANE colours ([`tool_color`]) give each *kind* of work one muted hue — read = blue,
 //! edit = gold, shell = mauve, web = cyan, memory = violet, delegation/asking = pink,
-//! plan/checkpoint = teal — so a glance down the transcript shows what Aizen was doing without
+//! plan/recovery = teal — so a glance down the transcript shows what Aizen was doing without
 //! reading a single tool name. The lanes are the opt-in **`lanes` theme** (`/theme lanes`,
 //! persisted as `"theme": "lanes"`); the default **`moonlight`** theme keeps every work surface
 //! brand-silver. Gold deliberately spans both palettes: warnings, the `⚡ yolo` chip and file
@@ -61,7 +61,7 @@ pub const LANE_WEB: u8 = 116; // cyan #87d7d7
 pub const LANE_MIND: u8 = 140; // violet #af87d7
 /// Talking to someone — sub-agents/workflows/team, clarify, telegram/notify.
 pub const LANE_TALK: u8 = 175; // pink #d787af
-/// Progress & time — the todo plan and checkpoints.
+/// Progress & recovery — the todo plan and recovery evidence.
 pub const LANE_PLAN: u8 = 73; // teal #5fafaf
 
 // ── diff panes (the boxed edit preview) ──────────────────────────────────────────
@@ -169,7 +169,7 @@ pub fn lane_color(name: &str) -> u8 {
         Some(L::Web | L::Browser | L::Mcp) => LANE_WEB,
         Some(L::MemoryRead | L::MemoryWrite | L::Skills | L::Persona) => LANE_MIND,
         Some(L::Delegation | L::Coordination | L::Clarify | L::Messaging) => LANE_TALK,
-        Some(L::Todo | L::Checkpoint) => LANE_PLAN,
+        Some(L::Todo | L::Recovery) => LANE_PLAN,
         None => ACCENT,
     }
 }
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(lane_color("task"), LANE_TALK);
         assert_eq!(lane_color("clarify"), LANE_TALK);
         assert_eq!(lane_color("todo_write"), LANE_PLAN);
-        assert_eq!(lane_color("checkpoint"), LANE_PLAN);
+        assert_eq!(lane_color("native_owner_undo"), LANE_PLAN);
         assert_eq!(
             lane_color("mystery_tool"),
             ACCENT,
