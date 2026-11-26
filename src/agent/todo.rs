@@ -1,15 +1,15 @@
-//! In-session task list (the `todo_write` tool) — makes multi-step work visibly tracked, the way
-//! Claude Code's todo list is one of its most legible features. Pure in-memory, zero infra: a
-//! process-global list the model REPLACES each call (send-the-whole-list semantics), rendered as a
-//! checklist into the scroll region + summarised in the status bar. Reset on `/clear`.
-//!
-//! P0 harness persistence: optional `confidence` / `hill_climbable` fields + incomplete helpers
-//! used by the agent loop's todo-poke / confidence-gate / hill-climb paths.
+//! Conversation-owned task list and backward-compatible `todo_write` surface.
+//! Durable state lives in an owned TaskContext; UI and reminders are projections, not authorities.
+
+mod state;
+pub use state::{
+    CheckResult, CompletionBasis, EvidenceToken, PlanAttachment, Requirement, TaskContext,
+    TaskState, TurnEnd,
+};
 
 use crate::agent::tools::Tool;
 use anyhow::Result;
 use console::style;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -21,8 +21,11 @@ pub enum Status {
     Done,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Todo {
+    /// Omit for new/legacy rows; repeat the returned ID when renaming or reordering a row.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub content: String,
     #[serde(default = "default_status")]
     pub status: Status,
@@ -42,6 +45,7 @@ impl Todo {
     /// Construct a todo without optional harness fields (tests + internal seeds).
     pub fn new(content: impl Into<String>, status: Status) -> Self {
         Self {
+            id: String::new(),
             content: content.into(),
             status,
             confidence: None,
@@ -50,56 +54,126 @@ impl Todo {
     }
 }
 
-/// The session's task list. Process-global (one REPL = one session); `/clear` wipes it.
-static TODOS: Lazy<Mutex<Vec<Todo>>> = Lazy::new(|| Mutex::new(Vec::new()));
+tokio::task_local! { static CONTEXT: TaskContext; }
 
-/// Replace the whole list (TodoWrite semantics: the model sends the full list every call).
-pub fn set(items: Vec<Todo>) {
-    *TODOS.lock().unwrap_or_else(|e| e.into_inner()) = items;
+/// The driver scopes its entire conversation future; blocking tools receive the same owned
+/// handle through ExecutionContext. A missing production scope never falls back to shared state.
+pub async fn with_context<F: std::future::Future>(context: TaskContext, future: F) -> F::Output {
+    CONTEXT.scope(context, future).await
 }
 
-pub fn snapshot() -> Vec<Todo> {
-    TODOS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+pub(crate) fn bound_context() -> Option<TaskContext> {
+    crate::core::exec_ctx::current()
+        .and_then(|c| c.task().cloned())
+        .or_else(|| CONTEXT.try_with(Clone::clone).ok())
 }
 
-/// The item currently in progress, if any — what a delegated child is told its parent is doing.
-pub fn active_item() -> Option<String> {
-    TODOS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|t| t.status == Status::InProgress)
-        .map(|t| t.content.clone())
-}
-
-/// Wipe the list (called on `/clear` / a fresh conversation).
-pub fn clear() {
-    TODOS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-}
-
-/// Set by the turn driver when a run ends: `true` means the open items are the model's own plan
-/// for unfinished work (step cap, deadline, cancel, a failed verification, a clarifying question)
-/// and the user's next message is usually "continue", so the list must survive the boundary.
-static CARRY_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Record how the turn that just ran ended. Call with `true` before a turn starts as well, so a
-/// turn that errors out (no outcome at all) keeps its plan for the retry.
-pub fn end_turn(abnormal: bool) {
-    CARRY_OVER.store(abnormal, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The user-turn boundary: the list is scoped to one turn's work. It used to be process-global
-/// and cleared only by `/new`, `/clear` and `/resume`, so a stale item from an edit turn made the
-/// next plain question cost up to two todo-poke round-trips, and `serve` lanes poked each other
-/// over one shared list. Cleared here unless the previous turn ended abnormally (see
-/// [`end_turn`]) — then its open items are the continuation plan and stay. Returns whether the
-/// list was cleared.
-pub fn begin_user_turn() -> bool {
-    if CARRY_OVER.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        return false;
+pub fn try_current_context() -> Option<TaskContext> {
+    if let Some(context) = bound_context() {
+        return Some(context);
     }
-    clear();
-    true
+    // Compatibility for older loop fixtures only; production has no singleton authority.
+    #[cfg(test)]
+    {
+        Some(TEST_CONTEXT.with(Clone::clone))
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! { static TEST_CONTEXT: TaskContext = TaskContext::private(); }
+
+pub fn current_context() -> TaskContext {
+    try_current_context().unwrap_or_default()
+}
+
+pub fn durable_snapshot() -> TaskState {
+    bound_context().map(|c| c.snapshot()).unwrap_or_default()
+}
+
+pub fn mark_saved(state: &TaskState) {
+    if let Some(context) = try_current_context() {
+        context.mark_saved(state);
+    }
+}
+
+pub fn restore_in_memory(state: TaskState) -> Result<()> {
+    try_current_context()
+        .ok_or_else(|| anyhow::anyhow!("task restore requires a conversation owner"))?
+        .install(state)
+}
+
+pub fn restore(state: TaskState) -> Result<()> {
+    try_current_context()
+        .ok_or_else(|| anyhow::anyhow!("task restore requires a conversation owner"))?
+        .restore(state)
+}
+
+/// Compatibility seed used by the built-in loop fixtures, not a model mutation path.
+pub fn set(items: Vec<Todo>) {
+    current_context()
+        .replace(items)
+        .expect("valid internal task seed");
+}
+
+/// Only active rows may steer execution. Historical terminal rows are still persisted/displayed.
+pub fn snapshot() -> Vec<Todo> {
+    current_context().effective_items()
+}
+
+pub fn active_item() -> Option<String> {
+    snapshot()
+        .into_iter()
+        .find(|t| t.status == Status::InProgress)
+        .map(|t| t.content)
+}
+
+pub fn clear() {
+    current_context().clear();
+}
+pub fn end_turn(abnormal: bool) {
+    current_context().end_turn(abnormal);
+}
+pub fn begin_user_turn() -> bool {
+    let context = current_context();
+    let cleared = context.begin_user_turn();
+    if !cleared && !context.snapshot().active && context.is_dirty() {
+        crate::ui::tui::note_line("Task snapshot is not saved; retained as inactive. Retry saving or explicitly clear it before replacing the checklist.");
+    }
+    cleared
+}
+
+/// Presentation-only HUD cache for the input/render thread, never read by workflow decisions.
+static HUD: Mutex<Option<String>> = Mutex::new(None);
+fn publish(state: &TaskState) {
+    let rows: Vec<_> = state
+        .items
+        .iter()
+        .map(|t| {
+            (
+                match t.status {
+                    Status::Pending => 0,
+                    Status::InProgress => 1,
+                    Status::Done => 2,
+                },
+                t.content.clone(),
+            )
+        })
+        .collect();
+    *HUD.lock().unwrap_or_else(|e| e.into_inner()) = summary(&state.items);
+    crate::ui::tui::plan_update_snapshot(&rows, state);
+}
+fn summary(items: &[Todo]) -> Option<String> {
+    (!items.is_empty()).then(|| {
+        format!(
+            "☑ {}/{}",
+            items.iter().filter(|t| t.status == Status::Done).count(),
+            items.len()
+        )
+    })
 }
 
 /// True when any item is still pending or in_progress (empty list → false).
@@ -133,58 +207,38 @@ pub fn incomplete_summary(max_chars: usize) -> Option<String> {
 
 /// `☑ done/total` for the status bar (None when there are no todos).
 pub fn status_summary() -> Option<String> {
-    let items = snapshot();
-    if items.is_empty() {
-        return None;
+    match try_current_context() {
+        Some(context) => summary(&context.snapshot().items),
+        None => HUD.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     }
-    let done = items.iter().filter(|t| t.status == Status::Done).count();
-    Some(format!("☑ {done}/{}", items.len()))
 }
 
-/// Which phase (if any) just CLOSED between two todo snapshots — its label, for a phase checkpoint.
-///
-/// The todo list is the only "phase" signal aizen has, so a boundary is read from it:
-///   1. an item that moved INTO `Done` this turn — its `content` names the phase that finished;
-///   2. failing that, a NEW `in_progress` item appearing while a DIFFERENT item was `in_progress`
-///      before — the previously-active item implicitly closed, so its content is the label.
-///
-/// Returns `None` when the list did not cross a boundary.
-///
-/// Matched by `content`, never by index: the model resends the whole list each call and may reorder
-/// or edit rows, so position is not stable. When several items reach `Done` in one turn (a model that
-/// batch-marks at the end), the LAST newly-done item's content is returned — ONE checkpoint for the
-/// group, never one per item.
+/// Detect a phase boundary by stable ID. The content fallback only serves pre-normalization
+/// legacy fixtures; canonical rows always have IDs, so renaming a row does not close a phase.
 pub fn phase_boundary_crossed(before: &[Todo], after: &[Todo]) -> Option<String> {
-    use std::collections::HashMap;
-    let before_status: HashMap<&str, Status> = before
-        .iter()
-        .map(|t| (t.content.as_str(), t.status))
-        .collect();
-
-    // 1. Any item that moved into Done this turn closes a phase. Scan from the end so a batch
-    //    "mark everything done" yields the last item's label once, not one label per item.
+    let key = |t: &Todo| {
+        if t.id.is_empty() {
+            format!("legacy:{}", t.content)
+        } else {
+            t.id.clone()
+        }
+    };
+    let before_status: std::collections::HashMap<_, _> =
+        before.iter().map(|t| (key(t), t.status)).collect();
     if let Some(t) = after.iter().rev().find(|t| {
-        t.status == Status::Done
-            && before_status.get(t.content.as_str()).copied() != Some(Status::Done)
+        t.status == Status::Done && before_status.get(&key(t)).copied() != Some(Status::Done)
     }) {
         return Some(t.content.clone());
     }
-
-    // 2. No new Done, but the focus moved: an item that WAS in_progress no longer is, while some
-    //    OTHER item is now in_progress. The previous active item implicitly closed — name it.
-    let was_active: Option<&str> = before
-        .iter()
-        .find(|t| t.status == Status::InProgress)
-        .map(|t| t.content.as_str());
-    if let Some(prev) = was_active {
+    if let Some(prev) = before.iter().find(|t| t.status == Status::InProgress) {
         let prev_still_active = after
             .iter()
-            .any(|t| t.content == prev && t.status == Status::InProgress);
+            .any(|t| key(t) == key(prev) && t.status == Status::InProgress);
         let other_now_active = after
             .iter()
-            .any(|t| t.status == Status::InProgress && t.content != prev);
+            .any(|t| t.status == Status::InProgress && key(t) != key(prev));
         if !prev_still_active && other_now_active {
-            return Some(prev.to_string());
+            return Some(prev.content.clone());
         }
     }
     None
@@ -250,15 +304,21 @@ pub fn render_block(items: &[Todo]) -> String {
 /// re-echoing the whole thing into context).
 fn model_ack(items: &[Todo]) -> String {
     if items.is_empty() {
-        return "todo list cleared".to_string();
+        return "todo list cleared; removed unfinished work remains an abandoned obligation, not completion".to_string();
     }
     let done = items.iter().filter(|t| t.status == Status::Done).count();
     let doing = items
         .iter()
         .filter(|t| t.status == Status::InProgress)
         .count();
+    let ids = items
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("{}={}", i + 1, t.id))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "todo list updated: {} item(s), {done} done, {doing} in progress",
+        "todo list updated: {} item(s), {done} done, {doing} in progress; IDs (row=id): {ids}. Repeat IDs when renaming/reordering. Done is a completion request: rows lacking matching runtime evidence stay pending. Propose observe/check/report requirements; unspecified remains unverified. This acknowledgement is in-memory, not a disk-save receipt.",
         items.len()
     )
 }
@@ -276,53 +336,165 @@ fn normalize_todos(mut items: Vec<Todo>) -> Vec<Todo> {
     items
 }
 
-/// Parse a `{"todos": [...]}` args object into a `Vec<Todo>` — shared by the top-level `todo_write`
-/// and the sub-agent-scoped `ScopedTodo`, so both accept exactly the same shape.
-fn parse_todos(args: &serde_json::Value) -> Result<Vec<Todo>> {
-    match args.get("todos") {
-        Some(v) => {
-            let items: Vec<Todo> = serde_json::from_value(v.clone()).map_err(|e| {
-                anyhow::anyhow!("invalid `todos` (expect [{{content, status}}]): {e}")
-            })?;
-            Ok(normalize_todos(items))
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TodoInput {
+    #[serde(default)]
+    id: String,
+    content: String,
+    #[serde(default)]
+    status: Option<Status>,
+    #[serde(default)]
+    confidence: Option<u8>,
+    #[serde(default)]
+    hill_climbable: Option<u8>,
+    #[serde(default)]
+    requirement: Option<ProposedRequirement>,
+    #[serde(default)]
+    phase: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ProposedRequirement {
+    Unspecified,
+    Observe { target: String },
+    Check { command: String, root: String },
+    Report,
+}
+
+impl ProposedRequirement {
+    fn into_runtime(self) -> Requirement {
+        match self {
+            Self::Unspecified => Requirement::Unspecified,
+            Self::Observe { target } => Requirement::Observe { target },
+            Self::Check { command, root } => Requirement::Check {
+                command,
+                root,
+                source_identity: None,
+            },
+            Self::Report => Requirement::Report,
         }
-        None => anyhow::bail!("missing `todos` array"),
     }
+}
+
+struct TodoProposal {
+    items: Vec<Todo>,
+    requirements: Vec<(String, Requirement)>,
+    plan: Option<String>,
+    phases: Vec<(String, String)>,
+}
+
+impl TodoProposal {
+    fn apply(self, context: &TaskContext) -> Result<Vec<Todo>> {
+        let attachment = self
+            .plan
+            .map(|path| {
+                let execution = crate::core::exec_ctx::current().ok_or_else(|| {
+                    anyhow::anyhow!("plan attachment requires an execution owner")
+                })?;
+                let root = execution
+                    .placement()
+                    .ok_or_else(|| anyhow::anyhow!("plan attachment requires a workspace"))?
+                    .workspace_root();
+                state::PlanAttachment::load(root, &path)
+            })
+            .transpose()?;
+        context.refresh_plan()?;
+        context.replace_with_plan(self.items, self.requirements, attachment, self.phases)
+    }
+}
+
+/// Parse the additive model DTO. Runtime receipt/fingerprint/waiver fields are intentionally not
+/// represented and unknown fields are rejected before any state mutation.
+fn parse_todos(args: &serde_json::Value) -> Result<TodoProposal> {
+    let envelope = args
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("todo_write expects an object"))?;
+    anyhow::ensure!(
+        envelope.keys().all(|key| key == "todos" || key == "plan"),
+        "unknown todo_write field; runtime evidence and waivers cannot be supplied by the model"
+    );
+    let value = args
+        .get("todos")
+        .ok_or_else(|| anyhow::anyhow!("missing `todos` array"))?;
+    let inputs: Vec<TodoInput> = serde_json::from_value(value.clone())
+        .map_err(|e| anyhow::anyhow!("invalid `todos`: {e}"))?;
+    let plan = envelope
+        .get("plan")
+        .map(|value| {
+            let path = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("plan must be a relative path"))?;
+            crate::agent::plan_document::validate_relative_path(path)?;
+            Ok::<_, anyhow::Error>(path.to_owned())
+        })
+        .transpose()?;
+    let mut items = Vec::with_capacity(inputs.len());
+    let mut requirements = Vec::new();
+    let mut phases = Vec::new();
+    for (index, input) in inputs.into_iter().enumerate() {
+        let key = if input.id.is_empty() {
+            format!("@index:{index}")
+        } else {
+            input.id.clone()
+        };
+        if let Some(phase) = input.phase {
+            anyhow::ensure!(
+                crate::agent::plan_document::valid_phase_id(&phase),
+                "invalid phase ID"
+            );
+            phases.push((key.clone(), phase));
+        }
+        if let Some(requirement) = input.requirement {
+            requirements.push((key, requirement.into_runtime()));
+        }
+        items.push(Todo {
+            id: input.id,
+            content: input.content,
+            status: input.status.unwrap_or(Status::Pending),
+            confidence: input.confidence.map(|v| v.min(100)),
+            hill_climbable: input.hill_climbable.map(|v| v.min(100)),
+        });
+    }
+    Ok(TodoProposal {
+        items: normalize_todos(items),
+        requirements,
+        plan,
+        phases,
+    })
 }
 
 /// The `todos` array JSON Schema — identical for `todo_write` and `ScopedTodo`.
 fn todos_schema() -> serde_json::Value {
     serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "todos": {
-                "type": "array",
-                "description": "Full task list; replaces previous.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "content": {"type": "string", "description": "concise imperative task"},
-                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
-                        "confidence": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "honest confidence at assign/done (0–100); optional, omit if trivial"
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "plan":{"type":"string","description":"Attach existing docs/plans/*.md contract."},
+            "todos":{"type":"array","maxItems":64,"items":{
+                "type":"object","additionalProperties":false,
+                "properties":{
+                    "id":{"type":"string"},
+                    "content":{"type":"string"},
+                    "status":{"enum":["pending","in_progress","done"]},
+                    "confidence":{"type":"integer"},
+                    "hill_climbable":{"type":"integer"},
+                    "phase":{"type":"string"},
+                    "requirement":{
+                        "type":"object","additionalProperties":false,
+                        "properties":{
+                            "kind":{"enum":["unspecified","observe","check","report"]},
+                            "target":{"type":"string"},
+                            "command":{"type":"string"},
+                            "root":{"type":"string"}
                         },
-                        "hill_climbable": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "quantifiable/iterable goal (0–100); optional, <~90 may prompt reframe"
-                        }
-                    },
-                    "required": ["content", "status"]
-                }
-            }
+                        "required":["kind"]
+                    }
+                },
+                "required":["content","status"]
+            }}
         },
-        "required": ["todos"]
+        "required":["todos"]
     })
 }
 
@@ -330,13 +502,17 @@ fn todos_schema() -> serde_json::Value {
 pub struct TodoWrite;
 
 impl Tool for TodoWrite {
+    fn planning_capability(&self) -> Option<crate::agent::planning::Capability> {
+        Some(crate::agent::planning::Capability::TaskUpdate)
+    }
     fn name(&self) -> &str {
         "todo_write"
     }
     fn description(&self) -> &str {
-        "Visible checklist for multi-file/hard-to-undo, not trivial work. Each call replaces FULL \
-         list; one in_progress, mark done before next. Optional 0–100 confidence at assign/done \
-         and hill_climbable for quantifiable goals. /clear resets; incomplete items block Done."
+        "Replace full checklist; empty abandons. Repeat IDs; omit for new rows. Done requests \
+         evidence, not proof. Requirement: observe needs target; check needs trusted command/root; \
+         report needs answer delivery; unspecified stays open. Optional scores 0–100; phase links \
+         to attached plan. Plan text never grants permission."
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()
@@ -346,43 +522,23 @@ impl Tool for TodoWrite {
         false
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
-        let items = parse_todos(args)?;
-        set(items.clone());
-        // Show the checklist to the USER as an in-place plan panel (retained updates the same box;
-        // classic re-prints it). `status`: 0 = pending, 1 = in-progress, 2 = done — matched by the
-        // renderer's ✓/▸/○ glyphs. An empty list removes the panel.
-        let rows: Vec<(u8, String)> = items
-            .iter()
-            .map(|t| {
-                let s = match t.status {
-                    Status::Done => 2u8,
-                    Status::InProgress => 1,
-                    Status::Pending => 0,
-                };
-                (s, t.content.clone())
-            })
-            .collect();
-        crate::ui::tui::plan_update(&rows);
+        let context = try_current_context()
+            .ok_or_else(|| anyhow::anyhow!("todo_write requires a conversation owner"))?;
+        let items = parse_todos(args)?.apply(&context)?;
         Ok(model_ack(&items))
     }
 }
 
-/// `todo_write` for a SUB-AGENT (W17). A sub-agent runs its own multi-step plan inside its own
-/// loop, but the top-level `TodoWrite` is unavailable to it (it writes the process-global `TODOS`
-/// and renders into the USER's scroll region — a sub-agent must not clobber either, and concurrent
-/// read-only sub-agents would race on one global list). This variant is fully SELF-CONTAINED: it
-/// holds its OWN list in a per-instance `Mutex` (fresh with each sub-agent registry), touches no
-/// global state, and prints nothing to the user's UI — the only effect is the ack returned to the
-/// sub-agent, which is exactly the recitation signal that keeps a long plan from drifting. The
-/// list dies with the sub-agent, which is correct: its plan is scratch work, not the user's.
+/// Private scratch checklist for a child. It uses the same validation/identity rules as
+/// the parent, but owns a separate context and never publishes into the parent's UI.
 pub struct ScopedTodo {
-    items: Mutex<Vec<Todo>>,
+    context: TaskContext,
 }
 
 impl ScopedTodo {
     pub fn new() -> Self {
         Self {
-            items: Mutex::new(Vec::new()),
+            context: TaskContext::private(),
         }
     }
 }
@@ -398,12 +554,7 @@ impl Tool for ScopedTodo {
         "todo_write"
     }
     fn description(&self) -> &str {
-        "Track your OWN multi-step plan as a checklist while you work. Send the COMPLETE current \
-         list every call (it REPLACES the previous one). Set ONE item to in_progress at a time and \
-         flip it to done before starting the next. Use it to keep a multi-step task on track; skip \
-         it for trivial one- or two-step work. Optional confidence / hill_climbable fields allowed. \
-         This is your private scratch plan — it is not shown to anyone and is discarded when you \
-         return your result."
+        TodoWrite.description()
     }
     fn parameters(&self) -> serde_json::Value {
         todos_schema()
@@ -413,16 +564,15 @@ impl Tool for ScopedTodo {
         false
     }
     fn execute(&self, args: &serde_json::Value) -> Result<String> {
-        let items = parse_todos(args)?;
-        *self.items.lock().unwrap_or_else(|e| e.into_inner()) = items.clone();
+        let context = bound_context().unwrap_or_else(|| self.context.clone());
+        let items = parse_todos(args)?.apply(&context)?;
         // No UI emission: a sub-agent's plan must not leak into the user's scroll region. The ack
         // (the recitation signal) is the whole point.
         Ok(model_ack(&items))
     }
 }
 
-/// Serializes access to the process-global TODOS list across concurrent tests / loop_eval
-/// scenarios (also used by `agent::tests` for the recitation-reminder loop test).
+/// Legacy fixture serialization guard; production task ownership is carried by TaskContext.
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
@@ -440,7 +590,7 @@ mod tests {
             Todo::new("b", Status::InProgress),
             Todo::new("c", Status::Pending),
         ]);
-        assert_eq!(status_summary().as_deref(), Some("☑ 1/3"));
+        assert_eq!(status_summary().as_deref(), Some("☑ 0/3"));
         assert_eq!(snapshot().len(), 3);
         assert!(has_incomplete());
         clear();
@@ -460,8 +610,17 @@ mod tests {
         let s = incomplete_summary(600).expect("open items");
         assert!(s.contains("[>] doing"), "{s}");
         assert!(s.contains("[ ] later"), "{s}");
-        assert!(!s.contains("done-one"), "{s}");
-        set(vec![Todo::new("all-done", Status::Done)]);
+        assert!(
+            s.contains("[ ] done-one"),
+            "an unverified claim stays open: {s}"
+        );
+        clear();
+        TodoWrite
+            .execute(&serde_json::json!({"todos":[{
+                "content":"report", "status":"done", "requirement":{"kind":"report"}
+            }]}))
+            .unwrap();
+        current_context().record_report().unwrap();
         assert!(incomplete_summary(600).is_none());
         clear();
     }
@@ -482,7 +641,7 @@ mod tests {
         let s = snapshot();
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].content, "y");
-        assert_eq!(status_summary().as_deref(), Some("☑ 1/2"));
+        assert_eq!(status_summary().as_deref(), Some("☑ 0/2"));
         clear();
     }
 
@@ -560,7 +719,7 @@ mod tests {
             "second sub-agent has its own list"
         );
         // The first sub-agent's list is still its own 2 items.
-        assert_eq!(sub.items.lock().unwrap().len(), 2);
+        assert_eq!(sub.context.snapshot().items.len(), 2);
 
         clear();
     }
@@ -570,6 +729,40 @@ mod tests {
         let sub = ScopedTodo::new();
         assert!(sub.execute(&serde_json::json!({})).is_err());
         assert!(sub.execute(&serde_json::json!({"todos": 5})).is_err());
+    }
+
+    #[test]
+    fn model_cannot_supply_authority_or_unknown_envelope_fields() {
+        let context = TaskContext::private();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default().with_task(context.clone());
+        crate::core::exec_ctx::with_current(ctx, || {
+            for args in [
+                serde_json::json!({"todos":[], "waiver":true}),
+                serde_json::json!({"todos":[], "checks":[]}),
+                serde_json::json!({"todos":[{"content":"x","status":"done","epoch":1}]}),
+                serde_json::json!({"todos":[{"content":"x","status":"done","requirement":{"kind":"check","command":"cargo check","root":".","source_identity":"forged"}}]}),
+            ] {
+                assert!(TodoWrite.execute(&args).is_err());
+                assert_eq!(context.snapshot(), TaskState::default());
+            }
+        });
+    }
+
+    #[test]
+    fn scoped_tool_uses_exact_execution_task_owner() {
+        let task = TaskContext::private();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default().with_task(task.clone());
+        let tool = ScopedTodo::new();
+        crate::core::exec_ctx::with_current(ctx, || {
+            tool.execute(&serde_json::json!({"todos":[{
+                "content":"report", "status":"done", "requirement":{"kind":"report"}
+            }]}))
+            .unwrap();
+        });
+        assert!(tool.context.snapshot().items.is_empty());
+        assert_eq!(task.snapshot().items.len(), 1);
+        task.record_report().unwrap();
+        assert!(task.is_complete());
     }
 
     #[test]
@@ -678,31 +871,51 @@ mod turn_scope_tests {
     }
 
     #[test]
-    fn a_normal_end_clears_the_list_at_the_next_user_turn() {
+    fn a_verified_report_retires_before_the_next_question() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        seed();
+        clear();
+        TodoWrite
+            .execute(&serde_json::json!({"todos":[{
+                "content":"answer", "status":"done", "requirement":{"kind":"report"}
+            }]}))
+            .unwrap();
+        current_context().record_report().unwrap();
         end_turn(false);
-        assert!(begin_user_turn(), "cleared");
+        mark_saved(&current_context().snapshot());
+        assert!(begin_user_turn(), "completed task retired");
         assert!(snapshot().is_empty());
-        assert!(
-            !has_incomplete(),
-            "a plain question after an edit turn owes no todo poke"
-        );
+        assert!(!has_incomplete(), "a fresh question owes no todo poke");
         clear();
     }
 
     #[test]
-    fn an_abnormal_end_carries_the_plan_over_exactly_once() {
+    fn nominal_normal_end_retains_unverified_work() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        seed();
+        end_turn(false);
+        assert_eq!(
+            current_context().snapshot().terminal,
+            Some(TurnEnd::Incomplete)
+        );
+        mark_saved(&current_context().snapshot());
+        assert!(!begin_user_turn());
+        assert!(has_incomplete());
+        clear();
+    }
+
+    #[test]
+    fn interrupted_and_unverified_ends_keep_continuation_until_resolved() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
         seed();
         end_turn(true);
         assert!(!begin_user_turn(), "kept for the continuation");
         assert!(has_incomplete());
-        // The carry-over is one-shot: the turn after that starts clean again unless it also
-        // ended abnormally.
         end_turn(false);
-        assert!(begin_user_turn());
-        assert!(snapshot().is_empty());
+        mark_saved(&current_context().snapshot());
+        assert!(!begin_user_turn(), "normal return is not evidence");
+        assert!(has_incomplete());
         clear();
     }
 }

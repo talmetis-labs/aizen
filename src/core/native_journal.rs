@@ -277,7 +277,7 @@ pub(crate) fn inspect_existing_records(claims: &[RecordClaim<'_>]) -> Result<Vec
         return Ok(Vec::new());
     }
     // Never expose paths, owners, source images, JSON parse details, or underlying storage errors.
-    inspect_existing_records_inner(None, claims)
+    inspect_existing_records_inner(None, claims, None)
         .map_err(|_| anyhow::anyhow!("native journal proof unavailable or exact claim mismatch"))
 }
 
@@ -288,19 +288,150 @@ pub(crate) fn inspect_existing_batch(
     claims: &[RecordClaim<'_>],
 ) -> Result<Vec<RecordProof>> {
     identity.validate()?;
-    inspect_existing_records_inner(Some(identity), claims).map_err(|_| {
+    inspect_existing_records_inner(Some(identity), claims, None).map_err(|_| {
         anyhow::anyhow!("native journal batch proof unavailable or incomplete exact coverage")
+    })
+}
+
+/// Removal must not destroy the current images needed to reconcile unresolved native writes.
+/// Inspect existing storage only; do not create a journal, reconcile records, or grant undo rights.
+pub(crate) fn require_workspace_settled(root: &Path) -> Result<()> {
+    let home = storage_home();
+    match fs::symlink_metadata(&home) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspecting native journal home"),
+        Ok(_) => {}
+    }
+    let directory = storage_directory()?;
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspecting native journal directory"),
+        Ok(_) => {}
+    }
+    inspect_existing_records_inner(None, &[], Some(root)).map(|_| ())
+}
+
+fn require_settled_workspace_records(journal: &Journal, root: &Path) -> Result<()> {
+    for record in &journal.records {
+        anyhow::ensure!(
+            !record.meta.binding.path.starts_with(root) || record.meta.state == State::Settled,
+            "native journal contains unresolved workspace writes; removal refused"
+        );
+    }
+    for fence in &journal.fences {
+        for intent in &fence.intents {
+            if intent.binding.path.starts_with(root) {
+                anyhow::ensure!(
+                    journal.records.iter().any(|record| {
+                        record.meta.id == intent.id && record.meta.state == State::Settled
+                    }),
+                    "native journal contains an unresolved workspace intent; removal refused"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A current logical write tip, not a historical hash match or standalone mutation authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerPostimage {
+    pub(crate) path: PathBuf,
+    pub(crate) key: String,
+    pub(crate) record_id: u64,
+    /// Preimage of the earliest contiguous exact-owner write segment at the logical tip.
+    pub(crate) before: FileFingerprint,
+    pub(crate) fingerprint: FileFingerprint,
+}
+
+/// Prove current, settled native Write postimages for one exact owner in input resource order.
+/// The caller retains exclusive resource leases and the global/workspace gates before this call
+/// and through its consuming operation. This only takes the later, existing journal lock; it never
+/// creates storage, reconciles evidence, or grants deletion/rename/unscoped-write coverage.
+/// Every selected resource must have resolved records/intents from ALL owners, with the selected
+/// owner at its logical tip. The contiguous same-owner segment must have matching image boundaries;
+/// `before` is its earliest preimage, stopping at the first foreign logical write. A consumer must
+/// compare it to its independently captured baseline to reject carried-in external edits before
+/// that segment. Unrelated resources do not acquire ownership through this proof.
+/// Resource and storage revalidation detects observed drift, but these cooperative gates cannot
+/// atomically exclude arbitrary external editors. A returned proof is not a durable future promise.
+pub(crate) fn prove_current_owner_postimages(
+    owner: &str,
+    resources: &[NativeResource],
+) -> Result<Vec<OwnerPostimage>> {
+    check_text(owner, MAX_OWNER_BYTES, "owner")?;
+    anyhow::ensure!(
+        !resources.is_empty() && resources.len() <= 32,
+        "native journal postimage proof requires 1..=32 resources"
+    );
+    let mut keys = std::collections::BTreeSet::new();
+    for resource in resources {
+        anyhow::ensure!(
+            keys.insert(resource.key()),
+            "native journal postimage proof has duplicate resources"
+        );
+        resource.verify()?;
+    }
+    with_existing_journal(|journal| {
+        let mut proofs = Vec::with_capacity(resources.len());
+        for resource in resources {
+            resource.verify()?;
+            ensure_resolved(resource, journal)?;
+            let stack = journal.active_stack(resource.key())?;
+            let tip =
+                &journal.records[*stack.last().context("native journal logical tip missing")?];
+            anyhow::ensure!(
+                tip.meta.owner == owner
+                    && matches!(tip.meta.operation, Operation::Write)
+                    && tip.meta.state == State::Settled
+                    && tip.meta.outcome == Some(Outcome::Applied)
+                    && matches_binding(&tip.meta.binding, resource)?,
+                "native journal current owner tip mismatch"
+            );
+            let mut earliest = tip;
+            for &index in stack.iter().rev().skip(1) {
+                let previous = &journal.records[index];
+                if previous.meta.owner != owner {
+                    break;
+                }
+                anyhow::ensure!(
+                    matches!(previous.meta.operation, Operation::Write)
+                        && previous.meta.state == State::Settled
+                        && previous.meta.outcome == Some(Outcome::Applied)
+                        && matches_binding(&previous.meta.binding, resource)?
+                        && earliest.meta.before == previous.meta.after,
+                    "native journal owner write segment is not continuous"
+                );
+                earliest = previous;
+            }
+            let (_, current) = read_image(resource.path())?;
+            anyhow::ensure!(
+                current == tip.meta.after.file(),
+                "native journal current owner postimage changed"
+            );
+            proofs.push(OwnerPostimage {
+                path: resource.path().to_path_buf(),
+                key: resource.key().to_owned(),
+                record_id: tip.meta.id,
+                before: earliest.meta.before.file(),
+                fingerprint: current,
+            });
+        }
+        for resource in resources {
+            resource.verify()?;
+        }
+        Ok(proofs)
+    })
+    .map_err(|_| {
+        anyhow::anyhow!("native journal current owner postimage proof unavailable or mismatched")
     })
 }
 
 fn inspect_existing_records_inner(
     coverage: Option<&BatchIdentity>,
     claims: &[RecordClaim<'_>],
+    removed_workspace: Option<&Path>,
 ) -> Result<Vec<RecordProof>> {
-    use crate::core::file_placement::NodeStamp;
-    use crate::core::repo_lock::LockMode;
-    use std::io::Read;
-
     anyhow::ensure!(
         claims.len() <= MAX_RECORDS,
         "too many native journal claims"
@@ -314,6 +445,83 @@ fn inspect_existing_records_inner(
         check_text(claim.expected_owner, MAX_OWNER_BYTES, "owner")?;
         claim.resource.verify()?;
     }
+    with_existing_journal(|journal| {
+        if let Some(root) = removed_workspace {
+            require_settled_workspace_records(journal, root)?;
+        }
+        if let Some(identity) = coverage {
+            anyhow::ensure!(
+                journal.epoch == Some(identity.epoch),
+                "native journal epoch mismatch"
+            );
+            let fence = journal
+                .fences
+                .iter()
+                .find(|fence| fence.batch == identity.batch)
+                .context("native journal coverage fence missing")?;
+            anyhow::ensure!(
+                fence.intents.len() == claims.len(),
+                "native journal incomplete coverage claims"
+            );
+            for (ordinal, (intent, claim)) in fence.intents.iter().zip(claims).enumerate() {
+                anyhow::ensure!(
+                    intent.id == claim.id && fence.owner == claim.expected_owner,
+                    "native journal coverage claim order mismatch"
+                );
+                let record = journal
+                    .records
+                    .iter()
+                    .find(|record| record.meta.id == intent.id)
+                    .context("native journal expected intent unresolved")?;
+                anyhow::ensure!(
+                    record.meta.coverage
+                        == Some(IntentTag {
+                            batch: identity.batch,
+                            ordinal: ordinal as u32
+                        }),
+                    "native journal coverage tag mismatch"
+                );
+            }
+        }
+        let mut proofs = Vec::with_capacity(claims.len());
+        for claim in claims {
+            let record = journal
+                .records
+                .iter()
+                .find(|record| record.meta.id == claim.id)
+                .context("native journal claimed record missing")?;
+            anyhow::ensure!(
+                record.meta.owner == claim.expected_owner
+                    && matches!(record.meta.operation, Operation::Write)
+                    && matches_resource(record, claim.resource)?
+                    && record.meta.before.file() == *claim.before
+                    && record.meta.after.file() == *claim.after,
+                "native journal exact claim mismatch"
+            );
+            let status = match (record.meta.state, record.meta.outcome) {
+                (State::Prepared, None) => RecordProofStatus::Prepared,
+                (State::Applied, Some(Outcome::Applied)) => RecordProofStatus::Applied,
+                (State::Settled, Some(Outcome::Applied)) => RecordProofStatus::SettledApplied,
+                (State::Settled, Some(Outcome::NotApplied)) => RecordProofStatus::SettledNotApplied,
+                _ => anyhow::bail!("native journal invalid proof status"),
+            };
+            proofs.push(RecordProof {
+                id: claim.id,
+                status,
+            });
+            claim.resource.verify()?;
+        }
+        Ok(proofs)
+    })
+}
+
+/// One read-only existing-storage path for historical and current-image proofs. Keep the shared
+/// lock and descriptor alive through the inspection, then revalidate before returning its result.
+fn with_existing_journal<T>(inspect: impl FnOnce(&Journal) -> Result<T>) -> Result<T> {
+    use crate::core::file_placement::NodeStamp;
+    use crate::core::repo_lock::LockMode;
+    use std::io::Read;
+
     let dir = storage_directory()?;
     let dir_meta = fs::symlink_metadata(&dir)?;
     anyhow::ensure!(dir_meta.is_dir(), "native journal directory missing");
@@ -357,68 +565,7 @@ fn inspect_existing_records_inner(
         "native journal records oversized or changed"
     );
     let journal = Journal::decode(&bytes)?;
-    if let Some(identity) = coverage {
-        anyhow::ensure!(
-            journal.epoch == Some(identity.epoch),
-            "native journal epoch mismatch"
-        );
-        let fence = journal
-            .fences
-            .iter()
-            .find(|fence| fence.batch == identity.batch)
-            .context("native journal coverage fence missing")?;
-        anyhow::ensure!(
-            fence.intents.len() == claims.len(),
-            "native journal incomplete coverage claims"
-        );
-        for (ordinal, (intent, claim)) in fence.intents.iter().zip(claims).enumerate() {
-            anyhow::ensure!(
-                intent.id == claim.id && fence.owner == claim.expected_owner,
-                "native journal coverage claim order mismatch"
-            );
-            let record = journal
-                .records
-                .iter()
-                .find(|record| record.meta.id == intent.id)
-                .context("native journal expected intent unresolved")?;
-            anyhow::ensure!(
-                record.meta.coverage
-                    == Some(IntentTag {
-                        batch: identity.batch,
-                        ordinal: ordinal as u32
-                    }),
-                "native journal coverage tag mismatch"
-            );
-        }
-    }
-    let mut proofs = Vec::with_capacity(claims.len());
-    for claim in claims {
-        let record = journal
-            .records
-            .iter()
-            .find(|record| record.meta.id == claim.id)
-            .context("native journal claimed record missing")?;
-        anyhow::ensure!(
-            record.meta.owner == claim.expected_owner
-                && matches!(record.meta.operation, Operation::Write)
-                && matches_resource(record, claim.resource)?
-                && record.meta.before.file() == *claim.before
-                && record.meta.after.file() == *claim.after,
-            "native journal exact claim mismatch"
-        );
-        let status = match (record.meta.state, record.meta.outcome) {
-            (State::Prepared, None) => RecordProofStatus::Prepared,
-            (State::Applied, Some(Outcome::Applied)) => RecordProofStatus::Applied,
-            (State::Settled, Some(Outcome::Applied)) => RecordProofStatus::SettledApplied,
-            (State::Settled, Some(Outcome::NotApplied)) => RecordProofStatus::SettledNotApplied,
-            _ => anyhow::bail!("native journal invalid proof status"),
-        };
-        proofs.push(RecordProof {
-            id: claim.id,
-            status,
-        });
-        claim.resource.verify()?;
-    }
+    let result = inspect(&journal)?;
     let after_meta = file.metadata()?;
     anyhow::ensure!(
         proof_file_identity(&file)? == identity
@@ -438,7 +585,7 @@ fn inspect_existing_records_inner(
             && NodeStamp::capture(&dir, &fs::symlink_metadata(&dir)?, false)? == dir_stamp,
         "native journal storage changed"
     );
-    Ok(proofs)
+    Ok(result)
 }
 
 // Never follow a substituted link or wait on a substituted FIFO. No create or write access.
@@ -577,10 +724,7 @@ pub(crate) fn apply(
     };
     journal.append(record)?;
     commit_last(resource, &storage, &mut journal)?;
-    // Durable settlement, not a child's final text, is the source of parent edit attribution.
-    exec_ctx::current()
-        .context("native journal lost its pinned execution context")?
-        .note_workspace_changes(&[resource.path().to_path_buf()]);
+    // Attribution is emitted at the mutation boundary, including failed post-write settlement.
     Ok(after)
 }
 
@@ -615,6 +759,13 @@ pub(crate) fn begin_batch(
 
 /// Publish the complete ordered changed-write manifest before allowing any batch source effect.
 /// A published fence with missing records is unresolved evidence, never evidence of NotApplied.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Retained journal batch publication API; retired source integration has no live caller, and compatibility regressions exercise this implementation."
+    )
+)]
 pub(crate) fn begin_covered_batch(
     owner: &str,
     writes: &[(&NativeResource, &FileFingerprint, &[u8])],
@@ -755,12 +906,33 @@ fn begin_batch_inner(
 }
 
 pub(crate) struct BatchApply {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained batch CAS result for exact image compatibility assertions; the retired source integrator no longer consumes it."
+        )
+    )]
     pub(crate) fingerprint: FileFingerprint,
     /// The exact durable native-journal record for this changed entry. A no-op has no record.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained exact batch record identity for historical provenance assertions; no live source integrator consumes it."
+        )
+    )]
     pub(crate) native_record_id: Option<u64>,
 }
 
 impl ApplyBatch {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained exact covered-fence identity accessor for journal compatibility regressions."
+        )
+    )]
     pub(crate) fn coverage_identity(&self) -> Option<&BatchIdentity> {
         self.coverage.as_ref()
     }
@@ -768,6 +940,13 @@ impl ApplyBatch {
     /// Consume only the next exact planned write and return its durable record identity when it
     /// changed the source. Recheck live bytes immediately before the CAS; a foreign editor can
     /// still race cooperative admission, so this is not an OS transaction.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained journal batch CAS/provenance primitive; current native tools use single-write CAS."
+        )
+    )]
     pub(crate) fn apply_with_record(
         &mut self,
         resource: &NativeResource,
@@ -817,11 +996,6 @@ impl ApplyBatch {
         } else {
             None
         };
-        if native_record_id.is_some() {
-            exec_ctx::current()
-                .context("native journal lost its pinned execution context")?
-                .note_workspace_changes(&[resource.path().to_path_buf()]);
-        }
         self.next = next;
         Ok(BatchApply {
             fingerprint: after,
@@ -1170,15 +1344,21 @@ fn reconcile_locked(
         if outcome == Outcome::Applied {
             journal.records[index].meta.state = State::Applied;
             journal.records[index].meta.outcome = Some(outcome);
-            storage
-                .save(journal)
-                .map_err(|_| PossiblyApplied { record_id: id })?;
+            storage.save(journal).map_err(|_| {
+                if let Some(ctx) = exec_ctx::current() {
+                    ctx.note_task_effects();
+                }
+                PossiblyApplied { record_id: id }
+            })?;
         }
         journal.records[index].meta.state = State::Settled;
         journal.records[index].meta.outcome = Some(outcome);
-        storage
-            .save(journal)
-            .map_err(|_| PossiblyApplied { record_id: id })?;
+        storage.save(journal).map_err(|_| {
+            if let Some(ctx) = exec_ctx::current() {
+                ctx.note_task_effects();
+            }
+            PossiblyApplied { record_id: id }
+        })?;
         result.push(match outcome {
             Outcome::Applied => Reconciliation::After { record_id: id },
             Outcome::NotApplied => Reconciliation::Before { record_id: id },
@@ -1221,6 +1401,13 @@ fn commit_last(resource: &NativeResource, storage: &Storage, journal: &mut Journ
         storage.save(journal)?;
         Ok(())
     })();
+    if completed.is_err() {
+        // PossiblyApplied is uncertainty even when durable intent failed before a visible write.
+        // Invalidate before returning it; successful-only attribution below is too late.
+        if let Some(ctx) = exec_ctx::current() {
+            ctx.note_task_effects();
+        }
+    }
     completed
         .map(|()| id)
         .map_err(|_| PossiblyApplied { record_id: id }.into())
@@ -1235,7 +1422,11 @@ fn guarded_mutation(
     let (_, actual) = read_image(resource.path())?;
     anyhow::ensure!(&actual == expected, "native journal CAS conflict");
     match after {
-        Some(bytes) if expected.exists => persist::atomic_write(resource.path(), bytes)?,
+        Some(bytes) if expected.exists => {
+            persist::atomic_write_observed(resource.path(), bytes, || {
+                exec_ctx::note_native_mutation(resource.path())
+            })?
+        }
         Some(bytes) => {
             // No-clobber creation. Partial writes are covered by the durable Prepared record.
             let mut opts = OpenOptions::new();
@@ -1246,13 +1437,19 @@ fn guarded_mutation(
                 opts.mode(0o600);
             }
             let mut file = opts.open(resource.path())?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
+            let result = (|| -> Result<()> {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            exec_ctx::note_native_mutation(resource.path());
+            result?;
         }
         None => {
             ensure_durable_deletion_supported()?;
             anyhow::ensure!(expected.exists, "native journal refuses redundant deletion");
             fs::remove_file(resource.path())?;
+            exec_ctx::note_native_mutation(resource.path());
         }
     }
     sync_directory(
@@ -2469,6 +2666,59 @@ mod tests {
             with_test_storage(&dir.home, || {
                 exec_ctx::with_current(owner("parent/batch"), || f(&dir))
             })
+        });
+    }
+
+    #[test]
+    fn workspace_removal_preflight_preserves_unresolved_records_and_missing_intents() {
+        batch_fixture(|dir| {
+            let root = fs::canonicalize(&dir.workspace).unwrap();
+            require_workspace_settled(&root).unwrap();
+            assert!(!storage_directory().unwrap().exists());
+            let resource = dir.resource("file.txt");
+            let _lease = dir.lease(&[&resource]);
+            let missing = FileFingerprint::missing();
+            let error =
+                with_test_prepared_failure(|| apply(&resource, &missing, b"after", "parent/batch"))
+                    .unwrap_err();
+            assert!(error.downcast_ref::<PossiblyApplied>().is_some());
+            let records = storage_directory().unwrap().join("records.bin");
+            let before = fs::read(&records).unwrap();
+            assert!(require_workspace_settled(&root).is_err());
+            assert_eq!(fs::read(&records).unwrap(), before);
+            assert!(!resource.path().exists());
+            reconcile(&resource).unwrap();
+            require_workspace_settled(&root).unwrap();
+            let batch =
+                begin_covered_batch("parent/batch", &[(&resource, &missing, b"after")]).unwrap();
+            drop(batch); // Durable intent, no record: absence is not proof of no pending effect.
+            let before = fs::read(&records).unwrap();
+            assert!(require_workspace_settled(&root).is_err());
+            assert_eq!(fs::read(&records).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn workspace_removal_preflight_does_not_block_on_another_workspace_or_rewrite_history() {
+        batch_fixture(|dir| {
+            let root = fs::canonicalize(&dir.workspace).unwrap();
+            let other = dir.root.join("other-workspace");
+            fs::create_dir(&other).unwrap();
+            let other = fs::canonicalize(other).unwrap();
+            let resource = dir.resource("file.txt");
+            let _lease = dir.lease(&[&resource]);
+            let missing = FileFingerprint::missing();
+            with_test_prepared_failure(|| apply(&resource, &missing, b"after", "parent/batch"))
+                .unwrap_err();
+            require_workspace_settled(&other).unwrap();
+            assert!(require_workspace_settled(&root).is_err());
+            reconcile(&resource).unwrap();
+            apply(&resource, &missing, b"settled", "parent/batch").unwrap();
+            let records = storage_directory().unwrap().join("records.bin");
+            let before = fs::read(&records).unwrap();
+            require_workspace_settled(&root).unwrap();
+            assert_eq!(fs::read(records).unwrap(), before);
+            assert_eq!(fs::read(resource.path()).unwrap(), b"settled");
         });
     }
 

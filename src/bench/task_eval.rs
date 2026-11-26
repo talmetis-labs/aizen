@@ -330,8 +330,6 @@ fn prepare_task(
         approval_mode: ApprovalMode::Yolo, // Existing opt-in benchmark policy, unchanged.
         quiet: true,
         enable_verify_gate: true,
-        auto_checkpoint: false,
-        checkpoint_each_edit: false,
         workspace_root: Some(work.to_path_buf()),
         ..AgentConfig::default()
     };

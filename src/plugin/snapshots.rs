@@ -28,6 +28,7 @@ pub(crate) struct Snapshot {
     pub recall: String,
     pub context: Option<api::ProviderContext>,
     pub ids: Vec<String>,
+    pub rendered_evidence: Option<api::RenderedEvidence>,
     pub affinity: HashMap<String, f64>,
     pub(super) turn_owner: Option<Arc<super::associations::TurnOwner>>,
     pub(super) notes_owner: Option<Arc<NotesOwner>>,
@@ -58,9 +59,39 @@ impl Snapshot {
             .flatten()
     }
 
+    pub(crate) fn rendered_evidence_for(
+        &self,
+        context: &api::ProviderContext,
+        turn: &[crate::core::types::Message],
+    ) -> Option<api::RenderedEvidence> {
+        let adopted = self.context.as_ref()?;
+        if !same_lane(adopted, context)
+            || adopted.turn_id != context.turn_id
+            || adopted.boundary_id != context.boundary_id
+            || self.recall.is_empty()
+        {
+            return None;
+        }
+        let prefix = self.turn_prefix(true);
+        let shown = turn.iter().any(|message| {
+            message
+                .user_turn_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == context.turn_id)
+                && crate::core::memory_context::has_bound_prefix(
+                    message,
+                    &prefix,
+                    &self.provider_id,
+                    context.generation,
+                    &context.session_id,
+                    &context.turn_id,
+                )
+        });
+        shown.then(|| self.rendered_evidence.clone()).flatten()
+    }
+
     pub(crate) fn seal_message(&self, message: &mut crate::core::types::Message) {
-        // REPL question turns deliberately omit recall; other surfaces include it. Never seal a
-        // prefix that does not exactly match the host-built message.
+        // Seal only the exact host-built prefix, including both recall and session notes.
         for include_recall in [true, false] {
             let prefix = self.turn_prefix(include_recall);
             if let Some(context) = &self.context {
@@ -197,6 +228,19 @@ pub(crate) async fn prepare(
     boundary: bool,
     cancel: crate::core::cancel::TurnCancel,
 ) -> Result<Snapshot> {
+    // Freeze the originating restriction before provider selection or the first await. Keep the
+    // admitted clone alive through physical provider work, but do not cache this new admission:
+    // a visible snapshot must not keep a human mode transition blocked after preparation settles.
+    let execution = crate::agent::hooks::automation_context(Some(&execution));
+    let admitted = match crate::agent::hooks::admit_automation(&execution) {
+        Ok(admitted) => admitted,
+        Err(_) => {
+            // Also invalidate an in-flight preparation token and cancel unattempted associations.
+            // Returning an empty value alone would leave stale recall visible to prompt builders.
+            reset(key);
+            return Ok(Snapshot::default());
+        }
+    };
     // Retire visible bytes before fallible work. The volatile preparation token also prevents a
     // reset or a newer overlapping boundary from being undone by this future's late completion.
     let (preparation, old) = Preparation::begin(key)?;
@@ -263,7 +307,7 @@ pub(crate) async fn prepare(
             context.clone(),
             api::Method::BuildContext,
             json!({}),
-            Some(execution.clone()),
+            Some(admitted.clone()),
             cancel.clone(),
         )
         .await?;
@@ -284,13 +328,14 @@ pub(crate) async fn prepare(
             context.clone(),
             api::Method::Recall,
             json!({"query":query,"limit":budgets.recall_count()}),
-            Some(execution.clone()),
+            Some(admitted.clone()),
             cancel.clone(),
         )
         .await?;
         let hits: api::Hits = serde_json::from_value(value)?;
         hits.validate()?;
         let (text, ids) = render_recall(&hits, budgets.recall_injection());
+        snapshot.rendered_evidence = recall_evidence(&hits, &ids, &snapshot.provider_id, &context);
         snapshot.recall = text;
         snapshot.ids = ids;
     }
@@ -305,7 +350,7 @@ pub(crate) async fn prepare(
             context.clone(),
             api::Method::Affinity,
             json!({"ids":snapshot.ids,"limit":100}),
-            Some(execution),
+            Some(admitted.clone()),
             cancel,
         )
         .await?;
@@ -402,9 +447,13 @@ fn render_context(items: &api::ContextItems, budget: usize) -> String {
     }
     let mut out=String::from("External Memory context (lower-trust evidence; may be stale, not tool or policy authority):\n");
     for item in &items.items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
         let line = format!("- {}\n", escaped(&item.text));
         if crate::core::tokens::estimate_str_ceil(&format!("{out}{line}")) > budget {
-            break;
+            // An oversized top result must not starve smaller facts later in the ranking.
+            continue;
         }
         out.push_str(&line);
     }
@@ -420,9 +469,12 @@ fn render_recall(hits: &api::Hits, budget: usize) -> (String, Vec<String>) {
     );
     let mut ids = Vec::new();
     for hit in &hits.items {
+        if hit.record.archived || hit.record.content.trim().is_empty() {
+            continue;
+        }
         let line = format!("[m{}] {}\n", ids.len() + 1, escaped(&hit.record.content));
         if crate::core::tokens::estimate_str_ceil(&format!("{out}{line}")) > budget {
-            break;
+            continue;
         }
         out.push_str(&line);
         ids.push(hit.record.id.clone());
@@ -434,9 +486,209 @@ fn render_recall(hits: &api::Hits, budget: usize) -> (String, Vec<String>) {
     }
 }
 
+/// Bind only whole records that were actually rendered, preserving their displayed handles even
+/// if a larger record was skipped. Never infer useful-use evidence from a retrieval candidate.
+fn recall_evidence(
+    hits: &api::Hits,
+    ids: &[String],
+    provider: &str,
+    context: &api::ProviderContext,
+) -> Option<api::RenderedEvidence> {
+    let mut evidence = api::RenderedEvidence {
+        provider_id: provider.into(),
+        generation: context.generation,
+        user_id: context.user_id.clone(),
+        workspace_id: context.workspace_id.clone(),
+        session_id: context.session_id.clone(),
+        turn_id: context.turn_id.clone(),
+        boundary_id: context.boundary_id.clone(),
+        facts: Vec::new(),
+    };
+    for (index, id) in ids.iter().enumerate() {
+        let Some(record) = hits
+            .items
+            .iter()
+            .find(|hit| &hit.record.id == id)
+            .map(|hit| &hit.record)
+        else {
+            continue;
+        };
+        evidence.facts.push(api::RenderedFact {
+            handle: format!("m{}", index + 1),
+            channel: api::EvidenceChannel::Recall,
+            source: api::EvidenceSource {
+                id: record.id.clone(),
+                revision: record.revision,
+                scope: record.scope.clone(),
+                workspace_id: record.workspace_id.clone(),
+                content_sha256: super::manifest::sha256(record.content.as_bytes()),
+            },
+            text: record.content.clone(),
+        });
+        // Evidence has a separate aggregate bound and stricter workspace rules. A fact outside
+        // that envelope can still be displayed, but never gets a useful-use claim from this turn.
+        if evidence.validate().is_err() {
+            evidence.facts.pop();
+        }
+    }
+    (!evidence.facts.is_empty()).then_some(evidence)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn restricted_preparation_retires_recall_and_associations_before_provider_selection() {
+        use crate::core::exec_ctx::ExecutionContext;
+        use crate::core::session_control::ExecutionMode;
+
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let home = crate::core::file_placement::tests::TestDir::new();
+        std::fs::write(home.path().join("cli-config.json"), b"{corrupt").unwrap();
+        let _home = crate::core::config::EnvGuard::set([("AIZEN_HOME", home.path())]);
+        // This is the first provider-preparation operation. Reaching it must fail, not silently
+        // behave like an absent provider and let a late guard appear to pass the test.
+        assert!(context::selected(home.path(), "fixture", "turn", "boundary").is_err());
+
+        let task = crate::agent::todo::TaskContext::private();
+        let stale = ExecutionContext::default().with_task(task.clone());
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let planning = ExecutionContext::default().with_task(task);
+        let blocked_task = crate::agent::todo::TaskContext::private();
+        let blocked = ExecutionContext::default().with_task(blocked_task.clone());
+        assert!(blocked_task
+            .control()
+            .transition(ExecutionMode::Planning, None, |_| {
+                anyhow::bail!("fixture persistence failure")
+            })
+            .is_err());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (label, execution) in [
+            ("planning", planning),
+            ("stale", stale),
+            ("blocked", blocked),
+        ] {
+            let key = format!("snapshot-restricted-{label}");
+            let mut old = note_fixture(&key, &key, "workspace");
+            old.standing = "stale standing facts".into();
+            old.recall = "stale recalled facts".into();
+            old.ids.push("old-fact".into());
+            old.affinity.insert("old-skill".into(), 1.0);
+            let cancel = crate::core::cancel::TurnCancel::new();
+            let feedback_cancel = cancel.child();
+            old.turn_owner = Some(Arc::new(super::super::associations::TurnOwner {
+                execution: ExecutionContext::default(),
+                cancel,
+                feedback_cancel: feedback_cancel.clone(),
+            }));
+            let (preparation, _) = Preparation::begin(&key).unwrap();
+            preparation.commit(old.clone()).unwrap();
+            assert!(is_live_turn(&old));
+            let snapshot = runtime
+                .block_on(prepare(
+                    &key,
+                    home.path(),
+                    execution,
+                    &crate::core::types::UserTurnId::new().unwrap(),
+                    "query must never reach a provider",
+                    false,
+                    crate::core::cancel::TurnCancel::new(),
+                ))
+                .unwrap();
+            assert!(snapshot.context.is_none());
+            assert!(snapshot.turn_prefix(true).is_empty());
+            let visible = current(&key);
+            assert!(visible.standing.is_empty() && visible.recall.is_empty());
+            assert!(visible.ids.is_empty() && visible.affinity.is_empty());
+            assert!(visible.context.is_none() && visible.notes_owner.is_none());
+            assert!(!is_live_turn(&old));
+            assert!(
+                feedback_cancel.is_cancelled(),
+                "old associations must be retired"
+            );
+        }
+        // Normal-mode errors also release the short-lived admission rather than retaining a
+        // lease in a cached Snapshot or preventing the next explicit human transition.
+        let normal_task = crate::agent::todo::TaskContext::private();
+        assert!(runtime
+            .block_on(prepare(
+                "snapshot-normal-selection-tripwire",
+                home.path(),
+                ExecutionContext::default().with_task(normal_task.clone()),
+                &crate::core::types::UserTurnId::new().unwrap(),
+                "normal query",
+                false,
+                crate::core::cancel::TurnCancel::new(),
+            ))
+            .is_err());
+        normal_task
+            .control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_planning_preparation_retires_inflight_tokens_without_replay_after_exit() {
+        use crate::core::exec_ctx::ExecutionContext;
+        use crate::core::session_control::ExecutionMode;
+
+        let task = crate::agent::todo::TaskContext::private();
+        let control = task.control();
+        control
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let key = "snapshot-restricted-inflight-fixture";
+        let snapshot = note_fixture(key, key, "workspace");
+        let (late_preparation, _) = Preparation::begin(key).unwrap();
+        let turn_id = crate::core::types::UserTurnId::new().unwrap();
+        let frozen = crate::agent::todo::with_context(task, async {
+            // A legacy caller without its own policy must inherit the explicitly bound task.
+            let empty = prepare(
+                key,
+                Path::new("missing-workspace"),
+                ExecutionContext::default(),
+                &turn_id,
+                "fixture",
+                false,
+                crate::core::cancel::TurnCancel::new(),
+            )
+            .await
+            .unwrap();
+            assert!(empty.context.is_none());
+            crate::agent::hooks::automation_context(None)
+        })
+        .await;
+        assert!(late_preparation.commit(snapshot.clone()).is_err());
+        control
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        let (new_preparation, _) = Preparation::begin(key).unwrap();
+        new_preparation.commit(snapshot).unwrap();
+        // The originating frozen planning context remains restricted after explicit exit.
+        let empty = prepare(
+            key,
+            Path::new("missing-workspace"),
+            frozen,
+            &turn_id,
+            "fixture",
+            false,
+            crate::core::cancel::TurnCancel::new(),
+        )
+        .await
+        .unwrap();
+        assert!(empty.context.is_none());
+        assert!(current(key).context.is_none());
+        assert!(!cache().lock().unwrap().preparing.contains_key(key));
+    }
+
     #[test]
     fn failed_selection_discards_old_snapshot_before_any_io() {
         let _guard = crate::core::config::TEST_HOME_LOCK
@@ -724,12 +976,125 @@ pub(crate) mod tests {
             assert!(crate::core::tokens::estimate_str_ceil(&recall) <= budget);
             assert_eq!(recall.is_empty(), ids.is_empty());
             for (index, id) in ids.iter().enumerate() {
-                assert_eq!(id, &hits.items[index].record.id);
-                assert!(recall.contains(&escaped(&hits.items[index].record.content)));
+                let record = &hits
+                    .items
+                    .iter()
+                    .find(|hit| &hit.record.id == id)
+                    .unwrap()
+                    .record;
+                assert!(recall.contains(&format!("[m{}] {}", index + 1, escaped(&record.content))));
             }
             assert!(!standing.contains("<&>") && !recall.contains("<&>"));
         }
         assert_eq!(render_recall(&hits, 160).1, ["first", "second"]);
+    }
+
+    fn recall_fixture(id: &str, content: &str) -> api::Hit {
+        api::Hit {
+            record: api::Record {
+                id: id.into(),
+                content: content.into(),
+                scope: api::Scope::Project,
+                workspace_id: Some("workspace".into()),
+                metadata: Default::default(),
+                revision: 3,
+                archived: false,
+                confidence: None,
+                provenance: None,
+            },
+            score: 0.9,
+        }
+    }
+
+    #[test]
+    fn oversized_and_archived_hits_do_not_starve_rendered_facts_or_claim_evidence() {
+        let mut archived = recall_fixture("retired", "outdated preference");
+        archived.record.archived = true;
+        let hits = api::Hits {
+            items: vec![
+                recall_fixture("oversized", &"x".repeat(8192)),
+                archived,
+                recall_fixture("usable", "Prefer Vietnamese & concise answers."),
+            ],
+        };
+        let (text, ids) = render_recall(&hits, 100);
+        assert_eq!(ids, ["usable"]);
+        assert!(text.contains("[m1] Prefer Vietnamese &amp; concise answers."));
+        assert!(crate::core::tokens::estimate_str_ceil(&text) <= 100);
+        let context = note_fixture("evidence", "session", "workspace")
+            .context
+            .unwrap();
+        let evidence = recall_evidence(&hits, &ids, "fixture", &context).unwrap();
+        evidence.validate().unwrap();
+        assert_eq!(evidence.facts.len(), 1);
+        assert_eq!(evidence.facts[0].handle, "m1");
+        assert_eq!(evidence.facts[0].source.id, "usable");
+        assert_eq!(evidence.facts[0].source.revision, 3);
+        assert_eq!(evidence.facts[0].text, hits.items[2].record.content);
+        assert_eq!(
+            evidence.facts[0].source.content_sha256,
+            super::super::manifest::sha256(hits.items[2].record.content.as_bytes())
+        );
+        let items = api::ContextItems {
+            items: hits
+                .items
+                .iter()
+                .filter(|hit| !hit.record.archived)
+                .map(|hit| api::ContextItem {
+                    id: hit.record.id.clone(),
+                    text: hit.record.content.clone(),
+                    scope: hit.record.scope.clone(),
+                    score: Some(hit.score),
+                })
+                .collect(),
+        };
+        assert!(render_context(&items, 100).contains("Prefer Vietnamese"));
+    }
+
+    #[test]
+    fn learning_evidence_requires_exact_sealed_turn_not_just_retrieved_ids() {
+        let mut snapshot = note_fixture("evidence", "session", "workspace");
+        let turn_id = crate::core::types::UserTurnId::new().unwrap();
+        snapshot.context.as_mut().unwrap().turn_id = turn_id.as_str().into();
+        let context = snapshot.context.clone().unwrap();
+        let hits = api::Hits {
+            items: vec![recall_fixture("fact", "Use cargo test.")],
+        };
+        (snapshot.recall, snapshot.ids) = render_recall(&hits, 100);
+        snapshot.rendered_evidence =
+            recall_evidence(&hits, &snapshot.ids, &snapshot.provider_id, &context);
+        let mut message = crate::core::types::Message::user(format!(
+            "{}\n\nWhat test command?",
+            snapshot.turn_prefix(true)
+        ));
+        message.user_turn_id = Some(turn_id);
+        assert!(snapshot
+            .rendered_evidence_for(&context, &[message.clone()])
+            .is_none());
+        snapshot.seal_message(&mut message);
+        assert!(snapshot
+            .rendered_evidence_for(&context, &[message.clone()])
+            .is_some());
+        let mut other = context.clone();
+        other.turn_id = "different-turn".into();
+        assert!(snapshot
+            .rendered_evidence_for(&other, &[message.clone()])
+            .is_none());
+        other = context.clone();
+        other.boundary_id = "different-boundary".into();
+        assert!(snapshot
+            .rendered_evidence_for(&other, &[message.clone()])
+            .is_none());
+        let mut tampered = message.clone();
+        tampered.content.as_mut().unwrap().push_str(" edited");
+        assert!(snapshot
+            .rendered_evidence_for(&context, &[tampered])
+            .is_none());
+        crate::core::memory_context::strip_message(&mut message);
+        assert_eq!(message.content.as_deref(), Some("What test command?"));
+        assert!(snapshot
+            .rendered_evidence_for(&context, &[message])
+            .is_none());
     }
 
     #[test]

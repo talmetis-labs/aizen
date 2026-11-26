@@ -21,7 +21,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::core::cli_config::{self, DiscordConfig};
-use crate::hostbot::platform::{Inbound, Outbound, Platform};
+use crate::hostbot::platform::{Inbound, IncomingMessage, Outbound, Platform};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -143,6 +143,7 @@ pub fn is_allowed(cfg: &DiscordConfig, channel: u64, user: u64) -> bool {
 
 /// One inbound message the gateway hands to the runner loop.
 pub struct Incoming {
+    pub message_id: u64,
     pub channel_id: u64,
     pub user_id: u64,
     pub content: String,
@@ -317,6 +318,7 @@ fn parse_message_create(d: Option<&Value>) -> Option<Incoming> {
         return None;
     }
     Some(Incoming {
+        message_id: d.get("id")?.as_str()?.parse().ok()?,
         channel_id,
         user_id,
         content,
@@ -377,7 +379,12 @@ impl Platform for DiscordPlatform {
                     .send(Inbound {
                         route: "default".to_string(),
                         chat: inc.channel_id,
-                        text: inc.content,
+                        message: IncomingMessage {
+                            event_id: inc.message_id.to_string(),
+                            message_id: inc.message_id.to_string(),
+                            sender_id: Some(inc.user_id.to_string()),
+                            text: inc.content,
+                        },
                     })
                     .await;
             }
@@ -494,7 +501,7 @@ mod tests {
             parse_message_create(Some(&empty)).is_none(),
             "empty content skipped"
         );
-        let ok = json!({"channel_id":"123","author":{"id":"456"},"content":"hello"});
+        let ok = json!({"id":"789","channel_id":"123","author":{"id":"456"},"content":"hello"});
         let inc = parse_message_create(Some(&ok)).expect("valid message parses");
         assert_eq!(
             (inc.channel_id, inc.user_id, inc.content.as_str()),

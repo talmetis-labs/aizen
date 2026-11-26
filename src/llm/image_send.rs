@@ -20,6 +20,19 @@ pub const IMAGE_MEMORY_BUDGET: usize = 192 * 1024 * 1024;
 static IMAGE_MEMORY_USED: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
+#[path = "image_budget_test_process.rs"]
+mod budget_test_process;
+#[cfg(test)]
+pub(crate) fn isolated_image_budget_test() -> bool {
+    budget_test_process::isolated_image_budget_test(false)
+}
+
+#[cfg(test)]
+pub(crate) fn isolated_image_budget_transport_test() -> bool {
+    budget_test_process::isolated_image_budget_test(true)
+}
+
+#[cfg(test)]
 pub(crate) fn image_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -1005,6 +1018,9 @@ mod tests {
 
     #[test]
     fn no_larger_candidate_is_kept_and_budget_exhaustion_is_original() {
+        if isolated_image_budget_test() {
+            return;
+        }
         let _guard = image_test_lock();
         let cache = Mutex::new(Cache::default());
         let source = fixture(1, 1, false, png::ColorType::Rgb, png::BitDepth::Eight);
@@ -1185,6 +1201,9 @@ mod tests {
 
     #[test]
     fn transient_admission_refusals_do_not_poison_the_cache() {
+        if isolated_image_budget_test() {
+            return;
+        }
         let _guard = image_test_lock();
         let cache = Mutex::new(Cache::default());
         let source = fixture(64, 64, true, png::ColorType::Rgb, png::BitDepth::Eight);
@@ -1207,6 +1226,9 @@ mod tests {
 
     #[test]
     fn resize_admission_failure_keeps_useful_full_resolution_and_retries() {
+        if isolated_image_budget_test() {
+            return;
+        }
         let _guard = image_test_lock();
         let cache = Mutex::new(Cache::default());
         let source = fixture(1536, 1024, true, png::ColorType::Rgb, png::BitDepth::Eight);
@@ -1220,6 +1242,16 @@ mod tests {
             size + MAX_DECODED + 1536 * 1024 * 3 + 2 * limit + 2 * uri_len(limit) + 1024 * 1024;
         let available = IMAGE_MEMORY_BUDGET - IMAGE_MEMORY_USED.load(Ordering::Acquire);
         let held = try_image_memory_lease(available - initial).unwrap();
+        // Ordinary HTTP requests do not take image_test_lock. Prove that even their minimum
+        // reservation can invalidate this exact codec allowance; this fixture needs a process,
+        // not another voluntary lock shared only by image tests.
+        let request_budget = Arc::new(crate::core::media_budget::MediaBudget::default());
+        let request = request_budget.reserve(256 * 1024).unwrap();
+        let refused = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
+        assert_eq!(refused.url.as_str(), source);
+        assert_eq!(refused.stats.candidates_encoded, 0);
+        assert!(cache.lock().unwrap().entries.is_empty());
+        drop(request);
         let partial = optimize_with_cache(&source, ImageSendPolicy::Balanced, false, &cache);
         assert!(partial.url.as_str().len() < source.len());
         assert_eq!(partial.dimensions, Some((1536, 1024)));

@@ -80,6 +80,7 @@ const ACCESS_FS_EXECUTE: u64 = 1 << 0;
 const ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
 const ACCESS_FS_READ_FILE: u64 = 1 << 2;
 const ACCESS_FS_READ_DIR: u64 = 1 << 3;
+const ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
 const ACCESS_FS_V1_MASK: u64 = (1 << 13) - 1; // execute..make_sym
 const ACCESS_FS_REFER: u64 = 1 << 13; // ABI v2
 const ACCESS_FS_TRUNCATE: u64 = 1 << 14; // ABI v3
@@ -317,6 +318,9 @@ fn build_ruleset(fs: &FsPolicy) -> Result<Option<OwnedFd>, String> {
     for p in &fs.read_write {
         add(p, handled); // everything the kernel governs, beneath this root
     }
+    if let Some(parent) = &fs.remove_worktree_parent {
+        add(parent, ACCESS_FS_REMOVE_DIR);
+    }
     for p in &fs.read_only {
         add(
             p,
@@ -550,6 +554,7 @@ mod tests {
                 "/dev".into(),
             ],
             exec_files: vec![],
+            remove_worktree_parent: None,
             deny: vec![],
         };
         let sbx = LinuxSandbox::build(&fs, false, &SandboxLimits::default());
@@ -594,6 +599,7 @@ mod tests {
                 "/proc".into(),
             ],
             exec_files: vec![],
+            remove_worktree_parent: None,
             deny: vec![],
         };
         let sbx = LinuxSandbox::build(&fs, true, &SandboxLimits::default());

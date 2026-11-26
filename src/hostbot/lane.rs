@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::hostbot::platform::Platform;
+use crate::hostbot::platform::{IncomingMessage, Platform};
 
 /// Default cap on turns running at once. Four is a compromise: enough that a slow chat doesn't block
 /// three others, few enough that four concurrent `cargo build`s don't take the machine down. Override
@@ -161,7 +161,7 @@ impl Default for LaneShared {
 
 /// A running lane: the queue its messages go on, and the task draining it.
 struct Lane {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<IncomingMessage>,
     task: JoinHandle<()>,
 }
 
@@ -228,7 +228,7 @@ impl<P: Platform> LaneRegistry<P> {
     ///
     /// A full queue drops the message rather than blocking the router: blocking would stall EVERY
     /// bot to punish one flooding chat, which is the failure this whole module exists to remove.
-    pub async fn dispatch(&self, ctx: LaneSpawn<P>, text: String) {
+    pub async fn dispatch(&self, ctx: LaneSpawn<P>, message: IncomingMessage) {
         let key = (ctx.route.clone(), ctx.chat);
         // Fast path: an existing, still-open lane.
         {
@@ -237,21 +237,25 @@ impl<P: Platform> LaneRegistry<P> {
                 if !lane.tx.is_closed() {
                     let tx = lane.tx.clone();
                     drop(lanes);
-                    if tx.try_send(text).is_err() {
-                        eprintln!("[lane {}:{}] queue full — message dropped", key.0, key.1);
+                    if let Err(error) = tx.try_send(message) {
+                        let dropped = error.into_inner();
+                        eprintln!(
+                            "[lane {}:{}] event {} (message {}) not admitted",
+                            key.0, key.1, dropped.event_id, dropped.message_id
+                        );
                     }
                     return;
                 }
             }
         }
         // Start a lane. Re-check under the lock: two messages can arrive back to back.
-        let (tx, rx) = mpsc::channel::<String>(LANE_QUEUE_DEPTH);
+        let (tx, rx) = mpsc::channel::<IncomingMessage>(LANE_QUEUE_DEPTH);
         let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lane) = lanes.get(&key) {
             if !lane.tx.is_closed() {
                 let tx = lane.tx.clone();
                 drop(lanes);
-                let _ = tx.try_send(text);
+                let _ = tx.try_send(message);
                 return;
             }
         }
@@ -265,7 +269,7 @@ impl<P: Platform> LaneRegistry<P> {
         );
         self.shared.stats.add_lane();
         drop(lanes);
-        let _ = tx.try_send(text);
+        let _ = tx.try_send(message);
     }
 }
 
@@ -276,7 +280,7 @@ pub struct LaneSpawn<P: Platform> {
     pub chat: P::Chat,
     #[allow(clippy::type_complexity)]
     pub spawn: Box<
-        dyn FnOnce(mpsc::Receiver<String>, Weak<LaneRegistry<P>>) -> JoinHandle<()>
+        dyn FnOnce(mpsc::Receiver<IncomingMessage>, Weak<LaneRegistry<P>>) -> JoinHandle<()>
             + Send
             + 'static,
     >,

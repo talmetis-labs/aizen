@@ -470,11 +470,16 @@ fn strip_line_suffix(path: &str) -> &str {
 
 // ── path resolution (the only part that touches the disk) ───────────────────────────────────────
 
-/// Project root, resolved ONCE. `config::project_root()` shells out to `git rev-parse` on its first
-/// branch — utterly unacceptable at the ~9fps this is called from, so it is cached for the process.
-fn project_root_cached() -> &'static Path {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(crate::core::config::project_root)
+/// Render-thread path projection; execution contexts always take precedence. Never fall back to
+/// startup cwd after focus, or an absent B file could become a clickable A file with the same name.
+fn project_root_cached() -> PathBuf {
+    crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        })
+        .or_else(crate::ui::tui::input_workspace)
+        .unwrap_or_else(crate::core::config::project_root)
 }
 
 /// How long a resolution stays cached. Long enough that a steady screen costs zero syscalls, short
@@ -498,8 +503,9 @@ fn resolve_path(cand: &str) -> Option<PathBuf> {
         return None;
     }
     let now = Instant::now();
+    let key = format!("{}\0{cand}", project_root_cached().display());
     if let Ok(cache) = resolve_cache().lock() {
-        if let Some((hit, at)) = cache.get(cand) {
+        if let Some((hit, at)) = cache.get(&key) {
             if now.duration_since(*at) < RESOLVE_TTL {
                 return hit.clone();
             }
@@ -510,7 +516,7 @@ fn resolve_path(cand: &str) -> Option<PathBuf> {
         if cache.len() >= RESOLVE_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(cand.to_string(), (found.clone(), now));
+        cache.insert(key, (found.clone(), now));
     }
     found
 }
@@ -521,10 +527,14 @@ fn probe_path(cand: &str) -> Option<PathBuf> {
     if p.is_absolute() {
         return std::fs::metadata(p).is_ok().then(|| p.to_path_buf());
     }
-    let mut roots: Vec<PathBuf> = vec![project_root_cached().to_path_buf()];
-    if let Ok(cwd) = std::env::current_dir() {
-        if !roots.contains(&cwd) {
-            roots.push(cwd);
+    let mut roots: Vec<PathBuf> = vec![project_root_cached()];
+    let bound = crate::core::exec_ctx::current().is_some_and(|ctx| ctx.placement().is_some())
+        || crate::ui::tui::input_workspace().is_some();
+    if !bound {
+        if let Ok(cwd) = std::env::current_dir() {
+            if !roots.contains(&cwd) {
+                roots.push(cwd);
+            }
         }
     }
     roots.into_iter().find_map(|root| {
@@ -930,6 +940,35 @@ pub(crate) fn captured_links(bytes: &[u8]) -> Vec<(usize, usize, String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_cache_is_scoped_to_bound_workspace_without_startup_fallback() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let a = fixture.path().join("a");
+        let b = fixture.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("same.rs"), "a").unwrap();
+        std::fs::write(b.join("same.rs"), "b").unwrap();
+        let placement = crate::core::file_placement::PlacementContext::new(
+            a.clone(),
+            fixture.path().join("home"),
+        )
+        .unwrap();
+        let first =
+            crate::core::exec_ctx::ExecutionContext::default().with_placement(placement.clone());
+        let second = first.with_placement(placement.fork_for(b.clone(), "b").unwrap());
+        crate::core::exec_ctx::with_current(first, || {
+            assert_eq!(resolve_path("same.rs"), Some(a.join("same.rs")))
+        });
+        crate::core::exec_ctx::with_current(second, || {
+            assert_eq!(resolve_path("same.rs"), Some(b.join("same.rs")));
+            assert!(
+                resolve_path("Cargo.toml").is_none(),
+                "never link the startup checkout when focused file is absent"
+            );
+        });
+    }
 
     /// Resolver that says every candidate exists, mapping it under a fixed absolute root. Lets the
     /// SHAPE rules be tested without depending on what happens to be on this machine's disk.

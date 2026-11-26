@@ -7,6 +7,14 @@ by kernel mechanisms where the platform has them, and reported honestly where it
 This document is the reference: threat model, architecture, mode semantics, the per-platform
 capability matrix, configuration, troubleshooting, and the limitations we know about.
 
+## Desktop document reviews
+
+From a workspace directory, `aizen sandbox review --topic SESSION` reads one JSON request from stdin and prints one JSON reply. Use the saved conversation slug as SESSION. The workspace and topic together scope the ledger. An operator or trusted worker can submit a UTF-8 Markdown document with `{"action":"submit","expected":0,"document":"…","sha256":"…"}`. Compute SHA-256 over the exact UTF-8 bytes. The expected number is the latest version returned by `{"action":"read"}`. This handoff accepts text. VM provisioning has its own lifecycle.
+
+Desktop's Preview offers read, request changes, discard and export for the selected version. Asking for changes records feedback for the producer. Reading an earlier revision uses `{"action":"read","version":1}`. Sample documents are explicitly marked. Export to a chosen folder requires a filesystem supporting hard links. Core checks the digest and records the destination before publication so a retry can reconcile an existing export.
+
+Each document is limited to 64 KiB. Journal admission reserves space for decisions and enforces a 2 MiB per-topic and 64 MiB catalog budget under an OS lock. Discarding a stored version clears its document bytes. User-exported files stay under the destination owner's control.
+
 ## Threat model
 
 Protected against (to the degree the capability matrix below says, per platform):
@@ -137,35 +145,34 @@ cooperating Aizen file tools. Read/read pairs can overlap; a pair containing a w
 only without write/read or write/write intersections. Capability checks and native resource locks
 do not confine arbitrary processes, hooks, external editors or repository build scripts.
 
-The explicit native speculative lane implemented in source uses a coherent immutable base and
-per-child private overlays, not concurrent live same-file writes. Only bounded native file tools
-are eligible; configured lifecycle hooks that could run cause refusal. Parent integration follows
-physical settlement and revalidates live base/read fingerprints. Conflicts and uncertain effects
-are retained without automatic retry or rollback. Combined-tree command verification is not semantic
-serializability or isolated-build proof. Verifier intent is durable before the opaque gate, and
-finish evidence links the exact start with an explicit physical-effect state; start-only, nonsettled
-or legacy evidence cannot certify accepted verification. Workflow summaries are strictly versioned
-provenance, not execution authority or complete crash/effect coverage. Parent-only restart reports are available through
-`checkpoint_view action=recovery_report` and `aizen time doctor --cohort ... --prepared ...
---resource ...`. Caller-selected exact resources, fresh admission and checked existing journal IDs
-are required; stored paths/IDs grant no execution authority. New integrations bind prepared/receipt
-evidence to a v2 journal epoch and complete changed-intent fence; restart inspection rejects missing
-records or incomplete claims, even when no claims are supplied. Legacy selected-ID proof is not
-upgraded to complete coverage. This historical accounting does not prove physical-worker closure;
-a durable worker roster/closure chain remains unfinished. Default reports do not append or settle
-pending guards, though metadata admission bookkeeping may be created. The CLI's explicit
-`--record-observation` flag appends only historical nonterminal inspection data under fresh parent
-admission and an existing exclusive cohort owner; it never changes source/native journal bytes,
-accepts verification or clears pending guards. Publication failures retain evidence without automatic
-cleanup/retry. Safe terminal reconciliation, selective inverse and checkpoint/authorship linkage are
-unfinished. This does not change the process capability matrix or imply release/install verification.
+Explicit `isolation: "worktree"` uses fresh registered Git-owned roots, not concurrent live
+same-file writes in one checkout. Children receive exact bounded native file scopes, not shell/build
+access. Actual native worker intents are published before launch; real joins and context-carrier
+retirement produce a private release token before the controller may commit attributed paths.
+The v2 registration is bounded to 128 workers and 128 KiB of metadata. Source history belongs to Git;
+mutation images and attribution remain in the separate native journal. Neither a report nor a
+serialized terminal record grants live ownership, restart adoption or physical-settlement proof.
+Cancellation, unjoined workers, unknown effects and uncertain publication retain barriers without
+automatic retry or cleanup. Destination integration and verification remain separate approved steps.
+See [the lifecycle contract](REFERENCE.md#git-owned-native-task-lifecycle).
+
+New `execution: "speculative"` requests are retired, with no implicit direct/Git fallback. Historical
+source-store evidence is read by compatibility code, not a source writer or custom same-file merger.
+`aizen time recovery --cohort ... --prepared ... --resource ...` uses caller-selected exact resources;
+stored paths/IDs are not access or execution authority. Missing roster/lineage, incomplete worker
+closure and same-file multi-author records remain diagnostic and unresolved, even for matching
+postimages. Default inspection does not append or settle pending guards. Explicit
+`--record-observation` only appends bounded nonterminal metadata under fresh parent/writer/physical
+admission and existing exclusive ownership; source/native journal bytes and pending barriers stay
+unchanged. General crash/unknown-effect reconciliation is not implemented. This does not change the
+process capability matrix or imply installation, release or cross-platform acceptance.
 
 Foreground shell/build work stays an opaque exclusive barrier against scoped native editors.
 Managed background `process` commands instead retain a separate lifetime barrier, allowing ordinary
 sequential tools in the same authorized writer scope to continue while a dev server lives. This is
 an explicit compatibility exception, **not filesystem/build isolation**: a background command may
-write arbitrary reachable paths while those tools run. Scoped native work, speculative cohorts,
-coherent checkpoints, recovery/undo and certified verification remain excluded. Automatic coverage
+write arbitrary reachable paths while those tools run. Scoped native work, Git-owned native tasks,
+native recovery/undo and certified verification remain excluded. Verification coverage
 is deferred during that interval; no protected/verified claim is earned. Lost observer/tree proof
 blocks ordinary effects with typed uncertainty until actual tree and pipe settlement is proven.
 
@@ -213,11 +220,28 @@ If the workspace is a filesystem root, the home directory, or a system directory
 refuses (a workspace-write sandbox over `C:\` protects nothing) and `auto` warns; override with
 `sandbox.dangerous_allow_broad_workspace = true` if you accept that.
 
-**Git persistence surfaces**: every internal git command Aizen runs (time-machine checkpoints,
-repo probing, the writer lease) is hardened with `core.hooksPath` pointed at a nonexistent
-directory, `core.fsmonitor=false`, an emptied `credential.helper`, and `GIT_TERMINAL_PROMPT=0` —
-a checkout's `.git/hooks` never executes because Aizen made a checkpoint. Git aliases cannot
-shadow builtin commands, so aliased-command injection does not apply to internal plumbing.
+**Read-only Git inspection** uses fixed arguments through the sandbox/settlement boundary and
+disables external diff/textconv, fsmonitor and interactive credential prompts. Repository probing
+through the hardened resolver is distinct from approved mutations. Git aliases cannot shadow
+builtin commands. There is no checkpoint persistence backend or automatic snapshot capture.
+
+**Explicit Git workspace operations** use a separate mutation path, preserving configured
+hooks/signing/filters rather than silently bypassing failures. `/time` exposes inspection,
+create/remove, explicit branch switch/revert and fast-forward-only integration; it does not yet
+provide focus/rebinding or a complete multi-agent Git handoff lifecycle. `work new`
+freezes a full committed OID, validates/reserves a new destination, and uses `GitMutation` through
+`runner::prepare_std`; configured checkout hooks/filters are not suppressed. Its request uses the
+source repository as workspace and the newly reserved directory as `cwd` (Git receives `-C` for
+source selection). Ordinary workspace/cwd/cache grants still apply; this is not an exact two-root
+sandbox or a repository-independent checkout. Shared Git directories outside these grants can be
+refused by enforcing backends. The protected `~/.aizen` root can also prevent managed worktrees
+there on enforcing backends; no deny rule is removed to make creation work. Windows strict still
+refuses unsupported kernel confinement. Guarded mode remains advisory, including for hooks.
+Creation retains cooperative writer/background ownership through actual process settlement and
+postinspection. Failed hooks or incomplete verification leave possible partial state for inspection,
+not automatic rollback/deletion. Path witnesses detect observed directory replacements but do not
+provide atomic exclusion against external filesystem/Git writers. Worktree-creation fixtures target
+Windows guarded mode; Linux/macOS enforcement remains unverified.
 
 ## Native Memory provider policy
 

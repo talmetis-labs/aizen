@@ -12,13 +12,13 @@ use crate::core::approval::ApprovalMode;
 use crate::core::session_store::*;
 use crate::core::{cli_config, types};
 use crate::features::slash::{self, SlashId};
-use crate::features::{commands, coop, timemachine};
+use crate::features::{commands, coop};
 use crate::ui::menus::{personas_menu, skills_menu, telegram_menu};
 use crate::ui::{config_ui, icons, splash, theme, tui};
 use crate::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{Confirm, Select};
+use dialoguer::Select;
 use types::Message;
 
 pub(crate) enum SlashOutcome {
@@ -375,8 +375,7 @@ fn slash_agents(arg: &str) {
 
 /// Rows for `/team status` — every aizen session registered in this repository.
 ///
-/// The point of this table is the LAST two columns: who is still running, and which files each
-/// window changed. `git diff` alone cannot answer either question once two windows share a tree.
+/// Session state and historical file observations, not current edit attribution or commit authority.
 pub(crate) fn team_status_lines() -> Vec<String> {
     let sessions = coop::list();
     if sessions.is_empty() {
@@ -463,7 +462,7 @@ pub(crate) fn team_status_lines() -> Vec<String> {
     }
     out.push(
         style(
-            "/team diff <n> [-p] · /team files <n> · /team claims · /team commit <n> · /team done",
+            "/team files <n> · /team claims · /team done — historical observations only; session diff/commit unavailable without current attribution",
         )
         .dim()
         .to_string(),
@@ -522,7 +521,7 @@ async fn slash_team(arg: &str) {
         "done" => {
             coop::set_state(coop::SessionState::Done);
             tui::emit_line(
-                &style("marked this session done — another window can now commit its work")
+                &style("marked this session done — this does not grant staging or commit authority")
                     .color256(theme::OK)
                     .to_string(),
             );
@@ -542,7 +541,7 @@ async fn slash_team(arg: &str) {
                     return;
                 }
                 tui::emit_line(&format!(
-                    "{} {} file(s) changed by {}",
+                    "{} {} historical file observation(s) for {}",
                     style("⚑").color256(splash::ACCENT),
                     paths.len(),
                     style(&view.manifest.session_id).bold()
@@ -552,7 +551,7 @@ async fn slash_team(arg: &str) {
                         "  {} {}  {}",
                         f.status,
                         f.path,
-                        style(format!("from checkpoint #{}", f.base)).dim()
+                        style("historical observation; not current attribution").dim()
                     ));
                 }
             }
@@ -579,38 +578,7 @@ async fn slash_team(arg: &str) {
                 }
             };
             match coop::session_diff(&view, patch) {
-                Ok(reports) if reports.is_empty() => tui::emit_line(
-                    &style(format!(
-                        "{} has no changes still present in the working tree",
-                        view.manifest.session_id
-                    ))
-                    .dim()
-                    .to_string(),
-                ),
-                Ok(reports) => {
-                    tui::emit_line(&format!(
-                        "{} changes attributed to {}",
-                        style("⚑").color256(splash::ACCENT),
-                        style(&view.manifest.session_id).bold()
-                    ));
-                    for report in &reports {
-                        for line in diff_lines(report, "/team diff <n>") {
-                            tui::emit_line(&line);
-                        }
-                    }
-                    if !view.overlapping.is_empty() {
-                        tui::emit_line(
-                            &style(format!(
-                                "⚠ {} file(s) were also changed by another session — the diff above \
-                                 cannot separate their lines: {}",
-                                view.overlapping.len(),
-                                view.overlapping.join(", ")
-                            ))
-                            .color256(theme::WARN)
-                            .to_string(),
-                        );
-                    }
-                }
+                Ok(never) => match never {},
                 Err(e) => tui::emit_line(&format!("{} {e:#}", style("team diff:").red())),
             }
         }
@@ -621,7 +589,7 @@ async fn slash_team(arg: &str) {
                 return;
             }
             tui::emit_line(&format!(
-                "{} {} claimed file(s) — most recent writer owns the claim",
+                "{} {} recorded claim(s) — historical observations, not current file ownership",
                 style("⚑ claims").color256(splash::ACCENT).bold(),
                 claims.len()
             ));
@@ -659,187 +627,18 @@ async fn slash_team(arg: &str) {
     }
 }
 
-/// `/team commit <session> [-m msg] [--verify] [--force] [--dry-run]`.
-///
-/// Staging is derived from the session's ledger, so the coordinator commits ONE window's work rather
-/// than whatever happens to be in the tree. The commit itself is confirmed interactively — it is the
-/// one irreversible step here.
+/// Historical ledgers are not current attribution. Refuse before any index access or verification.
 async fn slash_team_commit(rest: &str) {
-    let mut who = String::new();
-    let mut message = String::new();
-    let mut verify = false;
-    let mut force = false;
-    let mut dry_run = false;
-    let mut expect_message = false;
-    for tok in rest.split_whitespace() {
-        if expect_message {
-            if !message.is_empty() {
-                message.push(' ');
-            }
-            message.push_str(tok);
-            continue;
-        }
-        match tok {
-            "-m" | "--message" => expect_message = true,
-            "--verify" => verify = true,
-            "--force" => force = true,
-            "--dry-run" | "-n" => dry_run = true,
-            _ if who.is_empty() => who = tok.to_string(),
-            _ => {}
-        }
-    }
-    let view = match coop::resolve(&who) {
-        Ok(v) => v,
+    let who = rest.split_whitespace().next().unwrap_or("");
+    let view = match coop::resolve(who) {
+        Ok(view) => view,
         Err(e) => {
             tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
             return;
         }
     };
-    let plan = match coop::plan_commit(&view) {
-        Ok(p) => p,
-        Err(e) => {
-            tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
-            return;
-        }
-    };
-    tui::emit_line(&format!(
-        "{} {} file(s) from {}",
-        style("⚑ commit plan").color256(splash::ACCENT).bold(),
-        plan.paths.len(),
-        style(&plan.session_id).bold()
-    ));
-    for p in plan.paths.iter().take(100) {
-        tui::emit_line(&format!("  {p}"));
-    }
-    if plan.paths.len() > 100 {
-        tui::emit_line(
-            &style(format!("  … {} more", plan.paths.len() - 100))
-                .dim()
-                .to_string(),
-        );
-    }
-    if !plan.shared_paths.is_empty() {
-        tui::emit_line(
-            &style(format!(
-                "⚠ {} of these file(s) were also changed by another session; committing them takes \
-                 that work along — git cannot split one file by author: {}",
-                plan.shared_paths.len(),
-                plan.shared_paths.join(", ")
-            ))
-            .color256(theme::WARN)
-            .to_string(),
-        );
-    }
-    if !plan.blockers.is_empty() {
-        for b in &plan.blockers {
-            tui::emit_line(&style(format!("⚠ {b}")).color256(theme::WARN).to_string());
-        }
-        if !force {
-            tui::emit_line(
-                &style("nothing was staged. Re-run with --force to proceed anyway.")
-                    .dim()
-                    .to_string(),
-            );
-            return;
-        }
-    }
-    let review = match coop::stage_plan(&plan) {
-        Ok(s) => s,
-        Err(e) => {
-            tui::emit_line(&format!("{} {e:#}", style("team commit:").red()));
-            return;
-        }
-    };
-    for line in review.stat.lines() {
-        tui::emit_line(&format!("  {line}"));
-    }
-    if !review.separated.is_empty() {
-        tui::emit_line(
-            &style(format!(
-                "↔ {} shared file(s) were separated: the commit holds only this session's version, \
-                 while the working tree keeps both sessions' edits — {}",
-                review.separated.len(),
-                review.separated.join(", ")
-            ))
-            .color256(splash::ACCENT)
-            .to_string(),
-        );
-    }
-    if verify {
-        match crate::agent::verify_gate::run_verify_gate(&plan.root, 300).await {
-            None => tui::emit_line(
-                &style("verify: no known verify command for this project — skipped")
-                    .dim()
-                    .to_string(),
-            ),
-            Some(r) if r.accepted() => tui::emit_line(
-                &style(format!("verify: {} passed", r.command))
-                    .color256(theme::OK)
-                    .to_string(),
-            ),
-            Some(r) => {
-                tui::emit_line(
-                    &style(crate::agent::verify_gate::format_gate_failure(&r))
-                        .color256(theme::WARN)
-                        .to_string(),
-                );
-                let _ = coop::unstage_plan(&plan);
-                tui::emit_line(
-                    &style("unstaged the plan — the working tree was not touched")
-                        .dim()
-                        .to_string(),
-                );
-                return;
-            }
-        }
-    }
-    if dry_run {
-        let _ = coop::unstage_plan(&plan);
-        tui::emit_line(
-            &style("dry run — unstaged again, nothing was committed")
-                .dim()
-                .to_string(),
-        );
-        return;
-    }
-    let msg = if message.trim().is_empty() {
-        let task = view.manifest.task.trim();
-        if task.is_empty() {
-            format!("aizen session {}", plan.session_id)
-        } else {
-            task.to_string()
-        }
-    } else {
-        message.trim().to_string()
-    };
-    let status = tui::current_status();
-    tui::suspend();
-    let go = Confirm::with_theme(&ui_theme())
-        .with_prompt(format!("Commit {} file(s) as “{msg}”?", plan.paths.len()))
-        .default(false)
-        .interact()
-        .unwrap_or(false);
-    tui::resume(&status);
-    if !go {
-        let _ = coop::unstage_plan(&plan);
-        tui::emit_line(
-            &style("cancelled — unstaged, working tree untouched")
-                .dim()
-                .to_string(),
-        );
-        return;
-    }
-    match coop::commit_staged(&plan, &msg, &review) {
-        Ok(out) => {
-            for line in out.lines().take(6) {
-                tui::emit_line(&format!("  {line}"));
-            }
-            tui::emit_line(
-                &style(format!("committed {}'s work", plan.session_id))
-                    .color256(theme::OK)
-                    .to_string(),
-            );
-        }
+    match coop::session_commit(&view) {
+        Ok(never) => match never {},
         Err(e) => tui::emit_line(&format!("{} {e:#}", style("team commit:").red())),
     }
 }
@@ -850,36 +649,10 @@ fn slash_work(arg: &str) {
     let sub = parts.next().unwrap_or("").trim();
     let rest = parts.next().unwrap_or("").trim();
     match sub {
-        "" | "list" | "ls" => match coop::work_list() {
-            Ok(list) if list.is_empty() => tui::emit_line(
-                &style("no aizen worktrees — create one with /work new <name>")
-                    .dim()
-                    .to_string(),
-            ),
-            Ok(list) => {
-                tui::emit_line(&format!(
-                    "{}  {} worktree(s)",
-                    style("⚑ work").color256(splash::ACCENT).bold(),
-                    list.len()
-                ));
-                for w in &list {
-                    let flags = coop::work_remove_blockers(w);
-                    let note = if flags.is_empty() {
-                        style("clean".to_string()).color256(theme::OK)
-                    } else {
-                        style(flags.join("; ")).color256(theme::WARN)
-                    };
-                    tui::emit_line(&format!(
-                        "  {:<20} {}  {}",
-                        w.name,
-                        style(&w.branch).dim(),
-                        note
-                    ));
-                    tui::emit_line(
-                        &style(format!("      {}", w.path.display()))
-                            .dim()
-                            .to_string(),
-                    );
+        "" | "list" | "ls" => match coop::work_inventory_lines() {
+            Ok(lines) => {
+                for line in lines {
+                    tui::emit_line(&line);
                 }
             }
             Err(e) => tui::emit_line(&format!("{} {e:#}", style("work:").red())),
@@ -900,6 +673,13 @@ fn slash_work(arg: &str) {
                         .color256(theme::OK)
                         .to_string(),
                     );
+                    tui::emit_line(&format!(
+                        "committed base {}; pending parent edits are not copied",
+                        wt.base.as_str(),
+                    ));
+                    if wt.dirty {
+                        tui::emit_line("checkout left uncommitted/untracked/ignored files; inspect this worktree before using it");
+                    }
                     tui::emit_line(
                         &style(format!(
                             "open a new terminal there: cd {}",
@@ -969,12 +749,50 @@ async fn handle_slash_scoped(
     // has a handler here. The name lists used to live in five places; this is the only one left.
     // An empty name still means help: the retained REPL routes a bare `/` to the picker, but the
     // host bot and the plain REPL can both reach here with nothing after the slash.
+    let restricted = !crate::agent::hooks::automation_context(None).permits_automation();
     let Some(builtin) = slash::resolve(if name.is_empty() { "help" } else { name }) else {
+        if restricted {
+            tui::emit_line("Custom commands are unavailable while execution is restricted; no expansion was run.");
+            return SlashOutcome::Continue;
+        }
         return slash_custom_or_unknown(name, arg);
     };
+    // Default deny auxiliary effects too: a slash command is not a policy bypass. Only the
+    // explicit controller transition can widen; unsupported surfaces fail without side effects.
+    if restricted
+        && !matches!(
+            builtin.id,
+            SlashId::Plan
+                | SlashId::Help
+                | SlashId::Quit
+                | SlashId::Tokens
+                | SlashId::Context
+                | SlashId::Cost
+        )
+    {
+        tui::emit_line("This command is unavailable while execution is restricted. /plan status shows the policy; /plan off is the explicit implementation transition.");
+        return SlashOutcome::Continue;
+    }
     match builtin.id {
+        SlashId::Plan => {
+            if let Err(error) = crate::repl::planning::command(arg, history, model_label, design).await {
+                tui::emit_line(&format!("plan: {error:#}"));
+            }
+        }
         SlashId::Help => tui::emit_line(&style(slash::help_page()).dim().to_string()),
         SlashId::Quit => return SlashOutcome::Quit,
+        SlashId::Share => {
+            let saved = crate::core::session_store::current_session_slug()
+                .context("send a message or save this conversation first")
+                .and_then(|s| crate::remote::share_session(Some(s), None, None));
+            match saved {
+                Ok(_) => {
+                    tui::emit_line("Shared. Open Aizen Chat → Devices to continue this conversation.");
+                    return SlashOutcome::Quit;
+                }
+                Err(err) => tui::emit_line(&format!("Aizen Chat: {err:#}")),
+            }
+        }
         SlashId::Clear => {
             // `new`/`reset` are aliases of `/clear` (same identity) — they refresh too. To wipe
             // without carrying a memory of this thread, spell it `/clear hard` (see the help).
@@ -1063,8 +881,14 @@ async fn handle_slash_scoped(
             };
             match target {
                 None => tui::emit_line(&style("no saved conversation to resume yet").dim().to_string()),
-                Some(name) => match load_session_with_design(history, &name, model_label) {
-                    Ok((n, saved_design)) => {
+                Some(name) => match load_session_with_state(history, &name, model_label) {
+                    Ok((n, saved_design, saved_task, _saved_control)) => {
+                        // Loading validated the incoming state without touching the outgoing owner.
+                        // Reset first: resetting after restore would erase the incoming task.
+                        reset_per_session_state();
+                        if let Err(error) = agent::todo::restore(saved_task) {
+                            tui::emit_line(&format!("task state not restored: {error}"));
+                        }
                         if let Some(design) = design {
                             design.reset();
                             if let Some(saved) = saved_design {
@@ -1072,12 +896,9 @@ async fn handle_slash_scoped(
                                     tui::emit_line(&format!("design state not restored: {error}"));
                                 }
                             }
-                            update_live_history_with_design(history, Some(&design.snapshot()));
                         }
-                        // A restore is a thread switch — the restored thread must not inherit the
-                        // previous one's todos/cost/grants. Only on success: a failed load leaves
-                        // the live thread (and its state) untouched.
-                        reset_per_session_state();
+                        let design_snapshot = design.map(|design| design.snapshot());
+                        update_live_history_with_design(history, design_snapshot.as_ref());
                         // Replay so the restored thread is VISIBLE, not just present in the request:
                         // resuming into an empty-looking screen reads as "it didn't work".
                         agent::replay_transcript(history);
@@ -1115,8 +936,12 @@ async fn handle_slash_scoped(
             } else {
                 // Restore the newest offer. Side effects are never auto-replayed — only history + draft.
                 let offer = &offers[0];
-                match crate::core::recovery::accept_with_design(offer) {
-                    Ok((restored, draft, saved_design)) => {
+                match crate::core::recovery::accept_with_state(offer) {
+                    Ok((restored, draft, saved_design, saved_task, _saved_control)) => {
+                        reset_per_session_state();
+                        if let Err(error) = agent::todo::restore(saved_task) {
+                            tui::emit_line(&format!("task recovery state not restored: {error}"));
+                        }
                         *history = restored;
                         set_session_slug(offer.manifest.session_name.clone());
                         if let Some(design) = design {
@@ -1126,27 +951,25 @@ async fn handle_slash_scoped(
                                     tui::emit_line(&format!("design recovery state not restored: {error}"));
                                 }
                             }
-                            update_live_history_with_design(history, Some(&design.snapshot()));
                         }
                         migrate_legacy_prompt_lanes(history, model_label);
                         refresh_prompt_lanes_for_thread_switch(history, model_label);
-                        // Same thread-switch contract as /resume: the crashed thread's todos/cost/
-                        // grants belong to it, not to whatever was live before accepting.
-                        reset_per_session_state();
+                        let design_snapshot = design.map(|design| design.snapshot());
+                        update_live_history_with_design(history, design_snapshot.as_ref());
                         agent::replay_transcript(history);
                         if let Some(d) = draft {
                             tui::set_draft(&d);
                             tui::emit_line(&style("restored interrupted draft into the input box (not submitted)").dim().to_string());
                         }
                         if offer.manifest.side_effects_possible {
-                            let checkpoint = offer
+                            let historical = offer
                                 .manifest
-                                .checkpoint_id
-                                .map(|id| format!(" Check Time Machine checkpoint #{id} before retrying."))
-                                .unwrap_or_else(|| " Check Time Machine before retrying.".to_string());
+                                .checkpoint_label()
+                                .map(|label| format!(" Historical recovery evidence {label} grants no live restore authority."))
+                                .unwrap_or_default();
                             tui::emit_line(
                                 &style(format!(
-                                    "⚠ a previous tool may already have completed; retrying could repeat its side effect.{checkpoint}"
+                                    "A previous tool may already have completed; retrying could repeat its side effect. Inspect actual files, Git state and unresolved recovery evidence before retrying.{historical}"
                                 ))
                                 .color256(theme::WARN)
                                 .to_string(),
@@ -1852,118 +1675,53 @@ SlashId::Yolo => {
                 tui::note_line(&format!("{} {e}", style("serve:").red()));
             }
         }
-        // ── time machine (git snapshots) ──
-        // `/timemachine` is ONE command: it opens the checkpoint list, and picking a row rewinds to
-        // that code + chat. No `pick`/`restore` argument to remember, no separate read-only print —
-        // the list itself shows the history, so browsing and restoring are the same gesture (Esc
-        // leaves without touching anything).
-        SlashId::Timemachine => {
-            if let Err(e) = timemachine_menu(history, model_label).await {
-                tui::note_line(&format!("{} {e}", style("time:").red()));
-            }
-            // The legacy picker does not report whether it restored; invalidate conservatively.
-            if let Some(design) = design { design.mark_render_changed(); }
-        }
-        // Capture the conversation alongside the tree so a pick in `/timemachine` can rewind chat as
-        // well as code — a `/checkpoint` is a deliberate save point where the chat is worth keeping,
-        // unlike the loop's per-edit auto-snapshots (which restore files only).
-        SlashId::Checkpoint => match timemachine::save_with_chat(arg, false, history) {
-            Ok(s) => tui::emit_line(&format!(
-                "{} #{} saved ({})",
-                style("✓ checkpoint").color256(splash::ACCENT),
-                s.id,
-                if s.has_chat { "code + chat" } else { "files only" }
-            )),
-            Err(e) => tui::emit_line(&style(format!("checkpoint: {e}")).color256(crate::ui::theme::WARN).to_string()),
-        },
-        // `/diff` — see what changed before deciding to rewind. Argument forms mirror the CLI:
-        // bare = active checkpoint vs disk, `#5` = that checkpoint vs disk, `#1 #2` = the pair.
-        // `-p`/`--patch` anywhere switches from stat to hunks; anything after `--` narrows to paths.
-        SlashId::Diff => {
-            let mut sides: Vec<String> = Vec::new();
-            let mut paths: Vec<String> = Vec::new();
-            let mut patch = false;
-            let mut after_sep = false;
-            for tok in arg.split_whitespace() {
-                match tok {
-                    "--" => after_sep = true,
-                    "-p" | "--patch" => patch = true,
-                    _ if after_sep => paths.push(tok.to_string()),
-                    _ => sides.push(tok.to_string()),
-                }
-            }
-            let (from, to) = (sides.first().cloned(), sides.get(1).cloned());
-            match build_time_diff(from, to, paths, patch) {
-                // Must go through `emit_line`: raw `println!` from inside the REPL is wiped by the
-                // retained render thread's next repaint.
-                Ok(mut report) => {
-                    // On the retained TUI a patch goes through the diff boxes an edit result
-                    // gets (colour, side-by-side, gutter numbers) instead of monochrome lines.
-                    let boxed = if tui::retained_running() { report.patch.take() } else { None };
-                    let mut lines = diff_lines(&report, "-- <path>");
-                    if boxed.is_some() && lines.last().is_some_and(|l| l.contains("--patch for the full text")) {
-                        lines.pop();
+        SlashId::Time => {
+            use crate::cli::time::{parse_time_args, time_lines, unsupported_time_hint};
+            if let Some(note) = unsupported_time_hint(arg) {
+                tui::emit_line(note);
+            } else {
+                let result = parse_time_args(arg).and_then(|cmd| {
+                    if let crate::cli_args::TimeCmd::Focus { path } = &cmd {
+                        let next = crate::repl::workspace::focus(path, history, design)?;
+                        return crate::core::exec_ctx::with_current(next, || {
+                            if let Some(design) = design {
+                                design.begin_turn("workspace-focus", crate::repl::turn::design_workspace());
+                            }
+                            crate::agent::prompt_lanes::refresh_prompt_lanes_in_place(history, model_label);
+                            Ok(vec![format!("focused worktree {}; Git files, index and pending operation were not changed", crate::repl::turn::design_workspace())])
+                        });
                     }
-                    for line in lines {
-                        tui::emit_line(&line);
+                    let changes_current_tree = matches!(
+                        &cmd,
+                        crate::cli_args::TimeCmd::Switch { yes: true, .. }
+                            | crate::cli_args::TimeCmd::Undo { yes: true, .. }
+                            | crate::cli_args::TimeCmd::Redo { yes: true, .. }
+                            | crate::cli_args::TimeCmd::Integrate { yes: true, .. }
+                            | crate::cli_args::TimeCmd::IntegrateTask { yes: true, .. }
+                            | crate::cli_args::TimeCmd::VerifyTask { yes: true, .. }
+                            | crate::cli_args::TimeCmd::Sequencer { yes: true, .. }
+                            | crate::cli_args::TimeCmd::Merge { yes: true, .. }
+                            | crate::cli_args::TimeCmd::CherryPick { yes: true, .. }
+                            | crate::cli_args::TimeCmd::DeleteBranch { yes: true, .. }
+                    );
+                    let result = time_lines(cmd);
+                    // Failures can leave partial Git effects; neither success nor error preserves
+                    // prior visual verification. Preview-only inspection does not invalidate it.
+                    if changes_current_tree {
+                        if let Some(design) = design { design.mark_render_changed(); }
                     }
-                    if let Some(text) = boxed {
-                        crate::agent::emit_patch_boxes(&text);
-                        if report.patch_truncated {
-                            tui::emit_line(&style("… patch truncated — narrow it with `-- <path>`").dim().to_string());
-                        }
-                    }
-                }
-                Err(e) => tui::emit_line(&style(format!("diff: {e}")).color256(crate::ui::theme::WARN).to_string()),
-            }
-        }
-        // `/undo` (alias `/rewind`): show what the rewind WILL change first, refuse to discard
-        // work no checkpoint holds unless told `--yes`, and name the files it touched after.
-        SlashId::Undo => {
-            let yes = arg.split_whitespace().any(|w| matches!(w, "--yes" | "-y" | "yes"));
-            match timemachine::undo_target() {
-                Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
-                Ok((current, target)) => {
-                    let stat = build_time_diff(Some("working".into()), Some(format!("#{target}")), Vec::new(), false).ok();
-                    let files: Vec<String> = stat.as_ref().map(|r| r.files.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
-                    if let Some(r) = &stat {
-                        tui::emit_line(&style(format!("⏪ rewind to checkpoint #{target}: {} file(s), +{} −{}", r.files.len(), r.total_added(), r.total_deleted())).color256(splash::ACCENT).to_string());
-                        for line in diff_lines(r, "-- <path>").into_iter().skip(1) {
-                            if line.contains("--patch for the full text") { continue; }
+                    result
+                });
+                match result {
+                    Ok(lines) => {
+                        for line in lines {
                             tui::emit_line(&line);
                         }
                     }
-                    let dirty = timemachine::working_tree_differs_from(current).unwrap_or(false);
-                    if dirty && !yes {
-                        tui::emit_line(&style(format!("the working tree has changes since checkpoint #{current} that no checkpoint holds — `/diff` shows them; `/undo --yes` (or `/rewind --yes`) rewinds anyway")).color256(crate::ui::theme::WARN).to_string());
-                    } else {
-                        match timemachine::undo_with_report() {
-                            Ok((s, removed)) => {
-                                if let Some(design) = design { design.mark_render_changed(); }
-                                let named = if files.is_empty() { String::new() } else {
-                                    let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
-                                    let more = files.len().saturating_sub(shown.len());
-                                    format!(" — {}{}", shown.join(", "), if more > 0 { format!(" (+{more} more)") } else { String::new() })
-                                };
-                                tui::emit_line(&format!("{} checkpoint #{}{named}", style("⏪ rewound to").color256(splash::ACCENT), s.id));
-                                if !removed.is_empty() {
-                                    let shown: Vec<&str> = removed.iter().take(8).map(String::as_str).collect();
-                                    tui::emit_line(&style(format!("  removed {} file(s) that checkpoint never had: {} — `/redo` brings them back", removed.len(), shown.join(", "))).dim().to_string());
-                                }
-                            }
-                            Err(e) => tui::emit_line(&style(format!("undo: {e}")).color256(crate::ui::theme::WARN).to_string()),
-                        }
-                    }
+                    Err(e) => tui::emit_line(&format!("time: {e:#}")),
                 }
             }
         }
-        SlashId::Redo => match timemachine::redo() {
-            Ok(s) => {
-                if let Some(design) = design { design.mark_render_changed(); }
-                tui::emit_line(&format!("{} checkpoint #{}", style("⏩ re-applied").color256(splash::ACCENT), s.id));
-            }
-            Err(e) => tui::emit_line(&style(format!("redo: {e}")).color256(crate::ui::theme::WARN).to_string()),
-        },
         // Codebase index: scan the repo into a semantic chunk index for `codebase_search` +
         // per-turn retrieval injection. `/init` incrementally refreshes; `/init --force` rebuilds
         // from scratch; `/init --status` shows the current index without scanning. Esc cancels.
@@ -2046,11 +1804,15 @@ mod recovery_session_tests {
     }
 
     #[tokio::test]
+    async fn recover_adopts_manifest_session_slug_before_next_autosave() {
+        agent::todo::with_context(agent::todo::TaskContext::private(), recover_owned_state()).await;
+    }
+
     #[expect(
         clippy::await_holding_lock,
-        reason = "hermetic recovery fixture retains HOME, tape and todo isolation for the awaited handler"
+        reason = "hermetic recovery fixture retains global test isolation"
     )]
-    async fn recover_adopts_manifest_session_slug_before_next_autosave() {
+    async fn recover_owned_state() {
         let _home = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2061,6 +1823,10 @@ mod recovery_session_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let fixture = RecoveryHome::new();
+        agent::todo::set(vec![agent::todo::Todo::new(
+            "outgoing task",
+            agent::todo::Status::Pending,
+        )]);
         let mut history = vec![Message::user("previous conversation must survive")];
         save_session(&history, "previous-conversation", Some("fixture-model")).unwrap();
         set_session_slug(Some("previous-conversation".into()));
@@ -2070,6 +1836,15 @@ mod recovery_session_tests {
         let scope = crate::core::recovery::current_repo_scope();
         let saved_design = DesignContext::new("crashed-owner", &scope, DesignMode::On).snapshot();
         let recovered_history = vec![Message::user("recovered conversation")];
+        let recovered_task = agent::todo::TaskContext::private();
+        recovered_task
+            .replace(vec![agent::todo::Todo::new(
+                "continue recovered work",
+                agent::todo::Status::InProgress,
+            )])
+            .unwrap();
+        recovered_task.end_turn(true);
+        let saved_task = recovered_task.snapshot();
         let lease = fixture.root.join("recovery").join("fixture-abandoned");
         std::fs::create_dir_all(&lease).unwrap();
         let manifest = RecoveryManifest {
@@ -2083,8 +1858,10 @@ mod recovery_session_tests {
             session_name: Some("recovered-conversation".into()),
             safe_history_len: recovered_history.len(),
             checkpoint_id: None,
+            checkpoint_ref: None,
             sidecar_generation: 1,
             has_design_state: true,
+            has_task_state: true,
             turn_id: Some(1),
             side_effects_possible: false,
             effects_unsettled: false,
@@ -2095,6 +1872,7 @@ mod recovery_session_tests {
         let generation = serde_json::json!({
             "generation": 1,
             "design_state": saved_design,
+            "task_state": saved_task,
             "messages": recovered_history,
         });
         crate::core::persist::atomic_write_owner_only(
@@ -2118,6 +1896,7 @@ mod recovery_session_tests {
             Some("recovered-conversation")
         );
         assert_eq!(design.snapshot().owner_id, "crashed-owner");
+        assert_eq!(agent::todo::durable_snapshot(), saved_task);
         assert!(history
             .iter()
             .any(|m| m.content.as_deref() == Some("recovered conversation")));
@@ -2132,12 +1911,81 @@ mod recovery_session_tests {
             previous_bytes,
             "the recovered turn must not overwrite the previously open conversation"
         );
-        let (saved, _, state) =
-            read_session_path_with_design(&sessions_dir().join("recovered-conversation.json"))
+        let (saved, _, state, task, _control) =
+            read_session_path_with_state(&sessions_dir().join("recovered-conversation.json"))
                 .unwrap();
         assert!(saved
             .iter()
             .any(|m| m.content.as_deref() == Some("recovered conversation")));
         assert_eq!(state.unwrap().owner_id, "crashed-owner");
+        assert_eq!(task, saved_task);
+    }
+
+    #[tokio::test]
+    async fn resume_then_clear_replaces_only_the_owned_task_after_validated_load() {
+        agent::todo::with_context(agent::todo::TaskContext::private(), resume_owned_state()).await;
+    }
+
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "hermetic session fixture retains global test isolation"
+    )]
+    async fn resume_owned_state() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tape = crate::llm::replay::TAPE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _todo = agent::todo::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _fixture = RecoveryHome::new();
+        let loaded = agent::todo::TaskContext::private();
+        loaded
+            .replace(vec![agent::todo::Todo::new(
+                "saved continuation",
+                agent::todo::Status::InProgress,
+            )])
+            .unwrap();
+        loaded.end_turn(true);
+        let saved_task = loaded.snapshot();
+        agent::todo::with_context(loaded.clone(), async {
+            save_session_with_state(
+                &[Message::user("saved history")],
+                "task-resume",
+                Some("fixture-model"),
+                None,
+                &saved_task,
+            )
+        })
+        .await
+        .unwrap();
+        agent::todo::set(vec![agent::todo::Todo::new(
+            "outgoing",
+            agent::todo::Status::Pending,
+        )]);
+        let outgoing_task = agent::todo::durable_snapshot();
+        let mut history = vec![Message::user("outgoing history")];
+        let mut model = "fixture-model".to_string();
+        let design = DesignContext::new("outgoing-owner", "fixture", DesignMode::On);
+        handle_slash_with_design("resume does-not-exist", &mut history, &mut model, &design).await;
+        assert_eq!(agent::todo::durable_snapshot(), outgoing_task);
+        assert_eq!(history[0].content.as_deref(), Some("outgoing history"));
+
+        handle_slash_with_design("resume task-resume", &mut history, &mut model, &design).await;
+        assert_eq!(agent::todo::durable_snapshot(), saved_task);
+        assert!(
+            !agent::todo::begin_user_turn(),
+            "resume consumes continuation once"
+        );
+        assert_eq!(agent::todo::snapshot()[0].id, saved_task.items[0].id);
+
+        handle_slash_with_design("clear hard", &mut history, &mut model, &design).await;
+        assert_eq!(
+            agent::todo::durable_snapshot(),
+            agent::todo::TaskState::default()
+        );
+        assert!(!history.iter().any(|message| message.role == "user"));
     }
 }

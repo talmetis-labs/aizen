@@ -29,6 +29,7 @@ fn outcome(intent: &DispatchIntent, status: &str, summary: &str) -> TaskOutcome 
         tokens_in: 11,
         tokens_out: 3,
         evidence_images: Vec::new(),
+        git_handoff: None,
     }
 }
 
@@ -889,47 +890,79 @@ fn cohort_summary(base: &str) -> String {
     crate::core::speculation::verification::success_summary_fixture(base)
 }
 
-struct RecordingCohorts {
-    captured: RefCell<Vec<Vec<AttemptKey>>>,
-    finished: Cell<usize>,
-    observed_completions: Rc<Cell<usize>>,
-    refuse_finish: bool,
-    empty_receipt: bool,
-    accepted: Cell<usize>,
-    released: Cell<usize>,
+struct RejectRetiredLifecycle {
+    calls: Cell<usize>,
 }
-impl CohortLifecycle for RecordingCohorts {
-    fn capture(&self, intents: &mut [DispatchIntent]) -> Result<String> {
-        self.captured
-            .borrow_mut()
-            .push(intents.iter().map(|intent| intent.key.clone()).collect());
-        Ok(format!("{:032x}", self.captured.borrow().len()))
+impl GitAcceptance for RejectRetiredLifecycle {
+    fn accept_git(
+        &self,
+        _: &crate::core::git_ops::TaskHandoff,
+    ) -> Result<crate::core::git_ops::VerifiedTaskIntegration> {
+        self.calls.set(self.calls.get() + 1);
+        anyhow::bail!("retired execution reached Git acceptance")
     }
-    fn finish<'a>(
-        &'a self,
-        id: &'a str,
-        intents: &'a [DispatchIntent],
-    ) -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
-        Box::pin(async move {
-            assert!(self.observed_completions.get() >= intents.len());
-            self.finished.set(self.finished.get() + 1);
-            tokio::task::yield_now().await;
-            anyhow::ensure!(
-                !self.refuse_finish,
-                "injected merge conflict / applied-unverified refusal"
-            );
-            Ok(if self.empty_receipt {
-                String::new()
-            } else {
-                cohort_summary(id)
-            })
-        })
-    }
-    fn accepted(&self, _intents: &[DispatchIntent]) {
-        self.accepted.set(self.accepted.get() + 1);
-    }
-    fn release(&self) {
-        self.released.set(self.released.get() + 1);
+}
+
+async fn assert_retired_before_callbacks(tasks: &[WorkflowTask], width: usize, replay: &[Event]) {
+    let lifecycle = RejectRetiredLifecycle {
+        calls: Cell::new(0),
+    };
+    let error = schedule_with_git_acceptance(
+        tasks,
+        width,
+        "fixture",
+        &TurnCancel::new(),
+        policy(true),
+        replay,
+        |_| panic!("retired execution reached preparation"),
+        |_| -> std::result::Result<(), SlotDenied> {
+            panic!("retired execution reached admission")
+        },
+        |_| panic!("retired execution appended a journal event"),
+        |_, ()| async { panic!("retired execution dispatched a child") },
+        &lifecycle,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("retired"), "{error:#}");
+    assert_eq!(
+        lifecycle.calls.get(),
+        0,
+        "retired execution cannot reach Git acceptance"
+    );
+}
+
+// Historical data only. These helpers never enter scheduler admission or reconstruct authority.
+fn historical_candidate(tasks: &[WorkflowTask]) -> DispatchIntent {
+    State::new(tasks, policy(false))
+        .queue
+        .into_iter()
+        .find(|pending| pending.intent.task.execution == ExecutionMode::Speculative)
+        .unwrap()
+        .intent
+}
+
+fn historical_prefix(intent: &DispatchIntent, status: &str, report: &str) -> Vec<Event> {
+    vec![
+        Event::SpeculativeCohortCaptured {
+            seq: 0,
+            cohort_id: COHORT_BASE.into(),
+            members: vec![intent.key.clone()],
+        },
+        Event::DispatchIntent {
+            seq: 0,
+            intent: intent.clone(),
+        },
+        completion_event(intent, &outcome(intent, status, report)),
+    ]
+}
+
+fn historical_integration(intent: &DispatchIntent, receipt: String) -> Event {
+    Event::SpeculativeCohortIntegrated {
+        seq: 0,
+        cohort_id: COHORT_BASE.into(),
+        members: vec![intent.key.clone()],
+        receipt,
     }
 }
 
@@ -942,85 +975,98 @@ fn speculative_task(id: &str, after: &[&str]) -> WorkflowTask {
 }
 
 #[tokio::test]
-async fn speculative_ready_set_freezes_width_and_settles_only_after_full_integration() {
-    let tasks = vec![
+async fn retired_speculative_ready_sets_refuse_before_direct_or_private_callbacks() {
+    let mut tasks = vec![
         speculative_task("first", &[]),
         speculative_task("second", &[]),
         speculative_task("third", &[]),
         task("direct", "argus", &[]),
         task("dependent", "argus", &["first", "second"]),
     ];
-    let completions = Rc::new(Cell::new(0));
-    let cohorts = RecordingCohorts {
-        captured: RefCell::new(Vec::new()),
-        finished: Cell::new(0),
-        observed_completions: completions.clone(),
-        refuse_finish: false,
-        empty_receipt: false,
-        accepted: Cell::new(0),
-        released: Cell::new(0),
-    };
-    let events = RefCell::new(Vec::new());
-    let ran = RefCell::new(Vec::new());
-    let barrier = Rc::new(tokio::sync::Barrier::new(2));
-    let results = tokio::time::timeout(Duration::from_secs(1), schedule_cohorts(
-        &tasks, 2, "m", &TurnCancel::new(), policy(true), &[], |_| Ok(()), |_| Ok(()),
-        |event| {
-            if matches!(&event, Event::SpeculativeCohortIntegrated { .. }) {
-                assert_eq!(cohorts.accepted.get() + 1, cohorts.finished.get(),
-                    "logical publication follows the durable integration event");
-            }
-            if matches!(&event, Event::AttemptCompleted { .. }) {
-                completions.set(completions.get() + 1);
-            }
-            if matches!(&event, Event::TaskSettled { selected, .. }
-                if selected.task_id.0 == "first" || selected.task_id.0 == "second") {
-                assert_eq!(cohorts.finished.get(), 1);
-                assert_eq!(cohorts.accepted.get(), 1);
-                assert!(events.borrow().iter().any(|event|
-                    matches!(event, Event::SpeculativeCohortIntegrated { cohort_id, .. } if cohort_id == COHORT_BASE)));
-            }
-            events.borrow_mut().push(event);
-            Ok(())
-        },
-        |intent, ()| {
-            ran.borrow_mut().push(intent.task.id.clone());
-            if intent.task.execution == ExecutionMode::Direct { assert_eq!(cohorts.finished.get(), 2); }
-            let barrier = barrier.clone();
-            async move {
-                if intent.task.id == "first" || intent.task.id == "second" { barrier.wait().await; }
-                outcome(&intent, "done", "complete private candidate")
-            }
-        }, &cohorts,
-    )).await.expect("same-file private candidates must overlap, not deadlock").unwrap();
-    assert_eq!(
-        cohorts
-            .captured
-            .borrow()
-            .iter()
-            .map(|members| members
-                .iter()
-                .map(|key| key.task_id.0.as_str())
-                .collect::<Vec<_>>())
-            .collect::<Vec<_>>(),
-        [vec!["first", "second"], vec!["third"]]
-    );
-    assert_eq!(
-        *ran.borrow(),
-        ["first", "second", "third", "direct", "dependent"]
-    );
-    assert_eq!(super::super::logical_outcomes(&results).len(), 5);
-    assert_eq!(cohorts.accepted.get(), 2);
-    assert_eq!(cohorts.released.get(), 1);
-    State::new(&tasks, policy(true))
-        .replay(&events.borrow())
-        .unwrap();
+    for width in [1, 2, 32] {
+        assert_retired_before_callbacks(&tasks, width, &[]).await;
+    }
+    // A ready direct task cannot hide a later retired selection in the same request.
+    tasks.swap(0, 3);
+    assert_retired_before_callbacks(&tasks, 2, &[]).await;
 }
 
-#[tokio::test]
-async fn speculative_failure_and_conflict_never_retry_settle_or_release_dependents() {
+#[test]
+fn historical_speculative_integration_requires_the_complete_frozen_membership() {
+    let tasks = vec![
+        speculative_task("first", &[]),
+        speculative_task("second", &[]),
+        task("dependent", "argus", &["first", "second"]),
+    ];
+    let mut state = State::new(&tasks, policy(true));
+    let members: Vec<_> = state
+        .queue
+        .iter()
+        .take(2)
+        .map(|p| p.intent.key.clone())
+        .collect();
+    let mut events = vec![Event::SpeculativeCohortCaptured {
+        seq: 0,
+        cohort_id: COHORT_BASE.into(),
+        members: members.clone(),
+    }];
+    let first = dispatch(&mut state, "first", AttemptKind::Initial, &mut events);
+    complete(
+        &mut state,
+        first,
+        "done",
+        "first historical report",
+        &mut events,
+    );
+    let integrated = Event::SpeculativeCohortIntegrated {
+        seq: 0,
+        cohort_id: COHORT_BASE.into(),
+        members: members.clone(),
+        receipt: cohort_summary(COHORT_BASE),
+    };
+    let mut premature = events.clone();
+    premature.push(integrated.clone());
+    assert!(State::new(&tasks, policy(true)).replay(&premature).is_err());
+    let second = dispatch(&mut state, "second", AttemptKind::Initial, &mut events);
+    complete(
+        &mut state,
+        second,
+        "done",
+        "second historical report",
+        &mut events,
+    );
+    assert!(state.settled.is_empty());
+    assert!(!state.eligible(state.queue.front().unwrap()));
+    let mut mismatch = events.clone();
+    mismatch.push(Event::SpeculativeCohortIntegrated {
+        seq: 0,
+        cohort_id: COHORT_BASE.into(),
+        members: vec![members[0].clone()],
+        receipt: cohort_summary(COHORT_BASE),
+    });
+    assert!(State::new(&tasks, policy(true)).replay(&mismatch).is_err());
+    events.push(integrated);
+    let mut historical = State::new(&tasks, policy(true));
+    historical.replay(&events).unwrap();
+    assert_eq!(historical.settlements.len(), 2);
+    assert!(historical.settled.is_empty());
+    settle(&mut historical, &mut events);
+    assert!(historical.eligible(historical.queue.front().unwrap()));
+    assert_eq!(
+        historical.results.iter().map(|r| r.tokens_in).sum::<u64>(),
+        22
+    );
+    State::new(&tasks, policy(true)).replay(&events).unwrap();
+}
+
+#[test]
+fn historical_speculative_failures_do_not_enqueue_retries_or_release_dependencies() {
     for (status, report) in [
         ("error", "retained private report"),
+        (
+            "incomplete",
+            "retained private report; incomplete-unverified-handoff",
+        ),
         ("deadline", "retained private report"),
         ("max-iters", "retained private report"),
         ("done", "VERDICT: FAIL\nretained private report"),
@@ -1030,451 +1076,234 @@ async fn speculative_failure_and_conflict_never_retry_settle_or_release_dependen
             speculative_task("candidate", &[]),
             task("dependent", "argus", &["candidate"]),
         ];
-        let completions = Rc::new(Cell::new(0));
-        let cohorts = RecordingCohorts {
-            captured: RefCell::new(Vec::new()),
-            finished: Cell::new(0),
-            observed_completions: completions.clone(),
-            refuse_finish: status == "done",
-            empty_receipt: false,
-            accepted: Cell::new(0),
-            released: Cell::new(0),
-        };
-        let events = RefCell::new(Vec::new());
-        let ran = RefCell::new(Vec::new());
-        let error = schedule_cohorts(
-            &tasks,
-            2,
-            "m",
-            &TurnCancel::new(),
-            policy(true),
-            &[],
-            |_| Ok(()),
-            |_| Ok(()),
-            |event| {
-                if matches!(&event, Event::AttemptCompleted { .. }) {
-                    completions.set(completions.get() + 1);
-                }
-                events.borrow_mut().push(event);
-                Ok(())
-            },
-            |intent, ()| {
-                ran.borrow_mut().push(intent.key.clone());
-                async move { outcome(&intent, status, report) }
-            },
-            &cohorts,
-        )
-        .await
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("retained private report"));
+        let mut state = State::new(&tasks, policy(true));
+        let mut ignored_dispatch = Vec::new();
+        let intent = dispatch(
+            &mut state,
+            "candidate",
+            AttemptKind::Initial,
+            &mut ignored_dispatch,
+        );
+        let events = historical_prefix(&intent, status, report);
+        state
+            .complete(intent.clone(), outcome(&intent, status, report))
+            .unwrap();
+        assert_eq!(state.results.len(), 1);
+        assert_eq!(state.results[0].summary, report);
+        assert_eq!(state.results[0].tokens_in, 11);
+        assert!(state.results[0].selected_for.is_none());
         assert_eq!(
-            ran.borrow().len(),
+            state.settlements.len(),
             1,
-            "no restart, planner or dependency after {status}"
+            "completion queues, but does not publish, settlement"
         );
+        assert!(state.settled.is_empty());
         assert_eq!(
-            cohorts.finished.get(),
-            usize::from(status == "done" && !report.starts_with("VERDICT: FAIL"))
+            state.queue.len(),
+            1,
+            "no retry, fix or planner after {status}"
         );
-        assert_eq!(cohorts.accepted.get(), 0);
-        assert_eq!(cohorts.released.get(), 1);
-        assert!(!events.borrow().iter().any(|event| matches!(
-            event,
-            Event::TaskSettled { .. } | Event::SpeculativeCohortIntegrated { .. }
-        )));
-        assert!(State::new(&tasks, policy(true))
-            .replay(&events.borrow())
-            .is_err());
+        assert_eq!(state.queue[0].intent.key.task_id.0, "dependent");
+        assert!(!state.eligible(&state.queue[0]));
+        assert!(State::new(&tasks, policy(true)).replay(&events).is_err());
+        let mut claimed = events;
+        claimed.push(historical_integration(&intent, cohort_summary(COHORT_BASE)));
+        let candidate = status == "done" && !report.starts_with("VERDICT: FAIL");
+        assert_eq!(
+            State::new(&tasks, policy(true)).replay(&claimed).is_ok(),
+            candidate,
+            "accepted-looking metadata cannot rescue failed historical work: {status}"
+        );
     }
 }
 
 #[tokio::test]
-async fn speculative_completed_metadata_releases_overlay_owner_before_direct_work() {
-    use crate::core::speculation::store::{BaseSnapshot, OverlayHandle};
-    use crate::core::workspace_txn::{
-        PhysicalEffectLease, WorkspaceIdentity, WorkspaceWriterLease,
-    };
-    struct OwnedOverlay {
-        overlay: RefCell<Option<OverlayHandle>>,
-        released: Cell<bool>,
-    }
-    impl CohortLifecycle for OwnedOverlay {
-        fn capture(&self, intents: &mut [DispatchIntent]) -> Result<String> {
-            for intent in intents {
-                intent.task.overlay = self.overlay.borrow().clone();
-            }
-            Ok(COHORT_BASE.into())
-        }
-        fn finish<'a>(
-            &'a self,
-            _: &'a str,
-            _: &'a [DispatchIntent],
-        ) -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
-            Box::pin(async move {
-                drop(self.overlay.borrow_mut().take());
-                Ok(cohort_summary(COHORT_BASE))
-            })
-        }
-        fn accepted(&self, intents: &[DispatchIntent]) {
-            assert!(intents.iter().all(|intent| intent.task.overlay.is_none()));
-        }
-        fn release(&self) {
-            drop(self.overlay.borrow_mut().take());
-            self.released.set(true);
-        }
-    }
-    let fixture = crate::core::file_placement::tests::TestDir::new();
-    let work = fixture.path().join("work");
-    let store = fixture.path().join("store");
-    let locks = fixture.path().join("locks");
-    std::fs::create_dir(&work).unwrap();
-    std::fs::create_dir(&store).unwrap();
-    std::fs::create_dir(&locks).unwrap();
-    let work = work.canonicalize().unwrap();
-    let scope = crate::core::native_scope::NativeWriteScope::resolve(&work, &["native.txt".into()])
-        .unwrap();
-    let identity = WorkspaceIdentity {
-        repo_id: crate::core::workspace_txn::stable_key(&format!(
-            "fixture-repo-{}",
-            fixture.path().display()
-        )),
-        worktree_id: crate::core::workspace_txn::stable_key(&format!(
-            "fixture-tree-{}",
-            fixture.path().display()
-        )),
-        canonical_root: work.clone(),
-        canonical_git_dir: None,
-        canonical_common_git_dir: None,
-    };
-    let base = crate::core::workspace_txn::with_test_lock_home(&locks, || {
-        let writer = WorkspaceWriterLease::acquire_identity_scoped(
-            identity.clone(),
-            Duration::ZERO,
-            None,
-            "workflow owner lifetime fixture",
-            "controller",
-        )
-        .unwrap();
-        let physical = PhysicalEffectLease::exclusive(
-            Duration::ZERO,
-            None,
-            "workflow owner lifetime fixture",
-            "controller",
-        )
-        .unwrap();
-        BaseSnapshot::capture(
-            &identity,
-            std::slice::from_ref(&scope),
-            &store,
-            &writer,
-            &physical,
-        )
-        .unwrap()
+async fn historical_unverified_handoff_needs_acceptance_and_remains_non_success() {
+    let tasks = vec![
+        speculative_task("candidate", &[]),
+        task("dependent", "argus", &["candidate"]),
+    ];
+    let intent = historical_candidate(&tasks);
+    let mut events = historical_prefix(
+        &intent,
+        super::super::UNVERIFIED_HANDOFF_STATUS,
+        "unverified child report",
+    );
+    assert!(State::new(&tasks, policy(true)).replay(&events).is_err());
+    assert_retired_before_callbacks(&tasks, 2, &events).await;
+    events.push(historical_integration(&intent, cohort_summary(COHORT_BASE)));
+    let mut historical = State::new(&tasks, policy(true));
+    historical.replay(&events).unwrap();
+    assert!(historical.settled.is_empty());
+    assert!(!historical.eligible(historical.queue.front().unwrap()));
+    settle(&mut historical, &mut events);
+    assert!(historical.eligible(historical.queue.front().unwrap()));
+    assert_eq!(
+        historical.results[0].status,
+        super::super::UNVERIFIED_HANDOFF_STATUS
+    );
+    assert_eq!(historical.results[0].summary, "unverified child report");
+    assert!(!super::super::completed_status(
+        &historical.results[0].status
+    ));
+    assert_eq!(super::super::logical_failures(&historical.results), 1);
+    State::new(&tasks, policy(true)).replay(&events).unwrap();
+    assert_retired_before_callbacks(&tasks, 2, &events).await;
+}
+
+#[test]
+fn completed_graph_metadata_releases_git_owner_without_publishing_settlement() {
+    super::super::attempt_tests::with_fixture(|fixture| {
+        let owned = fixture.allocate();
+        let root = owned.root().to_path_buf();
+        let owner = std::sync::Arc::downgrade(&owned);
+        let tasks = vec![
+            task("candidate", "daedalus", &[]),
+            task("dependent", "argus", &["candidate"]),
+        ];
+        let mut state = State::new(&tasks, policy(true));
+        let mut events = Vec::new();
+        let mut intent = dispatch(&mut state, "candidate", AttemptKind::Initial, &mut events);
+        let key = intent.key.clone();
+        // No event, prepared task, context or fixture retains this live allocation.
+        intent.task.owned = Some(owned);
+        intent.task.isolation = super::super::WorkflowIsolation::Worktree;
+        assert!(
+            owner.upgrade().is_some(),
+            "fixture must own the real allocation"
+        );
+        let result = outcome(&intent, "done", "report alone is not a Git handoff");
+        let error = state.complete(intent, result).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no typed handoff"),
+            "{error:#}"
+        );
+        assert!(state.intents[&key].task.owned.is_none());
+        assert!(
+            owner.upgrade().is_none(),
+            "completed graph must not retain live Git ownership"
+        );
+        // Releasing graph ownership is independent of integration or logical settlement.
+        assert_eq!(state.results.len(), 1);
+        assert!(state.results[0].git_handoff.is_none());
+        assert!(state.results[0].selected_for.is_none());
+        assert!(state.settled.is_empty());
+        assert!(state.settlements.is_empty());
+        assert!(!state.eligible(state.queue.front().unwrap()));
+        assert_eq!(
+            std::fs::read(root.join("owned.txt")).unwrap(),
+            b"untouched native live source\n"
+        );
+        assert_eq!(
+            std::fs::read(fixture.work.join("owned.txt")).unwrap(),
+            b"untouched native live source\n"
+        );
     });
-    let directory = base.directory().to_path_buf();
-    let overlay = base.create_overlay("controller/candidate", &scope).unwrap();
-    drop(base);
-    let cohorts = OwnedOverlay {
-        overlay: RefCell::new(Some(overlay)),
-        released: Cell::new(false),
-    };
-    let tasks = vec![
-        speculative_task("candidate", &[]),
-        task("direct", "argus", &["candidate"]),
-    ];
-    let direct_ran = Cell::new(false);
-    schedule_cohorts(
-        &tasks,
-        1,
-        "m",
-        &TurnCancel::new(),
-        policy(true),
-        &[],
-        |_| Ok(()),
-        |_| Ok(()),
-        |_| Ok(()),
-        |intent, ()| {
-            if intent.task.execution == ExecutionMode::Direct {
-                assert!(
-                    crate::core::speculation::store::inspect_controller_records(&directory).is_ok(),
-                    "completed graph metadata must not retain owner.lock"
-                );
-                direct_ran.set(true);
-            }
-            async move { outcome(&intent, "done", "private candidate") }
-        },
-        &cohorts,
-    )
-    .await
-    .unwrap();
-    assert!(direct_ran.get());
-    assert!(cohorts.released.get());
 }
 
-#[tokio::test]
-async fn speculative_empty_receipt_cannot_publish_or_settle() {
+#[test]
+fn historical_speculative_empty_receipt_cannot_publish_or_settle() {
     let tasks = vec![
         speculative_task("candidate", &[]),
         task("dependent", "argus", &["candidate"]),
     ];
-    let completions = Rc::new(Cell::new(0));
-    let cohorts = RecordingCohorts {
-        captured: RefCell::new(Vec::new()),
-        finished: Cell::new(0),
-        observed_completions: completions.clone(),
-        refuse_finish: false,
-        empty_receipt: true,
-        accepted: Cell::new(0),
-        released: Cell::new(0),
-    };
-    let events = RefCell::new(Vec::new());
-    let ran = Cell::new(0);
-    let error = schedule_cohorts(
-        &tasks,
-        2,
-        "m",
-        &TurnCancel::new(),
-        policy(true),
-        &[],
-        |_| Ok(()),
-        |_| Ok(()),
-        |event| {
-            if matches!(&event, Event::AttemptCompleted { .. }) {
-                completions.set(completions.get() + 1);
-            }
-            events.borrow_mut().push(event);
-            Ok(())
-        },
-        |intent, ()| {
-            ran.set(ran.get() + 1);
-            async move { outcome(&intent, "done", "private candidate") }
-        },
-        &cohorts,
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("lifecycle summary invalid"));
-    assert_eq!(ran.get(), 1);
-    assert_eq!(cohorts.accepted.get(), 0);
-    assert_eq!(cohorts.released.get(), 1);
-    assert!(!events.borrow().iter().any(|event| matches!(
-        event,
-        Event::TaskSettled { .. } | Event::SpeculativeCohortIntegrated { .. }
-    )));
+    let intent = historical_candidate(&tasks);
+    let mut events = historical_prefix(&intent, "done", "private candidate");
+    events.push(historical_integration(&intent, String::new()));
+    assert!(
+        crate::core::speculation::verification::parse_success_summary("", COHORT_BASE).is_err()
+    );
+    assert!(crate::agent::runlog::validate_speculative_cohorts(&events).is_err());
+    let mut historical = State::new(&tasks, policy(true));
+    let error = historical.replay(&events).unwrap_err();
+    assert!(format!("{error:#}").contains("lifecycle evidence is unsupported"));
+    assert!(historical.results.is_empty());
+    assert!(historical.completed.is_empty());
+    assert!(historical.settled.is_empty());
+    assert!(historical.settlements.is_empty());
+    *events.last_mut().unwrap() = historical_integration(&intent, cohort_summary(COHORT_BASE));
+    State::new(&tasks, policy(true)).replay(&events).unwrap();
 }
 
 #[tokio::test]
-async fn speculative_failed_integration_journal_never_publishes_or_releases_dependents() {
-    let tasks = vec![
-        speculative_task("candidate", &[]),
-        task("dependent", "argus", &["candidate"]),
-    ];
-    let completions = Rc::new(Cell::new(0));
-    let cohorts = RecordingCohorts {
-        captured: RefCell::new(Vec::new()),
-        finished: Cell::new(0),
-        observed_completions: completions.clone(),
-        refuse_finish: false,
-        empty_receipt: false,
-        accepted: Cell::new(0),
-        released: Cell::new(0),
-    };
-    let events = RefCell::new(Vec::new());
-    let ran = Cell::new(0);
-    let sink_failed = Cell::new(false);
-    let error = schedule_cohorts(
-        &tasks,
-        2,
-        "m",
-        &TurnCancel::new(),
-        policy(true),
-        &[],
-        |_| Ok(()),
-        |_| Ok(()),
-        |event| {
-            assert!(
-                !sink_failed.get(),
-                "never append after the failed integration receipt"
-            );
-            if matches!(&event, Event::SpeculativeCohortIntegrated { .. }) {
-                sink_failed.set(true);
-                bail!("injected integrated receipt persistence failure");
-            }
-            if matches!(&event, Event::AttemptCompleted { .. }) {
-                completions.set(completions.get() + 1);
-            }
-            events.borrow_mut().push(event);
-            Ok(())
-        },
-        |intent, ()| {
-            ran.set(ran.get() + 1);
-            async move { outcome(&intent, "done", "private candidate") }
-        },
-        &cohorts,
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("persisting integrated cohort"));
-    assert_eq!(ran.get(), 1);
-    assert_eq!(cohorts.finished.get(), 1);
-    assert_eq!(cohorts.accepted.get(), 0);
-    assert_eq!(cohorts.released.get(), 1);
-    assert!(!events.borrow().iter().any(|event| matches!(
-        event,
-        Event::TaskSettled { .. } | Event::SpeculativeCohortIntegrated { .. }
-    )));
-}
-
-#[tokio::test]
-async fn speculative_captured_prefix_refuses_before_any_new_authority_or_admission() {
+async fn historical_captured_prefix_stays_unresolved_and_retired_entry_never_reopens_it() {
     let tasks = vec![speculative_task("candidate", &[])];
-    let key = AttemptKey {
-        task_id: TaskId("candidate".into()),
-        ordinal: 1,
-        kind: AttemptKind::Initial,
-    };
-    let intent = State::new(&tasks, policy(false))
-        .queue
-        .pop_front()
-        .unwrap()
-        .intent;
-    let captured = Event::SpeculativeCohortCaptured {
-        seq: 0,
-        cohort_id: COHORT_BASE.into(),
-        members: vec![key],
-    };
-    let dispatch = Event::DispatchIntent {
-        seq: 0,
-        intent: intent.clone(),
-    };
-    let completion = completion_event(&intent, &outcome(&intent, "done", "private candidate"));
-    let prefixes = [
-        vec![captured.clone()],
-        vec![captured.clone(), dispatch.clone()],
-        vec![captured, dispatch, completion],
-    ];
-    for prefix in prefixes {
-        let cohorts = RecordingCohorts {
-            captured: RefCell::new(Vec::new()),
-            finished: Cell::new(0),
-            observed_completions: Rc::new(Cell::new(0)),
-            refuse_finish: false,
-            empty_receipt: false,
-            accepted: Cell::new(0),
-            released: Cell::new(0),
-        };
-        let error = schedule_cohorts(
-            &tasks,
-            1,
-            "m",
-            &TurnCancel::new(),
-            policy(true),
-            &prefix,
-            |_| panic!("replay cannot prepare new authority"),
-            |_| -> std::result::Result<(), SlotDenied> { panic!("replay cannot admit a child") },
-            |_| panic!("rejected replay cannot append transitions"),
-            |intent, ()| async move { panic!("replay cannot redispatch {}", intent.key.display()) },
-            &cohorts,
-        )
-        .await
-        .unwrap_err();
+    let intent = historical_candidate(&tasks);
+    let completed = historical_prefix(&intent, "done", "private candidate");
+    for length in 1..=completed.len() {
+        let prefix = &completed[..length];
+        let mut historical = State::new(&tasks, policy(true));
+        let error = historical.replay(prefix).unwrap_err();
         assert!(format!("{error:#}").contains("no accepted integration"));
-        assert!(cohorts.captured.borrow().is_empty());
-        assert_eq!(cohorts.finished.get(), 0);
-        assert_eq!(cohorts.accepted.get(), 0);
+        assert!(historical.results.is_empty());
+        assert!(historical.intents.is_empty());
+        assert!(historical.settled.is_empty());
+        assert_retired_before_callbacks(&tasks, 1, prefix).await;
     }
 }
 
 #[tokio::test]
-async fn speculative_integrated_prefix_settles_once_without_reopening_or_reexecution() {
+async fn historical_integrated_prefix_settles_once_but_never_reopens_retired_execution() {
     let tasks = vec![
         speculative_task("candidate", &[]),
         task("dependent", "argus", &["candidate"]),
     ];
-    let key = AttemptKey {
-        task_id: TaskId("candidate".into()),
-        ordinal: 1,
-        kind: AttemptKind::Initial,
-    };
-    let intent = State::new(&tasks, policy(false))
-        .queue
-        .pop_front()
-        .unwrap()
-        .intent;
-    let mut prefix = vec![
-        Event::SpeculativeCohortCaptured {
-            seq: 0,
-            cohort_id: COHORT_BASE.into(),
-            members: vec![key.clone()],
-        },
-        Event::DispatchIntent {
-            seq: 0,
-            intent: intent.clone(),
-        },
-        completion_event(&intent, &outcome(&intent, "done", "private candidate")),
-        Event::SpeculativeCohortIntegrated {
-            seq: 0,
-            cohort_id: COHORT_BASE.into(),
-            members: vec![key.clone()],
-            receipt: cohort_summary(COHORT_BASE),
-        },
-    ];
+    let intent = historical_candidate(&tasks);
+    let key = intent.key.clone();
+    let mut prefix = historical_prefix(&intent, "done", "private candidate");
+    prefix.push(historical_integration(&intent, cohort_summary(COHORT_BASE)));
     for resume in 0..3 {
-        let cohorts = RecordingCohorts {
-            captured: RefCell::new(Vec::new()),
-            finished: Cell::new(0),
-            observed_completions: Rc::new(Cell::new(0)),
-            refuse_finish: false,
-            empty_receipt: false,
-            accepted: Cell::new(0),
-            released: Cell::new(0),
-        };
-        let appended = RefCell::new(Vec::new());
-        let ran = Cell::new(0);
-        let results = schedule_cohorts(
-            &tasks,
-            2,
-            "m",
-            &TurnCancel::new(),
-            policy(true),
-            &prefix,
-            |intent| {
-                assert_eq!(intent.key.task_id.0, "dependent");
-                Ok(())
-            },
-            |_| Ok(()),
-            |event| {
-                appended.borrow_mut().push(event);
-                Ok(())
-            },
-            |intent, ()| {
-                assert_eq!(intent.key.task_id.0, "dependent");
-                assert!(appended.borrow().iter().any(
-                    |event| matches!(event, Event::TaskSettled { selected, .. } if selected == &key)
-                ));
-                ran.set(ran.get() + 1);
-                async move { outcome(&intent, "done", "consumed integrated dependency") }
-            },
-            &cohorts,
-        )
-        .await
-        .unwrap();
-        assert_eq!(ran.get(), usize::from(resume == 0));
-        assert!(cohorts.captured.borrow().is_empty());
-        assert_eq!(cohorts.finished.get(), 0);
-        assert_eq!(cohorts.accepted.get(), 0);
-        assert_eq!(cohorts.released.get(), 1);
-        assert_eq!(super::super::logical_outcomes(&results).len(), 2);
-        prefix.extend(appended.into_inner());
+        let mut historical = State::new(&tasks, policy(true));
+        historical.replay(&prefix).unwrap();
+        assert!(historical.completed.contains(&key));
+        assert!(!historical.queue.iter().any(|p| p.intent.key == key));
+        let mut appended = Vec::new();
+        if resume == 0 {
+            assert!(!historical.eligible(historical.queue.front().unwrap()));
+            settle(&mut historical, &mut appended);
+            let dependent = dispatch(
+                &mut historical,
+                "dependent",
+                AttemptKind::Initial,
+                &mut appended,
+            );
+            assert_eq!(dependent.inputs, std::slice::from_ref(&key));
+            assert!(dependent.task.prompt.contains("private candidate"));
+            complete(
+                &mut historical,
+                dependent,
+                "done",
+                "consumed integrated dependency",
+                &mut appended,
+            );
+            settle(&mut historical, &mut appended);
+        } else {
+            assert!(historical.queue.is_empty());
+            assert!(historical.settlements.is_empty());
+        }
+        assert_eq!(super::super::logical_outcomes(&historical.results).len(), 2);
+        assert_eq!(
+            historical.results.iter().map(|r| r.tokens_in).sum::<u64>(),
+            22
+        );
+        prefix.extend(appended);
         assert_eq!(
             prefix
                 .iter()
-                .filter(
-                    |event| matches!(event, Event::TaskSettled { selected, .. } if selected == &key)
-                )
+                .filter(|event| matches!(event,
+            Event::TaskSettled { selected, .. } if selected == &key))
                 .count(),
             1
         );
+        assert_eq!(
+            prefix
+                .iter()
+                .filter(|event| matches!(event,
+            Event::DispatchIntent { intent, .. } if intent.key == key))
+                .count(),
+            1
+        );
+        assert_retired_before_callbacks(&tasks, 2, &prefix).await;
     }
 }
 
@@ -1591,77 +1420,35 @@ fn unsupported_lifecycle_summaries() -> Vec<String> {
 }
 
 #[tokio::test]
-async fn speculative_live_and_replay_refuse_unsupported_verifier_lifecycle_before_settlement() {
-    struct UnsupportedCohort(String);
-    impl CohortLifecycle for UnsupportedCohort {
-        fn capture(&self, _: &mut [DispatchIntent]) -> Result<String> {
-            Ok(COHORT_BASE.into())
-        }
-        fn finish<'a>(
-            &'a self,
-            _: &'a str,
-            _: &'a [DispatchIntent],
-        ) -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
-            Box::pin(async move { Ok(self.0.clone()) })
-        }
-        fn accepted(&self, _: &[DispatchIntent]) {
-            panic!("unsupported evidence cannot publish success")
-        }
-        fn release(&self) {}
-    }
+async fn historical_verifier_lifecycle_remains_fail_closed_and_cannot_reopen_execution() {
     let tasks = vec![
         speculative_task("candidate", &[]),
         task("dependent", "argus", &["candidate"]),
     ];
+    let intent = historical_candidate(&tasks);
     for receipt in unsupported_lifecycle_summaries() {
-        let events = RefCell::new(Vec::new());
-        let ran = Cell::new(0);
-        let cohorts = UnsupportedCohort(receipt.clone());
-        let error = schedule_cohorts(
-            &tasks,
-            2,
-            "m",
-            &TurnCancel::new(),
-            policy(true),
-            &[],
-            |_| Ok(()),
-            |_| Ok(()),
-            |event| {
-                events.borrow_mut().push(event);
-                Ok(())
-            },
-            |intent, ()| {
-                assert_eq!(intent.task.id, "candidate");
-                ran.set(ran.get() + 1);
-                async move { outcome(&intent, "done", "private candidate") }
-            },
-            &cohorts,
-        )
-        .await
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("lifecycle summary invalid"));
-        assert_eq!(ran.get(), 1);
-        assert!(!events.borrow().iter().any(|event| matches!(
-            event,
-            Event::SpeculativeCohortIntegrated { .. } | Event::TaskSettled { .. }
-        )));
-        let members = match &events.borrow()[0] {
-            Event::SpeculativeCohortCaptured { members, .. } => members.clone(),
-            _ => panic!("cohort must be captured before dispatch"),
-        };
-        let mut recorded = events.into_inner();
-        recorded.push(Event::SpeculativeCohortIntegrated {
-            seq: 0,
-            cohort_id: COHORT_BASE.into(),
-            members,
-            receipt,
-        });
-        assert!(crate::agent::runlog::validate_speculative_cohorts(&recorded).is_err());
         assert!(
-            State::new(&tasks, policy(true)).replay(&recorded).is_err(),
-            "replay must reject before preparing authority or releasing dependencies"
+            crate::core::speculation::verification::parse_success_summary(&receipt, COHORT_BASE)
+                .is_err()
         );
+        let mut recorded = historical_prefix(&intent, "done", "private candidate");
+        recorded.push(historical_integration(&intent, receipt));
+        assert!(crate::agent::runlog::validate_speculative_cohorts(&recorded).is_err());
+        let mut historical = State::new(&tasks, policy(true));
+        assert!(
+            historical.replay(&recorded).is_err(),
+            "historical validation must reject before any state publication"
+        );
+        assert!(historical.results.is_empty());
+        assert!(historical.intents.is_empty());
+        assert!(historical.completed.is_empty());
+        assert!(historical.settled.is_empty());
+        assert!(historical.settlements.is_empty());
+        assert_retired_before_callbacks(&tasks, 2, &recorded).await;
     }
+    let mut valid = historical_prefix(&intent, "done", "private candidate");
+    valid.push(historical_integration(&intent, cohort_summary(COHORT_BASE)));
+    State::new(&tasks, policy(true)).replay(&valid).unwrap();
 }
 
 struct Permit {
@@ -1805,4 +1592,32 @@ async fn every_attempt_kind_uses_one_admission_and_writer_lane_without_blocking_
         reader < fix,
         "a queued/slow fix must not freeze an independent reader"
     );
+}
+
+#[tokio::test]
+async fn retired_speculative_scheduler_refuses_before_any_callback() {
+    let mut retired = task("legacy", "daedalus", &[]);
+    retired.execution = ExecutionMode::Speculative;
+    let tasks = [retired];
+    let result = schedule(
+        &tasks,
+        1,
+        "fixture",
+        &TurnCancel::new(),
+        policy(false),
+        &[],
+        |_| panic!("retired execution reached preparation"),
+        |_| -> std::result::Result<(), SlotDenied> {
+            panic!("retired execution reached admission")
+        },
+        |_| panic!("retired execution wrote a journal event"),
+        |_, ()| async { panic!("retired execution dispatched a child") },
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("retired"));
+    assert_eq!(tasks[0].isolation, super::super::WorkflowIsolation::Shared);
+    let json = serde_json::to_string(&tasks[0]).unwrap();
+    let historical: WorkflowTask = serde_json::from_str(&json).unwrap();
+    assert_eq!(historical.execution, ExecutionMode::Speculative);
+    assert!(historical.execution.require_supported().is_err());
 }

@@ -7,9 +7,11 @@
 //! provenance and crash-flush rules cannot fork.
 
 use crate::agent::design::TaskDesignState;
+use crate::agent::todo::{self, TaskState};
+use crate::core::session_control::{PolicyLease, SessionControl};
 use crate::core::tool_media::{ImageUnavailable, ToolImage, MAX_IMAGE_BYTES};
 use crate::core::types::{Message, UsageRow, UserTurnId};
-use crate::core::{cli_config, config};
+use crate::core::{cli_config, config, exec_ctx};
 use crate::ui::{theme, tui};
 use crate::{fmt_time_ago, refresh_prompt_lanes_for_thread_switch};
 use anyhow::{Context, Result};
@@ -19,7 +21,10 @@ use std::io::Read as _;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) fn sessions_dir() -> std::path::PathBuf {
-    config::aizen_home().join("sessions")
+    crate::assistants::active().map_or_else(
+        || config::aizen_home().join("sessions"),
+        |thread| thread.directory.join("sessions"),
+    )
 }
 pub(crate) fn sanitize_name(s: &str) -> String {
     let n: String = s
@@ -213,15 +218,12 @@ pub(crate) fn merge_usage_ledger(
     Some(ledger)
 }
 
-/// On-disk shape of a saved session: `{"version":2,"meta":{…},"messages":[…]}`. The
-/// pre-provenance format was a bare `Vec<Message>` array — [`parse_session_bytes`] accepts both.
-/// `version` and `meta` both default: a future writer may bump the version, and a hand-written or
-/// partially-written file that still has `messages` is worth loading. Only a missing/unparsable
-/// `messages` makes a file unreadable.
+/// On-disk v3 envelopes require conversation control independently of task state. Known legacy
+/// envelopes (v0–2) and bare history arrays import default control only when the field is absent.
+/// Present malformed state never becomes an unrestricted default during a rewrite.
 #[derive(serde::Deserialize)]
 struct SessionFile {
     #[serde(default)]
-    #[allow(dead_code)]
     version: u32,
     #[serde(default)]
     meta: SessionMeta,
@@ -229,8 +231,136 @@ struct SessionFile {
     generation: u64,
     #[serde(default)]
     design_state: Option<TaskDesignState>,
+    #[serde(default, deserialize_with = "deserialize_task_state")]
+    task_state: Option<TaskState>,
+    #[serde(default, deserialize_with = "deserialize_session_control")]
+    session_control: Option<SessionControl>,
     #[serde(deserialize_with = "deserialize_stored_messages")]
     messages: Vec<Message>,
+}
+
+/// Missing task state is legacy; a present null/malformed object is not a task-free session.
+pub(crate) fn deserialize_task_state<'de, D>(deserializer: D) -> Result<Option<TaskState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <TaskState as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// A missing field is legacy; a present null, unknown version or invalid target is corruption.
+pub(crate) fn deserialize_session_control<'de, D>(
+    deserializer: D,
+) -> Result<Option<SessionControl>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let control = <SessionControl as serde::Deserialize>::deserialize(deserializer)?;
+    control.validate().map_err(serde::de::Error::custom)?;
+    Ok(Some(control))
+}
+
+/// Hold a policy admission through publication, so an autosave cannot race a human transition.
+/// Task equality includes its revision/evidence epoch; callers must check again just before I/O.
+pub(crate) struct PersistenceSnapshot {
+    owner: Option<todo::TaskContext>,
+    control: Option<SessionControl>,
+    _lease: Option<PolicyLease>,
+}
+impl PersistenceSnapshot {
+    pub(crate) fn capture(task: &TaskState) -> Result<Self> {
+        let owner = todo::bound_context();
+        let (control, lease) = if let Some(owner) = &owner {
+            let policy = owner.control().policy();
+            let lease = policy.admit()?;
+            (Some(policy.state().clone()), Some(lease))
+        } else {
+            (None, None)
+        };
+        let snapshot = Self {
+            owner,
+            control,
+            _lease: lease,
+        };
+        snapshot.check(task)?;
+        Ok(snapshot)
+    }
+    pub(crate) fn control(&self) -> Option<&SessionControl> {
+        self.control.as_ref()
+    }
+    pub(crate) fn check(&self, task: &TaskState) -> Result<()> {
+        task.validate()?;
+        if let Some(owner) = &self.owner {
+            anyhow::ensure!(
+                owner.snapshot() == *task,
+                "task changed while saving; retry with a coherent snapshot"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Ordinary saves may narrow, but cannot lift or replace a durable restriction. Only trusted
+/// explicit-control transition APIs may do that. Ownerless/offline saves keep the disk policy.
+pub(crate) fn preserve_control(
+    disk: Option<&SessionControl>,
+    incoming: Option<&SessionControl>,
+) -> Result<SessionControl> {
+    if let Some(control) = incoming {
+        control.validate()?;
+    }
+    if let Some(control) = disk {
+        control.validate()?;
+    }
+    if let (Some(disk), Some(incoming)) = (disk, incoming) {
+        anyhow::ensure!(
+            incoming.generation >= disk.generation && (!disk.is_planning() || disk == incoming),
+            "saved planning policy conflicts with active policy; restore it or use an explicit human transition"
+        );
+    }
+    Ok(incoming.or(disk).cloned().unwrap_or_default())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SaveControl<'a> {
+    Snapshot(&'a PersistenceSnapshot),
+    Explicit(&'a SessionControl),
+    Transition {
+        prior: Option<&'a SessionControl>,
+        next: &'a SessionControl,
+    },
+    Captured(Option<&'a SessionControl>),
+    Disk,
+}
+impl SaveControl<'_> {
+    pub(crate) fn resolve(&self, disk: Option<&SessionControl>) -> Result<SessionControl> {
+        match self {
+            Self::Snapshot(snapshot) => preserve_control(disk, snapshot.control()),
+            Self::Explicit(control) => {
+                control.validate()?;
+                Ok((*control).clone())
+            }
+            Self::Transition { prior, next } => {
+                anyhow::ensure!(
+                    disk == *prior,
+                    "saved execution policy changed; reload before transitioning"
+                );
+                next.validate()?;
+                anyhow::ensure!(
+                    next.generation > prior.map_or(0, |control| control.generation),
+                    "execution policy transition must advance its generation"
+                );
+                Ok((*next).clone())
+            }
+            Self::Captured(control) => preserve_control(disk, *control),
+            Self::Disk => preserve_control(disk, None),
+        }
+    }
+    pub(crate) fn check(&self, task: &TaskState) -> Result<()> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.check(task),
+            _ => task.validate(),
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -240,6 +370,9 @@ struct SessionFileRef<'a> {
     meta: &'a SessionMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     design_state: Option<&'a TaskDesignState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_state: Option<&'a TaskState>,
+    session_control: &'a SessionControl,
     messages: &'a [Value],
 }
 
@@ -644,10 +777,19 @@ pub(crate) fn parse_stored_history(bytes: &[u8]) -> Result<Vec<Message>> {
 }
 
 pub(crate) type SessionSnapshot = (Vec<Message>, Option<SessionMeta>, Option<TaskDesignState>);
+pub(crate) type SessionStateSnapshot = (
+    Vec<Message>,
+    Option<SessionMeta>,
+    Option<TaskDesignState>,
+    TaskState,
+    SessionControl,
+);
 type SessionGeneration = (
     Vec<Message>,
     Option<SessionMeta>,
     Option<TaskDesignState>,
+    TaskState,
+    SessionControl,
     u64,
 );
 
@@ -656,9 +798,17 @@ type SessionGeneration = (
 pub(crate) fn read_session_path_with_design(
     path: &std::path::Path,
 ) -> Result<SessionSnapshot, String> {
+    read_session_path_with_state(path)
+        .map(|(messages, meta, design, _, _)| (messages, meta, design))
+}
+
+pub(crate) fn read_session_path_with_state(
+    path: &std::path::Path,
+) -> Result<SessionStateSnapshot, String> {
     let bytes =
         read_bounded(path, MAX_HISTORY_BYTES).map_err(|e| format!("history unavailable: {e:?}"))?;
-    let (mut msgs, meta, design_state, generation) = parse_session_full(&bytes)?;
+    let (mut msgs, meta, design_state, task_state, control, generation) =
+        parse_session_full(&bytes)?;
     if let Ok(bytes) = read_bounded(&delta_path(path), MAX_HISTORY_BYTES) {
         if let Ok(text) = std::str::from_utf8(&bytes) {
             for line in text.lines().filter(|s| !s.trim().is_empty()) {
@@ -680,7 +830,10 @@ pub(crate) fn read_session_path_with_design(
         }
     }
     crate::agent::observe::retain_tool_images(&mut msgs);
-    Ok((msgs, meta, design_state))
+    task_state
+        .validate()
+        .map_err(|e| format!("invalid task state: {e:#}"))?;
+    Ok((msgs, meta, design_state, task_state, control))
 }
 
 pub(crate) fn read_session_path_reason(
@@ -703,6 +856,8 @@ struct DeltaState {
     saved_len: usize,
     prefix_fp: u64,
     design_fp: u64,
+    task_fp: u64,
+    control_fp: u64,
     generation: u64,
 }
 
@@ -715,7 +870,14 @@ fn fingerprint(value: &impl serde::Serialize) -> u64 {
     h.finish()
 }
 
-fn note_saved(name: &str, stored: &[Value], design: Option<&TaskDesignState>, generation: u64) {
+fn note_saved(
+    name: &str,
+    stored: &[Value],
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    control: &SessionControl,
+    generation: u64,
+) {
     let state = DeltaState {
         slug: sessions_dir()
             .join(format!("{}.json", sanitize_name(name)))
@@ -724,6 +886,8 @@ fn note_saved(name: &str, stored: &[Value], design: Option<&TaskDesignState>, ge
         saved_len: stored.len(),
         prefix_fp: fingerprint(&stored),
         design_fp: fingerprint(&design),
+        task_fp: fingerprint(task),
+        control_fp: fingerprint(control),
         generation,
     };
     if let Ok(mut g) = DELTA_STATE.lock() {
@@ -740,15 +904,62 @@ pub(crate) fn autosave_session_delta(
     autosave_session_delta_with_design(history, name, model, None)
 }
 
-/// State-only mutations and any prefix/media-retention rewrite require a full coherent envelope.
-/// JSONL entries remain flat Message objects for legacy readers, tagged with their base generation.
+/// Compatibility wrapper: capture the ambient task once for this write.
+#[cfg(test)]
 pub(crate) fn autosave_session_delta_with_design(
     history: &[Message],
     name: &str,
     model: Option<&str>,
     design: Option<&TaskDesignState>,
 ) -> Result<String> {
+    let task = todo::durable_snapshot();
+    autosave_session_delta_with_state(history, name, model, design, &task)
+}
+
+#[cfg(test)]
+pub(crate) fn autosave_session_delta_with_state(
+    history: &[Message],
+    name: &str,
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+) -> Result<String> {
+    let snapshot = PersistenceSnapshot::capture(task)?;
+    autosave_session_delta_inner(
+        history,
+        name,
+        model,
+        design,
+        task,
+        SaveControl::Snapshot(&snapshot),
+    )
+    .map(|(path, _)| path)
+}
+
+fn autosave_session_delta_inner(
+    history: &[Message],
+    name: &str,
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    policy: SaveControl<'_>,
+) -> Result<(String, SessionControl)> {
+    policy.check(task)?;
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
+    let disk = match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let revision = SessionRevision::read(&path)?;
+            let bytes = read_bounded(&path, MAX_HISTORY_BYTES)
+                .map_err(|e| anyhow::anyhow!("saved session is unavailable: {e:?}"))?;
+            let parsed = parse_session_full(&bytes)
+                .map_err(|why| anyhow::anyhow!("saved session is unreadable: {why}"))?;
+            revision.check(&path)?;
+            Some((parsed, revision))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading existing session"),
+    };
+    let control = policy.resolve(disk.as_ref().map(|(state, _)| &state.4))?;
     let delta = delta_path(&path);
     let stored = stored_history(history)?;
     let appendable = DELTA_STATE.lock().ok().and_then(|g| {
@@ -757,8 +968,29 @@ pub(crate) fn autosave_session_delta_with_design(
             let intact = stored
                 .get(..s.saved_len)
                 .is_some_and(|prefix| fingerprint(&prefix) == s.prefix_fp);
-            (same && intact && fingerprint(&design) == s.design_fp)
+            (same
+                && intact
+                && fingerprint(&design) == s.design_fp
+                && fingerprint(task) == s.task_fp
+                && fingerprint(&control) == s.control_fp)
                 .then_some((s.saved_len, s.generation))
+        })
+    });
+    // Deltas cannot update envelope provenance. Even an unchanged transcript needs a new
+    // generation after focus, before any later messages can be appended under the new project.
+    let project_key = config::project_key();
+    let project_root = config::project_root().display().to_string();
+    let project_slug = config::project_slug();
+    let appendable = appendable.filter(|(_, generation)| {
+        disk.as_ref().is_some_and(|(state, _)| {
+            state.5 == *generation
+                && fingerprint(&state.3) == fingerprint(task)
+                && state.4 == control
+                && state.1.as_ref().is_some_and(|meta| {
+                    meta.project_key.as_ref() == Some(&project_key)
+                        && meta.project_root.as_ref() == Some(&project_root)
+                        && meta.project_slug.as_ref() == Some(&project_slug)
+                })
         })
     });
     if let Some((saved_len, generation)) = appendable {
@@ -777,6 +1009,10 @@ pub(crate) fn autosave_session_delta_with_design(
                     buf.push(b'\n');
                 }
                 use std::io::Write as _;
+                policy.check(task)?;
+                if let Some((_, revision)) = &disk {
+                    revision.check(&path)?;
+                }
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -787,12 +1023,15 @@ pub(crate) fn autosave_session_delta_with_design(
                     .with_context(|| format!("appending to {}", delta.display()))?;
                 f.sync_all()?;
                 crate::core::persist::harden_owner_only_checked(&delta)?;
-                note_saved(name, &stored, design, generation);
+                note_saved(name, &stored, design, task, &control, generation);
             }
-            return Ok(path.display().to_string());
+            policy.check(task)?;
+            todo::mark_saved(task);
+            return Ok((path.display().to_string(), control));
         }
     }
-    save_session_with_design(history, name, model, design)
+    let saved = save_session_inner(history, name, model, design, task, policy)?;
+    Ok((saved.path, saved.control))
 }
 
 /// Remove the oldest conversations beyond `sessions_keep` / `sessions_max_bytes`, never the one
@@ -915,10 +1154,11 @@ fn gc_blobs() {
 /// pasted image, `Option<String>` refused to read it back, and every such conversation simply became
 /// "(unreadable)" with nothing anywhere saying "invalid type: sequence". Naming the error makes the
 /// next asymmetry visible the first time it happens instead of after 29 files.
+#[cfg(test)]
 pub(crate) fn parse_session_reason(
     bytes: &[u8],
 ) -> Result<(Vec<Message>, Option<SessionMeta>), String> {
-    parse_session_full(bytes).map(|(m, meta, _, _)| (m, meta))
+    parse_session_full(bytes).map(|(m, meta, _, _, _, _)| (m, meta))
 }
 
 fn parse_session_full(bytes: &[u8]) -> Result<SessionGeneration, String> {
@@ -929,7 +1169,14 @@ fn parse_session_full(bytes: &[u8]) -> Result<SessionGeneration, String> {
     if let Value::Array(values) = value {
         let mut msgs = parse_stored_messages(values).map_err(|e| e.to_string())?;
         crate::agent::observe::retain_tool_images(&mut msgs);
-        return Ok((msgs, None, None, 0));
+        return Ok((
+            msgs,
+            None,
+            None,
+            TaskState::default(),
+            SessionControl::default(),
+            0,
+        ));
     }
     let messages = value
         .get("messages")
@@ -937,21 +1184,39 @@ fn parse_session_full(bytes: &[u8]) -> Result<SessionGeneration, String> {
     if !messages.is_array() {
         return Err("messages must be an array".into());
     }
-    let mut file: SessionFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let mut file: SessionFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if file.version > 3 {
+        return Err("unsupported session envelope version".into());
+    }
+    if file.version == 3 && file.session_control.is_none() {
+        return Err("missing session_control in v3 session".into());
+    }
+    if let Some(task) = &file.task_state {
+        task.validate()
+            .map_err(|e| format!("invalid task state: {e:#}"))?;
+    }
+    let control = file.session_control.unwrap_or_default();
+    control
+        .validate()
+        .map_err(|e| format!("invalid session control: {e:#}"))?;
     crate::agent::observe::retain_tool_images(&mut file.messages);
     Ok((
         file.messages,
         Some(file.meta),
         file.design_state,
+        file.task_state.unwrap_or_default(),
+        control,
         file.generation,
     ))
 }
 
 /// [`parse_session_reason`] for the callers that only branch on success.
+#[cfg(test)]
 pub(crate) fn parse_session_bytes(bytes: &[u8]) -> Option<(Vec<Message>, Option<SessionMeta>)> {
     parse_session_reason(bytes).ok()
 }
 
+#[cfg(test)]
 pub(crate) fn save_session(history: &[Message], name: &str, model: Option<&str>) -> Result<String> {
     save_session_with_design(history, name, model, None)
 }
@@ -962,8 +1227,61 @@ pub(crate) fn save_session_with_design(
     model: Option<&str>,
     design: Option<&TaskDesignState>,
 ) -> Result<String> {
+    let task = todo::durable_snapshot();
+    save_session_with_state(history, name, model, design, &task)
+}
+
+pub(crate) fn save_session_with_state(
+    history: &[Message],
+    name: &str,
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+) -> Result<String> {
+    let snapshot = PersistenceSnapshot::capture(task)?;
+    save_session_inner(
+        history,
+        name,
+        model,
+        design,
+        task,
+        SaveControl::Snapshot(&snapshot),
+    )
+    .map(|saved| saved.path)
+}
+
+/// Fixture-only explicit save. Production human transitions use `prepare_control_transition`.
+#[cfg(test)]
+pub(crate) fn save_session_with_control(
+    history: &[Message],
+    name: &str,
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    control: &SessionControl,
+) -> Result<String> {
+    save_session_inner(
+        history,
+        name,
+        model,
+        design,
+        task,
+        SaveControl::Explicit(control),
+    )
+    .map(|saved| saved.path)
+}
+
+fn save_session_inner(
+    history: &[Message],
+    name: &str,
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    policy: SaveControl<'_>,
+) -> Result<PublishedSession> {
+    task.validate()?;
     // All three come from one cached identity lookup, so a file's key and slug can never disagree.
-    write_session_with_design(
+    let saved = write_session_checked(
         history,
         name,
         SessionMeta {
@@ -979,7 +1297,12 @@ pub(crate) fn save_session_with_design(
             usage: None,
         },
         design,
-    )
+        Some(task),
+        policy,
+        None,
+    )?;
+    todo::mark_saved(task);
+    Ok(saved)
 }
 
 /// Re-home an UNATTRIBUTED transcript — the legacy `last.json` pointer copy — under a real slug
@@ -988,15 +1311,28 @@ pub(crate) fn save_session_with_design(
 /// that lie then silences [`load_session`]'s cross-project warning, makes the file read as `here`
 /// forever, and can never be undone (there is no original path left to restore). Absent fields are
 /// the truth. Whatever the source DID record is carried through verbatim.
-pub(crate) fn rehome_session(
+fn rehome_session_with_state(
     history: &[Message],
     name: &str,
     carried: Option<SessionMeta>,
     model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    control: &SessionControl,
 ) -> Result<String> {
     let mut meta = carried.unwrap_or_default();
     meta.model = model.map(str::to_string).or(meta.model);
-    write_session(history, name, meta)
+    // Offline migration is not evidence that the ambient conversation was saved.
+    write_session_checked(
+        history,
+        name,
+        meta,
+        design,
+        Some(task),
+        SaveControl::Explicit(control),
+        None,
+    )
+    .map(|saved| saved.path)
 }
 
 /// How many saved sessions still carry a LEGACY zone slug — for `aizen zone migrate`'s plan.
@@ -1030,8 +1366,20 @@ pub(crate) fn retag_sessions_of_slug(legacy_slug: &str, on_error: &mut dyn FnMut
     let slug = config::project_slug();
     let mut n = 0usize;
     for s in stat_sessions() {
-        let Ok((msgs, Some(mut meta), design)) = read_session_path_with_design(&s.path) else {
-            continue;
+        let revision = match SessionRevision::read(&s.path) {
+            Ok(revision) => revision,
+            Err(e) => {
+                on_error(format!("session {}: {e:#}", s.name));
+                continue;
+            }
+        };
+        let (msgs, mut meta, design, task, control) = match read_session_path_with_state(&s.path) {
+            Ok((msgs, Some(meta), design, task, control)) => (msgs, meta, design, task, control),
+            Ok(_) => continue,
+            Err(e) => {
+                on_error(format!("session {}: {e}", s.name));
+                continue;
+            }
         };
         if meta.project_slug.as_deref() != Some(legacy_slug) {
             continue;
@@ -1047,10 +1395,12 @@ pub(crate) fn retag_sessions_of_slug(legacy_slug: &str, on_error: &mut dyn FnMut
             }
         };
         let file = SessionFileRef {
-            version: 2,
+            version: 3,
             generation: new_generation(),
             meta: &meta,
             design_state: design.as_ref(),
+            task_state: Some(&task),
+            session_control: &control,
             messages: &stored,
         };
         let bytes = match serde_json::to_vec_pretty(&file) {
@@ -1063,7 +1413,9 @@ pub(crate) fn retag_sessions_of_slug(legacy_slug: &str, on_error: &mut dyn FnMut
                 continue;
             }
         };
-        match crate::core::persist::atomic_write(&s.path, &bytes)
+        match revision
+            .check(&s.path)
+            .and_then(|_| crate::core::persist::atomic_write(&s.path, &bytes))
             .and_then(|_| crate::core::persist::harden_owner_only_checked(&s.path))
         {
             Ok(_) => {
@@ -1078,6 +1430,7 @@ pub(crate) fn retag_sessions_of_slug(legacy_slug: &str, on_error: &mut dyn FnMut
 
 /// Write a session file. `created` is preserved across the per-turn re-saves of one conversation
 /// (existing file's stamp wins, then the caller's carried one, then now); `updated` is always now.
+#[cfg(test)]
 pub(crate) fn write_session(history: &[Message], name: &str, meta: SessionMeta) -> Result<String> {
     write_session_with_design(history, name, meta, None)
 }
@@ -1125,20 +1478,44 @@ impl SessionRevision {
 /// Strict, non-aliasing lookup for noninteractive edits: never sanitize an invalid slug into
 /// a different conversation, and never rebuild its system lanes for the caller's cwd.
 pub(crate) fn read_session_for_edit(name: &str) -> Result<(SessionSnapshot, SessionRevision)> {
+    let ((messages, meta, design, _, _), revision) = read_session_for_edit_with_state(name)?;
+    Ok(((messages, meta, design), revision))
+}
+
+pub(crate) fn read_session_for_edit_with_state(
+    name: &str,
+) -> Result<(SessionStateSnapshot, SessionRevision)> {
     anyhow::ensure!(
         !name.is_empty() && sanitize_name(name) == name,
         "invalid session slug (use the saved filename without .json)"
     );
     let path = sessions_dir().join(format!("{name}.json"));
     let revision = SessionRevision::read(&path)?;
-    let snapshot = read_session_path_with_design(&path)
-        .map_err(|_| anyhow::anyhow!("saved session is unreadable"))?;
+    let snapshot = read_session_path_with_state(&path)
+        .map_err(|why| anyhow::anyhow!("saved session is unreadable: {why}"))?;
     revision.check(&path)?;
     Ok((snapshot, revision))
 }
 
+/// Identity of the exact envelope bytes published by this write, not a later disk snapshot.
+/// Generation is decimal text so consumers cannot lose precision through a JSON number.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct SessionSaveReceipt {
+    pub(crate) version: u32,
+    pub(crate) envelope_sha256: String,
+    pub(crate) generation: String,
+}
+
+struct PublishedSession {
+    path: String,
+    bytes: Vec<u8>,
+    generation: u64,
+    control: SessionControl,
+}
+
 /// Commit only if no envelope replacement, delta append, deletion or creation happened since load.
 /// Optimistic, not a cross-process lock: unrelated writers do not take a shared lease.
+#[allow(dead_code)] // Compatibility wrapper for callers that only need the saved path.
 pub(crate) fn write_session_if_unchanged(
     history: &[Message],
     name: &str,
@@ -1146,33 +1523,265 @@ pub(crate) fn write_session_if_unchanged(
     design: Option<&TaskDesignState>,
     revision: &SessionRevision,
 ) -> Result<String> {
-    write_session_checked(history, name, meta, design, Some(revision))
+    write_session_checked(
+        history,
+        name,
+        meta,
+        design,
+        None,
+        SaveControl::Disk,
+        Some(revision),
+    )
+    .map(|saved| saved.path)
 }
 
+pub(crate) fn write_session_if_unchanged_with_receipt(
+    history: &[Message],
+    name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+    revision: &SessionRevision,
+) -> Result<(String, SessionSaveReceipt)> {
+    let saved = write_session_checked(
+        history,
+        name,
+        meta,
+        design,
+        None,
+        SaveControl::Disk,
+        Some(revision),
+    )?;
+    let receipt = SessionSaveReceipt {
+        version: 1,
+        envelope_sha256: sha256_hex(&saved.bytes),
+        generation: saved.generation.to_string(),
+    };
+    Ok((saved.path, receipt))
+}
+
+#[cfg(test)]
 pub(crate) fn write_session_with_design(
     history: &[Message],
     name: &str,
     meta: SessionMeta,
     design: Option<&TaskDesignState>,
 ) -> Result<String> {
-    write_session_checked(history, name, meta, design, None)
+    let task = todo::durable_snapshot();
+    write_session_with_state(history, name, meta, design, &task)
 }
 
+pub(crate) fn write_session_with_state(
+    history: &[Message],
+    name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+) -> Result<String> {
+    let snapshot = PersistenceSnapshot::capture(task)?;
+    let saved = write_session_checked(
+        history,
+        name,
+        meta,
+        design,
+        Some(task),
+        SaveControl::Snapshot(&snapshot),
+        None,
+    )?;
+    todo::mark_saved(task);
+    Ok(saved.path)
+}
+
+/// Fixture-only unchecked explicit state write; human transitions require prior-policy CAS.
+#[cfg(test)]
+pub(crate) fn write_session_with_control(
+    history: &[Message],
+    name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    control: &SessionControl,
+) -> Result<String> {
+    let saved = write_session_checked(
+        history,
+        name,
+        meta,
+        design,
+        Some(task),
+        SaveControl::Explicit(control),
+        None,
+    )?;
+    todo::mark_saved(task);
+    Ok(saved.path)
+}
+
+/// Prepared outside the control mutex: transcript projection may materialize bounded image blobs.
+/// Publication checks both the prior policy and the exact envelope/delta revision; it never resolves
+/// project metadata, inspects ambient policy, or performs image preparation inside `transition`.
+pub(crate) struct PreparedControlTransition {
+    name: String,
+    meta: SessionMeta,
+    design: Option<TaskDesignState>,
+    task: TaskState,
+    stored: Vec<Value>,
+    expected: SessionControl,
+    disk: Option<SessionControl>,
+    revision: Option<SessionRevision>,
+}
+
+pub(crate) fn prepare_control_transition(
+    history: &[Message],
+    name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    expected: &SessionControl,
+    expected_revision: Option<&SessionRevision>,
+) -> Result<PreparedControlTransition> {
+    anyhow::ensure!(
+        !name.is_empty() && sanitize_name(name) == name && name != "last",
+        "planning transition requires an exact saved session slug, not a legacy pointer"
+    );
+    expected.validate()?;
+    task.validate()?;
+    let path = sessions_dir().join(format!("{name}.json"));
+    let (disk, revision) = match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let (snapshot, revision) = read_session_for_edit_with_state(name)?;
+            anyhow::ensure!(
+                snapshot.4 == *expected,
+                "saved execution policy changed; reload before transitioning"
+            );
+            (Some(snapshot.4), Some(revision))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                *expected == SessionControl::default(),
+                "saved execution policy disappeared; reload before transitioning"
+            );
+            (None, None)
+        }
+        Err(error) => return Err(error).context("checking transition session"),
+    };
+    let stored = stored_history(history)?;
+    if let Some(expected_revision) = expected_revision {
+        expected_revision.check(&path)?;
+    }
+    if let Some(revision) = &revision {
+        revision.check(&path)?;
+    }
+    Ok(PreparedControlTransition {
+        name: name.to_owned(),
+        meta,
+        design: design.cloned(),
+        task: task.clone(),
+        stored,
+        expected: expected.clone(),
+        disk,
+        revision,
+    })
+}
+
+impl PreparedControlTransition {
+    /// A freshly allocated slug must not replace a session that appeared before preparation.
+    pub(crate) fn require_absent(self) -> Result<Self> {
+        anyhow::ensure!(
+            self.disk.is_none(),
+            "new session slug is already occupied; retry"
+        );
+        Ok(self)
+    }
+
+    /// Consume once inside the trusted `ControlContext::transition` persistence callback.
+    pub(crate) fn save(self, next: &SessionControl) -> Result<String> {
+        anyhow::ensure!(
+            self.expected.generation.checked_add(1) == Some(next.generation),
+            "prepared execution policy transition is stale"
+        );
+        let saved = write_session_projection_checked(
+            || Ok(self.stored),
+            &self.name,
+            self.meta,
+            self.design.as_ref(),
+            Some(&self.task),
+            SaveControl::Transition {
+                prior: self.disk.as_ref(),
+                next,
+            },
+            self.revision.as_ref(),
+        )?;
+        todo::mark_saved(&self.task);
+        Ok(saved.path)
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // The policy is independent of task state and CAS revision.
 fn write_session_checked(
     history: &[Message],
     name: &str,
+    meta: SessionMeta,
+    design: Option<&TaskDesignState>,
+    task: Option<&TaskState>,
+    policy: SaveControl<'_>,
+    revision: Option<&SessionRevision>,
+) -> Result<PublishedSession> {
+    write_session_projection_checked(
+        || stored_history(history),
+        name,
+        meta,
+        design,
+        task,
+        policy,
+        revision,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_session_projection_checked(
+    project_history: impl FnOnce() -> Result<Vec<Value>>,
+    name: &str,
     mut meta: SessionMeta,
     design: Option<&TaskDesignState>,
+    task: Option<&TaskState>,
+    policy: SaveControl<'_>,
     revision: Option<&SessionRevision>,
-) -> Result<String> {
+) -> Result<PublishedSession> {
+    if let Some(task) = task {
+        task.validate()?;
+    }
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     config::harden_dir(&dir);
     let path = dir.join(format!("{}.json", sanitize_name(name)));
-    let existing_meta = std::fs::read(&path)
-        .ok()
-        .and_then(|b| parse_session_bytes(&b))
-        .and_then(|(_, m)| m);
+    if let Some(revision) = revision {
+        revision.check(&path)?;
+    }
+    // Never overwrite an unsupported/corrupt task envelope as though it were a missing session.
+    // Offline checked edits preserve the target's own state, not the caller's ambient session.
+    let existing_revision = match std::fs::symlink_metadata(&path) {
+        Ok(_) => Some(SessionRevision::read(&path)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading existing session revision"),
+    };
+    let existing = match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let bytes = read_bounded(&path, MAX_HISTORY_BYTES)
+                .map_err(|e| anyhow::anyhow!("saved session is unavailable: {e:?}"))?;
+            Some(
+                parse_session_full(&bytes)
+                    .map_err(|why| anyhow::anyhow!("saved session is unreadable: {why}"))?,
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading existing session"),
+    };
+    let existing_task = existing
+        .as_ref()
+        .map(|(_, _, _, task, _, _)| task.clone())
+        .unwrap_or_default();
+    let task = task.unwrap_or(&existing_task);
+    policy.check(task)?;
+    let control = policy.resolve(existing.as_ref().map(|state| &state.4))?;
+    let existing_meta = existing.and_then(|(_, meta, _, _, _, _)| meta);
     let existing_created = existing_meta.as_ref().and_then(|m| m.created.clone());
     let now = chrono::Local::now().to_rfc3339();
     meta.created = existing_created
@@ -1193,19 +1802,30 @@ fn write_session_checked(
         meter.cursor(),
         meter.rows_since(seen_epoch, seen_seq),
     );
-    let stored = stored_history(history)?;
+    let stored = project_history()?;
     let generation = new_generation();
     let file = SessionFileRef {
-        version: 2,
+        version: 3,
         generation,
         meta: &meta,
         design_state: design,
+        task_state: Some(task),
+        session_control: &control,
         messages: &stored,
     };
     let mut bytes = serde_json::to_vec_pretty(&file)?;
     bytes.push(b'\n');
+    policy.check(task)?;
     if let Some(revision) = revision {
         revision.check(&path)?;
+    }
+    if let Some(revision) = existing_revision {
+        revision.check(&path)?;
+    } else {
+        anyhow::ensure!(
+            matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "session appeared while saving; retry"
+        );
     }
     crate::core::persist::atomic_write(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -1213,25 +1833,61 @@ fn write_session_checked(
     crate::core::persist::harden_owner_only_checked(&path)?;
     // A full write supersedes any delta beside it, and is where the next delta starts from.
     let _ = std::fs::remove_file(delta_path(&path));
-    note_saved(name, &stored, design, generation);
-    Ok(path.display().to_string())
+    note_saved(name, &stored, design, task, &control, generation);
+    policy.check(task)?;
+    Ok(PublishedSession {
+        path: path.display().to_string(),
+        bytes,
+        generation,
+        control,
+    })
 }
 #[cfg(test)]
 pub(crate) fn load_session(history: &mut Vec<Message>, name: &str, model: &str) -> Result<usize> {
     load_session_with_design(history, name, model).map(|(count, _)| count)
 }
 
+#[cfg(test)]
 pub(crate) fn load_session_with_design(
     history: &mut Vec<Message>,
     name: &str,
     model: &str,
 ) -> Result<(usize, Option<TaskDesignState>)> {
+    load_session_state_inner(history, name, model, false)
+        .map(|(count, design, _, _)| (count, design))
+}
+
+pub(crate) fn load_session_with_state(
+    history: &mut Vec<Message>,
+    name: &str,
+    model: &str,
+) -> Result<(usize, Option<TaskDesignState>, TaskState, SessionControl)> {
+    load_session_state_inner(history, name, model, true)
+}
+
+fn load_session_state_inner(
+    history: &mut Vec<Message>,
+    name: &str,
+    model: &str,
+    accepts_task: bool,
+) -> Result<(usize, Option<TaskDesignState>, TaskState, SessionControl)> {
     let path = sessions_dir().join(format!("{}.json", sanitize_name(name)));
     if !path.is_file() {
         anyhow::bail!("no saved session '{name}'");
     }
-    let (loaded, meta, design) = read_session_path_with_design(&path)
+    let (loaded, meta, design, task, control) = read_session_path_with_state(&path)
         .map_err(|why| anyhow::anyhow!("session '{name}' is unreadable: {why}"))?;
+    anyhow::ensure!(
+        accepts_task || (task == TaskState::default() && control == SessionControl::default()),
+        "session contains task/control state; restore with load_session_with_state"
+    );
+    let control = if let Some(owner) = todo::bound_context() {
+        let context = owner.control();
+        context.restore(control)?;
+        context.snapshot()
+    } else {
+        control
+    };
     *history = loaded;
     // Rebuild BOTH prompt lanes for the CURRENT project + model. The stable lane saved in the file
     // reflects wherever the session was recorded — replaying it verbatim in another checkout
@@ -1282,7 +1938,15 @@ pub(crate) fn load_session_with_design(
         // The transcript is already restored into `history` at this point, so a failed re-home must
         // not fail the restore — report it and leave the slug unpinned, which makes the next autosave
         // allocate a fresh name (and say so) instead of overwriting the pointer.
-        match save_session_with_design(history, &fresh, Some(model), design.as_ref()) {
+        match rehome_session_with_state(
+            history,
+            &fresh,
+            meta,
+            Some(model),
+            design.as_ref(),
+            &task,
+            &control,
+        ) {
             Ok(_) => set_session_slug(Some(fresh)),
             Err(e) => {
                 set_session_slug(None);
@@ -1297,8 +1961,8 @@ pub(crate) fn load_session_with_design(
     }
     // Keep the exit-flush snapshot in step with what was just restored, so an abrupt window close
     // right after re-saves this conversation, not a stale one.
-    update_live_history_with_design(history, design.as_ref());
-    Ok((conversation_len(history), design))
+    publish_live_snapshot(history, design.as_ref(), &task, Some(&control));
+    Ok((conversation_len(history), design, task, control))
 }
 static SESSION_SLUG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -1569,7 +2233,8 @@ pub(crate) fn most_recent_session() -> Option<(String, usize, Option<String>)> {
     // pointer-era transcript from the hint AND (since `last` is never a row) from the picker too.
     // Pre-provenance pool where only the shared `last.json` copy ever existed: re-home that
     // transcript into a real named file once, so it shows up in /sessions from now on.
-    let (msgs, carried) = read_session_path(&sessions_dir().join("last.json"))?;
+    let (msgs, carried, design, task, control) =
+        read_session_path_with_state(&sessions_dir().join("last.json")).ok()?;
     if !msgs.iter().any(|m| m.role == "user") {
         return None;
     }
@@ -1587,7 +2252,15 @@ pub(crate) fn most_recent_session() -> Option<(String, usize, Option<String>)> {
     // Re-homing is a convenience, not a precondition: if the dir is unwritable the transcript
     // is still READABLE, so keep offering it under the legacy `last` name rather than pretending
     // there is nothing to resume. `load_session` re-homes on restore (and reports if that fails).
-    match rehome_session(&msgs, &fresh, carried, None) {
+    match rehome_session_with_state(
+        &msgs,
+        &fresh,
+        carried,
+        None,
+        design.as_ref(),
+        &task,
+        &control,
+    ) {
         Ok(_) => Some((fresh, conversation_len(&msgs), label)),
         Err(_) => Some(("last".to_string(), conversation_len(&msgs), label)),
     }
@@ -1921,6 +2594,9 @@ static LIVE_HISTORY: OnceLock<Mutex<Vec<Message>>> = OnceLock::new();
 struct LiveSnapshot {
     history: Vec<Message>,
     design_state: Option<TaskDesignState>,
+    task_state: TaskState,
+    session_control: Option<SessionControl>,
+    workspace: Option<exec_ctx::WorkspacePlacement>,
 }
 static LIVE_SNAPSHOT: OnceLock<Mutex<LiveSnapshot>> = OnceLock::new();
 
@@ -1928,12 +2604,41 @@ pub(crate) fn update_live_history_with_design(
     history: &[Message],
     design: Option<&TaskDesignState>,
 ) {
+    let task = todo::durable_snapshot();
+    update_live_history_with_state(history, design, &task);
+}
+
+pub(crate) fn update_live_history_with_state(
+    history: &[Message],
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+) {
+    let Ok(snapshot) = PersistenceSnapshot::capture(task) else {
+        return;
+    };
+    publish_live_snapshot(history, design, task, snapshot.control());
+}
+
+fn current_workspace() -> Option<exec_ctx::WorkspacePlacement> {
+    exec_ctx::current().and_then(|context| context.workspace_snapshot())
+}
+
+fn publish_live_snapshot(
+    history: &[Message],
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    control: Option<&SessionControl>,
+) {
+    let workspace = current_workspace();
     *LIVE_SNAPSHOT
         .get_or_init(|| Mutex::new(LiveSnapshot::default()))
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = LiveSnapshot {
         history: history.to_vec(),
         design_state: design.cloned(),
+        task_state: task.clone(),
+        session_control: control.cloned(),
+        workspace,
     };
     *live_history_slot()
         .lock()
@@ -1997,8 +2702,24 @@ pub(crate) fn flush_live_session_on_exit() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    // No REPL model label on this thread — `save_session` falls back to the configured model.
-    autosave_last_with_design(&snapshot.history, None, snapshot.design_state.as_ref());
+    let workspace = snapshot.workspace.clone();
+    let flush = || {
+        autosave_last_inner(
+            &snapshot.history,
+            None,
+            snapshot.design_state.as_ref(),
+            &snapshot.task_state,
+            SaveControl::Captured(snapshot.session_control.as_ref()),
+        );
+    };
+    if let Some(workspace) = workspace {
+        exec_ctx::with_current(
+            exec_ctx::ExecutionContext::default().with_workspace(&workspace),
+            flush,
+        );
+    } else {
+        flush();
+    }
     EXIT_FLUSHING.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -2084,6 +2805,41 @@ pub(crate) fn autosave_last_with_design(
     model: Option<&str>,
     design: Option<&TaskDesignState>,
 ) {
+    let task = todo::durable_snapshot();
+    autosave_last_with_state(history, model, design, &task);
+}
+
+pub(crate) fn autosave_last_with_state(
+    history: &[Message],
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+) {
+    let snapshot = match PersistenceSnapshot::capture(task) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tui::emit_line(&format!(
+                "autosave refused incoherent task/control snapshot: {e:#}"
+            ));
+            return;
+        }
+    };
+    autosave_last_inner(
+        history,
+        model,
+        design,
+        task,
+        SaveControl::Snapshot(&snapshot),
+    );
+}
+
+fn autosave_last_inner(
+    history: &[Message],
+    model: Option<&str>,
+    design: Option<&TaskDesignState>,
+    task: &TaskState,
+    policy: SaveControl<'_>,
+) {
     if history.iter().any(|m| m.role == "user") {
         let name = match current_session_slug() {
             Some(n) => n,
@@ -2102,8 +2858,10 @@ pub(crate) fn autosave_last_with_design(
         // ACL damage, OneDrive/AV lock on ~/.aizen — swallowing it meant the user worked for hours
         // believing the transcript was on disk and found nothing to resume. Say it once per failure
         // streak (not every turn), and say it again after a recovery so the state is never stale.
-        match autosave_session_delta_with_design(history, &name, model, design) {
-            Ok(_) => {
+        let saved_control = match autosave_session_delta_inner(
+            history, &name, model, design, task, policy,
+        ) {
+            Ok((_, control)) => {
                 if AUTOSAVE_BROKEN.swap(false, std::sync::atomic::Ordering::Relaxed)
                     && !EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed)
                 {
@@ -2113,6 +2871,7 @@ pub(crate) fn autosave_last_with_design(
                             .to_string(),
                     );
                 }
+                control
             }
             Err(e) => {
                 if !AUTOSAVE_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2126,8 +2885,9 @@ pub(crate) fn autosave_last_with_design(
                         tui::emit_line(&style(msg).color256(theme::WARN).to_string());
                     }
                 }
+                return;
             }
-        }
+        };
         let pruned = prune_session_pool(Some(&name));
         if pruned > 0 && !EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed) {
             tui::emit_line(
@@ -2138,19 +2898,42 @@ pub(crate) fn autosave_last_with_design(
                 .to_string(),
             );
         }
-        update_live_history_with_design(history, design);
-        let _ = crate::core::recovery::checkpoint_history_with_design(
-            history,
-            None,
-            crate::core::recovery::RecoveryPhase::Idle,
-            design,
-        );
+        // Carry the exact saved policy into the exit publication and recovery generation. Do not
+        // resample ambient control after a successful save (especially on a foreign exit thread).
+        publish_live_snapshot(history, design, task, Some(&saved_control));
+        let checkpoint = policy.check(task).and_then(|_| {
+            crate::core::recovery::checkpoint_history_with_policy(
+                history,
+                None,
+                crate::core::recovery::RecoveryPhase::Idle,
+                design,
+                task,
+                SaveControl::Captured(Some(&saved_control)),
+            )
+        });
+        if let Err(e) = checkpoint {
+            let message =
+                format!("recovery checkpoint failed: {e:#} — crash recovery is not up to date");
+            if EXIT_FLUSHING.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("{message}");
+            } else {
+                tui::emit_line(&style(message).color256(theme::WARN).to_string());
+            }
+        }
     }
 }
 
 /// Latch so a persistent autosave failure warns ONCE per streak instead of every turn (and reports
 /// once when writes start working again).
 static AUTOSAVE_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+#[path = "session_control_persistence_tests.rs"]
+mod control_persistence_tests;
+
+#[cfg(test)]
+#[path = "session_workspace_tests.rs"]
+mod workspace_persistence_tests;
 
 #[cfg(test)]
 mod user_turn_identity_tests {
@@ -2962,6 +3745,287 @@ mod bounded_sessions_tests {
             .unwrap(),
         );
         message
+    }
+
+    fn task_context(label: &str) -> todo::TaskContext {
+        let context = todo::TaskContext::private();
+        context
+            .replace(vec![todo::Todo::new(label, todo::Status::InProgress)])
+            .unwrap();
+        context
+    }
+
+    #[test]
+    fn task_only_change_rewrites_and_stale_generation_delta_never_replays() {
+        with_pool("task-delta", || {
+            let context = task_context("persist checklist");
+            let mut history = talk("tasks");
+            let task = context.snapshot();
+            autosave_session_delta_with_state(&history, "tasks", None, None, &task).unwrap();
+            let path = sessions_dir().join("tasks.json");
+            history.push(Message::assistant("progress"));
+            autosave_session_delta_with_state(&history, "tasks", None, None, &task).unwrap();
+            let stale_delta = std::fs::read(delta_path(&path)).unwrap();
+            let generation = parse_session_full(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .5;
+            context.end_turn(true);
+            let next_task = context.snapshot();
+            assert_ne!(task, next_task);
+            autosave_session_delta_with_state(&history, "tasks", None, None, &next_task).unwrap();
+            assert!(!delta_path(&path).exists());
+            assert_ne!(
+                parse_session_full(&std::fs::read(&path).unwrap())
+                    .unwrap()
+                    .5,
+                generation
+            );
+            std::fs::write(delta_path(&path), stale_delta).unwrap();
+            let (loaded, _, _, saved_task, _) = read_session_path_with_state(&path).unwrap();
+            assert_eq!(loaded.len(), history.len());
+            assert_eq!(saved_task, next_task);
+        });
+    }
+
+    #[test]
+    fn task_evidence_only_change_rewrites_full_session_and_resume_stales_proof() {
+        with_pool("task-evidence", || {
+            let context = task_context("deliver report");
+            let mut rows = context.snapshot().items;
+            rows[0].status = todo::Status::Done;
+            let requirements = vec![(rows[0].id.clone(), todo::Requirement::Report)];
+            context
+                .replace_with_requirements(rows, requirements)
+                .unwrap();
+            let history = talk("report");
+            let before = context.snapshot();
+            autosave_session_delta_with_state(&history, "report", None, None, &before).unwrap();
+            let path = sessions_dir().join("report.json");
+            let generation = parse_session_full(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .5;
+            context.record_report().unwrap();
+            assert!(context.is_complete());
+            let after = context.snapshot();
+            assert_ne!(before, after);
+            autosave_session_delta_with_state(&history, "report", None, None, &after).unwrap();
+            assert_ne!(
+                parse_session_full(&std::fs::read(&path).unwrap())
+                    .unwrap()
+                    .5,
+                generation
+            );
+            assert!(!delta_path(&path).exists());
+            let saved = read_session_path_with_state(&path).unwrap().3;
+            assert_eq!(saved, after);
+            let resumed = todo::TaskContext::private();
+            resumed.restore(saved).unwrap();
+            assert!(
+                !resumed.is_complete(),
+                "disk receipts are history, not live authority"
+            );
+            assert!(resumed.completion_pending());
+        });
+    }
+
+    #[test]
+    fn legacy_session_task_defaults_round_trip_without_ambient_inheritance() {
+        with_pool("task-legacy", || {
+            let context = task_context("unrelated ambient task");
+            let exec = crate::core::exec_ctx::ExecutionContext::default().with_task(context);
+            crate::core::exec_ctx::with_current(exec, || {
+                for (name, legacy) in [
+                    ("bare", serde_json::to_value(talk("bare")).unwrap()),
+                    (
+                        "envelope",
+                        serde_json::json!({"version": 2, "messages": talk("envelope")}),
+                    ),
+                ] {
+                    let path = sessions_dir().join(format!("{name}.json"));
+                    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                    let (history, meta, design, task, control) =
+                        read_session_path_with_state(&path).unwrap();
+                    assert_eq!(task, TaskState::default());
+                    write_session_with_control(
+                        &history,
+                        name,
+                        meta.unwrap_or_default(),
+                        design.as_ref(),
+                        &task,
+                        &control,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        read_session_path_with_state(&path).unwrap().3,
+                        TaskState::default()
+                    );
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn invalid_task_state_blocks_read_load_and_rewrite_without_touching_files() {
+        with_pool("task-invalid", || {
+            let task = task_context("valid task").snapshot();
+            let history = talk("valid session");
+            autosave_session_delta_with_state(&history, "invalid", None, None, &task).unwrap();
+            let path = sessions_dir().join("invalid.json");
+            let baseline: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let mut future = serde_json::to_value(&task).unwrap();
+            future["version"] = serde_json::json!(999);
+            let mut duplicate = serde_json::to_value(&task).unwrap();
+            duplicate["items"] = serde_json::json!([task.items[0], task.items[0]]);
+            for invalid in [future, duplicate, Value::Null, serde_json::json!({})] {
+                let mut bad = baseline.clone();
+                bad["task_state"] = invalid;
+                let bytes = serde_json::to_vec(&bad).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(read_session_path_with_state(&path).is_err());
+                assert!(parse_session_reason(&bytes).is_err());
+                assert!(read_session_for_edit("invalid").is_err());
+                let mut live = talk("do not replace");
+                let before = serde_json::to_value(&live).unwrap();
+                assert!(load_session_with_state(&mut live, "invalid", "m").is_err());
+                assert_eq!(serde_json::to_value(&live).unwrap(), before);
+                assert!(
+                    autosave_session_delta_with_state(&history, "invalid", None, None, &task)
+                        .is_err()
+                );
+                assert!(save_session_with_state(&history, "invalid", None, None, &task).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        });
+    }
+
+    #[test]
+    fn offline_checked_write_preserves_target_task_not_ambient_source() {
+        with_pool("task-checked", || {
+            let target = task_context("target task").snapshot();
+            save_session_with_state(&talk("target"), "target", None, None, &target).unwrap();
+            let ((_, meta, design), revision) = read_session_for_edit("target").unwrap();
+            let source = task_context("different live task");
+            let source_before = source.snapshot();
+            let exec = crate::core::exec_ctx::ExecutionContext::default().with_task(source.clone());
+            crate::core::exec_ctx::with_current(exec, || {
+                write_session_if_unchanged_with_receipt(
+                    &talk("compacted"),
+                    "target",
+                    meta.unwrap(),
+                    design.as_ref(),
+                    &revision,
+                )
+                .unwrap();
+                assert!(
+                    source.is_dirty(),
+                    "offline target write must not acknowledge source persistence"
+                );
+                assert_eq!(source.snapshot(), source_before);
+            });
+            let path = sessions_dir().join("target.json");
+            assert_eq!(read_session_path_with_state(&path).unwrap().3, target);
+        });
+    }
+
+    #[test]
+    fn retag_and_legacy_pointer_rehome_keep_stored_tasks() {
+        with_pool("task-migration", || {
+            let history = talk("migrated checklist");
+            let task = task_context("task from stored source").snapshot();
+            write_session_with_state(
+                &history,
+                "retag",
+                SessionMeta {
+                    project_slug: Some("legacy-task-slug".into()),
+                    ..SessionMeta::default()
+                },
+                None,
+                &task,
+            )
+            .unwrap();
+            let mut errors = Vec::new();
+            assert_eq!(
+                retag_sessions_of_slug("legacy-task-slug", &mut |error| errors.push(error)),
+                1
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            let path = sessions_dir().join("retag.json");
+            assert_eq!(read_session_path_with_state(&path).unwrap().3, task);
+            delete_session("retag").unwrap();
+            write_session_with_state(&history, "last", SessionMeta::default(), None, &task)
+                .unwrap();
+            let (name, _, _) = most_recent_session().unwrap();
+            assert_ne!(name, "last");
+            let (_, meta, _, restored_task, _) =
+                read_session_path_with_state(&sessions_dir().join(format!("{name}.json"))).unwrap();
+            assert_eq!(restored_task, task);
+            assert!(
+                meta.unwrap().project_key.is_none(),
+                "migration must not invent provenance"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_task_write_stays_dirty_and_legacy_loader_cannot_discard_tasks() {
+        with_pool("task-save-failure", || {
+            let context = task_context("unsaved task");
+            let task = context.snapshot();
+            let history = talk("save failure");
+            let path = sessions_dir().join("blocked.json");
+            std::fs::create_dir(&path).unwrap();
+            let exec =
+                crate::core::exec_ctx::ExecutionContext::default().with_task(context.clone());
+            crate::core::exec_ctx::with_current(exec, || {
+                assert!(save_session_with_design(&history, "blocked", None, None).is_err());
+                assert!(context.is_dirty());
+                assert_eq!(context.snapshot(), task);
+            });
+            save_session_with_state(&history, "owned", None, None, &task).unwrap();
+            let mut other_history = talk("keep this conversation");
+            let before = serde_json::to_value(&other_history).unwrap();
+            assert!(load_session_with_design(&mut other_history, "owned", "m").is_err());
+            assert_eq!(serde_json::to_value(&other_history).unwrap(), before);
+        });
+    }
+
+    #[test]
+    fn live_save_as_and_exit_flush_use_owned_task_snapshot() {
+        with_pool("task-exit", || {
+            let context = task_context("published task");
+            let snapshot = context.snapshot();
+            let history = talk("owned snapshot");
+            let exec =
+                crate::core::exec_ctx::ExecutionContext::default().with_task(context.clone());
+            crate::core::exec_ctx::with_current(exec, || {
+                assert!(context.is_dirty());
+                save_session_with_design(&history, "save-as", None, None).unwrap();
+                assert!(!context.is_dirty());
+                update_live_history_with_design(&history, None);
+            });
+            context
+                .replace(vec![todo::Todo::new(
+                    "later unsaved mutation",
+                    todo::Status::Pending,
+                )])
+                .unwrap();
+            set_session_slug(Some("exit-snapshot".into()));
+            std::thread::spawn(flush_live_session_on_exit)
+                .join()
+                .unwrap();
+            for name in ["save-as", "exit-snapshot"] {
+                assert_eq!(
+                    read_session_path_with_state(&sessions_dir().join(format!("{name}.json")))
+                        .unwrap()
+                        .3,
+                    snapshot
+                );
+            }
+            assert!(
+                context.is_dirty(),
+                "foreign-thread flush cannot acknowledge a later mutation"
+            );
+        });
     }
 
     #[test]

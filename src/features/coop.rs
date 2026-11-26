@@ -1,60 +1,27 @@
-//! Multi-session cooperation: who else is working in this repository, on what, and which files
-//! they touched.
+//! Multi-session cooperation: session registry, liveness, and Git worktree coordination.
 //!
-//! Aizen is routinely opened in several terminals at once against ONE working tree — auth in this
-//! window, the TUI in that one, tests in a third, and a last window that reviews and commits.
-//! Git sees only the union of all of it: `git diff` cannot say which line belongs to which window,
-//! so the reviewing window has no way to check one task's work, and no safe way to commit only it.
-//!
-//! This module is the missing bookkeeping. Every session publishes a manifest; every turn that
-//! touched the workspace appends the files it changed to that manifest's ledger, keyed by the
-//! pre-edit checkpoint the change is measured FROM. That key is what makes per-session diff
-//! possible after the fact: even once a later session overwrites the same file, this session's
-//! pre-image is still reachable as a blob inside its own checkpoint tree.
-//!
-//! Why turn-level attribution is exact rather than a guess: [`crate::core::workspace_txn::
-//! WorkspaceWriterLease`] is acquired EXCLUSIVE on the first writing tool of a turn and held until
-//! the turn ends (see `agent::execute_calls`). Two aizen sessions on one worktree are therefore
-//! already serialized at turn granularity, so "everything that changed between this turn's pre-edit
-//! checkpoint and now" is exactly this turn's work. Edits made by an external editor, or by git run
-//! by hand, land inside that window and are attributed to whoever held the lease — documented, not
-//! silently corrected.
-//!
-//! # Conflict handling, in the three places it actually happens
-//!
-//! The lease serializes turns; it does NOT make a read-modify-write atomic across turns. Session A
-//! reads a file in turn 1, B rewrites it in turn 2, A writes in turn 3 — every lock honored at every
-//! instant, and the logical operation still torn. Three defenses, each at the layer that can see the
-//! problem:
-//!
-//! 1. **`file_edit`** (single or batch) matches `old_string` against a FRESH read, so a rewritten region
-//!    fails to match on its own. Nothing to add.
-//! 2. **`file_write` / `file_move --overwrite`** have no anchor — a whole-file overwrite whose CAS
-//!    passes against whatever is on disk right now. [`crate::core::read_ledger`] is the anchor: what
-//!    THIS session last saw, per path, refusing the overwrite when the ground moved.
-//! 3. **Commit** takes the lease for the stage step (`git add` reads a tree a peer may be writing)
-//!    and pins the reviewed index by its tree hash, so what lands is what was approved.
-//!
-//! Overlap records remain a WARNING and never block: the second writer is frequently the point, and
-//! git cannot split one file by author anyway. What must not happen silently is losing the first
-//! writer's bytes, which is what the ledger above prevents.
+//! Git owns source history and the index. A shared working tree does not prove which session made
+//! a change: neither a writer lease nor an old checkpoint ledger excludes external user edits.
+//! Historical manifests and path claims remain readable as evidence, never staging authority.
+//! Session-specific diff/commit therefore fail closed until independently attributable Git-owned
+//! work is available. This module does not reconstruct files or capture replacement snapshots.
 //!
 //! Layout (`repo_id`, so linked worktrees of one repository share a registry):
 //!
 //! ```text
 //! ~/.aizen/coop/<repo_id>/
 //!   sessions/<session_id>.json   one session's manifest — written ONLY by its owner
-//!   sessions/<session_id>.lock   held for the process lifetime ⇒ liveness (see `alive`)
-//!   shared.json                  claims / overlaps / committed — written by anyone under a lock
+//!   sessions/<session_id>.lock   held for the process lifetime => liveness (see `alive`)
+//!   shared.json                  historical claims / overlaps / committed records
 //! ```
 //!
-//! Liveness needs no heartbeat: the owner holds an OS lock on its `.lock` for as long as it runs,
-//! and the OS releases it on exit however the process died. A reader that CAN take that lock is
-//! looking at a session that is gone (`abandoned`) — the same trick [`crate::core::recovery`] uses.
+//! Liveness uses an OS lock held for the process lifetime. The OS releases it even on a crash;
+//! a reader that can acquire it sees an abandoned session, not permission to adopt its edits.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -62,26 +29,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::persist::atomic_write_owner_only;
 use crate::core::repo_lock::RepoTxnLock;
-use crate::core::workspace_txn::{store_lock, WorkspaceIdentity};
-use crate::features::timemachine::{self, DiffReport, DiffSide};
+use crate::core::workspace_txn::WorkspaceIdentity;
 
-/// Manifest schema. A manifest from a newer binary is left alone; an unparseable one is swept.
+/// Manifest schema. Future and unreadable manifests are preserved for their owning binary.
 const SCHEMA: u32 = 1;
 /// Shared claims file schema.
 const SHARED_SCHEMA: u32 = 1;
 
-/// Ceiling on tracked paths per session — a runaway generated-file turn must not grow the manifest
-/// without bound. Overflow is reported in `truncated_files`, never silently dropped.
-const MAX_FILES: usize = 4000;
-/// Ceiling on retained overlap records.
+/// Ceiling on historical overlap fixtures; there is no new path-claim producer.
+#[cfg(test)]
 const MAX_OVERLAPS: usize = 500;
-/// Finished/committed manifests older than this are swept on read.
+/// Finished manifests with no unresolved attribution evidence may be swept after this interval.
 const RETENTION_SECS: u64 = 7 * 24 * 3600;
-/// How long `seal_turn` waits for the workspace writer lease before proceeding without it.
-const SEAL_LEASE_WAIT: Duration = Duration::from_secs(5);
-/// Wall-clock ceiling for the plumbing git calls this module makes itself.
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
-const GIT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// What a session is doing right now, as published by the session itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,21 +82,14 @@ impl SessionState {
     }
 }
 
-/// One file this session changed, and the checkpoint its pre-image lives in.
+/// Historical file attribution from a checkpoint-era manifest, not current ownership proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TouchedFile {
     /// Repository-relative path exactly as git reports it.
     pub path: String,
-    /// Pre-edit checkpoint of the turn that FIRST changed this file in this session. The pre-image
-    /// is a blob in that checkpoint's tree, so it survives later overwrites by other sessions.
+    /// Historical first checkpoint number. Preserved verbatim; never resolved or replayed.
     pub base: u32,
-    /// Pre-edit checkpoint of EVERY turn of this session that changed this path, ascending.
-    ///
-    /// `base` is the first of these and is what a whole-file diff measures from. This list is what
-    /// makes a *shared* file separable: each entry opens an interval that contains one turn by this
-    /// session and no other, so replaying just these intervals reconstructs this session's version
-    /// of a file another session also edited (see [`split_shared`]). Empty on manifests written
-    /// before the field existed — readers fall back to `base`.
+    /// Historical turn checkpoint numbers. Absence on older manifests remains readable.
     #[serde(default)]
     pub bases: Vec<u32>,
     /// Turn number (within this session) of the most recent change.
@@ -171,23 +123,41 @@ pub struct SessionManifest {
     pub state: SessionState,
     #[serde(default)]
     pub turns: u64,
-    /// Pre-edit checkpoint of the turn currently in flight, set by [`note_turn_base`].
+    /// Historical in-flight checkpoint number, retained as evidence without restore authority.
     #[serde(default)]
     pub base_checkpoint: Option<u32>,
     #[serde(default)]
     pub files: Vec<TouchedFile>,
-    /// Paths dropped because the ledger hit [`MAX_FILES`].
+    /// Historical paths dropped by the old ledger ceiling; still a coverage gap.
     #[serde(default)]
     pub truncated_files: u64,
-    /// Set when a turn touched the workspace but no checkpoint could be taken (no git, or not a
-    /// repository) — per-session diff is unavailable and the reason is worth showing.
+    /// Attribution limitation or historical failure reason; never cleared by a later turn.
     #[serde(default)]
     pub degraded: Option<String>,
-    /// An uncovered interval cannot be repaired retroactively by a later checkpoint.
+    /// An uncovered interval cannot be repaired retroactively by a later turn.
     #[serde(default)]
     pub coverage_gap: bool,
     pub started_unix: u64,
     pub updated_unix: u64,
+    /// Git task ownership is minted only after clean worktree creation, never from a branch name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) git_task: Option<GitTaskState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GitTaskState {
+    /// Missing only on historical records; never a live native completion capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_lifecycle: Option<crate::core::git_native_lifecycle::NativeLifecycle>,
+    pub owner: String,
+    pub base: crate::core::snapshots::GitOid,
+    pub tip: crate::core::snapshots::GitOid,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse: Option<crate::core::git_ops::PathInverse>,
+    pub paths: Vec<String>,
+    pub verified: bool,
 }
 
 /// Cross-session state. Written by any session, always under one lock.
@@ -263,15 +233,6 @@ impl SessionView {
         self.manifest.state.as_str()
     }
 
-    /// Whether a coordinator may commit this session's work without `--force`.
-    pub fn ready_to_commit(&self) -> bool {
-        !self.alive
-            || matches!(
-                self.manifest.state,
-                SessionState::Done | SessionState::Finished | SessionState::Failed
-            )
-    }
-
     /// Short label for the worktree: `.` for the main tree, else its directory name.
     pub fn worktree_label(&self) -> String {
         Path::new(&self.manifest.root)
@@ -282,12 +243,138 @@ impl SessionView {
     }
 }
 
+#[path = "coop_git_task.rs"]
+mod git_task;
+pub(crate) use git_task::{FrozenGitTask, GitTaskReceipt, GitTaskRegistration};
+
 struct Active {
     manifest: SessionManifest,
     _lock: RepoTxnLock,
 }
 
 static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
+// A focus switch keeps old registrations live: old work/evidence is not an idle, removable tree.
+static FOCUSED_SESSIONS: Mutex<Vec<Active>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn clear_focus_test_state() {
+    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    FOCUSED_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+#[cfg(test)]
+pub(crate) fn focus_test_root() -> Option<PathBuf> {
+    ACTIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|active| PathBuf::from(&active.manifest.root))
+}
+
+pub(crate) struct PreparedCoopScope {
+    identity: WorkspaceIdentity,
+    fresh: Option<Active>,
+}
+
+impl PreparedCoopScope {
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = active.as_ref() {
+            verify_focus_owner(active)?;
+        }
+        let retained = FOCUSED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let target = retained
+            .iter()
+            .find(|owner| {
+                owner.manifest.worktree_id == self.identity.worktree_id
+                    && owner.manifest.repo_id == self.identity.repo_id
+            })
+            .or(self.fresh.as_ref())
+            .context("prepared target registration is missing")?;
+        verify_focus_owner(target)
+    }
+
+    pub(crate) fn activate(mut self) {
+        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retained = FOCUSED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let next = retained
+            .iter()
+            .position(|owner| {
+                owner.manifest.worktree_id == self.identity.worktree_id
+                    && owner.manifest.repo_id == self.identity.repo_id
+            })
+            .map(|index| retained.swap_remove(index))
+            .or_else(|| self.fresh.take());
+        if let Some(next) = next {
+            if let Some(old) = active.replace(next) {
+                retained.push(old);
+            }
+        }
+    }
+}
+
+/// Prepare a target registration without replacing the current one. All fallible publication is
+/// complete before the controller changes session routing; activation only moves retained handles.
+pub(crate) fn prepare_focus_session(
+    identity: &WorkspaceIdentity,
+    session_name: Option<String>,
+    barrier: &WorkspaceRegistrationBarrier,
+) -> Result<PreparedCoopScope> {
+    barrier.verify()?;
+    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = active.as_ref() {
+        verify_focus_owner(active)?;
+    }
+    let retained = FOCUSED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = retained.iter().find(|owner| {
+        owner.manifest.worktree_id == identity.worktree_id
+            && owner.manifest.repo_id == identity.repo_id
+    });
+    anyhow::ensure!(
+        existing.is_some() || retained.len() < 64,
+        "too many retained workspace registrations; open a separate session"
+    );
+    if let Some(existing) = existing {
+        verify_focus_owner(existing)?;
+    }
+    require_no_other_workspace_owner_except(
+        identity,
+        existing.map(|owner| owner.manifest.session_id.as_str()),
+    )?;
+    let fresh = if existing.is_none() {
+        Some(create_session(identity, session_name, barrier)?)
+    } else {
+        None
+    };
+    Ok(PreparedCoopScope {
+        identity: identity.clone(),
+        fresh,
+    })
+}
+
+fn verify_focus_owner(active: &Active) -> Result<()> {
+    anyhow::ensure!(
+        !matches!(
+            active.manifest.state,
+            SessionState::Working | SessionState::AwaitingApproval
+        ),
+        "workspace focus requires an idle co-op owner"
+    );
+    let path = manifest_path(&active.manifest.repo_id, &active.manifest.session_id);
+    active
+        ._lock
+        .verify_existing_path(&path.with_extension("lock"))?;
+    let bytes = crate::core::file_placement::read_existing_regular(&path, 128 * 1024)?;
+    let stored: SessionManifest = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        serde_json::to_value(&stored)? == serde_json::to_value(&active.manifest)?,
+        "co-op ownership changed outside its owner; focus refused"
+    );
+    Ok(())
+}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -345,8 +432,9 @@ fn shared_path(repo_id: &str) -> PathBuf {
 
 /// Lock guarding [`Shared`]. Lives under `~/.aizen/locks/` like every other cross-process lock, so
 /// the registry directory itself holds only data.
+#[cfg(test)]
 fn shared_lock(repo_id: &str) -> PathBuf {
-    store_lock("coop-shared", repo_id)
+    crate::core::workspace_txn::store_lock("coop-shared", repo_id)
 }
 
 /// Identity of the workspace this process cooperates in.
@@ -364,26 +452,143 @@ fn current_repo_id() -> Option<String> {
 // Publishing this session
 // ---------------------------------------------------------------------------------------------
 
-/// Publish this process as a session in the current repository. Best-effort: any failure leaves the
-/// REPL working exactly as before, just invisible to `/team`.
-pub fn begin(session_name: Option<String>) {
-    let Ok(id) = identity() else { return };
-    let session_id = format!("{}-{}", now_unix(), std::process::id());
-    let dir = sessions_dir(&id.repo_id);
-    if fs::create_dir_all(&dir).is_err() {
-        return;
+/// Repository-scoped admission shared by session registration and prepared Git mutations. This
+/// is separate from workspace/store locks: mutations take writer -> registration; registration
+/// never takes a writer lock. Retain this value with the actual operation until physical settlement.
+pub(crate) struct WorkspaceRegistrationBarrier {
+    lock: RepoTxnLock,
+    resource: crate::core::workspace_txn::NativeResource,
+    path: PathBuf,
+    repo_id: String,
+}
+
+impl WorkspaceRegistrationBarrier {
+    pub(crate) fn verify(&self) -> Result<()> {
+        self.resource.verify()?;
+        self.lock.verify_existing_path(&self.path)
     }
-    crate::core::config::harden_dir(&coop_root(&id.repo_id));
-    crate::core::config::harden_dir(&dir);
-    // The liveness lock is taken FIRST and held for the process lifetime. Failing to take it means
-    // another process owns this id (impossible in practice — the id carries our pid) so we bail
-    // rather than publish a session whose liveness would read as dead.
-    let Ok(lock) = RepoTxnLock::acquire_exclusive(
-        &liveness_lock_path(&id.repo_id, &session_id),
-        Duration::from_secs(1),
-    ) else {
-        return;
+}
+
+pub(crate) fn acquire_workspace_registration_barrier(
+    identity: &WorkspaceIdentity,
+) -> Result<WorkspaceRegistrationBarrier> {
+    acquire_registration_barrier(identity, Duration::from_secs(15))
+}
+
+fn acquire_registration_barrier(
+    identity: &WorkspaceIdentity,
+    timeout: Duration,
+) -> Result<WorkspaceRegistrationBarrier> {
+    anyhow::ensure!(
+        !identity.repo_id.is_empty()
+            && identity
+                .repo_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "invalid repository identity for co-op registration admission"
+    );
+    // This namespace is deliberately not a workspace transaction or shared-state store lock.
+    let directory = crate::core::config::aizen_home().join("coop-registration");
+    ensure_registration_directory(&directory)?;
+    let path = directory.join(format!("{}.lock", identity.repo_id));
+    let resource = crate::core::workspace_txn::NativeResource::resolve(&path)?;
+    let cancel = crate::core::cancel::current();
+    let lock = RepoTxnLock::acquire_in_existing_parent(
+        &path,
+        crate::core::repo_lock::LockMode::Exclusive,
+        timeout,
+        cancel.as_ref(),
+    )?;
+    let barrier = WorkspaceRegistrationBarrier {
+        lock,
+        resource,
+        path,
+        repo_id: identity.repo_id.clone(),
     };
+    barrier.verify()?;
+    Ok(barrier)
+}
+
+/// Create only missing plain directories, without following a link/reparse ancestor. The lock's
+/// NativeResource subsequently pins this ancestry and its descriptor/path identity for rechecks.
+fn ensure_registration_directory(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "co-op registration requires an absolute data directory"
+    );
+    crate::core::workspace_txn::NativeResource::validate_spelling(&path.join("registration.lock"))?;
+    for directory in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        match fs::symlink_metadata(directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(directory) {
+                    Ok(()) => crate::core::config::harden_dir(directory),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).context("creating co-op registration directory")
+                    }
+                }
+            }
+            Err(error) => return Err(error).context("inspecting co-op registration directory"),
+        }
+        let metadata = fs::symlink_metadata(directory)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !crate::core::file_placement::is_link_or_reparse(&metadata),
+            "co-op registration directory must have only plain directory ancestors"
+        );
+    }
+    Ok(())
+}
+
+/// Publish under the same admission barrier retained by prepared Git mutations. Failure is reported
+/// and never falls back to unlocked publication; an existing active registration remains intact.
+pub fn begin(session_name: Option<String>) {
+    let result = (|| {
+        let id = identity()?;
+        // A branch observed before registration can become stale while waiting for a mutation.
+        // Publish unknown instead; verified Git operations refresh it under this same barrier.
+        // Never acquire Git execution/writer gates while holding registration admission.
+        let barrier = acquire_workspace_registration_barrier(&id)?;
+        publish_session(&id, session_name, &barrier)
+    })();
+    if let Err(error) = result {
+        crate::ui::tui::note_line(&format!("co-op registration unavailable: {error:#}"));
+    }
+}
+
+fn publish_session(
+    id: &WorkspaceIdentity,
+    session_name: Option<String>,
+    barrier: &WorkspaceRegistrationBarrier,
+) -> Result<()> {
+    let active = create_session(id, session_name, barrier)?;
+    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
+    Ok(())
+}
+
+fn create_session(
+    id: &WorkspaceIdentity,
+    session_name: Option<String>,
+    barrier: &WorkspaceRegistrationBarrier,
+) -> Result<Active> {
+    barrier.verify()?;
+    anyhow::ensure!(
+        barrier.repo_id == id.repo_id,
+        "co-op registration barrier belongs to another repository"
+    );
+    let session_id = format!(
+        "{}-{}-{}",
+        now_unix(),
+        std::process::id(),
+        crate::core::persist::unique_sequence()
+    );
+    ensure_registration_directory(&sessions_dir(&id.repo_id))?;
+    let lock = RepoTxnLock::acquire_in_existing_parent(
+        &liveness_lock_path(&id.repo_id, &session_id),
+        crate::core::repo_lock::LockMode::Exclusive,
+        Duration::from_secs(1),
+        None,
+    )?;
     let manifest = SessionManifest {
         schema: SCHEMA,
         session_id,
@@ -392,7 +597,7 @@ pub fn begin(session_name: Option<String>) {
         repo_id: id.repo_id.clone(),
         worktree_id: id.worktree_id.clone(),
         root: id.canonical_root.display().to_string(),
-        branch: current_branch(&id.canonical_root),
+        branch: None,
         session_name,
         task: String::new(),
         task_pinned: false,
@@ -405,14 +610,100 @@ pub fn begin(session_name: Option<String>) {
         coverage_gap: false,
         started_unix: now_unix(),
         updated_unix: now_unix(),
+        git_task: None,
     };
-    if write_manifest(&manifest).is_err() {
-        return;
-    }
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
+    let manifest_path = manifest_path(&manifest.repo_id, &manifest.session_id);
+    let manifest_resource = crate::core::workspace_txn::NativeResource::resolve(&manifest_path)?;
+    barrier.verify()?;
+    manifest_resource.verify()?;
+    lock.verify_existing_path(&liveness_lock_path(&manifest.repo_id, &manifest.session_id))?;
+    crate::core::persist::atomic_write_owner_only_checked(
+        &manifest_path,
+        &serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    manifest_resource.verify()?;
+    barrier.verify()?;
+    Ok(Active {
         manifest,
         _lock: lock,
-    });
+    })
+}
+
+/// Refresh only this process's matching registration from a caller-verified Git branch. `None`
+/// clears an unknown/failed result. No Git command, writer acquisition, or ownership grant occurs.
+pub(crate) fn refresh_workspace_branch(
+    identity: &WorkspaceIdentity,
+    branch: Option<&str>,
+    barrier: &WorkspaceRegistrationBarrier,
+) -> Result<()> {
+    let mut active = ACTIVE.lock().unwrap_or_else(|error| error.into_inner());
+    refresh_active_branch(active.as_mut(), identity, branch, barrier)
+}
+
+fn refresh_active_branch(
+    active: Option<&mut Active>,
+    identity: &WorkspaceIdentity,
+    branch: Option<&str>,
+    barrier: &WorkspaceRegistrationBarrier,
+) -> Result<()> {
+    let Some(active) = active else { return Ok(()) };
+    let current = &active.manifest;
+    if current.repo_id != identity.repo_id
+        || current.worktree_id != identity.worktree_id
+        || Path::new(&current.root) != identity.canonical_root
+    {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        barrier.repo_id == identity.repo_id,
+        "co-op branch refresh requires this repository's registration barrier"
+    );
+    barrier.verify()?;
+    let branch = branch
+        .map(|reference| -> Result<String> {
+            let name = reference
+                .strip_prefix("refs/heads/")
+                .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+                .context("co-op branch refresh requires a verified full local branch ref")?;
+            Ok(name.to_owned())
+        })
+        .transpose()?;
+    let path = manifest_path(&current.repo_id, &current.session_id);
+    let resource = crate::core::workspace_txn::NativeResource::resolve(&path)?;
+    let stamp = crate::core::file_placement::NodeStamp::capture(
+        &path,
+        &fs::symlink_metadata(&path)?,
+        false,
+    )?;
+    let disk: SessionManifest = serde_json::from_slice(&fs::read(&path)?)?;
+    anyhow::ensure!(
+        serde_json::to_value(&disk)? == serde_json::to_value(current)?,
+        "co-op manifest changed outside its active owner; branch refresh refused"
+    );
+    active
+        ._lock
+        .verify_existing_path(&liveness_lock_path(&current.repo_id, &current.session_id))?;
+    let mut refreshed = current.clone();
+    refreshed.branch = branch;
+    refreshed.updated_unix = now_unix();
+    resource.verify()?;
+    anyhow::ensure!(
+        crate::core::file_placement::NodeStamp::capture(
+            &path,
+            &fs::symlink_metadata(&path)?,
+            false,
+        )? == stamp,
+        "co-op manifest path changed during branch refresh"
+    );
+    barrier.verify()?;
+    crate::core::persist::atomic_write_owner_only_checked(
+        &path,
+        &serde_json::to_vec_pretty(&refreshed)?,
+    )?;
+    resource.verify()?;
+    barrier.verify()?;
+    active.manifest = refreshed;
+    Ok(())
 }
 
 fn write_manifest(m: &SessionManifest) -> Result<()> {
@@ -420,26 +711,49 @@ fn write_manifest(m: &SessionManifest) -> Result<()> {
     atomic_write_owner_only(&manifest_path(&m.repo_id, &m.session_id), &bytes)
 }
 
+/// Choose bookkeeping from the originating immutable placement, including an old pinned child.
+/// Missing ownership never borrows whichever workspace the REPL most recently focused.
+fn with_scoped_active<T>(f: impl FnOnce(Option<&mut Active>) -> T) -> T {
+    let root = crate::core::exec_ctx::current().and_then(|ctx| {
+        ctx.placement()
+            .map(|placement| placement.project_root().to_path_buf())
+    });
+    let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let matches = active.as_ref().is_some_and(|active| {
+        root.as_ref().is_none_or(|root| {
+            crate::core::config::normalize_path_key(root)
+                == crate::core::config::normalize_path_key(Path::new(&active.manifest.root))
+        })
+    });
+    if matches || root.is_none() {
+        return f(active.as_mut());
+    }
+    let mut retained = FOCUSED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    f(retained.iter_mut().find(|owner| {
+        root.as_ref().is_some_and(|root| {
+            crate::core::config::normalize_path_key(root)
+                == crate::core::config::normalize_path_key(Path::new(&owner.manifest.root))
+        })
+    }))
+}
+
 /// Mutate this session's manifest and republish it. Rolls back in memory if the write failed, so
 /// what other windows read is always what this one believes.
 fn update<F: FnOnce(&mut SessionManifest)>(f: F) {
-    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(active) = guard.as_mut() else { return };
-    let before = active.manifest.clone();
-    f(&mut active.manifest);
-    active.manifest.updated_unix = now_unix();
-    if write_manifest(&active.manifest).is_err() {
-        active.manifest = before;
-    }
+    with_scoped_active(|active| {
+        let Some(active) = active else { return };
+        let before = active.manifest.clone();
+        f(&mut active.manifest);
+        active.manifest.updated_unix = now_unix();
+        if write_manifest(&active.manifest).is_err() {
+            active.manifest = before;
+        }
+    });
 }
 
 /// This session's id, when it is published.
 pub fn current_session_id() -> Option<String> {
-    ACTIVE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|a| a.manifest.session_id.clone())
+    with_scoped_active(|active| active.map(|a| a.manifest.session_id.clone()))
 }
 
 pub fn set_state(state: SessionState) {
@@ -474,194 +788,63 @@ pub fn suggest_task(text: &str) {
     });
 }
 
-/// Record the pre-edit checkpoint of the turn now in flight. Called from the same place the agent
-/// loop notes it for the time machine, so the two can never disagree about which tree a turn is
-/// measured from.
-pub fn note_turn_base(checkpoint: u32) {
-    update(|m| {
-        record_turn_base(m, checkpoint);
-    });
+/// Record effects without claiming their paths or bytes belong to this session. Callers use this
+/// for actual native writes and opaque effects; it is not a snapshot or a new ownership receipt.
+pub fn note_attribution_gap(reason: &str) {
+    update(|m| record_attribution_gap(m, reason));
 }
 
-fn record_turn_base(m: &mut SessionManifest, checkpoint: u32) {
-    // First writing tool of the turn wins: later tools share that pre-image.
-    if m.base_checkpoint.is_none() {
-        m.base_checkpoint = Some(checkpoint);
-    }
-    if !m.coverage_gap {
-        m.degraded = None;
+fn record_attribution_gap(m: &mut SessionManifest, reason: &str) {
+    m.coverage_gap = true;
+    // Do not replace an earlier failure with a less precise turn-end/background message. Historical
+    // checkpoint fields and file entries remain verbatim, even though they grant no authority.
+    if m.degraded.as_deref().is_none_or(str::is_empty) {
+        let reason = safe_text(reason, 240);
+        m.degraded = Some(if reason.is_empty() {
+            "session effects have no independently attributable ownership receipt".into()
+        } else {
+            reason
+        });
     }
 }
 
 /// Record an opaque background interval without attributing its writes to this session.
-/// Historical file entries remain, but a later snapshot cannot fill the missing interval.
 pub fn note_background_coverage_gap() {
-    update(record_background_coverage_gap);
+    note_attribution_gap("managed background effects: session attribution is incomplete");
 }
 
-fn record_background_coverage_gap(m: &mut SessionManifest) {
-    m.base_checkpoint = None;
-    m.coverage_gap = true;
-    m.degraded = Some("managed background effects: session attribution is incomplete".into());
-}
-
-/// Record that a turn wrote to the workspace with no checkpoint available (no git, or not a
-/// repository). The file list still accrues; only the diff is unavailable.
-pub fn note_checkpoint_unavailable(reason: &str) {
-    let reason = safe_text(reason, 120);
-    update(|m| m.degraded = Some(reason.clone()));
-}
-
-/// Fold the finished turn into this session's ledger and return warnings worth showing the user.
-///
-/// Runs the diff from this turn's pre-edit checkpoint to the working tree, unions the result into
-/// the ledger, and claims those paths. Called on EVERY turn end (success, cancel, or error) — a
-/// cancelled turn can still have written files, and forgetting them is what makes a coordinator's
-/// commit incomplete.
+/// Finish bookkeeping without reading source files or modifying Git's index. No snapshot-era file
+/// claims are extended. Without an independently attributable effect receipt, even an empty ledger
+/// cannot certify complete coverage (including a failed/cancelled turn or effects outside Git).
+/// `note_attribution_gap` preserves a more precise effect reason when one was recorded.
 pub fn seal_turn() -> Vec<String> {
-    let _background = match crate::core::workspace_txn::BackgroundProcessBarrier::acquire(None) {
-        Ok(guard) => guard,
-        Err(error) => {
-            if error
-                .downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>()
-                .is_some()
-            {
-                note_background_coverage_gap();
-            } else {
-                let reason = safe_text(&format!("session attribution unavailable: {error:#}"), 120);
-                update(|m| {
-                    m.base_checkpoint = None;
-                    m.coverage_gap = true;
-                    m.degraded = Some(reason.clone());
-                });
-            }
-            return Vec::new();
-        }
-    };
-    let (repo_id, session_id, base, turn) = {
-        let guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(a) = guard.as_ref() else {
-            return Vec::new();
-        };
-        (
-            a.manifest.repo_id.clone(),
-            a.manifest.session_id.clone(),
-            a.manifest.base_checkpoint,
-            a.manifest.turns.saturating_add(1),
-        )
-    };
-    update(|m| {
-        m.turns = turn;
-        m.base_checkpoint = None;
-    });
-    let Some(base) = base else {
-        // The turn never touched the workspace; nothing to attribute.
-        return Vec::new();
-    };
-
-    // Hold the writer lease while measuring, so no other session's turn can be mid-write and have
-    // its work counted as ours. Best-effort: if the lease cannot be had we still measure, because
-    // an unattributed change is worse than a slightly over-attributed one.
-    let _lease = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
-        &crate::core::config::project_root(),
-        SEAL_LEASE_WAIT,
-        None,
-        "coop seal",
-    )
-    .ok();
-
-    let changed =
-        match timemachine::diff(&DiffSide::Checkpoint(base), &DiffSide::Working, &[], None) {
-            Ok(report) => report
-                .files
-                .iter()
-                .flat_map(|f| {
-                    // A rename touches both names: the new path is this session's, and the old path
-                    // must be staged too or the commit would leave the original file behind.
-                    let mut v = vec![(f.status, f.path.clone())];
-                    if let Some(old) = &f.old_path {
-                        v.push(('D', old.clone()));
-                    }
-                    v
-                })
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                note_checkpoint_unavailable(&format!("diff from checkpoint #{base} failed: {e}"));
-                return Vec::new();
-            }
-        };
-    if changed.is_empty() {
-        return Vec::new();
-    }
-
-    let mut overflow = 0u64;
-    update(|m| {
-        overflow = merge_touched(&mut m.files, &changed, base, turn);
-        m.truncated_files = m.truncated_files.saturating_add(overflow);
-    });
-
-    let paths: Vec<String> = changed.iter().map(|(_, p)| p.clone()).collect();
-    let mut warnings = claim_paths(&repo_id, &session_id, &paths).unwrap_or_default();
-    if overflow > 0 {
-        warnings.push(format!(
-            "coop: this session has touched more than {MAX_FILES} files; {overflow} path(s) are not \
-             tracked and would be missed by /team commit"
-        ));
-    }
-    warnings
+    update(seal_manifest);
+    Vec::new()
 }
 
-/// Union `changed` into `files`. Returns how many paths had to be dropped at [`MAX_FILES`].
-///
-/// `base` is recorded only the FIRST time a path appears: that is the checkpoint whose tree still
-/// holds this session's pre-image of the file, and re-basing it on every later turn would silently
-/// narrow the diff to the most recent turn's work.
-fn merge_touched(
-    files: &mut Vec<TouchedFile>,
-    changed: &[(char, String)],
-    base: u32,
-    turn: u64,
-) -> u64 {
-    let mut dropped = 0u64;
-    for (status, path) in changed {
-        if let Some(existing) = files.iter_mut().find(|f| &f.path == path) {
-            existing.last_turn = turn;
-            existing.status = *status;
-            // Every turn that touched the path is remembered, because each one opens an interval
-            // holding only this session's work. Dropping the later ones would make a split silently
-            // reconstruct just the first turn's version.
-            if !existing.bases.contains(&base) {
-                existing.bases.push(base);
-                existing.bases.sort_unstable();
-            }
-            continue;
-        }
-        if files.len() >= MAX_FILES {
-            dropped += 1;
-            continue;
-        }
-        files.push(TouchedFile {
-            path: path.clone(),
-            base,
-            last_turn: turn,
-            status: *status,
-            bases: vec![base],
-        });
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    dropped
+fn seal_manifest(m: &mut SessionManifest) {
+    m.turns = m.turns.saturating_add(1);
+    record_attribution_gap(
+        m,
+        "session attribution unavailable: no independently attributable effect receipt; an empty ledger does not certify coverage",
+    );
 }
 
-/// Clean shutdown: stop expecting a live process, but KEEP the manifest. A window that finishes its
-/// task and is closed is exactly the window whose diff the coordinator still needs to review.
+/// Clean shutdown: stop expecting a live process, but keep historical attribution evidence.
 pub fn clear() {
     let taken = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(active) = taken {
+    let mut owners: Vec<_> = taken.into_iter().collect();
+    owners.extend(
+        FOCUSED_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..),
+    );
+    for active in owners {
         let mut m = active.manifest;
         if m.state != SessionState::Done {
             m.state = SessionState::Finished;
         }
-        m.base_checkpoint = None;
         m.updated_unix = now_unix();
         let _ = write_manifest(&m);
     }
@@ -681,6 +864,7 @@ fn load_shared(repo_id: &str) -> Shared {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn save_shared(repo_id: &str, shared: &Shared) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(shared)?;
     let _ = fs::create_dir_all(coop_root(repo_id));
@@ -688,6 +872,7 @@ fn save_shared(repo_id: &str, shared: &Shared) -> Result<()> {
 }
 
 /// Read-modify-write [`Shared`] under its lock.
+#[cfg(test)]
 fn with_shared<T, F: FnOnce(&mut Shared) -> T>(repo_id: &str, f: F) -> Result<T> {
     let _lock = RepoTxnLock::acquire_exclusive(&shared_lock(repo_id), Duration::from_secs(5))?;
     let mut shared = load_shared(repo_id);
@@ -696,8 +881,8 @@ fn with_shared<T, F: FnOnce(&mut Shared) -> T>(repo_id: &str, f: F) -> Result<T>
     Ok(out)
 }
 
-/// Claim `paths` for `session_id`, recording an overlap wherever another session got there first.
-/// Never refuses: two sessions editing one file is a fact to report, not an error to block on.
+/// Build historical claim fixtures. Production has no snapshot-derived claim producer.
+#[cfg(test)]
 fn claim_paths(repo_id: &str, session_id: &str, paths: &[String]) -> Result<Vec<String>> {
     with_shared(repo_id, |shared| {
         let now = now_unix();
@@ -754,10 +939,167 @@ fn alive(repo_id: &str, session_id: &str) -> bool {
     RepoTxnLock::acquire_exclusive(&path, Duration::from_millis(50)).is_err()
 }
 
+/// Fail-closed ownership admission for a Git mutation under its caller's writer/barrier guards.
+/// Unlike listing, this never sweeps manifests, creates directories/locks, or treats unreadable
+/// evidence as an absent owner. It does not exclude arbitrary external Git/file writers.
+pub(crate) fn require_no_other_workspace_owner(identity: &WorkspaceIdentity) -> Result<()> {
+    require_no_other_workspace_owner_except(identity, current_session_id().as_deref())
+}
+
+/// Shared-ref retirement is conservative: every other live repository owner blocks it.
+pub(crate) fn require_no_other_repository_owner(identity: &WorkspaceIdentity) -> Result<()> {
+    require_owner_admission(identity, current_session_id().as_deref(), true)
+}
+
+fn require_no_other_workspace_owner_except(
+    identity: &WorkspaceIdentity,
+    current: Option<&str>,
+) -> Result<()> {
+    require_owner_admission(identity, current, false)
+}
+
+fn require_owner_admission(
+    identity: &WorkspaceIdentity,
+    current: Option<&str>,
+    repository_wide: bool,
+) -> Result<()> {
+    let root = fs::canonicalize(&identity.canonical_root)
+        .context("cannot identify Git mutation workspace")?;
+    anyhow::ensure!(
+        root == identity.canonical_root,
+        "Git mutation workspace identity changed"
+    );
+    let home = crate::core::config::aizen_home();
+    for directory in [
+        home.clone(),
+        home.join("coop"),
+        coop_root(&identity.repo_id),
+        sessions_dir(&identity.repo_id),
+    ] {
+        match fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("cannot inspect co-op ownership registry"),
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_dir() && !crate::core::file_placement::is_link_or_reparse(&metadata),
+                "unsafe co-op ownership registry directory; Git mutation refused"
+            ),
+        }
+    }
+    for entry in fs::read_dir(sessions_dir(&identity.repo_id))
+        .context("cannot read co-op ownership registry")?
+    {
+        let path = entry
+            .context("unreadable co-op ownership registry entry")?
+            .path();
+        let metadata =
+            fs::symlink_metadata(&path).context("cannot inspect co-op ownership entry")?;
+        anyhow::ensure!(
+            metadata.is_file() && !crate::core::file_placement::is_link_or_reparse(&metadata),
+            "unsafe co-op ownership entry; Git mutation refused"
+        );
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("lock") => {
+                // begin() takes the lock before publishing its manifest. A live orphan lock is
+                // therefore an unknown owner, not evidence that the workspace is idle.
+                match fs::symlink_metadata(path.with_extension("json")) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        anyhow::ensure!(
+                            !existing_session_alive(&path)?,
+                            "live co-op lock has no readable owner manifest; Git mutation refused"
+                        );
+                    }
+                    Err(error) => return Err(error).context("cannot identify co-op lock owner"),
+                }
+                continue;
+            }
+            Some("json") => {}
+            _ => bail!("unknown co-op ownership entry; Git mutation refused"),
+        }
+        let bytes = if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|id| id.starts_with("git-task-"))
+        {
+            crate::core::file_placement::read_existing_regular(
+                &path,
+                crate::core::git_native_lifecycle::MAX_MANIFEST_BYTES as u64,
+            )?
+        } else {
+            fs::read(&path).context("cannot read co-op owner manifest")?
+        };
+        let manifest: SessionManifest = serde_json::from_slice(&bytes)
+            .context("unreadable or unsupported co-op owner manifest; Git mutation refused")?;
+        anyhow::ensure!(
+            manifest.schema == SCHEMA,
+            "unsupported co-op owner manifest schema; Git mutation refused"
+        );
+        anyhow::ensure!(
+            manifest.repo_id == identity.repo_id
+                && !manifest.worktree_id.is_empty()
+                && path.file_stem().and_then(|stem| stem.to_str())
+                    == Some(manifest.session_id.as_str()),
+            "unknown co-op owner identity; Git mutation refused"
+        );
+        if manifest.git_task.is_some()
+            || manifest
+                .session_id
+                .starts_with(crate::core::git_native_lifecycle::REGISTRATION_PREFIX)
+        {
+            git_task::validate_manifest(&manifest)?;
+        }
+        if let Some(task) = &manifest.git_task {
+            anyhow::ensure!(
+                current == Some(manifest.session_id.as_str()) || task.phase == "handed_off"
+                    || (!repository_wide && manifest.worktree_id != identity.worktree_id),
+                "unfinished owned Git task; retain worktree and inspect ownership evidence before mutation"
+            );
+        }
+        // A proven dead session's removed worktree is historical evidence, not a current owner.
+        // Unknown/missing liveness still refuses before we consider its path.
+        if !existing_session_alive(&path.with_extension("lock"))? {
+            continue;
+        }
+        let owner_path = Path::new(&manifest.root);
+        anyhow::ensure!(
+            owner_path.is_absolute(),
+            "unknown co-op owner workspace; Git mutation refused"
+        );
+        let owner_root = fs::canonicalize(owner_path)
+            .context("cannot identify co-op owner workspace; Git mutation refused")?;
+        anyhow::ensure!(
+            (!repository_wide && owner_root != root)
+                || current == Some(manifest.session_id.as_str()),
+            "another Aizen session owns the affected worktree/repository; Git mutation refused"
+        );
+    }
+    Ok(())
+}
+
+/// Missing, replaced, or unreadable lock files are unknown liveness, never dead-owner proof.
+fn existing_session_alive(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path).context("cannot determine co-op owner liveness")?;
+    anyhow::ensure!(
+        metadata.is_file() && !crate::core::file_placement::is_link_or_reparse(&metadata),
+        "unsafe co-op liveness lock; Git mutation refused"
+    );
+    match RepoTxnLock::acquire_existing_exclusive(path, Duration::from_millis(50)) {
+        Ok(_lock) => Ok(false),
+        Err(error)
+            if error
+                .downcast_ref::<crate::core::repo_lock::LockBusy>()
+                .is_some() =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error).context("unknown co-op owner liveness; Git mutation refused"),
+    }
+}
+
 /// Every session known in this repository, newest activity first.
 ///
-/// Sweeps debris as it goes: unparseable manifests, and finished/committed ones past
-/// [`RETENTION_SECS`].
+/// Sweeps only readable finished/committed manifests past [`RETENTION_SECS`]. Unknown schemas and
+/// unreadable evidence are left untouched for a compatible reader or explicit repair.
 pub fn list() -> Vec<SessionView> {
     let Some(repo_id) = current_repo_id() else {
         return Vec::new();
@@ -766,25 +1108,55 @@ pub fn list() -> Vec<SessionView> {
 }
 
 fn list_in(repo_id: &str) -> Vec<SessionView> {
+    read_sessions(repo_id).0
+}
+
+/// The flag records omitted evidence. Listing stays best-effort, but worktree removal must not
+/// mistake an unreadable or newer peer manifest for proof that no owner exists.
+fn read_sessions(repo_id: &str) -> (Vec<SessionView>, bool) {
     let Ok(rd) = fs::read_dir(sessions_dir(repo_id)) else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
     let shared = load_shared(repo_id);
     let mine = current_session_id();
     let now = now_unix();
     let mut out = Vec::new();
-    for entry in rd.flatten() {
+    let mut omitted = false;
+    for entry in rd {
+        let Ok(entry) = entry else {
+            omitted = true;
+            continue;
+        };
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let manifest = fs::read(&path)
+        let bytes = if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|id| id.starts_with("git-task-"))
+        {
+            crate::core::file_placement::read_existing_regular(
+                &path,
+                crate::core::git_native_lifecycle::MAX_MANIFEST_BYTES as u64,
+            )
             .ok()
-            .and_then(|b| serde_json::from_slice::<SessionManifest>(&b).ok());
+        } else {
+            fs::read(&path).ok()
+        };
+        let manifest = bytes
+            .and_then(|b| serde_json::from_slice::<SessionManifest>(&b).ok())
+            .filter(|manifest| {
+                !(manifest.git_task.is_some()
+                    || manifest
+                        .session_id
+                        .starts_with(crate::core::git_native_lifecycle::REGISTRATION_PREFIX))
+                    || git_task::validate_manifest(manifest).is_ok()
+            });
         let Some(manifest) = manifest.filter(|m| m.schema <= SCHEMA) else {
-            // Debris or a manifest from a newer binary: sweep only what we could not read at all,
-            // and leave a readable future schema for the binary that owns it.
-            let _ = crate::core::persist::remove_if_exists(&path);
+            // Parse failure does not prove debris: a newer binary may use fields/enums we cannot
+            // read. Never erase its evidence (or its lock) during an ordinary registry read.
+            omitted = true;
             continue;
         };
         let is_self = mine.as_deref() == Some(manifest.session_id.as_str());
@@ -795,7 +1167,18 @@ fn list_in(repo_id: &str) -> Vec<SessionView> {
                 manifest.state,
                 SessionState::Finished | SessionState::Done | SessionState::Failed
             );
-        if !alive && terminal && now.saturating_sub(manifest.updated_unix) > RETENTION_SECS {
+        // Age cannot resolve a coverage gap or give historical source attribution live authority.
+        // Preserve that evidence even after the session is marked finished or committed.
+        if !alive
+            && terminal
+            && manifest.git_task.is_none()
+            && !manifest.coverage_gap
+            && manifest.degraded.is_none()
+            && manifest.base_checkpoint.is_none()
+            && manifest.files.is_empty()
+            && manifest.truncated_files == 0
+            && now.saturating_sub(manifest.updated_unix) > RETENTION_SECS
+        {
             let _ = crate::core::persist::remove_if_exists(&path);
             let _ = crate::core::persist::remove_if_exists(&liveness_lock_path(
                 repo_id,
@@ -823,7 +1206,7 @@ fn list_in(repo_id: &str) -> Vec<SessionView> {
             .cmp(&a.manifest.updated_unix)
             .then_with(|| a.manifest.session_id.cmp(&b.manifest.session_id))
     });
-    out
+    (out, omitted)
 }
 
 /// One line for startup: are other windows working in this repository right now?
@@ -853,7 +1236,9 @@ pub fn peers_banner() -> Option<String> {
         bits.push(format!("{abandoned} abandoned"));
     }
     if pending > 0 {
-        bits.push(format!("{pending} with uncommitted changes"));
+        bits.push(format!(
+            "{pending} with historical file records (not current ownership proof)"
+        ));
     }
     if bits.is_empty() {
         bits.push(format!("{} known", peers.len()));
@@ -903,7 +1288,7 @@ pub fn resolve(reference: &str) -> Result<SessionView> {
     }
 }
 
-/// Files this session changed, deduplicated and sorted.
+/// Historical paths recorded by this session, deduplicated and sorted; not current ownership.
 pub fn session_paths(view: &SessionView) -> Vec<String> {
     let mut paths: Vec<String> = view.manifest.files.iter().map(|f| f.path.clone()).collect();
     paths.sort();
@@ -911,42 +1296,40 @@ pub fn session_paths(view: &SessionView) -> Vec<String> {
     paths
 }
 
-/// Per-session diff: one report per pre-edit checkpoint this session measured from.
-///
-/// Grouping by base is what keeps the answer honest once another window has overwritten the same
-/// file — each group is diffed from the tree that holds THIS session's pre-image.
-pub fn session_diff(view: &SessionView, patch: bool) -> Result<Vec<DiffReport>> {
-    if view.manifest.files.is_empty() {
-        return Ok(Vec::new());
-    }
-    let here = identity()?;
-    if view.manifest.worktree_id != here.worktree_id {
-        bail!(
-            "session {} works in a different worktree ({}) — run /team diff from there, or use \
-             `aizen work list` to see it",
-            view.manifest.session_id,
-            view.manifest.root
-        );
-    }
-    let mut by_base: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-    for f in &view.manifest.files {
-        by_base.entry(f.base).or_default().push(f.path.clone());
-    }
-    let patch_limit = if patch { Some(200_000) } else { None };
-    let mut reports = Vec::new();
-    for (base, paths) in by_base {
-        let report = timemachine::diff(
-            &DiffSide::Checkpoint(base),
-            &DiffSide::Working,
-            &paths,
-            patch_limit,
-        )
-        .with_context(|| format!("diffing session changes from checkpoint #{base}"))?;
-        if !report.is_empty() {
-            reports.push(report);
-        }
-    }
-    Ok(reports)
+/// Historical session ledgers cannot produce an exact current diff. Refuse even an empty ledger:
+/// absence of old file records is not evidence that the session made no changes.
+pub fn session_diff(view: &SessionView, _patch: bool) -> Result<Infallible> {
+    refuse_historical_attribution(view, "diff")
+}
+
+/// Compatibility refusal for the retired session-commit surface. No manifest state, branch name,
+/// path list, `done` marker, or caller force flag grants staging authority. Future commits must use
+/// independently attributable Git-owned worktrees through the shared Git operation implementation.
+pub fn session_commit(view: &SessionView) -> Result<Infallible> {
+    refuse_historical_attribution(view, "commit")
+}
+
+fn refuse_historical_attribution(view: &SessionView, operation: &str) -> Result<Infallible> {
+    let m = &view.manifest;
+    let recorded_reason = m
+        .degraded
+        .as_deref()
+        .map(|reason| format!(" Recorded limitation: {}.", safe_text(reason, 240)))
+        .unwrap_or_default();
+    bail!(
+        "session {operation} unavailable: coverage gap for session {}. Historical checkpoint \
+         manifests and file lists grant no current staging authority; shared working-tree changes \
+         cannot be attributed to one session. No independently attributable Git-owned worktree \
+         result or exact native-journal attribution is available through this registry. \
+         Recorded files: {}; omitted paths: {}; coverage_gap: {}.{} \
+         Inspect real Git history/diffs or use exact native undo where supported; nothing was staged, \
+         committed, or changed",
+        safe_text(&m.session_id, 120),
+        m.files.len(),
+        m.truncated_files,
+        m.coverage_gap,
+        recorded_reason,
+    )
 }
 
 /// Every recorded overlap in this repository.
@@ -959,11 +1342,8 @@ pub fn overlaps() -> Vec<Overlap> {
 /// Who else — if anyone — most recently claimed `rel_path`, provided that session is still live and
 /// is not us. `None` when the path is unclaimed, ours, or owned by a session that has already gone.
 ///
-/// This is the pre-write half of overlap handling. [`claim_paths`] records an overlap AFTER a turn
-/// has written, which is right for reporting but useless for prevention: a whole-file overwrite has
-/// already destroyed the other window's work by then. A tool about to blow away a file's contents
-/// asks this first, and refuses when the answer is another live session (see
-/// [`crate::core::read_ledger`]).
+/// Historical claims are conservative warnings for pre-write checks. They never grant staging
+/// authority, and this cutover does not extend them from shared working-tree observations.
 ///
 /// Deliberately cheap and lock-free: a stale read here can only cost a spurious refusal that names
 /// the session to check, never a silent loss. Claims from DEAD sessions are ignored — an abandoned
@@ -987,8 +1367,8 @@ pub fn live_peer_claim_at(abs: &Path) -> Option<String> {
 /// Repository-relative form of `abs`, as git would name it, for claim lookups. `None` when the path
 /// is outside this session's worktree — a claim on it could not be meaningful.
 pub fn relative_to_worktree(abs: &Path) -> Option<String> {
-    let guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let root = PathBuf::from(&guard.as_ref()?.manifest.root);
+    let root =
+        with_scoped_active(|active| active.map(|active| PathBuf::from(&active.manifest.root)))?;
     let canon = abs.canonicalize().unwrap_or_else(|_| abs.to_path_buf());
     let rel = canon.strip_prefix(&root).ok()?;
     let s = rel.to_string_lossy().replace('\\', "/");
@@ -1006,603 +1386,46 @@ pub fn claims() -> Vec<(String, Claim)> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Splitting one file that two sessions both edited
-// ---------------------------------------------------------------------------------------------
-
-/// One session's reconstructed version of a file another session also changed.
-#[derive(Debug, Clone)]
-pub struct SplitFile {
-    pub path: String,
-    /// Reconstructed content, or `None` when this session's work removed the file.
-    pub content: Option<Vec<u8>>,
-    /// Git file mode to stage it with.
-    pub mode: String,
-    /// Regions where this session's edit and the peer's cannot both be kept. Non-zero means the
-    /// reconstruction contains conflict markers and MUST NOT be staged.
-    pub conflicts: u32,
-    /// How many of this session's turns had to be replayed.
-    pub replayed: usize,
-    /// Set when this file cannot be separated at all; the reason is written for the user.
-    pub unavailable: Option<String>,
-}
-
-impl SplitFile {
-    /// Safe to stage: a clean reconstruction with no conflicts.
-    pub fn usable(&self) -> bool {
-        self.unavailable.is_none() && self.conflicts == 0
-    }
-}
-
-/// Checkpoint ids that START a turn, for every session in this worktree, ascending.
-///
-/// The end of one session's turn is the next turn to begin anywhere in the worktree, so this is the
-/// set of interval boundaries. Manual checkpoints (`aizen time save`) are deliberately excluded: they
-/// do not end a turn, and treating them as boundaries would truncate a turn's interval and silently
-/// drop the rest of that turn's work from the reconstruction.
-///
-/// `base_checkpoint` of a session mid-turn is included — that turn's writes are in flight and must
-/// bound the previous interval rather than being swept into it.
-fn turn_boundaries(repo_id: &str, worktree_id: &str, existing: &BTreeSet<u32>) -> Vec<u32> {
-    let mut ids: Vec<u32> = list_in(repo_id)
-        .into_iter()
-        .filter(|v| v.manifest.worktree_id == worktree_id)
-        .flat_map(|v| {
-            let mut per: Vec<u32> = v
-                .manifest
-                .files
-                .iter()
-                .flat_map(|f| {
-                    if f.bases.is_empty() {
-                        vec![f.base]
-                    } else {
-                        f.bases.clone()
-                    }
-                })
-                .collect();
-            per.extend(v.manifest.base_checkpoint);
-            per
-        })
-        .filter(|id| existing.contains(id))
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-/// Tree of the last commit, or `None` in a repository with no commits yet.
-fn head_tree(root: &Path) -> Option<String> {
-    git_ok(
-        root,
-        &[
-            "rev-parse".into(),
-            "-q".into(),
-            "--verify".into(),
-            "HEAD^{tree}".into(),
-        ],
-    )
-    .ok()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-}
-
-/// Scratch file inside the git directory.
-///
-/// NOT in the working tree: a temp file there would be picked up by another session's checkpoint
-/// (`add -A`) and land in its snapshot. The git directory is excluded from all of that.
-fn scratch_path(root: &Path, tag: &str) -> Result<PathBuf> {
-    let dir = git_ok(root, &["rev-parse".into(), "--absolute-git-dir".into()])?
-        .trim()
-        .to_string();
-    Ok(PathBuf::from(dir).join(format!(
-        "aizen-coop-{tag}-{}-{}",
-        std::process::id(),
-        crate::core::persist::unique_sequence()
-    )))
-}
-
-/// Three-way merge of raw bytes, returning the merged content and the conflict count.
-///
-/// Done through files rather than pipes so content that is not valid UTF-8 survives: the bounded
-/// runner decodes stdout lossily, which would corrupt a binary or latin-1 file on the way through.
-/// `git merge-file` rewrites `ours` in place, so the result is read back from disk byte for byte.
-fn merge_three_way(
-    root: &Path,
-    ours: &[u8],
-    base: &[u8],
-    theirs: &[u8],
-    labels: (&str, &str, &str),
-) -> Result<(Vec<u8>, u32)> {
-    let o = scratch_path(root, "ours")?;
-    let b = scratch_path(root, "base")?;
-    let t = scratch_path(root, "theirs")?;
-    let write_all = || -> std::io::Result<()> {
-        fs::write(&o, ours)?;
-        fs::write(&b, base)?;
-        fs::write(&t, theirs)
-    };
-    write_all().context("writing scratch files for the three-way merge")?;
-    let args: Vec<String> = vec![
-        "merge-file".into(),
-        "-q".into(),
-        "-L".into(),
-        labels.0.to_string(),
-        "-L".into(),
-        labels.1.to_string(),
-        "-L".into(),
-        labels.2.to_string(),
-        o.display().to_string(),
-        b.display().to_string(),
-        t.display().to_string(),
-    ];
-    let code = git_code(root, &args);
-    let merged = fs::read(&o);
-    for p in [&o, &b, &t] {
-        let _ = fs::remove_file(p);
-    }
-    let merged = merged.context("reading back the merged result")?;
-    match code {
-        // `merge-file` reports the conflict count as its exit status; anything from the error range
-        // means it could not merge at all, and a "0 conflicts" reading there would be a lie.
-        Some(c) if (0..128).contains(&c) => Ok((merged, c as u32)),
-        other => bail!(
-            "git merge-file could not reconstruct this file (exit {})",
-            other
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "killed".into())
-        ),
-    }
-}
-
-/// Reconstruct `path` as it would look with ONLY `view`'s work applied.
-///
-/// Why the pre-image is the wrong starting point: if the peer edited the file BEFORE this session
-/// first touched it, this session's pre-edit checkpoint already contains the peer's work, so diffing
-/// from it would carry that work along — exactly what a split is supposed to remove. The base is
-/// therefore the last commit, and only this session's own turns are replayed onto it.
-///
-/// Each turn is recoverable because writes are serialized: the workspace writer lease is held for a
-/// whole turn, so between one turn's pre-edit checkpoint and the next turn's there is the work of
-/// exactly one session. Replaying those intervals — and no others — onto the committed base yields
-/// this session's version, with the peer's edits to the same file left out.
-///
-/// Reads only. The working tree is never touched, so the peer keeps editing throughout.
-pub fn split_shared(view: &SessionView, path: &str) -> Result<SplitFile> {
-    let here = identity()?;
-    if view.manifest.worktree_id != here.worktree_id {
-        bail!(
-            "session {} works in a different worktree ({})",
-            view.manifest.session_id,
-            view.manifest.root
-        );
-    }
-    let entry = view
-        .manifest
-        .files
-        .iter()
-        .find(|f| f.path == path)
-        .with_context(|| format!("session {} did not change {path}", view.manifest.session_id))?;
-    let mut out = SplitFile {
-        path: path.to_string(),
-        content: None,
-        mode: String::new(),
-        conflicts: 0,
-        replayed: 0,
-        unavailable: None,
-    };
-
-    let mut mine: Vec<u32> = if entry.bases.is_empty() {
-        vec![entry.base]
-    } else {
-        entry.bases.clone()
-    };
-    mine.sort_unstable();
-    mine.dedup();
-
-    let existing: BTreeSet<u32> = timemachine::checkpoint_ids()
-        .context("listing checkpoints")?
-        .into_iter()
-        .collect();
-    let pruned: Vec<u32> = mine
-        .iter()
-        .copied()
-        .filter(|i| !existing.contains(i))
-        .collect();
-    if !pruned.is_empty() {
-        // Without the pre-image of a turn there is no way to know what that turn changed, and
-        // guessing would hand the user a file that silently drops work.
-        out.unavailable = Some(format!(
-            "checkpoint(s) {} for this session's edits to {path} have been pruned, so its turns \
-             cannot be replayed",
-            pruned
-                .iter()
-                .map(|i| format!("#{i}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        return Ok(out);
-    }
-
-    let root = PathBuf::from(&view.manifest.root);
-    let bounds = turn_boundaries(
-        &view.manifest.repo_id,
-        &view.manifest.worktree_id,
-        &existing,
-    );
-    let working =
-        timemachine::resolve_tree(&DiffSide::Working).context("hashing the working tree")?;
-
-    let base_blob = match head_tree(&root) {
-        Some(tree) => timemachine::blob_in_tree(&tree, path)
-            .with_context(|| format!("reading the committed version of {path}"))?,
-        None => None,
-    };
-    let mut acc: Option<Vec<u8>> = base_blob.as_ref().map(|b| b.bytes.clone());
-    if let Some(b) = &base_blob {
-        out.mode = b.mode.clone();
-    }
-
-    let sid = view.manifest.session_id.clone();
-    for start in &mine {
-        let start_tree = timemachine::resolve_tree(&DiffSide::Checkpoint(*start))
-            .with_context(|| format!("resolving checkpoint #{start}"))?;
-        let before = timemachine::blob_in_tree(&start_tree, path)?;
-        let end_tree = match bounds.iter().copied().find(|b| b > start) {
-            Some(end) => timemachine::resolve_tree(&DiffSide::Checkpoint(end))
-                .with_context(|| format!("resolving checkpoint #{end}"))?,
-            // No later turn anywhere: this session's work is the newest thing in the tree.
-            None => working.clone(),
-        };
-        let after = timemachine::blob_in_tree(&end_tree, path)?;
-
-        if before.as_ref().map(|b| &b.oid) == after.as_ref().map(|a| &a.oid) {
-            continue;
-        }
-        out.replayed += 1;
-        if let Some(a) = &after {
-            out.mode = a.mode.clone();
-        }
-        match (&before, &after) {
-            // The turn removed the file: nothing later can be merged onto absence.
-            (_, None) => acc = None,
-            (None, Some(a)) => match &acc {
-                None => acc = Some(a.bytes.clone()),
-                Some(cur) => {
-                    let (merged, c) = merge_three_way(
-                        &root,
-                        cur,
-                        &[],
-                        &a.bytes,
-                        (&sid, "committed", "this session"),
-                    )?;
-                    out.conflicts += c;
-                    acc = Some(merged);
-                }
-            },
-            (Some(bf), Some(af)) => {
-                let Some(cur) = &acc else {
-                    // The file exists only because the OTHER session created it. There is no
-                    // committed base to replay onto, and starting from the peer's creation would
-                    // commit the peer's work under this session's name.
-                    out.unavailable = Some(format!(
-                        "{path} does not exist in the last commit and was created by another \
-                         session, so this session's changes to it cannot be separated"
-                    ));
-                    return Ok(out);
-                };
-                let (merged, c) = merge_three_way(
-                    &root,
-                    cur,
-                    &bf.bytes,
-                    &af.bytes,
-                    (&sid, "before this turn", "after this turn"),
-                )?;
-                out.conflicts += c;
-                acc = Some(merged);
-            }
-        }
-    }
-    out.content = acc;
-    if out.mode.is_empty() {
-        out.mode = "100644".to_string();
-    }
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Coordinator: commit one session's work
-// ---------------------------------------------------------------------------------------------
-
-/// What a commit-by-session would do, computed before anything is staged.
-#[derive(Debug, Clone)]
-pub struct CommitPlan {
-    pub session_id: String,
-    pub paths: Vec<String>,
-    /// Paths this session shares with another one: staging them carries the other session's
-    /// changes to the same file along, because git tracks content and not authorship.
-    pub shared_paths: Vec<String>,
-    /// Reasons this plan is not safe to run without `--force`.
-    pub blockers: Vec<String>,
-    pub root: PathBuf,
-}
-
-/// Build the commit plan for one session. Read-only: nothing is staged here.
-pub fn plan_commit(view: &SessionView) -> Result<CommitPlan> {
-    let here = identity()?;
-    let mut blockers = Vec::new();
-    if view.manifest.worktree_id != here.worktree_id {
-        blockers.push(format!(
-            "session works in another worktree ({}) — commit it from there",
-            view.manifest.root
-        ));
-    }
-    if view.committed {
-        blockers.push("this session's changes were already committed".to_string());
-    }
-    if !view.ready_to_commit() {
-        blockers.push(format!(
-            "session is still {} — wait for it, mark it with /team done, or pass --force",
-            view.effective_state()
-        ));
-    }
-    let paths = session_paths(view);
-    if paths.is_empty() {
-        blockers.push("session has no recorded file changes".to_string());
-    }
-    if view.manifest.truncated_files > 0 {
-        blockers.push(format!(
-            "{} path(s) exceeded the tracking ceiling and are NOT in this plan",
-            view.manifest.truncated_files
-        ));
-    }
-    let shared_paths: Vec<String> = paths
-        .iter()
-        .filter(|p| view.overlapping.contains(p))
-        .cloned()
-        .collect();
-    Ok(CommitPlan {
-        session_id: view.manifest.session_id.clone(),
-        paths,
-        shared_paths,
-        blockers,
-        root: PathBuf::from(&view.manifest.root),
-    })
-}
-
-/// Stage one reconstructed file, index-only.
-///
-/// The working tree is deliberately NOT written: it holds the union of both sessions' work, the peer
-/// is still editing it, and overwriting it with this session's version alone would destroy the peer's
-/// live changes — the precise failure this whole module exists to prevent. Git allows an index entry
-/// to differ from the file on disk, so the commit can hold one session's version while the other
-/// session keeps working from the union.
-///
-/// The bytes came out of existing blobs, i.e. already in clean-filtered form, so `--no-filters`
-/// stops a `.gitattributes` clean driver from being applied a second time.
-fn stage_split(root: &Path, split: &SplitFile) -> Result<()> {
-    let Some(bytes) = &split.content else {
-        // This session's work removed the file.
-        return git_ok(
-            root,
-            &[
-                "update-index".into(),
-                "--force-remove".into(),
-                "--".into(),
-                split.path.clone(),
-            ],
-        )
-        .map(|_| ());
-    };
-    let scratch = scratch_path(root, "blob")?;
-    fs::write(&scratch, bytes)
-        .with_context(|| format!("writing the reconstructed {}", split.path))?;
-    let hashed = git_ok(
-        root,
-        &[
-            "hash-object".into(),
-            "-w".into(),
-            "--no-filters".into(),
-            "--".into(),
-            scratch.display().to_string(),
-        ],
-    );
-    let _ = fs::remove_file(&scratch);
-    let oid = hashed
-        .with_context(|| format!("storing the reconstructed {}", split.path))?
-        .trim()
-        .to_string();
-    let mode = if split.mode.is_empty() {
-        "100644"
-    } else {
-        split.mode.as_str()
-    };
-    git_ok(
-        root,
-        &[
-            "update-index".into(),
-            "--add".into(),
-            "--cacheinfo".into(),
-            format!("{mode},{oid},{}", split.path),
-        ],
-    )
-    .map(|_| ())
-}
-
-/// What a staged review consists of: the stat a human reads, and the exact identity of the index
-/// they read it from.
-#[derive(Debug, Clone)]
-pub struct Staged {
-    /// `git diff --cached --stat`, for display.
-    pub stat: String,
-    /// Shared paths that were separated: the index holds this session's version, not the union on
-    /// disk. Worth telling the user, because the commit will not match the working tree for these.
-    pub separated: Vec<String>,
-    /// Tree object of the index at review time. [`commit_staged`] refuses unless the index still
-    /// hashes to this, so what gets committed is what was approved and nothing else.
-    pub tree: String,
-}
-
-/// Take the workspace lease for one short coordinator step.
-///
-/// The reason a coordinator needs it at all: `git add` reads the working tree, and a peer window
-/// mid-turn is writing to that same tree. Stage without the lease and the index can capture half of
-/// another session's in-flight edit. Reentrancy is handled in [`crate::core::workspace_txn`], so this
-/// is also correct when the coordinator window is itself inside a turn.
-///
-/// Deliberately NOT held across the approval prompt: blocking every other window for as long as a
-/// human takes to decide is worse than the race it would close, and the tree digest below closes that
-/// race without holding anything.
-fn coordinator_lease(
-    root: &Path,
-    what: &str,
-) -> Option<crate::core::workspace_txn::WorkspaceWriterLease> {
-    crate::core::workspace_txn::WorkspaceWriterLease::acquire(
-        root,
-        Duration::from_secs(15),
-        None,
-        what,
-    )
-    .ok()
-}
-
-/// Hash of the current index, as a tree object. This is the review token: two indexes with the same
-/// tree are byte-for-byte the same staged content.
-fn index_tree(root: &Path) -> Result<String> {
-    git_ok(root, &["write-tree".into()])
-        .map(|s| s.trim().to_string())
-        .context("hashing the staged index")
-}
-
-/// Stage exactly the plan's paths and return the review plus the identity of what was staged.
-///
-/// Deliberately additive: staging leaves the working tree untouched, so another window's in-flight
-/// edits cannot be lost by a review that is later abandoned.
-///
-/// Files this session shares with another are not staged from disk — disk holds the union of both
-/// sessions' work. Each is reconstructed by [`split_shared`] and staged index-only, so the commit
-/// carries one session's version while the peer keeps editing the union. A file that cannot be
-/// separated cleanly aborts the whole stage rather than landing a commit with someone else's work
-/// (or conflict markers) in it.
-pub fn stage_plan(plan: &CommitPlan) -> Result<Staged> {
-    if plan.paths.is_empty() {
-        bail!("nothing to stage");
-    }
-    let _lease = coordinator_lease(&plan.root, "coop stage");
-    let mut args: Vec<String> = vec!["add".into(), "--".into()];
-    args.extend(plan.paths.iter().cloned());
-    // `git add` of a deleted path stages the deletion; `--` guards paths that look like flags.
-    git_ok(&plan.root, &args).context("staging this session's files")?;
-
-    let mut separated = Vec::new();
-    if !plan.shared_paths.is_empty() {
-        let view = resolve(&plan.session_id)?;
-        let mut refused = Vec::new();
-        for path in &plan.shared_paths {
-            match split_shared(&view, path) {
-                Ok(split) if split.usable() => {
-                    stage_split(&plan.root, &split)?;
-                    separated.push(path.clone());
-                }
-                Ok(split) => refused.push(match &split.unavailable {
-                    Some(why) => format!("{path}: {why}"),
-                    None => format!(
-                        "{path}: this session's edits and another session's overlap in {} region(s) \
-                         and cannot be separated automatically",
-                        split.conflicts
-                    ),
-                }),
-                Err(e) => refused.push(format!("{path}: {e:#}")),
-            }
-        }
-        if !refused.is_empty() {
-            // Roll the index back: a partially separated stage is the one state where a later
-            // `--force` would commit a mix nobody chose.
-            let _ = unstage_plan(plan);
-            bail!(
-                "cannot commit this session alone — {} shared file(s) could not be separated:\n  {}\n\
-                 Resolve the overlap in the working tree (or commit both sessions together) and \
-                 re-run.",
-                refused.len(),
-                refused.join("\n  ")
-            );
-        }
-    }
-
-    let stat = git_ok(
-        &plan.root,
-        &["diff".into(), "--cached".into(), "--stat".into()],
-    )?;
-    let tree = index_tree(&plan.root)?;
-    Ok(Staged {
-        stat,
-        separated,
-        tree,
-    })
-}
-
-/// Commit what `stage_plan` staged. Caller is responsible for approval — this is the irreversible
-/// step and it is never reached without one.
-///
-/// `staged` is the review the user approved. If the index no longer hashes to it, something changed
-/// between review and approval — another window staged, or a hook ran — and committing would land
-/// content nobody looked at. That is refused rather than reconciled: the coordinator re-runs and
-/// reviews the new state.
-pub fn commit_staged(plan: &CommitPlan, message: &str, staged: &Staged) -> Result<String> {
-    let _lease = coordinator_lease(&plan.root, "coop commit");
-    let now = index_tree(&plan.root)?;
-    if now != staged.tree {
-        bail!(
-            "the staged changes are not the ones that were reviewed (index moved from {} to {}); \
-             nothing was committed. Re-run /team commit to review the current state",
-            &staged.tree[..staged.tree.len().min(8)],
-            &now[..now.len().min(8)]
-        );
-    }
-    let staged_names = git_ok(
-        &plan.root,
-        &["diff".into(), "--cached".into(), "--name-only".into()],
-    )?;
-    if staged_names.trim().is_empty() {
-        bail!("nothing is staged — run the plan again");
-    }
-    let out = git_ok(
-        &plan.root,
-        &["commit".into(), "-m".into(), message.to_string()],
-    )?;
-    if let Some(repo_id) = current_repo_id() {
-        let sid = plan.session_id.clone();
-        let paths = plan.paths.clone();
-        let _ = with_shared(&repo_id, |shared| {
-            shared.committed.insert(sid.clone(), now_unix());
-            // The claim is spent: a later session editing the same file is not overlapping with
-            // work that has already landed.
-            for p in &paths {
-                if shared.owners.get(p).map(|c| c.session_id.as_str()) == Some(sid.as_str()) {
-                    shared.owners.remove(p);
-                }
-            }
-            shared
-                .overlaps
-                .retain(|o| o.first != sid && o.second != sid);
-        });
-    }
-    Ok(out)
-}
-
-/// Unstage what a plan staged, for an abandoned review. `git restore --staged` touches the index
-/// only — the working tree, and therefore every other window's live edits, is untouched.
-pub fn unstage_plan(plan: &CommitPlan) -> Result<()> {
-    if plan.paths.is_empty() {
-        return Ok(());
-    }
-    let _lease = coordinator_lease(&plan.root, "coop unstage");
-    let mut args: Vec<String> = vec!["restore".into(), "--staged".into(), "--".into()];
-    args.extend(plan.paths.iter().cloned());
-    git_ok(&plan.root, &args).map(|_| ())
-}
-
-// ---------------------------------------------------------------------------------------------
 // Isolated worktree mode
 // ---------------------------------------------------------------------------------------------
+
+/// Full Git registry for browsing. This observation is deliberately separate from removal
+/// admission: it includes external/bare/prunable worktrees and does not certify clean file state.
+pub(crate) fn work_inventory() -> Result<Vec<crate::core::git_ops::WorktreeEntry>> {
+    crate::core::git_ops::worktree_inventory(&crate::core::config::project_root())
+}
+
+/// Shared terminal rendering: quote untrusted path/ref/reason bytes so control characters cannot
+/// create forged rows. Inventory is not a dirty-state or liveness check.
+pub(crate) fn work_inventory_lines() -> Result<Vec<String>> {
+    let entries = work_inventory()?;
+    let quote = |value: &str| serde_json::to_string(value).expect("string serialization");
+    let mut lines = vec![format!("{} Git worktree(s)", entries.len())];
+    for entry in entries {
+        let state = entry
+            .branch
+            .as_deref()
+            .unwrap_or(if entry.bare { "bare" } else { "detached" });
+        let head = entry
+            .head
+            .as_ref()
+            .map(|oid| oid.as_str())
+            .unwrap_or("unborn");
+        lines.push(format!(
+            "  {}  {}  {head}",
+            quote(&entry.path),
+            quote(state)
+        ));
+        if let Some(reason) = entry.locked {
+            lines.push(format!("    locked: {}", quote(&reason)));
+        }
+        if let Some(reason) = entry.prunable {
+            lines.push(format!("    prunable: {}", quote(&reason)));
+        }
+    }
+    lines.push("Inventory only: file changes and live sessions are not checked; this is not removal approval.".into());
+    Ok(lines)
+}
 
 /// One linked worktree created for a session.
 #[derive(Debug, Clone)]
@@ -1637,113 +1460,143 @@ fn valid_worktree_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a linked worktree plus its branch, and return where it landed.
-pub fn work_new(name: &str) -> Result<WorkTree> {
+/// Create from a frozen committed HEAD, never from the parent's pending index/files.
+/// The returned worktree is not an automatic-commit ownership grant.
+pub(crate) fn work_new(name: &str) -> Result<crate::core::git_ops::CreatedWorktree> {
+    prepare_work_new(&crate::core::config::project_root(), name, None)?.execute()
+}
+
+/// Shared managed-directory adapter; preparation never creates paths or grants agent ownership.
+pub(crate) fn prepare_work_new(
+    root: &Path,
+    name: &str,
+    base: Option<&str>,
+) -> Result<crate::core::git_ops::PreparedWorktreeCreation> {
     valid_worktree_name(name)?;
-    let id = identity()?;
-    if id.canonical_git_dir.is_none() {
-        bail!("isolated worktrees need a git repository (run `git init` first)");
-    }
+    let id = crate::core::git_ops::workspace_identity(root)?;
     let dir = worktrees_root(&id.repo_id).join(name);
-    if dir.exists() {
-        bail!("{} already exists", dir.display());
-    }
-    fs::create_dir_all(worktrees_root(&id.repo_id))
-        .with_context(|| format!("creating {}", worktrees_root(&id.repo_id).display()))?;
     let branch = format!("aizen/{name}");
-    git_ok(
+    match base {
+        Some(base) => crate::core::git_ops::PreparedWorktreeCreation::prepare_from(
+            &id.canonical_root,
+            &dir,
+            &branch,
+            base,
+        ),
+        None => crate::core::git_ops::PreparedWorktreeCreation::prepare(
+            &id.canonical_root,
+            &dir,
+            &branch,
+        ),
+    }
+}
+
+/// Inspect only the selected managed worktree. Every Git query goes through the caller's retained
+/// operation owner; registry admission is strict and never creates locks or sweeps old manifests.
+fn work_target_with_query(
+    id: &WorkspaceIdentity,
+    target: &WorkspaceIdentity,
+    name: &str,
+    query: impl Fn(&Path, &[&str]) -> Result<Vec<u8>>,
+) -> Result<WorkTree> {
+    valid_worktree_name(name)?;
+    let path = worktrees_root(&id.repo_id).join(name);
+    let metadata = fs::symlink_metadata(&path).context("reading selected managed worktree")?;
+    anyhow::ensure!(
+        metadata.is_dir() && !crate::core::file_placement::is_link_or_reparse(&metadata),
+        "managed worktree must be a plain directory"
+    );
+    let canon = fs::canonicalize(&path).context("canonicalizing managed worktree")?;
+    anyhow::ensure!(
+        canon == target.canonical_root
+            && target.repo_id == id.repo_id
+            && target.canonical_common_git_dir == id.canonical_common_git_dir,
+        "selected worktree repository identity changed; removal refused"
+    );
+    require_no_other_workspace_owner_except(target, None)?;
+    let inventory = crate::core::git_ops::parse_worktrees(&query(
         &id.canonical_root,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?)?;
+    let registered = inventory
+        .iter()
+        .find(|entry| fs::canonicalize(&entry.path).is_ok_and(|registered| registered == canon))
+        .context("managed directory is not a registered Git worktree")?;
+    anyhow::ensure!(
+        registered.locked.is_none()
+            && registered.prunable.is_none()
+            && !registered.bare
+            && !registered.detached,
+        "managed worktree is locked, prunable, bare, or detached; inspect it before removal"
+    );
+    let branch = registered
+        .branch
+        .as_deref()
+        .and_then(|name| name.strip_prefix("refs/heads/"))
+        .context("managed worktree has no local branch")?
+        .to_owned();
+    let tip = registered
+        .head
+        .as_ref()
+        .context("managed worktree has no commit")?;
+    let base = String::from_utf8(query(
+        &id.canonical_root,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+    )?)
+    .context("Git base query returned non-UTF-8 data")?;
+    let base = crate::core::snapshots::GitOid::parse(base.trim())?;
+    crate::core::git_ops::validate_visible_index(&query(&path, &["ls-files", "-v", "-f", "-z"])?)?;
+    let dirty = !query(
+        &path,
         &[
-            "worktree".into(),
-            "add".into(),
-            "-b".into(),
-            branch.clone(),
-            dir.display().to_string(),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
         ],
-    )
-    .with_context(|| format!("creating worktree {name}"))?;
+    )?
+    .is_empty();
+    let range = format!("{}..{}", base.as_str(), tip.as_str());
+    let ahead = String::from_utf8(query(&path, &["rev-list", "--count", &range])?)
+        .context("Git ahead query returned non-UTF-8 data")?
+        .trim()
+        .parse::<u64>()
+        .context("invalid worktree ahead count; removal refused")?;
+    require_no_other_workspace_owner_except(target, None)?;
+    // Zero is certified by strict admission above, never a default for a failed liveness query.
     Ok(WorkTree {
-        name: name.to_string(),
-        path: dir,
+        name: name.to_owned(),
+        path,
         branch,
-        dirty: false,
-        ahead: 0,
+        dirty,
+        ahead,
         sessions: 0,
     })
 }
 
-/// Every aizen-created worktree of this repository, with the state that decides whether removing it
-/// would lose work.
-pub fn work_list() -> Result<Vec<WorkTree>> {
-    let id = identity()?;
-    let root = worktrees_root(&id.repo_id);
-    let sessions = list_in(&id.repo_id);
-    let Ok(rd) = fs::read_dir(&root) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let branch = current_branch(&path).unwrap_or_else(|| format!("aizen/{name}"));
-        let dirty = git_ok(&path, &["status".into(), "--porcelain".into()])
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(true);
-        let ahead = git_ok(
-            &path,
-            &[
-                "rev-list".into(),
-                "--count".into(),
-                format!("{branch}@{{upstream}}..{branch}"),
-            ],
+#[cfg(test)]
+fn work_target_for(id: &WorkspaceIdentity, name: &str) -> Result<WorkTree> {
+    let target = WorkspaceIdentity::discover(&worktrees_root(&id.repo_id).join(name))?;
+    work_target_with_query(id, &target, name, |root, args| {
+        crate::core::git_ops::inspection_bytes_owned(
+            root,
+            args.iter().map(|arg| (*arg).into()).collect(),
+            None,
         )
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .or_else(|| {
-            // No upstream: compare against the repository's current HEAD branch instead, which is
-            // what "has this worktree got commits nobody else has?" means locally.
-            let base = current_branch(&id.canonical_root)?;
-            git_ok(
-                &path,
-                &[
-                    "rev-list".into(),
-                    "--count".into(),
-                    format!("{base}..{branch}"),
-                ],
-            )
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-        })
-        .unwrap_or(0);
-        let canon = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let session_count = sessions
-            .iter()
-            .filter(|s| {
-                let sroot = fs::canonicalize(&s.manifest.root)
-                    .unwrap_or_else(|_| PathBuf::from(&s.manifest.root));
-                sroot == canon && s.alive
-            })
-            .count();
-        out.push(WorkTree {
-            name,
-            path,
-            branch,
-            dirty,
-            ahead,
-            sessions: session_count,
-        });
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    })
 }
 
-/// Why removing a worktree would lose work. Empty means it is safe to remove.
+#[cfg(test)]
+fn git_inspect_text(root: &Path, args: &[&str]) -> Result<String> {
+    let bytes = crate::core::git_ops::inspection_bytes(
+        root,
+        args.iter().map(|arg| (*arg).into()).collect(),
+    )?;
+    String::from_utf8(bytes).context("Git inspection returned non-UTF-8 data")
+}
+
+/// Preliminary removal blockers, not a substitute for fresh execution-time admission.
 pub fn work_remove_blockers(wt: &WorkTree) -> Vec<String> {
     let mut blockers = Vec::new();
     if wt.dirty {
@@ -1764,36 +1617,118 @@ pub fn work_remove_blockers(wt: &WorkTree) -> Vec<String> {
     blockers
 }
 
-/// Remove a linked worktree. Refuses while [`work_remove_blockers`] is non-empty unless `force`,
-/// and never rewrites or discards content in the tree it removes: the branch is left in place, so
-/// any commits made there remain reachable by name.
+fn require_safe_worktree_removal(force: bool) -> Result<()> {
+    anyhow::ensure!(!force,
+        "forced worktree removal is not supported: a retained branch cannot save uncommitted or ignored files; inspect and resolve blockers first");
+    Ok(())
+}
+
+/// Remove only a clean, inactive managed worktree; the branch is retained separately.
+/// Keeping a branch does not preserve uncommitted/untracked/ignored files, so `force` is refused.
 pub fn work_remove(name: &str, force: bool) -> Result<String> {
     valid_worktree_name(name)?;
-    let id = identity()?;
-    let wt = work_list()?
-        .into_iter()
-        .find(|w| w.name == name)
-        .with_context(|| format!("no aizen worktree named '{name}'"))?;
-    let blockers = work_remove_blockers(&wt);
-    if !blockers.is_empty() && !force {
-        bail!(
-            "refusing to remove '{name}': {}. Nothing was changed. Re-run with --force only if \
-             that work is expendable (the branch {} is kept either way)",
-            blockers.join("; "),
-            wt.branch
+    require_safe_worktree_removal(force)?;
+    work_remove_for(&identity()?, name)
+}
+
+fn work_remove_for(id: &WorkspaceIdentity, name: &str) -> Result<String> {
+    valid_worktree_name(name)?;
+    let path = worktrees_root(&id.repo_id).join(name);
+    let metadata = fs::symlink_metadata(&path).context("reading selected managed worktree")?;
+    anyhow::ensure!(
+        metadata.is_dir() && !crate::core::file_placement::is_link_or_reparse(&metadata),
+        "managed worktree must be a plain directory"
+    );
+    anyhow::ensure!(
+        fs::canonicalize(&path)? != id.canonical_root,
+        "cannot remove the current workspace; focus another worktree first"
+    );
+    let cancel = crate::core::cancel::current();
+    let writer = crate::core::workspace_txn::WorkspaceWriterLease::acquire(
+        &path,
+        Duration::from_secs(15),
+        cancel.as_ref(),
+        "remove managed worktree",
+    )?;
+    anyhow::ensure!(
+        writer.identity().repo_id == id.repo_id
+            && writer.identity().canonical_common_git_dir == id.canonical_common_git_dir,
+        "selected worktree repository identity changed; removal refused"
+    );
+    let barrier = crate::core::workspace_txn::BackgroundProcessBarrier::acquire(cancel.as_ref())?;
+    let registration = acquire_workspace_registration_barrier(writer.identity())?;
+    registration.verify()?;
+    // Removal has no self exception: even this process must not have an active registration there.
+    require_no_other_workspace_owner_except(writer.identity(), None)?;
+    crate::core::git_ops::require_settled_operations(writer.identity())?;
+    let scope = crate::core::exec_ctx::current()
+        .map(|ctx| ctx.resource_scope())
+        .unwrap_or_else(|| "default".into());
+    {
+        let physical = crate::core::workspace_txn::PhysicalEffectLease::exclusive(
+            Duration::from_secs(15),
+            cancel.as_ref(),
+            "worktree recovery preflight",
+            &scope,
+        )?;
+        crate::core::speculation::legacy::require_settled(
+            &writer.identity().canonical_root,
+            &writer,
+            &physical,
+        )?;
+        crate::core::speculation::namespace::inspect_existing(
+            writer.identity().clone(),
+            &crate::core::config::aizen_home(),
+        )?;
+        crate::core::native_journal::require_workspace_settled(&writer.identity().canonical_root)?;
+    }
+    let owner = std::sync::Arc::new((writer, barrier, registration));
+    let wt = work_target_with_query(id, owner.0.identity(), name, |root, args| {
+        owner.2.verify()?;
+        let result = crate::core::git_ops::inspection_bytes_owned(
+            root,
+            args.iter().map(|arg| (*arg).into()).collect(),
+            Some(Box::new(owner.clone())),
         );
-    }
-    let mut args: Vec<String> = vec![
-        "worktree".into(),
-        "remove".into(),
-        wt.path.display().to_string(),
-    ];
-    if force {
-        args.push("--force".into());
-    }
-    git_ok(&id.canonical_root, &args).with_context(|| format!("removing worktree {name}"))?;
+        let registration_valid = owner.2.verify();
+        let bytes = result?;
+        registration_valid.context("co-op registration changed during removal inspection")?;
+        Ok(bytes)
+    })?;
+    anyhow::ensure!(
+        wt.path == path && fs::canonicalize(&path)? == owner.0.identity().canonical_root,
+        "worktree changed during removal preflight"
+    );
+    let blockers = work_remove_blockers(&wt);
+    anyhow::ensure!(
+        blockers.is_empty(),
+        "refusing to remove '{name}': {}",
+        blockers.join("; ")
+    );
+    let git_dir = owner
+        .0
+        .identity()
+        .canonical_git_dir
+        .as_ref()
+        .context("worktree Git directory is missing")?;
+    crate::core::git_ops::require_idle_operation(git_dir)?;
+    require_no_other_workspace_owner_except(owner.0.identity(), None)?;
+    crate::core::git_ops::require_settled_operations(owner.0.identity())?;
+    owner.2.verify()?;
+    // Every bounded query and mutation owns a share after observer timeout/cancellation. The
+    // caller's share permits postchecks while retaining writer/background/registration admission.
+    let removed = crate::core::git_ops::remove_worktree(
+        &id.canonical_root,
+        &wt.path,
+        Box::new(owner.clone()),
+    )
+    .with_context(|| format!("removing worktree {name}"));
+    let registration_valid = owner.2.verify();
+    removed?;
+    registration_valid.context("co-op registration changed during worktree removal")?;
     Ok(format!(
-        "removed worktree {} (branch {} kept)",
+        "removed worktree {} at {} (branch {} kept)",
+        wt.name,
         wt.path.display(),
         wt.branch
     ))
@@ -1805,9 +1740,8 @@ pub fn work_remove(name: &str, force: bool) -> Result<String> {
 
 /// Read-only view of the other windows, for the model.
 ///
-/// Deliberately read-only: deciding what to commit, and committing it, stays with the human at
-/// `/team commit`. What the model needs is the ability to NOTICE that another window owns the file
-/// it was about to rewrite — that is a coordination fact it cannot otherwise get.
+/// This is coordination evidence, not an attribution or commit receipt. Historical file records
+/// help identify peers to consult, but shared working-tree edits are not adopted as session work.
 pub struct TeamStatus;
 
 impl crate::agent::tools::Tool for TeamStatus {
@@ -1816,11 +1750,9 @@ impl crate::agent::tools::Tool for TeamStatus {
     }
 
     fn description(&self) -> &str {
-        "List the other aizen sessions working in this repository right now: their task, state \
-         (working/idle/done/abandoned), and which files each has changed. Use it BEFORE editing a \
-         file that another session may own, and when the user asks what the other windows are \
-         doing or whether their work is ready. Read-only — reviewing and committing another \
-         session's work is the user's call via `/team commit`."
+        "List aizen sessions in this repository: task, liveness, state, and historical file records. \
+         Use it to coordinate with other windows before editing. Read-only; records do not prove \
+         current file ownership or provide per-session diff/commit authority."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1829,7 +1761,7 @@ impl crate::agent::tools::Tool for TeamStatus {
             "properties": {
                 "files": {
                     "type": "boolean",
-                    "description": "include each session's changed file list (default false)"
+                    "description": "include historical file records, not current ownership proof (default false)"
                 }
             },
             "additionalProperties": false
@@ -1842,11 +1774,13 @@ impl crate::agent::tools::Tool for TeamStatus {
         if sessions.is_empty() {
             return Ok("no aizen sessions are registered in this repository".to_string());
         }
-        let mut out = String::new();
+        let mut out = String::from(
+            "Registry only: historical file records do not grant current attribution or staging authority.\n",
+        );
         for v in &sessions {
             let m = &v.manifest;
             out.push_str(&format!(
-                "{}{} · {} · turns={} · files={}{}\n  task: {}\n",
+                "{}{} · {} · turns={} · historical_files={}{}\n  task: {}\n",
                 m.session_id,
                 if v.is_self { " (this session)" } else { "" },
                 v.effective_state(),
@@ -1889,61 +1823,6 @@ impl crate::agent::tools::Tool for TeamStatus {
         }
         Ok(out.trim_end().to_string())
     }
-}
-
-// ---------------------------------------------------------------------------------------------
-// git plumbing
-// ---------------------------------------------------------------------------------------------
-
-/// Run git in `root`, bounded. `output_bounded` rather than `Command::output()`: a wedged git with a
-/// live grandchild holding the pipe would otherwise hang the REPL thread for good.
-fn git_ok(root: &Path, args: &[String]) -> Result<String> {
-    let mut cmd = crate::core::gitx::command()?;
-    cmd.current_dir(root);
-    cmd.args(args);
-    let out = crate::core::proctree::output_bounded(&mut cmd, GIT_TIMEOUT, GIT_DRAIN_GRACE)
-        .context("running git")?;
-    if out.timed_out {
-        bail!(
-            "git {} timed out",
-            args.first().cloned().unwrap_or_default()
-        );
-    }
-    if out.code != Some(0) {
-        let stderr = out.stderr.trim();
-        let detail = if stderr.is_empty() {
-            out.stdout.trim()
-        } else {
-            stderr
-        };
-        bail!("git {} failed: {}", args.join(" "), detail);
-    }
-    Ok(out.stdout)
-}
-
-/// Run git in `root` and return its exit code.
-///
-/// For the commands whose exit STATUS is the answer rather than a failure: `merge-file` reports the
-/// number of conflicts that way, so treating non-zero as an error would throw the result away.
-fn git_code(root: &Path, args: &[String]) -> Option<i32> {
-    let mut cmd = crate::core::gitx::command().ok()?;
-    cmd.current_dir(root);
-    cmd.args(args);
-    let out = crate::core::proctree::output_bounded(&mut cmd, GIT_TIMEOUT, GIT_DRAIN_GRACE).ok()?;
-    if out.timed_out {
-        return None;
-    }
-    out.code
-}
-
-fn current_branch(root: &Path) -> Option<String> {
-    git_ok(
-        root,
-        &["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()],
-    )
-    .ok()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty() && s != "HEAD")
 }
 
 #[cfg(test)]
@@ -2009,6 +1888,7 @@ mod tests {
             // before the assertion ran. Tests that care about staleness set this explicitly.
             started_unix: now_unix(),
             updated_unix: now_unix(),
+            git_task: None,
         }
     }
 
@@ -2054,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_repo_scoped_and_sweeps_unreadable_manifests() {
+    fn registry_is_repo_scoped_and_preserves_unreadable_manifests() {
         let _home = Home::new("scope");
         fs::create_dir_all(sessions_dir("repo-a")).unwrap();
         fs::create_dir_all(sessions_dir("repo-b")).unwrap();
@@ -2066,7 +1946,15 @@ mod tests {
         let a = list_in("repo-a");
         assert_eq!(a.len(), 1, "only this repository's sessions are visible");
         assert_eq!(a[0].manifest.session_id, "s-a");
-        assert!(!junk.exists(), "unreadable manifest is swept");
+        assert_eq!(
+            fs::read(&junk).unwrap(),
+            b"{not json",
+            "unreadable evidence is preserved"
+        );
+        assert!(
+            read_sessions("repo-a").1,
+            "selective replay must notice omitted evidence"
+        );
         assert_eq!(list_in("repo-b").len(), 1, "the other repo is untouched");
     }
 
@@ -2092,60 +1980,6 @@ mod tests {
         assert!(
             !manifest_path(repo, "s-old").exists(),
             "a finished session past retention leaves no file behind"
-        );
-    }
-
-    #[test]
-    fn ledger_keeps_the_first_base_so_a_later_overwrite_cannot_narrow_the_diff() {
-        let mut files = Vec::new();
-        let dropped = merge_touched(&mut files, &[('M', "src/a.rs".into())], 5, 1);
-        assert_eq!(dropped, 0);
-        // Same file changed again two turns later, from a newer checkpoint.
-        merge_touched(
-            &mut files,
-            &[('M', "src/a.rs".into()), ('A', "src/b.rs".into())],
-            9,
-            3,
-        );
-        assert_eq!(files.len(), 2);
-        let a = files.iter().find(|f| f.path == "src/a.rs").unwrap();
-        assert_eq!(
-            a.base, 5,
-            "pre-image stays the FIRST checkpoint this session saw"
-        );
-        assert_eq!(a.last_turn, 3);
-        let b = files.iter().find(|f| f.path == "src/b.rs").unwrap();
-        assert_eq!(
-            b.base, 9,
-            "a newly touched file bases on the turn that touched it"
-        );
-        assert_eq!(
-            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
-            vec!["src/a.rs", "src/b.rs"],
-            "ledger stays sorted for stable rendering"
-        );
-    }
-
-    #[test]
-    fn ledger_reports_overflow_instead_of_silently_dropping_paths() {
-        let mut files: Vec<TouchedFile> = (0..MAX_FILES)
-            .map(|i| TouchedFile {
-                path: format!("f{i}.rs"),
-                base: 1,
-                last_turn: 1,
-                status: 'M',
-                bases: vec![1],
-            })
-            .collect();
-        let dropped = merge_touched(&mut files, &[('A', "overflow.rs".into())], 2, 2);
-        assert_eq!(dropped, 1, "the ceiling is reported, not hidden");
-        assert_eq!(files.len(), MAX_FILES);
-        // An already-tracked path still updates once the ceiling is hit.
-        let dropped = merge_touched(&mut files, &[('M', "f0.rs".into())], 2, 3);
-        assert_eq!(dropped, 0);
-        assert_eq!(
-            files.iter().find(|f| f.path == "f0.rs").unwrap().last_turn,
-            3
         );
     }
 
@@ -2228,6 +2062,205 @@ mod tests {
     }
 
     #[test]
+    fn forced_worktree_removal_is_refused_before_discovery() {
+        assert!(require_safe_worktree_removal(false).is_ok());
+        let error = work_remove("valid-name", true).unwrap_err();
+        assert!(error.to_string().contains("forced worktree removal"));
+    }
+
+    #[test]
+    fn managed_worktree_removal_preserves_ignored_files_and_checks_git_state() -> Result<()> {
+        let _mode = crate::sandbox::runner::tests::lock();
+        let home = Home::new("work-remove");
+        let root = home.root.join("repo");
+        fs::create_dir(&root)?;
+        let Some(git) = crate::core::gitx::git_exe() else {
+            anyhow::ensure!(std::env::var_os("CI").is_none(), "Git required in CI");
+            eprintln!("SKIP: Git unavailable for managed worktree removal");
+            return Ok(());
+        };
+        let run = |cwd: &Path, args: &[&str]| -> Result<()> {
+            let output = std::process::Command::new(&git)
+                .current_dir(cwd)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "fixture Git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        run(&root, &["init", "-q"])?;
+        fs::write(root.join(".gitignore"), "ignored.tmp\n")?;
+        fs::write(root.join("tracked.txt"), "base\n")?;
+        run(&root, &["add", ".gitignore", "tracked.txt"])?;
+        run(&root, &["commit", "-qm", "base"])?;
+        let id = WorkspaceIdentity::discover(&root)?;
+        let path = worktrees_root(&id.repo_id).join("fixture");
+        fs::create_dir_all(path.parent().unwrap())?;
+        run(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "aizen/fixture",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        )?;
+        crate::core::workspace_txn::with_test_lock_home(&home.root, || -> Result<()> {
+            assert_eq!(work_target_for(&id, "fixture")?.ahead, 0);
+            for name in ["untracked.txt", "ignored.tmp"] {
+                fs::write(path.join(name), "must survive\n")?;
+                assert!(work_target_for(&id, "fixture")?.dirty);
+                assert!(work_remove_for(&id, "fixture").is_err());
+                assert_eq!(fs::read(path.join(name))?, b"must survive\n");
+                fs::remove_file(path.join(name))?;
+            }
+            let target_id = WorkspaceIdentity::discover(&path)?;
+            let marker = target_id
+                .canonical_git_dir
+                .as_ref()
+                .unwrap()
+                .join("REVERT_HEAD");
+            fs::write(&marker, "fixture unfinished operation")?;
+            let error = work_remove_for(&id, "fixture").unwrap_err();
+            assert!(
+                error.to_string().contains("active Git operation"),
+                "{error:#}"
+            );
+            fs::remove_file(marker)?;
+            run(&root, &["worktree", "lock", path.to_str().unwrap()])?;
+            assert!(work_remove_for(&id, "fixture").is_err());
+            run(&root, &["worktree", "unlock", path.to_str().unwrap()])?;
+            let checkout_bytes = fs::read(path.join("tracked.txt"))?;
+            for flag in ["--assume-unchanged", "--skip-worktree"] {
+                run(&path, &["update-index", flag, "tracked.txt"])?;
+                fs::write(path.join("tracked.txt"), "hidden pending edit\n")?;
+                let result = work_remove_for(&id, "fixture");
+                assert!(result.is_err(), "removal accepted {flag}: {result:?}");
+                assert_eq!(
+                    fs::read(path.join("tracked.txt"))?,
+                    b"hidden pending edit\n"
+                );
+                fs::write(path.join("tracked.txt"), &checkout_bytes)?;
+                let clear = if flag == "--assume-unchanged" {
+                    "--no-assume-unchanged"
+                } else {
+                    "--no-skip-worktree"
+                };
+                run(&path, &["update-index", clear, "tracked.txt"])?;
+            }
+            fs::create_dir_all(sessions_dir(&id.repo_id))?;
+            let invalid_session = sessions_dir(&id.repo_id).join("unknown.json");
+            fs::write(&invalid_session, "not a session")?;
+            assert!(work_remove_for(&id, "fixture").is_err());
+            fs::remove_file(invalid_session)?;
+            let mut live = manifest(&id.repo_id, "removal-live", SessionState::Working);
+            live.root = fs::canonicalize(&path)?.to_string_lossy().into_owned();
+            live.worktree_id = target_id.worktree_id.clone();
+            write_manifest(&live)?;
+            let missing_lock = liveness_lock_path(&id.repo_id, &live.session_id);
+            assert!(work_remove_for(&id, "fixture").is_err());
+            assert!(
+                !missing_lock.exists(),
+                "removal must not create missing liveness evidence"
+            );
+            let live_lock = RepoTxnLock::acquire_exclusive(
+                &liveness_lock_path(&id.repo_id, &live.session_id),
+                Duration::from_secs(1),
+            )?;
+            assert!(work_remove_for(&id, "fixture").is_err());
+            assert!(path.exists());
+            drop(live_lock);
+            fs::remove_file(manifest_path(&id.repo_id, &live.session_id))?;
+            run(
+                &path,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "unintegrated agent change",
+                ],
+            )?;
+            assert_eq!(work_target_for(&id, "fixture")?.ahead, 1);
+            assert!(work_remove_for(&id, "fixture").is_err());
+            run(&root, &["merge", "--ff-only", "aizen/fixture"])?;
+            let sibling = path.with_file_name("locked-sibling");
+            run(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    sibling.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )?;
+            run(&root, &["worktree", "lock", sibling.to_str().unwrap()])?;
+            let parent_head = fs::read(root.join(".git/HEAD"))?;
+            let parent_index = fs::read(root.join(".git/index"))?;
+            let receipt_dir = home
+                .root
+                .join("git-operations-v1")
+                .join(&target_id.repo_id)
+                .join(&target_id.worktree_id);
+            fs::create_dir_all(&receipt_dir)?;
+            let receipt = receipt_dir.join("removal-blocker.json");
+            let tip = git_inspect_text(&path, &["rev-parse", "HEAD"])?;
+            let pending = serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "id": "removal-blocker",
+                "root": target_id.canonical_root,
+                "git_dir": target_id.canonical_git_dir,
+                "common_dir": target_id.canonical_common_git_dir,
+                "before": tip.trim(),
+                "after": null,
+                "branch_before": "refs/heads/aizen/fixture",
+                "change": {"action": "integrate", "commit": tip.trim()},
+                "targets": [tip.trim()],
+                "state": "running",
+                "resulting_commits": [],
+                "verified": false
+            }))?;
+            fs::write(&receipt, &pending)?;
+            let pending_error = work_remove_for(&id, "fixture").unwrap_err();
+            assert!(
+                pending_error
+                    .to_string()
+                    .contains("unfinished Git operation"),
+                "{pending_error:#}"
+            );
+            assert!(path.exists());
+            assert_eq!(
+                fs::read(&receipt)?,
+                pending,
+                "pending evidence must not be removed"
+            );
+            fs::remove_file(receipt)?;
+            let message = work_remove_for(&id, "fixture")?;
+            assert!(message.contains("branch aizen/fixture kept"));
+            assert!(!path.exists());
+            run(&root, &["show-ref", "--verify", "refs/heads/aizen/fixture"])?;
+            assert_eq!(fs::read(root.join(".git/HEAD"))?, parent_head);
+            assert_eq!(fs::read(root.join(".git/index"))?, parent_index);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn removing_a_worktree_is_refused_while_it_holds_work() {
         let dirty = WorkTree {
             name: "wt".into(),
@@ -2263,46 +2296,6 @@ mod tests {
     }
 
     #[test]
-    fn a_running_session_is_not_committable_without_force() {
-        let _home = Home::new("plan");
-        let repo = "repo-p";
-        fs::create_dir_all(sessions_dir(repo)).unwrap();
-        let mut m = manifest(repo, "s-live", SessionState::Working);
-        m.files = vec![TouchedFile {
-            path: "src/a.rs".into(),
-            base: 1,
-            last_turn: 1,
-            status: 'M',
-            bases: vec![1],
-        }];
-        write_manifest(&m).unwrap();
-        let _held = RepoTxnLock::acquire_exclusive(
-            &liveness_lock_path(repo, "s-live"),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let view = list_in(repo)
-            .into_iter()
-            .find(|v| v.manifest.session_id == "s-live")
-            .unwrap();
-        assert!(view.alive);
-        assert!(!view.ready_to_commit(), "a working session is not ready");
-
-        let mut finished = m.clone();
-        finished.state = SessionState::Finished;
-        write_manifest(&finished).unwrap();
-        drop(_held);
-        let view = list_in(repo)
-            .into_iter()
-            .find(|v| v.manifest.session_id == "s-live")
-            .unwrap();
-        assert!(
-            view.ready_to_commit(),
-            "a closed session is ready to commit"
-        );
-    }
-
-    #[test]
     fn resolve_accepts_index_and_unique_suffix_but_refuses_ambiguity() {
         let sessions = ["1000-11", "1000-12"];
         // `resolve` reads the live registry; exercise the matching rule it uses directly so the
@@ -2325,326 +2318,514 @@ mod tests {
         );
     }
 
-    /// A throwaway git repository with one commit. `None` when git is unavailable, so the suite still
-    /// passes on a machine without it rather than failing for the wrong reason.
-    fn temp_repo(tag: &str) -> Option<PathBuf> {
-        crate::core::gitx::git_exe()?;
-        let root = std::env::temp_dir().join(format!(
-            "aizen-coop-git-{tag}-{}-{}",
-            std::process::id(),
-            crate::core::persist::unique_sequence()
-        ));
-        fs::create_dir_all(&root).ok()?;
-        let root = root.canonicalize().ok()?;
-        let run = |args: &[&str]| {
-            git_ok(
-                &root,
-                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            )
-            .ok()
-        };
-        run(&["init", "--initial-branch=main"])?;
-        run(&["config", "user.email", "t@example.invalid"])?;
-        run(&["config", "user.name", "t"])?;
-        run(&["config", "commit.gpgsign", "false"])?;
-        fs::write(root.join("a.txt"), "base\n").ok()?;
-        run(&["add", "-A"])?;
-        run(&["commit", "-m", "base"])?;
-        Some(root)
+    fn owner_identity(home: &Home) -> WorkspaceIdentity {
+        WorkspaceIdentity {
+            repo_id: "ownership-fixture".into(),
+            worktree_id: "ownership-worktree".into(),
+            canonical_root: home.root.canonicalize().unwrap(),
+            canonical_git_dir: None,
+            canonical_common_git_dir: None,
+        }
     }
 
     #[test]
-    fn a_commit_is_refused_when_the_index_moved_after_the_review() {
-        // The window between "user reads the stat" and "user approves" is not held under any lock —
-        // holding one across a human decision would freeze every other window. The tree digest is
-        // what closes it: if anything staged in that window, the approved review no longer describes
-        // what would land, and committing it would ship content nobody looked at.
-        // Sandboxed home: `commit_staged` records the commit in `shared.json`, and that must land in
-        // a temp tree rather than the developer's real `~/.aizen`.
-        let _home = Home::new("treeguard");
-        let Some(root) = temp_repo("treeguard") else {
-            return;
+    fn branch_refresh_preserves_evidence_and_only_updates_matching_active_owner() -> Result<()> {
+        let home = Home::new("branch-refresh");
+        let identity = owner_identity(&home);
+        let barrier = acquire_registration_barrier(&identity, Duration::ZERO)?;
+        refresh_active_branch(None, &identity, Some("refs/heads/topic"), &barrier)?;
+        assert!(!sessions_dir(&identity.repo_id).exists());
+        fs::create_dir_all(sessions_dir(&identity.repo_id))?;
+        let mut m = historical_view().manifest;
+        m.repo_id = identity.repo_id.clone();
+        m.worktree_id = identity.worktree_id.clone();
+        m.root = identity.canonical_root.display().to_string();
+        m.degraded = Some("historical uncovered effects".into());
+        m.coverage_gap = true;
+        write_manifest(&m)?;
+        let path = manifest_path(&m.repo_id, &m.session_id);
+        let lock = RepoTxnLock::acquire_exclusive(
+            &liveness_lock_path(&m.repo_id, &m.session_id),
+            Duration::from_secs(1),
+        )?;
+        let before = serde_json::to_value(&m)?;
+        let mut active = Active {
+            manifest: m,
+            _lock: lock,
         };
-        fs::write(root.join("a.txt"), "session A's work\n").unwrap();
-        let plan = CommitPlan {
-            session_id: "s-a".into(),
-            paths: vec!["a.txt".into()],
-            shared_paths: Vec::new(),
-            blockers: Vec::new(),
-            root: root.clone(),
-        };
-        let review = stage_plan(&plan).expect("staging the plan");
-        assert!(review.stat.contains("a.txt"), "{}", review.stat);
-
-        // Another window stages something of its own between review and approval.
-        fs::write(root.join("b.txt"), "session B's work\n").unwrap();
-        git_ok(&root, &["add".into(), "--".into(), "b.txt".into()]).unwrap();
-
-        let err = commit_staged(&plan, "should not land", &review)
-            .expect_err("a moved index must refuse rather than commit the surprise");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("not the ones that were reviewed"), "{msg}");
-        // Nothing was committed: HEAD still points at the single base commit.
-        let count = git_ok(&root, &["rev-list".into(), "--count".into(), "HEAD".into()]).unwrap();
-        assert_eq!(count.trim(), "1", "the refused commit must not have landed");
-
-        // Re-reviewing the current state succeeds — the guard refuses stale approvals, not progress.
-        let fresh = stage_plan(&plan).expect("re-staging");
-        commit_staged(&plan, "reviewed again", &fresh).expect("a current review commits");
-        let count = git_ok(&root, &["rev-list".into(), "--count".into(), "HEAD".into()]).unwrap();
-        assert_eq!(count.trim(), "2");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn background_gap_preserves_history_without_certifying_missing_interval() {
-        let mut m = manifest("repo-gap", "session-gap", SessionState::Working);
-        merge_touched(&mut m.files, &[('M', "historical.rs".into())], 4, 1);
-        record_turn_base(&mut m, 8);
-        record_background_coverage_gap(&mut m);
-        assert!(m.base_checkpoint.is_none());
-        assert_eq!(m.files[0].base, 4);
-        let mut m: SessionManifest =
-            serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
-        record_turn_base(&mut m, 12);
-        assert_eq!(m.base_checkpoint, Some(12), "fresh coverage may resume");
-        assert!(m.coverage_gap);
+        let mut other = identity.clone();
+        other.worktree_id = "other".into();
+        refresh_active_branch(Some(&mut active), &other, None, &barrier)?;
+        assert_eq!(serde_json::to_value(&active.manifest)?, before);
+        for branch in [Some("refs/heads/topic"), None] {
+            refresh_active_branch(Some(&mut active), &identity, branch, &barrier)?;
+            assert_eq!(
+                active.manifest.branch.as_deref(),
+                branch.map(|name| name.strip_prefix("refs/heads/").unwrap())
+            );
+            let mut actual = serde_json::to_value(&active.manifest)?;
+            actual["branch"] = before["branch"].clone();
+            actual["updated_unix"] = before["updated_unix"].clone();
+            assert_eq!(
+                actual, before,
+                "branch refresh must retain all historical evidence"
+            );
+            let loaded: SessionManifest = serde_json::from_slice(&fs::read(&path)?)?;
+            assert_eq!(
+                serde_json::to_value(loaded)?,
+                serde_json::to_value(&active.manifest)?
+            );
+        }
+        let bytes = fs::read(&path)?;
         assert!(
-            m.degraded.is_some(),
-            "a fresh base cannot repair missing history"
+            refresh_active_branch(Some(&mut active), &identity, Some("topic"), &barrier).is_err()
         );
-        assert_eq!(m.files[0].base, 4);
+        assert_eq!(fs::read(&path)?, bytes);
+        let mut foreign = identity.clone();
+        foreign.repo_id = "foreign".into();
+        let foreign_barrier = acquire_registration_barrier(&foreign, Duration::ZERO)?;
+        assert!(
+            refresh_active_branch(Some(&mut active), &identity, None, &foreign_barrier).is_err()
+        );
+        assert_eq!(fs::read(&path)?, bytes);
+        fs::remove_file(&path)?;
+        assert!(refresh_active_branch(Some(&mut active), &identity, None, &barrier).is_err());
+        assert!(
+            !path.exists(),
+            "missing manifest must not be recreated by refresh"
+        );
+        Ok(())
     }
 
     #[test]
-    fn every_turn_that_touches_a_path_is_remembered_not_just_the_first() {
-        // `base` stays at the first turn (a whole-file diff measures from there), but a split has to
-        // replay EVERY turn of this session. If later turns were dropped, a two-turn session would
-        // silently reconstruct only its first turn's work.
-        let mut files = Vec::new();
-        merge_touched(&mut files, &[('M', "src/a.rs".into())], 4, 1);
-        merge_touched(&mut files, &[('M', "src/a.rs".into())], 9, 2);
-        merge_touched(&mut files, &[('M', "src/a.rs".into())], 9, 3);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].base, 4, "the first turn remains the diff base");
-        assert_eq!(files[0].last_turn, 3);
+    fn removal_inspection_queries_fail_closed_and_never_read_legacy_registry() -> Result<()> {
+        let home = Home::new("removal-query-admission");
+        let id = owner_identity(&home);
+        let path = worktrees_root(&id.repo_id).join("fixture");
+        fs::create_dir_all(&path)?;
+        let mut target = id.clone();
+        target.canonical_root = path.canonicalize()?;
+        target.worktree_id = "target-worktree".into();
+        let oid = "a".repeat(40);
+        for fail_at in 0..=5 {
+            let calls = std::cell::Cell::new(0usize);
+            let result = work_target_with_query(&id, &target, "fixture", |root, args| {
+                let call = calls.get() + 1;
+                calls.set(call);
+                anyhow::ensure!(call != fail_at, "injected query failure {call}");
+                Ok(match args[0] {
+                    "worktree" => {
+                        assert_eq!(root, id.canonical_root);
+                        assert_eq!(args, ["worktree", "list", "--porcelain", "-z"]);
+                        format!(
+                            "worktree {}\0HEAD {oid}\0branch refs/heads/topic\0\0",
+                            path.display()
+                        )
+                        .into_bytes()
+                    }
+                    "rev-parse" => format!("{oid}\n").into_bytes(),
+                    "ls-files" | "status" => Vec::new(),
+                    "rev-list" => b"0\n".to_vec(),
+                    unexpected => panic!("unexpected query {unexpected}"),
+                })
+            });
+            if fail_at == 0 {
+                let observed = result?;
+                assert_eq!(calls.get(), 5);
+                assert_eq!(observed.sessions, 0);
+                assert_eq!(observed.ahead, 0);
+                assert!(!observed.dirty);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("injected query failure"),
+                    "{error:#}"
+                );
+                assert_eq!(calls.get(), fail_at);
+            }
+        }
+        fs::create_dir_all(sessions_dir(&id.repo_id))?;
+        let mut unknown = manifest(&id.repo_id, "missing-lock", SessionState::Finished);
+        unknown.root = target.canonical_root.display().to_string();
+        write_manifest(&unknown)?;
+        let result = work_target_with_query(&id, &target, "fixture", |_, _| {
+            panic!("unknown liveness must refuse before any Git query")
+        });
+        assert!(result.is_err());
+        assert!(!liveness_lock_path(&id.repo_id, "missing-lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_owner_admission_is_read_only_and_does_not_sweep() -> Result<()> {
+        let home = Home::new("owner-read-only");
+        let identity = owner_identity(&home);
+        require_no_other_workspace_owner(&identity)?;
+        assert!(
+            !coop_root(&identity.repo_id).exists(),
+            "absent registry must not be created"
+        );
+        fs::create_dir_all(sessions_dir(&identity.repo_id))?;
+        let mut m = manifest(&identity.repo_id, "old-dead", SessionState::Finished);
+        m.root = identity.canonical_root.display().to_string();
+        m.updated_unix = 0;
+        write_manifest(&m)?;
+        let path = manifest_path(&identity.repo_id, &m.session_id);
+        let before = fs::read(&path)?;
+        let lock = liveness_lock_path(&identity.repo_id, &m.session_id);
+        assert!(require_no_other_workspace_owner(&identity).is_err());
+        assert!(
+            !lock.exists(),
+            "missing liveness evidence must not be created"
+        );
+        fs::write(&lock, b"old lock evidence")?;
+        require_no_other_workspace_owner(&identity)?;
         assert_eq!(
-            files[0].bases,
-            vec![4, 9],
-            "each distinct turn interval is recorded exactly once"
+            fs::read(path)?,
+            before,
+            "admission must not sweep old evidence"
         );
+        assert_eq!(fs::read(lock)?, b"old lock evidence");
+        Ok(())
     }
 
     #[test]
-    fn turn_boundaries_span_every_session_and_skip_pruned_checkpoints() {
-        // A session's turn ends where the NEXT turn begins — anywhere in the worktree, not just in
-        // the same session. Boundaries must therefore be collected across sessions, or an interval
-        // would swallow a peer's turn and attribute their work to this session.
-        let _home = Home::new("bounds");
-        let repo = "repo-bounds";
-        fs::create_dir_all(sessions_dir(repo)).unwrap();
+    fn mutation_owner_admission_excludes_only_exact_self_in_same_worktree() -> Result<()> {
+        let home = Home::new("owner-live");
+        let identity = owner_identity(&home);
+        fs::create_dir_all(sessions_dir(&identity.repo_id))?;
+        let mut m = manifest(&identity.repo_id, "owner-live", SessionState::Working);
+        m.root = identity.canonical_root.display().to_string();
+        let lock_path = liveness_lock_path(&identity.repo_id, &m.session_id);
+        let held = RepoTxnLock::acquire_exclusive(&lock_path, Duration::from_secs(1))?;
+        assert!(
+            require_no_other_workspace_owner(&identity).is_err(),
+            "live orphan lock must block"
+        );
+        write_manifest(&m)?;
+        assert!(require_no_other_workspace_owner_except(&identity, None).is_err());
+        assert!(require_no_other_workspace_owner_except(&identity, Some("live")).is_err());
+        require_no_other_workspace_owner_except(&identity, Some("owner-live"))?;
+        let other = home.root.join("other-worktree");
+        fs::create_dir(&other)?;
+        m.root = other.canonicalize()?.display().to_string();
+        write_manifest(&m)?;
+        require_no_other_workspace_owner_except(&identity, None)?;
+        assert!(
+            require_owner_admission(&identity, None, true).is_err(),
+            "shared-ref retirement must block another live worktree owner"
+        );
+        m.root = home.root.join("missing-worktree").display().to_string();
+        write_manifest(&m)?;
+        assert!(require_no_other_workspace_owner_except(&identity, None).is_err());
+        drop(held);
+        require_no_other_workspace_owner_except(&identity, None)?;
+        assert!(
+            !Path::new(&m.root).exists(),
+            "dead removed worktree must not block"
+        );
+        fs::remove_file(&lock_path)?;
+        assert!(
+            require_no_other_workspace_owner_except(&identity, None).is_err(),
+            "missing lock is still unknown liveness, not proof of a dead session"
+        );
+        Ok(())
+    }
 
-        let mut a = manifest(repo, "s-a", SessionState::Idle);
-        a.files = vec![TouchedFile {
-            path: "shared.rs".into(),
-            base: 2,
-            last_turn: 2,
-            status: 'M',
-            bases: vec![2, 6],
-        }];
-        write_manifest(&a).unwrap();
+    #[test]
+    fn registration_barrier_excludes_publication_until_mutation_releases_it() -> Result<()> {
+        let home = Home::new("registration-barrier");
+        let identity = owner_identity(&home);
+        let held = acquire_registration_barrier(&identity, Duration::ZERO)?;
+        held.verify()?;
+        let mut sibling = identity.clone();
+        sibling.worktree_id = "other-worktree".into();
+        let blocked = acquire_registration_barrier(&sibling, Duration::ZERO);
+        assert!(
+            blocked.is_err(),
+            "registration of another worktree shares repository admission"
+        );
+        let error = blocked.err().unwrap();
+        assert!(
+            error
+                .downcast_ref::<crate::core::repo_lock::LockBusy>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            !sessions_dir(&identity.repo_id).exists(),
+            "blocked begin cannot publish unlocked"
+        );
+        let mut other_repo = identity.clone();
+        other_repo.repo_id = "different-repository".into();
+        let independent = acquire_registration_barrier(&other_repo, Duration::ZERO)?;
+        drop(independent);
+        drop(held);
+        let registration = acquire_registration_barrier(&identity, Duration::ZERO)?;
+        registration.verify()?;
+        Ok(())
+    }
 
-        let mut b = manifest(repo, "s-b", SessionState::Working);
-        b.files = vec![TouchedFile {
+    #[test]
+    fn registration_barrier_rejects_unsafe_namespace_and_lock_replacement() -> Result<()> {
+        let home = Home::new("registration-path");
+        let identity = owner_identity(&home);
+        let directory = home.root.join("coop-registration");
+        fs::write(&directory, b"must not replace this file")?;
+        assert!(acquire_registration_barrier(&identity, Duration::ZERO).is_err());
+        assert_eq!(fs::read(&directory)?, b"must not replace this file");
+        fs::remove_file(&directory)?;
+        let mut invalid = identity.clone();
+        invalid.repo_id = "../escape".into();
+        assert!(acquire_registration_barrier(&invalid, Duration::ZERO).is_err());
+        #[cfg(unix)]
+        {
+            let external = home.root.join("external");
+            fs::create_dir(&external)?;
+            std::os::unix::fs::symlink(&external, &directory)?;
+            assert!(acquire_registration_barrier(&identity, Duration::ZERO).is_err());
+            assert_eq!(fs::read_dir(&external)?.count(), 0);
+            fs::remove_file(&directory)?;
+            let barrier = acquire_registration_barrier(&identity, Duration::ZERO)?;
+            fs::rename(&barrier.path, barrier.path.with_extension("old"))?;
+            fs::write(&barrier.path, b"replacement lock")?;
+            assert!(
+                barrier.verify().is_err(),
+                "path replacement must invalidate the held barrier"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_owner_admission_refuses_unknown_registry_evidence() -> Result<()> {
+        let home = Home::new("owner-unknown");
+        let identity = owner_identity(&home);
+        let dir = sessions_dir(&identity.repo_id);
+        fs::create_dir_all(dir.parent().unwrap())?;
+        fs::write(&dir, "not a directory")?;
+        assert!(require_no_other_workspace_owner(&identity).is_err());
+        fs::remove_file(&dir)?;
+        fs::create_dir(&dir)?;
+        let mut m = manifest(&identity.repo_id, "invalid", SessionState::Finished);
+        m.root = identity.canonical_root.display().to_string();
+        let path = manifest_path(&identity.repo_id, &m.session_id);
+        fs::write(&path, "not json")?;
+        assert!(require_no_other_workspace_owner(&identity).is_err());
+        assert_eq!(fs::read(&path)?, b"not json");
+        m.schema = SCHEMA + 1;
+        write_manifest(&m)?;
+        assert!(require_no_other_workspace_owner(&identity).is_err());
+        m.schema = SCHEMA;
+        m.repo_id = "foreign".into();
+        fs::write(&path, serde_json::to_vec(&m)?)?;
+        assert!(require_no_other_workspace_owner(&identity).is_err());
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path)?;
+            let external = home.root.join("external-owner.json");
+            fs::write(&external, serde_json::to_vec(&m)?)?;
+            std::os::unix::fs::symlink(&external, &path)?;
+            assert!(require_no_other_workspace_owner(&identity).is_err());
+            assert!(fs::symlink_metadata(&path)?.file_type().is_symlink());
+        }
+        Ok(())
+    }
+
+    fn historical_view() -> SessionView {
+        let mut m = manifest("historical-repo", "historical-session", SessionState::Done);
+        m.base_checkpoint = Some(17);
+        m.files.push(TouchedFile {
             path: "shared.rs".into(),
             base: 4,
-            last_turn: 1,
+            bases: vec![4, 9],
+            last_turn: 3,
             status: 'M',
-            bases: vec![4],
-        }];
-        // Mid-turn: these writes are in flight and must bound the previous interval.
-        b.base_checkpoint = Some(8);
-        write_manifest(&b).unwrap();
-
-        // Another worktree of the same repository: its checkpoints live in a different ledger.
-        let mut other = manifest(repo, "s-other", SessionState::Idle);
-        other.worktree_id = "wt-elsewhere".into();
-        other.files = vec![TouchedFile {
-            path: "shared.rs".into(),
-            base: 5,
-            last_turn: 1,
-            status: 'M',
-            bases: vec![5],
-        }];
-        write_manifest(&other).unwrap();
-
-        // #6 has been pruned from the ledger; #99 was never a turn start.
-        let existing: BTreeSet<u32> = [2, 4, 5, 8, 99].into_iter().collect();
-        let bounds = turn_boundaries(repo, "wt", &existing);
-        assert_eq!(
-            bounds,
-            vec![2, 4, 8],
-            "both sessions' turns bound each other, the pruned and foreign ones are left out"
-        );
+        });
+        SessionView {
+            manifest: m,
+            alive: false,
+            is_self: false,
+            committed: false,
+            overlapping: Vec::new(),
+        }
     }
 
     #[test]
-    fn replaying_one_turn_keeps_this_sessions_edit_and_drops_the_peers() {
-        // The property the whole split rests on. Session A changed line 2; session B changed line 3
-        // in the same file. Replaying A's interval onto the committed base must yield A's change and
-        // NOT B's — even though every tree A was measured in already contained B's work.
-        let Some(root) = temp_repo("replay") else {
-            return;
-        };
-        let committed = "1\nA-target\n3\n4\n5\n6\n7\n8\nB-target\n10\n";
-        // What A's turn saw before and after. BOTH trees already contain B's work on line 9 —
-        // that is the whole difficulty: A was never measured against a tree free of B's edits.
-        let before_turn = "1\nA-target\n3\n4\n5\n6\n7\n8\nB-EDITED\n10\n";
-        let after_turn = "1\nA-EDITED\n3\n4\n5\n6\n7\n8\nB-EDITED\n10\n";
-        let (merged, conflicts) = merge_three_way(
-            &root,
-            committed.as_bytes(),
-            before_turn.as_bytes(),
-            after_turn.as_bytes(),
-            ("s-a", "before", "after"),
-        )
-        .expect("replaying a clean turn");
-        assert_eq!(
-            conflicts, 0,
-            "the two sessions edited well-separated regions"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&merged),
-            "1\nA-EDITED\n3\n4\n5\n6\n7\n8\nB-target\n10\n",
-            "A's edit is kept and B's is left behind, even though every tree A was measured \
-             in already contained B's work"
-        );
-        let _ = fs::remove_dir_all(root);
+    fn historical_attribution_never_grants_diff_or_commit_authority() {
+        for state in [
+            SessionState::Working,
+            SessionState::Done,
+            SessionState::Finished,
+        ] {
+            for empty in [false, true] {
+                let mut view = historical_view();
+                view.manifest.state = state;
+                view.manifest.branch = Some("aizen/looks-owned".into());
+                // Missing Git/root cannot turn historical metadata into staging authority.
+                view.manifest.root = "unavailable-worktree".into();
+                if empty {
+                    view.manifest.files.clear();
+                    view.manifest.base_checkpoint = None;
+                }
+                for result in [
+                    session_diff(&view, false),
+                    session_diff(&view, true),
+                    session_commit(&view),
+                ] {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("coverage gap"), "{error}");
+                    assert!(error.contains("no current staging authority"), "{error}");
+                    assert!(error.contains("nothing was staged"), "{error}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn edits_on_adjacent_lines_are_reported_rather_than_merged() {
-        // Worth pinning down, because it bounds what the feature can promise. Git's merge granularity
-        // is the hunk, not the line: two sessions editing lines that fall in one hunk cannot be
-        // separated, even though no single line was touched twice. That is reported as a conflict —
-        // conservative in the safe direction, since the alternative is inventing a resolution.
-        let Some(root) = temp_repo("adjacent") else {
-            return;
-        };
-        let (_, conflicts) = merge_three_way(
-            &root,
-            b"one\ntwo\nB-EDITED\n",
-            b"one\ntwo\nthree\n",
-            b"one\nA-EDITED\nthree\n",
-            ("s-a", "before", "after"),
-        )
-        .expect("merge-file runs");
+    fn historical_refusals_preserve_index_working_files_and_manifest() -> Result<()> {
+        let home = Home::new("historical-refusal");
+        let root = home.root.join("worktree");
+        fs::create_dir_all(root.join(".git"))?;
+        // Intentionally not a valid repository/index. Refusal must precede even Git discovery,
+        // staging, scratch-object creation, or attempted cleanup of an abandoned review.
+        fs::write(root.join(".git/index"), b"user staged bytes\0must survive")?;
+        fs::write(root.join(".git/HEAD"), b"user branch evidence")?;
+        fs::write(root.join("shared.rs"), b"mixed user and peer edits")?;
+        let mut view = historical_view();
+        view.manifest.root = root.display().to_string();
+        view.manifest.coverage_gap = true;
+        view.manifest.degraded = Some("unsettled shell effects".into());
+        view.manifest.truncated_files = 3;
+        fs::create_dir_all(sessions_dir(&view.manifest.repo_id))?;
+        write_manifest(&view.manifest)?;
+        let path = manifest_path(&view.manifest.repo_id, &view.manifest.session_id);
+        let before = fs::read(&path)?;
+        for result in [session_diff(&view, true), session_commit(&view)] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("unsettled shell effects"), "{error}");
+            assert!(error.contains("omitted paths: 3"), "{error}");
+        }
+        assert_eq!(
+            fs::read(root.join(".git/index"))?,
+            b"user staged bytes\0must survive"
+        );
+        assert_eq!(fs::read(root.join(".git/HEAD"))?, b"user branch evidence");
+        assert_eq!(
+            fs::read(root.join("shared.rs"))?,
+            b"mixed user and peer edits"
+        );
+        assert_eq!(fs::read(path)?, before);
+        assert_eq!(fs::read_dir(root.join(".git"))?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn historical_fields_round_trip_without_reconstruction() {
+        let mut value = serde_json::to_value(historical_view().manifest).unwrap();
+        // Manifests preceding the multi-base field remain readable, not replayable.
+        value["files"][0].as_object_mut().unwrap().remove("bases");
+        let old: SessionManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(old.base_checkpoint, Some(17));
+        assert_eq!(old.files[0].base, 4);
+        assert!(old.files[0].bases.is_empty());
+        let before = serde_json::to_value(&old).unwrap();
+        let loaded: SessionManifest = serde_json::from_value(before.clone()).unwrap();
+        assert_eq!(serde_json::to_value(loaded).unwrap(), before);
+    }
+
+    #[test]
+    fn gaps_and_sealing_preserve_historical_evidence_and_first_reason() {
+        let mut m = historical_view().manifest;
+        let historical_files = m.files.clone();
+        record_attribution_gap(&mut m, "native effect has no per-session attribution");
+        record_attribution_gap(&mut m, "managed background effects");
+        seal_manifest(&mut m);
+        assert!(m.coverage_gap);
+        assert_eq!(
+            m.degraded.as_deref(),
+            Some("native effect has no per-session attribution")
+        );
+        assert_eq!(m.base_checkpoint, Some(17));
+        assert_eq!(m.files, historical_files);
+        assert_eq!(m.turns, 2);
+        let mut m: SessionManifest =
+            serde_json::from_value(serde_json::to_value(m).unwrap()).unwrap();
+        seal_manifest(&mut m);
+        assert!(m.coverage_gap);
+        assert_eq!(m.base_checkpoint, Some(17));
+        assert_eq!(m.files, historical_files);
+    }
+
+    #[test]
+    fn empty_ledger_at_turn_end_never_certifies_complete_coverage() {
+        let mut m = manifest("repo", "empty", SessionState::Working);
+        seal_manifest(&mut m);
+        assert!(m.coverage_gap);
+        assert!(m
+            .degraded
+            .as_deref()
+            .unwrap()
+            .contains("empty ledger does not certify coverage"));
         assert!(
-            conflicts > 0,
-            "adjacent-line edits share a hunk and must be reported, not silently resolved"
+            m.files.is_empty(),
+            "unattributed edits must not become new file claims"
         );
-        let _ = fs::remove_dir_all(root);
+        assert!(
+            m.base_checkpoint.is_none(),
+            "sealing must not manufacture a baseline"
+        );
     }
 
     #[test]
-    fn two_sessions_editing_the_same_line_is_reported_not_guessed() {
-        let Some(root) = temp_repo("collide") else {
-            return;
-        };
-        // Both sessions rewrote line 2. There is no answer that keeps both.
-        let (merged, conflicts) = merge_three_way(
-            &root,
-            b"one\nB's version\nthree\n",
-            b"one\ntwo\nthree\n",
-            b"one\nA's version\nthree\n",
-            ("s-a", "before", "after"),
-        )
-        .expect("merge-file reports conflicts through its exit status");
-        assert!(conflicts > 0, "an overlapping edit must not report success");
-        let text = String::from_utf8_lossy(&merged);
-        assert!(
-            text.contains("<<<<<<<"),
-            "conflict markers are present: {text}"
-        );
-        // A SplitFile in this shape is refused by `usable()`, so markers can never be staged.
-        let split = SplitFile {
-            path: "x.rs".into(),
-            content: Some(merged),
-            mode: "100644".into(),
-            conflicts,
-            replayed: 1,
-            unavailable: None,
-        };
-        assert!(
-            !split.usable(),
-            "a conflicted reconstruction is never stageable"
-        );
-        let _ = fs::remove_dir_all(root);
+    fn historical_attribution_evidence_survives_retention() {
+        let _home = Home::new("historical-retention");
+        let repo = "repo-history";
+        fs::create_dir_all(sessions_dir(repo)).unwrap();
+        for variant in 0..5 {
+            let mut m = manifest(repo, &format!("evidence-{variant}"), SessionState::Finished);
+            m.updated_unix = 0;
+            match variant {
+                0 => m.coverage_gap = true,
+                1 => m.base_checkpoint = Some(17),
+                2 => m.files = historical_view().manifest.files,
+                3 => m.truncated_files = 5,
+                _ => m.degraded = Some("historical unsupported interval".into()),
+            }
+            write_manifest(&m).unwrap();
+            let path = manifest_path(repo, &m.session_id);
+            let before = fs::read(&path).unwrap();
+            let lock = liveness_lock_path(repo, &m.session_id);
+            fs::write(&lock, b"lock evidence").unwrap();
+            assert!(list_in(repo)
+                .iter()
+                .any(|view| view.manifest.session_id == m.session_id));
+            assert_eq!(fs::read(path).unwrap(), before);
+            assert_eq!(fs::read(lock).unwrap(), b"lock evidence");
+        }
     }
 
     #[test]
-    fn a_split_is_staged_without_disturbing_the_other_sessions_working_copy() {
-        // The reason staging is index-only: disk holds BOTH sessions' work and the peer is still
-        // editing it. Writing this session's version to disk would destroy the peer's live changes —
-        // the exact loss this module exists to prevent.
-        let Some(root) = temp_repo("indexonly") else {
-            return;
-        };
-        let union = "shared: A's line and B's line\n";
-        fs::write(root.join("a.txt"), union).unwrap();
-        let split = SplitFile {
-            path: "a.txt".into(),
-            content: Some(b"shared: only A's line\n".to_vec()),
-            mode: "100644".into(),
-            conflicts: 0,
-            replayed: 1,
-            unavailable: None,
-        };
-        stage_split(&root, &split).expect("staging a reconstructed blob");
-
-        let staged =
-            git_ok(&root, &["show".into(), ":a.txt".into()]).expect("reading the staged version");
-        assert_eq!(
-            staged.trim_end(),
-            "shared: only A's line",
-            "the index holds this session's version alone"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("a.txt")).unwrap(),
-            union,
-            "the working tree still holds the union — the peer's edits are untouched"
-        );
-        // And it is a real commit, not a staging trick: the committed tree carries the split version.
-        git_ok(&root, &["commit".into(), "-m".into(), "A only".into()]).unwrap();
-        let committed = git_ok(&root, &["show".into(), "HEAD:a.txt".into()]).unwrap();
-        assert_eq!(committed.trim_end(), "shared: only A's line");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_split_that_removes_the_file_stages_a_deletion() {
-        let Some(root) = temp_repo("removal") else {
-            return;
-        };
-        let split = SplitFile {
-            path: "a.txt".into(),
-            content: None,
-            mode: String::new(),
-            conflicts: 0,
-            replayed: 1,
-            unavailable: None,
-        };
-        stage_split(&root, &split).expect("staging a removal");
-        let staged = git_ok(
-            &root,
-            &["diff".into(), "--cached".into(), "--name-status".into()],
-        )
-        .unwrap();
-        assert!(staged.starts_with('D'), "the deletion is staged: {staged}");
-        assert!(
-            root.join("a.txt").exists(),
-            "the file itself is left on disk for the other session"
-        );
-        let _ = fs::remove_dir_all(root);
+    fn future_manifests_and_unknown_states_are_preserved_with_their_locks() {
+        let _home = Home::new("future-schema");
+        let repo = "repo-future";
+        fs::create_dir_all(sessions_dir(repo)).unwrap();
+        for (id, state) in [("readable", "finished"), ("unknown-state", "future-state")] {
+            let mut m = manifest(repo, id, SessionState::Finished);
+            m.schema = SCHEMA + 1;
+            m.updated_unix = 0;
+            let mut value = serde_json::to_value(m).unwrap();
+            value["state"] = serde_json::json!(state);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let path = manifest_path(repo, id);
+            let lock = liveness_lock_path(repo, id);
+            fs::write(&path, &bytes).unwrap();
+            fs::write(&lock, b"lock evidence").unwrap();
+            let (views, omitted) = read_sessions(repo);
+            assert!(views.is_empty());
+            assert!(omitted);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&lock).unwrap(), b"lock evidence");
+        }
     }
 }

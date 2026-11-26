@@ -197,8 +197,7 @@ fn check_invocation_origin(
         ensure!(
             execution.is_none_or(|ctx| ctx.can_restore_workspace()
                 && ctx.dispatch_label().is_none()
-                && ctx.native_scope().is_none()
-                && ctx.overlay().is_none()),
+                && ctx.native_scope().is_none()),
             "delegated or speculative execution cannot request human Memory management"
         );
     }

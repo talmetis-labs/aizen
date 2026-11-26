@@ -212,21 +212,40 @@ Mặc định BẬT (spawn khi cần), dùng rust-analyzer · pyright · typescr
 
 ---
 
-## 10. Cỗ máy thời gian (checkpoint & hoàn tác)
+## 10. Git-native Time Machine
 
-Aizen chụp ảnh code theo thời gian (dựa trên git), cho phép quay lại bất kỳ điểm nào — cả code lẫn nội dung chat.
+Time Machine now operates on real Git history, not saved source checkpoints or chat rewinds.
+`/time` (aliases `/timemachine`, `/tm`) defaults to read-only status. Examples:
 
-| Lệnh | Tác dụng | Bí danh |
-|---|---|---|
-| `/checkpoint [ghi chú]` | Lưu điểm khôi phục ngay bây giờ | `/snapshot`, `/cp` |
-| `/timemachine` | Duyệt mọi checkpoint (`▸` = hiện tại), chọn để nhảy về | `/timeline`, `/tm` |
-| `/diff [từ] [đến] [-p]` | Xem những gì đã đổi giữa hai thời điểm | |
-| `/undo` | Quay lại checkpoint trước | |
-| `/redo` | Áp dụng lại checkpoint kế tiếp | |
+```text
+/time history
+/time branches
+/time worktrees
+/time switch topic
+/time undo HEAD~1
+/time operations
+/time redo <undo-operation-id>
+/time integrate <commit-oid>
+/time merge <commit-oid>
+/time cherry-pick <oid-1> <oid-2>
+/time reconcile <failed-operation-id>
+/time delete-branch topic --retained-ref refs/heads/main
+```
 
-> Mẹo: chạy `/diff` để đọc thay đổi **trước khi** `/undo`.
+Mutation commands above are preview-only unless `--yes` is supplied. They require supported clean
+state, frozen targets and settled ownership; no implicit stash, forced checkout or reset. Undo
+creates inverse Git commits; redo selects a completed undo receipt, not a checkpoint number.
+Conflicts remain for inspection, and project tests must run on the resulting destination.
+`create <name> [--base <revision>]` previews a worktree at a frozen commit (HEAD by default); add
+`--yes` to create it without copying pending parent edits. `remove <name>` uses the existing guarded
+worktree removal adapter. Neither operation focuses this session.
 
-Ở terminal: `aizen time save · list · restore · undo · redo`.
+The old `/checkpoint`, `/snapshot`, `/cp`, `/timeline`, `/diff`, `/undo`, `/redo` and checkpoint
+save/restore/GC commands are removed. Existing recovery evidence is preserved. `/time focus` can
+explicitly rebind a settled session to a checked worktree; Git-owned native tasks return unverified,
+not-integrated handoffs. Integration and destination verification need separate approval. New
+`execution: "speculative"` requests are retired, not automatically migrated. General crash or unknown-
+effect reconciliation remains unavailable. See the [full reference](REFERENCE.md#git-native-time-commands).
 
 ---
 
@@ -391,8 +410,8 @@ Terminal đang chạy giữ nguyên phiên bản của nó; terminal **kế ti�
 1. `/init` để Aizen hiểu codebase (lần đầu).
 2. Gõ yêu cầu bằng tiếng Việt.
 3. Đang chạy: `>` để đổi hướng, `?` để hỏi ngoài lề, `Esc` để hủy.
-4. `/diff` xem thay đổi → hài lòng thì thôi, không thì `/undo`.
-5. `/checkpoint` lưu mốc an toàn trước khi thử việc mạo hiểm.
+4. Inspect pending edits with `git diff` and `git diff --cached`; use `/time history` for committed work.
+5. Preview `/time undo <commit>` for a selected committed change; add `--yes` only after reviewing the intent. Pending mixed edits are not covered by a checkpoint or universal undo.
 
 ---
 

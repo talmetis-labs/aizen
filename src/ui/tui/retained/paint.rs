@@ -428,18 +428,16 @@ fn draw_sidebar(frame: &mut Frame<'_>, rect: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(lines), rect);
 }
 
-/// The working directory, clipped from the LEFT so the tail — the part that names the project —
-/// survives. Computed once: the process cwd does not move under the render thread.
+/// The focused input workspace, clipped from the left. This display-only projection does not
+/// change process cwd or route tool execution from the render thread.
 fn sidebar_cwd(width: usize) -> String {
-    static CWD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let full = CWD.get_or_init(|| {
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    });
-    let w = console::measure_text_width(full);
+    let full = super::super::input_workspace()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|root| root.display().to_string())
+        .unwrap_or_default();
+    let w = console::measure_text_width(&full);
     if w <= width {
-        return full.clone();
+        return full;
     }
     let cut: String = full
         .chars()

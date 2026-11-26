@@ -25,6 +25,7 @@ impl std::fmt::Display for GitMissing {
 impl std::error::Error for GitMissing {}
 
 /// True when `e`'s chain contains [`GitMissing`] — robust against any `.context()` wrapping.
+#[cfg(test)]
 pub fn is_git_missing(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<GitMissing>().is_some())
 }
@@ -55,6 +56,7 @@ impl Resolution {
 
 /// The resolved git executable, or `None` when git is genuinely absent.
 pub fn git_exe() -> Option<PathBuf> {
+    crate::agent::planning::check_automation_boundary().ok()?;
     resolved().path().map(Path::to_path_buf)
 }
 
@@ -67,6 +69,7 @@ pub fn git_exe() -> Option<PathBuf> {
 /// so the flag has to live here too — otherwise those spawns keep allocating a console and can trip
 /// the `0xc0000142` loader-init failure the flag exists to avoid.
 pub fn command() -> anyhow::Result<std::process::Command> {
+    crate::agent::planning::check_automation_boundary()?;
     match git_exe() {
         Some(p) => Ok(harden(no_window(std::process::Command::new(p)))),
         None => Err(anyhow::Error::new(GitMissing)),
@@ -74,10 +77,9 @@ pub fn command() -> anyhow::Result<std::process::Command> {
 }
 
 /// Harden an INTERNAL git invocation against repository-controlled execution and hangs. Aizen's
-/// own plumbing (time-machine checkpoints, repo probing, the writer lease) must never run code the
-/// repository placed in `.git/hooks`, a configured fsmonitor daemon, or a credential helper — a
-/// checkout is untrusted input, and "aizen made a checkpoint" must not be a code-execution event.
-/// Applied to every spawn built here and to the time machine's own git builder.
+/// own inspection and writer-lease discovery must never run code the repository placed in hooks,
+/// fsmonitor or credential helpers. Approved user-facing Git changes use the separate mutation
+/// profile in `core::git_ops`, which preserves configured hooks and signing.
 ///
 /// * `core.hooksPath` → a directory that never exists, so NO hook fires (repo-local ones included);
 /// * `core.fsmonitor=false` → no repo-configured monitor daemon is started;
@@ -116,13 +118,14 @@ fn no_window(cmd: std::process::Command) -> std::process::Command {
 /// found on PATH — the expected case earns no noise; every other outcome changes observable
 /// behavior and is stated once, plainly.
 pub fn resolution_note() -> Option<String> {
+    crate::agent::planning::check_automation_boundary().ok()?;
     match resolved() {
         Resolution::OnPath(_) => None,
         Resolution::Override(p) => Some(format!("git: {} (AIZEN_GIT override)", p.display())),
         Resolution::Fallback(p) => Some(format!("git: not on PATH — using {}", p.display())),
         Resolution::Missing => Some(
             "git: not found (AIZEN_GIT/PATH/known locations) — project identity uses the nearest \
-             .git marker or folder path; time-machine checkpoints are off"
+             .git marker or folder path; Git history and workspace operations are unavailable"
                 .to_string(),
         ),
     }

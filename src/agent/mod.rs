@@ -11,18 +11,22 @@
 //! (no live calls). Production passes a closure over `client::chat_with_tools`.
 
 pub mod app_catalog;
-pub(crate) mod apps;
 pub mod architect;
 pub mod blackboard;
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod builtin;
+pub(crate) mod chat_input;
 pub mod clarify;
 pub mod cmd_guard;
 pub mod codebase;
 pub mod compact;
+mod completion;
+pub(crate) mod computer;
 pub mod context_pack;
 pub mod design;
+pub(crate) mod git_change;
+pub(crate) mod git_native_attempt;
 pub mod goal;
 pub mod hooks;
 pub mod image_context;
@@ -32,23 +36,29 @@ pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod mcp_serve;
+pub(crate) mod native_handoff;
 pub(crate) mod native_undo;
 pub mod observe;
 pub mod orchestration;
+pub(crate) mod plan_control;
+pub(crate) mod plan_document;
 pub mod plan_nudge;
+pub(crate) mod planning;
+pub(crate) mod planning_write;
 pub mod process;
 pub mod project_context;
 pub mod prompt_lanes;
 pub mod query_lang;
 pub mod reach;
 pub mod repo_map;
+mod request_language;
 pub mod result_format;
 pub mod roles;
 pub mod runlog;
 pub mod search;
 pub(crate) mod speculation;
-pub(crate) mod speculative_attempt;
 pub mod task_tool;
+pub(crate) mod time_budget;
 pub mod todo;
 pub mod tool_routing;
 pub mod tool_search;
@@ -496,8 +506,8 @@ pub fn build_top_level_system_prompt_bundle(
              - When work decomposes into independent angles (multi-file investigation, multi-angle \
              review, broad search, parallel research), PREFER the `workflow` tool (mode=fanout) \
              over serial `task` loops or doing it yourself — request as many tasks as the work \
-             needs; the harness bounds how many run at once. Keep writes singular (at most \
-             ONE coder/writer child); fan out the reads.\n\
+             needs; the harness bounds concurrency. Give independent editors exact file scopes. For \
+             independent changes to one file, use workflow mode=propose_edits and apply the reviewed batch.\n\
              - When you have claims/findings to trust, use `workflow` mode=verify to adversarially \
              refute each one before committing to conclusions.\n\
              - Use `task` for a single focused sub-problem; never nest orchestration.\n\
@@ -539,6 +549,8 @@ pub type StepNote = (u64, fn(u64, usize, &str));
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Request-only text history for a bound local assistant conversation.
+    pub(crate) assistant_context: Option<std::sync::Arc<crate::assistants::context::Projection>>,
     /// Where mid-run nudges go (see [`NudgeRole`]). Default `System`; the REPL sets it per endpoint.
     pub nudge_role: NudgeRole,
     /// Hard step cap before the one-shot auto-extend.
@@ -589,19 +601,6 @@ pub struct AgentConfig {
     pub enable_verify_gate: bool,
     /// Wall-clock cap (seconds) for the verify-gate subprocess.
     pub verify_gate_timeout_secs: u64,
-    /// Stamp a one-shot time-machine checkpoint before the FIRST destructive tool call of a run, so
-    /// the whole session's edits are rewindable (W15). Best-effort (no-op outside a git repo).
-    /// Default `true`; tests set it `false` (their cwd is a real repo — no checkpoint pollution).
-    pub auto_checkpoint: bool,
-    /// Stamp a time-machine checkpoint at each PHASE boundary (a todo reaching `done` / focus moving
-    /// to a new `in_progress` item, or a clean verify gate after edits) rather than after every edit
-    /// turn — so a run of N edits inside one phase yields ONE meaningful restore point, not N noise
-    /// snapshots. `note_last_good` is set at that mark, so `checkpoint action=rewind target=last_good` lands
-    /// at the last CLEAN phase. Best-effort + dedup'd (a zero-diff tree reuses the last snapshot), so
-    /// a phase that only ran a build costs nothing. Requires `auto_checkpoint`; default `true`,
-    /// forced `false` in tests (their cwd is a real repo). Field name kept for wire/back-compat; only
-    /// the firing CONDITION changed.
-    pub checkpoint_each_edit: bool,
     /// The model's context window in tokens, for the mid-loop context guard. A single run-away
     /// loop (reading many large files) can blow past the window BEFORE control returns to the
     /// REPL's auto-compact; when the running history crosses ~90% of this, the loop injects a
@@ -648,7 +647,7 @@ pub struct AgentConfig {
     pub compact_at_pct: u8,
     /// The run id for this loop, if the caller wants a durable event log (durable-run Phase 1).
     /// When set, the loop opens `scratch/runs/<run_id>.jsonl` and records `Note` events at every
-    /// phase checkpoint, so a crash leaves a trace of which phases completed. `None` disables
+    /// phase boundary, so a crash leaves a trace of observed progress. `None` disables
     /// run-logging entirely (the default for one-shot `aizen agent` calls, where the transcript
     /// is already the durable record).
     pub run_id: Option<String>,
@@ -681,18 +680,20 @@ pub struct AgentConfig {
     /// Per-request wall-clock cap (seconds) for an LSP query, so a hung server can never block the
     /// agent turn. Mirrors Helix's 20s default.
     pub lsp_request_timeout_secs: u64,
-    /// P0.1: when the model returns text-only while session todos still have pending/in_progress
-    /// items, inject a poke and continue (anti early-exit). Sub-agents leave this OFF — their plan
-    /// lives in ScopedTodo, not the process-global list. Default ON for the top-level loop.
+    /// When the model returns text-only with open owned rows, inject a bounded reminder.
+    /// Child tasks normally disable nudging but still enforce runtime completion evidence.
     pub enable_todo_poke: bool,
-    /// Max incomplete-todo pokes per run before Done is allowed anyway. `0` disables poking even
-    /// when `enable_todo_poke` is true.
+    /// Max incomplete-todo reminders per run. Zero disables reminders, not completion checks.
+    /// Exhausting this budget leaves unverified work Incomplete rather than authorizing Done.
     pub max_todo_poke_attempts: usize,
-    /// Nudge once before a model call when the request looks broad or edits grow, with no plan/todos.
-    /// Task size picks the artifact (todo list for small, `docs/plans/*.md` for large); this is the
-    /// harness's reminder for when the model judged the size wrong. Never blocks, never edits source.
-    /// Sub-agents leave it OFF — the artifacts belong to the top-level user's run.
+    /// Bounded Direct/TODO/Plan advice on the next normal model call; no edit or completion gate.
+    /// Sub-agents leave it OFF — artifacts belong to the top-level user's request.
     pub enable_plan_nudge: bool,
+    /// Ephemeral request state shared only by retry/refresh continuations, never persisted.
+    pub(crate) workflow_advice: plan_nudge::AdviceContext,
+    /// Host-designated unsaved architect document (relative path, expected logical ID).
+    /// Matching native save/readback may attach it; this grants no write or completion authority.
+    pub(crate) architect_document: Option<(String, String)>,
     /// P0.2: arm a one-shot re-check when a todo is marked done with a large confidence jump.
     pub enable_confidence_gate: bool,
     /// Confidence ≥ this (and a spike of `conf_spike_delta`) when marking done arms the gate.
@@ -780,6 +781,8 @@ pub struct AgentConfig {
     /// step completes, its result is recorded, and the run ends the same orderly way Esc does.
     /// Consequence to size for: overshoot is bounded by the longest single step, not by zero.
     pub deadline: Option<std::time::Instant>,
+    /// Shared soft budget; the captured execution-context deadline remains the hard ceiling.
+    pub(crate) adaptive_time: Option<time_budget::AdaptiveTimeBudget>,
     /// Explicit wire effort for this run: outer `None` keeps legacy resolution, `Some(None)`
     /// omits it, and `Some(Some(tier))` pins it without mutating another run's override.
     pub wire_reasoning_effort: Option<Option<String>>,
@@ -792,6 +795,17 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    pub(crate) fn run_deadline(&self) -> Option<std::time::Instant> {
+        let soft = self
+            .adaptive_time
+            .as_ref()
+            .map(|budget| budget.deadline(std::time::Instant::now(), false).0);
+        match (self.deadline, soft) {
+            (Some(hard), Some(soft)) => Some(hard.min(soft)),
+            (hard, soft) => hard.or(soft),
+        }
+    }
+
     /// Give the reasoning-effort tier teeth in the HARNESS, not just on the wire. The five tiers
     /// used to change only the `reasoning_effort` string — a no-op on every provider that ignores
     /// the field — so `/effort low` and `/effort max` ran the identical loop. Now a tier sets the
@@ -823,23 +837,28 @@ impl AgentConfig {
         self.max_log_result_chars = log;
     }
 
-    /// The directory this run resolves relative paths against and takes its writer lease on:
-    /// `workspace_root` when a lane pinned one, else the process cwd. Canonicalized, because the
-    /// lease keys workspaces by identity — two spellings of one path must not read as two repos.
-    /// Falls back to `.` only when cwd itself is unreadable (a deleted directory), matching the
-    /// prior behaviour at every call site.
+    /// Resolve the lane root, then its captured placement, then startup cwd. An unavailable bound
+    /// root stays bound: never redirect a vanished worktree to the parent's cwd. Run admission
+    /// separately requires the selected root to exist and be a directory.
     pub fn effective_root(&self) -> std::path::PathBuf {
-        self.workspace_root
+        let root = self
+            .workspace_root
             .clone()
+            .or_else(|| {
+                self.exec_ctx
+                    .placement()
+                    .map(|p| p.workspace_root().to_path_buf())
+            })
             .or_else(|| std::env::current_dir().ok())
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        root.canonicalize().unwrap_or(root)
     }
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            assistant_context: None,
             max_iters: 25,
             auto_extend_to: 80,
             max_tool_result_chars: 4096,
@@ -854,8 +873,6 @@ impl Default for AgentConfig {
             quiet: false,
             enable_verify_gate: true,
             verify_gate_timeout_secs: 300,
-            auto_checkpoint: true,
-            checkpoint_each_edit: true,
             context_window: 0,
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
@@ -877,6 +894,8 @@ impl Default for AgentConfig {
             enable_todo_poke: true,
             max_todo_poke_attempts: 2,
             enable_plan_nudge: true,
+            workflow_advice: plan_nudge::AdviceContext::default(),
+            architect_document: None,
             enable_confidence_gate: true,
             conf_high: 90,
             conf_spike_delta: 40,
@@ -898,6 +917,7 @@ impl Default for AgentConfig {
             step_note: None,
             delegated_call_cap: None,
             deadline: None,
+            adaptive_time: None,
             wire_reasoning_effort: None,
             tool_image_policy: crate::llm::media::VisionPolicy::default(),
             image_config: None,
@@ -909,8 +929,10 @@ impl Default for AgentConfig {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// The model returned a final answer (no tool calls).
+    /// The final answer has no outstanding task or verification obligations.
     Done,
+    /// The model stopped, but work remains open, abandoned, stale or unverified.
+    Incomplete,
     /// The model repeated the exact same tool call(s) two turns running.
     Divergence,
     /// The (auto-extended) step cap was exhausted.
@@ -946,6 +968,7 @@ impl StopReason {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Done => "done",
+            Self::Incomplete => "incomplete",
             Self::Divergence => "divergence",
             Self::MaxIters => "max_iters",
             Self::VerificationFailed => "verification_failed",
@@ -959,6 +982,8 @@ impl StopReason {
 
 #[derive(Debug)]
 pub struct AgentOutcome {
+    /// The unmodified final_text has positive direct-provider provenance for speech.
+    pub(crate) speech_final_verified: bool,
     /// The model's final answer (already streamed to stdout by `aizen agent`; consumed by the
     /// programmatic callers — `main.rs` one-shot, workflow/task sub-agent collection).
     pub final_text: Option<String>,
@@ -1064,6 +1089,10 @@ where
 /// unchanged for its existing callers/tests — compaction is simply OFF on that path.
 type NoSummarizer = fn(Vec<Message>) -> std::future::Ready<Result<String>>;
 
+fn compact_prose_enabled(quiet: bool, json: bool) -> bool {
+    !quiet && !json
+}
+
 /// The agent loop over an EXISTING conversation: `messages` already holds the system prompt and
 /// every turn so far (the unified chat+agent REPL appends a user turn then calls this). Drives
 /// tool calls to a final answer; on Done the final assistant text is pushed onto `messages` so a
@@ -1164,26 +1193,95 @@ where
     // conversation. Strip before the review request is captured, so a user-role nudge can never
     // be mistaken for the request.
     retire_nudges(messages);
-    let scoped = pin_placement_context(cfg)?;
-    let run = run_agent_loop_body(chat, summarize, oracle, &scoped, registry, messages);
+    let scoped = cfg.clone();
+    let task = scoped
+        .exec_ctx
+        .task()
+        .cloned()
+        .unwrap_or_else(todo::current_context);
+    if let Some(advice) = task.resume_workflow_advice(clarify_continuation_id(messages)) {
+        scoped.workflow_advice.resume(advice);
+        if let Some(answer) = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && !prompt_lanes::is_plan_context(message))
+            .and_then(crate::core::memory_context::clean_content)
+        {
+            scoped
+                .workflow_advice
+                .observe_request(clean_review_user_text(answer));
+        }
+    }
+    let mut advice_run = scoped.workflow_advice.run();
+    let mut scoped = pin_placement_context(&scoped)?;
+    scoped.exec_ctx = scoped.exec_ctx.with_task(task).admit_policy()?;
+    let task = scoped
+        .exec_ctx
+        .task()
+        .expect("task was bound above")
+        .clone();
+    if scoped.exec_ctx.is_planning() {
+        scoped.enable_verify_gate = false;
+        scoped.enable_lsp = false;
+        scoped.enable_plan_nudge = false;
+    }
+    // Keep the large loop future out of the nested task-local wrappers. Each delegated
+    // worker shares the runtime's default stack with its caller and the tool executor.
+    let run = Box::pin(run_agent_loop_body(
+        chat, summarize, oracle, &scoped, registry, messages,
+    ));
+    // Bind every future poll, not the thread across await. Config/cache lookups in the loop and
+    // model callbacks must see this run's workspace without leaking into another child on the worker.
+    let run = crate::core::exec_ctx::with_current_future(scoped.exec_ctx.clone(), run);
     #[cfg(test)]
     let run = crate::core::workspace_txn::with_test_lock_namespace_future(
         scoped.exec_ctx.test_lock_namespace().cloned(),
         run,
     );
-    run.await
+    let result = todo::with_context(task.clone(), run).await;
+    if matches!(&result, Ok(outcome) if matches!(outcome.stop, StopReason::Refresh)) {
+        advice_run.preserve_for_refresh();
+    } else if matches!(&result, Ok(outcome) if matches!(outcome.stop, StopReason::AwaitingInput(_)))
+    {
+        if let Some(call_id) = last_clarify_call_id(messages) {
+            task.pause_workflow_advice(call_id.to_owned(), scoped.workflow_advice.take());
+        }
+    }
+    result
 }
 
-fn pin_placement_context(cfg: &AgentConfig) -> Result<AgentConfig> {
+pub(crate) fn pin_placement_context(cfg: &AgentConfig) -> Result<AgentConfig> {
+    use anyhow::Context;
+
     let mut scoped = cfg.clone();
-    let root = cfg.effective_root();
+    let root = cfg
+        .effective_root()
+        .canonicalize()
+        .context("bound workspace is unavailable; refusing to run in another directory")?;
+    anyhow::ensure!(root.is_dir(), "bound workspace is not a directory");
+    scoped.workspace_root = Some(root.clone());
     let placement = match cfg.exec_ctx.placement() {
         Some(context) => context.fork_for(root, &cfg.exec_ctx.resource_scope())?,
-        None => crate::core::file_placement::PlacementContext::new(
-            root.clone(),
-            crate::core::config::aizen_home(),
-        )?
-        .fork_for(root, &cfg.exec_ctx.resource_scope())?,
+        None => {
+            // Startup may be inside a repository subdirectory or use AIZEN_PROJECT_ROOT. Keep
+            // its project identity while preserving the existing cwd for relative tool paths.
+            let project = if cfg.workspace_root.is_none() {
+                crate::core::config::project_root()
+            } else {
+                root.clone()
+            };
+            let project = if project.is_absolute() {
+                project
+            } else {
+                std::env::current_dir()?.join(project)
+            };
+            crate::core::file_placement::PlacementContext::new(
+                root.clone(),
+                crate::core::config::aizen_home(),
+            )?
+            .with_project_root(project)?
+            .fork_for(root, &cfg.exec_ctx.resource_scope())?
+        }
     };
     scoped.exec_ctx = cfg
         .exec_ctx
@@ -1193,8 +1291,6 @@ fn pin_placement_context(cfg: &AgentConfig) -> Result<AgentConfig> {
     scoped.deadline = scoped.exec_ctx.deadline();
     if scoped.exec_ctx.native_scope().is_some() {
         // Capability state, not caller-selected booleans, decides whether global work is allowed.
-        scoped.auto_checkpoint = false;
-        scoped.checkpoint_each_edit = false;
         scoped.enable_verify_gate = false;
         scoped.enable_lsp = false;
         scoped.enable_plan_nudge = false;
@@ -1218,14 +1314,83 @@ where
     O: Fn(Vec<Message>) -> OFut,
     OFut: Future<Output = Result<String>>,
 {
+    let text_reply = if cfg.goal.is_none()
+        && !cfg.exec_ctx.is_planning()
+        && !todo::has_incomplete()
+        && !cfg.exec_ctx.task().is_some_and(|task| task.needs_check())
+    {
+        chat_input::TextReply::for_history(messages, registry)
+    } else {
+        None
+    };
+    let surface_prompt = if computer::bound()
+        && registry.get("computer_observe").is_some()
+        && !cfg.exec_ctx.is_planning()
+        && crate::core::cli_config::load().prompt_tier.is_none()
+    {
+        messages.first().and_then(computer::SurfacePrompt::new)
+    } else {
+        None
+    };
+    let chat = |mut history: Vec<Message>, mut defs: Vec<ToolDef>| {
+        let view = text_reply.as_ref().filter(|view| view.matches(&history));
+        let text_only = view.is_some_and(|v| v.text_only);
+        if let Some(surface) = surface_prompt
+            .as_ref()
+            .filter(|s| !text_only && s.matches(&history, &defs))
+        {
+            surface.apply(&mut history);
+        } else if let Some(view) = view {
+            view.apply(&mut history);
+        }
+        if text_only {
+            defs.clear();
+        }
+        let reply = chat(history, defs);
+        async move {
+            let turn = reply.await?;
+            anyhow::ensure!(
+                !text_only || turn.tool_calls.is_empty(),
+                "Provider returned a tool call in a text-only reply"
+            );
+            Ok(turn)
+        }
+    };
+    let request_size = |history: &[Message], schemas: usize, defs: &[ToolDef]| {
+        let raw = estimate_request_tokens(history, cfg);
+        let view = text_reply.as_ref().filter(|v| v.matches(history));
+        if let Some(surface) = surface_prompt
+            .as_ref()
+            .filter(|s| !view.is_some_and(|v| v.text_only) && s.matches(history, defs))
+        {
+            return raw.saturating_sub(surface.savings) + schemas;
+        }
+        match view {
+            Some(v) => raw.saturating_sub(v.savings) + if v.text_only { 0 } else { schemas },
+            None => raw + schemas,
+        }
+    };
     // Capture the real request before verify/todo/goal gates can append synthetic user turns. Prefix
     // stripping keeps automatic memory/codebase retrieval out of the review contract.
     let mut review_request = capture_review_request(messages);
     // ExecutionContext owns this logical run's anchors. Continuations preserve the handle;
     // fresh turns and delegated children explicitly create independent recovery.
     let mut defs = registry.defs();
-    // Tool schemas ride on EVERY request but live in no message — count them once here so the
-    // context guards below compare the real request size against the window.
+    let routing_request = chat_input::routing_text(&review_request);
+    let requested = tool_search::requested_tools(registry, &routing_request);
+    let names: Vec<_> = requested.iter().map(String::as_str).collect();
+    tool_search::select_matches(registry, &mut defs, &names);
+    let goal_mode = cfg.goal.is_some();
+    if goal_mode {
+        defs.retain(|def| def.function.name != clarify::NAME);
+        push_nudge_as(
+            messages,
+            cfg.nudge_role,
+            NUDGE_GOAL,
+            "[goal-mode] Work autonomously. Resolve ordinary ambiguities with evidence and reversible assumptions. If safe progress is impossible, report the blocker without asking for a clarification. Tool approval rules still apply. Use goal_complete only when the goal has actually been reached.",
+        );
+    }
+    // Schemas live outside the transcript; request_size accounts for text-only projections.
     let mut schema_overhead = estimate_defs_tokens(&defs);
     let mut visual_revision = cfg.exec_ctx.visual().revision();
     let mut cap = cfg.max_iters;
@@ -1263,12 +1428,12 @@ where
     // CUMULATIVE edit flag — set once any successful edit lands; arms the one-shot self-review AND
     // gates the verify gate (a run that never edited has nothing to verify).
     let mut made_any_edits = false;
+    let mut proposal_applications = workflow_tool::ProposalApplications::default();
     // Successful edit-tool calls since the last harness check (see `harness_check_after_edits`).
     let mut edits_since_check: usize = 0;
     // WHERE the most recent successful edit landed (a directory), so the verify gate can typecheck
     // the tree the edit actually touched rather than the process cwd. The two differ constantly — a
-    // session launched from the home directory editing `Desktop/proj/src/x.js` — exactly the gap the
-    // pre-edit checkpoint already discovers via `target_dir`; the gate must not lag behind it. `None`
+    // session launched from the home directory editing `Desktop/proj/src/x.js`. `None`
     // (no path named, or the edit was `shell_run`) keeps the cwd-relative fallback.
     let mut last_edit_dir: Option<std::path::PathBuf> = None;
     // Every file a successful edit named this run: the narrow rung of the Done ladder (the
@@ -1278,21 +1443,10 @@ where
     // gate can distinguish pre-existing compiler errors from regressions introduced by this run.
     // `None` = not yet captured; `Some` = immutable for the lifetime of the run.
     let mut verify_baseline: Option<verify_gate::VerifyBaseline> = None;
-    // PHASE CHECKPOINT STATE (replaces the old per-edit-turn checkpoint). A "phase" is a unit of work
-    // the model marks in its todo list; the timeline stamps ONE checkpoint when a phase closes, not
-    // one per edit. `phase_todos_before` is the todo snapshot at the TOP of the current turn — compared
-    // against the post-turn snapshot to detect a boundary (see `todo::phase_boundary_crossed`).
-    // `made_edits_in_phase` gates the checkpoint so an all-talk phase (todo flipped with no file
-    // change) does not stamp one; it resets to false the moment a phase is stamped, so the next
-    // stamp trigger cannot double-fire on the same work. `phase_counter` supplies a fallback label
-    // for the no-todo path: a model that never calls `todo_write` closes no todo phases, so its only
-    // boundary is the verify gate coming back clean — that stamp needs a name too.
+    // Phase events describe TODO transitions or verified work, not restore points.
     let mut phase_todos_before: Vec<crate::agent::todo::Todo> = crate::agent::todo::snapshot();
     let mut made_edits_in_phase = false;
     let mut phase_counter = 0usize;
-    // Operation-scoped checkpoint latch: set only after a pre-edit checkpoint succeeds. Approval is
-    // evaluated first; a declined call must never run Git hooks/filters or mutate recovery metadata.
-    let mut auto_checkpointed = false;
     let mut writer_lease: Option<crate::core::workspace_txn::WorkspaceWriterLease> = None;
     crate::core::recovery::set_phase(crate::core::recovery::RecoveryPhase::WaitingModel);
     let mut self_review_done = false;
@@ -1320,9 +1474,13 @@ where
     // P0.1: incomplete-todo pokes this run (cap = max_todo_poke_attempts).
     let mut todo_poke_attempts = 0usize;
     // Run-local advisory state; never infer this turn's intent from the widened conversation shape.
-    let mut planning = cfg
-        .enable_plan_nudge
-        .then(|| plan_nudge::PlanNudge::new(&review_request, &cfg.effective_root()));
+    let mut planning = cfg.enable_plan_nudge.then(|| {
+        cfg.workflow_advice
+            .begin(&review_request, cfg.exec_ctx.is_planning())
+    });
+    let plan_task = cfg.exec_ctx.task().expect("run entry binds task").clone();
+    let mut plan_refresh = prompt_lanes::PlanContextRefresh::default();
+    let mut plan_boundary = 0u64;
     // True when the PREVIOUS turn was the model's final answer (text, no tool call). A continuation
     // that fires right after that is dragging the run onward AFTER the model already said it was
     // done — block it (see the step-cap branch), unless the todo list still says work is open.
@@ -1345,7 +1503,7 @@ where
     let read_cache_scope = cfg.exec_ctx.resource_scope();
     // Run-log (durable-run Phase 1): open the append-only event log for this run, if the caller
     // gave us a run_id. The writer is opened once here and lives for the whole loop; every
-    // phase-checkpoint stamp below appends a `Note` event so a crash leaves a durable trace of
+    // phase boundary below appends a `Note` event so a crash leaves a durable trace of
     // which phases completed. `None` (the default for one-shot `aizen agent` calls) disables
     // run-logging entirely.
     let mut runlog: Option<crate::agent::runlog::RunLogWriter> =
@@ -1359,8 +1517,6 @@ where
     // GOAL MODE bypasses the iteration cap entirely: `/goal` promises to run until the goal is
     // genuinely finished, so the only exits are Esc (→ Cancelled, via `cancel::race`) or a verified
     // completion (→ Done, via the goal gate + verify gate). Ordinary turns keep `iter < cap`.
-    let goal_mode = cfg.goal.is_some();
-
     // Phase 2b (live blackboard): track how many sibling notes were on the board the last time we
     // told the model. A sibling's report landing mid-run bumps the count → the model gets a fresh
     // env_line as a collapsing system nudge (same cache-friendly shape as NUDGE_BUDGET).
@@ -1373,16 +1529,21 @@ where
     let mut background_coverage_noted = false;
 
     loop {
-        check_background_effects()?;
+        let time_step_started = std::time::Instant::now();
+        let plan_state = plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+        if let Some(planning) = &mut planning {
+            planning.observe_task(&plan_state);
+        }
+        check_background_effects().inspect_err(|_| {
+            cfg.exec_ctx.note_task_effects_at(None);
+        })?;
         if managed_background_active() {
             verify_passed = false;
             verify_baseline = None;
-            auto_checkpointed = false;
-            crate::core::recovery::set_checkpoint(None);
             crate::features::coop::note_background_coverage_gap();
             cfg.exec_ctx.recovery().defer_background_coverage();
             if !background_coverage_noted && !cfg.quiet {
-                emit_trace("→ managed background process active: automatic checkpoints and certified verification deferred; ordinary tools may continue");
+                emit_trace("→ managed background process active: certified verification deferred; shared effects have no automatic restore coverage; ordinary tools may continue");
                 background_coverage_noted = true;
             }
         }
@@ -1391,6 +1552,7 @@ where
         // whether the previous iteration reached it through a tool path or a Done-gate `continue`.
         if cfg.cancel.is_cancelled() {
             return Ok(AgentOutcome {
+                speech_final_verified: false,
                 final_text: None,
                 iters: iter,
                 verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -1444,7 +1606,25 @@ where
                 }
             }
         }
-        // WALL-CLOCK CEILING (`cfg.deadline`), checked beside the cancel flag because it is the same
+        if let Some(budget) = &cfg.adaptive_time {
+            let allowed = !cfg.cancel.is_cancelled()
+                && !stall.is_stalled()
+                && nudged_sigs.is_empty()
+                && iter < cfg.auto_extend_to.max(cfg.max_iters);
+            if let (_, Some(grant)) = budget.deadline(std::time::Instant::now(), allowed) {
+                let seconds = grant
+                    .deadline
+                    .saturating_duration_since(grant.previous)
+                    .as_secs();
+                let note = format!("time budget extended by {seconds}s after new tool evidence");
+                if let Some((row, publish)) = cfg.step_note {
+                    publish(row, iter, &note);
+                } else if !cfg.quiet {
+                    emit_trace(&format!("→ {note}"));
+                }
+            }
+        }
+        // WALL-CLOCK CEILING (`cfg.run_deadline()`), checked beside the cancel flag because it is the same
         // kind of exit: the step that just finished is recorded, and no new work starts. NOT gated on
         // `goal_mode` — goal mode deliberately ignores the STEP cap, but a caller who set an explicit
         // wall-clock ceiling means it, and "runs until the goal is done" with no time bound is exactly
@@ -1454,8 +1634,12 @@ where
         // path can be a further 300s ON TOP of an already-elapsed ceiling — a deadline that overruns
         // itself to write a summary isn't one. The caller reports the stop reason instead
         // (`task_tool::stop_body_warning`), so the partial work is still labelled honestly.
-        if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if cfg
+            .run_deadline()
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
             return Ok(AgentOutcome {
+                speech_final_verified: false,
                 final_text: None,
                 iters: iter,
                 verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -1533,6 +1717,11 @@ where
         if cfg.enable_steering {
             let steers = crate::core::steer::drain();
             if !steers.is_empty() {
+                if let Some(planning) = &mut planning {
+                    for request in &steers {
+                        planning.observe_request(request);
+                    }
+                }
                 if !cfg.quiet {
                     for s in &steers {
                         emit_trace(
@@ -1615,7 +1804,7 @@ where
         // corrected by the provider's last real usage report when we have one. Recomputed after any
         // guard mutates history.
         let mut est_now = effective_tokens(
-            estimate_request_tokens(messages, cfg) + schema_overhead,
+            request_size(messages, schema_overhead, &defs),
             real_anchor.as_ref(),
         );
 
@@ -1652,10 +1841,13 @@ where
                     // Compact a staged history: summary failure, cancellation or visual quota
                     // failure must not strip recall or replace any part of the live transcript.
                     let mut staged = messages.clone();
+                    let cycle = crate::ui::events::CompactCycle::start();
                     let compacted = tokio::select! {
                         biased;
                         _ = cfg.cancel.cancelled() => {
+                            cycle.cancelled();
                             return Ok(AgentOutcome {
+                                speech_final_verified: false,
                                 final_text: None,
                                 iters: iter,
                                 verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -1666,20 +1858,21 @@ where
                             &mut staged, summarize, compact::KEEP_TURNS,
                         ) => result,
                     };
+                    if cfg.cancel.is_cancelled() {
+                        cycle.cancelled();
+                        return Ok(AgentOutcome {
+                            speech_final_verified: false,
+                            final_text: None,
+                            iters: iter,
+                            verification: design_verification(cfg, verify_passed, made_any_edits),
+                            stop: StopReason::Cancelled,
+                        });
+                    }
+                    plan_boundary = plan_boundary.wrapping_add(1);
                     let arm = match compacted {
                         Ok((before, after)) => {
-                            if cfg.cancel.is_cancelled() {
-                                return Ok(AgentOutcome {
-                                    final_text: None,
-                                    iters: iter,
-                                    verification: design_verification(
-                                        cfg,
-                                        verify_passed,
-                                        made_any_edits,
-                                    ),
-                                    stop: StopReason::Cancelled,
-                                });
-                            }
+                            cfg.exec_ctx.refresh_tool_images(&staged);
+                            cfg.exec_ctx.refresh_visual(&mut staged)?;
                             *messages = staged;
                             compact_failures = 0;
                             context_warned = false; // history shrank — let the wrap-up nudge re-arm if it refills
@@ -1687,12 +1880,10 @@ where
                             real_anchor = None; // spliced history invalidates the anchor
                             stall.forget_successes(); // summarized-away results must not mark a re-read as stale
                             read_cache_clear_scope(&read_cache_scope); // rebuilt indices — the short-circuit proof is void
-                            cfg.exec_ctx.refresh_tool_images(messages);
-                            cfg.exec_ctx.refresh_visual(messages)?;
                             visual_revision = cfg.exec_ctx.visual().revision();
-                            crate::ui::events::compact_boundary(before, after);
-                            est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
-                            if !cfg.quiet {
+                            est_now = request_size(messages, schema_overhead, &defs);
+                            cycle.success(before, after, est_now, cfg.context_window);
+                            if compact_prose_enabled(cfg.quiet, crate::ui::events::on()) {
                                 let line =
                                     format!("→ context: auto-compacted ~{before} → ~{after} tok");
                                 if crate::ui::tui::active() {
@@ -1708,8 +1899,9 @@ where
                         // the rest of the cooldown while context kept climbing. Say so — the user
                         // can fix the summarizer — and latch only on the second failure in a row.
                         Err(e) => {
+                            cycle.failed();
                             compact_failures += 1;
-                            if !cfg.quiet {
+                            if compact_prose_enabled(cfg.quiet, crate::ui::events::on()) {
                                 let line = format!(
                                     "⚠ context: auto-compact failed ({e:#}) — continuing without \
                                      it; older results still collapse to digests and the overflow shrink stands"
@@ -1738,15 +1930,24 @@ where
             }
         }
 
+        // Restore the replaceable lane after compaction or prompt bookkeeping. Coincident
+        // boundaries reuse the same checked document observation.
+        let plan_state = plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+        if let Some(planning) = &mut planning {
+            planning.observe_task(&plan_state);
+        }
+        est_now = effective_tokens(
+            request_size(messages, schema_overhead, &defs),
+            real_anchor.as_ref(),
+        );
+
         // Advice rides the next normal request, after compaction so it cannot be folded away
         // before the model sees it. No tool interception or extra Done round-trip.
         if let Some(planning) = &mut planning {
-            if let Some(reminder) =
-                planning.take_reminder(edited_paths.len(), !todo::snapshot().is_empty())
-            {
+            if let Some(reminder) = planning.take_reminder(&edited_paths) {
                 push_nudge_as(messages, cfg.nudge_role, PLAN_NUDGE_PREFIX, &reminder);
                 est_now = effective_tokens(
-                    estimate_request_tokens(messages, cfg) + schema_overhead,
+                    request_size(messages, schema_overhead, &defs),
                     real_anchor.as_ref(),
                 );
             }
@@ -1819,7 +2020,7 @@ where
         // not the answer — surface the error instead of thrashing.
         let mut overflow_shrinks: usize = 0;
         let call_control = cfg.delegated_call_cap.map(|cap| {
-            crate::llm::delegated::Control::new(cap, cfg.deadline, cfg.step_note.map(|s| s.0))
+            crate::llm::delegated::Control::new(cap, cfg.run_deadline(), cfg.step_note.map(|s| s.0))
         });
 
         let mut turn = if cfg.goal.is_some() {
@@ -1832,20 +2033,28 @@ where
             let mut attempt: u32 = 0;
             let mut permanent_tries: u32 = 0;
             loop {
-                check_background_effects()?;
+                check_background_effects().inspect_err(|_| {
+                    cfg.exec_ctx.note_task_effects_at(None);
+                })?;
                 // The loop-top deadline check is unreachable while we spin here — honor it here
                 // too, with the same shape (no synthesis call on an already-elapsed ceiling).
-                if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                if cfg
+                    .run_deadline()
+                    .is_some_and(|d| std::time::Instant::now() >= d)
+                {
                     if nudge_pushed {
                         messages.pop();
                     }
                     return Ok(AgentOutcome {
+                        speech_final_verified: false,
                         final_text: None,
                         iters: iter,
                         verification: design_verification(cfg, verify_passed, made_any_edits),
                         stop: StopReason::Deadline,
                     });
                 }
+                plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+                plan_boundary = plan_boundary.wrapping_add(1);
                 match crate::core::cancel::race(
                     &cfg.cancel,
                     crate::llm::delegated::run(
@@ -1860,6 +2069,7 @@ where
                             messages.pop();
                         }
                         return Ok(AgentOutcome {
+                            speech_final_verified: false,
                             final_text: None,
                             iters: iter,
                             verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -1924,6 +2134,7 @@ where
                                     messages.pop();
                                 }
                                 return Ok(AgentOutcome {
+                                    speech_final_verified: false,
                                     final_text: None,
                                     iters: iter,
                                     verification: design_verification(
@@ -1961,7 +2172,7 @@ where
                             overflow_shrinks += 1;
                             real_anchor = None; // history shrank under the anchor's feet
                             stall.forget_successes(); // evicted bodies must not mark re-reads stale
-                            est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
+                            est_now = request_size(messages, schema_overhead, &defs);
                             goal_retry_line("context overflow — cleared old tool results", 0);
                         }
                         // No budget, no backoff: the credential this call used is already gone
@@ -1997,6 +2208,7 @@ where
                                     messages.pop();
                                 }
                                 return Ok(AgentOutcome {
+                                    speech_final_verified: false,
                                     final_text: None,
                                     iters: iter,
                                     verification: design_verification(
@@ -2028,6 +2240,7 @@ where
                                     messages.pop();
                                 }
                                 return Ok(AgentOutcome {
+                                    speech_final_verified: false,
                                     final_text: None,
                                     iters: iter,
                                     verification: design_verification(
@@ -2099,19 +2312,27 @@ where
             let mut attempt: u32 = 0;
             let mut empty_nudges: usize = 0;
             loop {
-                check_background_effects()?;
+                check_background_effects().inspect_err(|_| {
+                    cfg.exec_ctx.note_task_effects_at(None);
+                })?;
                 // Same reason as the goal branch: the loop-top deadline check cannot fire while
                 // this retry loop spins, so a run that is out of time must stop HERE, not after
                 // the budget's worth of further 300s calls.
-                if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                if cfg
+                    .run_deadline()
+                    .is_some_and(|d| std::time::Instant::now() >= d)
+                {
                     rollback(messages, empty_nudges, nudge_pushed);
                     return Ok(AgentOutcome {
+                        speech_final_verified: false,
                         final_text: None,
                         iters: iter,
                         verification: design_verification(cfg, verify_passed, made_any_edits),
                         stop: StopReason::Deadline,
                     });
                 }
+                plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+                plan_boundary = plan_boundary.wrapping_add(1);
                 match crate::core::cancel::race(
                     &cfg.cancel,
                     crate::llm::delegated::run(
@@ -2124,6 +2345,7 @@ where
                     None => {
                         rollback(messages, empty_nudges, nudge_pushed);
                         return Ok(AgentOutcome {
+                            speech_final_verified: false,
                             final_text: None,
                             iters: iter,
                             verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -2196,6 +2418,7 @@ where
                         {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
+                                speech_final_verified: false,
                                 final_text: None,
                                 iters: iter,
                                 verification: design_verification(
@@ -2240,7 +2463,7 @@ where
                             overflow_shrinks += 1;
                             real_anchor = None;
                             stall.forget_successes();
-                            est_now = estimate_request_tokens(messages, cfg) + schema_overhead;
+                            est_now = request_size(messages, schema_overhead, &defs);
                             if !cfg.quiet {
                                 retry_line(
                                     "overflow",
@@ -2278,6 +2501,7 @@ where
                         {
                             rollback(messages, empty_nudges, nudge_pushed);
                             return Ok(AgentOutcome {
+                                speech_final_verified: false,
                                 final_text: None,
                                 iters: iter,
                                 verification: design_verification(
@@ -2292,6 +2516,14 @@ where
                 }
             }
         };
+
+        // A provider await may overlap an external same-ID edit or phase removal. Revalidate
+        // before tool preparation and the terminal gates, never treat old document prose as proof.
+        plan_boundary = plan_boundary.wrapping_add(1);
+        let plan_state = plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+        if let Some(planning) = &mut planning {
+            planning.observe_task(&plan_state);
+        }
 
         // Run-log: record the completed LLM turn (durable-run Phase 1). `request_hash` is a stable
         // hash of the message count + tool-call count — enough for a resume to detect "the context
@@ -2323,7 +2555,11 @@ where
         // else in the text, as an empty-200. Lift it into a real call ONLY when the native array is
         // empty and every name is a registered tool; prose with no such block is left alone. The
         // arguments go through the same `parse_call_args` repair as native calls.
-        if turn.tool_calls.is_empty() {
+        if turn.tool_calls.is_empty()
+            && !text_reply
+                .as_ref()
+                .is_some_and(|v| v.text_only && v.matches(messages))
+        {
             if let Some(text) = turn.content.as_deref() {
                 if let Some((calls, rest)) =
                     lenient::extract_text_tool_calls(text, |n| registry.get(n).is_some())
@@ -2336,6 +2572,7 @@ where
                     }
                     turn.tool_calls = calls;
                     turn.content = rest;
+                    turn.speech_final_verified = false;
                 }
             }
         }
@@ -2443,6 +2680,8 @@ where
             }
             // Set when THIS round's verify ran and failed — self-review must not spend its
             // once-per-run oracle call reviewing code that is known-broken.
+            plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+            completion::revalidate_after_plan_refresh(&plan_task)?;
             let mut verify_failed_now = false;
             // VERIFY/REPAIR GATE (F2 + W8): after an editing run, run a fast typecheck before Done.
             // On failure, record the premature "done", inject the errors, and loop back for a fix.
@@ -2451,18 +2690,18 @@ where
             // spent — it is NOT consumed by a single edit, so a model can no longer skip
             // verification by simply re-asserting "done" without editing (W8). `verify_passed`
             // latches a clean check; a FRESH successful edit clears it (see the edit block) so new
-            // work is always re-verified. Best-effort: an unknown project / missing toolchain → the
-            // gate returns None and this turn falls through to Done (never loops on absence).
+            // work is always re-verified. An unknown project or missing toolchain is surfaced
+            // once; its unresolved obligation still prevents Done after reminder exhaustion.
             if cfg.enable_verify_gate
                 && !managed_background_active()
-                && made_any_edits
-                && !verify_passed
+                && ((made_any_edits && !verify_passed)
+                    || cfg.exec_ctx.task().is_some_and(|task| task.needs_check()))
+                && !verify_absence_demanded
                 && verify_attempts < cfg.max_verify_attempts
             {
                 // Typecheck the tree the edits ACTUALLY landed in, not the process cwd. Since the
                 // confine guard was removed, a write can land outside cwd (a session launched from
-                // home editing `Desktop/proj/src/x.js`), and the checkpoint path already discovers
-                // the repo from the write target for exactly this reason — the gate must match, or it
+                // home editing `Desktop/proj/src/x.js`). Resolve from the target or the gate
                 // typechecks the wrong tree (or finds no manifest and skips verification silently).
                 // `verify_root` walks up from the edit dir to the nearest project manifest; falling
                 // back to this run's own root only when it never named an edit path (e.g. shell-only
@@ -2474,15 +2713,51 @@ where
                     .unwrap_or(cwd);
                 // The Done ladder: the typecheck, then the narrowest test the edited files name,
                 // then — on a multi-file change that fits the budget — the suite.
-                let gate = verify_gate::run_verify_ladder_in_context(
+                let gate = completion::run_checks(
+                    &cfg.exec_ctx,
                     &gate_dir,
                     cfg.verify_gate_timeout_secs,
                     &edited_paths,
                     cfg.quiet,
-                    &cfg.exec_ctx,
                 )
-                .await;
-                if gate.is_none() && !verify_absence_demanded && !cfg.cancel.is_cancelled() {
+                .await?;
+                plan_boundary = plan_boundary.wrapping_add(1);
+                plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+                if let Some(result) = gate
+                    .as_ref()
+                    .filter(|r| r.effect_state != tools::ToolEffectState::Settled)
+                {
+                    cfg.exec_ctx.note_task_effects();
+                    return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
+                        result.effect_state,
+                    ))
+                    .context(result.output.clone()));
+                }
+                // Cancellation/deadline during a verifier await is not an unavailable check and
+                // must never fall through to a successful final answer.
+                if cfg.cancel.is_cancelled()
+                    || cfg
+                        .run_deadline()
+                        .is_some_and(|d| std::time::Instant::now() >= d)
+                {
+                    return Ok(AgentOutcome {
+                        speech_final_verified: false,
+                        final_text: turn.content,
+                        iters: iter + 1,
+                        verification: design_verification(cfg, false, made_any_edits),
+                        stop: if cfg.cancel.is_cancelled() {
+                            StopReason::Cancelled
+                        } else {
+                            StopReason::Deadline
+                        },
+                    });
+                }
+                if gate
+                    .as_ref()
+                    .is_none_or(|r| r.termination == verify_gate::VerifyTermination::Unavailable)
+                    && !verify_absence_demanded
+                    && !cfg.cancel.is_cancelled()
+                {
                     verify_absence_demanded = true;
                     if !cfg.quiet {
                         crate::ui::tui::verify_line(
@@ -2492,7 +2767,10 @@ where
                     }
                     demands.push(verify_gate::ABSENCE_DEMAND.to_string());
                 }
-                if let Some(result) = gate.filter(|result| !result.background_deferred) {
+                if let Some(result) = gate.filter(|result| {
+                    !result.background_deferred
+                        && result.termination != verify_gate::VerifyTermination::Unavailable
+                }) {
                     if result.effect_state != tools::ToolEffectState::Settled {
                         return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
                             result.effect_state,
@@ -2525,7 +2803,9 @@ where
                                     crate::ui::tui::verify_line(&result.command, note.as_str());
                                 }
                             }
-                            (true, String::new())
+                            // Non-regression against a red baseline is useful context, not a clean
+                            // check and not authority to certify a completed task.
+                            (result.accepted(), verify_gate::format_gate_failure(&result))
                         } else if delta.new_diagnostics.is_empty() {
                             (false, verify_gate::format_gate_failure(&result))
                         } else {
@@ -2546,11 +2826,8 @@ where
                         if cfg.goal.is_some() {
                             goal::clear();
                         }
-                        // Once a phase has spent past half its repair budget, offer the rewind as an
-                        // explicit escape hatch: patching further is often more costly than dropping
-                        // back to the last clean phase mark and re-approaching. Reuses the existing
-                        // `recovery_hint` (respects the rewind budget; empty when none is left) — no
-                        // new state, just surfacing an option the model already has.
+                        // After repeated repair failure, explain the remaining recovery options
+                        // and coverage limits without implying a saved workspace baseline.
                         let mut failure_msg = failure_msg_body;
                         if verify_attempts * 2 >= cfg.max_verify_attempts {
                             if let Some(hint) = cfg.exec_ctx.recovery().hint(&cfg.effective_root())
@@ -2565,18 +2842,10 @@ where
                         // the gate (a fresh successful edit clears the latch → new work is
                         // re-verified).
                         verify_passed = true;
-                        // A clean verify is the OTHER phase boundary (decision: todo-close AND
-                        // verify-pass both mark phases). This catches the no-todo run — the model
-                        // edited and finished without ever flipping a todo, so
-                        // `phase_boundary_crossed` never fired. Stamp the still-uncheckpointed edits
-                        // ONCE here as a verified phase. Gated on `made_edits_in_phase` so a no-edit
-                        // "done" (latch already clean) stamps nothing; `save` dedups a zero-diff
-                        // tree so it's free when the last todo boundary already captured this tree.
-                        if cfg.checkpoint_each_edit && made_edits_in_phase {
+                        // Record genuinely verified work, including runs without a TODO list.
+                        if made_edits_in_phase {
                             phase_counter += 1;
                             let label = format!("phase {phase_counter} verified");
-                            let checkpoint_saved =
-                                stamp_phase_checkpoint(cfg, last_edit_dir.as_deref(), &label);
                             // Run-log: record the phase boundary so a crash leaves a durable trace
                             // of which phases completed (durable-run Phase 1).
                             if let Some(log) = runlog.as_mut() {
@@ -2586,7 +2855,7 @@ where
                                     body: String::new(),
                                 });
                             }
-                            made_edits_in_phase = !checkpoint_saved;
+                            made_edits_in_phase = false;
                             phase_todos_before = crate::agent::todo::snapshot();
                         }
                     }
@@ -2617,6 +2886,7 @@ where
                     }
                 }
                 return Ok(AgentOutcome {
+                    speech_final_verified: false,
                     final_text,
                     iters: iter + 1,
                     verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -2638,7 +2908,10 @@ where
                     // note (so the user sees the cleanup suggestions) but does NOT hold Done — the
                     // model isn't forced to churn on style. LGTM / no-diff falls straight through.
                     Some(o) => {
-                        if let Some(review) = oracle_review(o, &review_request).await {
+                        let review = oracle_review(o, &review_request).await;
+                        plan_boundary = plan_boundary.wrapping_add(1);
+                        plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+                        if let Some(review) = review {
                             if review.blocking {
                                 demands.push(format!(
                                     "[self-review]\n{}\n\nFix each [BLOCKING] item above, or state briefly why it does not apply — then give your final answer. [ADVISORY] items are optional.",
@@ -2671,6 +2944,7 @@ where
                         emit_trace("→ model requested a thread refresh (REFRESH:)");
                     }
                     return Ok(AgentOutcome {
+                        speech_final_verified: false,
                         final_text: turn.content,
                         iters: iter + 1,
                         verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -2679,10 +2953,20 @@ where
                 }
             }
 
-            // P0.1 INCOMPLETE-TODO GATE: text-only while session todos still open → poke, don't Done.
-            // Empty list is a no-op (trivial tasks / model never used todos). Exhausted budget → Done.
-            // Sub-agents leave enable_todo_poke false (process-global list ≠ ScopedTodo).
+            plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+            completion::revalidate_after_plan_refresh(&plan_task)?;
+            let report_ready = turn
+                .content
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+                && cfg
+                    .exec_ctx
+                    .task()
+                    .is_some_and(|task| task.only_report_pending());
+            // Reminders are bounded advice. The final completion decision below is enforced even
+            // when nudging is disabled or its budget has been exhausted.
             if cfg.enable_todo_poke
+                && !report_ready
                 && cfg.max_todo_poke_attempts > 0
                 && todo_poke_attempts < cfg.max_todo_poke_attempts
             {
@@ -2702,8 +2986,9 @@ where
                     demands.push(format!(
                         "{TODO_POKE_PREFIX} Session todos are still incomplete — you may not finish yet.\n\n\
                          Incomplete:\n{summary}\n\n\
-                         Either (a) finish the remaining items and verify, or (b) mark items done only \
-                         if genuinely complete, or (c) clear the todo list to abandon the plan — then stop.\n\
+                         Either finish the remaining work and satisfy its evidence requirements, or \
+                         explain what remains incomplete. Clearing the list abandons work; it does not \
+                         certify completion.\n\
                          Attempt {todo_poke_attempts}/{}.",
                         cfg.max_todo_poke_attempts
                     ));
@@ -2777,6 +3062,7 @@ where
                 );
                 messages.push(Message::assistant(text.clone()));
                 return Ok(AgentOutcome {
+                    speech_final_verified: false,
                     final_text: Some(text),
                     iters: iter + 1,
                     verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -2793,7 +3079,13 @@ where
             // `continue`s earlier in this same block. So Done in goal mode ⟺ declared + verified.
             // There is no iteration cap in goal mode, so this poke can re-fire indefinitely — the run
             // ends only on genuine completion (here) or Esc (`cancel::race` above).
-            if let Some(goal_text) = &cfg.goal {
+            if let Some(goal_text) = cfg.goal.as_ref().filter(|_| {
+                report_ready
+                    || !cfg
+                        .exec_ctx
+                        .task()
+                        .is_some_and(|task| task.completion_pending())
+            }) {
                 if goal::take_pending().is_none() {
                     if !cfg.quiet {
                         let line = "→ goal: not complete yet — keep working";
@@ -2838,6 +3130,11 @@ where
             if cfg.enable_steering {
                 let steers = crate::core::steer::drain();
                 if !steers.is_empty() {
+                    if let Some(planning) = &mut planning {
+                        for request in &steers {
+                            planning.observe_request(request);
+                        }
+                    }
                     let injected = crate::core::steer::format_injection(&steers);
                     review_request.push_str("\n\nSteering requirements:\n");
                     review_request.push_str(&injected);
@@ -2873,6 +3170,7 @@ where
 
             let mut final_text = turn.content;
             let evidence = design_evidence_summary(cfg, verify_passed, made_any_edits);
+            let speech_final_verified = turn.speech_final_verified && evidence.is_empty();
             if !evidence.is_empty() {
                 let text = final_text.get_or_insert_with(String::new);
                 if !text.is_empty() {
@@ -2886,12 +3184,27 @@ where
                     messages.push(Message::assistant(t.clone()));
                 }
             }
-            return Ok(AgentOutcome {
+            if final_text
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+            {
+                if let Some(task) = cfg.exec_ctx.task() {
+                    task.record_report()?;
+                }
+            }
+            let mut outcome = AgentOutcome {
+                speech_final_verified,
                 final_text,
                 iters: iter + 1,
                 verification: design_verification(cfg, verify_passed, made_any_edits),
-                stop: StopReason::Done,
-            });
+                stop: if proposal_applications.rejected() {
+                    StopReason::Incomplete
+                } else {
+                    StopReason::Done
+                },
+            };
+            outcome.reconcile_task_completion(&cfg.exec_ctx, &cfg.cancel);
+            return Ok(outcome);
         }
 
         // Reaching the tool path means this turn HAS tool calls, i.e. work is genuinely continuing —
@@ -2927,6 +3240,7 @@ where
                 )
                 .await;
                 return Ok(AgentOutcome {
+                    speech_final_verified: false,
                     final_text: final_text.answer,
                     iters: iter + 1,
                     verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -3023,7 +3337,6 @@ where
             cfg,
             &mut messages[base..],
             eager,
-            &mut auto_checkpointed,
             &mut writer_lease,
             &mut verify_baseline,
             &cache_candidates,
@@ -3059,48 +3372,27 @@ where
             .iter()
             .find(|execution| execution.effect_state != tools::ToolEffectState::Settled)
         {
+            cfg.exec_ctx.note_task_effects();
             return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(execution.effect_state))
                 .context(format!("call {} retained its actual tool result; the coordinating parent must inspect eventual effects", execution.call_id)));
         }
 
-        check_background_effects()?;
-
-        if let Some(planning) = &mut planning {
-            for (call, execution) in calls.iter().zip(&executions) {
-                if call.function.name != "file_read" || execution.outcome.failure.is_some() {
-                    continue;
-                }
-                if let Some(prepared) = &execution.prepared {
-                    if let Some(path) = prepared
-                        .args
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        planning.observe_path(&cfg.effective_root(), std::path::Path::new(path));
-                    }
-                    if let Some(files) = prepared
-                        .args
-                        .get("files")
-                        .and_then(serde_json::Value::as_array)
-                    {
-                        for file in files {
-                            if let Some(path) = file.get("path").and_then(serde_json::Value::as_str)
-                            {
-                                planning.observe_path(
-                                    &cfg.effective_root(),
-                                    std::path::Path::new(path),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+        if let Err(error) = check_background_effects() {
+            cfg.exec_ctx.note_task_effects();
+            return Err(error);
         }
+
+        // The single attached document, not a filename observed in tool output, determines
+        // whether this run has a usable saved plan. Refresh after cache indices are recorded below.
 
         // Settled actual mutations arm verification, including a delegated write followed by a
         // failed child step. Denied/no-op calls without recorded changes do not arm it.
+        for (call, execution) in calls.iter().zip(&executions) {
+            proposal_applications.observe(cfg, registry, call, execution);
+        }
         let edited_this_turn = calls.iter().zip(&executions).any(|(call, execution)| {
             call.function.name != "native_owner_undo"
+                && !execution.delivered_plan()
                 && registry
                     .get(&call.function.name)
                     .is_some_and(|tool| execution.changed_workspace(tool))
@@ -3114,8 +3406,8 @@ where
             verify_passed = false;
             // Remember WHERE this turn's edit landed so the verify gate typechecks that tree, not the
             // process cwd. Take the target of the LAST edit whose result wasn't an error/no-op — the
-            // same successful-op filter `turn_made_edits` used — matching the checkpoint's
-            // `target_dir` discovery. A named path yields its parent dir; `None` (e.g. `shell_run`)
+            // same successful-op filter `turn_made_edits` used. A named path yields its parent dir;
+            // `None` (e.g. `shell_run`)
             // leaves the previous value, so the gate falls back to cwd only when nothing better exists.
             for (tc, execution) in calls.iter().zip(&executions) {
                 let Some(prepared) = execution.prepared.as_ref() else {
@@ -3124,26 +3416,22 @@ where
                 let Some(t) = registry.get(&tc.function.name) else {
                     continue;
                 };
-                if !execution.changed_workspace(t) {
+                if tc.function.name == "native_owner_undo"
+                    || execution.delivered_plan()
+                    || !execution.changed_workspace(t)
+                {
                     continue;
                 }
                 if let Some(dir) = t.workspace_target_prepared(prepared) {
                     last_edit_dir = Some(dir);
                 }
                 for p in prepared_edit_paths(&cfg.effective_root(), &tc.function.name, prepared) {
-                    if let Some(planning) = &mut planning {
-                        planning.observe_path(&cfg.effective_root(), &p);
-                    }
                     if !edited_paths.contains(&p) {
                         edited_paths.push(p);
                     }
                 }
             }
-            // A successful edit belongs to the CURRENT phase. The checkpoint is no longer stamped
-            // here (one-per-edit made the timeline unreadable) — it is deferred to the phase boundary
-            // just below, so a run of N edits inside one phase yields ONE restore point, not N. This
-            // flag gates that stamp: a phase that only talked (todo flipped, no file change) captures
-            // nothing.
+            // Record a verified phase only when actual edits remain since the last phase event.
             made_edits_in_phase = true;
         }
 
@@ -3167,6 +3455,7 @@ where
                     .zip(&executions)
                     .filter(|(call, execution)| {
                         call.function.name != "native_owner_undo"
+                            && !execution.delivered_plan()
                             && registry
                                 .get(&call.function.name)
                                 .is_some_and(|t| execution.changed_workspace(t))
@@ -3184,6 +3473,7 @@ where
                     .as_deref()
                     .and_then(verify_gate::verify_root)
                     .unwrap_or(cwd);
+                let task_capture = cfg.exec_ctx.task().map(|task| task.evidence_captures());
                 if let Some(result) = verify_gate::run_verify_gate_in_context(
                     &gate_dir,
                     cfg.verify_gate_timeout_secs,
@@ -3193,16 +3483,20 @@ where
                 .filter(|result| !result.background_deferred)
                 {
                     if result.effect_state != tools::ToolEffectState::Settled {
+                        cfg.exec_ctx.note_task_effects();
                         return Err(anyhow::Error::new(tools::ToolEffectsUnsettled(
                             result.effect_state,
                         ))
                         .context(result.output));
                     }
+                    if let (Some(task), Some(tokens)) = (cfg.exec_ctx.task(), task_capture) {
+                        completion::record_gate(task, tokens, &gate_dir, &result)?;
+                    }
                     let (ok, failure) = match &verify_baseline {
                         Some(b) => {
                             let d = verify_gate::compare_to_baseline(b, &result);
                             if d.passed {
-                                (true, String::new())
+                                (result.accepted(), verify_gate::format_gate_failure(&result))
                             } else if d.new_diagnostics.is_empty() {
                                 (false, verify_gate::format_gate_failure(&result))
                             } else {
@@ -3238,43 +3532,21 @@ where
             append_to_last_tool_result(&mut messages[base..], &extra);
         }
 
-        // PHASE CHECKPOINT (replaces the old per-edit-turn snapshot). A "phase" is a unit of work the
-        // model marks in its todo list; the timeline stamps ONE checkpoint when a phase CLOSES —
-        // an item reaching Done, or focus moving to a new in_progress item (see
-        // `todo::phase_boundary_crossed`) — instead of one per edit. Gated on `made_edits_in_phase`
-        // so an all-talk phase stamps nothing, and `save` dedups a zero-diff tree so a phase that only
-        // ran a build costs nothing either. Behind the same `checkpoint_each_edit` latch as before
-        // (ON in production, OFF in tests / workflow children), and checked OUTSIDE the
-        // `edited_this_turn` block because the closing `todo_write` can land on a turn that itself made
-        // no file edit. `note_last_good` moves to the phase mark here, so `checkpoint_rewind
-        // target=last_good` lands at the last CLEAN phase, not mid-phase.
-        if cfg.checkpoint_each_edit {
-            let phase_todos_after = crate::agent::todo::snapshot();
-            if made_edits_in_phase {
-                if let Some(label) = crate::agent::todo::phase_boundary_crossed(
-                    &phase_todos_before,
-                    &phase_todos_after,
-                ) {
-                    let checkpoint_saved = stamp_phase_checkpoint(
-                        cfg,
-                        last_edit_dir.as_deref(),
-                        &format!("phase: {label}"),
-                    );
-                    // Run-log: record the phase boundary so a crash leaves a durable trace
-                    // of which phases completed (durable-run Phase 1).
-                    if let Some(log) = runlog.as_mut() {
-                        let _ = log.record(crate::agent::runlog::Event::Note {
-                            seq: 0, // writer stamps the real seq
-                            label: format!("phase: {label}"),
-                            body: String::new(),
-                        });
-                    }
-                    made_edits_in_phase = !checkpoint_saved;
-                }
+        // A TODO transition is a real phase event, not evidence of verification or recovery.
+        let phase_todos_after = crate::agent::todo::snapshot();
+        if let Some(label) =
+            crate::agent::todo::phase_boundary_crossed(&phase_todos_before, &phase_todos_after)
+        {
+            if let Some(log) = runlog.as_mut() {
+                let _ = log.record(crate::agent::runlog::Event::Note {
+                    seq: 0, // writer stamps the real seq
+                    label: format!("phase: {label}"),
+                    body: "TODO phase transition; verification is recorded separately".into(),
+                });
             }
-            // Track the latest list so the next boundary is measured against it, moved or not.
-            phase_todos_before = phase_todos_after;
+            made_edits_in_phase = false;
         }
+        phase_todos_before = phase_todos_after;
 
         // Remember this turn's file_read answers for the identical-re-read short-circuit. Only from
         // turns with NO destructive call: a write in the same turn could have rewritten the file
@@ -3356,6 +3628,18 @@ where
             }
         }
 
+        // A host-designated architect draft becomes saved only after its exact native write
+        // succeeds and a checked readback matches the logical ID. This is not a check waiver.
+        architect::attach_saved_document(cfg, registry, &calls, &executions)?;
+
+        // All tool-result indices above are settled before replacing the plan lane. A tool may
+        // attach or rewrite the contract, so the next gates and model round need fresh bytes.
+        plan_boundary = plan_boundary.wrapping_add(1);
+        let plan_state = plan_refresh.refresh(plan_boundary, &plan_task, messages)?;
+        if let Some(planning) = &mut planning {
+            planning.observe_task(&plan_state);
+        }
+
         // BATCH-COACH: three consecutive turns that each made exactly ONE read-only retrieval call
         // is the dribble pattern the system prompt already warns about — name it mid-run, where the
         // habit is visible. A system nudge rides the NEXT request (zero extra round-trips), once
@@ -3396,12 +3680,37 @@ where
         // completes todo work. Failures are keyed by (tool, normalized error class), deliberately not
         // by args: changing arguments cannot disguise the same failure, while a genuinely different
         // failure class records a ruled-out cause. Repeated success bytes are likewise not new facts.
+        let matched: Vec<_> = calls
+            .iter()
+            .zip(&results)
+            .filter(|(call, _)| call.function.name == "tool_search")
+            .flat_map(|(_, (_, result))| tool_search::discovered_names(result, registry))
+            .collect();
+        if tool_search::select_matches(registry, &mut defs, &matched) {
+            if goal_mode {
+                defs.retain(|def| def.function.name != clarify::NAME);
+            }
+            schema_overhead = estimate_defs_tokens(&defs);
+            real_anchor = None;
+        }
         let mut learned = false;
+
         for (tc, (_, result)) in calls.iter().zip(&results) {
             learned |= if result_is_failure(registry, &tc.function.name, result) {
                 stall.note_failure(&tc.function.name, result)
             } else {
-                stall.note_success(result)
+                let novel = stall.note_success(result);
+                if novel && !cfg.cancel.is_cancelled() {
+                    if let Some(budget) = &cfg.adaptive_time {
+                        budget.note_progress(
+                            std::time::Instant::now(),
+                            time_step_started.elapsed(),
+                            &tc.function.name,
+                            result,
+                        );
+                    }
+                }
+                novel
             };
         }
         // Todo completion counts as evidence only when THIS turn wrote the list. The list is
@@ -3483,6 +3792,7 @@ where
             )
             .await;
             return Ok(AgentOutcome {
+                speech_final_verified: false,
                 final_text: final_text.answer,
                 iters: iter + 1,
                 verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -3559,9 +3869,10 @@ where
         // Checked after the tool results are appended so `messages` is a valid, resumable history.
         // Gated on a clarify call actually firing this turn (not just "is the cell non-empty") so a
         // turn that never asked can't drain a stale value.
-        if calls.iter().any(|c| c.function.name == clarify::NAME) {
+        if !goal_mode && calls.iter().any(|c| c.function.name == clarify::NAME) {
             if let Some(ask) = clarify::take_pending() {
                 return Ok(AgentOutcome {
+                    speech_final_verified: false,
                     final_text: None,
                     iters: iter,
                     verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -3613,6 +3924,7 @@ where
     )
     .await;
     Ok(AgentOutcome {
+        speech_final_verified: false,
         final_text: final_text.answer,
         iters: iter,
         verification: design_verification(cfg, verify_passed, made_any_edits),
@@ -3645,12 +3957,24 @@ where
         };
     }
     let ceiling = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let deadline = cfg.deadline.map_or(ceiling, |d| d.min(ceiling));
+    let deadline = cfg.run_deadline().map_or(ceiling, |d| d.min(ceiling));
     if std::time::Instant::now() >= deadline {
         return SynthesisOutcome {
             answer: None,
             stop: Some(StopReason::Deadline),
         };
+    }
+    let mut plan_refresh = prompt_lanes::PlanContextRefresh::default();
+    if let Some(task) = cfg.exec_ctx.task() {
+        if let Err(error) = plan_refresh.refresh(0, task, messages) {
+            if !cfg.quiet {
+                emit_trace(&format!("final synthesis refused: {error}"));
+            }
+            return SynthesisOutcome {
+                answer: None,
+                stop: Some(StopReason::Incomplete),
+            };
+        }
     }
     let mut synth = messages.clone();
     synth.push(Message::user(why));
@@ -3661,6 +3985,17 @@ where
             return SynthesisOutcome { answer: None, stop: Some(StopReason::Deadline) },
         result = chat(synth, Vec::new()) => result,
     };
+    if let Some(task) = cfg.exec_ctx.task() {
+        if let Err(error) = plan_refresh.refresh(1, task, messages) {
+            if !cfg.quiet {
+                emit_trace(&format!("final synthesis refresh failed: {error}"));
+            }
+            return SynthesisOutcome {
+                answer: None,
+                stop: Some(StopReason::Incomplete),
+            };
+        }
+    }
     let answer = turn
         .ok()
         .and_then(|turn| turn.content)
@@ -3693,9 +4028,28 @@ fn safe_tool_ceiling() -> std::time::Duration {
 
 fn safe_tool_deadline(cfg: &AgentConfig) -> tokio::time::Instant {
     let ceiling = tokio::time::Instant::now() + safe_tool_ceiling();
-    cfg.deadline
+    cfg.run_deadline()
         .map(tokio::time::Instant::from_std)
         .map_or(ceiling, |d| d.min(ceiling))
+}
+
+/// A prepared delegated Task or reader Workflow has its own bounded wall policy. Giving it the generic ten-minute
+/// safe-tool observer would truncate even its initial twenty-minute window before adaptive grants
+/// could help. Freeze the observer once before launch, using the actual private dispatch contract;
+/// ordinary tools keep their existing ceiling and the parent's effective deadline always wins.
+fn prepared_tool_deadline(
+    cfg: &AgentConfig,
+    prepared: &tools::PreparedToolCall,
+) -> tokio::time::Instant {
+    let Some(child) = task_tool::prepared_wall_deadline(prepared)
+        .or_else(|| workflow_tool::prepared_wall_deadline(prepared))
+    else {
+        return safe_tool_deadline(cfg);
+    };
+    let child = tokio::time::Instant::from_std(child);
+    cfg.run_deadline()
+        .map(tokio::time::Instant::from_std)
+        .map_or(child, |parent| child.min(parent))
 }
 
 /// The pre-fill placeholder for a tool result whose call never completed (the turn future was
@@ -3726,7 +4080,6 @@ async fn execute_calls(
     cfg: &AgentConfig,
     sink: &mut [Message],
     eager: Vec<(usize, tools::StartedSafeCall)>,
-    auto_checkpointed: &mut bool,
     writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
 ) -> Vec<(String, String)> {
     let scoped = match pin_placement_context(cfg) {
@@ -3751,7 +4104,6 @@ async fn execute_calls(
         &scoped,
         sink,
         eager,
-        auto_checkpointed,
         writer_lease,
         &mut None,
         &[],
@@ -3765,7 +4117,10 @@ async fn execute_calls(
 fn unstarted_tool_error(cfg: &AgentConfig) -> Option<&'static str> {
     if cfg.cancel.is_cancelled() {
         Some("error: cancelled by user")
-    } else if cfg.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+    } else if cfg
+        .run_deadline()
+        .is_some_and(|d| std::time::Instant::now() >= d)
+    {
         Some("error: absolute run deadline elapsed; tool was not started")
     } else {
         None
@@ -3780,6 +4135,9 @@ fn plan_execution_calls(
     calls
         .iter()
         .map(|call| {
+            if cfg.goal.is_some() && call.function.name == clarify::NAME {
+                return Err("error: Clarification is disabled in goal mode. Continue under a safe assumption or report the blocker.".into());
+            }
             let (args, repair) = prepare_call_args(registry, call)?;
             if let Some(what) = repair {
                 if !cfg.quiet {
@@ -3787,9 +4145,15 @@ fn plan_execution_calls(
                 }
             }
             match registry.get(&call.function.name) {
-                Some(tool) => tool
-                    .plan_call(&args, &cfg.exec_ctx)
-                    .map_err(|error| format!("error: {error}")),
+                Some(tool) => {
+                    planning::check_tool(&cfg.exec_ctx, tool)
+                        .map_err(|error| format!("error: {error}"))?;
+                    let mut prepared = tool
+                        .plan_call(&args, &cfg.exec_ctx)
+                        .map_err(|error| format!("error: {error}"))?;
+                    prepared.workspace_binding = cfg.exec_ctx.workspace_binding().cloned();
+                    Ok(prepared)
+                }
                 None => Ok(tools::PreparedToolCall::new(args)),
             }
         })
@@ -3813,7 +4177,7 @@ fn prepare_execution_calls(
             }
             match registry.get(&call.function.name) {
                 Some(tool) => tool
-                    .prepare_call(&args, &cfg.exec_ctx)
+                    .prepare_checked(&args, &cfg.exec_ctx)
                     .map_err(|error| format!("error: {error}")),
                 None => Ok(tools::PreparedToolCall::new(args)),
             }
@@ -3840,10 +4204,6 @@ fn effective_calls(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Regression adapter mirrors the production dispatch boundary"
-)]
 async fn execute_prepared_calls(
     registry: &ToolRegistry,
     calls: &[ToolCall],
@@ -3851,7 +4211,6 @@ async fn execute_prepared_calls(
     cfg: &AgentConfig,
     sink: &mut [Message],
     eager: Vec<(usize, tools::StartedSafeCall)>,
-    auto_checkpointed: &mut bool,
     writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
 ) -> Vec<(String, String)> {
     execute_execution_calls(
@@ -3862,7 +4221,6 @@ async fn execute_prepared_calls(
         cfg,
         sink,
         eager,
-        auto_checkpointed,
         writer_lease,
         &mut None,
         &[],
@@ -3885,7 +4243,6 @@ async fn execute_execution_calls(
     cfg: &AgentConfig,
     sink: &mut [Message],
     eager: Vec<(usize, tools::StartedSafeCall)>,
-    auto_checkpointed: &mut bool,
     writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
     verify_baseline: &mut Option<verify_gate::VerifyBaseline>,
     cache_candidates: &[Option<ReadCacheEntry>],
@@ -3898,7 +4255,6 @@ async fn execute_execution_calls(
         cfg,
         sink,
         eager,
-        auto_checkpointed,
         writer_lease,
         verify_baseline,
         cache_candidates,
@@ -3919,7 +4275,6 @@ async fn execute_execution_calls_with_policy(
     cfg: &AgentConfig,
     sink: &mut [Message],
     eager: Vec<(usize, tools::StartedSafeCall)>,
-    auto_checkpointed: &mut bool,
     writer_lease: &mut Option<crate::core::workspace_txn::WorkspaceWriterLease>,
     verify_baseline: &mut Option<verify_gate::VerifyBaseline>,
     cache_candidates: &[Option<ReadCacheEntry>],
@@ -3942,6 +4297,16 @@ async fn execute_execution_calls_with_policy(
     // made at its execution boundary; original provider calls remain untouched.
 
     let mut parsed = planned.to_vec();
+    for prepared in &mut parsed {
+        if let Ok(call) = prepared {
+            if let Err(error) = cfg
+                .exec_ctx
+                .require_current_binding(call.workspace_binding.as_ref())
+            {
+                *prepared = Err(format!("error: {error}"));
+            }
+        }
+    }
     for (&position, started) in &eager {
         if let Some(prepared) = parsed.get_mut(position) {
             *prepared = Ok(started.prepared().clone());
@@ -4039,93 +4404,6 @@ async fn execute_execution_calls_with_policy(
                 continue;
             }
         }
-        // Speculative scopes may overlap only inside a controller-seated common-base cohort.
-        // Direct native calls below retain their existing read/write conflict barriers.
-        let mut speculative = Vec::new();
-        for k in i..n.min(i + MAX_PARALLEL) {
-            let Some(tool) = registry.get_arc(&calls[k].function.name) else {
-                break;
-            };
-            if tool.name() != "task" || eager.contains_key(&k) {
-                break;
-            }
-            if bind_at_boundary && parsed[k].as_ref().is_ok_and(|p| p.delegation.is_none()) {
-                parsed[k] = tool
-                    .prepare_call(
-                        &planned[k]
-                            .as_ref()
-                            .expect("parsed task has planned args")
-                            .args,
-                        &cfg.exec_ctx,
-                    )
-                    .map_err(|error| format!("error: {error}"));
-            }
-            let Ok(prepared) = &parsed[k] else { break };
-            if task_tool::speculative_scope(prepared).is_none() {
-                break;
-            }
-            speculative.push((k, tool, prepared.clone()));
-        }
-        if !speculative.is_empty() {
-            let end = i + speculative.len();
-            let mut approved = Vec::new();
-            for (k, tool, prepared) in speculative {
-                if let Some(denied) = gate_prepared_and_approve(tool.as_ref(), &prepared, cfg) {
-                    land(
-                        k,
-                        note_unrun_prepared_call(tool.name(), &prepared, denied, cfg).into(),
-                        &mut results,
-                        sink,
-                    );
-                } else {
-                    approved.push((k, tool, prepared));
-                }
-            }
-            if !approved.is_empty() && cfg.enable_verify_gate && verify_baseline.is_none() {
-                let root = cfg.effective_root();
-                let gate_dir = verify_gate::verify_root(&root).unwrap_or(root);
-                if let Some(baseline) = verify_gate::run_verify_gate_in_context(
-                    &gate_dir,
-                    cfg.verify_gate_timeout_secs,
-                    &cfg.exec_ctx,
-                )
-                .await
-                {
-                    if baseline.effect_state != tools::ToolEffectState::Settled {
-                        for (k, tool, prepared) in approved.drain(..) {
-                            land(
-                                k,
-                                tools::ToolOutcome::failed_with_effect_state(
-                                    note_unrun_prepared_call(
-                                        tool.name(),
-                                        &prepared,
-                                        baseline.output.clone(),
-                                        cfg,
-                                    ),
-                                    baseline.effect_state,
-                                ),
-                                &mut results,
-                                sink,
-                            );
-                        }
-                        cancelled = true;
-                    } else if !baseline.background_deferred {
-                        *verify_baseline = Some(verify_gate::baseline_from_result(&baseline));
-                    }
-                }
-            }
-            if !approved.is_empty() {
-                for (k, prepared, outcome) in speculation::run_task_cohort(approved, cfg).await {
-                    parsed[k] = Ok(prepared);
-                    if outcome.effect_state != tools::ToolEffectState::Settled {
-                        cancelled = true;
-                    }
-                    land(k, outcome, &mut results, sink);
-                }
-            }
-            i = end;
-            continue;
-        }
         if scoped_native_parallel {
             let mut batch = Vec::new();
             let mut occupied: Vec<crate::core::native_scope::NativeWriteScope> = Vec::new();
@@ -4140,7 +4418,7 @@ async fn execute_execution_calls_with_policy(
                         .is_ok_and(|prepared| prepared.delegation.is_none())
                 {
                     parsed[k] = tool
-                        .prepare_call(
+                        .prepare_checked(
                             &planned[k]
                                 .as_ref()
                                 .expect("parsed task has planned args")
@@ -4236,7 +4514,7 @@ async fn execute_execution_calls_with_policy(
                             calls[k].id.clone(),
                             prepared,
                             cancel.clone(),
-                            safe_tool_deadline(cfg),
+                            prepared_tool_deadline(cfg, &body_args),
                             cfg.exec_ctx.tool_workers(),
                             move || {
                                 crate::core::cancel::with_current(cancel, || {
@@ -4307,7 +4585,7 @@ async fn execute_execution_calls_with_policy(
                     if bind_at_boundary && parsed[k].as_ref().is_ok_and(|p| p.delegation.is_none())
                     {
                         parsed[k] = tool
-                            .prepare_call(
+                            .prepare_checked(
                                 &planned[k].as_ref().expect("safe ⇒ planned").args,
                                 &cfg.exec_ctx,
                             )
@@ -4337,7 +4615,7 @@ async fn execute_execution_calls_with_policy(
                     }
                     let quiet = cfg.quiet && !crate::ui::events::on();
                     let budgets = cfg.result_budgets();
-                    let deadline = safe_tool_deadline(cfg);
+                    let deadline = prepared_tool_deadline(cfg, &args);
                     let delegated = args.delegation.is_some();
                     let cancel = if delegated {
                         cfg.cancel.child()
@@ -4444,11 +4722,11 @@ async fn execute_execution_calls_with_policy(
         } else {
             // BARRIER: bind after earlier calls have completed, before approval or effects.
             let name = calls[i].function.name.as_str();
-            if bind_at_boundary {
+            if bind_at_boundary && parsed[i].is_ok() {
                 if let (Some(tool), Ok(intent)) = (registry.get(name), &planned[i]) {
                     if intent.delegation.is_none() {
                         parsed[i] = tool
-                            .prepare_call(&intent.args, &cfg.exec_ctx)
+                            .prepare_checked(&intent.args, &cfg.exec_ctx)
                             .map_err(|e| format!("error: {e}"));
                     }
                 }
@@ -4481,12 +4759,16 @@ async fn execute_execution_calls_with_policy(
                                 }.err().map(|error| {
                                     format!("error: approved managed destination unavailable: {error}")
                                 }));
-                                // WHERE the write lands (a directory), when the tool names a path. The
-                                // checkpoint gate below discovers the repository from here rather than
-                                // from cwd; see the comment at its `save_protected_change_in` call.
+                                // Discover lease and verification identity from the actual target,
+                                // never from the process cwd when the tool names another directory.
                                 let target_dir = tool.workspace_target_prepared(args);
                                 let resource_only = cfg.exec_ctx.native_scope().is_some()
-                                    || tool.name() == "native_owner_undo"
+                                    || builtin::plan_write_proof(args).is_some_and(|proof| {
+                                        proof.check_prepared(&cfg.exec_ctx, args).is_ok()
+                                    })
+                                    // Git changes acquire their own writer/background/registration
+                                    // leases inside the exact approved PreparedChange.
+                                    || matches!(tool.name(), "native_owner_undo" | "git_change")
                                     || (args.delegation.is_some()
                                         && matches!(tool.name(), "task" | "workflow"));
                                 let background_active = matches!(
@@ -4495,8 +4777,6 @@ async fn execute_execution_calls_with_policy(
                                 );
                                 if background_active {
                                     *verify_baseline = None;
-                                    *auto_checkpointed = false;
-                                    crate::core::recovery::set_checkpoint(None);
                                     crate::features::coop::note_background_coverage_gap();
                                     cfg.exec_ctx.recovery().defer_background_coverage();
                                 }
@@ -4506,7 +4786,7 @@ async fn execute_execution_calls_with_policy(
                                     && tool.name() != "native_owner_undo"
                                     && cfg.enable_verify_gate
                                     && verify_baseline.is_none()
-                                    && effect.needs_checkpoint()
+                                    && effect.mutates_workspace()
                                 {
                                     let root =
                                         target_dir.clone().unwrap_or_else(|| cfg.effective_root());
@@ -4581,106 +4861,7 @@ async fn execute_execution_calls_with_policy(
                                 } else {
                                     None
                                 };
-                                // `checkpoint` action=rewind IS the recovery path — never nest a pre-edit
-                                // snapshot of the broken tree before undoing it.
-                                let skip_pre_checkpoint = resource_only
-                                    || crate::features::timemachine::is_rewind_call(
-                                        tool.name(),
-                                        args,
-                                    );
-                                let checkpoint_error = if let Some(error) = lease_error {
-                                    Some(error)
-                                } else if skip_pre_checkpoint {
-                                    None
-                                } else if cfg.auto_checkpoint
-                                    && (effect.needs_checkpoint()
-                                        || (target_dir.is_some()
-                                            && !args.file.as_ref().is_some_and(|file| {
-                                                (file.destination.is_managed()
-                                                    || file.source_managed)
-                                                    && effect == tools::WorkspaceEffect::External
-                                            })))
-                                {
-                                    // Discover the work tree from WHERE THE WRITE LANDS, not from the
-                                    // process's cwd. The two differ constantly — a session launched from
-                                    // the home directory editing `Desktop/proj/src/x.js` — and asking the
-                                    // wrong one produced both of this turn's failures: no repo at cwd
-                                    // meant `External`, whose old arm refused the call outright with
-                                    // "narrow the path" (meaningless when the sibling project IS the
-                                    // target; and because the refusal was DETERMINISTIC the model
-                                    // retried until the divergence guard killed the run), while the
-                                    // fallback advice was to `git init` — in the user's HOME DIRECTORY,
-                                    // with the real `.git` sitting one level down. Asked from the target
-                                    // instead, that same write is an ordinary in-repo edit with full
-                                    // rewind coverage. `None` (no path named, e.g. `shell_run`) keeps
-                                    // the cwd-relative behavior.
-                                    let checkpoint_root =
-                                        target_dir.clone().unwrap_or_else(|| cfg.effective_root());
-                                    match crate::features::timemachine::save_for_in_context(
-                                    cfg.exec_ctx.recovery(), &checkpoint_root,
-                                    crate::features::timemachine::PRE_EDIT_LABEL, true, true, &cfg.exec_ctx,
-                                ) {
-                                    Ok(None) => {
-                                        // Two benign shapes, two honest messages: "not a repo" and
-                                        // "no git executable" behave the same (checkpoints off, the
-                                        // edit proceeds) but must never be conflated in what the
-                                        // user reads — the latter is fixable by installing git.
-                                        // Record the reason on this session's manifest too: with no
-                                        // checkpoint there is no pre-image, so per-session diff is
-                                        // impossible and `/team status` should say why rather than
-                                        // show an empty change list that looks like a bug.
-                                        crate::features::coop::note_checkpoint_unavailable(
-                                            if crate::core::gitx::git_exe().is_none() {
-                                                "git executable not found"
-                                            } else {
-                                                "not a git repository"
-                                            },
-                                        );
-                                        if !cfg.quiet {
-                                            if crate::core::gitx::git_exe().is_none() {
-                                                emit_trace("→ checkpoint off: git executable not found — edits proceed without checkpoints");
-                                            } else {
-                                                emit_trace("→ checkpoint unavailable: not a git repository");
-                                            }
-                                        }
-                                        None
-                                    }
-                                    Ok(Some(snap)) => {
-                                        *auto_checkpointed = true;
-                                        crate::core::recovery::set_checkpoint(Some(snap.id));
-                                        // Same snapshot, second reader: this is the tree THIS
-                                        // session's changes are measured from, so another window can
-                                        // later diff exactly this session's work even after a third
-                                        // window overwrites the same files (`features::coop`).
-                                        crate::features::coop::note_turn_base(snap.id);
-                                        if !cfg.quiet {
-                                            emit_trace(&format!(
-                                                "→ checkpoint #{} saved (agent: `checkpoint` action=rewind target=pre_edit; human: `aizen time restore {}`)",
-                                                snap.id, snap.id
-                                            ));
-                                        }
-                                        None
-                                    }
-                                    Err(e) if e.downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>().is_some() => {
-                                        *auto_checkpointed = false;
-                                        *verify_baseline = None;
-                                        crate::core::recovery::set_checkpoint(None);
-                                        crate::features::coop::note_background_coverage_gap();
-                                        cfg.exec_ctx.recovery().defer_background_coverage();
-                                        None
-                                    }
-                                    Err(e) => {
-                                        baseline_effect = tool_error_effect_state(&e);
-                                        Some(format!(
-                                            "error: protected workspace change was not run because the pre-edit checkpoint failed: {e:#}{}",
-                                            crate::features::timemachine::checkpoint_failure_hint(&e)
-                                        ))
-                                    },
-                                }
-                                } else {
-                                    None
-                                };
-                                if let Some(error) = checkpoint_error {
+                                if let Some(error) = lease_error {
                                     tools::ToolOutcome::failed_with_effect_state(
                                         note_unrun_prepared_call(name, args, error, cfg),
                                         baseline_effect,
@@ -4884,7 +5065,7 @@ fn turn_made_prepared_edits(
             let (Some(tool), Ok(prepared)) = (registry.get(&call.function.name), prepared) else {
                 return false;
             };
-            tool.workspace_effect_prepared(prepared).needs_checkpoint()
+            tool.workspace_effect_prepared(prepared).mutates_workspace()
                 && !result.starts_with("error:")
                 && !result.starts_with(builtin::NOOP_WRITE_PREFIX)
                 && !result.starts_with(builtin::DRY_RUN_PREFIX)
@@ -4904,7 +5085,7 @@ fn turn_made_edits(
         };
         let args =
             parse_call_args(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
-        if !t.workspace_effect(&args).needs_checkpoint() || result.starts_with("error:") {
+        if !t.workspace_effect(&args).mutates_workspace() || result.starts_with("error:") {
             return false; // no workspace mutation effect, or a denied/errored op.
         }
         // A write tool that no-op'd (target already held identical content) wrote nothing to disk,
@@ -4981,7 +5162,7 @@ pub fn eager_starter<'a>(
         if started.fetch_add(1, Relaxed) >= MAX_PARALLEL {
             return None; // over the cap: run normally at execution time
         }
-        let prepared = tool.prepare_call(&args, &cfg.exec_ctx).ok()?;
+        let prepared = tool.prepare_checked(&args, &cfg.exec_ctx).ok()?;
         if tool.is_destructive_prepared(&prepared) || !tool.is_concurrency_safe_prepared(&prepared)
         {
             barrier_hit.store(true, Relaxed);
@@ -4990,7 +5171,7 @@ pub fn eager_starter<'a>(
         // A delegated (read-only `task`) eager call gets the SAME alignment as the parallel
         // launcher: its own cancellation token and an execution context clamped to the observer
         // deadline, so an expired observer stops this child instead of leaving it running unnoticed.
-        let deadline = safe_tool_deadline(cfg);
+        let deadline = prepared_tool_deadline(cfg, &prepared);
         let delegated = prepared.delegation.is_some();
         let turn_cancel = if delegated {
             cancel.child()
@@ -5143,72 +5324,14 @@ fn check_native_capability(
     tool: &dyn tools::Tool,
     prepared: &tools::PreparedToolCall,
 ) -> anyhow::Result<()> {
-    let overlay = ctx.overlay();
-    if overlay.is_some() {
-        hooks::check_speculative_policy()?;
-    }
+    planning::check_prepared(ctx, tool, prepared)?;
     let Some(scope) = ctx.native_scope() else {
-        anyhow::ensure!(overlay.is_none(), "overlay lost its exact native authority");
-        anyhow::ensure!(
-            !matches!(
-                prepared.footprint,
-                Some(tools::PreparedFootprint::Overlay { .. })
-            ),
-            "private overlay call cannot execute in a live context"
-        );
         return Ok(());
     };
     if !matches!(tool.name(), "file_read" | "file_edit" | "file_write")
         || tool.command_to_guard(&prepared.args).is_some()
     {
         anyhow::bail!("native child capability is outside its approved file-only allowlist");
-    }
-    if let Some(active) = overlay {
-        let Some(tools::PreparedFootprint::Overlay { handle, files }) = &prepared.footprint else {
-            anyhow::bail!("private overlay requires sealed private resources; no live fallback");
-        };
-        anyhow::ensure!(
-            active.same_handle(handle),
-            "prepared overlay context changed"
-        );
-        active.check_owner_scope(&ctx.resource_scope(), scope)?;
-        anyhow::ensure!(!files.is_empty(), "private overlay has no approved files");
-        let root = ctx
-            .placement()
-            .ok_or_else(|| anyhow::anyhow!("private overlay lost its workspace binding"))?
-            .workspace_root();
-        for (file, mode) in files {
-            active.check_file(file)?;
-            let bound = active.resolve(root, file.logical_path())?;
-            anyhow::ensure!(
-                bound.key() == file.key(),
-                "private resource binding changed"
-            );
-            anyhow::ensure!(
-                scope.resources().iter().any(|r| r.key() == file.key()),
-                "private read exceeds sealed native scope"
-            );
-            if *mode == crate::core::repo_lock::LockMode::Exclusive {
-                anyhow::ensure!(
-                    file.is_writable() && scope.write_keys().iter().any(|k| k == file.key()),
-                    "private write exceeds sealed native scope"
-                );
-            }
-        }
-        let worker = builtin::prepared_native_worker(prepared)?
-            .ok_or_else(|| anyhow::anyhow!("private overlay lost its frozen native operation"))?;
-        worker.check_attempt(active, scope)?;
-        let kind = match tool.name() {
-            "file_read" => crate::core::speculation::workers::NativeWorkerKind::Read,
-            "file_edit" => crate::core::speculation::workers::NativeWorkerKind::Edit,
-            "file_write" => crate::core::speculation::workers::NativeWorkerKind::Write,
-            _ => unreachable!("native file allowlist checked above"),
-        };
-        anyhow::ensure!(
-            worker.kind() == kind,
-            "prepared private operation belongs to another tool"
-        );
-        return Ok(());
     }
     let Some(tools::PreparedFootprint::Native(resources)) = &prepared.footprint else {
         anyhow::bail!("native child requires verified exact prepared resources; nothing executed");
@@ -5231,6 +5354,85 @@ fn pre_tool_hook_in_body(tool: &dyn tools::Tool, prepared: &tools::PreparedToolC
     !tool.is_destructive_prepared(prepared)
         && !tool.may_return_images(&prepared.args)
         && tool.is_concurrency_safe_prepared(prepared)
+}
+
+/// Trusted REPL ingress only: an opaque legacy preparation still goes through the ordinary
+/// approval, worker, resource lease, native journal, CAS and readback path. Never reprepare here.
+pub(crate) async fn execute_human_plan_migration(
+    prepared: tools::PreparedToolCall,
+    ctx: crate::core::exec_ctx::ExecutionContext,
+) -> Result<String> {
+    use anyhow::Context as _;
+    anyhow::ensure!(
+        planning_write::is_human_migration(&prepared)
+            && ctx.is_planning()
+            && ctx.native_scope().is_some(),
+        "legacy migration requires host-prepared, exact planning authority"
+    );
+    let proof = planning_write::proof(&prepared)
+        .context("legacy migration lost its provenance")?
+        .clone();
+    proof.check_prepared(&ctx, &prepared)?;
+    let root = ctx
+        .placement()
+        .context("legacy migration requires pinned placement")?
+        .workspace_root()
+        .to_path_buf();
+    let cfg = pin_placement_context(&AgentConfig {
+        exec_ctx: ctx.admit_policy()?,
+        workspace_root: Some(root.clone()),
+        approval_mode: crate::core::approval::ApprovalMode::Ask,
+        enable_verify_gate: false,
+        enable_lsp: false,
+        enable_plan_nudge: false,
+        ..AgentConfig::default()
+    })?;
+    let registry = builtin::planning_registry(
+        &root,
+        cfg.exec_ctx.policy().context("missing migration policy")?,
+    );
+    let call = ToolCall {
+        id: "human-plan-migrate".into(),
+        kind: "function".into(),
+        function: crate::core::types::FunctionCall {
+            name: "file_write".into(),
+            arguments: serde_json::to_string(&prepared.args)?,
+        },
+    };
+    let mut sink = vec![Message::tool_result(&call.id, "")];
+    let mut writer = None;
+    let mut baseline = None;
+    let mut results = crate::core::exec_ctx::with_current_future(
+        cfg.exec_ctx.clone(),
+        execute_execution_calls(
+            &registry,
+            &[call],
+            &[Ok(prepared)],
+            false,
+            &cfg,
+            &mut sink,
+            Vec::new(),
+            &mut writer,
+            &mut baseline,
+            &[None],
+        ),
+    )
+    .await;
+    let result = results.pop().context("migration returned no outcome")?;
+    if result.outcome.effect_state != tools::ToolEffectState::Settled {
+        return Err(
+            anyhow::Error::new(tools::ToolEffectsUnsettled(result.outcome.effect_state))
+                .context(result.outcome.observation.text),
+        );
+    }
+    if let Some(error) = result.outcome.failure {
+        anyhow::bail!("{error}");
+    }
+    anyhow::ensure!(
+        proof.successful_write(),
+        "migration has no settled write receipt"
+    );
+    Ok(result.outcome.observation.text)
 }
 
 fn gate_prepared_and_approve(
@@ -5358,7 +5560,10 @@ fn gate_prepared_and_approve(
     // Hooks for safe readers run in the body, including exact readers admitted beside writers.
     // Other calls run theirs here, after the hard floor and before approval, never twice.
     let mut hook_allow = false;
-    if !pre_tool_hook_in_body(tool, prepared) && process::check_background_effects().is_ok() {
+    if cfg.exec_ctx.permits_automation()
+        && !pre_tool_hook_in_body(tool, prepared)
+        && process::check_background_effects().is_ok()
+    {
         let hook_ctx = hooks::Context::from_cfg(cfg);
         match hooks::run_blocking(|| hooks::pre_tool(tool.name(), args, &hook_ctx)) {
             hooks::PreToolVerdict::Deny { run, reason } => {
@@ -5373,7 +5578,18 @@ fn gate_prepared_and_approve(
     let media_approval = tool.may_return_images(args)
         && cfg.tool_image_policy == crate::llm::media::VisionPolicy::Supported
         && cfg.tool_image_destination.is_some();
-    if media_approval {
+    if planning_write::is_human_migration(prepared) {
+        // This host-only operation never inherits yolo, a standing file_write grant or a hook allow.
+        let Some(mut preview) = prepared_preview(tool, prepared) else {
+            return Some("error: legacy migration requires its exact preview".into());
+        };
+        preview.lines.push("Migrate this exact legacy document once; implementation remains restricted. Declining leaves the selected target saved without changing the file.".into());
+        if !approve(tool.name(), prepared, cfg, Some(&preview), None) {
+            return Some(
+                "error: the user declined this legacy migration; no file was changed".into(),
+            );
+        }
+    } else if media_approval {
         if !cfg.approval_mode.approves_all() {
             let mut preview = prepared_preview(tool, prepared).unwrap_or(tools::ApprovalPreview {
                 title: tool.name().to_string(),
@@ -5663,7 +5879,7 @@ fn run_tool_body(
     image_destination: Option<String>,
 ) -> ToolObservation {
     let ctx = crate::core::exec_ctx::current().unwrap_or_default();
-    match tool.prepare_call(args, &ctx) {
+    match tool.prepare_checked(args, &ctx) {
         Ok(prepared) => {
             run_prepared_tool_body(tool, &prepared, quiet, budgets, image_destination).observation
         }
@@ -5686,6 +5902,22 @@ fn run_prepared_tool_body(
         });
     }
     run_prepared_tool_body_cached(tool, prepared, quiet, budgets, image_destination, None)
+}
+
+/// Fixtures use the production capability, resource-lock, effect and journal path. This does not
+/// launch a worker or grant authority; callers must seat a real owner and use launch_prepared.
+#[cfg(test)]
+pub(crate) fn execute_owned_native_fixture_body(
+    tool: std::sync::Arc<dyn tools::Tool>,
+    prepared: &tools::PreparedToolCall,
+) -> tools::ToolOutcome {
+    run_prepared_tool_body(
+        tool,
+        prepared,
+        true,
+        AgentConfig::default().result_budgets(),
+        None,
+    )
 }
 
 fn process_observation_or_cleanup(name: &str, args: &serde_json::Value) -> bool {
@@ -5722,6 +5954,16 @@ fn run_prepared_tool_body_cached(
     if let Err(error) = check_native_capability(&exec_ctx, tool.as_ref(), prepared) {
         return tools::ToolOutcome::failed(format!("error: {error}"));
     }
+    // Direct/eager callers may bypass the top-level run lease. Keep this actual body admitted
+    // through settlement too; a human transition must not race a checked synchronous operation.
+    let _policy_admission = match exec_ctx
+        .policy()
+        .map(|_| exec_ctx.admit_policy())
+        .transpose()
+    {
+        Ok(admitted) => admitted,
+        Err(error) => return tools::ToolOutcome::failed(format!("error: {error}")),
+    };
     if !exec_ctx.can_restore_workspace() && tool.name() == "native_owner_undo" {
         return tools::ToolOutcome::failed(
             "error: delegated children cannot undo workspace mutations",
@@ -5755,7 +5997,8 @@ fn run_prepared_tool_body_cached(
     let missing = tools::missing_required_strings(&tool.parameters(), args);
     // Safe readers run their pre hook here; barrier calls already ran it ahead of approval.
     let hook_ctx = hooks::Context::here(quiet);
-    let hook_denied = if pre_tool_hook_in_body(tool.as_ref(), prepared)
+    let hook_denied = if exec_ctx.permits_automation()
+        && pre_tool_hook_in_body(tool.as_ref(), prepared)
         && process::check_background_effects().is_ok()
     {
         match hooks::pre_tool(tool.name(), args, &hook_ctx) {
@@ -5814,9 +6057,9 @@ fn run_prepared_tool_body_cached(
                 "task"
                     | "workflow"
                     | "shell_run"
+                    | "git_inspect"
+                    | "git_change"
                     | "process"
-                    | "checkpoint"
-                    | "checkpoint_view"
                     | "symbol_replace"
                     | "symbol_insert"
             ) || tool.name().starts_with("lsp_")
@@ -5855,6 +6098,20 @@ fn run_prepared_tool_body_cached(
             }) {
                 Ok(ToolObservation::text(cached))
             } else {
+                // Native writers and process tools invalidate at their actual commit/admission
+                // boundaries. An uninstrumented opaque writer must invalidate before invocation,
+                // including when its body later fails after applying partial effects.
+                if !self_managed
+                    && matches!(
+                        tool.workspace_effect_prepared(prepared),
+                        tools::WorkspaceEffect::OpaqueWorkspace
+                    )
+                {
+                    exec_ctx.note_task_effects_at(Some(&root));
+                    crate::features::coop::note_attribution_gap(
+                        "opaque workspace effects have no automatic source restore or session-diff baseline",
+                    );
+                }
                 tool.execute_prepared(prepared)
             }
         })()
@@ -5882,9 +6139,19 @@ fn run_prepared_tool_body_cached(
             )
         }
     };
+    if tool.workspace_effect_prepared(prepared).mutates_workspace()
+        && (effect_state != tools::ToolEffectState::Settled
+            || (failure.is_none()
+                && !observation.text.starts_with(builtin::NOOP_WRITE_PREFIX)
+                && !observation.text.starts_with(builtin::DRY_RUN_PREFIX)))
+    {
+        crate::features::coop::note_attribution_gap(
+            "workspace effects require exact native receipts or Git history; no automatic session-diff baseline exists",
+        );
+    }
     if prepared.workspace_changes.is_none()
         && failure.is_none()
-        && tool.workspace_effect_prepared(prepared).needs_checkpoint()
+        && tool.workspace_effect_prepared(prepared).mutates_workspace()
         && tool.name() != "native_owner_undo"
         && !observation.text.starts_with(builtin::NOOP_WRITE_PREFIX)
         && !observation.text.starts_with(builtin::DRY_RUN_PREFIX)
@@ -5924,7 +6191,8 @@ fn run_prepared_tool_body_cached(
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     // `post_tool` hooks read the raw result; what they say rides the result the model reads.
-    let hook_note = if hook_denied.is_none()
+    let hook_note = if exec_ctx.permits_automation()
+        && hook_denied.is_none()
         && effect_state == tools::ToolEffectState::Settled
         && process::check_background_effects().is_ok()
     {
@@ -6023,10 +6291,6 @@ pub(crate) fn tool_error_effect_state(error: &anyhow::Error) -> tools::ToolEffec
     } else if let Some(error) = error.downcast_ref::<crate::core::native_journal::PossiblyApplied>()
     {
         tools::ToolEffectState::PossiblyApplied(Some(error.record_id))
-    } else if let Some(error) =
-        error.downcast_ref::<crate::core::speculation::integration::IntegrationUnsettled>()
-    {
-        tools::ToolEffectState::PossiblyApplied(error.possibly_applied_record)
     } else if let Some(error) = error.downcast_ref::<native_undo::NativeUndoFailure>() {
         tools::ToolEffectState::PossiblyApplied(error.possibly_applied_record)
     } else {
@@ -6366,7 +6630,7 @@ fn emit_warning(kind: &str, plain: &str, styled: &str, quiet: bool) {
 }
 
 /// A call that produced a result WITHOUT running its body — arguments that did not parse, an
-/// unknown tool, a gate refusal, a failed pre-edit checkpoint — still owes the JSON stream its
+/// unknown tool, a gate refusal, an unavailable workspace lease — still owes the JSON stream its
 /// `tool_call` / `tool_result` pair, or a front-end would show a model that asked for a tool and
 /// heard nothing back. The transcript needs nothing extra: the gate already said why. Returns
 /// `out` unchanged so it can wrap the expression that produced it.
@@ -6403,6 +6667,37 @@ fn note_unrun_call_with_identity(
         emit_tool_result_as(seq, name, args, &out, None, dispatch.as_deref());
     }
     out
+}
+
+#[cfg(test)]
+pub(crate) fn migration_yolo_approval_fixture(
+    prepared: &tools::PreparedToolCall,
+    ctx: crate::core::exec_ctx::ExecutionContext,
+) -> Result<bool> {
+    use anyhow::Context as _;
+    anyhow::ensure!(planning_write::is_human_migration(prepared));
+    let root = ctx
+        .placement()
+        .context("migration fixture requires pinned placement")?
+        .workspace_root()
+        .to_path_buf();
+    let cfg = AgentConfig {
+        exec_ctx: ctx.admit_policy()?,
+        workspace_root: Some(root.clone()),
+        approval_mode: crate::core::approval::ApprovalMode::Yolo,
+        enable_verify_gate: false,
+        enable_lsp: false,
+        ..AgentConfig::default()
+    };
+    let registry = builtin::planning_registry(&root, cfg.exec_ctx.policy().unwrap());
+    let tool = registry
+        .get("file_write")
+        .context("missing planning file_write")?;
+    crate::core::cancel::with_current(cfg.cancel.clone(), || {
+        crate::core::exec_ctx::with_current(cfg.exec_ctx.clone(), || {
+            Ok(gate_prepared_and_approve(tool, prepared, &cfg).is_none())
+        })
+    })
 }
 
 #[cfg(test)]
@@ -6447,7 +6742,6 @@ pub(crate) fn approval_identity_fixture(
         exec_ctx: ctx.clone(),
         workspace_root: Some(root.to_path_buf()),
         enable_verify_gate: false,
-        auto_checkpoint: false,
         enable_lsp: false,
         spill_result_over_chars: 0,
         ..AgentConfig::default()
@@ -6462,7 +6756,7 @@ pub(crate) fn approval_identity_fixture(
                 let mut registry = tools::ToolRegistry::new();
                 registry.register(Box::new(ApprovalProbe));
                 let tool = registry.get("approval_identity_probe").unwrap();
-                let prepared = tool.prepare_call(&serde_json::json!({}), &cfg.exec_ctx)?;
+                let prepared = tool.prepare_checked(&serde_json::json!({}), &cfg.exec_ctx)?;
                 if abandon {
                     let allowed = gate_prepared_and_approve(tool, &prepared, &cfg).is_none();
                     drop(prepared); // Allowed, but this invocation never starts or lends its id.
@@ -6499,7 +6793,6 @@ pub(crate) fn approval_identity_fixture(
                     &cfg,
                     &mut sink,
                     Vec::new(),
-                    &mut false,
                     &mut None,
                     &mut None,
                     &[],
@@ -6518,79 +6811,8 @@ pub(crate) fn approval_identity_fixture(
 /// A long-running tool is the one place a *tool* legitimately needs the trace lane: `shell_run`'s
 /// slow-command note has to reach the same surface as the loop's own progress lines, or it would
 /// `println!` into a raw-mode TUI and be wiped by the next repaint.
-/// A diagnostic that belongs in the run log, not in the user's transcript. Checkpoint
-/// unavailability is a property of the working directory (no repo, no git binary), so it recurs at
-/// every phase boundary and says nothing new after the first time — but it is still worth having
-/// when reconciling a run.
-fn tracing_note(line: &str) {
-    crate::ui::events::trace(line);
-}
-
 pub(crate) fn emit_trace_public(line: &str) {
     emit_trace(line);
-}
-
-/// Stamp ONE time-machine checkpoint at a phase boundary and record it as this run's `last_good`
-/// rewind anchor. Best-effort: the three error shapes match the pre-edit path exactly — no work tree
-/// and a missing git executable are benign (checkpoints are simply off, the run continues), and only
-/// a real store/lock/ownership failure earns a cry-wolf warning carrying git's own cause (`{e:#}`).
-///
-/// Factored out of the loop because the phase mark can fire on a turn that made no edit (the closing
-/// `todo_write` lands alone), so the call site is outside the `edited_this_turn` block. `label` is the
-/// full checkpoint label (e.g. `"phase: wire up auth"`), already prefixed by the caller.
-fn stamp_phase_checkpoint(cfg: &AgentConfig, root: Option<&std::path::Path>, label: &str) -> bool {
-    if cfg.exec_ctx.native_scope().is_some() {
-        return false;
-    }
-    let root = root
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| cfg.effective_root());
-    match crate::features::timemachine::save_for_in_context(
-        cfg.exec_ctx.recovery(),
-        &root,
-        label,
-        true,
-        false,
-        &cfg.exec_ctx,
-    ) {
-        Ok(Some(snap)) => {
-            if !cfg.quiet {
-                emit_trace(&format!(
-                    "  └ checkpoint #{} — {label} (agent: `checkpoint` action=rewind target=last_good; human: `aizen time restore {}`)",
-                    snap.id, snap.id
-                ));
-            }
-            return true;
-        }
-        Ok(None) => {
-            // Same benign, repeating case as the two arms below: no git-visible coverage is a
-            // property of the directory, not news about this turn.
-            tracing_note("checkpoint unavailable: no git-visible repository coverage");
-        }
-        Err(e)
-            if e.downcast_ref::<crate::core::workspace_txn::BackgroundProcessBusy>()
-                .is_some() =>
-        {
-            crate::features::coop::note_background_coverage_gap();
-            cfg.exec_ctx.recovery().defer_background_coverage();
-            crate::core::recovery::set_checkpoint(None);
-            tracing_note("phase checkpoint deferred: managed background process active");
-        }
-        Err(e) if e.to_string().contains("not a git repository") => {
-            // Benign and repeated: every phase boundary in a non-repo directory would print this.
-            // The session run-log keeps it for forensics; the transcript stays clean.
-            tracing_note("checkpoint unavailable: not a git repository");
-        }
-        Err(e) if crate::core::gitx::is_git_missing(&e) => {
-            tracing_note("checkpoint unavailable: git executable not found (edits proceed without checkpoints)");
-        }
-        Err(e) => {
-            emit_trace(&format!(
-                "  └ warning: phase checkpoint failed; this phase's work may not be independently rewindable: {e:#}"
-            ));
-        }
-    }
-    false
 }
 
 /// The tool-call anchor icon — the moonlight cog `⚙` (matching the mockup), or empty when icons are
@@ -6741,6 +6963,17 @@ fn workflow_target(args: &serde_json::Value) -> String {
             .map(|a| a.len())
             .unwrap_or(0);
         return format!("verify · {n} finding{}", if n == 1 { "" } else { "s" });
+    }
+    if mode == "propose_edits" {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let count = args
+            .get("parts")
+            .and_then(|v| v.as_array())
+            .map_or(0, Vec::len);
+        return format!("{mode} · {path} · {count} parts");
     }
     let tasks: &[serde_json::Value] = args
         .get("tasks")
@@ -7143,49 +7376,6 @@ fn emit_edit_diff(path: &str, out: &str) {
     crate::ui::tui::diff_box(path, adds, dels, hunks);
 }
 
-/// Split a multi-file unified patch (`git diff-tree -p` output) into `(path, patch)` per file —
-/// the path from the `+++ b/…` line, else from the `diff --git a/x b/y` header.
-pub(crate) fn split_patch_by_file(patch: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut cur: Option<(String, String)> = None;
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            if let Some(block) = cur.take() {
-                out.push(block);
-            }
-            let path = rest
-                .rsplit_once(" b/")
-                .map(|(_, p)| p.to_string())
-                .unwrap_or_else(|| rest.to_string());
-            cur = Some((path, String::new()));
-            continue;
-        }
-        let Some((path, body)) = cur.as_mut() else {
-            continue;
-        };
-        if let Some(p) = line.strip_prefix("+++ b/") {
-            *path = p.trim().to_string();
-        }
-        body.push_str(line);
-        body.push('\n');
-    }
-    if let Some(block) = cur.take() {
-        out.push(block);
-    }
-    out
-}
-
-/// Render a multi-file patch as one diff box per file (`/diff --patch` on the retained TUI;
-/// the same boxes an edit result gets). Files whose patch carries no changed rows are skipped.
-pub(crate) fn emit_patch_boxes(patch: &str) -> usize {
-    let blocks = split_patch_by_file(patch);
-    let n = blocks.len();
-    for (path, body) in blocks {
-        emit_edit_diff(&path, &body);
-    }
-    n
-}
-
 /// Hunks an edit result shows the model before the rest becomes a count.
 const COMPACT_DIFF_MAX_HUNKS: usize = 3;
 
@@ -7486,6 +7676,13 @@ fn unchanged_read_result(
     }
     for (raw, (path, expected)) in paths.iter().zip(&entry.files) {
         let resolved = builtin::confine(root, raw, true).ok()?;
+        // A new explicit observation requirement needs a native delivery receipt, not a cache
+        // acknowledgement referring to an earlier turn. The native read owns that receipt.
+        if crate::core::exec_ctx::current()
+            .is_some_and(|ctx| ctx.capture_task_observation(&resolved, root).is_some())
+        {
+            return None;
+        }
         if resolved.canonicalize().ok()? != path.canonicalize().ok()? {
             return None;
         }
@@ -7857,11 +8054,16 @@ fn estimate_tokens(messages: &[Message]) -> usize {
 /// Context guards count the outgoing view, not retained images the wire will omit. Synthetic
 /// observations and the task capsule remain request-only; base64 is not counted as prose tokens.
 fn estimate_request_tokens(messages: &[Message], cfg: &AgentConfig) -> usize {
-    crate::llm::media::estimate_request_tokens(
+    let total = crate::llm::media::estimate_request_tokens(
         messages,
         cfg.tool_image_policy,
         cfg.tool_image_destination.as_deref(),
         cfg.exec_ctx.design().as_ref(),
+    );
+    total.saturating_sub(
+        cfg.assistant_context
+            .as_ref()
+            .map_or(0, |view| view.savings(messages)),
     )
 }
 
@@ -8219,6 +8421,46 @@ fn clean_review_user_text(content: &str) -> &str {
     }
 }
 
+/// An immediate user answer may resume an in-process pause, but a tool-shaped message alone cannot.
+/// Match the actual clarify call/result pair; IDs never grant permission or completion evidence.
+fn clarify_continuation_id(messages: &[Message]) -> Option<&str> {
+    let idx = messages
+        .iter()
+        .rposition(|message| message.role == "user" && !prompt_lanes::is_plan_context(message))?;
+    if messages[idx + 1..]
+        .iter()
+        .any(|message| message.role != "system" && !prompt_lanes::is_plan_context(message))
+    {
+        return None;
+    }
+    last_clarify_call_id(&messages[..idx])
+}
+
+fn last_clarify_call_id(messages: &[Message]) -> Option<&str> {
+    let idx = messages
+        .iter()
+        .rposition(|message| message.role == "assistant")?;
+    let results = &messages[idx + 1..];
+    if results.iter().any(|message| {
+        message.role != "tool"
+            && !prompt_lanes::is_plan_context(message)
+            && !NUDGE_KINDS
+                .iter()
+                .any(|kind| is_nudge_of_kind(message, kind))
+    }) {
+        return None;
+    }
+    messages[idx].tool_calls.iter().rev().find_map(|call| {
+        (call.function.name == clarify::NAME
+            && !call.id.is_empty()
+            && call.id.len() <= 256
+            && results.iter().any(|message| {
+                message.role == "tool" && message.tool_call_id.as_deref() == Some(&call.id)
+            }))
+        .then_some(call.id.as_str())
+    })
+}
+
 /// Capture the newest real user request. A terse clarification answer is joined to the preceding user
 /// request when it immediately follows a `clarify` tool result, so "option 2" remains reviewable.
 fn capture_review_request(messages: &[Message]) -> String {
@@ -8466,6 +8708,7 @@ fn run_git_bounded_args(
 /// Stable identifying prefixes for the loop's system nudges. [`push_nudge`] uses them to REPLACE a
 /// stale earlier nudge of the same kind instead of accreting a new copy — across a long REPL
 /// session (one loop invocation per user turn) the old append-only behavior grew without bound.
+const NUDGE_GOAL: &str = "[goal-mode]";
 const NUDGE_CONTEXT: &str = "Context is nearly full";
 const NUDGE_DIVERGENCE: &str = "You repeated the same tool call(s)";
 const NUDGE_STEP_LIMIT: &str = "You are nearing the step limit";
@@ -8605,6 +8848,7 @@ const USER_NUDGE_TAG: &str = "[harness] ";
 /// of the next run — a nudge is advice for THIS run, and left in place it rides every later
 /// request as instructions (and, on the Codex path, inside the hoisted instructions blob).
 const NUDGE_KINDS: &[&str] = &[
+    NUDGE_GOAL,
     NUDGE_CONTEXT,
     NUDGE_DIVERGENCE,
     NUDGE_STEP_LIMIT,
@@ -8905,7 +9149,9 @@ fn approve(
             style(plain_who.trim_end()).color256(crate::ui::theme::WARN)
         )
     };
-    let once = preview.is_some_and(|p| p.lines.iter().any(|line| line == IMAGE_APPROVAL_ONCE));
+    let migration = planning_write::is_human_migration(prepared);
+    let once = migration
+        || preview.is_some_and(|p| p.lines.iter().any(|line| line == IMAGE_APPROVAL_ONCE));
     // JSON stream: the question goes out as data and the answer comes back on stdin.
     if crate::ui::events::on() {
         let preview = preview
@@ -8939,6 +9185,8 @@ fn approve(
         // menu can be painted and y/n/a on the keyboard is the whole interface.
         let hint = if crate::ui::tui::retained_running() {
             "— approve?"
+        } else if migration {
+            "— approve this legacy migration? [y]es · [n]o"
         } else if once {
             "— approve this image transmission? [y]es · [n]o"
         } else {
@@ -9190,6 +9438,18 @@ mod tests {
 
     mod task_parallel_tests {
         include!("task_parallel_tests.rs");
+    }
+
+    mod workspace_binding_tests {
+        include!("workspace_binding_tests.rs");
+    }
+
+    mod planning_loop_tests {
+        include!("planning_loop_tests.rs");
+    }
+
+    mod workflow_advice_loop_tests {
+        include!("workflow_advice_loop_tests.rs");
     }
 
     mod hooks_executor_tests {
@@ -10032,22 +10292,6 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_file_patch_splits_per_file_with_the_new_path() {
-        let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
-                     diff --git a/old.rs b/new.rs\nsimilarity index 90%\n--- a/old.rs\n+++ b/new.rs\n@@ -2 +2 @@\n-p\n+q\n";
-        let blocks = split_patch_by_file(patch);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].0, "src/a.rs");
-        assert!(blocks[0].1.contains("@@ -1 +1 @@") && blocks[0].1.contains("+y"));
-        assert_eq!(blocks[1].0, "new.rs", "a rename is titled by its new path");
-        assert!(
-            !blocks[1].1.contains("+y"),
-            "files do not bleed into each other"
-        );
-        assert!(split_patch_by_file("").is_empty());
-    }
-
-    #[test]
     fn edit_headers_show_the_relative_path_not_the_basename() {
         assert_eq!(rel_path_display("src/agent/mod.rs"), "src/agent/mod.rs");
         assert_eq!(rel_path_display("src\\agent\\mod.rs"), "src/agent/mod.rs");
@@ -10855,6 +11099,7 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────────
     fn tool_turn(name: &str, args: &str) -> ChatTurn {
         ChatTurn {
+            speech_final_verified: false,
             content: None,
             tool_calls: vec![ToolCall {
                 id: format!("call_{name}"),
@@ -10873,6 +11118,7 @@ mod tests {
     }
     fn final_turn(text: &str) -> ChatTurn {
         ChatTurn {
+            speech_final_verified: false,
             content: Some(text.into()),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
@@ -10885,6 +11131,7 @@ mod tests {
     /// A turn with SEVERAL tool calls (for testing turns that pad a failing call with a throwaway).
     fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
         ChatTurn {
+            speech_final_verified: false,
             content: None,
             tool_calls: calls
                 .iter()
@@ -10953,9 +11200,8 @@ mod tests {
             quiet: true,
             enable_verify_gate: false,
             verify_gate_timeout_secs: 90,
-            auto_checkpoint: false, // OFF in tests: cwd is a real repo — no checkpoint pollution
-            checkpoint_each_edit: false, // OFF in tests for the same reason
             context_window: 0, // guard off by default in tests; the guard test sets it explicitly
+            assistant_context: None,
             keep_recent_tool_results: 8,
             clear_tool_result_min_chars: 1024,
             clear_step_pct: 10,
@@ -10979,6 +11225,8 @@ mod tests {
             max_todo_poke_attempts: 2,
             // OFF like the other harness gates here: tests that exercise it set it explicitly.
             enable_plan_nudge: false,
+            workflow_advice: plan_nudge::AdviceContext::default(),
+            architect_document: None,
             enable_confidence_gate: false,
             conf_high: 90,
             conf_spike_delta: 40,
@@ -11005,6 +11253,7 @@ mod tests {
             // fire spuriously on a loaded CI box and turn an assertion about MaxIters/Divergence into a
             // flake. The deadline tests set it explicitly.
             deadline: None,
+            adaptive_time: None,
             wire_reasoning_effort: None,
             tool_image_policy: crate::llm::media::VisionPolicy::Unknown,
             image_config: None,
@@ -11014,7 +11263,7 @@ mod tests {
     }
 
     /// The PRODUCTION defaults, with only the non-hermetic bits neutralized (verify gate spawns a
-    /// real `cargo check`; checkpoints would pollute this repo; the P0 gates read a process-global
+    /// real `cargo check`; the P0 gates read a process-global
     /// todo list shared with other tests). Everything the "don't stop early" behavior depends on —
     /// `max_transient_retries`, `max_continuations`, `max_stall_recoveries`, the caps — is left
     /// exactly as shipped, so these tests fail if a default regresses. Contrast with [`cfg`], which
@@ -11023,8 +11272,6 @@ mod tests {
         fn production_defaults_for_test() -> Self {
             Self {
                 enable_verify_gate: false,
-                auto_checkpoint: false,
-                checkpoint_each_edit: false,
                 enable_todo_poke: false,
                 enable_confidence_gate: false,
                 enable_hill_climb: false,
@@ -11083,11 +11330,64 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::await_holding_lock, reason = "Serialize fixture task context")]
+    async fn plan_nudge_refresh_preserves_budget_but_terminal_run_retires_it() {
+        let _guard = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        todo::clear();
+        let config = AgentConfig {
+            enable_plan_nudge: true,
+            ..cfg()
+        };
+        for (reply, expected_advice, expected_stop) in [
+            (
+                "REFRESH: retain the current request",
+                1,
+                StopReason::Refresh,
+            ),
+            ("done", 0, StopReason::Done),
+            ("done", 1, StopReason::Done),
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let chat = |messages: Vec<Message>, _: Vec<ToolDef>| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let advice: Vec<_> = messages
+                    .iter()
+                    .filter(|message| {
+                        message
+                            .content
+                            .as_deref()
+                            .is_some_and(|text| text.contains(PLAN_NUDGE_PREFIX))
+                    })
+                    .collect();
+                assert_eq!(advice.len(), expected_advice);
+                if let Some(message) = advice.first() {
+                    assert!(message
+                        .content
+                        .as_deref()
+                        .unwrap()
+                        .contains("Workflow advice: Plan"));
+                }
+                std::future::ready(Ok(final_turn(reply)))
+            };
+            // Fresh transcript and cloned config reproduce the refresh handoff, not compaction
+            // preserving an old prompt message. The third run is a genuinely new request.
+            let next = config.clone();
+            let out = run_agent(chat, &next, &registry(), "sys", "Migrate storage")
+                .await
+                .unwrap();
+            assert_eq!(out.stop, expected_stop);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
     #[expect(
         clippy::await_holding_lock,
         reason = "Pin test home and todos through real file execution"
     )]
-    async fn plan_nudge_observes_growth_and_plan_reads_before_the_next_model_call() {
+    async fn plan_nudge_observes_growth_but_arbitrary_plan_reads_are_not_attachment() {
         let _guard = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -11137,7 +11437,11 @@ mod tests {
                             .is_some_and(|s| s.contains(PLAN_NUDGE_PREFIX))
                     })
                     .count();
-                assert_eq!(count, usize::from(changed >= 3 && !read_existing_plan));
+                assert_eq!(
+                    count,
+                    usize::from(changed >= 3),
+                    "reading legacy prose is not a saved-plan attachment"
+                );
                 std::future::ready(Ok(turns
                     .lock()
                     .unwrap()
@@ -11145,7 +11449,12 @@ mod tests {
                     .expect("no extra Done demand")))
             };
             let out = run_agent(chat, &c, &r, "sys", "Fix a typo").await.unwrap();
-            assert_eq!(out.stop, StopReason::Done);
+            assert_eq!(
+                out.stop,
+                StopReason::Incomplete,
+                "plan nudges do not certify native writes with the verifier disabled"
+            );
+            assert_eq!(out.iters, 5 + usize::from(read_existing_plan));
             assert!(turns.lock().unwrap().is_empty());
         }
     }
@@ -11172,7 +11481,8 @@ mod tests {
             &mut plan,
             "fixture",
             Some("max"),
-        );
+        )
+        .unwrap();
         // file_write's existing parent requirement is unchanged; directory setup is a separate
         // approved shell operation in production, not an architect side effect.
         std::fs::create_dir_all(root.join("docs/plans")).unwrap();
@@ -11197,11 +11507,18 @@ mod tests {
             final_turn("done"),
         ]));
         let chat = |messages: Vec<Message>, _: Vec<ToolDef>| {
-            assert!(!messages.iter().any(|m| m
-                .content
-                .as_deref()
-                .is_some_and(|s| s.contains(PLAN_NUDGE_PREFIX))));
+            let advice: Vec<_> = messages
+                .iter()
+                .filter_map(|m| m.content.as_deref())
+                .filter(|text| text.contains(PLAN_NUDGE_PREFIX))
+                .collect();
+            assert_eq!(advice.len(), 1, "drafts do not suppress workflow advice");
+            assert!(advice[0].contains("Workflow advice: Todo"));
+            assert!(!advice[0].contains("Save a plan FIRST"));
             let mut turns = turns.lock().unwrap();
+            if turns.len() == 3 {
+                assert!(!root.join(path).exists(), "advice precedes the first save");
+            }
             if turns.len() < 3 {
                 assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), plan.text);
             }
@@ -11213,10 +11530,14 @@ mod tests {
             }
             std::future::ready(Ok(turns.pop_front().expect("bounded run")))
         };
+        let out = run_agent(chat, &c, &r, "sys", request).await.unwrap();
         assert_eq!(
-            run_agent(chat, &c, &r, "sys", request).await.unwrap().stop,
-            StopReason::Done
+            out.stop,
+            StopReason::Incomplete,
+            "saving the plan and implementation does not verify either write"
         );
+        assert_eq!(out.iters, 3);
+        assert!(turns.lock().unwrap().is_empty());
         assert!(root.join("owned.txt").exists());
     }
 
@@ -11235,7 +11556,7 @@ mod tests {
             crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path().join("home"))]);
         c.approval_mode = crate::core::approval::ApprovalMode::Ask;
         let mut plan = architect::parse_plan("## Acceptance\nCheck behavior", "request");
-        architect::prepare_document("Change storage", &mut plan, "fixture", Some("max"));
+        architect::prepare_document("Change storage", &mut plan, "fixture", Some("max")).unwrap();
         std::fs::create_dir_all(root.join("docs/plans")).unwrap();
         let path = plan.path.as_ref().unwrap();
         let result = exec(
@@ -11288,7 +11609,7 @@ mod tests {
         let Some(tool) = r.get_arc(&tc.function.name) else {
             return format!("error: unknown tool '{}'", tc.function.name);
         };
-        let prepared = match tool.prepare_call(&args, &cfg.exec_ctx) {
+        let prepared = match tool.prepare_checked(&args, &cfg.exec_ctx) {
             Ok(prepared) => prepared,
             Err(error) => return format!("error: {error}"),
         };
@@ -11316,19 +11637,10 @@ mod tests {
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
-        let mut checkpointed = false;
         let mut writer_lease = None;
         let results = crate::core::workspace_txn::with_test_lock_namespace_future(
             c.exec_ctx.test_lock_namespace().cloned(),
-            execute_calls(
-                r,
-                calls,
-                c,
-                &mut sink,
-                Vec::new(),
-                &mut checkpointed,
-                &mut writer_lease,
-            ),
+            execute_calls(r, calls, c, &mut sink, Vec::new(), &mut writer_lease),
         )
         .await;
         // The sink must mirror the returned results (the loop relies on it).
@@ -11864,6 +12176,7 @@ mod tests {
     async fn successful_edit_always_counts_as_evidence() {
         // The report is constant, but every invocation commits a distinct native write. Only the
         // actual edit evidence can reset the episode after the first report has lost its novelty.
+        // These writes prove progress, not completion: this fixture disables the verifier.
         struct ConstantReport(std::sync::Arc<dyn Tool>);
         impl Tool for ConstantReport {
             fn name(&self) -> &str {
@@ -11898,7 +12211,7 @@ mod tests {
                 a: &serde_json::Value,
                 c: &crate::core::exec_ctx::ExecutionContext,
             ) -> Result<tools::PreparedToolCall> {
-                self.0.prepare_call(a, c)
+                self.0.prepare_checked(a, c)
             }
             fn execute(&self, _: &serde_json::Value) -> Result<String> {
                 unreachable!("prepared native fixture")
@@ -11933,8 +12246,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             out.stop,
-            StopReason::Done,
-            "a run of real edits with a constant result body must not be stopped as a stall"
+            StopReason::Incomplete,
+            "unverified native edits must not be certified as complete"
+        );
+        assert_eq!(
+            out.iters, 7,
+            "all six productive edits and the final report must run without a stall stop"
         );
         assert_eq!(out.final_text.as_deref(), Some("all edits landed"));
         for n in 1..=6 {
@@ -12258,32 +12575,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auto_checkpoint_defaults_on_and_off_in_tests() {
-        // W15: production defaults the auto-checkpoint latch ON, but the unit-test cfg() forces it
-        // OFF (the test cwd is a real git repo — a checkpoint per destructive test would pollute it).
-        assert!(
-            AgentConfig::default().auto_checkpoint,
-            "production default must be ON"
-        );
-        assert!(
-            !cfg().auto_checkpoint,
-            "test cfg must force it OFF to avoid repo pollution"
-        );
-        // The phase checkpoint (a restore point when a phase closes — todo done or verify pass —
-        // rather than after each edit) is gated behind the SAME latch, so it also defaults ON in
-        // production and OFF in tests, where a checkpoint would pollute the real test repo. Field
-        // name kept for back-compat; only the firing condition changed.
-        assert!(
-            AgentConfig::default().checkpoint_each_edit,
-            "phase checkpoint default must be ON"
-        );
-        assert!(
-            !cfg().checkpoint_each_edit,
-            "test cfg must force phase checkpoint OFF"
-        );
-    }
-
     #[tokio::test]
     async fn large_task_many_distinct_edits_no_false_positive() {
         let r = registry();
@@ -12422,6 +12713,166 @@ mod tests {
         assert_eq!(
             out.iters, 6,
             "the ceiling is auto_extend_to + max_continuations * max_iters"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the isolated HOME stable through actual tool settlement"
+    )]
+    async fn adaptive_time_real_loop_grants_only_after_a_successful_tool_observation() {
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
+        let start = std::time::Instant::now();
+        let hard = start + std::time::Duration::from_secs(900);
+        let budget =
+            time_budget::AdaptiveTimeBudget::new(start, std::time::Duration::from_secs(60), hard);
+        let c = AgentConfig {
+            deadline: Some(hard),
+            adaptive_time: Some(budget.clone()),
+            ..cfg()
+        };
+        let mut r = registry();
+        r.register(Box::new(LongReadTool));
+        let out = run_agent(
+            scripted(vec![tool_turn("file_read", "{}"), final_turn("done")]),
+            &c,
+            &r,
+            "sys",
+            "read the document",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(c.run_deadline().unwrap() > start + std::time::Duration::from_secs(60));
+        assert!(c.run_deadline().unwrap() <= hard);
+        assert_eq!(
+            c.deadline,
+            Some(hard),
+            "soft grants must not replace the physical origin ceiling"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "Keep the isolated HOME stable through actual tool settlement"
+    )]
+    async fn adaptive_time_real_loop_does_not_reward_a_failed_data_tool() {
+        struct FailedRead;
+        impl Tool for FailedRead {
+            fn name(&self) -> &str {
+                "file_read"
+            }
+            fn description(&self) -> &str {
+                "a failing data observation"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            fn execute(&self, _: &serde_json::Value) -> Result<String> {
+                anyhow::bail!("fixture read failed")
+            }
+        }
+        let _lock = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", fixture.path())]);
+        let start = std::time::Instant::now();
+        let hard = start + std::time::Duration::from_secs(900);
+        let budget =
+            time_budget::AdaptiveTimeBudget::new(start, std::time::Duration::from_secs(60), hard);
+        let c = AgentConfig {
+            deadline: Some(hard),
+            adaptive_time: Some(budget),
+            ..cfg()
+        };
+        let mut r = registry();
+        r.register(Box::new(FailedRead));
+        let mut messages = vec![Message::system("sys"), Message::user("read the document")];
+        let _out = run_agent_loop(
+            scripted(vec![
+                tool_turn("file_read", "{}"),
+                final_turn("read failed"),
+            ]),
+            &c,
+            &r,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert!(messages.iter().any(|m| m.role == "tool"
+            && m.content
+                .as_deref()
+                .is_some_and(|s| s.contains("fixture read failed"))));
+        assert_eq!(
+            c.run_deadline(),
+            Some(start + std::time::Duration::from_secs(60))
+        );
+        assert_valid_history(&messages);
+    }
+
+    #[tokio::test]
+    async fn adaptive_time_expired_soft_window_spends_no_model_call_with_hard_time_left() {
+        let start = std::time::Instant::now();
+        let hard = start + std::time::Duration::from_secs(900);
+        let budget = time_budget::AdaptiveTimeBudget::new(start, std::time::Duration::ZERO, hard);
+        let c = AgentConfig {
+            deadline: Some(hard),
+            adaptive_time: Some(budget),
+            ..cfg()
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let chat = move |_: Vec<Message>, _: Vec<ToolDef>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(final_turn("unreachable")))
+        };
+        let out = run_agent(chat, &c, &registry(), "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Deadline);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(c.deadline, Some(hard));
+    }
+
+    #[tokio::test]
+    async fn adaptive_time_cancel_wins_over_available_progress_credit() {
+        let start = std::time::Instant::now();
+        let hard = start + std::time::Duration::from_secs(900);
+        let budget =
+            time_budget::AdaptiveTimeBudget::new(start, std::time::Duration::from_secs(60), hard);
+        budget.note_progress(
+            start,
+            std::time::Duration::from_secs(1),
+            "file_read",
+            "fresh contents",
+        );
+        let c = AgentConfig {
+            deadline: Some(hard),
+            adaptive_time: Some(budget),
+            ..cfg()
+        };
+        c.cancel.cancel();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let chat = move |_: Vec<Message>, _: Vec<ToolDef>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(final_turn("unreachable")))
+        };
+        let out = run_agent(chat, &c, &registry(), "sys", "task")
+            .await
+            .unwrap();
+        assert_eq!(out.stop, StopReason::Cancelled);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            c.run_deadline(),
+            Some(start + std::time::Duration::from_secs(60))
         );
     }
 
@@ -13207,6 +13658,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_prose_is_terminal_only_and_respects_quiet() {
+        assert!(compact_prose_enabled(false, false));
+        assert!(!compact_prose_enabled(true, false));
+        assert!(!compact_prose_enabled(false, true));
+        assert!(!compact_prose_enabled(true, true));
+    }
+
+    fn assert_compact_terminal(events: &[serde_json::Value], terminal: &str) {
+        assert_eq!(events.len(), 2, "one start and exactly one terminal record");
+        assert_eq!(events[0]["type"], "system");
+        assert_eq!(events[0]["subtype"], "compact_status");
+        assert_eq!(events[0]["compact_metadata"]["phase"], "started");
+        assert_eq!(
+            events[0]["compact_metadata"]["cycle_id"],
+            events[1]["compact_metadata"]["cycle_id"]
+        );
+        assert!(events[0]["parent_tool_use_id"].is_null());
+        assert!(events[1]["parent_tool_use_id"].is_null());
+        if terminal == "success" {
+            assert_eq!(events[1]["subtype"], "compact_boundary");
+        } else {
+            assert_eq!(events[1]["subtype"], "compact_status");
+            assert_eq!(events[1]["compact_metadata"]["phase"], terminal);
+        }
+    }
+
     #[tokio::test]
     async fn compacting_loop_summarizes_older_turns_when_over_threshold() {
         let r = registry();
@@ -13225,15 +13703,28 @@ mod tests {
             Message::user(format!("u3 {}", "z".repeat(200))),
         ];
         let summarize = |_msgs: Vec<Message>| async { Ok("DENSE_SUMMARY_OK".to_string()) };
-        let out = run_agent_loop_compacting(
+        let mut expected = messages.clone();
+        let (before, after) =
+            compact::compact_history(&mut expected, summarize, compact::KEEP_TURNS)
+                .await
+                .unwrap();
+        let expected_request =
+            estimate_request_tokens(&expected, &c) + estimate_defs_tokens(&r.defs());
+        let (out, events) = crate::ui::events::capture_compaction(run_agent_loop_compacting(
             scripted(vec![final_turn("done")]),
             summarize,
             &c,
             &r,
             &mut messages,
-        )
-        .await
-        .unwrap();
+        ))
+        .await;
+        let out = out.unwrap();
+        assert_compact_terminal(&events, "success");
+        let metadata = &events[1]["compact_metadata"];
+        assert_eq!(metadata["pre_tokens"], before);
+        assert_eq!(metadata["post_tokens"], after);
+        assert_eq!(metadata["request_tokens"], expected_request);
+        assert_eq!(metadata["context_window"], c.context_window);
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(
             messages[0].content.as_deref(),
@@ -13265,15 +13756,16 @@ mod tests {
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("x".repeat(400))];
-        let out = run_agent_loop_compacting(
+        let (out, events) = crate::ui::events::capture_compaction(run_agent_loop_compacting(
             scripted(vec![final_turn("done")]),
             |_| async { panic!("a recent-only history is not a compaction failure") },
             &c,
             &ToolRegistry::new(),
             &mut messages,
-        )
-        .await
-        .unwrap();
+        ))
+        .await;
+        let out = out.unwrap();
+        assert!(events.is_empty());
         assert_eq!(out.stop, StopReason::Done);
         assert!(messages
             .iter()
@@ -13306,15 +13798,23 @@ mod tests {
             Message::user("current task"),
         ];
         let original = messages.clone();
-        let out = run_agent_loop_compacting(
+        let (out, events) = crate::ui::events::capture_compaction(run_agent_loop_compacting(
             scripted(vec![final_turn("done")]),
-            |_| async { anyhow::bail!("fixture summary failure") },
+            |_| async { anyhow::bail!("fixture-private-provider-body") },
             &c,
             &ToolRegistry::new(),
             &mut messages,
-        )
-        .await
-        .unwrap();
+        ))
+        .await;
+        let out = out.unwrap();
+        assert_compact_terminal(&events, "failed");
+        assert_eq!(
+            events[1]["compact_metadata"]["error"],
+            "Automatic compaction failed."
+        );
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("fixture-private-provider-body"));
         assert_eq!(out.stop, StopReason::Done);
         for message in original {
             let expected = serde_json::to_value(message).unwrap();
@@ -13342,7 +13842,7 @@ mod tests {
         ];
         let original = messages.clone();
         let cancel = c.cancel.clone();
-        let out = run_agent_loop_compacting(
+        let (out, events) = crate::ui::events::capture_compaction(run_agent_loop_compacting(
             |_messages, _tools| async {
                 panic!("cancel during compaction must not reach the coding model")
             },
@@ -13353,14 +13853,48 @@ mod tests {
             &c,
             &ToolRegistry::new(),
             &mut messages,
-        )
-        .await
-        .unwrap();
+        ))
+        .await;
+        let out = out.unwrap();
+        assert_compact_terminal(&events, "cancelled");
         assert_eq!(out.stop, StopReason::Cancelled);
         assert_eq!(
             serde_json::to_value(messages).unwrap(),
             serde_json::to_value(original).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn compacting_loop_cancel_after_ready_summary_has_no_success_boundary() {
+        let c = AgentConfig {
+            context_window: 100,
+            compact_at_pct: 20,
+            ..cfg()
+        };
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user("first task"),
+            Message::assistant("a1"),
+            Message::user("second task"),
+            Message::assistant("a2"),
+            Message::user("current task"),
+        ];
+        let original = serde_json::to_value(&messages).unwrap();
+        let cancel = c.cancel.clone();
+        let (out, events) = crate::ui::events::capture_compaction(run_agent_loop_compacting(
+            |_, _| async { panic!("cancel must not reach the coding model") },
+            move |_| {
+                cancel.cancel();
+                std::future::ready(Ok("summary already ready".to_owned()))
+            },
+            &c,
+            &ToolRegistry::new(),
+            &mut messages,
+        ))
+        .await;
+        assert_eq!(out.unwrap().stop, StopReason::Cancelled);
+        assert_compact_terminal(&events, "cancelled");
+        assert_eq!(serde_json::to_value(messages).unwrap(), original);
     }
 
     #[tokio::test]
@@ -13497,7 +14031,6 @@ mod tests {
             .unwrap()
             .success());
         config.enable_verify_gate = true;
-        config.auto_checkpoint = true;
         let background = crate::core::exec_ctx::with_current(config.exec_ctx.clone(), || {
             SidecarEffectLease::acquire(
                 SidecarKind::BackgroundProcess,
@@ -13508,11 +14041,17 @@ mod tests {
         });
         let results = exec(&registry(), &[call("ordinary", "delete", "{}")], &config).await;
         assert_eq!(results[0].1, "deleted");
-        assert_eq!(config.exec_ctx.recovery().status(&root).pre_edit, None);
+        assert!(config
+            .exec_ctx
+            .recovery()
+            .hint(&root)
+            .unwrap()
+            .contains("Background effects"));
+        assert!(!home.join("timemachine").exists());
         drop(background);
         let results = exec(&registry(), &[call("fresh", "delete", "{}")], &config).await;
         assert_eq!(results[0].1, "deleted");
-        assert!(config.exec_ctx.recovery().status(&root).pre_edit.is_some());
+        assert!(!home.join("timemachine").exists());
     }
 
     #[test]
@@ -13566,7 +14105,7 @@ mod tests {
                 args: &serde_json::Value,
                 ctx: &crate::core::exec_ctx::ExecutionContext,
             ) -> Result<tools::PreparedToolCall> {
-                self.inner.prepare_call(args, ctx)
+                self.inner.prepare_checked(args, ctx)
             }
             fn execute(&self, _args: &serde_json::Value) -> Result<String> {
                 anyhow::bail!("prepared fixture only")
@@ -13653,7 +14192,13 @@ mod tests {
                                 Message::user("apply owned exact-file change"),
                             ];
                             let result = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-                            assert_eq!(result.stop, StopReason::Done);
+                            assert_eq!(
+                                result.stop,
+                                StopReason::Incomplete,
+                                "owned writes still need verification after the child returns"
+                            );
+                            assert_eq!(result.iters, 2);
+                            assert_eq!(result.final_text.as_deref(), Some("child complete"));
                             assert!(!c.exec_ctx.can_restore_workspace());
                             assert_valid_history(&messages);
                         })
@@ -13693,7 +14238,7 @@ mod tests {
         clippy::await_holding_lock,
         reason = "Pin the fixture home across dispatch workers; workers do not acquire TEST_HOME_LOCK"
     )]
-    async fn native_owner_undo_dispatch_skips_whole_tree_lease_baseline_and_checkpoint() {
+    async fn native_owner_undo_dispatch_uses_only_exact_resource_admission() {
         use crate::core::persist::FileFingerprint;
         use crate::core::workspace_txn::{NativeResource, NativeResourceLease};
         let _home_lock = crate::core::config::TEST_HOME_LOCK
@@ -13705,8 +14250,6 @@ mod tests {
         let _env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
         config.exec_ctx = config.exec_ctx.with_resource_scope("undo-parent");
         config.enable_verify_gate = true;
-        config.auto_checkpoint = true;
-        config.checkpoint_each_edit = true;
         let owner = "undo-parent/task/a";
         let child = config
             .exec_ctx
@@ -13755,7 +14298,6 @@ mod tests {
         )];
         let planned = plan_execution_calls(&registry, &calls, &config);
         let mut sink = vec![Message::tool_result("undo", INTERRUPTED_TOOL_PLACEHOLDER)];
-        let mut checkpointed = false;
         let mut writer_lease = None;
         let mut baseline = None;
         let executions = crate::core::workspace_txn::with_test_lock_namespace_future(
@@ -13768,7 +14310,6 @@ mod tests {
                 &config,
                 &mut sink,
                 Vec::new(),
-                &mut checkpointed,
                 &mut writer_lease,
                 &mut baseline,
                 &[],
@@ -13779,9 +14320,9 @@ mod tests {
         assert_eq!(executions[0].effect_state, tools::ToolEffectState::Settled);
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"before");
         assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"sibling");
-        assert!(!checkpointed);
         assert!(writer_lease.is_none());
         assert!(baseline.is_none());
+        assert!(!home.join("timemachine").exists());
         assert!(!config.exec_ctx.placement().unwrap().home_root().exists());
     }
 
@@ -13842,7 +14383,6 @@ mod tests {
             &c,
             &mut sink,
             Vec::new(),
-            &mut false,
             &mut None,
             &mut None,
             &[],
@@ -13951,7 +14491,6 @@ mod tests {
             "preparation/preview must not mkdir"
         );
         let mut sink = vec![Message::tool_result("write", INTERRUPTED_TOOL_PLACEHOLDER)];
-        let mut checkpointed = false;
         let mut lease = None;
         let results = execute_prepared_calls(
             &registry,
@@ -13960,7 +14499,6 @@ mod tests {
             &c,
             &mut sink,
             Vec::new(),
-            &mut checkpointed,
             &mut lease,
         )
         .await;
@@ -13973,7 +14511,6 @@ mod tests {
                 .unwrap();
         assert_eq!(lease.identity().worktree_id, expected_identity.worktree_id);
         assert_ne!(lease.identity().canonical_root, root);
-        assert!(!checkpointed);
         assert!(!turn_made_edits(
             &registry,
             &effective_calls(std::slice::from_ref(&requested), &prepared),
@@ -13997,7 +14534,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(
+            out.stop,
+            StopReason::Incomplete,
+            "managed artifact writes are real effects, not a completion receipt"
+        );
+        assert_eq!(out.iters, 2);
+        assert_eq!(
+            std::fs::read_to_string(
+                actual
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("second.txt")
+            )
+            .unwrap(),
+            "second"
+        );
         assert!(messages
             .iter()
             .flat_map(|message| &message.tool_calls)
@@ -14047,7 +14601,6 @@ mod tests {
             cached
         );
         let mut sink = vec![Message::tool_result("write", INTERRUPTED_TOOL_PLACEHOLDER)];
-        let mut checkpointed = false;
         let mut lease = None;
         let results = execute_prepared_calls(
             &registry,
@@ -14056,7 +14609,6 @@ mod tests {
             &c,
             &mut sink,
             Vec::new(),
-            &mut checkpointed,
             &mut lease,
         )
         .await;
@@ -14179,7 +14731,6 @@ mod tests {
             .actual_path()
             .to_path_buf();
         let mut sink = vec![Message::tool_result("move", INTERRUPTED_TOOL_PLACEHOLDER)];
-        let mut checkpointed = false;
         let mut lease = None;
         let results = execute_prepared_calls(
             &registry,
@@ -14188,7 +14739,6 @@ mod tests {
             &c,
             &mut sink,
             Vec::new(),
-            &mut checkpointed,
             &mut lease,
         )
         .await;
@@ -14197,7 +14747,6 @@ mod tests {
             lease.is_some(),
             "source removal must retain the workspace lease"
         );
-        assert!(!checkpointed, "fixture explicitly disables checkpoints");
         assert!(!root.join("source.txt").exists());
         assert_eq!(std::fs::read_to_string(actual).unwrap(), "source");
         assert!(turn_made_prepared_edits(
@@ -14337,7 +14886,7 @@ mod tests {
                 args: &serde_json::Value,
                 ctx: &crate::core::exec_ctx::ExecutionContext,
             ) -> Result<tools::PreparedToolCall> {
-                self.inner.prepare_call(args, ctx)
+                self.inner.prepare_checked(args, ctx)
             }
             fn execute_prepared(
                 &self,
@@ -14421,7 +14970,6 @@ mod tests {
             .iter()
             .map(|call| Message::tool_result(&call.id, INTERRUPTED_TOOL_PLACEHOLDER))
             .collect();
-        let mut checkpointed = false;
         let mut writer_lease = None;
         let mut baseline = None;
         let mut execution = Box::pin(execute_execution_calls(
@@ -14432,7 +14980,6 @@ mod tests {
             &config,
             &mut sink,
             Vec::new(),
-            &mut checkpointed,
             &mut writer_lease,
             &mut baseline,
             &[],
@@ -14598,7 +15145,7 @@ mod tests {
             std::fs::read_to_string(root.join("owned.txt")).unwrap(),
             "changed"
         );
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.stop, StopReason::Incomplete);
         assert_eq!(out.final_text.as_deref(), Some("second done"));
         let reviews = messages
             .iter()
@@ -14785,7 +15332,6 @@ mod tests {
                 &config,
                 &mut sink,
                 vec![(0, started)],
-                &mut false,
                 &mut None,
                 &mut None,
                 &[],
@@ -14831,7 +15377,6 @@ mod tests {
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
-        let mut checkpointed = false;
         let mut writer_lease = None;
         let results = execute_calls(
             &r,
@@ -14839,7 +15384,6 @@ mod tests {
             &cfg(),
             &mut sink,
             vec![(0, h)],
-            &mut checkpointed,
             &mut writer_lease,
         )
         .await;
@@ -14883,7 +15427,6 @@ mod tests {
             &config,
             &mut sink,
             vec![(0, started)],
-            &mut false,
             &mut None,
         )
         .await;
@@ -14923,18 +15466,8 @@ mod tests {
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
-        let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(
-            &r,
-            &calls,
-            &cfg(),
-            &mut sink,
-            vec![],
-            &mut checkpointed,
-            &mut writer_lease,
-        )
-        .await;
+        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![], &mut writer_lease).await;
         assert_eq!(results[0].1, "hello", "the repaired arg reached the tool");
     }
 
@@ -14961,18 +15494,9 @@ mod tests {
             tc.id.clone(),
             INTERRUPTED_TOOL_PLACEHOLDER.to_string(),
         )];
-        let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(
-            &r,
-            &[tc],
-            &c,
-            &mut sink,
-            vec![(0, h)],
-            &mut checkpointed,
-            &mut writer_lease,
-        )
-        .await;
+        let results =
+            execute_calls(&r, &[tc], &c, &mut sink, vec![(0, h)], &mut writer_lease).await;
         assert_eq!(results[0].1, "hello");
     }
 
@@ -14996,18 +15520,8 @@ mod tests {
             .iter()
             .map(|tc| Message::tool_result(tc.id.clone(), INTERRUPTED_TOOL_PLACEHOLDER.to_string()))
             .collect();
-        let mut checkpointed = false;
         let mut writer_lease = None;
-        let results = execute_calls(
-            &r,
-            &calls,
-            &cfg(),
-            &mut sink,
-            vec![],
-            &mut checkpointed,
-            &mut writer_lease,
-        )
-        .await;
+        let results = execute_calls(&r, &calls, &cfg(), &mut sink, vec![], &mut writer_lease).await;
         let out = &results[0].1;
         assert!(out.starts_with("error: "), "{out}");
         assert!(out.contains("echo"), "names the tool: {out}");
@@ -15173,6 +15687,7 @@ mod tests {
         // turn finishes. Proves the loop wires execute_calls correctly.
         let r = registry();
         let multi = ChatTurn {
+            speech_final_verified: false,
             content: None,
             tool_calls: vec![
                 call("a", "echo", r#"{"text":"1"}"#),
@@ -15295,11 +15810,8 @@ mod tests {
         clippy::await_holding_lock,
         reason = "Keep process-global AIZEN_HOME stable through the awaited delete's writer lease so the no-manifest verification gate is actually exercised"
     )]
-    async fn verify_gate_with_nothing_to_run_demands_a_manual_check_once() {
-        // Gate ON, an edit lands, but the tree carries no manifest the gate recognises. The old
-        // shape fell through to Done in silence; now the first "done" is intercepted by ONE demand
-        // to run the project's own check, and the second "done" is accepted — the demand fires
-        // once per run and never loops.
+    async fn verify_gate_with_nothing_to_run_remains_incomplete_after_one_demand() {
+        // Absence is reported once; another unsupported completion claim is not a clean check.
         let _g = crate::core::config::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -15323,7 +15835,7 @@ mod tests {
             std::fs::read_to_string(dir.join("owned.txt")).unwrap(),
             "changed"
         );
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.stop, StopReason::Incomplete);
         assert_eq!(out.final_text.as_deref(), Some("second done"));
         let demands = messages
             .iter()
@@ -15348,6 +15860,7 @@ mod tests {
         // An HTTP-200 with neither content nor a tool call — this provider's most common silent
         // failure. Goal mode must retry it, ordinary mode feeds it to the done cascade.
         ChatTurn {
+            speech_final_verified: false,
             content: None,
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
@@ -16002,46 +16515,61 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let _hooks_disabled =
             crate::core::config::EnvGuard::set([("AIZEN_NO_HOOKS", std::ffi::OsStr::new("1"))]);
-        // W22: a read/fetch tool's output must be measured against `max_fetch_chars`, NOT the
-        // smaller `max_chars` — otherwise the reach layer's 20k fetch gets halved to 4k before
-        // relevance-truncation ever sees the full document (the double-cut the plan calls out).
-        let small_budget = 200usize;
-        let large_budget = 6000usize;
-        let budgets = ResultBudgets {
-            default: small_budget,
-            fetch: large_budget,
-            log: small_budget,
-            delegate: small_budget,
-            spill_over: 0,
-        };
-        let fetch_tool = std::sync::Arc::new(LongFetchTool) as std::sync::Arc<dyn Tool>;
-        let out = run_tool_body(fetch_tool, &serde_json::json!({}), true, budgets, None).text;
-        assert!(
-            out.chars().count() > small_budget,
-            "web_fetch output should use the larger fetch budget, not the small default: got {} chars",
-            out.chars().count()
-        );
-        assert!(
-            out.chars().count() <= large_budget + 200,
-            "still bounded by the larger budget"
-        );
-        // `file_read` budgets ITSELF (contiguous, marked) — the loop must not cut it again. Its
-        // 12 k-char output sits under the 4× safety net and comes back verbatim.
-        let read_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
-        let verbatim = LongReadTool.execute(&serde_json::json!({})).unwrap();
-        let out = run_tool_body(read_tool, &serde_json::json!({}), true, budgets, None).text;
-        assert_eq!(
-            out, verbatim,
-            "the loop must not re-cut a self-budgeted read"
-        );
+        // This output-contract fixture must not acquire the user's live workspace/HOME locks.
+        let temp = crate::core::file_placement::tests::TestDir::new();
+        crate::core::workspace_txn::with_test_lock_home(temp.path(), || {
+            let placement = crate::core::file_placement::PlacementContext::new(
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+            )
+            .unwrap();
+            let context =
+                crate::core::exec_ctx::ExecutionContext::default().with_placement(placement);
+            crate::core::exec_ctx::with_current(context, || {
+                // W22: a read/fetch tool's output must be measured against `max_fetch_chars`, NOT the
+                // smaller `max_chars` — otherwise the reach layer's 20k fetch gets halved to 4k before
+                // relevance-truncation ever sees the full document (the double-cut the plan calls out).
+                let small_budget = 200usize;
+                let large_budget = 6000usize;
+                let budgets = ResultBudgets {
+                    default: small_budget,
+                    fetch: large_budget,
+                    log: small_budget,
+                    delegate: small_budget,
+                    spill_over: 0,
+                };
+                let fetch_tool = std::sync::Arc::new(LongFetchTool) as std::sync::Arc<dyn Tool>;
+                let out =
+                    run_tool_body(fetch_tool, &serde_json::json!({}), true, budgets, None).text;
+                assert!(
+                    out.chars().count() > small_budget,
+                    "web_fetch output should use the larger fetch budget, not the small default: got {} chars",
+                    out.chars().count()
+                );
+                assert!(
+                    out.chars().count() <= large_budget + 200,
+                    "still bounded by the larger budget"
+                );
+                // `file_read` budgets ITSELF (contiguous, marked) — the loop must not cut it again. Its
+                // 12 k-char output sits under the 4× safety net and comes back verbatim.
+                let read_tool = std::sync::Arc::new(LongReadTool) as std::sync::Arc<dyn Tool>;
+                let verbatim = LongReadTool.execute(&serde_json::json!({})).unwrap();
+                let out =
+                    run_tool_body(read_tool, &serde_json::json!({}), true, budgets, None).text;
+                assert_eq!(
+                    out, verbatim,
+                    "the loop must not re-cut a self-budgeted read"
+                );
 
-        // A non-truncatable tool (positional output) stays at the SMALL budget regardless.
-        let konst_out = "x".repeat(1000);
-        let plain = truncate_result(&konst_out, small_budget);
-        assert!(
-            plain.chars().count() <= small_budget + 40,
-            "non-fetch tools keep the small budget"
-        );
+                // A non-truncatable tool (positional output) stays at the SMALL budget regardless.
+                let konst_out = "x".repeat(1000);
+                let plain = truncate_result(&konst_out, small_budget);
+                assert!(
+                    plain.chars().count() <= small_budget + 40,
+                    "non-fetch tools keep the small budget"
+                );
+            });
+        });
     }
 
     #[test]
@@ -16613,25 +17141,41 @@ mod tests {
         assert_valid_history(&messages);
     }
 
+    // Exercise reminder/confidence behavior with a genuinely satisfied requirement rather than
+    // treating a model's `done` status as evidence. The receipt API is test-only and typed.
+    fn task_with_observed_first_todo(items: Vec<todo::Todo>) -> todo::TaskContext {
+        let task = todo::TaskContext::private();
+        let target = "test-local observed fixture";
+        task.replace_with_requirements(
+            items,
+            vec![(
+                "@index:0".into(),
+                todo::Requirement::Observe {
+                    target: target.into(),
+                },
+            )],
+        )
+        .unwrap();
+        let token = task.observation_capture(target).unwrap();
+        task.record_observation_with_token(token, target).unwrap();
+        task
+    }
+
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "Serialize the process-global todo fixture across both awaited reminder runs and reset; the loop uses the separate TODOS mutex"
-    )]
     async fn todo_recitation_fires_replaces_and_respects_cadence() {
-        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        todo::set(vec![
+        let task = task_with_observed_first_todo(vec![
             todo::Todo::new("map the module", todo::Status::Done),
             todo::Todo::new("fix the parser", todo::Status::InProgress),
             todo::Todo::new("run the tests", todo::Status::Pending),
         ]);
         let r = registry();
         let c = AgentConfig {
+            exec_ctx: cfg().exec_ctx.with_task(task),
             todo_reminder_every: 2,
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("long task")];
-        // 5 distinct tool turns → reminders due after iters 2 and 4 — but COLLAPSED to one message.
+        // Four distinct tool turns → reminders due after iters 2 and 4 — COLLAPSED to one message.
         let chat = scripted(vec![
             tool_turn("echo", r#"{"text":"1"}"#),
             tool_turn("echo", r#"{"text":"2"}"#),
@@ -16640,7 +17184,7 @@ mod tests {
             final_turn("done"),
         ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.stop, StopReason::Incomplete);
         let reminders: Vec<&Message> = messages
             .iter()
             .filter(|m| {
@@ -16658,7 +17202,10 @@ mod tests {
         assert_valid_history(&messages);
 
         // Empty list → no reminder at all.
-        todo::clear();
+        let c2 = AgentConfig {
+            exec_ctx: c.exec_ctx.clone().with_task(todo::TaskContext::private()),
+            ..c
+        };
         let mut messages2 = vec![Message::system("sys"), Message::user("task")];
         let chat2 = scripted(vec![
             tool_turn("echo", r#"{"text":"1"}"#),
@@ -16666,7 +17213,10 @@ mod tests {
             tool_turn("echo", r#"{"text":"3"}"#),
             final_turn("done"),
         ]);
-        run_agent_loop(chat2, &c, &r, &mut messages2).await.unwrap();
+        let out2 = run_agent_loop(chat2, &c2, &r, &mut messages2)
+            .await
+            .unwrap();
+        assert_eq!(out2.stop, StopReason::Done);
         assert!(
             !messages2.iter().any(|m| m
                 .content
@@ -16696,16 +17246,14 @@ mod tests {
             ..cfg()
         };
         let mut messages = vec![Message::system("sys"), Message::user("multi-step")];
-        // First text-only → poke; second text-only after model "finishes" todos in real life would
-        // pass — here we clear between by scripting a tool that doesn't clear; instead second
-        // final still incomplete → second poke; third final with list still open but budget=2 → Done.
+        // Two reminders are the nudge budget, never permission to certify open work.
         let chat = scripted(vec![
             final_turn("done early"),
             final_turn("still done"),
             final_turn("forced done"),
         ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.stop, StopReason::Incomplete);
         let pokes = messages
             .iter()
             .filter(|m| {
@@ -16717,7 +17265,7 @@ mod tests {
             .count();
         assert_eq!(
             pokes, 2,
-            "exactly max_todo_poke_attempts pokes, then Done: {pokes}"
+            "exactly max_todo_poke_attempts pokes, then Incomplete: {pokes}"
         );
         assert!(
             messages.iter().any(|m| {
@@ -16729,6 +17277,67 @@ mod tests {
             "poke lists the open item"
         );
         todo::clear();
+    }
+
+    #[tokio::test]
+    async fn report_completion_is_delivered_without_an_extra_todo_poke() {
+        let task = todo::TaskContext::private();
+        let mut rows = task
+            .replace(vec![todo::Todo::new(
+                "report findings",
+                todo::Status::Pending,
+            )])
+            .unwrap();
+        let requirements = vec![(rows[0].id.clone(), todo::Requirement::Report)];
+        rows[0].status = todo::Status::Done;
+        task.replace_with_requirements(rows, requirements).unwrap();
+        let c = AgentConfig {
+            exec_ctx: crate::core::exec_ctx::ExecutionContext::default().with_task(task.clone()),
+            enable_todo_poke: true,
+            max_todo_poke_attempts: 2,
+            ..cfg()
+        };
+        let out = run_agent(
+            scripted(vec![final_turn("findings delivered")]),
+            &c,
+            &registry(),
+            "sys",
+            "report",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stop, StopReason::Done);
+        assert!(task.is_complete());
+        assert_eq!(task.snapshot().reports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn todo_poke_disabled_or_zero_never_certifies_open_work() {
+        for (enabled, budget) in [(false, 2), (true, 0)] {
+            let task = todo::TaskContext::private();
+            task.replace(vec![todo::Todo::new("unfinished", todo::Status::Pending)])
+                .unwrap();
+            let c = AgentConfig {
+                exec_ctx: crate::core::exec_ctx::ExecutionContext::default()
+                    .with_task(task.clone()),
+                enable_todo_poke: enabled,
+                max_todo_poke_attempts: budget,
+                ..cfg()
+            };
+            let out = run_agent(
+                scripted(vec![final_turn("all done")]),
+                &c,
+                &registry(),
+                "sys",
+                "work",
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.stop, StopReason::Incomplete);
+            assert!(task.completion_pending());
+            task.finish_turn(out.stop.task_turn_end());
+            assert!(task.snapshot().carry_over);
+        }
     }
 
     #[tokio::test]
@@ -16763,7 +17372,7 @@ mod tests {
             final_turn("second done"), // both budgets spent → accepted
         ]);
         let out = run_agent_loop(chat, &c, &r, &mut messages).await.unwrap();
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.stop, StopReason::Incomplete);
         assert_eq!(out.final_text.as_deref(), Some("second done"));
         let merged: Vec<&Message> = messages
             .iter()
@@ -16929,10 +17538,31 @@ mod tests {
     /// Steering is a process-global mailbox (the keyboard thread has no handle on the running turn),
     /// so these tests must not interleave with each other.
     fn steer_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::core::steer::test_lock()
+    }
+
+    // The caller holds TEST_HOME_LOCK before the steering mailbox lock. Hook configuration is
+    // process-environment-rooted, so a private task/placement alone cannot isolate this fixture.
+    fn steering_fixture() -> (
+        crate::core::file_placement::tests::TestDir,
+        AgentConfig,
+        crate::core::config::EnvGuard,
+    ) {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("workspace");
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let placement =
+            crate::core::file_placement::PlacementContext::new(root.clone(), home.clone()).unwrap();
+        let mut config = cfg();
+        config.workspace_root = Some(root);
+        config.exec_ctx = config
+            .exec_ctx
+            .with_task(todo::TaskContext::private())
+            .with_placement(placement);
+        let env = crate::core::config::EnvGuard::set([("AIZEN_HOME", &home)]);
+        (fixture, config, env)
     }
 
     #[tokio::test]
@@ -16941,31 +17571,66 @@ mod tests {
         reason = "Serialize the process-global steering fixture from arm through awaited drain and disarm; the loop uses the separate MAILBOX mutex"
     )]
     async fn steer_is_folded_into_the_running_turn_at_the_next_iteration() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let _g = steer_guard();
+        let (_fixture, config, _env) = steering_fixture();
         let r = registry();
         let c = AgentConfig {
             enable_steering: true,
             max_iters: 6,
             auto_extend_to: 6,
-            ..cfg()
+            ..config
         };
         let mut messages = vec![Message::system("sys"), Message::user("original task")];
         // A tool turn, then a final answer. The steer is posted BEFORE the loop runs, so it is drained
         // at the very first iteration boundary — the same path a mid-flight Alt+Enter takes.
         crate::core::steer::arm();
         assert!(crate::core::steer::push("also update the README"));
-        let out = run_agent_loop(
-            scripted(vec![
-                tool_turn("echo", r#"{"text":"hi"}"#),
-                final_turn("done"),
-            ]),
-            &c,
-            &r,
-            &mut messages,
+        // Force another task to remain ambient so libtest thread reuse cannot hide fixture leakage.
+        let ambient = todo::TaskContext::private().with_control(
+            c.exec_ctx
+                .task()
+                .expect("steering fixture owns a task")
+                .control(),
+        );
+        ambient
+            .replace(vec![todo::Todo::new(
+                "unrelated pending task",
+                todo::Status::Pending,
+            )])
+            .unwrap();
+        let out = todo::with_context(
+            ambient.clone(),
+            run_agent_loop(
+                scripted(vec![
+                    tool_turn("echo", r#"{"text":"hi"}"#),
+                    final_turn("done"),
+                ]),
+                &c,
+                &r,
+                &mut messages,
+            ),
         )
         .await
         .unwrap();
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "steering completion: outcome={out:?}; task={:?}; policy={:?}; tool_results={:?}",
+            c.exec_ctx.task().unwrap().snapshot(),
+            c.exec_ctx.policy().map(|policy| policy.validate_current()),
+            messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ambient.completion_pending(),
+            "another task must remain untouched"
+        );
         let injected: Vec<&Message> = messages
             .iter()
             .filter(|m| {
@@ -16999,13 +17664,17 @@ mod tests {
         reason = "Serialize the process-global steering fixture through the awaited late-push/done-gate race and disarm; MAILBOX has a separate mutex"
     )]
     async fn steer_arriving_at_the_final_answer_blocks_done_and_grants_another_turn() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let _g = steer_guard();
+        let (_fixture, config, _env) = steering_fixture();
         let r = registry();
         let c = AgentConfig {
             enable_steering: true,
             max_iters: 6,
             auto_extend_to: 6,
-            ..cfg()
+            ..config
         };
         let mut messages = vec![Message::system("sys"), Message::user("task")];
         // The steer must land INSIDE the model call — after the top-of-loop drain, while the answer is
@@ -17054,11 +17723,14 @@ mod tests {
         reason = "Preserve the process-global parent steering fixture through the awaited child run, pending assertion, and disarm; MAILBOX has a separate mutex"
     )]
     async fn steering_is_ignored_when_disabled_so_a_steer_cannot_leak_into_a_subagent() {
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let _g = steer_guard();
+        let (_fixture, c, _env) = steering_fixture();
         let r = registry();
         // Sub-agents / workflow children keep the default (false): a steer aimed at the top-level task
         // must not be swallowed by whatever a delegated child happens to be doing.
-        let c = cfg();
         assert!(!c.enable_steering, "steering is opt-in — default OFF");
         let mut messages = vec![Message::system("sys"), Message::user("child task")];
         crate::core::steer::arm();
@@ -17088,16 +17760,88 @@ mod tests {
         assert_eq!(leftover, vec!["meant for the parent".to_string()]);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[expect(
         clippy::await_holding_lock,
-        reason = "Keep the process-global todo fixture complete throughout awaited done-gate reads and cleanup; the loop uses the separate TODOS mutex"
+        reason = "Keep runner mode, HOME and steering mailbox pinned until the hook and loop settle"
     )]
+    async fn steering_configured_hook_requires_verification_even_for_pure_echo() {
+        let _mode = crate::sandbox::runner::tests::lock();
+        let _home = crate::core::config::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _g = steer_guard();
+        struct Restore(crate::sandbox::SandboxMode);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::sandbox::set_mode(self.0);
+            }
+        }
+        let _restore = Restore(crate::sandbox::mode());
+        crate::sandbox::set_mode(crate::sandbox::SandboxMode::Guarded);
+        let (_fixture, mut config, _env) = steering_fixture();
+        config.enable_steering = true;
+        let _hooks = crate::core::config::EnvGuard::unset(["AIZEN_NO_HOOKS"]);
+        let home = config.exec_ctx.placement().unwrap().home_root();
+        let command = if cfg!(windows) {
+            "echo hook> hook-effect.txt"
+        } else {
+            "printf hook > hook-effect.txt"
+        };
+        let hooks = crate::core::cli_config::CliConfig {
+            hooks: Some(crate::core::cli_config::HooksConfig {
+                pre_tool: vec![crate::core::cli_config::Hook {
+                    run: command.into(),
+                    matches: Some("echo".into()),
+                    timeout_secs: Some(5),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            home.join("cli-config.json"),
+            serde_json::to_vec(&hooks).unwrap(),
+        )
+        .unwrap();
+        let registry = registry();
+        let mut messages = vec![Message::system("sys"), Message::user("original task")];
+        crate::core::steer::arm();
+        assert!(crate::core::steer::push("also update the README"));
+        let outcome = run_agent_loop(
+            scripted(vec![
+                tool_turn("echo", r#"{"text":"hi"}"#),
+                final_turn("done"),
+            ]),
+            &config,
+            &registry,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        let _ = crate::core::steer::disarm();
+        assert!(
+            config.effective_root().join("hook-effect.txt").exists(),
+            "the actual hook must run"
+        );
+        assert_eq!(
+            outcome.stop,
+            StopReason::Incomplete,
+            "hook effects are not pure-read evidence"
+        );
+        assert!(config.exec_ctx.task().unwrap().needs_check());
+    }
+
+    #[tokio::test]
     async fn todo_poke_allows_done_when_all_done() {
-        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        todo::set(vec![todo::Todo::new("only", todo::Status::Done)]);
+        let task = task_with_observed_first_todo(vec![todo::Todo::new("only", todo::Status::Done)]);
+        assert!(
+            task.is_complete(),
+            "the fixture must be done by evidence, not a claim"
+        );
         let r = registry();
         let c = AgentConfig {
+            exec_ctx: cfg().exec_ctx.with_task(task),
             enable_todo_poke: true,
             max_todo_poke_attempts: 2,
             ..cfg()
@@ -17120,20 +17864,17 @@ mod tests {
                 .is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))),
             "no poke when all todos done"
         );
-        todo::clear();
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "Serialize pending and empty process-global todo fixtures across both awaited done-gate runs; the loop uses the separate TODOS mutex"
-    )]
     async fn todo_poke_disabled_or_empty_list() {
-        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Pending todos but poke OFF → Done immediately.
-        todo::set(vec![todo::Todo::new("open", todo::Status::Pending)]);
+        // Disabling the nudge avoids another model call, but cannot certify pending work.
+        let task = todo::TaskContext::private();
+        task.replace(vec![todo::Todo::new("open", todo::Status::Pending)])
+            .unwrap();
         let r = registry();
         let c = AgentConfig {
+            exec_ctx: cfg().exec_ctx.with_task(task),
             enable_todo_poke: false,
             ..cfg()
         };
@@ -17141,12 +17882,16 @@ mod tests {
         let out = run_agent_loop(scripted(vec![final_turn("bye")]), &c, &r, &mut messages)
             .await
             .unwrap();
-        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.stop, StopReason::Incomplete);
         assert_eq!(out.iters, 1);
+        assert!(!messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(TODO_POKE_PREFIX))));
 
-        // Empty list + poke ON → Done.
-        todo::clear();
+        // Empty list + poke ON → Done: no effects or requirements are outstanding.
         let c2 = AgentConfig {
+            exec_ctx: cfg().exec_ctx.with_task(todo::TaskContext::private()),
             enable_todo_poke: true,
             max_todo_poke_attempts: 2,
             ..cfg()
@@ -17156,6 +17901,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out2.stop, StopReason::Done);
+        assert_eq!(out2.iters, 1);
         assert!(!messages2.iter().any(|m| m
             .content
             .as_deref()
@@ -17163,16 +17909,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "Serialize the process-global todo confidence sequence through awaited TodoWrite workers, gate reads, and cleanup; TODOS has a separate mutex"
-    )]
     async fn confidence_spike_arms_one_shot_gate() {
-        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        todo::clear();
+        let task =
+            task_with_observed_first_todo(vec![todo::Todo::new("ship it", todo::Status::Pending)]);
         let mut r = registry();
         r.register(Box::new(todo::TodoWrite));
         let c = AgentConfig {
+            exec_ctx: cfg().exec_ctx.with_task(task.clone()),
             enable_todo_poke: false, // isolate confidence gate
             enable_confidence_gate: true,
             conf_high: 90,
@@ -17206,20 +17949,19 @@ mod tests {
             })
             .count();
         assert_eq!(gates, 1, "confidence gate fires exactly once");
-        todo::clear();
+        assert_eq!(out.iters, 4);
+        assert_eq!(out.final_text.as_deref(), Some("done after recheck"));
+        assert!(task.is_complete());
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "Serialize both process-global todo confidence sequences through awaited TodoWrite workers, resets, and cleanup; TODOS has a separate mutex"
-    )]
     async fn confidence_stepwise_or_omitted_no_gate() {
-        let _g = todo::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        todo::clear();
+        let task =
+            task_with_observed_first_todo(vec![todo::Todo::new("ship", todo::Status::Pending)]);
         let mut r = registry();
         r.register(Box::new(todo::TodoWrite));
         let c = AgentConfig {
+            exec_ctx: cfg().exec_ctx.with_task(task.clone()),
             enable_todo_poke: false,
             enable_confidence_gate: true,
             conf_high: 90,
@@ -17257,9 +17999,16 @@ mod tests {
             }),
             "stepwise rises must not arm the gate"
         );
+        assert_eq!(out.iters, 4);
+        assert!(task.is_complete());
 
-        // Omitted confidence → no gate.
-        todo::clear();
+        // Omitted confidence → no gate, even when the observed task really completes.
+        let task2 =
+            task_with_observed_first_todo(vec![todo::Todo::new("x", todo::Status::Pending)]);
+        let c2 = AgentConfig {
+            exec_ctx: c.exec_ctx.clone().with_task(task2.clone()),
+            ..c
+        };
         let mut messages2 = vec![Message::system("sys"), Message::user("task")];
         let chat2 = scripted(vec![
             tool_turn(
@@ -17268,14 +18017,18 @@ mod tests {
             ),
             final_turn("done"),
         ]);
-        run_agent_loop(chat2, &c, &r, &mut messages2).await.unwrap();
+        let out2 = run_agent_loop(chat2, &c2, &r, &mut messages2)
+            .await
+            .unwrap();
+        assert_eq!(out2.stop, StopReason::Done);
+        assert_eq!(out2.iters, 2);
+        assert!(task2.is_complete());
         assert!(!messages2.iter().any(|m| {
             m.role == "user"
                 && m.content
                     .as_deref()
                     .is_some_and(|c| c.starts_with(CONFIDENCE_GATE_PREFIX))
         }));
-        todo::clear();
     }
 
     #[tokio::test]
@@ -17325,6 +18078,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         let mut armed = false;
         let items1 = vec![todo::Todo {
+            id: "item-1".into(),
             content: "t".into(),
             status: todo::Status::InProgress,
             confidence: Some(40),
@@ -17333,6 +18087,7 @@ mod tests {
         update_confidence_tracking(&items1, &mut map, &mut armed, 90, 40);
         assert!(!armed);
         let items2 = vec![todo::Todo {
+            id: "item-1".into(),
             content: "t".into(),
             status: todo::Status::Done,
             confidence: Some(100),
@@ -17345,6 +18100,7 @@ mod tests {
         let mut armed2 = false;
         update_confidence_tracking(
             &[todo::Todo {
+                id: "item-1".into(),
                 content: "t".into(),
                 status: todo::Status::InProgress,
                 confidence: Some(40),
@@ -17357,6 +18113,7 @@ mod tests {
         );
         update_confidence_tracking(
             &[todo::Todo {
+                id: "item-1".into(),
                 content: "t".into(),
                 status: todo::Status::Done,
                 confidence: Some(70),

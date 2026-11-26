@@ -187,7 +187,14 @@ where
     if !manager::read_state()?.packages.contains_key("mnemos") {
         return Ok(present(None, None, target, time));
     }
-    let installed = tokio::task::spawn_blocking(releases::installed_version).await??;
+    // The byte-verification worker can outlive a canceled parent future. Capture its own
+    // admission before spawning so a later planning transition still waits for settlement.
+    let context = crate::agent::hooks::automation_context(None);
+    let admitted = crate::agent::hooks::admit_automation(&context)?;
+    let installed = tokio::task::spawn_blocking(move || {
+        crate::core::exec_ctx::with_current(admitted, releases::installed_version)
+    })
+    .await??;
     let cached = read(target, time);
     if mode == Mode::Cached
         || (mode == Mode::Automatic
@@ -275,18 +282,6 @@ pub(crate) fn cached_notice() -> Option<String> {
             candidate.version
         )
     })
-}
-
-pub(crate) fn spawn_background_check() {
-    if !crate::core::cli_config::update_check_enabled(&crate::core::cli_config::load()) {
-        return;
-    }
-    if !manager::read_state().is_ok_and(|s| s.packages.contains_key("mnemos")) {
-        return;
-    }
-    tokio::spawn(async {
-        let _ = status(Mode::Automatic).await;
-    });
 }
 
 #[cfg(test)]

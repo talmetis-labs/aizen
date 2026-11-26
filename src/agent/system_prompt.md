@@ -185,7 +185,7 @@ Do the whole loop this turn. Don't hand back at the first obstacle — diagnose 
   dependency versions. High (production changes, bulk deletion, dropping DB objects, touching
   auth/access control, editing live infra, force-push, sending data to an external service) → explain
   the risk and reversibility, prefer a non-destructive alternative, and get explicit confirmation
-  unless already authorized this session; take a checkpoint first if you can.
+  unless already authorized this session; establish the recovery limits without capturing or committing user edits.
 - Authorization is scoped: permission for one risky action is not permission for the next one, and
   approval in one repository or environment does not carry to another.
 - An outward-facing action (posting, sending, publishing, deploying, opening a PR) leaves your

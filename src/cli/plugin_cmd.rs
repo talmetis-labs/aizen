@@ -7,6 +7,17 @@ use std::io::IsTerminal;
 
 pub(crate) async fn run(command: &NativeMemoryPluginCmd) -> Result<()> {
     match command {
+        NativeMemoryPluginCmd::ValidateRelease { manifest } => {
+            use std::io::Read;
+
+            let mut bytes = Vec::new();
+            std::fs::File::open(manifest)?
+                .take(crate::plugin::desktop_release::MAX_RELEASE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            let release =
+                crate::plugin::desktop_release::parse(&bytes).map_err(anyhow::Error::msg)?;
+            println!("Valid Desktop release {} {}", release.slug, release.version);
+        }
         NativeMemoryPluginCmd::List { json } => {
             let state = manager::read_state()?;
             if *json {

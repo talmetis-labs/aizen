@@ -122,6 +122,11 @@ pub fn render_transcript(msgs: &[Message]) -> String {
     let mut out = String::new();
     let mut visual_budget = crate::llm::media::VisualDescriptorBudget::default();
     for m in msgs {
+        if super::prompt_lanes::is_plan_context(m) {
+            // The single live lane is rebuilt by the controller after compaction. Do not distill
+            // repository prose into a higher-trust system summary or mistake it for user intent.
+            continue;
+        }
         let body = crate::core::memory_context::clean_content(m)
             .unwrap_or("")
             .trim();
@@ -249,7 +254,7 @@ pub fn plan_compact_cut(history: &[Message], keep_turns: usize) -> Option<usize>
         .iter()
         .enumerate()
         .skip(lead)
-        .filter(|(_, m)| m.role == "user")
+        .filter(|(_, m)| m.role == "user" && !super::prompt_lanes::is_plan_context(m))
         .map(|(i, _)| i)
         .collect();
     if user_idxs.len() < 2 {
@@ -281,7 +286,7 @@ pub fn plan_compact_cut_at(
         .iter()
         .enumerate()
         .skip(lead)
-        .find(|(_, m)| m.role == "user")
+        .find(|(_, m)| m.role == "user" && !super::prompt_lanes::is_plan_context(m))
         .map(|(i, _)| i)?;
     let steps: Vec<usize> = history
         .iter()
@@ -544,7 +549,7 @@ where
         .then(|| {
             older
                 .iter()
-                .position(|m| m.role == "user")
+                .position(|m| m.role == "user" && !super::prompt_lanes::is_plan_context(m))
                 .map(|index| lead + index)
         })
         .flatten();

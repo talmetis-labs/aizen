@@ -439,6 +439,8 @@ pub struct SandboxRequest {
     pub private_tmp: bool,
     /// Sealed restrictive policy. Ordinary builders leave it absent, preserving their behavior.
     restricted: Option<NativePluginPolicy>,
+    #[cfg(unix)]
+    git_metadata: Vec<PathBuf>,
 }
 
 impl SandboxRequest {
@@ -461,6 +463,8 @@ impl SandboxRequest {
             extra_env: Vec::new(),
             private_tmp: true,
             restricted: None,
+            #[cfg(unix)]
+            git_metadata: Vec::new(),
         }
     }
 
@@ -488,6 +492,8 @@ impl SandboxRequest {
             extra_env: Vec::new(),
             private_tmp: true,
             restricted: None,
+            #[cfg(unix)]
+            git_metadata: Vec::new(),
         }
     }
 
@@ -589,6 +595,34 @@ impl SandboxRequest {
     pub fn extra_env(mut self, env: Vec<(String, String)>) -> Self {
         self.extra_env = env;
         self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_git_metadata(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.git_metadata.extend(roots);
+        self.git_metadata.sort_unstable();
+        self.git_metadata.dedup();
+        self
+    }
+
+    #[cfg(unix)]
+    pub(super) fn git_metadata(&self) -> &[PathBuf] {
+        &self.git_metadata
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn git_worktree_removal_parent(&self) -> Option<PathBuf> {
+        let CommandSpec::Exec { args, .. } = &self.spec else {
+            return None;
+        };
+        if self.origin == CommandOrigin::GitMutation
+            && matches!(args.as_slice(), [group, verb, separator, target]
+                if group == "worktree" && verb == "remove" && separator == "--"
+                    && Path::new(target) == self.workspace_root)
+        {
+            return self.workspace_root.parent()?.canonicalize().ok();
+        }
+        None
     }
     pub fn private_tmp(mut self, on: bool) -> Self {
         self.private_tmp = on;

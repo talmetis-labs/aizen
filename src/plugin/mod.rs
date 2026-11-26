@@ -5,6 +5,7 @@ pub(crate) mod associations;
 pub(crate) mod client;
 pub mod configuration;
 pub(crate) mod context;
+pub(crate) mod desktop_release;
 pub(crate) mod events;
 pub mod install;
 pub mod manager;

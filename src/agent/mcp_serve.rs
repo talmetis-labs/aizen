@@ -13,7 +13,7 @@
 //! Three things follow from the implementation being this thin:
 //!
 //! * The tools are *core's own* `task` and `workflow`, taken out of the same registry a REPL turn
-//!   builds. Schema, description, scoping, depth cap, concurrency gate, checkpointing and the
+//!   builds. Schema, description, scoping, depth cap, concurrency gate, effect tracking and the
 //!   orchestration registry all come along unchanged, because none of it is reimplemented here.
 //! * Every dispatch therefore writes a run manifest to `~/.aizen/orchestration/runs`, so a fan-out
 //!   started by Claude Code shows up in `/workflows` and in the desktop's office pane exactly like

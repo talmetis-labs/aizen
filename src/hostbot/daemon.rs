@@ -1,18 +1,9 @@
-//! The generic host-bot daemon — ONE serial agent runner that drives any `Platform`.
-//!
-//! `aizen serve` (Telegram) and `aizen discord serve` (Discord) both funnel into `run_daemon<P>`:
-//! the platform spawns its listener(s), inbound messages arrive on one channel tagged with the
-//! originating sub-bot (`Inbound::route`), and a single loop processes them one at a time — chatting,
-//! running `/commands`, and (on platforms that support it) routing a destructive-op approval back to
-//! the SAME bot the request came from. Because it's serial, that per-turn approval route never races.
-//!
-//! Sessions are keyed by `(route, chat)` and persisted to `~/.aizen/hostbot/sessions/` after every
-//! turn, so a daemon restart (the point of `Restart=always` self-host) keeps its context.
+//! Hostbot router. Each platform address has a serial lane. Telegram addresses include the topic.
+//! Each lane restores its own verified session on first use and owns its task context.
 
 use anyhow::{Context, Result};
 use console::style;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, Sender};
 
 use crate::agent::{self, AgentConfig, StopReason};
@@ -20,7 +11,7 @@ use crate::core::approval::ApprovalMode;
 use crate::core::types::Message;
 use crate::hostbot::health;
 use crate::hostbot::lane;
-use crate::hostbot::platform::{Inbound, Platform};
+use crate::hostbot::platform::{Inbound, IncomingMessage, Platform};
 use crate::hostbot::platforms;
 use crate::hostbot::store;
 use crate::llm::client;
@@ -330,6 +321,7 @@ struct LaneCtx {
     route: String,
     /// Chat id, `Display`ed (platform-agnostic: Telegram `i64`, Discord `u64`).
     chat: String,
+    approval_route: Option<crate::core::exec_ctx::ApprovalRoute>,
     /// This lane's working directory.
     root: std::path::PathBuf,
     /// This lane's persona (`None` ⇒ the global one).
@@ -337,6 +329,21 @@ struct LaneCtx {
     /// This lane's `reasoning_effort`, resolved (see `lane_effort`).
     #[allow(clippy::option_option)]
     effort: Option<Option<String>>,
+}
+
+fn conversation_id(
+    platform: &str,
+    route: &str,
+    chat: impl std::fmt::Display,
+) -> crate::core::convo::ConversationId {
+    // Existing transport identities also own browser sessions and approval state.
+    // Future adapters use a reserved namespace Mnemos can distinguish from ordinary CLI sessions.
+    let prefix = if matches!(platform, "telegram" | "discord") {
+        ""
+    } else {
+        "hostbot:"
+    };
+    crate::core::convo::ConversationId::new(format!("{prefix}{platform}:{route}:{chat}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,6 +359,9 @@ async fn run_serve_turn(
     lane: &LaneCtx,
     shared: &lane::LaneShared,
 ) -> Result<String> {
+    // This lane owns the context for its entire lifetime, including commands and persistence.
+    crate::agent::todo::begin_user_turn();
+    crate::agent::todo::current_context().finish_turn(crate::agent::todo::TurnEnd::Interrupted);
     let context_window =
         crate::core::model_context::discover(&crate::core::cli_config::ResolvedEndpoint {
             base_url: base_url.to_string(),
@@ -379,15 +389,14 @@ async fn run_serve_turn(
     // memory. Ordinary messages in an established thread must keep the active core byte-stable.
     // The bundle states THIS lane's cwd and wears THIS lane's persona.
     let turn_cancel = crate::core::cancel::TurnCancel::new();
-    let exec_ctx =
-        crate::core::exec_ctx::ExecutionContext::new(crate::core::convo::ConversationId::new(
-            format!("{platform_name}:{}:{}", lane.route, lane.chat),
-        ))
-        .with_persona(lane.persona.clone())
-        .with_approval_route(Some(crate::core::exec_ctx::ApprovalRoute {
-            route: lane.route.clone(),
-            chat: lane.chat.clone(),
-        }));
+    let exec_ctx = crate::core::exec_ctx::ExecutionContext::new(conversation_id(
+        platform_name,
+        &lane.route,
+        &lane.chat,
+    ))
+    .with_persona(lane.persona.clone())
+    .with_task(crate::agent::todo::current_context())
+    .with_approval_route(lane.approval_route.clone());
     crate::core::memory_context::strip_history(history);
     let memory_key = format!("hostbot:{platform_name}:{}:{}", lane.route, lane.chat);
     let user_turn_id = crate::core::types::UserTurnId::new()?;
@@ -504,43 +513,46 @@ async fn run_serve_turn(
                 .map(|t| t.content.unwrap_or_default())
         }
     };
-    // Same turn scoping as the REPL: the todo list belongs to one turn's work and carries over
-    // only when the run ended abnormally. (Lanes still share one process-global list — a
-    // per-lane list is a later step.)
-    crate::agent::todo::begin_user_turn();
-    crate::agent::todo::end_turn(true);
-    let result = crate::plugin::associations::scoped(
+    let mut result = crate::plugin::associations::scoped(
         memory_snapshot.clone(),
         cfg.exec_ctx.clone(),
         agent::run_agent_loop_compacting(chat, summarize, &cfg, &registry, history),
     )
     .await;
-    if result
-        .as_ref()
-        .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
+    if let Ok(outcome) = &mut result {
+        // Hooks run before the terminal decision, persistence and optional success feedback.
+        if cfg.exec_ctx.permits_automation() {
+            let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
+            crate::agent::hooks::run_blocking(|| {
+                crate::agent::hooks::stop(
+                    outcome.stop.label(),
+                    outcome.iters,
+                    outcome.final_text.as_deref(),
+                    &hook_ctx,
+                )
+            });
+        }
+        outcome.reconcile_task_completion(&cfg.exec_ctx, &cfg.cancel);
+    }
+    crate::agent::todo::current_context().finish_turn(
+        result
+            .as_ref()
+            .map(|outcome| outcome.stop.task_turn_end())
+            .unwrap_or(crate::agent::todo::TurnEnd::Failed),
+    );
+    if cfg.exec_ctx.permits_automation()
+        && result
+            .as_ref()
+            .is_ok_and(|outcome| matches!(outcome.stop, StopReason::Done))
     {
         crate::plugin::associations::flush(&memory_snapshot).await?;
     } else {
         crate::plugin::associations::discard(&memory_snapshot);
     }
     let outcome = result?;
-    // The user's `stop` hooks see every finished bot turn too (see `agent::hooks`).
-    {
-        let hook_ctx = crate::agent::hooks::Context::from_cfg(&cfg);
-        crate::agent::hooks::run_blocking(|| {
-            crate::agent::hooks::stop(
-                outcome.stop.label(),
-                outcome.iters,
-                outcome.final_text.as_deref(),
-                &hook_ctx,
-            )
-        });
-    }
-    crate::agent::todo::end_turn(!matches!(outcome.stop, StopReason::Done));
-
     // A generation-bound provider event never writes Core's legacy Memory store. No selected
     // capable provider means no event and no child process; the lane's explicit context is retained.
-    {
+    if cfg.exec_ctx.permits_automation() {
         let _learning = shared.learn.lock().await;
         match crate::plugin::events::prepare(
             &outcome.stop,
@@ -569,10 +581,12 @@ async fn run_serve_turn(
     if let StopReason::AwaitingInput(ask) = &outcome.stop {
         return Ok(format!("❓ {}", ask.display()));
     }
-    Ok(outcome
+    let answer = outcome
         .final_text
+        .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(the agent produced no answer)".to_string()))
+        .unwrap_or("(the agent produced no answer)");
+    Ok(crate::ui::events::completion_result_text(outcome.stop.label(), answer).into_owned())
 }
 
 // ── the generic daemon loop ──────────────────────────────────────────────────────────
@@ -595,11 +609,68 @@ async fn lane_worker<P: Platform>(
     route: String,
     chat: P::Chat,
     tx: Sender<Inbound<P::Chat>>,
-    mut rx: mpsc::Receiver<String>,
+    rx: mpsc::Receiver<IncomingMessage>,
+) {
+    let loaded = store::load_lane_session(
+        platform.name(),
+        &route,
+        &chat.to_string(),
+        P::legacy_parent_chat(chat).as_deref(),
+    );
+    let (history, task_state, session_control) = match loaded {
+        Ok(saved) => saved.unwrap_or_default(),
+        Err(error) => {
+            eprintln!("[lane {route}:{chat}] saved execution policy unavailable: {error}");
+            send_reply(&*platform, &route, chat, "Execution blocked. Check the saved session and any planning restriction on its legacy parent chat.").await;
+            return;
+        }
+    };
+    let task_context = crate::agent::todo::TaskContext::private();
+    if let Err(error) = task_context.control().restore(session_control) {
+        eprintln!("[lane {route}:{chat}] execution policy not restored: {error}");
+        return;
+    }
+    if let Err(error) = task_context.restore(task_state) {
+        eprintln!("[lane {route}:{chat}] task state not restored: {error}");
+        return;
+    }
+    crate::agent::todo::with_context(
+        task_context,
+        lane_worker_scoped(
+            platform,
+            shared,
+            registry,
+            http,
+            base_url,
+            api_key,
+            default_model,
+            route,
+            chat,
+            tx,
+            rx,
+            history,
+        ),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn lane_worker_scoped<P: Platform>(
+    platform: Arc<P>,
+    shared: Arc<lane::LaneShared>,
+    registry: Weak<lane::LaneRegistry<P>>,
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    default_model: String,
+    route: String,
+    chat: P::Chat,
+    tx: Sender<Inbound<P::Chat>>,
+    mut rx: mpsc::Receiver<IncomingMessage>,
     mut history: Vec<Message>,
 ) {
-    while let Some(text) = rx.recv().await {
-        let trimmed = text.trim().to_string();
+    while let Some(message) = rx.recv().await {
+        let trimmed = message.text.trim().to_string();
 
         // A `/command` → the dispatcher. `Some(reply)` = handled; `None` = fall through to the agent.
         //
@@ -648,6 +719,13 @@ async fn lane_worker<P: Platform>(
         let ctx = LaneCtx {
             route: route.clone(),
             chat: chat.to_string(),
+            approval_route: platform.supports_approval().then(|| {
+                crate::core::exec_ctx::ApprovalRoute {
+                    route: route.clone(),
+                    chat: chat.to_string(),
+                    sender_id: message.sender_id,
+                }
+            }),
             root: lane_cwd(&route),
             persona: platform.persona_for(&route),
             effort: lane_effort(&route),
@@ -658,12 +736,7 @@ async fn lane_worker<P: Platform>(
         // overlap; lanes sharing a directory take turns (see `lane::RootGate` for why that is
         // mandatory rather than polite).
         let turn = lane::with_turn_guards(&shared, &ctx.root, async {
-            // The approval-route global still exists for pre-context callers; the authoritative
-            // copy rides on the turn's `ExecutionContext`, built inside `run_serve_turn`.
-            if platform.supports_approval() {
-                platform.set_approval_route(&route, chat);
-            }
-            let out = run_serve_turn(
+            run_serve_turn(
                 &http,
                 &base_url,
                 &api_key,
@@ -675,18 +748,18 @@ async fn lane_worker<P: Platform>(
                 &ctx,
                 &shared,
             )
-            .await;
-            if platform.supports_approval() {
-                platform.clear_approval_route();
-            }
-            out
+            .await
         })
         .await;
 
         let failed = turn.is_err();
         let reply = turn.unwrap_or_else(|e| format!("error: {e}"));
-        // Persist the updated history so a restart keeps this chat's context.
-        let _ = store::save_session(platform.name(), &route, &chat.to_string(), &history);
+        // Persist both history and this lane's task; failed writes leave the owned task dirty.
+        if let Err(error) =
+            store::save_session(platform.name(), &route, &chat.to_string(), &history)
+        {
+            eprintln!("[lane {route}:{chat}] session not saved: {error}");
+        }
         let send_failed = !send_reply(&*platform, &route, chat, &reply).await;
         let _ = platform
             .finish_status(&route, chat, status, failed || send_failed)
@@ -735,14 +808,6 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
             platform.name()
         );
     }
-    let mut seeds: HashMap<(String, P::Chat), Vec<Message>> = HashMap::new();
-    for (route, chat_s, msgs) in store::load_sessions(platform.name()) {
-        if let Ok(chat) = chat_s.parse::<P::Chat>() {
-            seeds.insert((route, chat), msgs);
-        }
-    }
-    let seeds = Arc::new(Mutex::new(seeds));
-
     let lanes = lane::LaneRegistry::<P>::new();
     eprintln!(
         "{}",
@@ -791,15 +856,14 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
             }
             m = rx.recv() => match m { Some(m) => m, None => break },
         };
-        let Inbound { route, chat, text } = inbound;
+        let Inbound {
+            route,
+            chat,
+            message,
+        } = inbound;
 
         // Hand off and go straight back to receiving. This return-immediately step is what makes the
         // daemon responsive: the turn happens on the lane's own task.
-        let seed = seeds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(route.clone(), chat))
-            .unwrap_or_default();
         let spawn_platform = platform.clone();
         let spawn_shared = lanes.shared.clone();
         let spawn_http = http.clone();
@@ -826,11 +890,10 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
                             chat,
                             spawn_tx,
                             rx,
-                            seed,
                         ))
                     }),
                 },
-                text,
+                message,
             )
             .await;
     }
@@ -840,6 +903,34 @@ async fn run_daemon<P: Platform>(platform: P) -> Result<()> {
     // probe judges a heartbeat nobody is refreshing and the verdict depends on which deadline the
     // last state happened to leave behind.
     health::clear();
+    Ok(())
+}
+
+/// Clear transcript/task data without deleting the durable execution restriction.
+fn reset_lane_context(
+    platform: &str,
+    route: &str,
+    chat: &str,
+    history: &mut Vec<Message>,
+) -> anyhow::Result<()> {
+    let task = crate::agent::todo::bound_context()
+        .ok_or_else(|| anyhow::anyhow!("reset requires the active lane owner"))?;
+    let control = task.control();
+    let saved_control = store::load_session_with_state(platform, route, chat)?
+        .map(|(_, _, saved)| saved)
+        .unwrap_or_else(|| control.snapshot());
+    // Even an unsaved lane must reject reset while a worker is still admitted.
+    control.restore(saved_control)?;
+    let policy = control.policy();
+    let _lease = policy.admit()?;
+    if policy.is_planning() {
+        store::reset_session_with_control(platform, route, chat, policy.state())?;
+    } else {
+        store::drop_session(platform, route, chat)?;
+    }
+    history.clear();
+    task.clear();
+    crate::plugin::snapshots::reset(&format!("hostbot:{platform}:{route}:{chat}"));
     Ok(())
 }
 
@@ -867,17 +958,14 @@ async fn handle_command<P: Platform>(
     match name {
         "help" | "start" => Some(serve_help_text()),
         "new" | "reset" => {
-            crate::plugin::snapshots::reset(&format!("hostbot:{}:{route}:{chat}", platform.name()));
-            history.clear();
-            store::drop_session(platform.name(), route, &chat.to_string());
+            if let Err(error) =
+                reset_lane_context(platform.name(), route, &chat.to_string(), history)
+            {
+                return Some(format!("reset refused: {error}"));
+            }
             // Free this chat's browser session too (its page/@refs are part of the dropped context).
             #[cfg(feature = "browser")]
-            crate::agent::browser::release(&crate::core::convo::ConversationId::new(format!(
-                "{}:{}:{}",
-                platform.name(),
-                route,
-                chat
-            )));
+            crate::agent::browser::release(&conversation_id(platform.name(), route, chat));
             Some("🆕 started a fresh conversation — earlier context dropped.".to_string())
         }
         "resume" => {
@@ -1122,12 +1210,11 @@ async fn handle_command<P: Platform>(
                     // turn's context guard is sized by `resolve_ctx_window(model)`. Keeping a prefix
                     // that names the OLD model would both mislead the new one and size its window
                     // wrong. `run_serve_turn` rebuilds both lanes from the cleared history.
-                    crate::plugin::snapshots::reset(&format!(
-                        "hostbot:{}:{route}:{chat}",
-                        platform.name()
-                    ));
-                    history.clear();
-                    store::drop_session(platform.name(), route, &chat.to_string());
+                    if let Err(error) =
+                        reset_lane_context(platform.name(), route, &chat.to_string(), history)
+                    {
+                        return Some(format!("model changed, but context reset refused: {error}"));
+                    }
                     // Read back through the seam so the confirmation states what the next turn will
                     // really send, rather than echoing the input.
                     let (effective, _) = resolve_effective_model(route, model);
@@ -1140,12 +1227,12 @@ async fn handle_command<P: Platform>(
         }
         "memory" | "mem" => {
             let root = lane_cwd(route);
-            let execution = crate::core::exec_ctx::ExecutionContext::new(
-                crate::core::convo::ConversationId::new(format!(
-                    "{}:{route}:{chat}",
-                    platform.name()
-                )),
-            );
+            let execution = crate::core::exec_ctx::ExecutionContext::new(conversation_id(
+                platform.name(),
+                route,
+                chat,
+            ))
+            .with_task(crate::agent::todo::current_context());
             Some(
                 match crate::plugin::manual::slash_in(arg, &root, Some(execution)).await {
                     Ok(result) => result,
@@ -1287,6 +1374,7 @@ pub async fn run_discord_serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("daemon_reset_control_tests.rs");
 
     struct OfflinePlatform;
     impl Platform for OfflinePlatform {
@@ -1376,19 +1464,30 @@ mod tests {
             store::save_session(OfflinePlatform.name(), "fixture-route", "1", &history).unwrap();
             store::save_session(OfflinePlatform.name(), "fixture-route", "2", &history).unwrap();
             let (tx, _rx) = mpsc::channel(1);
+            let task_context = crate::agent::todo::TaskContext::private();
+            task_context
+                .replace(vec![crate::agent::todo::Todo::new(
+                    "current chat only",
+                    crate::agent::todo::Status::InProgress,
+                )])
+                .unwrap();
             let reply = runtime
-                .block_on(handle_command(
-                    &OfflinePlatform,
-                    name,
-                    &argument,
-                    &mut history,
-                    "fixture-route",
-                    1,
-                    "fixture-default",
-                    &Weak::new(),
-                    &tx,
+                .block_on(crate::agent::todo::with_context(
+                    task_context.clone(),
+                    handle_command(
+                        &OfflinePlatform,
+                        name,
+                        &argument,
+                        &mut history,
+                        "fixture-route",
+                        1,
+                        "fixture-default",
+                        &Weak::new(),
+                        &tx,
+                    ),
                 ))
                 .unwrap();
+            assert_eq!(task_context.snapshot().items.is_empty(), clears_history);
             assert!(!reply.is_empty());
             let snapshot = crate::plugin::snapshots::current(&fixture.key);
             assert_eq!(snapshot.context.is_none(), retires, "{name} {argument}");

@@ -7,7 +7,11 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::store::{InspectedRecord, SealedManifestIdentity};
+pub(crate) use crate::core::worker_evidence::{
+    scope_sha256, DriverResult, NativeWorkerKind, WorkerResult,
+};
+
+use super::evidence::{InspectedRecord, SealedManifestIdentity};
 
 pub(crate) const ROSTER_LABEL: &str = "speculation-worker-roster";
 pub(crate) const INTENT_LABEL: &str = "speculation-worker-intent";
@@ -39,14 +43,6 @@ pub(crate) struct WorkerRoster {
     pub(crate) members: Vec<AttemptMember>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum NativeWorkerKind {
-    Read,
-    Edit,
-    Write,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkerIntent {
@@ -62,15 +58,6 @@ pub(crate) struct WorkerIntent {
     pub(crate) kind: NativeWorkerKind,
     /// Digest of the frozen prepared capability, not model-supplied arguments or a live grant.
     pub(crate) prepared_sha256: [u8; 32],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkerResult {
-    Returned,
-    Failed,
-    Panicked,
-    NotStarted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,15 +81,6 @@ pub(crate) struct WorkerClosed {
     pub(crate) ownership_released: bool,
     #[serde(deserialize_with = "bounded_sequence")]
     pub(crate) children: Vec<WorkerReceipt>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum DriverResult {
-    Completed,
-    Failed,
-    Cancelled,
-    Panicked,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,7 +145,7 @@ impl WorkerInspection {
             metadata.get("owner").and_then(serde_json::Value::as_str) == self.parent.as_deref(),
             "integration physical-worker parent differs"
         );
-        let lineage = super::store::sealed_lineage(metadata)?
+        let lineage = super::evidence::sealed_lineage(metadata)?
             .context("worker-backed integration requires exact sealed lineage")?;
         ensure!(
             lineage.len() == self.admitted_attempts && lineage.len() == self.sealed.len(),
@@ -405,43 +383,6 @@ impl AttemptClosed {
         );
         Ok(())
     }
-}
-
-/// Exact sorted readable bindings and writable bits; historical digest, never file authority.
-pub(crate) fn scope_sha256<'a>(
-    bindings: impl Iterator<Item = (&'a str, &'a std::path::Path, bool)>,
-) -> Result<[u8; 32]> {
-    use ring::digest::{Context as DigestContext, SHA256};
-    let mut digest = DigestContext::new(&SHA256);
-    digest.update(b"aizen-speculation-worker-scope-v1\0");
-    let mut previous = None;
-    let mut count = 0usize;
-    for (key, path, writable) in bindings {
-        ensure!(
-            count < 32
-                && !key.is_empty()
-                && key.len() <= 128
-                && previous.is_none_or(|prior| prior < key),
-            "worker scope keys invalid or unordered"
-        );
-        let path = path.to_str().context("worker scope path is not UTF-8")?;
-        ensure!(
-            !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control),
-            "worker scope path invalid"
-        );
-        for value in [key, path] {
-            digest.update(&(value.len() as u64).to_le_bytes());
-            digest.update(value.as_bytes());
-        }
-        digest.update(&[u8::from(writable)]);
-        previous = Some(key);
-        count += 1;
-    }
-    ensure!(count > 0, "worker scope is empty");
-    digest.update(&(count as u64).to_le_bytes());
-    let mut result = [0; 32];
-    result.copy_from_slice(digest.finish().as_ref());
-    Ok(result)
 }
 
 pub(crate) fn is_worker_label(label: &str) -> bool {

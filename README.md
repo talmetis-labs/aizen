@@ -61,9 +61,6 @@ instead with `aizen login`, which approves a short code and comes back with a ke
 ## Multi‑Bot Host System
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/9331f184-a829-413e-88b7-adb36432bd75" />
 
-## Time machine
-<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/10582817-8ec4-4924-ae78-b1151c041d05" />
-
 ## Why Aizen
 |  | |
 |---|---|
@@ -89,7 +86,7 @@ instead with `aizen login`, which approves a short code and comes back with a ke
 | **Multi-agent** | The Pantheon: seven capability-scoped sub-agents (`argus` finds · `metis` plans · `daedalus` builds · `nemesis` reviews · `themis` tests · `clio` researches · `mnemosyne` recalls); `aizen workflow` fans them out and synthesises one answer. |
 | **Web + browser** | Search, fetch, and a katana-style crawler — all SSRF-guarded. Opt-in CDP tools drive a real Chrome. |
 | **Extensible** | MCP servers (stdio/HTTP, OAuth 2.1), markdown slash-command macros, outbound notify channels. |
-| **Recoverable** | Git-backed checkpoints — `/timemachine` rewinds a bad turn. |
+| **Git-native workspaces** | `/time` inspects Git history and manages worktrees; explicit switch/revert/fast-forward operations, no snapshot rewind. |
 
 **→ [Full reference](docs/REFERENCE.md)** — every command, the REPL surface, self-hosting, MCP,
 browser tools, and the safety model in detail.

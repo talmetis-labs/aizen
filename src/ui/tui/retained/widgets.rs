@@ -224,7 +224,7 @@ pub(crate) fn render_tool_row(t: &ToolEvent, width: usize) -> String {
 /// bright moonlight, pending rows are faint.
 pub(crate) fn render_plan_box(rows: &[PlanRow], width: usize) -> Vec<String> {
     use crate::ui::theme;
-    // The frame tint: the plan/checkpoint lane's teal under the `lanes` theme, the quiet dim
+    // The frame tint: the plan/recovery lane's teal under the `lanes` theme, the quiet dim
     // silver every box wears under `moonlight`.
     let frame_color = if theme::lanes_enabled() {
         theme::LANE_PLAN

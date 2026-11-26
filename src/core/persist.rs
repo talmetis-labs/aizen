@@ -137,6 +137,13 @@ pub(crate) fn sweep_orphan_temps_older_than(dir: &Path, min_age_secs: u64) {
 /// to the state dir) can never see. The once-gate keeps the added cost to one `read_dir` per
 /// distinct directory per run instead of one per write.
 fn sweep_parent_once(parent: &Path) {
+    // Persistence also runs while a policy transition holds its owner mutex. Never look up or
+    // admit that policy here: doing so would reenter the mutex. Conversation writes have an exact
+    // effect budget and must not opportunistically remove unrelated files, even in normal mode.
+    // Standalone/startup housekeeping keeps the existing once-per-directory sweep.
+    if crate::core::exec_ctx::current().is_some() || crate::agent::todo::bound_context().is_some() {
+        return;
+    }
     use std::sync::{Mutex, OnceLock};
     static SWEPT: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
     let swept = SWEPT.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
@@ -175,10 +182,23 @@ pub fn fingerprint(path: &Path) -> Result<FileFingerprint> {
 /// Callers that need coordination against other compliant Aizen writers should also hold the
 /// appropriate resource/workspace lock. This CAS remains the final defense against editors, old
 /// binaries, and other programs that do not honor Aizen's lock protocol.
+#[cfg(test)]
 pub fn compare_and_atomic_write(
     path: &Path,
     expected: &FileFingerprint,
     bytes: &[u8],
+) -> Result<FileFingerprint> {
+    compare_and_atomic_write_observed(path, expected, bytes, || {})
+}
+
+/// Native workspace callers supply an effect sink. Metadata persistence deliberately does not.
+/// The sink runs only once the replacement/creation exists, including a later partial-write error.
+/// A failed CAS or content no-op never emits a mutation.
+pub(crate) fn compare_and_atomic_write_observed(
+    path: &Path,
+    expected: &FileFingerprint,
+    bytes: &[u8],
+    on_mutation: impl FnOnce(),
 ) -> Result<FileFingerprint> {
     let actual = fingerprint(path)?;
     if &actual != expected {
@@ -189,12 +209,16 @@ pub fn compare_and_atomic_write(
         }
         .into());
     }
-    if expected.exists {
-        atomic_write(path, bytes)?;
-    } else {
-        atomic_create(path, bytes)?;
+    let after = FileFingerprint::for_bytes(bytes);
+    if actual == after {
+        return Ok(actual);
     }
-    Ok(FileFingerprint::for_bytes(bytes))
+    if expected.exists {
+        atomic_write_observed(path, bytes, on_mutation)?;
+    } else {
+        atomic_create(path, bytes, on_mutation)?;
+    }
+    Ok(after)
 }
 
 #[cfg(test)]
@@ -229,6 +253,14 @@ pub fn remove_if_unchanged(path: &Path, expected: &FileFingerprint) -> Result<bo
 /// The temporary file is created with `create_new`, so concurrent writers never share a staging
 /// path. Existing Unix mode bits are copied before the rename. The final path is never truncated.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_observed(path, bytes, || {})
+}
+
+pub(crate) fn atomic_write_observed(
+    path: &Path,
+    bytes: &[u8],
+    on_mutation: impl FnOnce(),
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -248,6 +280,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         }
 
         replace_file(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        on_mutation();
         sync_parent(path);
         Ok(())
     })();
@@ -258,7 +291,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-fn atomic_create(path: &Path, bytes: &[u8]) -> Result<()> {
+fn atomic_create(path: &Path, bytes: &[u8], on_mutation: impl FnOnce()) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -284,10 +317,15 @@ fn atomic_create(path: &Path, bytes: &[u8]) -> Result<()> {
             anyhow::Error::from(e).context(format!("creating {}", path.display()))
         }
     })?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("flushing {}", path.display()))?;
+    let result = (|| {
+        file.write_all(bytes)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing {}", path.display()))
+    })();
+    // Creation already changed the destination even when writing/flushing failed.
+    on_mutation();
+    result?;
     drop(file);
     sync_parent(path);
     Ok(())
@@ -496,6 +534,105 @@ mod tests {
             std::process::id(),
             unique_sequence()
         ))
+    }
+
+    #[test]
+    fn planning_atomic_write_never_sweeps_unrelated_staging_files() {
+        let dir = crate::core::file_placement::tests::TestDir::new();
+        let orphan = dir.path().join(".unrelated.aizen-tmp-999-1");
+        fs::write(&orphan, b"keep").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let task = crate::agent::todo::TaskContext::private();
+        task.control()
+            .transition(
+                crate::core::session_control::ExecutionMode::Planning,
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default().with_task(task);
+        crate::core::exec_ctx::with_current(ctx, || {
+            atomic_write(&dir.path().join("authorized.md"), b"authorized write").unwrap();
+        });
+        assert_eq!(fs::read(&orphan).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(dir.path().join("authorized.md")).unwrap(),
+            b"authorized write"
+        );
+    }
+
+    #[test]
+    fn control_transition_persistence_does_not_reenter_policy_mutex() {
+        for task_local in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let dir = crate::core::file_placement::tests::TestDir::new();
+                let path = dir.path().join("control.json");
+                let task = crate::agent::todo::TaskContext::private();
+                let control = task.control();
+                let save = || {
+                    use crate::core::session_control::ExecutionMode;
+                    for mode in [ExecutionMode::Planning, ExecutionMode::Normal] {
+                        control
+                            .transition(mode, None, |next| {
+                                atomic_write(&path, &serde_json::to_vec(next)?)
+                            })
+                            .unwrap();
+                    }
+                    let saved: crate::core::session_control::SessionControl =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(saved, control.snapshot());
+                };
+                if task_local {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap()
+                        .block_on(crate::agent::todo::with_context(task, async { save() }));
+                } else {
+                    let ctx = crate::core::exec_ctx::ExecutionContext::default().with_task(task);
+                    crate::core::exec_ctx::with_current(ctx, save);
+                }
+                tx.send(()).unwrap();
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("transition persistence must not reenter its locked policy owner");
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn observed_cas_counts_each_mutation_but_not_noops_or_conflicts() {
+        let path = temp_path_named("effect-sink");
+        let effects = std::cell::Cell::new(0);
+        let note = || effects.set(effects.get() + 1);
+        let first =
+            compare_and_atomic_write_observed(&path, &FileFingerprint::missing(), b"first", note)
+                .unwrap();
+        assert_eq!(effects.get(), 1);
+        compare_and_atomic_write_observed(&path, &first, b"first", note).unwrap();
+        assert_eq!(effects.get(), 1, "content no-op has no mutation");
+        assert!(compare_and_atomic_write_observed(
+            &path,
+            &FileFingerprint::missing(),
+            b"denied",
+            note,
+        )
+        .is_err());
+        assert_eq!(effects.get(), 1, "failed CAS has no mutation");
+        let second = compare_and_atomic_write_observed(&path, &first, b"second", note).unwrap();
+        compare_and_atomic_write_observed(&path, &second, b"third", note).unwrap();
+        assert_eq!(
+            effects.get(),
+            3,
+            "same path still advances on every actual write"
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

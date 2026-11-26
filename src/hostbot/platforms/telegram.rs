@@ -12,21 +12,27 @@
 //! registry (primary "default" + `/addbot`-hosted extras) that used to live inline in `run_serve`, so
 //! the generic daemon loop stays platform-agnostic.
 
+mod approval;
+mod destination;
+pub use approval::request_approval_on;
+pub use destination::Destination;
+
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::agent::tools::Tool;
 use crate::core::cli_config::{self, TelegramConfig};
-use crate::hostbot::platform::{BotInfo, Inbound, Outbound, Platform, StatusHandle};
+use crate::hostbot::platform::{
+    BotInfo, Inbound, IncomingMessage, Outbound, Platform, StatusHandle,
+};
 use crate::hostbot::store;
 
 const API_BASE: &str = "https://api.telegram.org/bot";
@@ -49,13 +55,28 @@ pub struct Update {
 pub struct Message {
     pub message_id: i64,
     pub chat: Chat,
+    pub message_thread_id: Option<u64>,
+    pub direct_messages_topic: Option<DirectTopic>,
+    #[serde(default)]
+    pub is_topic_message: bool,
+    pub from: Option<User>,
+    pub sender_chat: Option<Chat>,
     #[serde(default)]
     pub text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DirectTopic {
+    pub topic_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Chat {
     pub id: i64,
+    #[serde(default)]
+    pub is_forum: bool,
+    #[serde(default)]
+    pub is_direct_messages: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,37 +167,22 @@ impl Client {
     }
 
     /// Send a plain-text message (no parse_mode → a stray `*`/`_` never breaks delivery).
-    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<Message> {
+    pub async fn send_message(&self, chat: impl Into<Destination>, text: &str) -> Result<Message> {
         self.call(
             "sendMessage",
-            json!({"chat_id": chat_id, "text": text, "disable_web_page_preview": true}),
+            chat.into().message_params(json!({
+                "text": text, "disable_web_page_preview": true
+            })),
         )
         .await
     }
 
-    /// Telegram-native HTML. The platform send path retries the renderer's plain fallback on error.
-    pub async fn send_html(&self, chat_id: i64, html: &str) -> Result<Message> {
+    async fn send_html(&self, chat: Destination, html: &str) -> Result<Message> {
         self.call(
             "sendMessage",
-            json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML", "disable_web_page_preview": true}),
-        )
-        .await
-    }
-
-    /// Send a message with a single inline-keyboard row of (label, callback_data) buttons.
-    pub async fn send_keyboard(
-        &self,
-        chat_id: i64,
-        text: &str,
-        buttons: &[(&str, String)],
-    ) -> Result<Message> {
-        let row: Vec<Value> = buttons
-            .iter()
-            .map(|(label, data)| json!({"text": label, "callback_data": data}))
-            .collect();
-        self.call(
-            "sendMessage",
-            json!({"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": [row]}}),
+            chat.message_params(json!({
+                "text": html, "parse_mode": "HTML", "disable_web_page_preview": true
+            })),
         )
         .await
     }
@@ -268,25 +274,7 @@ pub fn is_allowed(cfg: &TelegramConfig, chat_id: i64) -> bool {
 
 // ── approval registry (daemon path) ──────────────────────────────────────────────
 
-static PENDING: Lazy<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 static DAEMON_ACTIVE: AtomicBool = AtomicBool::new(false);
-static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// The bot + chat an approval should be sent to THIS turn. The multi-bot `serve` loop processes one
-/// message at a time; before each turn it pins the originating bot's `(token, chat)` here so a
-/// destructive-op approval goes back to the SAME bot the request came from (not always the primary).
-/// `None` ⇒ fall back to the primary `configured()` bot (the single-bot / standalone path).
-static APPROVAL_ROUTE: Lazy<Mutex<Option<(String, i64)>>> = Lazy::new(|| Mutex::new(None));
-
-/// Pin the approval route to a specific bot token + chat (called before a serve turn runs).
-pub fn set_approval_route(token: String, chat: i64) {
-    *APPROVAL_ROUTE.lock().unwrap() = Some((token, chat));
-}
-/// Clear the approval route (called after a serve turn finishes) so it never leaks to the next turn.
-pub fn clear_approval_route() {
-    *APPROVAL_ROUTE.lock().unwrap() = None;
-}
 
 pub fn set_daemon_active(v: bool) {
     DAEMON_ACTIVE.store(v, Ordering::SeqCst);
@@ -296,25 +284,6 @@ pub fn set_daemon_active(v: bool) {
 pub fn daemon_is_active() -> bool {
     DAEMON_ACTIVE.load(Ordering::SeqCst)
 }
-fn next_approval_id() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        APPROVAL_SEQ.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
-/// Called by the serve poll loop when a callback arrives → resolve a pending approval.
-/// Returns true if an approval was waiting on this id.
-pub fn resolve_approval(id: &str, approved: bool) -> bool {
-    if let Some(tx) = PENDING.lock().unwrap().remove(id) {
-        let _ = tx.send(approved);
-        true
-    } else {
-        false
-    }
-}
-
 /// Parse our approval callback_data: `ng/appr/<id>/y` | `.../n` → (id, approved).
 pub fn parse_callback(data: &str) -> Option<(String, bool)> {
     let rest = data.strip_prefix("ng/appr/")?;
@@ -326,121 +295,25 @@ pub fn parse_callback(data: &str) -> Option<(String, bool)> {
     }
 }
 
-/// Resolve a hosted bot's token by route name — how an `ExecutionContext`-carried approval route
-/// (which is platform-agnostic: `route` + a `Display`ed chat id) becomes a client. `None` when no
-/// daemon is running or the route names a bot that isn't hosted.
-fn token_for_route(route: &str) -> Option<String> {
-    let ctl = bot_control()?;
-    let bots = ctl.bots.lock().unwrap();
-    bots.get(route).map(|h| h.token.clone())
-}
-
-/// Ask the owner to approve something via Telegram. `Some(approved)` if Telegram handled it,
-/// `None` if not configured / no allowed chat. Deny on 5-minute timeout.
-pub async fn request_approval(prompt: &str) -> Option<bool> {
-    request_approval_on(prompt, None).await
-}
-
-/// Ask for approval, delivering the prompt to an EXPLICIT lane when one is given.
-///
-/// Route resolution, most specific first:
-///   1. `lane` — the turn's own `(route, chat)` from its `ExecutionContext`. Authoritative under
-///      concurrent lanes, where the process-global slot belongs to whichever turn started last.
-///   2. `APPROVAL_ROUTE` — the serial daemon's per-turn pin (still correct when only one turn runs).
-///   3. the primary `configured()` bot — standalone `aizen agent`, no daemon.
-pub async fn request_approval_on(
-    prompt: &str,
-    lane: Option<crate::core::exec_ctx::ApprovalRoute>,
-) -> Option<bool> {
-    let explicit = lane.and_then(|l| {
-        let chat = l.chat.parse::<i64>().ok()?;
-        let token = token_for_route(&l.route)?;
-        Some((token, chat))
-    });
-    let route = match explicit {
-        Some(pair) => Some(pair),
-        None => APPROVAL_ROUTE.lock().unwrap().clone(),
-    };
-    let (client, chat) = match route {
-        Some((token, chat)) => (Client::new(token).ok()?, chat),
-        None => {
-            let (client, cfg) = configured()?;
-            (client, first_chat(&cfg)?)
+/// A hosted turn must resolve its own route. A stale route never falls back to another chat.
+fn destination_for_turn(
+    lane: Option<&crate::core::exec_ctx::ApprovalRoute>,
+) -> Option<(Arc<Client>, Destination)> {
+    if let Some(lane) = lane {
+        let chat: Destination = lane.chat.parse().ok()?;
+        let ctl = bot_control()?;
+        let bots = ctl.bots.lock().unwrap();
+        let bot = bots.get(&lane.route)?;
+        if !bot.allowed.lock().unwrap().contains(&chat.chat) {
+            return None;
         }
-    };
-    let id = next_approval_id();
-    let text = format!("🔐 Approve this action?\n\n{prompt}");
-    let buttons = [
-        ("✅ Approve", format!("ng/appr/{id}/y")),
-        ("❌ Deny", format!("ng/appr/{id}/n")),
-    ];
-    let msg = client.send_keyboard(chat, &text, &buttons).await.ok()?;
-
-    let approved = if daemon_is_active() {
-        let (tx, rx) = oneshot::channel();
-        PENDING.lock().unwrap().insert(id.clone(), tx);
-        let r = tokio::time::timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS), rx).await;
-        PENDING.lock().unwrap().remove(&id); // cleanup on timeout
-        matches!(r, Ok(Ok(true)))
-    } else {
-        self_poll_for_approval(&client, &id).await
-    };
-
-    let verdict = if approved {
-        "✅ Approved"
-    } else {
-        "❌ Denied / timed out"
-    };
-    let _ = client
-        .edit_text(chat, msg.message_id, &format!("{text}\n\n{verdict}"))
-        .await;
-    Some(approved)
-}
-
-/// Standalone path: no daemon poll loop, so poll `getUpdates` ourselves for our callback.
-async fn self_poll_for_approval(client: &Client, id: &str) -> bool {
-    let start = tokio::time::Instant::now();
-    let mut offset = 0i64;
-    let mut warned_conflict = false;
-    while start.elapsed() < Duration::from_secs(APPROVAL_TIMEOUT_SECS) {
-        let updates = match client.get_updates(offset, 20).await {
-            Ok(u) => u,
-            Err(e) => {
-                // 409 Conflict = another process (almost always a running `aizen serve` daemon) already
-                // owns getUpdates for this bot token. Telegram allows only ONE poller per token, so
-                // the two steal each other's callbacks and approvals get lost. Surface it ONCE
-                // (instead of a silent 1s retry storm) and back off — the owner should approve in the
-                // daemon, or stop one of the two processes. (A cross-process daemon lockfile so the
-                // standalone never self-polls when a daemon owns the token is the complete fix.)
-                if !warned_conflict && e.to_string().contains("409") {
-                    warned_conflict = true;
-                    eprintln!(
-                        "[telegram] getUpdates 409 Conflict — another process (likely `aizen serve`) is \
-                         already polling this bot token; this standalone approval may not receive the \
-                         callback. Approve in that process, or stop it."
-                    );
-                }
-                tokio::time::sleep(Duration::from_secs(if warned_conflict { 3 } else { 1 })).await;
-                continue;
-            }
-        };
-        for u in &updates {
-            offset = offset.max(u.update_id + 1);
-        }
-        for u in updates {
-            if let Some(cb) = u.callback_query {
-                if let Some((cid, approved)) = cb.data.as_deref().and_then(parse_callback) {
-                    if cid == id {
-                        let _ = client
-                            .answer_callback(&cb.id, if approved { "Approved" } else { "Denied" })
-                            .await;
-                        return approved;
-                    }
-                }
-            }
-        }
+        return Some((bot.client.clone(), chat));
     }
-    false
+    if daemon_is_active() {
+        return None;
+    }
+    let (client, cfg) = configured()?;
+    Some((Arc::new(client), first_chat(&cfg)?.into()))
 }
 
 /// Bridge an async future to the sync `Tool::execute` path — the shared cancel-aware bridge
@@ -458,7 +331,7 @@ impl Tool for TelegramSend {
         "telegram_send"
     }
     fn description(&self) -> &str {
-        "Send a notification to the owner's Telegram (progress, result, alert). Use when running \
+        "Send a notification to this Telegram conversation, or to the configured owner from standalone mode. Use when running \
          unattended so the owner sees what happened. Not for asking a question → use telegram_ask."
     }
     fn parameters(&self) -> Value {
@@ -480,10 +353,10 @@ impl Tool for TelegramSend {
             .get("text")
             .and_then(|v| v.as_str())
             .context("missing required string arg 'text'")?;
+        let route = crate::core::exec_ctx::current().and_then(|ctx| ctx.approval_route());
         block(async {
-            let (client, cfg) =
-                configured().context("telegram not configured (run `aizen telegram setup`)")?;
-            let chat = first_chat(&cfg).context("no allowed_chat_ids configured")?;
+            let (client, chat) =
+                destination_for_turn(route.as_ref()).context("Telegram destination unavailable")?;
             client.send_message(chat, text).await?;
             anyhow::Ok(())
         })?;
@@ -520,7 +393,8 @@ impl Tool for TelegramAsk {
             .get("question")
             .and_then(|v| v.as_str())
             .context("missing required string arg 'question'")?;
-        match block(async { anyhow::Ok(request_approval(q).await) })? {
+        let route = crate::core::exec_ctx::current().and_then(|ctx| ctx.approval_route());
+        match block(async { anyhow::Ok(request_approval_on(q, route).await) })? {
             Some(true) => Ok("approved".to_string()),
             Some(false) => Ok("denied (or timed out)".to_string()),
             None => Ok("error: telegram not configured (run `aizen telegram setup`)".to_string()),
@@ -587,7 +461,7 @@ struct BotControl {
     bots: Arc<Mutex<HashMap<String, BotHandle>>>,
     base_allowed: Arc<Mutex<Vec<i64>>>,
     menu: Vec<(String, String)>,
-    tx: Sender<Inbound<i64>>,
+    tx: Sender<Inbound<Destination>>,
 }
 static BOT_CONTROL: Lazy<Mutex<Option<Arc<BotControl>>>> = Lazy::new(|| Mutex::new(None));
 
@@ -651,7 +525,7 @@ impl TelegramPlatform {
     }
 }
 
-/// A short pairing code from process id + nanos (no rng crate — same posture as `next_approval_id`).
+/// A short pairing code for the current enrollment window.
 fn gen_pairing_code() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -690,7 +564,7 @@ async fn spawn_bot(
     allowed: Arc<Mutex<Vec<i64>>>,
     persona: Option<String>,
     pairing: Option<String>,
-    tx: &Sender<Inbound<i64>>,
+    tx: &Sender<Inbound<Destination>>,
 ) -> Result<String> {
     let client = Client::new(token.clone()).context("building the Telegram HTTP client")?;
     let username = client.get_me().await.unwrap_or_else(|_| "?".to_string());
@@ -747,7 +621,7 @@ fn spawn_bot_poll(
     client: Arc<Client>,
     allowed: Arc<Mutex<Vec<i64>>>,
     pairing: Option<String>,
-    tx: Sender<Inbound<i64>>,
+    tx: Sender<Inbound<Destination>>,
     _poll_lock: crate::core::repo_lock::RepoTxnLock,
     state: Arc<Mutex<BotState>>,
 ) -> JoinHandle<()> {
@@ -800,24 +674,34 @@ fn spawn_bot_poll(
             for u in updates {
                 offset = offset.max(u.update_id + 1);
                 if let Some(cb) = u.callback_query {
-                    let chat = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
-                    if allowed.lock().unwrap().contains(&chat) {
+                    let chat = cb.message.as_ref().map(|m| m.chat.id);
+                    if chat.is_some_and(|id| allowed.lock().unwrap().contains(&id)) {
                         if let Some((id, ok)) = cb.data.as_deref().and_then(parse_callback) {
-                            resolve_approval(&id, ok);
+                            approval::resolve(&id, ok, &client, &cb);
                         }
                     }
                     let _ = client.answer_callback(&cb.id, "").await;
                     continue;
                 }
                 if let Some(msg) = u.message {
+                    let Some(chat) = Destination::from_message(&msg) else {
+                        continue;
+                    };
                     let Some(text) = msg.text else { continue };
-                    let chat = msg.chat.id;
-                    if allowed.lock().unwrap().contains(&chat) {
+                    if allowed.lock().unwrap().contains(&chat.chat) {
                         let _ = tx
                             .send(Inbound {
                                 route: name.clone(),
                                 chat,
-                                text,
+                                message: IncomingMessage {
+                                    event_id: u.update_id.to_string(),
+                                    message_id: msg.message_id.to_string(),
+                                    sender_id: msg
+                                        .from
+                                        .filter(|_| msg.sender_chat.is_none())
+                                        .map(|u| u.id.to_string()),
+                                    text,
+                                },
                             })
                             .await;
                         continue;
@@ -833,8 +717,8 @@ fn spawn_bot_poll(
                                 )
                                 .await;
                         } else if text.trim() == code {
-                            allowed.lock().unwrap().push(chat);
-                            persist_owner(chat);
+                            allowed.lock().unwrap().push(chat.chat);
+                            persist_owner(chat.chat);
                             pairing = None;
                             let _ = client
                                 .send_message(
@@ -892,7 +776,7 @@ async fn do_add_bot(
     bots: &Arc<Mutex<HashMap<String, BotHandle>>>,
     base_allowed: &Arc<Mutex<Vec<i64>>>,
     menu: &[(String, String)],
-    tx: &Sender<Inbound<i64>>,
+    tx: &Sender<Inbound<Destination>>,
     name: &str,
     token: &str,
     own_owner: bool,
@@ -1022,7 +906,11 @@ fn do_set_persona(
 }
 
 impl Platform for TelegramPlatform {
-    type Chat = i64;
+    type Chat = Destination;
+
+    fn legacy_parent_chat(chat: Destination) -> Option<String> {
+        chat.legacy_parent()
+    }
 
     fn name(&self) -> &'static str {
         "telegram"
@@ -1032,7 +920,7 @@ impl Platform for TelegramPlatform {
         3500 // well under Telegram's 4096 UTF-16 cap, leaving headroom for the "$ cmd\n" prefixes
     }
 
-    async fn start(&self, tx: Sender<Inbound<i64>>) -> Result<()> {
+    async fn start(&self, tx: Sender<Inbound<Destination>>) -> Result<()> {
         set_daemon_active(true);
         // No owner yet ⇒ boot the primary bot in pairing mode: print a code on the host, and the first
         // chat that echoes it back claims ownership. The bot controls the machine, so we never accept
@@ -1149,7 +1037,12 @@ impl Platform for TelegramPlatform {
             .collect()
     }
 
-    async fn send_outbound(&self, route: &str, chat: i64, outbound: &Outbound) -> Result<()> {
+    async fn send_outbound(
+        &self,
+        route: &str,
+        chat: Destination,
+        outbound: &Outbound,
+    ) -> Result<()> {
         let client = self.route_client(route)?;
         if outbound.rich {
             match client.send_html(chat, &outbound.text).await {
@@ -1161,7 +1054,7 @@ impl Platform for TelegramPlatform {
         Ok(())
     }
 
-    async fn start_status(&self, route: &str, chat: i64) -> Result<Option<StatusHandle>> {
+    async fn start_status(&self, route: &str, chat: Destination) -> Result<Option<StatusHandle>> {
         let client = self.route_client(route)?;
         let msg = client.send_message(chat, "✦ Đang xử lý…").await?;
         Ok(Some(StatusHandle(msg.message_id)))
@@ -1170,7 +1063,7 @@ impl Platform for TelegramPlatform {
     async fn finish_status(
         &self,
         route: &str,
-        chat: i64,
+        chat: Destination,
         status: Option<StatusHandle>,
         failed: bool,
     ) -> Result<()> {
@@ -1180,16 +1073,18 @@ impl Platform for TelegramPlatform {
         let client = self.route_client(route)?;
         if failed {
             return client
-                .edit_text(chat, message_id, "⚠ Không thể hoàn tất")
+                .edit_text(chat.chat, message_id, "⚠ Không thể hoàn tất")
                 .await;
         }
-        if client.delete_message(chat, message_id).await.is_err() {
-            client.edit_text(chat, message_id, "✓ Hoàn tất").await?;
+        if client.delete_message(chat.chat, message_id).await.is_err() {
+            client
+                .edit_text(chat.chat, message_id, "✓ Hoàn tất")
+                .await?;
         }
         Ok(())
     }
 
-    async fn send(&self, route: &str, chat: i64, text: &str) -> Result<()> {
+    async fn send(&self, route: &str, chat: Destination, text: &str) -> Result<()> {
         let client = self.route_client(route)?;
         client.send_message(chat, text).await?;
         Ok(())
@@ -1198,19 +1093,6 @@ impl Platform for TelegramPlatform {
     fn supports_approval(&self) -> bool {
         true
     }
-    fn set_approval_route(&self, route: &str, chat: i64) {
-        let token = {
-            let bots = self.bots.lock().unwrap();
-            bots.get(route).map(|h| h.token.clone())
-        };
-        if let Some(token) = token {
-            set_approval_route(token, chat);
-        }
-    }
-    fn clear_approval_route(&self) {
-        clear_approval_route();
-    }
-
     fn supports_multibot(&self) -> bool {
         true
     }
@@ -1220,7 +1102,7 @@ impl Platform for TelegramPlatform {
         name: &str,
         token: &str,
         own_owner: bool,
-        tx: &Sender<Inbound<i64>>,
+        tx: &Sender<Inbound<Destination>>,
     ) -> Result<String> {
         do_add_bot(
             &self.bots,
@@ -1393,7 +1275,7 @@ impl Tool for BotAdmin {
          token; use name \"default\" to set/replace the PRIMARY bot's own token — takes effect on the \
          next `aizen serve`); `remove` (stop hosting a bot — cannot remove \"default\"); `set_persona` \
          (give a bot its own character — the persona must already exist; omit `persona` to clear it). \
-         Memory stays the primary agent's; only a bot's persona/voice differs. \"default\" is the \
+         \"default\" is the \
          primary bot: you can set its token via `add`, but not remove it or give it a separate persona."
     }
     fn parameters(&self) -> Value {
@@ -1508,11 +1390,6 @@ mod tests {
         cfg.allowed_chat_ids = vec![7, 9];
         assert!(is_allowed(&cfg, 7));
         assert!(!is_allowed(&cfg, 8));
-    }
-
-    #[test]
-    fn resolve_unknown_approval_is_false() {
-        assert!(!resolve_approval("no-such-id", true));
     }
 
     #[test]

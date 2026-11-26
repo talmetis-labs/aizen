@@ -45,6 +45,16 @@ pub(crate) enum Commands {
     /// Run the agentic loop: the model uses tools (memory + files + shell) to do a task.
     /// (For the library of specialist sub-agents you can DELEGATE to, see `agents`.)
     Agent(AgentArgs),
+    /// Share one saved CLI conversation with Aizen Chat, or transfer selected assistant data.
+    Remote {
+        #[command(subcommand)]
+        cmd: crate::remote::RemoteCmd,
+    },
+    /// Manage channel-independent local assistants and their conversations. Outputs JSON.
+    Assistant {
+        #[command(subcommand)]
+        cmd: crate::assistants::AssistantCmd,
+    },
     /// Run a workflow: fan out a set of role-scoped sub-agents (from a JSON spec), then
     /// synthesize their results into one answer (mixture-of-agents).
     Workflow(WorkflowArgs),
@@ -215,7 +225,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         cmd: DiscordCmd,
     },
-    /// Time machine — git-backed code snapshots: save · list · restore · undo · redo.
+    /// Inspect real Git history and manage isolated worktrees; no checkpoint storage.
     Time {
         #[command(subcommand)]
         cmd: TimeCmd,
@@ -326,7 +336,7 @@ pub(crate) enum Commands {
 pub(crate) enum AppsCmd {
     /// List the featured apps and which are already connected.
     List,
-    /// Read HOME connector configuration and durable jobs without connecting or launching apps.
+    /// Show the MCP connectors configured in HOME and their enabled state offline.
     Status {
         /// Optional connector key in HOME mcp.json (not the project-effective configuration).
         name: Option<String>,
@@ -679,97 +689,190 @@ pub(crate) enum ReachCmd {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TimeCmd {
-    /// Save a checkpoint of the current repository's Git-visible tree.
-    Save {
-        /// Optional label, e.g. `before refactor`.
-        label: Vec<String>,
+    /// Inspect the current Git branch and tracked/untracked working changes.
+    Status,
+    /// Show real Git commits reachable from HEAD (not pending edits).
+    History {
+        /// Maximum commits to display.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
     },
-    /// List the timeline (▸ marks the active point).
-    List,
-    /// Restore the working tree to checkpoint #id (auto-saves the current state first).
-    Restore {
-        /// Checkpoint id (from `aizen time list`).
-        id: u32,
+    /// List local Git branches and their current commit OIDs.
+    Branches,
+    /// List every Git-registered worktree, including external worktrees.
+    Worktrees,
+    /// Focus an existing worktree in this interactive session; never changes Git files or cwd.
+    Focus { path: String },
+    /// Inspect local HEAD movement; reflog does not save uncommitted files.
+    Reflog {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
     },
-    /// Show what changed between two points in time (checkpoint ids, or `working` for the live tree).
-    ///
-    /// With one argument, diffs that checkpoint against the working tree — "what have I changed
-    /// since #5". With two, diffs the pair. Stat-only by default; `--patch` prints the hunks.
-    Diff {
-        /// From: a checkpoint id, or `working`. Defaults to the active checkpoint.
-        from: Option<String>,
-        /// To: a checkpoint id, or `working` (the default).
-        to: Option<String>,
-        /// Print the unified patch, not just the per-file stat.
-        #[arg(short, long)]
-        patch: bool,
-        /// Limit the diff to these paths.
-        #[arg(long = "path", value_name = "PATH")]
+    /// Preview a new worktree from a frozen commit (HEAD by default); --yes creates it.
+    Create {
+        /// Worktree name: letters, digits, `-`, `_`, `.` (1-64 chars).
+        name: String,
+        /// Explicit Git revision; resolved once before approval. Pending edits are never copied.
+        #[arg(long, value_parser = parse_time_revision)]
+        base: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove an idle, clean managed worktree, retaining its branch (same adapter as `work remove`).
+    Remove { name: String },
+    /// Preview switching this clean worktree to an existing local branch; --yes executes.
+    Switch {
+        branch: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview reverting an explicitly ordered commit list; --yes creates inverse Git commits.
+    Undo {
+        #[arg(required = true, num_args = 1..=32, value_parser = parse_time_revision)]
+        commits: Vec<String>,
+        /// Required for merge commits; never guessed. Applies to an all-merge list only.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        mainline: Option<u32>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Build a Git-generated inverse of exact files in a registered owned worktree, not here.
+    UndoPaths {
+        #[arg(value_parser = parse_time_revision)]
+        commit: String,
+        /// Exact changed filename; repeat for rename endpoints. No globs/directories.
+        #[arg(long = "path", required = true, action = clap::ArgAction::Append)]
         paths: Vec<String>,
-        /// Emit a machine-readable JSON report.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        mainline: Option<u32>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Inspect existing Git operation receipts, including incomplete outcomes (no replay).
+    Operations {
+        /// Inspect one exact receipt and current Git state, without acknowledging or retrying it.
+        #[arg(long, value_parser = parse_time_operation_id)]
+        receipt: Option<String>,
+    },
+    /// Inspect destination verification records, including unfinished attempts (no retry).
+    Verifications,
+    /// Preview redoing one completed undo by its exact operation ID; no implicit latest.
+    Redo {
+        #[arg(value_parser = parse_time_operation_id)]
+        receipt: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview fast-forward-only integration of a frozen Git commit; --yes executes.
+    Integrate {
+        #[arg(value_parser = parse_time_revision)]
+        commit: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview fast-forward integration of one settled Git task registration from its exact base.
+    IntegrateTask {
+        #[arg(value_parser = parse_time_operation_id)]
+        receipt: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview frozen verification of one completed task integration at its exact destination HEAD.
+    VerifyTask {
+        #[arg(value_parser = parse_time_operation_id)]
+        receipt: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Continue, abort or quit a recognized conflict owned by one recorded failed operation.
+    Sequencer {
+        #[arg(value_parser = parse_time_operation_id)]
+        receipt: String,
+        /// One of: continue, abort, quit.
+        #[arg(value_parser = ["continue", "abort", "quit"])]
+        step: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Acknowledge one settled failure after manual resolution; metadata only, never replay.
+    Reconcile {
+        #[arg(value_parser = parse_time_operation_id)]
+        receipt: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview a two-parent merge of one frozen commit; --yes executes with hooks/signing.
+    Merge {
+        #[arg(value_parser = parse_time_revision)]
+        commit: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview cherry-picking explicitly ordered commits; conflicts/empty commits stop the list.
+    CherryPick {
+        #[arg(required = true, num_args = 1..=32, value_parser = parse_time_revision)]
+        commits: Vec<String>,
+        /// Required for merge commits; applies to an all-merge list only.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        mainline: Option<u32>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview deletion of an unused local branch after explicit retained-ref reachability proof.
+    DeleteBranch {
+        branch: String,
+        /// Full local ref whose history must retain every deleted-branch commit (refs/heads/...).
+        #[arg(long)]
+        retained_ref: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Inspect historical speculation evidence without replay, restore, repair or cleanup.
+    Recovery {
+        /// Emit a machine-readable report.
         #[arg(long)]
         json: bool,
-    },
-    /// Step one checkpoint back.
-    Undo,
-    /// Step one checkpoint forward.
-    Redo,
-    /// Drop oldest checkpoints, keeping at most N (default: the configured limit, 50).
-    Prune {
-        /// Keep at most this many checkpoints.
-        #[arg(short, long)]
-        keep: Option<usize>,
-    },
-    /// Delete specific checkpoints by id (disk is reclaimed by the next `aizen time gc`).
-    Rm {
-        /// Checkpoint ids (from `aizen time list`). The active point is refused — restore
-        /// somewhere else first.
-        #[arg(required = true)]
-        ids: Vec<u32>,
-    },
-    /// Inspect ledger/refs/sidecars/journal without mutating the working tree.
-    Doctor {
-        /// Emit a machine-readable JSON report.
+        /// Exact speculative cohort to inspect.
         #[arg(long)]
-        json: bool,
-        /// Recover/rollback a valid interrupted transaction before reporting.
-        #[arg(long, conflicts_with_all = ["cohort", "prepared", "resources", "record_observation"])]
-        repair: bool,
-        /// Select one speculative cohort; inspection is read-only unless --record-observation is set.
-        #[arg(long, requires = "prepared")]
-        cohort: Option<String>,
-        /// Exact immutable integration-prepared record ID for --cohort.
-        #[arg(long, requires = "cohort")]
-        prepared: Option<String>,
+        cohort: String,
+        /// Exact immutable integration-prepared record ID.
+        #[arg(long)]
+        prepared: String,
         /// Caller-selected exact file; repeat for every prepared file. Never inferred from evidence.
-        #[arg(long = "resource", value_name = "PATH", requires_all = ["cohort", "prepared"])]
+        #[arg(long = "resource", value_name = "PATH")]
         resources: Vec<String>,
-        /// Append a nonterminal inspection observation only; never settles, replays or changes source.
-        #[arg(long, requires_all = ["cohort", "prepared"], conflicts_with = "repair")]
+        /// Append a nonterminal observation only; never settles, replays or changes source.
+        #[arg(long)]
         record_observation: bool,
     },
-    /// Remove orphan Time Machine refs/sidecars after validating the authoritative ledger.
-    ///
-    /// With `--all`, instead sweeps EVERY private store under `~/.aizen/timemachine/` and reports
-    /// orphan stores whose source repository no longer exists (deleted or moved). Dry-run unless
-    /// `--apply` is given, which moves orphans to `~/.aizen/timemachine/.trash/<timestamp>/`.
-    Gc {
-        /// Sweep every repo's store at the home level (orphan-store cleanup), not just this repo.
-        #[arg(long)]
-        all: bool,
-        /// With `--all`: actually move orphan stores to `.trash/` (default is a dry-run report).
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Delete ALL checkpoints (run `aizen time gc` afterwards to reclaim the disk they used).
-    Clear,
+}
+
+fn parse_time_operation_id(value: &str) -> Result<String, String> {
+    if crate::core::git_ops::valid_operation_id(value) {
+        Ok(value.to_owned())
+    } else {
+        Err("select an exact undo operation ID from `aizen time operations`, not a revision or path".into())
+    }
+}
+
+/// Historical numeric checkpoint IDs are never forwarded to Git's revision parser.
+fn parse_time_revision(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with('-')
+        || value.chars().any(char::is_control)
+        || value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("supply an explicit Git revision, not a historical checkpoint number".into());
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TeamCmd {
     /// List every aizen session in this repository: state, task, files touched, overlaps.
     Status,
-    /// Show what ONE session changed, measured from its own pre-edit checkpoints.
+    /// Request a session-attributed diff; historical ledgers without current attribution are refused.
     Diff {
         /// Session id, a unique suffix of one, `self`, or a row number from `status`.
         session: String,
@@ -779,20 +882,20 @@ pub(crate) enum TeamCmd {
     },
     /// Show which session currently owns each changed path.
     Claims,
-    /// Stage exactly one session's files and review them. Committing requires `--yes`.
+    /// Request a session commit; refuses before staging when current attribution is unavailable.
     Commit {
         /// Session id, a unique suffix of one, `self`, or a row number from `status`.
         session: String,
-        /// Commit message. Defaults to that session's task description.
+        /// Legacy message option; does not bypass the attribution refusal.
         #[arg(short, long)]
         message: Option<String>,
-        /// Stage and print the review, then unstage without committing.
+        /// Legacy review option; no index changes occur without current attribution.
         #[arg(long)]
         dry_run: bool,
-        /// Proceed even when the session is still running or its files overlap another session's.
+        /// Legacy flag; cannot override missing attribution or ownership.
         #[arg(long)]
         force: bool,
-        /// Actually commit. Without it, this behaves as `--dry-run`.
+        /// Legacy approval flag; cannot override missing attribution or ownership.
         #[arg(long)]
         yes: bool,
     },
@@ -805,13 +908,13 @@ pub(crate) enum WorkCmd {
         /// Worktree name: letters, digits, `-`, `_`, `.` (1-64 chars).
         name: String,
     },
-    /// List aizen worktrees with their branch, dirty state, unmerged commits, and live sessions.
+    /// List all Git-registered worktrees, including external, detached, locked and prunable entries.
     List,
     /// Remove an aizen worktree. Refuses while it holds uncommitted or unmerged work.
     Remove {
         /// Worktree name.
         name: String,
-        /// Remove anyway. The branch is kept either way, so commits stay reachable by name.
+        /// Legacy flag: refused. Resolve dirty files/live sessions instead of forcing removal.
         #[arg(long)]
         force: bool,
     },
@@ -1308,22 +1411,6 @@ pub(crate) enum ConfigCmd {
         /// default registry.
         #[arg(long)]
         skill_registry: Option<String>,
-        /// Time-machine checkpoints to keep (oldest auto-pruned past this; `0` = unlimited). Default 50.
-        #[arg(long)]
-        timemachine_keep: Option<usize>,
-        /// Safety-net checkpoints (`before agent edits`) to keep, pruned before any named
-        /// milestone is touched. Default 5.
-        #[arg(long)]
-        timemachine_keep_safety: Option<usize>,
-        /// Maximum number of files in one Time Machine snapshot.
-        #[arg(long)]
-        timemachine_max_files: Option<u64>,
-        /// Maximum aggregate bytes in one Time Machine snapshot.
-        #[arg(long)]
-        timemachine_max_bytes: Option<u64>,
-        /// Maximum size of one file in a Time Machine snapshot.
-        #[arg(long)]
-        timemachine_max_file_bytes: Option<u64>,
         /// Auto-detect reasoning effort per turn from your wording (default on). `false` pins the
         /// fixed --reasoning-effort (or omits it if unset).
         #[arg(long)]
@@ -1454,6 +1541,18 @@ pub(crate) enum ConfigCmd {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ProviderConfigCmd {
+    /// Rotate one saved literal API key via bounded stdin JSON (provider-key-v1).
+    ///
+    /// Targets require kind, expected_url and expected_model; profile also requires name.
+    /// Only saved keys change; inherited environment credentials and role key references do not.
+    Key {
+        /// Read the secret payload from non-terminal stdin (required).
+        #[arg(long)]
+        stdin: bool,
+        /// Machine response format: json (required). Errors contain only fixed codes.
+        #[arg(long, value_name = "FORMAT")]
+        output_format: Option<String>,
+    },
     /// Add a named endpoint profile. Existing names are rejected.
     Add {
         name: String,
@@ -1563,8 +1662,23 @@ pub(crate) struct ChatArgs {
 
 #[derive(Parser, Debug)]
 pub(crate) struct AgentArgs {
-    /// The task for the agent to accomplish.
-    pub(crate) task: String,
+    /// Run in a named local assistant. Use from its workspace with --thread.
+    #[arg(long, requires = "thread", conflicts_with = "resume")]
+    pub(crate) assistant: Option<String>,
+    /// Existing conversation ID from assistant new-thread. Each turn is saved automatically.
+    #[arg(long, requires = "assistant")]
+    pub(crate) thread: Option<String>,
+    /// The task for the agent to accomplish (or use --task-file).
+    #[arg(required_unless_present = "task_file", conflicts_with = "task_file")]
+    pub(crate) task: Option<String>,
+    /// Read the task from a regular UTF-8 file (at most 512 KiB); leaves stdin for run control.
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "task",
+        conflicts_with = "task"
+    )]
+    pub(crate) task_file: Option<std::path::PathBuf>,
     /// Session-scoped visual design guidance: auto | on | off. Never writes saved configuration.
     #[arg(long, value_name = "MODE", default_value = "auto")]
     pub(crate) design: crate::agent::design::DesignMode,
@@ -1580,9 +1694,27 @@ pub(crate) struct AgentArgs {
     /// Pre-authorize destructive tools (file edits / shell) without an interactive prompt.
     #[arg(short, long)]
     pub(crate) yes: bool,
+    /// Run the provided task in goal mode, without clarification prompts.
+    #[arg(long)]
+    pub(crate) goal: bool,
     /// Hard step cap before the one-shot auto-extend (default 25).
     #[arg(long)]
     pub(crate) max_iters: Option<usize>,
+    /// Enter durable plan-only mode before this run. Pass `--plan=PATH` to select an exact document;
+    /// bare `--plan` reuses the saved target or allocates one. The optional value deliberately uses
+    /// equals syntax so it can never consume the positional task.
+    #[arg(
+        long,
+        value_name = "PATH",
+        require_equals = true,
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        num_args = 0..=1,
+        conflicts_with = "exit_plan"
+    )]
+    pub(crate) plan: Option<Option<String>>,
+    /// Exit a saved plan-only session before this run. Requires --resume and a restricted session.
+    #[arg(long, conflicts_with = "plan")]
+    pub(crate) exit_plan: bool,
     /// Save the finished conversation under ~/.aizen/sessions, so /sessions can reopen it.
     /// Off by default: this subcommand is also the scripting and CI entry point, and a file per
     /// invocation would bury the pool the picker reads.
@@ -1622,6 +1754,23 @@ pub(crate) struct AgentArgs {
     /// only the closing `result` object. The contract is in REFERENCE.md.
     #[arg(long, value_name = "FORMAT", value_parser = ["text", "json", "stream-json"], default_value = "text")]
     pub(crate) output_format: String,
+    /// Opt into bounded preview-owner diagnostics (stream-json only). Does NOT retain servers.
+    /// Feature-detect via agent --help; HTTP readiness remains the host's responsibility.
+    #[arg(long)]
+    pub(crate) host_preview_diagnostics: bool,
+    /// Emit a local viewer frame from the actual CDP page after a successful browser action.
+    /// Requires stream-json. Frames never enter model messages or saved conversations.
+    #[arg(long)]
+    pub(crate) host_browser_preview: bool,
+    /// Bind Computer Use to the single surface granted by the host over this run's stdio.
+    #[arg(long, value_parser = ["browser", "pc"])]
+    pub(crate) desktop_computer: Option<String>,
+    /// Use the selected-surface protocol with filtered browser reads and refreshed action results.
+    #[arg(long, requires = "desktop_computer")]
+    pub(crate) desktop_computer_v2: bool,
+    /// The selected surface grant only permits observations.
+    #[arg(long, requires = "desktop_computer")]
+    pub(crate) desktop_computer_read_only: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -1652,6 +1801,8 @@ pub(crate) struct WorkflowArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum NativeMemoryPluginCmd {
+    /// Validate a seller's Aizen Desktop release without installing it.
+    ValidateRelease { manifest: std::path::PathBuf },
     /// Inspect installed packages without executing them.
     List {
         #[arg(long)]
@@ -1975,6 +2126,11 @@ pub(crate) enum MemoryCmd {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum SandboxCliCmd {
+    /// Read a scoped document review request from stdin and return JSON.
+    Review {
+        #[arg(long)]
+        topic: String,
+    },
     /// What the sandbox enforces on THIS machine, capability by capability — `enforced`,
     /// `partial`, `advisory`, or `unavailable`. Never inflated: where the platform has no kernel
     /// mechanism, this says so.
@@ -2022,6 +2178,30 @@ mod time_recovery_report_args_tests {
     use super::*;
 
     #[test]
+    fn retired_checkpoint_commands_and_config_flags_are_rejected() {
+        for action in [
+            "save", "list", "restore", "diff", "prune", "rm", "gc", "clear", "doctor",
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "time", action]).is_err(),
+                "accepted {action}"
+            );
+        }
+        for flag in [
+            "--timemachine-keep",
+            "--timemachine-keep-safety",
+            "--timemachine-max-files",
+            "--timemachine-max-bytes",
+            "--timemachine-max-file-bytes",
+        ] {
+            assert!(
+                Cli::try_parse_from(["aizen", "config", "set", flag, "10"]).is_err(),
+                "accepted {flag}"
+            );
+        }
+    }
+
+    #[test]
     fn observation_append_is_explicit_requires_selection_and_conflicts_with_repair() {
         for args in [
             vec!["--record-observation"],
@@ -2037,13 +2217,13 @@ mod time_recovery_report_args_tests {
             ],
         ] {
             assert!(
-                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+                Cli::try_parse_from(["aizen", "time", "recovery"].into_iter().chain(args)).is_err()
             );
         }
         let cli = Cli::try_parse_from([
             "aizen",
             "time",
-            "doctor",
+            "recovery",
             "--cohort",
             "cohort",
             "--prepared",
@@ -2057,18 +2237,17 @@ mod time_recovery_report_args_tests {
         match cli.command {
             Some(Commands::Time {
                 cmd:
-                    TimeCmd::Doctor {
+                    TimeCmd::Recovery {
                         json,
-                        repair,
                         cohort,
                         prepared,
                         resources,
                         record_observation,
                     },
             }) => {
-                assert!(record_observation && json && !repair);
-                assert_eq!(cohort.as_deref(), Some("cohort"));
-                assert_eq!(prepared.as_deref(), Some("prepared"));
+                assert!(record_observation && json);
+                assert_eq!(cohort, "cohort");
+                assert_eq!(prepared, "prepared");
                 assert_eq!(resources, ["a.txt"]);
             }
             _ => panic!("expected explicit recovery observation selection"),
@@ -2093,13 +2272,13 @@ mod time_recovery_report_args_tests {
             ],
         ] {
             assert!(
-                Cli::try_parse_from(["aizen", "time", "doctor"].into_iter().chain(args)).is_err()
+                Cli::try_parse_from(["aizen", "time", "recovery"].into_iter().chain(args)).is_err()
             );
         }
         let cli = Cli::try_parse_from([
             "aizen",
             "time",
-            "doctor",
+            "recovery",
             "--cohort",
             "cohort",
             "--prepared",
@@ -2114,9 +2293,8 @@ mod time_recovery_report_args_tests {
         match cli.command {
             Some(Commands::Time {
                 cmd:
-                    TimeCmd::Doctor {
+                    TimeCmd::Recovery {
                         json,
-                        repair,
                         cohort,
                         prepared,
                         resources,
@@ -2125,25 +2303,75 @@ mod time_recovery_report_args_tests {
             }) => {
                 assert!(!record_observation);
                 assert!(json);
-                assert!(!repair);
-                assert_eq!(cohort.as_deref(), Some("cohort"));
-                assert_eq!(prepared.as_deref(), Some("prepared"));
+                assert_eq!(cohort, "cohort");
+                assert_eq!(prepared, "prepared");
                 assert_eq!(resources, ["a.txt", "b.txt"]);
             }
-            _ => panic!("expected exact recovery report doctor selection"),
+            _ => panic!("expected exact recovery report selection"),
         }
         assert!(Cli::try_parse_from([
             "aizen",
             "time",
-            "doctor",
+            "recovery",
             "--cohort",
             "cohort",
             "--prepared",
             "prepared"
         ])
         .is_ok());
-        assert!(Cli::try_parse_from(["aizen", "time", "doctor"]).is_ok());
-        assert!(Cli::try_parse_from(["aizen", "time", "doctor", "--repair"]).is_ok());
+        assert!(Cli::try_parse_from(["aizen", "time", "recovery"]).is_err());
+        assert!(Cli::try_parse_from(["aizen", "time", "recovery", "--repair"]).is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "agent_plan_args_tests.rs"]
+mod agent_plan_args_tests;
+
+#[cfg(test)]
+mod agent_task_file_args_tests {
+    use super::*;
+
+    #[test]
+    fn task_file_requires_exactly_one_source_and_keeps_resume_images() {
+        for args in [
+            vec![],
+            vec!["--task-file"],
+            vec!["--task-file", "task.txt", "question"],
+        ] {
+            assert!(Cli::try_parse_from(["aizen", "agent"].into_iter().chain(args)).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "aizen",
+            "agent",
+            "--task-file",
+            "task.txt",
+            "--resume",
+            "saved",
+            "--image",
+            "fixture.png",
+            "--save-session",
+            "--output-format",
+            "stream-json",
+        ])
+        .unwrap();
+        let Some(Commands::Agent(args)) = cli.command else {
+            panic!("agent")
+        };
+        assert!(args.task.is_none());
+        assert_eq!(
+            args.task_file.as_deref(),
+            Some(std::path::Path::new("task.txt"))
+        );
+        assert_eq!(args.resume.as_deref(), Some("saved"));
+        assert_eq!(args.image, ["fixture.png"]);
+        assert!(args.save_session);
+        let cli = Cli::try_parse_from(["aizen", "agent", "ordinary text"]).unwrap();
+        let Some(Commands::Agent(args)) = cli.command else {
+            panic!("agent")
+        };
+        assert_eq!(args.task.as_deref(), Some("ordinary text"));
+        assert!(args.task_file.is_none());
     }
 }
 

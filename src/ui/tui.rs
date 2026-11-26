@@ -33,6 +33,28 @@ use tokio::sync::oneshot;
 pub(crate) mod approval;
 mod retained;
 
+/// Input/render-thread projection only. Execution authority lives in the REPL session; tools and
+/// children must never consult this presentation slot to choose a workspace.
+static INPUT_WORKSPACE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+pub(crate) fn set_input_workspace(root: std::path::PathBuf) {
+    *INPUT_WORKSPACE.lock().unwrap_or_else(|e| e.into_inner()) = Some(root);
+}
+#[cfg(test)]
+pub(crate) fn swap_input_workspace_for_test(
+    root: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    std::mem::replace(
+        &mut *INPUT_WORKSPACE.lock().unwrap_or_else(|e| e.into_inner()),
+        root,
+    )
+}
+pub(crate) fn input_workspace() -> Option<std::path::PathBuf> {
+    INPUT_WORKSPACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// A key whose `read_key()` returned within this many ms was ALREADY waiting in the OS input buffer
 /// → it arrived as part of a burst (a paste), not a deliberate human keystroke. Used so a newline
 /// *inside* a paste becomes a literal newline in the draft instead of submitting the line — the fix
@@ -256,9 +278,9 @@ fn at_matches(draft: &[char]) -> Vec<String> {
     // Avoid triggering on obvious non-path patterns like `@everyone`.
     // We return results even for an empty prefix (show recent/top files) but cap at 12.
     const LIMIT: usize = 12;
-    let root = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
+    let root = match input_workspace().or_else(|| std::env::current_dir().ok()) {
+        Some(root) => root,
+        None => return Vec::new(),
     };
     // Walk up to ~2000 entries from cwd, collect relative paths that match the prefix.
     let lower_prefix = prefix.to_lowercase();
@@ -475,7 +497,7 @@ const TIPS: &[&str] = &[
     "`/model` switches models mid-session; `/config` opens setup",
     "`/persona` role-plays a character with its own evolving memory",
     "`/compact` summarizes old turns to free up context",
-    "`/time` saves & restores code checkpoints (git-backed)",
+    "`/time` inspects Git history and previews branch, undo and integration operations",
     "`/skills` loads reusable step-by-step procedures on demand",
     "delegate a sub-task with the `task` tool for parallel work",
     "`/cost` and `/tokens` show this session's usage",
@@ -770,8 +792,8 @@ fn handle_status_command_inline(name: &str, arg: &str) -> bool {
 pub enum Submission {
     /// A normal chat/agent message (text + pasted image data URLs).
     Chat(String, Vec<String>),
-    /// Enter validated the full editable selection; do not reinterpret its cleaned prose as paths.
-    PreparedChat(String, Vec<String>),
+    /// Enter validated the full editable selection; retain raw human text for policy ingress.
+    PreparedChat(String, Vec<String>, String),
     /// A slash command line (without the leading `/`). The input thread parks itself after sending
     /// this so the REPL can hand stdin to a `dialoguer` menu, then unparks it via the resume channel.
     Slash(String),
@@ -2392,24 +2414,82 @@ pub(crate) fn tool_call_end_display(
 
 /// Replace the in-place plan checklist. `items` = `(status, text)` where status 0/1/2 = pending /
 /// in-progress / done. Empty removes the panel. Classic path re-prints the box each call.
+#[allow(dead_code)] // Compatibility entry point; task publication uses plan_update_snapshot.
 pub fn plan_update(items: &[(u8, String)]) {
+    let state = crate::agent::todo::try_current_context().map(|context| context.snapshot());
+    plan_update_projection(items, state.as_ref());
+}
+
+/// The task publisher supplies the SAME snapshot that produced the rows. No per-row resnapshot.
+pub(crate) fn plan_update_snapshot(items: &[(u8, String)], state: &crate::agent::todo::TaskState) {
+    plan_update_projection(items, Some(state));
+}
+
+fn plan_update_projection(items: &[(u8, String)], state: Option<&crate::agent::todo::TaskState>) {
+    static PLAIN_PLAN_VISIBLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static DOCUMENT_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let state = state.filter(|state| crate::ui::events::plan_snapshot_aligned(items, state));
     if crate::ui::events::on() && !retained::is_running() {
-        crate::ui::events::plan(items);
+        crate::ui::events::plan_snapshot(items, state);
         return;
+    }
+    let note = state.and_then(crate::ui::events::plan_document_summary);
+    let changed_note = {
+        let mut previous = DOCUMENT_NOTE.lock().unwrap_or_else(|e| e.into_inner());
+        if *previous != note {
+            let next = note.clone().or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|_| "plan document detached".to_owned())
+            });
+            *previous = note;
+            next
+        } else {
+            None
+        }
+    };
+    if let Some(note) = changed_note {
+        // Retained-safe transcript metadata, never a fake TODO or a completion row.
+        note_line(&note);
     }
     let rows: Vec<retained::PlanRow> = items
         .iter()
-        .map(|(s, t)| retained::PlanRow {
-            status: *s,
-            text: t.clone(),
+        .enumerate()
+        .map(|(index, (s, t))| {
+            let link = state.and_then(|state| {
+                let row = &state.items[index];
+                state
+                    .item_phases
+                    .iter()
+                    .find(|link| link.item_id == row.id)
+                    .map(|link| (link, state.phase_resolved(&row.id)))
+            });
+            retained::PlanRow {
+                status: *s,
+                text: link.map_or_else(
+                    || t.clone(),
+                    |(link, resolved)| {
+                        format!(
+                            "{t} [phase {}{}]",
+                            link.phase_id,
+                            if resolved { "" } else { ": unresolved" }
+                        )
+                    },
+                ),
+            }
         })
         .collect();
     if retained::is_running() {
         retained::plan_update(rows);
     } else if !rows.is_empty() {
+        PLAIN_PLAN_VISIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
         for line in retained::render_plan_box(&rows, width()) {
             emit_trace_line(&line);
         }
+    } else if PLAIN_PLAN_VISIBLE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // Plain scrollback cannot be erased; explicitly retire the last printed checklist.
+        emit_trace_line("todo list cleared");
     }
 }
 
@@ -2495,17 +2575,6 @@ pub fn set_working(working: bool) {
     if retained::is_running() {
         retained::set_working(working);
     }
-}
-
-/// The status line currently on screen. Needed by any surface that [`suspend`]s for a dialoguer
-/// prompt and must hand the SAME status back to [`resume`] — passing an empty string there blanks
-/// the footer for the rest of the session.
-pub fn current_status() -> String {
-    render()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .status
-        .clone()
 }
 
 /// The effort chip waiting to ride on the status row's model segment. `effort_ui` arms it per turn
@@ -4407,8 +4476,9 @@ fn input_loop(
                         continue;
                     }
                 }
-                let (line, images, pick, attached) = {
+                let (line, images, pick, attached, raw_human) = {
                     let line: String = render().lock().unwrap().draft.iter().collect();
+                    let raw_human = line.clone();
                     let mut pending = pending_images().lock().unwrap();
                     let (cleaned, from_line) =
                         match crate::ui::image_input::prepare_image_attachments(&line, &pending) {
@@ -4441,7 +4511,7 @@ fn input_loop(
                     r.cursor = 0;
                     r.images = 0;
                     r.palette_sel = 0;
-                    (line, images, pick, attached)
+                    (line, images, pick, attached, raw_human)
                 };
                 hist_idx = None;
                 repaint();
@@ -4547,7 +4617,7 @@ fn input_loop(
                             continue;
                         }
                         if sub_tx
-                            .send(Submission::PreparedChat(line, attached))
+                            .send(Submission::PreparedChat(line, attached, raw_human))
                             .is_err()
                         {
                             return;
@@ -7013,8 +7083,8 @@ pub(crate) mod tests {
         assert!(slash_takes_stdin("import"));
         assert!(slash_takes_stdin("effort"));
         assert!(!slash_takes_stdin("effort status"));
-        assert!(slash_takes_stdin("timemachine"));
-        assert!(slash_takes_stdin("timeline"));
+        assert!(!slash_takes_stdin("timemachine"));
+        assert!(!slash_takes_stdin("time history"));
         assert!(!slash_takes_stdin("memory"));
         assert!(!slash_takes_stdin("memory rust"));
         assert!(slash_takes_stdin("tools menu"));
@@ -7029,15 +7099,7 @@ pub(crate) mod tests {
         // `/tools menu` opened a dialoguer picker without suspending the retained frame, while this
         // table (the keyboard's copy) parked for it. `/memory` was the mirror image — main suspended,
         // the keyboard didn't. One argument-aware table now answers both.
-        for line in [
-            "timemachine",
-            "timeline",
-            "tm",
-            "tools menu",
-            "toolsets toggle",
-            "effort",
-            "update",
-        ] {
+        for line in ["tools menu", "toolsets toggle", "effort", "update"] {
             assert!(
                 slash_takes_stdin(line),
                 "/{line} opens a picker → must suspend"

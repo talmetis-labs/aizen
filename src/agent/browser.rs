@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 mod capture;
 mod config;
+mod host_preview;
 mod static_source;
 mod transport;
 pub use capture::{BrowserScreenshot, BrowserSetViewport};
@@ -219,11 +220,11 @@ async fn with_cdp<T>(
     mut f: impl for<'a> FnMut(&'a mut CdpClient) -> Pin<Box<dyn Future<Output = Result<T>> + 'a>>,
 ) -> Result<T> {
     let budget = transport::Budget::new(OP_TIMEOUT);
-    let bounded = budget.clone();
-    bounded
-        .run(async move {
-            let handle = session_handle(&crate::core::convo::active());
-            let mut sess = handle.lock().await;
+    let handle = session_handle(&crate::core::convo::active());
+    let mut sess = budget.run(async { Ok(handle.lock().await) }).await?;
+    let result = budget
+        .clone()
+        .run(async {
             sess.last_used = std::time::Instant::now();
             let switched = sess
                 .client
@@ -264,7 +265,7 @@ async fn with_cdp<T>(
             }
             let mut replay_profile = profile.clone();
             replay_profile.target_id = Some(target_id);
-            let mut client = connect(profile_name, replay_profile, budget).await?;
+            let mut client = connect(profile_name, replay_profile, budget.clone()).await?;
             client.selection = profile;
             sess.client = Some(client);
             sess.needs_reconnect = true;
@@ -272,7 +273,13 @@ async fn with_cdp<T>(
             sess.needs_reconnect = second.is_err();
             second
         })
-        .await
+        .await;
+    if result.is_ok() && crate::ui::events::browser_frames_enabled() {
+        if let Some(client) = sess.client.as_mut() {
+            host_preview::present(client).await;
+        }
+    }
+    result
 }
 
 fn connection_error(e: &anyhow::Error) -> bool {
@@ -876,6 +883,9 @@ pub async fn doctor() -> String {
 
 /// Purely offline availability check for default registry advertisement. No discovery/attach/probe.
 pub fn is_configured() -> bool {
+    if crate::agent::computer::bound() {
+        return false;
+    }
     let endpoint = crate::core::cli_config::branded_env("BROWSER_CDP");
     config::explicitly_configured(&config::config_path(), endpoint.as_deref())
 }

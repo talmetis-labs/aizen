@@ -1,13 +1,12 @@
-//! Controller-owned native snapshots, private edits and deterministic integration.
-//!
-//! Durable records are evidence, never execution capabilities. Only sealed in-process handles
-//! authorize overlay IO; only the coordinating parent can materialize a checked integration.
+//! Historical speculative evidence inspection and bounded nonterminal observations.
+//! No source capture, overlay, custom merger or integration runtime remains in this module.
 
-pub(crate) mod integration;
-pub(crate) mod lifecycle;
-pub(crate) mod merge;
+pub(crate) mod evidence;
+pub(crate) mod inspection;
+pub(crate) mod legacy;
+pub(crate) mod namespace;
 pub(crate) mod recovery;
-pub(crate) mod store;
+pub(crate) mod restart;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod verification;

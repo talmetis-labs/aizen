@@ -57,6 +57,7 @@ fn scripted(
 
 fn tool_turn(name: &str, args: &str) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: None,
         tool_calls: vec![ToolCall {
             id: format!("call_{name}"),
@@ -76,6 +77,7 @@ fn tool_turn(name: &str, args: &str) -> ChatTurn {
 
 fn final_turn(text: &str) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: Some(text.into()),
         tool_calls: vec![],
         finish_reason: Some("stop".into()),
@@ -90,6 +92,7 @@ fn final_turn(text: &str) -> ChatTurn {
 /// successful one to "look busy" (the W3/W4 anti-pattern).
 fn multi_tool_turn(calls: &[(&str, &str)]) -> ChatTurn {
     ChatTurn {
+        speech_final_verified: false,
         content: None,
         tool_calls: calls
             .iter()
@@ -442,7 +445,7 @@ fn scenarios() -> Vec<Scenario> {
         ),
     ];
 
-    // ── P0.1: incomplete todos block Done until poke budget exhausts ──
+    // Exhausting the nudge budget never authorizes unfinished work as Done.
     out.push(Scenario {
         name: "poke_blocks_early_done",
         shape: "persist",
@@ -451,7 +454,7 @@ fn scenarios() -> Vec<Scenario> {
             final_turn("still claiming done"),
             final_turn("exhausted poke budget"),
         ],
-        expect_stop: StopReason::Done,
+        expect_stop: StopReason::Incomplete,
         max_iters: Some(3),
         seed_todos: Some(vec![
             Todo::new("done-bit", Status::Done),
@@ -579,7 +582,6 @@ fn eval_cfg() -> AgentConfig {
         auto_extend_to: 20,
         quiet: true,
         enable_verify_gate: false, // no real toolchain in the harness — this measures LOOP shape
-        auto_checkpoint: false,    // cwd may be a real repo — no checkpoint pollution
         context_window: 0,         // guard off — scripts are short and synthetic
         todo_reminder_every: 0,    // recitation reads the process-global list; irrelevant here
         // P0 harness: off by default in eval_cfg; persistence scenarios opt in explicitly.
@@ -596,20 +598,16 @@ fn eval_cfg() -> AgentConfig {
     }
 }
 
-/// Run one scenario against the REAL loop, return its health verdict, outcome, and measurements.
-#[expect(
-    clippy::await_holding_lock,
-    reason = "Sequential offline scenarios must isolate global todos through the entire scripted loop"
-)]
+/// Run one scenario against the REAL loop with its own checklist authority.
 async fn run_scenario(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) {
-    // Serialize process-global todo mutations through seed, execution, assertions and cleanup.
-    // `run` awaits scenarios sequentially on main's multi-thread runtime (this future is not spawned).
-    // The scripted model returns Ready; fixture tools and todo helpers never acquire TEST_LOCK,
-    // including tool bodies awaited on the blocking pool. They use their own short-lived locks.
-    // Dropping this guard before await would let another fixture overwrite the scenario's todos.
-    let _g = crate::agent::todo::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    crate::agent::todo::with_context(
+        crate::agent::todo::TaskContext::private(),
+        run_scenario_scoped(s),
+    )
+    .await
+}
+
+async fn run_scenario_scoped(s: &Scenario) -> (bool, usize, StopReason, ScenarioStats) {
     if let Some(todos) = &s.seed_todos {
         crate::agent::todo::set(todos.clone());
     } else {
@@ -700,6 +698,7 @@ fn clone_turns(turns: &[ChatTurn]) -> Vec<ChatTurn> {
     turns
         .iter()
         .map(|t| ChatTurn {
+            speech_final_verified: false,
             content: t.content.clone(),
             tool_calls: t.tool_calls.clone(),
             finish_reason: t.finish_reason.clone(),

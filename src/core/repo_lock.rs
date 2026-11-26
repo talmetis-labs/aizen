@@ -51,11 +51,12 @@ pub struct RepoTxnLock {
 }
 
 impl RepoTxnLock {
-    /// Backward-compatible exclusive acquisition used by existing Time Machine and recovery callers.
+    /// Exclusive acquisition used by persistent metadata and recovery coordination.
     pub fn acquire(path: &Path, timeout: Duration) -> Result<Self> {
         Self::acquire_mode(path, LockMode::Exclusive, timeout, None)
     }
 
+    #[cfg(test)]
     pub fn acquire_shared(path: &Path, timeout: Duration) -> Result<Self> {
         Self::acquire_mode(path, LockMode::Shared, timeout, None)
     }
@@ -78,6 +79,40 @@ impl RepoTxnLock {
         let lock = Self::acquire_open_file(path, mode, timeout, None, file)?;
         resource.verify()?;
         lock.verify_existing_stamp(path, &stamp)?;
+        Ok(lock)
+    }
+
+    /// Create only the lock file in an already-existing checked parent. Unlike `acquire_mode`,
+    /// this never recreates a vanished namespace. Opening is no-follow/nonblocking and the owned
+    /// descriptor must still match the guarded path before the caller can enter its transaction.
+    pub(crate) fn acquire_in_existing_parent(
+        path: &Path,
+        mode: LockMode,
+        timeout: Duration,
+        cancel: Option<&crate::core::cancel::TurnCancel>,
+    ) -> Result<Self> {
+        let parent = path.parent().context("transaction lock has no parent")?;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(parent)?.is_dir(),
+            "transaction lock parent is not an existing directory"
+        );
+        let resource = crate::core::workspace_txn::NativeResource::resolve(path)?;
+        let stamp = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Some(crate::core::file_placement::NodeStamp::capture(
+                path, &metadata, false,
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        // A competing creator is a retryable refusal, never a reason to reopen a substituted file.
+        let file = open_lock_no_follow(path, stamp.is_none())?;
+        let lock = Self::acquire_open_file(path, mode, timeout, cancel, file)?;
+        resource.verify()?;
+        if let Some(stamp) = stamp {
+            lock.verify_existing_stamp(path, &stamp)?;
+        } else {
+            lock.verify_existing_path(path)?;
+        }
         Ok(lock)
     }
 
@@ -223,8 +258,20 @@ impl Drop for RepoTxnLock {
     target_os = "freebsd"
 ))]
 fn open_existing_lock(path: &Path) -> Result<File> {
+    open_lock_no_follow(path, false)
+}
+
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+))]
+fn open_lock_no_follow(path: &Path, create_new: bool) -> Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(false);
+    options.read(true).write(true).create_new(create_new);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -255,8 +302,20 @@ fn open_existing_lock(path: &Path) -> Result<File> {
     target_os = "ios",
     target_os = "freebsd"
 )))]
-fn open_existing_lock(_path: &Path) -> Result<File> {
-    anyhow::bail!("existing-only lock acquisition unavailable on this platform")
+fn open_existing_lock(path: &Path) -> Result<File> {
+    open_lock_no_follow(path, false)
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+fn open_lock_no_follow(_path: &Path, _create_new: bool) -> Result<File> {
+    anyhow::bail!("no-follow lock acquisition unavailable on this platform")
 }
 
 #[cfg(windows)]
@@ -427,6 +486,47 @@ mod tests {
             drop(guard);
             assert_eq!(std::fs::read(&path).unwrap(), sentinel, "{mode:?}");
         }
+    }
+
+    #[test]
+    fn checked_lock_creation_never_recreates_parent_and_preserves_existing_bytes() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let missing = fixture.path().join("absent/transaction.lock");
+        assert!(RepoTxnLock::acquire_in_existing_parent(
+            &missing,
+            LockMode::Exclusive,
+            Duration::ZERO,
+            None,
+        )
+        .is_err());
+        assert!(!missing.parent().unwrap().exists());
+        let path = fixture.path().join("transaction.lock");
+        let owner = RepoTxnLock::acquire_in_existing_parent(
+            &path,
+            LockMode::Exclusive,
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+        owner.verify_existing_path(&path).unwrap();
+        drop(owner);
+        std::fs::write(&path, b"retained marker").unwrap();
+        for mode in [LockMode::Shared, LockMode::Exclusive] {
+            let owner =
+                RepoTxnLock::acquire_in_existing_parent(&path, mode, Duration::ZERO, None).unwrap();
+            drop(owner);
+            assert_eq!(std::fs::read(&path).unwrap(), b"retained marker");
+        }
+        let alias = fixture.path().join("alias.lock");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(RepoTxnLock::acquire_in_existing_parent(
+            &path,
+            LockMode::Exclusive,
+            Duration::ZERO,
+            None,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&alias).unwrap(), b"retained marker");
     }
 
     #[test]

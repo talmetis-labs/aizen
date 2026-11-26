@@ -181,10 +181,9 @@ async fn real_verify_descendant_settlement_preserves_results_and_ownership() -> 
         });
         controller.await?;
         if scenario == "cancel" {
-            assert!(
-                result.is_none(),
-                "settled cancellation cannot become a passing check: {result:?}"
-            );
+            let result = result.expect("settled cancellation has a typed outcome");
+            assert_eq!(result.termination, VerifyTermination::Cancelled);
+            assert!(!result.accepted());
         } else {
             let result = result.expect("owned verifier command must run");
             assert_eq!(

@@ -1,6 +1,9 @@
 //! Literal task identities and one queued admission lane for every physical attempt.
 
 #[cfg(test)]
+#[path = "workflow_git_scheduler_tests.rs"]
+mod git_tests;
+#[cfg(test)]
 #[path = "workflow_scheduler_tests.rs"]
 mod tests;
 
@@ -122,6 +125,7 @@ struct State<'a> {
     intents: HashMap<AttemptKey, DispatchIntent>,
     completed: HashSet<AttemptKey>,
     settled: HashMap<TaskId, AttemptKey>,
+    git_accepted: HashMap<AttemptKey, crate::core::git_ops::VerifiedTaskIntegration>,
     settlements: VecDeque<(TaskId, AttemptKey)>,
     ordinal: HashMap<TaskId, u32>,
     fixed: HashSet<TaskId>,
@@ -140,6 +144,7 @@ impl<'a> State<'a> {
             intents: HashMap::new(),
             completed: HashSet::new(),
             settled: HashMap::new(),
+            git_accepted: HashMap::new(),
             settlements: VecDeque::new(),
             ordinal: HashMap::new(),
             fixed: HashSet::new(),
@@ -209,7 +214,11 @@ impl<'a> State<'a> {
             .live_deadlines
             .entry(intent.goal.clone())
             .or_insert_with(|| {
-                let local = crate::agent::task_tool::subagent_wall_deadline();
+                let steps = intent.task.prepared.as_ref().map_or_else(
+                    || super::child_step_total(&intent.task, intent.task.agent.is_some()),
+                    |prepared| prepared.contract.max_steps,
+                );
+                let local = crate::agent::task_tool::subagent_wall_deadline(steps);
                 match (local, self.policy.parent_deadline) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
@@ -259,9 +268,17 @@ impl<'a> State<'a> {
 
     fn materialize(&self, intent: &mut DispatchIntent) -> Result<()> {
         if intent.key.kind == AttemptKind::Initial {
+            let frozen_base = intent.task.git_base.clone();
             let original = self.original(&intent.key.task_id)?;
             intent.inputs = self.inputs(original);
             intent.task = with_upstream(original, &self.results, &self.published(), None);
+            intent.task.git_base = frozen_base;
+            if intent.task.isolation == super::WorkflowIsolation::Worktree {
+                intent.task.git_prerequisites = intent.inputs.iter().map(|dependency| {
+                    self.git_accepted.get(dependency).map(|a| a.destination.clone())
+                        .context("owned dependent requires exact accepted Git integration/verification for every prerequisite")
+                }).collect::<Result<Vec<_>>>()?;
+            }
         }
         Ok(())
     }
@@ -284,13 +301,31 @@ impl<'a> State<'a> {
         outcome.selected_for = None;
         outcome.attempt = Some(intent.key.clone());
         let mut recorded = intent.clone();
-        // Completed graph metadata must not retain executable overlay/base ownership. The
-        // active cohort alone keeps its selected handles until parent verification settles.
-        recorded.task.overlay = None;
+        // Historical graph metadata is never live Git-owned task authority.
+        recorded.task.owned = None;
         self.intents.insert(intent.key.clone(), recorded);
         self.results.push(outcome);
         let idx = self.results.len() - 1;
         let outcome = &self.results[idx];
+        if intent.task.isolation == super::WorkflowIsolation::Worktree {
+            // One owned attempt only. Handoff is not task settlement, and errors never mint retry.
+            let handoff = outcome.git_handoff.as_ref().context(
+                "owned workflow has no typed handoff; retained work requires inspection",
+            )?;
+            super::git::validate_handoff(handoff)?;
+            anyhow::ensure!(
+                outcome.status == "git-handoff-pending"
+                    && !verdict_failed(outcome)
+                    && intent.task.git_base.as_ref() == Some(&handoff.base),
+                "owned workflow handoff/status/base mismatch"
+            );
+            self.settlements.push_back((intent.goal, intent.key));
+            return Ok(());
+        }
+        anyhow::ensure!(
+            outcome.git_handoff.is_none(),
+            "shared workflow cannot publish a Git-owned handoff"
+        );
         if intent.task.execution == ExecutionMode::Speculative {
             // Private attempts have exactly one dispatch. A failed/partial overlay must never
             // become a fresh live retry, fix or planner replacement behind the parent's back.
@@ -451,12 +486,27 @@ impl<'a> State<'a> {
         if !self.completed.contains(&selected) {
             bail!("settlement without attempt completion");
         }
+        if self
+            .intents
+            .get(&selected)
+            .is_some_and(|i| i.task.isolation == super::WorkflowIsolation::Worktree)
+        {
+            anyhow::ensure!(
+                self.git_accepted.contains_key(&selected),
+                "Git handoff cannot settle before accepted destination verification"
+            );
+        }
         for outcome in &mut self.results {
             if outcome.selected_for.as_ref() == Some(&goal) {
                 outcome.selected_for = None;
             }
             if outcome.attempt.as_ref() == Some(&selected) {
                 outcome.selected_for = Some(goal.clone());
+                if self.git_accepted.contains_key(&selected) {
+                    // Upstream summary bytes stay identical across crash/replay; the typed event
+                    // carries acceptance. Never append another report suffix while replaying.
+                    outcome.status = "done".into();
+                }
             }
         }
         self.settlements
@@ -467,6 +517,7 @@ impl<'a> State<'a> {
 
     fn replay(&mut self, events: &[Event]) -> Result<()> {
         crate::agent::runlog::validate_speculative_cohorts(events)?;
+        crate::agent::runlog::validate_git_workflow(events)?;
         for event in events {
             match event {
                 Event::DispatchIntent { intent, .. } => {
@@ -504,6 +555,15 @@ impl<'a> State<'a> {
                         self.live_deadlines.insert(intent.goal.clone(), live);
                     }
                     expected.deadline_unix_ms = intent.deadline_unix_ms;
+                    // This is historical binding only. Runtime creation cannot occur until the
+                    // current destination and exact dependency evidence are revalidated.
+                    if expected.task.isolation == super::WorkflowIsolation::Worktree {
+                        anyhow::ensure!(
+                            intent.task.git_base.is_some(),
+                            "owned intent has no frozen base"
+                        );
+                        expected.task.git_base = intent.task.git_base.clone();
+                    }
                     expected.live_deadline =
                         self.live_deadlines.get(&intent.goal).copied().flatten();
                     if serde_json::to_value(&expected)? != serde_json::to_value(intent)? {
@@ -520,6 +580,7 @@ impl<'a> State<'a> {
                     iters,
                     tokens_in,
                     tokens_out,
+                    git_handoff,
                     ..
                 } => {
                     if status == "unknown-worker" {
@@ -558,8 +619,27 @@ impl<'a> State<'a> {
                             tokens_in: *tokens_in,
                             tokens_out: *tokens_out,
                             evidence_images: Vec::new(),
+                            git_handoff: git_handoff.clone(),
                         },
                     )?;
+                }
+                Event::GitTaskAccepted { key, evidence, .. } => {
+                    let handoff = self
+                        .results
+                        .iter()
+                        .find(|r| r.attempt.as_ref() == Some(key))
+                        .and_then(|r| r.git_handoff.as_ref())
+                        .context("Git acceptance without exact completed handoff")?;
+                    anyhow::ensure!(
+                        evidence.destination == handoff.tip
+                            && crate::core::git_ops::valid_operation_id(&evidence.integration)
+                            && crate::core::git_ops::valid_operation_id(&evidence.verification)
+                            && self
+                                .git_accepted
+                                .insert(key.clone(), evidence.clone())
+                                .is_none(),
+                        "duplicate or mismatched Git acceptance event"
+                    );
                 }
                 Event::TaskSettled {
                     task_id, selected, ..
@@ -579,8 +659,8 @@ impl<'a> State<'a> {
         for key in self.intents.keys() {
             if !self.completed.contains(key) {
                 bail!("unknown outcome for admitted attempt {}: dispatch intent has no completion. \
-                    Do not repeat a possible write. Inspect `aizen time doctor` and the crash-recovery \
-                    journal/checkpoints, reconcile the workspace, then start explicitly authorized new work",
+                    Do not repeat a possible write. Inspect actual workspace effects and the crash-recovery \
+                    evidence, reconcile the workspace, then start explicitly authorized new work",
                     key.display());
             }
         }
@@ -615,44 +695,26 @@ pub(crate) fn completion_event(intent: &DispatchIntent, outcome: &TaskOutcome) -
         iters: outcome.iters,
         tokens_in: outcome.tokens_in,
         tokens_out: outcome.tokens_out,
+        git_handoff: outcome.git_handoff.clone(),
     }
 }
 
-/// A lifecycle adapter for the same admission driver, not a second scheduler. Capabilities
-/// inserted by capture stay process-local; only bounded membership/evidence reaches the journal.
-pub(crate) trait CohortLifecycle {
-    fn capture(&self, intents: &mut [DispatchIntent]) -> Result<String>;
-    fn finish<'a>(
-        &'a self,
-        id: &'a str,
-        intents: &'a [DispatchIntent],
-    ) -> futures_util::future::LocalBoxFuture<'a, Result<String>>;
-    /// Publish logical success only after verified evidence is durably accepted.
-    fn accepted(&self, _intents: &[DispatchIntent]) {}
-    /// Drop controller authority after admitted futures drain, including on failure.
-    fn release(&self) {}
+/// Verifies accepted destination evidence without replacing physical child closure.
+pub(crate) trait GitAcceptance {
+    fn accept_git(
+        &self,
+        _handoff: &crate::core::git_ops::TaskHandoff,
+    ) -> Result<crate::core::git_ops::VerifiedTaskIntegration> {
+        bail!(
+            "owned workflow requires explicit parent Git integration and destination verification"
+        )
+    }
 }
 
 #[cfg(test)]
-struct NoCohorts;
+struct NoGitAcceptance;
 #[cfg(test)]
-impl CohortLifecycle for NoCohorts {
-    fn capture(&self, _intents: &mut [DispatchIntent]) -> Result<String> {
-        bail!("speculative workflow requires its controller-owned cohort lifecycle")
-    }
-    fn finish<'a>(
-        &'a self,
-        _id: &'a str,
-        _intents: &'a [DispatchIntent],
-    ) -> futures_util::future::LocalBoxFuture<'a, Result<String>> {
-        Box::pin(async { bail!("no speculative cohort was captured") })
-    }
-}
-
-struct ActiveCohort {
-    id: String,
-    intents: Vec<DispatchIntent>,
-}
+impl GitAcceptance for NoGitAcceptance {}
 
 /// Only the driver awaits completion/timers. An admission refusal never occupies width or a writer
 /// lane. Already-admitted futures are drained on cancel/error; their permits live inside execution.
@@ -728,13 +790,13 @@ where
         persist,
         run,
         scoped_admission,
-        &NoCohorts,
+        &NoGitAcceptance,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn schedule_cohorts<F, Fut, P, Admit, Prepare, Persist, C>(
+pub(crate) async fn schedule_with_git_acceptance<F, Fut, P, Admit, Prepare, Persist, C>(
     tasks: &[WorkflowTask],
     width: usize,
     model: &str,
@@ -745,7 +807,7 @@ pub(crate) async fn schedule_cohorts<F, Fut, P, Admit, Prepare, Persist, C>(
     admit: Admit,
     persist: Persist,
     run: F,
-    cohorts: &C,
+    acceptance: &C,
 ) -> Result<Vec<TaskOutcome>>
 where
     F: Fn(DispatchIntent, P) -> Fut,
@@ -753,7 +815,7 @@ where
     Prepare: FnMut(&mut DispatchIntent) -> Result<()>,
     Admit: FnMut(&DispatchIntent) -> std::result::Result<P, SlotDenied>,
     Persist: FnMut(Event) -> Result<()>,
-    C: CohortLifecycle,
+    C: GitAcceptance,
 {
     schedule_driver(
         tasks,
@@ -767,7 +829,7 @@ where
         persist,
         run,
         super::SCOPED_NATIVE_PARALLEL_ENABLED,
-        cohorts,
+        acceptance,
     )
     .await
 }
@@ -785,7 +847,7 @@ async fn schedule_driver<F, Fut, P, Admit, Prepare, Persist, C>(
     mut persist: Persist,
     run: F,
     scoped_admission: bool,
-    cohorts: &C,
+    acceptance: &C,
 ) -> Result<Vec<TaskOutcome>>
 where
     F: Fn(DispatchIntent, P) -> Fut,
@@ -793,12 +855,27 @@ where
     Prepare: FnMut(&mut DispatchIntent) -> Result<()>,
     Admit: FnMut(&DispatchIntent) -> std::result::Result<P, SlotDenied>,
     Persist: FnMut(Event) -> Result<()>,
-    C: CohortLifecycle,
+    C: GitAcceptance,
 {
+    // Refuse historical source-store requests before replay, callbacks or new admission.
+    for task in tasks {
+        task.execution.require_supported()?;
+    }
     super::waves(tasks)?;
     let mut state = State::new(tasks, policy);
     state.replay(replay)?;
-    let mut cohort: Option<ActiveCohort> = None;
+    for (key, expected) in &state.git_accepted {
+        let handoff = state
+            .results
+            .iter()
+            .find(|r| r.attempt.as_ref() == Some(key))
+            .and_then(|r| r.git_handoff.as_ref())
+            .context("replayed Git acceptance lost handoff")?;
+        anyhow::ensure!(
+            &acceptance.accept_git(handoff)? == expected,
+            "replayed Git acceptance no longer matches durable destination evidence"
+        );
+    }
     let mut in_flight = FuturesUnordered::new();
     let mut active = HashMap::<AttemptKey, (super::WorkflowDispatchMode, bool)>::new();
     let mut failure: Option<anyhow::Error> = None;
@@ -819,51 +896,44 @@ where
     // Labelled so the expiry path can leave the admission scan and let the top of the loop drain
     // the settlement it just recorded, instead of breaking out with a settlement still pending.
     'driver: loop {
-        if cancel.is_cancelled() && cohort.is_some() && failure.is_none() {
-            failure = Some(anyhow::anyhow!("speculative cohort cancelled; private reports retained, no integration or automatic replay"));
-        }
         let stopping = cancel.is_cancelled() || failure.is_some();
-        if !stopping {
-            if let Some(selected) = cohort.as_ref().filter(|selected| {
-                selected
-                    .intents
+        if !stopping && failure.is_none() {
+            while let Some((goal, selected)) = state.settlements.front().cloned() {
+                let handoff = state
+                    .results
                     .iter()
-                    .all(|intent| state.completed.contains(&intent.key))
-            }) {
-                let members = selected
-                    .intents
-                    .iter()
-                    .map(|intent| intent.key.clone())
-                    .collect();
-                let integrated = cohorts.finish(&selected.id, &selected.intents).await.and_then(|receipt| {
-                    crate::core::speculation::verification::parse_success_summary(&receipt, &selected.id)
-                        .context("speculative integration lifecycle summary invalid; reconcile retained evidence")?;
-                    Ok(receipt)
-                });
-                match integrated {
-                    Ok(receipt) => {
-                        if let Err(error) = persist(Event::SpeculativeCohortIntegrated {
-                            seq: 0, cohort_id: selected.id.clone(), members, receipt,
-                        }) {
-                            journal_failed = true;
-                            failure = Some(error.context("persisting integrated cohort; dependencies not released"));
-                        } else {
-                            let mut accepted = selected.intents.clone();
-                            for intent in &mut accepted {
-                                intent.task.overlay = None;
+                    .find(|r| r.attempt.as_ref() == Some(&selected))
+                    .and_then(|r| r.git_handoff.as_ref());
+                if let Some(handoff) = handoff {
+                    let accepted = acceptance.accept_git(handoff);
+                    match accepted {
+                        Ok(evidence) => {
+                            if let Some(prior) = state.git_accepted.get(&selected) {
+                                if prior != &evidence {
+                                    failure = Some(anyhow::anyhow!(
+                                        "accepted Git integration evidence changed after replay"
+                                    ));
+                                    break;
+                                }
+                            } else if let Err(error) = persist(Event::GitTaskAccepted {
+                                seq: 0,
+                                key: selected.clone(),
+                                evidence: evidence.clone(),
+                            }) {
+                                journal_failed = true;
+                                failure = Some(error.context(
+                                    "persisting Git acceptance; dependencies not released",
+                                ));
+                                break;
                             }
-                            // Release every controller/graph handle before publishing success or
-                            // admitting direct work that may checkpoint the now-verified live tree.
-                            cohort = None;
-                            cohorts.accepted(&accepted);
+                            state.git_accepted.insert(selected.clone(), evidence);
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
                         }
                     }
-                    Err(error) => failure = Some(error.context("speculative cohort did not integrate and verify; no settlement or automatic retry")),
                 }
-            }
-        }
-        if !stopping && failure.is_none() && cohort.is_none() {
-            while let Some((goal, selected)) = state.settlements.front().cloned() {
                 if let Err(error) = persist(Event::TaskSettled {
                     seq: 0,
                     task_id: goal.clone(),
@@ -881,87 +951,6 @@ where
             }
         }
         if !stopping && failure.is_none() {
-            if cohort.is_none() && in_flight.is_empty() {
-                let first = state
-                    .queue
-                    .iter()
-                    .find(|pending| state.eligible(pending) && pending.due <= Instant::now());
-                if first.is_some_and(|pending| {
-                    pending.intent.task.execution == ExecutionMode::Speculative
-                }) {
-                    let keys: Vec<_> = state
-                        .queue
-                        .iter()
-                        .filter(|pending| {
-                            pending.intent.task.execution == ExecutionMode::Speculative
-                                && state.eligible(pending)
-                                && pending.due <= Instant::now()
-                        })
-                        .take(width.clamp(1, 32))
-                        .map(|pending| pending.intent.key.clone())
-                        .collect();
-                    let mut selected = Vec::with_capacity(keys.len());
-                    for key in &keys {
-                        let position = state
-                            .queue
-                            .iter()
-                            .position(|pending| &pending.intent.key == key)
-                            .unwrap();
-                        let mut pending = state.queue.remove(position).unwrap();
-                        // Freeze the logical budget at capture too: a private attempt is a physical
-                        // attempt like any other and must not outlive the parent's deadline.
-                        state.freeze_deadline(&mut pending.intent);
-                        if let Err(error) = state
-                            .materialize(&mut pending.intent)
-                            .and_then(|()| prepare(&mut pending.intent))
-                        {
-                            failure = Some(error.context("preparing frozen speculative ready set"));
-                            break;
-                        }
-                        selected.push(pending.intent);
-                    }
-                    if failure.is_none() {
-                        match cohorts.capture(&mut selected) {
-                            Ok(id) if !id.is_empty() && id.len() <= 128 => {
-                                let members =
-                                    selected.iter().map(|intent| intent.key.clone()).collect();
-                                if let Err(error) = persist(Event::SpeculativeCohortCaptured {
-                                    seq: 0,
-                                    cohort_id: id.clone(),
-                                    members,
-                                }) {
-                                    journal_failed = true;
-                                    failure = Some(error.context(
-                                        "persisting speculative membership; dispatch not started",
-                                    ));
-                                } else {
-                                    for intent in selected.iter().rev() {
-                                        state.queue.push_front(Pending {
-                                            intent: intent.clone(),
-                                            due: Instant::now(),
-                                            admission_deadline: None,
-                                        });
-                                    }
-                                    cohort = Some(ActiveCohort {
-                                        id,
-                                        intents: selected,
-                                    });
-                                }
-                            }
-                            Ok(_) => {
-                                failure =
-                                    Some(anyhow::anyhow!("invalid controller cohort identity"))
-                            }
-                            Err(error) => {
-                                failure =
-                                    Some(error.context(
-                                        "capturing speculative cohort; no dispatch started",
-                                    ))
-                            }
-                        }
-                    }
-                }
-            }
             let count = if failure.is_none() {
                 state.queue.len()
             } else {
@@ -978,25 +967,9 @@ where
                     state.queue.push_back(pending);
                     continue;
                 }
-                if let Some(selected) = &cohort {
-                    if !selected
-                        .intents
-                        .iter()
-                        .any(|intent| intent.key == pending.intent.key)
-                    {
-                        state.queue.push_back(pending);
-                        continue;
-                    }
-                } else if pending.intent.task.execution == ExecutionMode::Speculative {
-                    // A cohort starts only at the idle boundary; direct work cannot enter it.
-                    state.queue.push_front(pending);
+                if let Err(error) = state.materialize(&mut pending.intent) {
+                    failure = Some(error.context("materializing queued dispatch"));
                     break;
-                }
-                if cohort.is_none() {
-                    if let Err(error) = state.materialize(&mut pending.intent) {
-                        failure = Some(error.context("materializing queued dispatch"));
-                        break;
-                    }
                 }
                 state.freeze_deadline(&mut pending.intent);
                 if pending
@@ -1017,6 +990,7 @@ where
                         tokens_in: 0,
                         tokens_out: 0,
                         evidence_images: Vec::new(),
+                        git_handoff: None,
                     };
                     if let Err(error) = persist(Event::DispatchIntent {
                         seq: 0,
@@ -1042,14 +1016,13 @@ where
                 }
                 let writer = super::workflow_task_is_writer(&pending.intent.task);
                 let mode = super::workflow_dispatch_mode(&pending.intent.task);
-                let conflict = cohort.is_none()
-                    && active.values().any(|(other, other_writer)| {
-                        if scoped_admission {
-                            !mode.compatible(other)
-                        } else {
-                            writer && *other_writer
-                        }
-                    });
+                let conflict = active.values().any(|(other, other_writer)| {
+                    if scoped_admission {
+                        !mode.compatible(other)
+                    } else {
+                        writer && *other_writer
+                    }
+                });
                 if conflict {
                     state.queue.push_back(pending);
                     continue;
@@ -1167,26 +1140,14 @@ where
                 failure = Some(anyhow::Error::new(crate::agent::task_tool::TaskWorkerStillRunning)
                     .context(format!("attempt {} still has a live blocking worker; no retry or dependency release", intent.key.display())));
             } else if failure.is_none() {
-                let speculative_failed = intent.task.execution == ExecutionMode::Speculative
-                    && (!completed_status(&outcome.status) || verdict_failed(&outcome));
                 if let Err(error) = state.complete(intent, outcome) {
                     failure = Some(error.context("applying durable completion"));
-                } else if speculative_failed {
-                    failure = Some(anyhow::anyhow!("speculative cohort has a failed, incomplete or FAIL-verdict attempt; private edits retained, no integration, retry or dependency release"));
                 }
             }
         }
     }
-    // All admitted futures were drained. A live blocking body retains its own execution
-    // context/handle; scheduler graph metadata must never keep a physically-settled owner alive.
-    drop(cohort);
-    for pending in &mut state.queue {
-        pending.intent.task.overlay = None;
-    }
-    for intent in state.intents.values_mut() {
-        intent.task.overlay = None;
-    }
-    cohorts.release();
+    // All admitted futures were drained. Unknown bodies keep their runtime ownership;
+    // logical graph completion and observer return cannot certify their physical closure.
     if let Some(error) = failure {
         let mut report = format!(
             "workflow infrastructure failure: {error:#}\nobserved spend: {observed_in}→{observed_out} tok across {observed_count} observed physical completions (live workers may have additional unreported spend)"
@@ -1225,6 +1186,7 @@ where
                 tokens_in: 0,
                 tokens_out: 0,
                 evidence_images: Vec::new(),
+                git_handoff: None,
             });
         }
     }
@@ -1301,6 +1263,7 @@ mod scoped_admission_tests {
             declared_write_paths: declared_write_paths.clone(),
             declared_read_paths: None,
             execution: ExecutionMode::Direct,
+            isolation: super::super::WorkflowIsolation::Shared,
             system: "fixed".into(),
             contract: crate::agent::task_tool::TaskContract {
                 boundaries: None,
@@ -1337,6 +1300,7 @@ mod scoped_admission_tests {
             selected_for: None,
             attempt: None,
             evidence_images: Vec::new(),
+            git_handoff: None,
         }
     }
 

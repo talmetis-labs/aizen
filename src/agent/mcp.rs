@@ -62,8 +62,7 @@ pub struct McpConfig {
     /// connected server exceeds this, the largest servers are deferred (biggest first) until the
     /// advertised remainder fits — deferred tools are reached through `tool_search` instead of
     /// riding on every request. Absent or `0` leaves auto-deferral OFF — it is opt-in, because a
-    /// grammar-constrained gateway cannot call a deferred tool at all (see
-    /// [`DEFER_AUTO_TOKENS_DEFAULT`]). Per-server `defer` pins win over this budget in both
+    /// search introduces an additional model round trip. Per-server `defer` pins win in both
     /// directions.
     #[serde(default, rename = "deferAutoTokens", alias = "defer_auto_tokens")]
     pub defer_auto_tokens: Option<usize>,
@@ -92,12 +91,16 @@ pub struct ServerConfig {
     /// Tool names to drop (after `include`).
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Deferral pin. `true` → this server's tools never ride on the request (always reached via
+    /// Deferral pin. `true` → this server's tools are discovered on demand (reached via
     /// `tool_search`); `false` → always advertised, however large; absent → the auto budget
     /// (`deferAutoTokens`) decides. Deferred tools stay fully callable — only their schemas move
     /// from the request to `tool_search` results.
     #[serde(default)]
     pub defer: Option<bool>,
+    /// Exact remote tools the owner runs with server-enforced read-only credentials.
+    /// Accepted only from the home config and ignored by stdio transports.
+    #[serde(default, rename = "remoteReadOnlyTools")]
+    pub remote_read_only_tools: Vec<String>,
     /// `"oauth"` → this remote needs OAuth 2.1 sign-in; the token is cached under
     /// `~/.aizen/mcp-tokens/<key>.json` and attached as a `Bearer` header (refreshed transparently).
     #[serde(default)]
@@ -143,7 +146,12 @@ fn read_one(path: &Path) -> Result<Option<McpConfig>> {
 pub fn load_config() -> Result<Option<McpConfig>> {
     let home = read_one(&config_path())?;
     let proj = if project_trusted() {
-        read_one(&project_config_path())?
+        read_one(&project_config_path())?.map(|mut config| {
+            for server in config.servers.values_mut() {
+                server.remote_read_only_tools.clear();
+            }
+            config
+        })
     } else {
         None
     };
@@ -222,8 +230,19 @@ fn project_key() -> String {
 
 /// Whether the current repo is trusted to load its project-local MCP servers.
 pub fn project_trusted() -> bool {
-    let key = project_key();
-    load_trust().trusted.contains(&key)
+    project_trusted_at(&crate::core::config::project_root())
+}
+
+/// Check the root supplying executable project configuration, not an ambient session's root.
+/// An unavailable root has no live trust authority, even if its old spelling is in the store.
+pub(crate) fn project_trusted_at(root: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    root.is_dir()
+        && load_trust()
+            .trusted
+            .contains(&root.to_string_lossy().to_string())
 }
 
 /// Trust the current repo's project MCP servers (idempotent; clears any prior dismissal).
@@ -959,6 +978,17 @@ impl Drop for RemoteSidecarOperation {
     }
 }
 
+/// Invalidate proof only when a tool request reaches transport admission, never for discovery.
+/// Server read-only hints are not mutation authority. The synchronous tool bridge keeps the current
+/// execution context pinned while polling transport I/O, including reconnect and OAuth replays.
+fn note_tool_call_admission(msg: &Value) {
+    if msg.get("method").and_then(Value::as_str) == Some("tools/call") {
+        if let Some(ctx) = crate::core::exec_ctx::current() {
+            ctx.note_task_effects();
+        }
+    }
+}
+
 enum Transport {
     Stdio(StdioTransport),
     Http(HttpTransport),
@@ -1011,6 +1041,7 @@ impl StdioTransport {
             .and_then(|v| v.as_u64())
             .context("stdio request needs an id")?;
         let line = serde_json::to_string(msg)? + "\n";
+        note_tool_call_admission(msg);
         if let Err(e) = self.stdin.write_all(line.as_bytes()).await {
             return Err(anyhow::Error::new(McpTransportError::new(
                 TransportErrorKind::SendFailed,
@@ -1067,6 +1098,7 @@ impl StdioTransport {
 }
 
 struct HttpTransport {
+    remote_read_only_tools: Vec<String>,
     client: reqwest::Client,
     url: String,
     headers: BTreeMap<String, String>,
@@ -1199,6 +1231,13 @@ impl HttpTransport {
         let safe_url = redact_secrets(&self.url, &secrets);
         let rb = self.apply_headers(self.client.post(&self.url)).json(msg);
         let mut operation = RemoteSidecarOperation::acquire()?;
+        let remote_read = msg
+            .pointer("/params/name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| self.remote_read_only_tools.iter().any(|tool| tool == name));
+        if !remote_read {
+            note_tool_call_admission(msg);
+        }
         let mut resp = match rb.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -1697,6 +1736,17 @@ impl Connection {
                 _ => break,
             }
         }
+        if let Transport::Http(transport) = &mut self.transport {
+            transport.remote_read_only_tools = out
+                .iter()
+                .filter(|tool| {
+                    tool.read_only
+                        && self.cfg.allows(&tool.name)
+                        && self.cfg.remote_read_only_tools.contains(&tool.name)
+                })
+                .map(|tool| tool.name.clone())
+                .collect();
+        }
         Ok(out)
     }
 
@@ -1714,6 +1764,7 @@ struct ToolMeta {
     description: String,
     input_schema: Value,
     read_only: bool,
+    search_aliases: Vec<String>,
 }
 
 impl ToolMeta {
@@ -1734,11 +1785,26 @@ impl ToolMeta {
             .and_then(|a| a.get("readOnlyHint"))
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
+        let search_aliases = v
+            .get("_meta")
+            .and_then(|meta| meta.get("aizen/aliases"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(12)
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|alias| {
+                !alias.is_empty() && alias.len() <= 96 && !alias.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+            .collect();
         Some(Self {
             name,
             description,
             input_schema,
             read_only,
+            search_aliases,
         })
     }
 }
@@ -1751,6 +1817,7 @@ struct ServerHandle {
     conn: Arc<Mutex<Connection>>,
     tools: Vec<ToolMeta>,
     server_info: Value,
+    estimated_schema_tokens: std::sync::OnceLock<usize>,
     /// Canonical hash of the exposed tool schemas at connect time. `notifications/tools/list_changed`
     /// marks the manager dirty, but the schema the model sees must NOT change mid-run — the next
     /// user-turn registry rebuild reconnects, recomputes this, and only then re-exposes changed tools.
@@ -2053,6 +2120,7 @@ fn connect_http(name: &str, cfg: &ServerConfig) -> Result<Transport> {
     };
     let secrets = server_secrets(cfg, token.as_ref());
     Ok(Transport::Http(HttpTransport {
+        remote_read_only_tools: Vec::new(),
         client,
         url,
         headers: cfg.headers.clone(),
@@ -2067,6 +2135,12 @@ fn connect_http(name: &str, cfg: &ServerConfig) -> Result<Transport> {
 
 /// Connect one server: build transport → handshake → list tools (all under a timeout).
 async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
+    let context = crate::agent::hooks::automation_context(None);
+    let admitted = crate::agent::hooks::admit_automation(&context)?;
+    crate::core::exec_ctx::with_current_future(admitted, connect_one_inner(name, cfg)).await
+}
+
+async fn connect_one_inner(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
     check_startup_effects()?;
     let transport = if cfg.command.is_some() {
         // Hard floor: the same `cmd_guard` that protects `shell_run` gates an MCP child too, so a
@@ -2153,6 +2227,7 @@ async fn connect_one(name: &str, cfg: &ServerConfig) -> Result<ServerHandle> {
     let schema_hash = schema_hash(&tools);
     Ok(ServerHandle {
         name: name.to_string(),
+        estimated_schema_tokens: Default::default(),
         conn: Arc::new(Mutex::new(conn)),
         tools,
         server_info,
@@ -2316,7 +2391,14 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
     let overall = CONNECT_TIMEOUT * 3;
     let mut set: tokio::task::JoinSet<(String, Result<ServerHandle>)> = tokio::task::JoinSet::new();
     for (name, sc) in enabled {
-        set.spawn(async move {
+        // JoinSet tasks do not inherit the caller's task-local/TLS policy. Admit before scheduling;
+        // the runner then retains this owner through the physical stdio sidecar lifetime.
+        let context = crate::agent::hooks::automation_context(None);
+        let admitted = match crate::agent::hooks::admit_automation(&context) {
+            Ok(admitted) => admitted,
+            Err(_) => continue,
+        };
+        set.spawn(crate::core::exec_ctx::with_current_future(admitted, async move {
             let r = match tokio::time::timeout(overall, connect_one(&name, &sc)).await {
                 Ok(r) => r,
                 Err(_) => Err(startup_failure_without_settlement(anyhow!(
@@ -2324,7 +2406,7 @@ async fn build_manager(cfg: &McpConfig) -> Manager {
                 ), true)),
             };
             (name, r)
-        });
+        }));
     }
 
     let mut servers = Vec::new();
@@ -2369,6 +2451,14 @@ fn block<F: std::future::Future>(f: F) -> F::Output {
 /// turn; `invalidate()` clears it so a freshly-added app is picked up on the next registry build (no
 /// process relaunch). Leaves it `None` (unbuilt) when there's no Tokio runtime (e.g. unit tests).
 fn ensure_manager() {
+    let context = crate::agent::hooks::automation_context(None);
+    let Ok(admitted) = crate::agent::hooks::admit_automation(&context) else {
+        return;
+    };
+    crate::core::exec_ctx::with_current(admitted, ensure_manager_inner);
+}
+
+fn ensure_manager_inner() {
     if check_startup_effects().is_err() {
         return;
     }
@@ -2428,7 +2518,7 @@ fn fnv1a(s: &str) -> u64 {
 // (schema_hash is defined once near ServerHandle — see above.)
 
 /// Sanitize a server/tool name into the `[a-z0-9_]` charset the tool-name grammar expects.
-fn slug(s: &str) -> String {
+pub(super) fn slug(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_ascii_alphanumeric() {
@@ -2470,15 +2560,9 @@ fn qualified_name(server: &str, tool: &str) -> String {
 
 /// Default auto-deferral budget: **0 — auto-deferral is opt-in.**
 ///
-/// Deferral only works where the provider lets the model emit a tool call whose name is not in
-/// the request's `tools` array. Measured 2026-08-26 (A/B, same model, same forced prompt): a
-/// hosted gateway's free-tier model called an ADVERTISED `mcp_design_docs` on its first action,
-/// but with the server deferred it could not produce that call at all — every attempt decoded
-/// into an advertised tool instead, i.e. the gateway grammar-locks call names to the advertised
-/// set. First-party endpoints (Anthropic, OpenAI) accept undeclared names, but a default that
-/// silently breaks connected tools on constrained gateways is worse than a default that spends
-/// tokens; users opt in with `"deferAutoTokens": 4000` (or pin `"defer": true` per server) once
-/// they know their provider.
+/// Preserve the direct, single-request path for existing configurations. A positive budget
+/// enables largest-first deferral. The agent loop advertises the selected MCP matches after
+/// a search, including on gateways that constrain calls to the current request's tool names.
 const DEFER_AUTO_TOKENS_DEFAULT: usize = 0;
 
 /// The model-facing description of one MCP tool — shared by the live registration and the size
@@ -2546,6 +2630,9 @@ fn plan_deferral(
 /// effective mcp.json. Config is re-read here (two small files) so a pin edit takes effect on the
 /// next turn's registry rebuild without a reconnect.
 fn deferred_servers(mgr: &Manager) -> std::collections::BTreeSet<String> {
+    if mgr.servers.is_empty() {
+        return Default::default();
+    }
     let cfg = match load_config() {
         Ok(Some(c)) => c,
         _ => McpConfig::default(),
@@ -2557,7 +2644,12 @@ fn deferred_servers(mgr: &Manager) -> std::collections::BTreeSet<String> {
         .map(|s| {
             (
                 s.name.clone(),
-                server_defs_estimate(s),
+                if threshold == 0 {
+                    0
+                } else {
+                    *s.estimated_schema_tokens
+                        .get_or_init(|| server_defs_estimate(s))
+                },
                 cfg.servers.get(&s.name).and_then(|sc| sc.defer),
             )
         })
@@ -2623,6 +2715,7 @@ pub fn discovered_tools() -> Vec<Discovered> {
                     description: tool_description(&srv.name, t),
                     schema: t.input_schema.clone(),
                     destructive: !t.read_only,
+                    search_aliases: t.search_aliases.clone(),
                     conn: srv.conn.clone(),
                     // Pin the server's tool-schema hash + connect-time generation (0). A reconnect
                     // mid-turn re-lists the tools and bumps the generation to 1; if the re-listed hash
@@ -2776,6 +2869,7 @@ struct McpTool {
     description: String,
     schema: Value,
     destructive: bool,
+    search_aliases: Vec<String>,
     conn: Arc<Mutex<Connection>>,
     /// The connection generation this tool's schema was built against. If a reconnect bumps the
     /// live generation AND the re-listed schema hash differs, the tool the model was shown no longer
@@ -2788,6 +2882,9 @@ struct McpTool {
 }
 
 impl Tool for McpTool {
+    fn search_aliases(&self) -> &[String] {
+        &self.search_aliases
+    }
     fn name(&self) -> &str {
         &self.qualified
     }
@@ -2941,6 +3038,59 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn planning_mcp_connect_refuses_before_transport_or_config_discovery() {
+        use crate::core::session_control::ExecutionMode;
+        let task = crate::agent::todo::TaskContext::private();
+        task.control()
+            .transition(ExecutionMode::Planning, None, |_| Ok(()))
+            .unwrap();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default().with_task(task.clone());
+        // A malformed transport normally fails only after the admission boundary. Planning must
+        // refuse first without reading config, touching the manager, or opening a connection.
+        let config: ServerConfig = serde_json::from_value(json!({})).unwrap();
+        crate::core::exec_ctx::with_current_future(ctx.clone(), async {
+            let error = connect_one("forbidden", &config).await.err().unwrap();
+            assert!(error.to_string().contains("automation suppressed"));
+            ensure_manager();
+        })
+        .await;
+        task.control()
+            .transition(ExecutionMode::Normal, None, |_| Ok(()))
+            .unwrap();
+        crate::core::exec_ctx::with_current_future(ctx, async {
+            assert!(connect_one("stale", &config).await.is_err());
+        })
+        .await;
+    }
+
+    #[test]
+    fn tool_call_admission_invalidates_live_owners_but_not_discovery() {
+        let parent_task = crate::agent::todo::TaskContext::private();
+        let parent =
+            crate::core::exec_ctx::ExecutionContext::default().with_task(parent_task.clone());
+        let child = parent.with_resource_scope("mcp-child");
+        let sibling = parent.with_resource_scope("mcp-sibling");
+        let child_task = child.task().unwrap().clone();
+        let parent_epoch = parent_task.effect_epoch();
+        let child_epoch = child_task.effect_epoch();
+        let sibling_epoch = sibling.task().unwrap().effect_epoch();
+        crate::core::exec_ctx::with_current(child, || {
+            note_tool_call_admission(&rpc_request(1, "initialize", json!({})));
+            note_tool_call_admission(&rpc_request(2, "tools/list", json!({})));
+            assert_eq!(parent_task.effect_epoch(), parent_epoch);
+            assert_eq!(child_task.effect_epoch(), child_epoch);
+            // Each transport attempt, including a replay, invalidates before any response exists.
+            let call = rpc_request(3, "tools/call", json!({"name": "read", "arguments": {}}));
+            note_tool_call_admission(&call);
+            note_tool_call_admission(&call);
+        });
+        assert_eq!(parent_task.effect_epoch(), parent_epoch + 2);
+        assert_eq!(child_task.effect_epoch(), child_epoch + 2);
+        assert_eq!(sibling.task().unwrap().effect_epoch(), sibling_epoch);
+        assert!(child_task.snapshot().checks.is_empty());
+    }
 
     #[test]
     fn an_in_flight_start_never_blocks_but_a_failed_one_does_until_proven() {
@@ -3380,6 +3530,7 @@ mod tests {
             description: String::new(),
             input_schema: json!({"type":"object"}),
             read_only: true,
+            search_aliases: Vec::new(),
         };
         let rw = ToolMeta {
             name: "y".into(),
@@ -3661,6 +3812,7 @@ mod tests {
             include: vec![],
             exclude: vec![],
             defer: None,
+            remote_read_only_tools: Vec::new(),
             auth: None,
             oauth: None,
         };

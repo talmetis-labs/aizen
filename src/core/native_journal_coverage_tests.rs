@@ -98,6 +98,471 @@ fn unchecked_v2(journal: &Journal) -> Vec<u8> {
 }
 
 #[test]
+fn owner_postimages_missing_storage_fails_without_creating_or_repairing_it() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        fs::write(resource.path(), b"unattributed").unwrap();
+        let _lease = f.lease(&[&resource]);
+        let home = f.home.join("proof-only");
+        with_test_storage(&home, || {
+            let prove = || {
+                prove_current_owner_postimages("coverage-parent", std::slice::from_ref(&resource))
+            };
+            assert!(prove().is_err());
+            assert!(!home.exists(), "proof must not create a missing home");
+            fs::create_dir(&home).unwrap();
+            assert!(prove().is_err());
+            assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+            let dir = home.join("native-journal-v1");
+            fs::create_dir(&dir).unwrap();
+            assert!(prove().is_err());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            let lock = dir.join("storage.lock");
+            fs::write(&lock, b"existing lock").unwrap();
+            assert!(prove().is_err());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            assert_eq!(fs::read(&lock).unwrap(), b"existing lock");
+            fs::remove_file(&lock).unwrap();
+            let records = dir.join("records.bin");
+            let empty = Journal::default().encode().unwrap();
+            fs::write(&records, &empty).unwrap();
+            assert!(prove().is_err());
+            assert!(!lock.exists(), "proof must not recreate the lock");
+            assert_eq!(fs::read(&records).unwrap(), empty);
+            fs::write(&lock, b"existing lock").unwrap();
+            assert!(prove().is_err(), "empty history proves no current owner");
+            fs::write(&records, b"corrupt journal").unwrap();
+            assert!(prove().is_err());
+            assert_eq!(fs::read(&records).unwrap(), b"corrupt journal");
+            assert_eq!(fs::read(&lock).unwrap(), b"existing lock");
+        });
+        assert_eq!(fs::read(resource.path()).unwrap(), b"unattributed");
+    });
+}
+
+#[test]
+fn owner_postimages_returns_exact_ordered_current_tips_without_writes() {
+    let f = Fixture::new();
+    f.run(|| {
+        let a = f.resource("a.txt");
+        let b = f.resource("b.txt");
+        let _lease = f.lease(&[&a, &b]);
+        let missing = FileFingerprint::missing();
+        let first = apply(&a, &missing, b"first", "coverage-parent").unwrap();
+        let after_a = apply(&a, &first, b"current", "coverage-parent").unwrap();
+        let after_b = FileFingerprint::for_bytes(b"covered");
+        let mut batch =
+            begin_covered_batch("coverage-parent", &[(&b, &missing, b"covered")]).unwrap();
+        batch.apply(&b, &missing, b"covered").unwrap();
+        drop(batch);
+        let path = f.path();
+        let lock = path.parent().unwrap().join("storage.lock");
+        let before = fs::read(&path).unwrap();
+        let lock_before = fs::read(&lock).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let lock_modified = fs::metadata(&lock).unwrap().modified().unwrap();
+        assert_eq!(
+            prove_current_owner_postimages("coverage-parent", &[b.clone(), a.clone()]).unwrap(),
+            vec![
+                OwnerPostimage {
+                    path: b.path().to_path_buf(),
+                    key: b.key().to_owned(),
+                    record_id: 3,
+                    before: missing.clone(),
+                    fingerprint: after_b,
+                },
+                OwnerPostimage {
+                    path: a.path().to_path_buf(),
+                    key: a.key().to_owned(),
+                    record_id: 2,
+                    before: missing,
+                    fingerprint: after_a,
+                },
+            ]
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&lock).unwrap(), lock_before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            fs::metadata(&lock).unwrap().modified().unwrap(),
+            lock_modified
+        );
+        assert_eq!(fs::read(a.path()).unwrap(), b"current");
+        assert_eq!(fs::read(b.path()).unwrap(), b"covered");
+        let storage = Storage::open().unwrap();
+        assert!(prove_current_owner_postimages("coverage-parent", &[a, b]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(storage);
+    });
+}
+
+#[test]
+fn owner_postimages_repeated_writes_expose_first_preimage_until_foreign_boundary() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        fs::write(resource.path(), b"baseline").unwrap();
+        let baseline = FileFingerprint::for_bytes(b"baseline");
+        let first = apply(&resource, &baseline, b"first", "coverage-parent").unwrap();
+        let second = apply(&resource, &first, b"second", "coverage-parent").unwrap();
+        let final_image = apply(&resource, &second, b"last", "coverage-parent").unwrap();
+        let before = fs::read(f.path()).unwrap();
+        let proof =
+            prove_current_owner_postimages("coverage-parent", std::slice::from_ref(&resource))
+                .unwrap();
+        assert_eq!(proof[0].before, baseline);
+        assert_eq!(proof[0].fingerprint, final_image);
+        assert_eq!(proof[0].record_id, 3);
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+        let foreign = exec_ctx::with_current(
+            ExecutionContext::default().with_resource_scope("foreign"),
+            || apply(&resource, &final_image, b"foreign", "foreign").unwrap(),
+        );
+        let resumed = apply(&resource, &foreign, b"resumed", "coverage-parent").unwrap();
+        apply(&resource, &resumed, b"resumed-again", "coverage-parent").unwrap();
+        let before = fs::read(f.path()).unwrap();
+        let proof = prove_current_owner_postimages("coverage-parent", &[resource]).unwrap();
+        assert_eq!(
+            proof[0].before, foreign,
+            "do not cross a foreign logical write"
+        );
+        assert_ne!(
+            proof[0].before, baseline,
+            "consumer baseline comparison rejects this segment"
+        );
+        assert_eq!(proof[0].record_id, 6);
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+    });
+}
+
+#[test]
+fn owner_postimages_refuses_external_edit_between_same_owner_writes() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        let missing = FileFingerprint::missing();
+        apply(&resource, &missing, b"first-owned", "coverage-parent").unwrap();
+        fs::write(resource.path(), b"external").unwrap();
+        let external = FileFingerprint::for_bytes(b"external");
+        let after = apply(&resource, &external, b"second-owned", "coverage-parent").unwrap();
+        let before = fs::read(f.path()).unwrap();
+        assert!(inspect_existing_records(&[claim(2, &resource, &external, &after)]).is_ok());
+        assert!(
+            prove_current_owner_postimages("coverage-parent", std::slice::from_ref(&resource))
+                .is_err()
+        );
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+        assert_eq!(fs::read(resource.path()).unwrap(), b"second-owned");
+    });
+}
+
+#[test]
+fn owner_postimages_requires_bounded_nonempty_unique_resources_and_exact_owner() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("child.txt");
+        let _lease = f.lease(&[&resource]);
+        let owner = "coverage-parent/child";
+        let child = ExecutionContext::default().with_resource_scope(owner);
+        exec_ctx::with_current(child, || {
+            apply(&resource, &FileFingerprint::missing(), b"child", owner).unwrap();
+        });
+        let before = fs::read(f.path()).unwrap();
+        for wrong in [
+            "",
+            "invalid\0owner",
+            "coverage-parent",
+            "coverage-parent/child/other",
+        ] {
+            assert!(
+                prove_current_owner_postimages(wrong, std::slice::from_ref(&resource)).is_err()
+            );
+        }
+        assert!(prove_current_owner_postimages(
+            &"x".repeat(MAX_OWNER_BYTES + 1),
+            std::slice::from_ref(&resource)
+        )
+        .is_err());
+        assert!(prove_current_owner_postimages(owner, &[]).is_err());
+        let duplicate = [resource.clone(), resource.clone()];
+        assert!(prove_current_owner_postimages(owner, &duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate resources"));
+        let too_many: Vec<_> = (0..33)
+            .map(|i| f.resource(&format!("file-{i}.txt")))
+            .collect();
+        assert!(prove_current_owner_postimages(owner, &too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("1..=32"));
+        // A parent may inspect an exact child owner without impersonating its execution context.
+        assert!(prove_current_owner_postimages(owner, &[resource]).is_ok());
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+    });
+}
+
+#[test]
+fn owner_postimages_rejects_changed_missing_and_oversized_source_images() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        apply(
+            &resource,
+            &FileFingerprint::missing(),
+            b"owned",
+            "coverage-parent",
+        )
+        .unwrap();
+        let before = fs::read(f.path()).unwrap();
+        let prove =
+            || prove_current_owner_postimages("coverage-parent", std::slice::from_ref(&resource));
+        for bytes in [b"other".to_vec(), vec![b'x'; MAX_SOURCE_BYTES + 1]] {
+            fs::write(resource.path(), &bytes).unwrap();
+            assert!(prove().is_err());
+            assert_eq!(fs::read(resource.path()).unwrap(), bytes);
+            assert_eq!(fs::read(f.path()).unwrap(), before);
+        }
+        fs::remove_file(resource.path()).unwrap();
+        assert!(prove().is_err());
+        assert!(!resource.path().exists());
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+    });
+}
+
+#[test]
+fn owner_postimages_rejects_foreign_equal_bytes_and_follows_logical_undo_tip() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        let missing = FileFingerprint::missing();
+        let owned = apply(&resource, &missing, b"owned", "coverage-parent").unwrap();
+        exec_ctx::with_current(
+            ExecutionContext::default().with_resource_scope("foreign"),
+            || {
+                let changed = apply(&resource, &owned, b"foreign", "foreign").unwrap();
+                apply(&resource, &changed, b"owned", "foreign").unwrap();
+            },
+        );
+        let before = fs::read(f.path()).unwrap();
+        assert!(inspect_existing_records(&[claim(1, &resource, &missing, &owned)]).is_ok());
+        assert!(
+            prove_current_owner_postimages("coverage-parent", std::slice::from_ref(&resource))
+                .is_err()
+        );
+        assert_eq!(
+            prove_current_owner_postimages("foreign", std::slice::from_ref(&resource)).unwrap()[0]
+                .record_id,
+            3
+        );
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+        assert_eq!(fs::read(resource.path()).unwrap(), b"owned");
+        let parent = exec_ctx::current().unwrap();
+        assert_eq!(undo_owner(&parent, &resource, "foreign").unwrap(), 2);
+        let after_undo = fs::read(f.path()).unwrap();
+        assert_eq!(
+            prove_current_owner_postimages("coverage-parent", std::slice::from_ref(&resource))
+                .unwrap()[0]
+                .record_id,
+            1,
+            "the latest physical record is an Undo, not the logical write tip"
+        );
+        assert!(prove_current_owner_postimages("foreign", &[resource]).is_err());
+        assert_eq!(fs::read(f.path()).unwrap(), after_undo);
+    });
+}
+
+#[test]
+fn owner_postimages_refuses_unresolved_records_from_every_owner_without_reconciling() {
+    for owner in ["coverage-parent", "foreign"] {
+        for point in [Fault::Prepared, Fault::Write, Fault::Applied] {
+            let f = Fixture::new();
+            f.run(|| {
+                let resource = f.resource("source.txt");
+                let _lease = f.lease(&[&resource]);
+                let owned = apply(
+                    &resource,
+                    &FileFingerprint::missing(),
+                    b"owned",
+                    "coverage-parent",
+                )
+                .unwrap();
+                exec_ctx::with_current(
+                    ExecutionContext::default().with_resource_scope(owner),
+                    || {
+                        assert!(with_test_fault(point, || {
+                            apply(&resource, &owned, b"pending", owner)
+                        })
+                        .is_err());
+                    },
+                );
+                // Matching the old settled image cannot resolve another owner's later intent.
+                fs::write(resource.path(), b"owned").unwrap();
+                let before = fs::read(f.path()).unwrap();
+                assert!(prove_current_owner_postimages("coverage-parent", &[resource]).is_err());
+                assert_eq!(fs::read(f.path()).unwrap(), before);
+                let journal = Journal::decode(&before).unwrap();
+                assert_ne!(journal.records.last().unwrap().meta.state, State::Settled);
+            });
+        }
+    }
+}
+
+#[test]
+fn owner_postimages_refuses_missing_intents_but_does_not_expand_resource_scope() {
+    for owner in ["coverage-parent", "foreign"] {
+        let f = Fixture::new();
+        f.run(|| {
+            let selected = f.resource("selected.txt");
+            let other = f.resource("other.txt");
+            let _lease = f.lease(&[&selected, &other]);
+            let missing = FileFingerprint::missing();
+            let owned = apply(&selected, &missing, b"owned", "coverage-parent").unwrap();
+            apply(&other, &missing, b"other", "coverage-parent").unwrap();
+            exec_ctx::with_current(
+                ExecutionContext::default().with_resource_scope(owner),
+                || {
+                    drop(begin_covered_batch(owner, &[(&selected, &owned, b"pending")]).unwrap());
+                },
+            );
+            let before = fs::read(f.path()).unwrap();
+            assert!(prove_current_owner_postimages("coverage-parent", &[selected]).is_err());
+            assert_eq!(
+                prove_current_owner_postimages("coverage-parent", &[other]).unwrap()[0].record_id,
+                2
+            );
+            assert_eq!(fs::read(f.path()).unwrap(), before);
+        });
+    }
+}
+
+#[test]
+fn owner_postimages_settled_not_applied_is_not_current_ownership() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        assert!(with_test_fault(Fault::Prepared, || {
+            apply(
+                &resource,
+                &FileFingerprint::missing(),
+                b"after",
+                "coverage-parent",
+            )
+        })
+        .is_err());
+        reconcile(&resource).unwrap();
+        fs::write(resource.path(), b"after").unwrap();
+        let before = fs::read(f.path()).unwrap();
+        let journal = Journal::decode(&before).unwrap();
+        assert_eq!(journal.records[0].meta.state, State::Settled);
+        assert_eq!(journal.records[0].meta.outcome, Some(Outcome::NotApplied));
+        assert!(prove_current_owner_postimages("coverage-parent", &[resource]).is_err());
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+    });
+}
+
+#[test]
+fn owner_postimages_refuses_path_key_and_historical_parent_mismatches() {
+    for mismatch in 0..3 {
+        let f = Fixture::new();
+        f.run(|| {
+            let resource = f.resource("source.txt");
+            let other = f.resource("other.txt");
+            let _lease = f.lease(&[&resource]);
+            apply(
+                &resource,
+                &FileFingerprint::missing(),
+                b"owned",
+                "coverage-parent",
+            )
+            .unwrap();
+            let storage = Storage::open().unwrap();
+            let mut journal = storage.load().unwrap();
+            let binding = &mut journal.records[0].meta.binding;
+            match mismatch {
+                0 => binding.path = other.path().to_path_buf(),
+                1 => binding.key = other.key().to_owned(),
+                _ => binding.parent_identity = (u64::MAX, u64::MAX),
+            }
+            storage.save(&journal).unwrap();
+            drop(storage);
+            let before = fs::read(f.path()).unwrap();
+            assert!(
+                Journal::decode(&before).is_ok(),
+                "binding check must not rely on corruption"
+            );
+            assert!(prove_current_owner_postimages("coverage-parent", &[resource]).is_err());
+            assert_eq!(fs::read(f.path()).unwrap(), before);
+        });
+    }
+}
+
+#[test]
+fn owner_postimages_rejects_replaced_resource_ancestry_without_rebinding_it() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        apply(
+            &resource,
+            &FileFingerprint::missing(),
+            b"owned",
+            "coverage-parent",
+        )
+        .unwrap();
+        let before = fs::read(f.path()).unwrap();
+        let moved = f.work.with_extension("moved");
+        fs::rename(&f.work, &moved).unwrap();
+        fs::create_dir(&f.work).unwrap();
+        fs::write(f.work.join("source.txt"), b"owned").unwrap();
+        assert!(resource.verify().is_err());
+        assert!(prove_current_owner_postimages("coverage-parent", &[resource]).is_err());
+        let rebound = f.resource("source.txt");
+        assert!(prove_current_owner_postimages("coverage-parent", &[rebound]).is_err());
+        assert_eq!(fs::read(f.path()).unwrap(), before);
+        assert_eq!(fs::read(moved.join("source.txt")).unwrap(), b"owned");
+        assert_eq!(fs::read(f.work.join("source.txt")).unwrap(), b"owned");
+    });
+}
+
+#[test]
+fn existing_journal_reader_revalidates_storage_after_inspection() {
+    let f = Fixture::new();
+    f.run(|| {
+        let resource = f.resource("source.txt");
+        let _lease = f.lease(&[&resource]);
+        apply(
+            &resource,
+            &FileFingerprint::missing(),
+            b"owned",
+            "coverage-parent",
+        )
+        .unwrap();
+        let path = f.path();
+        let before = fs::read(&path).unwrap();
+        let mut changed = before.clone();
+        changed.push(0);
+        assert!(with_existing_journal(|_| {
+            // Simulate an external writer that ignores the cooperative storage lock.
+            fs::write(&path, &changed).unwrap();
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            changed,
+            "inspection must not repair drift"
+        );
+    });
+}
+
+#[test]
 fn identity_is_strict_nonzero_and_unknown_journal_versions_fail_closed() {
     for identity in [
         BatchIdentity {

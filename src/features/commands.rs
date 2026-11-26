@@ -62,11 +62,15 @@ fn project_dir() -> PathBuf {
 
 /// All custom commands, project entries overriding global ones of the same name. Sorted by name.
 pub fn list() -> Vec<CustomCommand> {
+    list_from(project_dir(), false)
+}
+
+pub(crate) fn list_from(project: PathBuf, scoped: bool) -> Vec<CustomCommand> {
     let mut by_name: std::collections::BTreeMap<String, CustomCommand> =
         std::collections::BTreeMap::new();
     // Global first, then project — so project insertions overwrite global on collision.
-    for (dir, source) in [(global_dir(), "global"), (project_dir(), "project")] {
-        for cmd in load_dir(&dir, &dir, source) {
+    for (dir, source) in [(global_dir(), "global"), (project, "project")] {
+        for cmd in load_dir(&dir, &dir, source, scoped) {
             by_name.insert(cmd.name.clone(), cmd);
         }
     }
@@ -85,15 +89,24 @@ pub fn find(name: &str) -> Option<CustomCommand> {
 }
 
 /// Recursively load `*.md` under `dir`, namespacing by path relative to `base`.
-fn load_dir(dir: &Path, base: &Path, source: &'static str) -> Vec<CustomCommand> {
+fn load_dir(dir: &Path, base: &Path, source: &'static str, scoped: bool) -> Vec<CustomCommand> {
     let mut out = Vec::new();
+    if scoped && dir.symlink_metadata().map_or(true, |m| !m.is_dir()) {
+        return out;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
     };
     for entry in rd.flatten() {
         let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if scoped && kind.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
-            out.extend(load_dir(&path, base, source));
+            out.extend(load_dir(&path, base, source, scoped));
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             if let Some(cmd) = parse_file(&path, base, source) {
                 out.push(cmd);
@@ -136,6 +149,10 @@ fn parse_file(path: &Path, base: &Path, source: &'static str) -> Option<CustomCo
 
 /// Expand a command's body against `args` (the raw string typed after the command name).
 pub fn expand(cmd: &CustomCommand, args: &str) -> Result<String> {
+    expand_refs(&substitute(cmd, args)).map(|out| out.trim().to_string())
+}
+
+pub(crate) fn substitute(cmd: &CustomCommand, args: &str) -> String {
     let positionals: Vec<&str> = args.split_whitespace().collect();
     let mut out = cmd.body.clone();
 
@@ -147,8 +164,7 @@ pub fn expand(cmd: &CustomCommand, args: &str) -> Result<String> {
         out = out.replace(&format!("${i}"), val);
     }
 
-    out = expand_refs(&out)?;
-    Ok(out.trim().to_string())
+    out
 }
 
 /// Expand `@<path>` file refs + `` !`cmd` `` read-only shell refs in arbitrary text. Shared by
@@ -167,10 +183,15 @@ fn expand_files(s: &str) -> Result<String> {
     static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|\s)@([^\s`]+)").unwrap());
     // Canonicalize so `confine`'s `starts_with(base)` check (which canonicalizes the target) sees a
     // matching prefix — a bare cwd may differ from its canonical form (UNC/case) and falsely escape.
-    let root = std::env::current_dir()
-        .context("resolving cwd")?
+    let root = crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        })
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().context("resolving cwd"))?
         .canonicalize()
-        .context("canonicalizing cwd")?;
+        .context("bound input workspace is unavailable")?;
     let mut out = String::with_capacity(s.len());
     let mut last = 0;
     for cap in RE.captures_iter(s) {
@@ -200,10 +221,15 @@ fn expand_files(s: &str) -> Result<String> {
 /// blocked or non-read-only commands are refused with the reason (never executed silently).
 fn expand_shell(s: &str) -> Result<String> {
     static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"!`([^`]+)`").unwrap());
-    let root = std::env::current_dir()
-        .context("resolving cwd")?
+    let root = crate::core::exec_ctx::current()
+        .and_then(|ctx| {
+            ctx.placement()
+                .map(|placement| placement.workspace_root().to_path_buf())
+        })
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().context("resolving cwd"))?
         .canonicalize()
-        .context("canonicalizing cwd")?;
+        .context("bound input workspace is unavailable")?;
     let mut out = String::with_capacity(s.len());
     let mut last = 0;
     for cap in RE.captures_iter(s) {
@@ -366,6 +392,32 @@ mod tests {
         assert_eq!(expand(&miss, "").unwrap(), "ping @everyone now");
         let nofile = cmd("@no/such/file.xyz");
         assert_eq!(expand(&nofile, "").unwrap(), "@no/such/file.xyz");
+    }
+
+    #[test]
+    fn at_file_uses_bound_workspace_without_changing_cwd() {
+        let fixture = crate::core::file_placement::tests::TestDir::new();
+        let root = fixture.path().join("selected");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("bound-reference.txt"), "selected workspace bytes").unwrap();
+        let placement = crate::core::file_placement::PlacementContext::new(
+            root.clone(),
+            fixture.path().join("home"),
+        )
+        .unwrap();
+        let ctx = crate::core::exec_ctx::ExecutionContext::default().with_placement(placement);
+        let cwd = std::env::current_dir().unwrap();
+        crate::core::exec_ctx::with_current(ctx, || {
+            let expanded = expand_refs("inspect @bound-reference.txt").unwrap();
+            assert!(expanded.contains("selected workspace bytes"));
+            std::fs::remove_file(root.join("bound-reference.txt")).unwrap();
+            std::fs::remove_dir(&root).unwrap();
+            assert!(
+                expand_refs("inspect @Cargo.toml").is_err(),
+                "missing root must not read the startup checkout"
+            );
+        });
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
     }
 
     #[test]

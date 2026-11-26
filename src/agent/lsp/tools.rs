@@ -499,10 +499,11 @@ impl Tool for SymbolReplace {
                 "symbolic host write",
                 &scope,
             )?;
-            crate::core::persist::compare_and_atomic_write(
+            crate::core::persist::compare_and_atomic_write_observed(
                 &plan.path,
                 &plan.base_fingerprint,
                 plan.new_content.as_bytes(),
+                || crate::core::exec_ctx::note_native_mutation(&plan.path),
             )
             .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
         } // Release host-write exclusion before requesting LSP edit feedback.
@@ -627,10 +628,11 @@ impl Tool for SymbolInsert {
                 "symbolic host write",
                 &scope,
             )?;
-            crate::core::persist::compare_and_atomic_write(
+            crate::core::persist::compare_and_atomic_write_observed(
                 &plan.path,
                 &plan.base_fingerprint,
                 plan.new_content.as_bytes(),
+                || crate::core::exec_ctx::note_native_mutation(&plan.path),
             )
             .map_err(|e| anyhow!("stale symbolic edit: {e}"))?;
         } // Release host-write exclusion before requesting LSP edit feedback.

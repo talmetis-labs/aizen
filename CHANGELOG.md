@@ -5,6 +5,41 @@ All notable changes to **Aizen** (`aizen`) — the pure-Rust agentic coding CLI.
 This repo was extracted from the NextGen monorepo at v0.1.0 (2026-06-27); the detailed pre-0.1.0
 development log lives in that monorepo's history.
 
+## [Unreleased]
+
+### Added
+- Continue a shared CLI session from Aizen Chat while Core runs on a paired host. The
+  `aizen remote` commands control sharing with a compatible relay. Shared sessions expose
+  supported slash commands, reasoning effort, clarification prompts, and tool approvals.
+- Transfer selected assistant topics, personas, skills, and Mnemos records between compatible
+  Core hosts. Each transfer is bound to a destination workspace.
+- Validate the Aizen Desktop plugin v1 release manifest with `aizen plugin validate-release`.
+  The repository includes the manifest schema and a seller example.
+- Offer computer-use tools to runs bound to a compatible host surface, including read-only sessions.
+- Save workspace-bound plans and delegate changes in owned Git worktrees. Inspect the resulting
+  Git operations and use their recorded outcomes to review, hand off, or reverse eligible changes.
+
+### Changed
+- Narrow the first tool set for simple lookups and expose additional tools as the task needs them.
+  Improve multilingual request matching, repository search, and bounded tool output.
+- Use separate Mnemos session identities for assistant topics, room members, and bot destinations
+  with a compatible provider. Keep local learning and recovery tied to the selected workspace.
+- `/goal` no longer opens clarification prompts. Tool approval still follows the selected
+  approval policy.
+
+### Fixed
+- Preserve workspace and session bindings across resumed plans and delegated work, with shared
+  deadlines and clearer handling of interrupted runs.
+- Prevent stack overflows when parallel Task and Workflow workers stream model responses.
+- Keep linked Unix worktree metadata accessible to Git and allow clean managed worktree removal
+  under Linux Landlock.
+
+### Removed
+- Retired checkpoint-based rewind and new speculative overlay execution. `/time` now uses Git
+  history and worktrees. Historical speculation records remain available for inspection.
+- Retired the dormant creative adapters and their job journal. `aizen apps status --json`
+  now reports configured MCP connectors using schema version 2.
+
 ## [0.7.4] — 2026-11-06
 
 ### Added

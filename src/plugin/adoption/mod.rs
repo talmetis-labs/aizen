@@ -149,8 +149,7 @@ pub(crate) async fn dispatch(request: &Request, workspace: &str, generation: u64
             ensure!(
                 crate::core::exec_ctx::current().is_none_or(|ctx| ctx.can_restore_workspace()
                     && ctx.dispatch_label().is_none()
-                    && ctx.native_scope().is_none()
-                    && ctx.overlay().is_none()),
+                    && ctx.native_scope().is_none()),
                 "delegated or speculative execution cannot request human adoption"
             );
             ensure!(

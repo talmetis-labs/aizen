@@ -830,6 +830,9 @@ mod tests {
     }
     #[test]
     fn shared_owned_payload_clones_preserve_string_wire_and_release_only_at_last_drop() {
+        if crate::llm::image_send::isolated_image_budget_test() {
+            return;
+        }
         use crate::llm::image_send::{try_image_memory_lease, IMAGE_MEMORY_BUDGET};
         let _lock = crate::llm::image_send::image_test_lock();
         let bytes = encode_rgba_png(&[1, 2, 3, 255], 1, 1).unwrap();

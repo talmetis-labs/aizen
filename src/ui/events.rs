@@ -44,6 +44,25 @@ const STREAM: u8 = 1;
 const FINAL: u8 = 2;
 
 static MODE: AtomicU8 = AtomicU8::new(OFF);
+static BROWSER_FRAMES: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn enable_browser_frames() {
+    BROWSER_FRAMES.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn browser_frames_enabled() -> bool {
+    streaming() && BROWSER_FRAMES.load(Ordering::Relaxed) && who_here().is_none()
+}
+
+pub(crate) fn browser_frame(profile: &str, target: &str, title: &str, jpeg: &str) {
+    if browser_frames_enabled() {
+        emit(
+            "system",
+            json!({"subtype":"browser_frame","version":1,"profile":profile,
+            "target_id":target,"title":title,"jpeg":jpeg}),
+        );
+    }
+}
 /// Set by a `bypassPermissions` reply: every later approval is answered without asking.
 static ALLOW_ALL: AtomicBool = AtomicBool::new(false);
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -123,6 +142,9 @@ struct Run {
     /// waits on it. A sender that errors means the reader saw stdin close (a deny follows).
     waiting: Option<HashMap<String, Sender<String>>>,
     stdin_reader: StdinReader,
+    /// Explicit host opt-in; ordinary stream-json consumers retain the original wire surface.
+    host_preview_diagnostics: bool,
+    preview_owner_reported: bool,
     seed: u64,
 }
 
@@ -139,6 +161,8 @@ impl Run {
             spoken: String::new(),
             waiting: None,
             stdin_reader: StdinReader::NotStarted,
+            host_preview_diagnostics: false,
+            preview_owner_reported: false,
             seed: 0,
         }
     }
@@ -181,6 +205,71 @@ impl Run {
 /// closing `result` object (`json`). Irreversible for the process: a one-shot run is one turn.
 pub fn enable(streaming: bool) {
     MODE.store(if streaming { STREAM } else { FINAL }, Ordering::Relaxed);
+}
+
+/// Enable diagnostics only for a host that explicitly negotiated the CLI flag. This is NOT a
+/// retention grant: process lifetimes still own their workspace/global exclusion and containment.
+pub(crate) fn enable_host_preview_diagnostics() {
+    if streaming() {
+        lock().host_preview_diagnostics = true;
+    }
+}
+
+const PREVIEW_RETENTION_BLOCKER: &str = "process_lifetime_owns_exclusion";
+const PREVIEW_PROCESS_CAP: usize = 16;
+
+fn add_preview_capabilities(run: &Run, fields: &mut Value) {
+    if run.host_preview_diagnostics {
+        fields["capabilities"] = json!({"host_preview": {
+            "version": 1,
+            "retention": false,
+            "reason": PREVIEW_RETENTION_BLOCKER,
+            "readiness": "host_http_probe",
+            "completion": "result",
+        }});
+    }
+    if BROWSER_FRAMES.load(Ordering::Relaxed) {
+        fields["capabilities"]["browser_frame"] = json!(1);
+    }
+}
+
+fn preview_owner_fields(run: &mut Run, jobs: &[crate::agent::process::JobInfo]) -> Option<Value> {
+    if !run.host_preview_diagnostics || run.preview_owner_reported {
+        return None;
+    }
+    run.preview_owner_reported = true;
+    if jobs.is_empty() {
+        return None;
+    }
+    // Opaque run-local handles only. No commands, arbitrary PIDs, logs, or guessed URLs. A wrapper
+    // that exited may still have live descendants: `running` is NOT HTTP health or tree settlement.
+    let processes: Vec<Value> = jobs
+        .iter()
+        .take(PREVIEW_PROCESS_CAP)
+        .map(|job| json!({"id": job.id, "running": job.running}))
+        .collect();
+    Some(json!({
+        "subtype": "preview_owner_exiting",
+        "version": 1,
+        "retained": false,
+        "reason": PREVIEW_RETENTION_BLOCKER,
+        "readiness": "unverified",
+        "processes": processes,
+    }))
+}
+
+/// An opt-in advisory immediately before the one-shot result/error, never a second completion or
+/// proof that an HTTP server has stopped. The host correlates handles with its own preview evidence.
+pub(crate) fn preview_owner_exiting() {
+    if !streaming() || !lock().host_preview_diagnostics {
+        return;
+    }
+    // Do not acquire process ownership while holding the stream mutex.
+    let jobs = crate::agent::process::snapshot();
+    let mut run = lock();
+    if let Some(fields) = preview_owner_fields(&mut run, &jobs) {
+        emit_locked(&mut run, "system", fields, false);
+    }
 }
 
 /// Whether machine-readable output owns stdout (either format).
@@ -438,6 +527,59 @@ fn emit(kind: &str, fields: Value) {
     emit_locked(&mut run, kind, fields, false);
 }
 
+/// Private transport to the host that owns this child process. Only the compact text reply
+/// becomes a tool result. A timeout after dispatch is ambiguous and must never replay input.
+pub(crate) fn computer_call(action: &str, args: &Value) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        streaming() && who_here().is_none(),
+        "no foreground computer grant"
+    );
+    start_stdin_reader();
+    let (id, rx) = {
+        let mut run = lock();
+        let id = format!("computer-{}", uuid(&mut run));
+        let rx = run
+            .register_waiter(&id)
+            .ok_or_else(|| anyhow::anyhow!("computer host unavailable"))?;
+        emit_locked(
+            &mut run,
+            "system",
+            json!({"subtype":"computer_request","version":1,
+            "request_id":id,"action":action,"args":args}),
+            false,
+        );
+        (id, rx)
+    };
+    let deadline = Instant::now() + std::time::Duration::from_secs(12);
+    let result = loop {
+        if approval_interrupted() || Instant::now() >= deadline {
+            break Err(anyhow::anyhow!(
+                "computer request interrupted; observe again before any further action"
+            ));
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(80)) {
+            Ok(line) => break Ok(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(anyhow::anyhow!("computer host disconnected"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    lock().waiting().remove(&id);
+    let reply: Value = serde_json::from_str(&result?)?;
+    let response = &reply["response"];
+    anyhow::ensure!(
+        response["request_id"] == id && response["subtype"] == "computer",
+        "invalid host reply"
+    );
+    let text = response["text"]
+        .as_str()
+        .filter(|s| s.len() <= 32000)
+        .ok_or_else(|| anyhow::anyhow!("invalid computer observation"))?;
+    anyhow::ensure!(response["ok"] == true, "{text}");
+    Ok(text.to_owned())
+}
+
 /// `text` with every ANSI sequence removed, trailing whitespace dropped per line, and blank lines
 /// gone — what a trace line looks like once it is data rather than a styled terminal row.
 pub(crate) fn plain(text: &str) -> String {
@@ -603,25 +745,22 @@ pub fn start(
         "yolo" => "bypassPermissions",
         _ => "default",
     };
-    emit_locked(
-        &mut run,
-        "system",
-        json!({
-            "subtype": "init",
-            "cwd": cwd,
-            "model": model,
-            "tools": tools,
-            "mcp_servers": [],
-            "permissionMode": permission_mode,
-            "approval_mode": approval,
-            "agent": "aizen",
-            "version": env!("CARGO_PKG_VERSION"),
-            "effort": effort,
-            "images": images,
-            "pid": std::process::id(),
-        }),
-        false,
-    );
+    let mut fields = json!({
+        "subtype": "init",
+        "cwd": cwd,
+        "model": model,
+        "tools": tools,
+        "mcp_servers": [],
+        "permissionMode": permission_mode,
+        "approval_mode": approval,
+        "agent": "aizen",
+        "version": env!("CARGO_PKG_VERSION"),
+        "effort": effort,
+        "images": images,
+        "pid": std::process::id(),
+    });
+    add_preview_capabilities(&run, &mut fields);
+    emit_locked(&mut run, "system", fields, false);
 }
 
 /// A fragment of the assistant's answer, in the order it streamed: a `text_delta`. The whole
@@ -658,7 +797,7 @@ pub fn reasoning(delta: &str) {
     );
 }
 
-/// A line the human transcript would have shown as progress (`→ checkpoint #3 saved`, a retry
+/// A line the human transcript would have shown as progress (a verification-status update, a retry
 /// note): `system` / `informational` at level `info`. Styling stripped; empty lines dropped.
 pub fn trace(text: &str) {
     let clean = plain(text);
@@ -782,13 +921,92 @@ pub fn tool_result(
     );
 }
 
-/// The plan checklist as the agent last wrote it — `system` / `plan`. `items` = `(status, text)`
-/// with status 0 / 1 / 2 = pending / in progress / done, the same rows the panel renders.
+/// The runtime's effective checklist — `system` / `plan`. Status stays compatible with the
+/// panel; stable IDs and completion basis are additive, never inferred from a model Done claim.
+#[allow(dead_code)] // Compatibility entry point; owned task publications use plan_snapshot.
 pub fn plan(items: &[(u8, String)]) {
-    emit(
-        "system",
-        json!({ "subtype": "plan", "items": plan_rows(items) }),
-    );
+    let state = crate::agent::todo::try_current_context().map(|context| context.snapshot());
+    plan_snapshot(items, state.as_ref());
+}
+
+pub(crate) fn plan_snapshot(items: &[(u8, String)], state: Option<&crate::agent::todo::TaskState>) {
+    emit("system", plan_projection(items, state));
+}
+
+pub(crate) fn plan_snapshot_aligned(
+    items: &[(u8, String)],
+    state: &crate::agent::todo::TaskState,
+) -> bool {
+    state.items.len() == items.len()
+        && state.items.iter().zip(items).all(|(row, (status, text))| {
+            let effective = match row.status {
+                crate::agent::todo::Status::Pending => 0,
+                crate::agent::todo::Status::InProgress => 1,
+                crate::agent::todo::Status::Done => 2,
+            };
+            effective == *status && row.content == *text
+        })
+}
+
+fn plan_projection(items: &[(u8, String)], state: Option<&crate::agent::todo::TaskState>) -> Value {
+    let mut rows = plan_rows(items);
+    let mut event = json!({ "subtype": "plan" });
+    if let Some(state) = state.filter(|state| plan_snapshot_aligned(items, state)) {
+        for (projection, row) in rows.iter_mut().zip(&state.items) {
+            projection["id"] = json!(row.id);
+            projection["completion_basis"] =
+                json!(completion_basis_label(state.completion_basis(&row.id)));
+            if let Some(link) = state.item_phases.iter().find(|link| link.item_id == row.id) {
+                projection["phase"] = json!({
+                    "plan_id": link.plan_id, "phase_id": link.phase_id,
+                    "resolved": state.phase_resolved(&row.id),
+                });
+            }
+        }
+        event["task_id"] = json!(state.id);
+        event["task_revision"] = json!(state.revision);
+        event["evidence_epoch"] = json!(state.effect_epoch);
+        event["document"] = state.plan.as_ref().map_or(Value::Null, |plan| json!({
+            "path": plan.path, "id": plan.id, "fingerprint": plan.fingerprint,
+            "freshness": plan.freshness, "usable": plan.usable(), "phases": plan.phases,
+            "validation": if plan.usable() { "validated at last refresh" } else { "not currently usable" },
+        }));
+    }
+    event["items"] = json!(rows);
+    event
+}
+
+pub(crate) fn plan_document_summary(state: &crate::agent::todo::TaskState) -> Option<String> {
+    let plan = state.plan.as_ref()?;
+    // JSON quoting keeps a hostile path from injecting terminal control characters/newlines.
+    let path = json!(plan.path);
+    let status = if plan.usable() {
+        "validated at last refresh".to_owned()
+    } else {
+        format!(
+            "not usable ({}; saved metadata may be historical)",
+            json!(plan.freshness)
+        )
+    };
+    Some(format!(
+        "plan document {} {path} — {status}; not implementation-check evidence",
+        plan.id
+    ))
+}
+
+#[cfg(test)]
+#[path = "plan_event_tests.rs"]
+mod plan_event_tests;
+
+fn completion_basis_label(basis: crate::agent::todo::CompletionBasis) -> &'static str {
+    use crate::agent::todo::CompletionBasis;
+    match basis {
+        CompletionBasis::Observed => "observed",
+        CompletionBasis::Reported => "reported",
+        CompletionBasis::Verified => "verified",
+        CompletionBasis::NotRequired => "not_required",
+        CompletionBasis::Unverified => "unverified",
+    }
 }
 
 /// The `plan` record's rows: the panel's numeric status as a word.
@@ -867,6 +1085,7 @@ pub fn hook(fields: Value) {
 }
 
 /// Older turns were summarized in place — the SDK's `system` / `compact_boundary`.
+#[allow(dead_code)] // Keep the original two-argument event API for existing callers.
 pub fn compact_boundary(pre_tokens: usize, post_tokens: usize) {
     emit(
         "system",
@@ -875,6 +1094,120 @@ pub fn compact_boundary(pre_tokens: usize, post_tokens: usize) {
             "compact_metadata": { "trigger": "auto", "pre_tokens": pre_tokens, "post_tokens": post_tokens },
         }),
     );
+}
+
+/// One automatic compaction, scoped to the speaker at start (not whichever child runs last).
+/// Dropping an unfinished cycle reports failure, including early `?` returns. Cooperative
+/// cancellation is explicit; a hard process kill is detected by the stream consumer at exit.
+pub(crate) struct CompactCycle {
+    id: String,
+    who: Option<String>,
+    parent: Option<String>,
+    terminal: bool,
+}
+
+impl CompactCycle {
+    pub(crate) fn start() -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let who = who_here();
+        let parent = parent_for(&lock(), who.as_deref());
+        let cycle = Self {
+            id: format!("compact_{}", SEQ.fetch_add(1, Ordering::Relaxed)),
+            who,
+            parent,
+            terminal: false,
+        };
+        cycle.status("started");
+        cycle
+    }
+
+    fn fields(&self, subtype: &str, mut metadata: Value) -> Value {
+        metadata["cycle_id"] = json!(self.id);
+        metadata["trigger"] = json!("auto");
+        json!({
+            "subtype": subtype,
+            "compact_metadata": metadata,
+            "parent_tool_use_id": self.parent,
+            "dispatch": self.who,
+        })
+    }
+
+    fn status(&self, phase: &str) {
+        let mut metadata = json!({ "phase": phase });
+        if phase == "failed" {
+            // Never serialize an upstream error: providers may echo credentials or private input.
+            metadata["error"] = json!("Automatic compaction failed.");
+        }
+        emit_compaction(self.fields("compact_status", metadata));
+    }
+
+    pub(crate) fn success(
+        mut self,
+        pre_tokens: usize,
+        post_tokens: usize,
+        request_tokens: usize,
+        context_window: usize,
+    ) {
+        self.terminal = true;
+        emit_compaction(self.fields(
+            "compact_boundary",
+            json!({
+                "pre_tokens": pre_tokens, "post_tokens": post_tokens,
+                "request_tokens": request_tokens, "context_window": context_window,
+            }),
+        ));
+    }
+
+    pub(crate) fn failed(mut self) {
+        self.terminal = true;
+        self.status("failed");
+    }
+
+    pub(crate) fn cancelled(mut self) {
+        self.terminal = true;
+        self.status("cancelled");
+    }
+}
+
+impl Drop for CompactCycle {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.status("failed");
+        }
+    }
+}
+
+fn emit_compaction(fields: Value) {
+    #[cfg(test)]
+    if COMPACT_TEST_EVENTS
+        .try_with(|events| {
+            events
+                .borrow_mut()
+                .push(record(&mut lock(), "system", fields.clone()))
+        })
+        .is_ok()
+    {
+        return;
+    }
+    emit("system", fields);
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static COMPACT_TEST_EVENTS: std::cell::RefCell<Vec<Value>>;
+}
+
+/// Task-local capture avoids changing the process-wide JSON mode or racing unrelated loop tests.
+#[cfg(test)]
+pub(crate) async fn capture_compaction<F: std::future::Future>(
+    future: F,
+) -> (F::Output, Vec<Value>) {
+    COMPACT_TEST_EVENTS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let result = future.await;
+            (result, COMPACT_TEST_EVENTS.with(|events| events.take()))
+        })
+        .await
 }
 
 /// The finished conversation was written to the session pool — `system` / `session_saved`.
@@ -903,14 +1236,31 @@ pub fn steer_leftover(text: &str) {
     );
 }
 
-/// The SDK `result` subtype and `is_error` for one of aizen's stop words (`done`, `divergence`,
-/// `max_iters`, `verification_failed`, `awaiting_input`, `cancelled`, `deadline`).
+/// The SDK `result` subtype and `is_error` for one of aizen's stop words (`done`, `incomplete`,
+/// `divergence`, `max_iters`, `verification_failed`, `awaiting_input`, `cancelled`, `deadline`).
 pub(crate) fn result_kind(stop: &str) -> (&'static str, bool) {
     match stop {
         "done" | "awaiting_input" => ("success", false),
         "max_iters" => ("error_max_turns", true),
         _ => ("error_during_execution", true),
     }
+}
+
+pub(crate) const INCOMPLETE_VERDICT: &str =
+    "[incomplete: runtime completion requirements are not satisfied; the work above is not confirmed complete.]";
+
+/// Keep captured, hostbot and JSON replies honest even after optimistic model-authored prose.
+/// This verdict is runtime-owned, never inferred from or suppressed by the model's answer.
+pub(crate) fn completion_result_text<'a>(stop: &str, answer: &'a str) -> std::borrow::Cow<'a, str> {
+    if stop == "incomplete" {
+        std::borrow::Cow::Owned(format!("{answer}\n\n{INCOMPLETE_VERDICT}"))
+    } else {
+        std::borrow::Cow::Borrowed(answer)
+    }
+}
+
+fn completion_fields(stop: &str) -> Value {
+    json!({ "status": stop, "completed": stop == "done" })
 }
 
 /// Aizen's usage summary (`calls`, `input` with cache reads and writes included, `output`,
@@ -951,6 +1301,7 @@ pub fn done_with_verification(
     usage: Value,
     verification: Option<Value>,
     last_streamed: Option<&str>,
+    speech_final_verified: bool,
 ) {
     if !on() {
         return;
@@ -969,12 +1320,14 @@ pub fn done_with_verification(
         }
     }
     let (subtype, is_error) = result_kind(stop);
+    let result_text = completion_result_text(stop, final_text.unwrap_or(""));
     let mut fields = json!({
         "subtype": subtype,
         "is_error": is_error,
         "duration_ms": elapsed_ms(&run),
         "num_turns": steps,
-        "result": final_text.unwrap_or(""),
+        "result": result_text,
+        "completion": completion_fields(stop),
         "stop_reason": Value::Null,
         "usage": usage_fields(&usage),
         "permission_denials": run.denials,
@@ -993,7 +1346,66 @@ pub fn done_with_verification(
     if is_error {
         fields["errors"] = json!([stop]);
     }
+    if let Some(proof) = speech_final_proof(
+        streaming(),
+        stop,
+        session,
+        final_text,
+        speech_final_verified,
+    ) {
+        fields["speech_final"] = proof;
+    }
     emit_locked(&mut run, "result", fields, true);
+}
+
+fn speech_final_proof(
+    is_stream_json: bool,
+    stop: &str,
+    session: Option<&str>,
+    text: Option<&str>,
+    verified: bool,
+) -> Option<Value> {
+    if !is_stream_json || stop != "done" || !verified || session.is_none_or(str::is_empty) {
+        return None;
+    }
+    text.filter(|s| !s.trim().is_empty() && s.len() <= 24 * 1024)
+        .map(|s| json!({ "version": 1, "text": s }))
+}
+
+#[cfg(test)]
+#[test]
+fn speech_final_requires_exact_saved_root_done_provenance() {
+    let value = speech_final_proof(true, "done", Some("fixture"), Some(" Final answer. "), true);
+    assert_eq!(
+        value,
+        Some(json!({ "version": 1, "text": " Final answer. " }))
+    );
+    assert_eq!(
+        speech_final_proof(false, "done", Some("fixture"), Some("answer"), true),
+        None
+    );
+    assert_eq!(
+        speech_final_proof(
+            true,
+            "awaiting_input",
+            Some("fixture"),
+            Some("answer"),
+            true
+        ),
+        None
+    );
+    assert_eq!(
+        speech_final_proof(true, "incomplete", Some("fixture"), Some("answer"), true),
+        None
+    );
+    assert_eq!(
+        speech_final_proof(true, "done", None, Some("answer"), true),
+        None
+    );
+    assert_eq!(
+        speech_final_proof(true, "done", Some("fixture"), Some("reasoning-only"), false),
+        None
+    );
 }
 
 fn unstreamed_result_text<'a>(
@@ -1026,6 +1438,7 @@ pub fn error(message: &str) {
         "permission_denials": run.denials,
         "errors": [message],
         "stop": "error",
+        "completion": completion_fields("error"),
     });
     emit_locked(&mut run, "result", fields, true);
 }
@@ -1428,6 +1841,139 @@ mod tests {
     }
 
     #[test]
+    fn host_preview_diagnostic_is_opt_in_and_opaque() {
+        let mut ordinary = run();
+        let jobs = vec![crate::agent::process::JobInfo {
+            id: "proc_7".into(),
+            running: true,
+            elapsed: "3s".into(),
+            command: "secret command must not cross protocol".into(),
+        }];
+        assert!(preview_owner_fields(&mut ordinary, &jobs).is_none());
+
+        let mut host = run();
+        host.host_preview_diagnostics = true;
+        let mut init = json!({"subtype": "init"});
+        add_preview_capabilities(&host, &mut init);
+        assert_eq!(init["capabilities"]["host_preview"]["version"], 1);
+        assert_eq!(init["capabilities"]["host_preview"]["retention"], false);
+        assert_eq!(
+            init["capabilities"]["host_preview"]["reason"],
+            PREVIEW_RETENTION_BLOCKER
+        );
+        let fields = preview_owner_fields(&mut host, &jobs).expect("one bounded owner advisory");
+        assert_eq!(fields["subtype"], "preview_owner_exiting");
+        assert_eq!(fields["version"], 1);
+        assert_eq!(fields["retained"], false);
+        assert_eq!(fields["readiness"], "unverified");
+        assert_eq!(fields["processes"][0]["id"], "proc_7");
+        assert_eq!(fields["processes"][0]["running"], true);
+        assert!(fields["processes"][0].get("command").is_none());
+        assert!(preview_owner_fields(&mut host, &jobs).is_none());
+    }
+
+    #[test]
+    fn host_preview_diagnostic_empty_pool_is_not_repeated() {
+        let mut host = run();
+        host.host_preview_diagnostics = true;
+        let mut ordinary_init = json!({"subtype": "init"});
+        add_preview_capabilities(&run(), &mut ordinary_init);
+        assert!(ordinary_init.get("capabilities").is_none());
+        assert!(preview_owner_fields(&mut host, &[]).is_none());
+        assert!(preview_owner_fields(
+            &mut host,
+            &[crate::agent::process::JobInfo {
+                id: "proc_late".into(),
+                running: true,
+                elapsed: "1s".into(),
+                command: "not exposed".into(),
+            },]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn host_preview_diagnostic_caps_owner_handles_at_sixteen() {
+        let mut host = run();
+        host.host_preview_diagnostics = true;
+        let jobs: Vec<_> = (0..20)
+            .map(|index| crate::agent::process::JobInfo {
+                id: format!("proc_{index}"),
+                running: index % 2 == 0,
+                elapsed: "1s".into(),
+                command: "not exposed".into(),
+            })
+            .collect();
+        let fields = preview_owner_fields(&mut host, &jobs).expect("bounded owner advisory");
+        let processes = fields["processes"].as_array().expect("process array");
+        assert_eq!(processes.len(), PREVIEW_PROCESS_CAP);
+        assert_eq!(processes[0]["id"], "proc_0");
+        assert_eq!(processes[15]["id"], "proc_15");
+        assert!(processes
+            .iter()
+            .all(|process| process.get("command").is_none()));
+    }
+
+    #[tokio::test]
+    async fn compact_cycles_have_unique_ids_and_exactly_one_terminal_event() {
+        let (_, events) = capture_compaction(async {
+            CompactCycle::start().success(100, 40, 72, 4096);
+            CompactCycle::start().failed();
+            CompactCycle::start().cancelled();
+            drop(CompactCycle::start()); // Early error/abandoned future cannot leave a live spinner.
+        })
+        .await;
+        assert_eq!(events.len(), 8);
+        let mut ids = std::collections::HashSet::new();
+        for pair in events.chunks_exact(2) {
+            let start = &pair[0];
+            let end = &pair[1];
+            assert_eq!(start["type"], "system");
+            assert_eq!(start["subtype"], "compact_status");
+            assert_eq!(start["compact_metadata"]["phase"], "started");
+            let id = start["compact_metadata"]["cycle_id"].as_str().unwrap();
+            assert!(ids.insert(id));
+            assert_eq!(end["compact_metadata"]["cycle_id"], id);
+            assert_eq!(start["session_id"], end["session_id"]);
+            assert_eq!(start["compact_metadata"]["trigger"], "auto");
+            assert_eq!(end["compact_metadata"]["trigger"], "auto");
+            assert_ne!(start["uuid"], end["uuid"]);
+            assert!(start["parent_tool_use_id"].is_null());
+        }
+        assert_eq!(events[1]["subtype"], "compact_boundary");
+        assert_eq!(events[1]["compact_metadata"]["pre_tokens"], 100);
+        assert_eq!(events[1]["compact_metadata"]["post_tokens"], 40);
+        assert_eq!(events[1]["compact_metadata"]["request_tokens"], 72);
+        assert_eq!(events[1]["compact_metadata"]["context_window"], 4096);
+        assert_eq!(events[3]["compact_metadata"]["phase"], "failed");
+        assert_eq!(
+            events[3]["compact_metadata"]["error"],
+            "Automatic compaction failed."
+        );
+        assert_eq!(events[5]["compact_metadata"]["phase"], "cancelled");
+        assert_eq!(events[7]["compact_metadata"]["phase"], "failed");
+    }
+
+    #[test]
+    fn compact_cycle_preserves_parent_identity_when_other_children_start() {
+        let mut run = run();
+        run.parents.push((1, "toolu_owner".into()));
+        let cycle = CompactCycle {
+            id: "fixture-cycle".into(),
+            who: Some("child".into()),
+            parent: parent_for(&run, Some("child")),
+            terminal: true,
+        };
+        run.parents.push((2, "toolu_unrelated".into()));
+        let fields = cycle.fields("compact_status", json!({ "phase": "failed" }));
+        let event = record(&mut run, "system", fields);
+        assert_eq!(event["parent_tool_use_id"], "toolu_owner");
+        assert_eq!(event["dispatch"], "child");
+        assert_eq!(event["compact_metadata"]["cycle_id"], "fixture-cycle");
+        assert_eq!(event["compact_metadata"]["phase"], "failed");
+    }
+
+    #[test]
     fn immediate_approval_replies_are_registered_before_publication() {
         let mut r = run();
         r.stdin_reader = StdinReader::Live;
@@ -1672,9 +2218,43 @@ mod tests {
     fn stop_words_map_to_result_subtypes() {
         assert_eq!(result_kind("done"), ("success", false));
         assert_eq!(result_kind("awaiting_input"), ("success", false));
+        assert_eq!(result_kind("incomplete"), ("error_during_execution", true));
         assert_eq!(result_kind("max_iters"), ("error_max_turns", true));
         assert_eq!(result_kind("divergence"), ("error_during_execution", true));
         assert_eq!(result_kind("cancelled"), ("error_during_execution", true));
+    }
+
+    #[test]
+    fn completion_basis_labels_preserve_unverified_and_noncheck_distinctions() {
+        use crate::agent::todo::CompletionBasis;
+        for (basis, label) in [
+            (CompletionBasis::Observed, "observed"),
+            (CompletionBasis::Reported, "reported"),
+            (CompletionBasis::Verified, "verified"),
+            (CompletionBasis::NotRequired, "not_required"),
+            (CompletionBasis::Unverified, "unverified"),
+        ] {
+            assert_eq!(completion_basis_label(basis), label);
+        }
+    }
+
+    #[test]
+    fn incomplete_verdict_travels_with_captured_and_json_answers() {
+        let answer = "All changes are complete.";
+        let result = completion_result_text("incomplete", answer);
+        assert!(result.starts_with(answer));
+        assert!(result.ends_with(INCOMPLETE_VERDICT));
+        assert!(completion_result_text("incomplete", "").contains(INCOMPLETE_VERDICT));
+        for stop in ["done", "awaiting_input", "cancelled", "deadline"] {
+            assert_eq!(completion_result_text(stop, answer), answer);
+        }
+        assert_eq!(completion_fields("done")["completed"], true);
+        for stop in ["incomplete", "awaiting_input", "verification_failed"] {
+            let completion = completion_fields(stop);
+            assert_eq!(completion["status"], stop);
+            assert_eq!(completion["completed"], false);
+            assert!(completion.get("verified").is_none());
+        }
     }
 
     /// A steer line keeps its text, a reply keeps its id, and neither is confused for the other.
