@@ -112,7 +112,8 @@ pub fn restore(state: TaskState) -> Result<()> {
         .restore(state)
 }
 
-/// Compatibility seed used by the built-in loop fixtures, not a model mutation path.
+/// Seed the current task in unit fixtures.
+#[cfg(test)]
 pub fn set(items: Vec<Todo>) {
     current_context()
         .replace(items)

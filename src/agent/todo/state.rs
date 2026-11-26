@@ -1094,6 +1094,7 @@ impl TaskContext {
         let current = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *current != *self.saved.lock().unwrap_or_else(|e| e.into_inner())
     }
+    #[cfg(test)]
     pub fn replace(&self, items: Vec<Todo>) -> Result<Vec<Todo>> {
         self.replace_with_requirements(items, Vec::new())
     }
