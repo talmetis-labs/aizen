@@ -7,6 +7,8 @@ development log lives in that monorepo's history.
 
 ## [Unreleased]
 
+## [0.7.5]
+
 ### Added
 - Continue a shared CLI session from Aizen Chat while Core runs on a paired host. The
   `aizen remote` commands control sharing with a compatible relay. Shared sessions expose
@@ -32,13 +34,20 @@ development log lives in that monorepo's history.
   deadlines and clearer handling of interrupted runs.
 - Prevent stack overflows while streaming model responses in the REPL, Task, and Workflow.
 - Keep linked Unix worktree metadata accessible to Git and allow clean managed worktree removal
-  under Linux Landlock.
+  under Linux Landlock. Treat commit ranges as revisions when counting ahead commits in managed
+  worktrees, including on Windows paths where probing the range as a filename fails.
 
 ### Removed
 - Retired checkpoint-based rewind and new speculative overlay execution. `/time` now uses Git
   history and worktrees. Historical speculation records remain available for inspection.
 - Retired the dormant creative adapters and their job journal. `aizen apps status --json`
   now reports configured MCP connectors using schema version 2.
+
+### Testing
+- Run the Windows Git operations suite in parallel with the other Windows tests. Both jobs must
+  pass for the existing Windows check to pass.
+- Use canonical temporary directories in co-op tests and exercise the manifest size limit
+  without depending on the host's maximum path length.
 
 ## [0.7.4] — 2026-11-06
 
